@@ -1,0 +1,164 @@
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(u8)]
+pub enum TokenKind {
+    #[default]
+    EOF,
+    Identifier,
+    Number,
+    Double,
+    String,
+    True,
+    False,
+    None,
+
+    /// Symbols
+    LeftParenthesis,
+    RightParenthesis,
+    LeftBrace,
+    RightBrace,
+    LeftBracket,
+    RightBracket,
+
+    Minus,
+    MinusMinus,
+    Plus,
+    PlusPlus,
+    SlimArrow,
+    Star,
+    StarStar,
+    Slash,
+    Percent,
+    Ampersand,
+    AmpersandAmpersand,
+    Pipe,
+    PipePipe,
+    PipeGreater,
+    Caret,
+    Tilde,
+    Comma,
+    SemiColon,
+
+    Dot,
+    DotDot,
+    DotDotDot,
+    FatArrow,
+    Less,
+    LessEqual,
+    LessLess,
+    Greater,
+    GreaterEqual,
+    GreaterGreater,
+
+    Bang,
+    BangEqual,
+    Equal,
+    EqualEqual,
+
+    ///
+    And,
+    As,
+    Bool,
+    Const,
+    Continue,
+    Default,
+    Else,
+    For,
+    Function,
+    If,
+    Len,
+    Let,
+    Match,
+    Or,
+    Print,
+    PrintLn,
+    Prop,
+    Pub,
+    Raise,
+    Return,
+    Some,
+    Err,
+    Trait,
+    This,
+    Use,
+    While,
+    Yield,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TokenPosition {
+    line: usize,
+    column: usize,
+}
+
+impl TokenPosition {
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    pub fn column(&self) -> usize {
+        self.column
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    start: TokenPosition,
+    end: TokenPosition,
+    file: String,
+    lexeme: String,
+    kind: TokenKind,
+}
+
+impl Default for Token {
+    fn default() -> Self {
+        Token {
+            start: TokenPosition { line: 0, column: 0 },
+            end: TokenPosition { line: 0, column: 0 },
+            lexeme: String::from("\0"),
+            file: String::from(""),
+            kind: TokenKind::EOF,
+        }
+    }
+}
+
+impl Token {
+    pub fn begin(kind: TokenKind, line: usize, column: usize, file: &str) -> Self {
+        Token {
+            kind,
+            start: TokenPosition { line, column },
+            end: TokenPosition { line, column },
+            file: file.to_string(),
+            lexeme: String::new(),
+        }
+    }
+
+    pub fn end(&mut self, kind: TokenKind, lexeme: String, line: usize, column: usize) {
+        self.kind = kind;
+        self.end = TokenPosition { line, column };
+        self.lexeme = lexeme;
+    }
+
+    pub fn start_line(&self) -> usize {
+        self.start.line
+    }
+
+    pub fn start_column(&self) -> usize {
+        self.start.column
+    }
+
+    pub fn end_line(&self) -> usize {
+        self.end.line
+    }
+
+    pub fn end_column(&self) -> usize {
+        self.end.column
+    }
+
+    pub fn kind(&self) -> TokenKind {
+        self.kind
+    }
+
+    pub fn lexeme(&self) -> &str {
+        self.lexeme.as_ref()
+    }
+}

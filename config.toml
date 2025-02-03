@@ -1,0 +1,12 @@
+debug = false
+quiet = false
+
+[buffering]
+mode = 'Full'
+size = 1024
+
+[memory]
+limit = 1024
+
+# [garbage]
+

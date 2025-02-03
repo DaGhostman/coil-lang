@@ -1,0 +1,10 @@
+[package]
+name = "machine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+parser = { path = "../parser" }
+serde = "1.0.215"
+toml = "0.8.19"

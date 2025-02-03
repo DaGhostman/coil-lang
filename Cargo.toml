@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "common", "compiler", "machine", 
+    "parser",
+    "scanner",
+]
+
+[package]
+name = "zero"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "common" }
+scanner = { path = "scanner" }
+parser = { path = "parser" }
+compiler = { path = "compiler" }
+machine = { path = "machine" }
+toml = "0.8.19"
+serde = { version = "1.0.215", features = ["alloc", "derive"] }
+clap = { version = "4.5.23", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = 0

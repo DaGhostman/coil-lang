@@ -1,0 +1,11 @@
+[package]
+name = "scanner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = '../common' }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports"] }
+
