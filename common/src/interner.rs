@@ -2,7 +2,7 @@ use std::hash::Hash;
 
 use ahash::{HashMap, HashMapExt};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Interner<V>
 where
     V: Hash + Clone + Eq,
@@ -19,6 +19,21 @@ impl<V: Eq + Hash + Clone> Default for Interner<V> {
             uniq: HashMap::with_capacity(32),
             storage: Vec::with_capacity(32),
         }
+    }
+}
+
+impl<V: Eq + Hash + Clone> From<Vec<V>> for Interner<V> {
+    fn from(collection: Vec<V>) -> Self {
+        let mut interner = Self::default();
+        for (idx, val) in collection.iter().enumerate() {
+            let i = interner.intern(val.to_owned());
+
+            if i != idx {
+                panic!("Key mismatch");
+            }
+        }
+
+        interner
     }
 }
 
@@ -45,8 +60,29 @@ impl<V: Hash + Clone + Eq> Interner<V> {
         self.uniq.len()
     }
 
-    pub fn dump(&self) -> Vec<&V> {
-        self.storage.iter().collect()
+    pub fn dump(&self) -> Vec<V> {
+        self.storage.iter().map(|value| value.to_owned()).collect()
+    }
+
+    pub fn import(&mut self, items: Vec<V>) {
+        let size = items.len();
+        self.storage.reserve(size);
+        self.uniq.reserve(size);
+
+        for value in items {
+            self.intern(value.to_owned());
+        }
+        self.cursor = size;
+    }
+}
+
+impl<V: Hash + Clone + Eq> IntoIterator for Interner<V> {
+    type Item = V;
+
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.storage.into_iter()
     }
 }
 

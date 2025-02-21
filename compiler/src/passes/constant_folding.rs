@@ -1,10 +1,10 @@
 use std::ops::{Add, Rem, Shl, Sub};
 
+use common::program::Program;
 use common::{
-    opcodes::{Code, Operation, IR},
+    opcodes::{Operation, IR},
     Value, ValueKind,
 };
-use parser::Program;
 
 use crate::CompilationPass;
 
@@ -12,25 +12,24 @@ use crate::CompilationPass;
 pub struct ConstantFolding {}
 
 impl CompilationPass for ConstantFolding {
-    fn compile(
+    fn compile<'pass>(
         &mut self,
-        code: parser::Program<common::opcodes::IR>,
-    ) -> Result<parser::Program<common::opcodes::IR>, common::error::Error> {
-        let mut constants = code.constants();
-        let mut modified: Vec<IR> = vec![];
-        let mut phase = code.code();
+        code: &'pass mut Program<common::opcodes::IR>,
+    ) -> Result<&'pass mut Program<common::opcodes::IR>, common::error::Error> {
+        let mut modified: Vec<IR>;
+        let default_value = Value::default();
 
         loop {
             let mut cursor = 0;
             modified = vec![];
 
-            while let Some(op) = phase.get(cursor) {
+            while let Some(op) = code.get(cursor) {
                 match op.code() {
                     Operation::Add => {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -39,32 +38,28 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-                                    let constant = constants.intern(Value::new(
-                                        ValueKind::INTEGER(lhs.wrapping_add(rhs)),
+                                    let constant = code.add_constant(Value::new(
+                                        ValueKind::INTEGER(lhs.wrapping_add(*rhs)),
                                     ));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs.add(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::FLOAT(lhs.add(rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -76,7 +71,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -85,32 +80,28 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-                                    let constant = constants.intern(Value::new(
-                                        ValueKind::INTEGER(lhs.wrapping_sub(rhs)),
+                                    let constant = code.add_constant(Value::new(
+                                        ValueKind::INTEGER(lhs.wrapping_sub(*rhs)),
                                     ));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -122,7 +113,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -131,32 +122,28 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-                                    let constant = constants.intern(Value::new(
-                                        ValueKind::INTEGER(lhs.wrapping_mul(rhs)),
+                                    let constant = code.add_constant(Value::new(
+                                        ValueKind::INTEGER(lhs.wrapping_mul(*rhs)),
                                     ));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -168,7 +155,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -177,32 +164,28 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-                                    let constant = constants.intern(Value::new(
-                                        ValueKind::INTEGER(lhs.wrapping_div(rhs)),
+                                    let constant = code.add_constant(Value::new(
+                                        ValueKind::INTEGER(lhs.wrapping_div(*rhs)),
                                     ));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -214,7 +197,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -223,32 +206,28 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-                                    let constant = constants.intern(Value::new(
-                                        ValueKind::INTEGER(lhs.wrapping_rem(rhs)),
+                                    let constant = code.add_constant(Value::new(
+                                        ValueKind::INTEGER(lhs.wrapping_rem(*rhs)),
                                     ));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs.rem(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::FLOAT(lhs.rem(rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -260,7 +239,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -269,39 +248,36 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
                                     let constant =
-                                        constants.intern(Value::new(ValueKind::INTEGER(
-                                            lhs.wrapping_pow((rhs).try_into().unwrap_or_default()),
+                                        code.add_constant(Value::new(ValueKind::INTEGER(
+                                            lhs.wrapping_pow((*rhs).try_into().unwrap_or_default()),
                                         )));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs.powf(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::FLOAT(lhs.powf(*rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-                                    let constant = constants.intern(Value::new(ValueKind::FLOAT(
-                                        lhs.powi((rhs).try_into().unwrap_or_default()),
+                                    let constant = code.add_constant(Value::new(ValueKind::FLOAT(
+                                        lhs.powi((*rhs).try_into().unwrap_or_default()),
                                     )));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -313,7 +289,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -322,26 +298,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(rhs), Some(lhs)) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::BOOLEAN(lhs == rhs)));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::BOOLEAN(lhs == rhs)));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -353,7 +324,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -362,26 +333,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(rhs), Some(lhs)) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::BOOLEAN(lhs != rhs)));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::BOOLEAN(lhs != rhs)));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -393,7 +359,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -402,26 +368,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(rhs), Some(lhs)) => {
-                                    let constant =
-                                        constants.intern(Value::new(ValueKind::BOOLEAN(lhs < rhs)));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::BOOLEAN(lhs < rhs)));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -433,7 +394,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -442,26 +403,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(rhs), Some(lhs)) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::BOOLEAN(lhs <= rhs)));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::BOOLEAN(lhs <= rhs)));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -473,7 +429,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -482,26 +438,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(rhs), Some(lhs)) => {
-                                    let constant =
-                                        constants.intern(Value::new(ValueKind::BOOLEAN(lhs > rhs)));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::BOOLEAN(lhs > rhs)));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -513,7 +464,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -522,26 +473,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(rhs), Some(lhs)) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::BOOLEAN(lhs >= rhs)));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::BOOLEAN(lhs >= rhs)));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -553,7 +499,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -562,26 +508,21 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-                                    let constant = constants
-                                        .intern(Value::new(ValueKind::INTEGER(lhs.shl(rhs))));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    let constant = code
+                                        .add_constant(Value::new(ValueKind::INTEGER(lhs.shl(rhs))));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -593,7 +534,7 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.get(modified.len() - 1);
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Operation::Push), Some(Operation::Push)) =
+                        if let (Some(Operation::Const), Some(Operation::Const)) =
                             (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
                         {
                             // Here we pop so we can remove the values
@@ -602,28 +543,23 @@ impl CompilationPass for ConstantFolding {
                             // will not result in any type-errors
                             match (
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                                 modified.pop().map(|c| {
-                                    constants
-                                        .lookup(c.get(0).copied().unwrap_or_default())
-                                        .copied()
-                                        .unwrap_or_default()
+                                    code.constant(c.get(0).copied().unwrap_or_default())
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 }),
                             ) {
                                 (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
                                     let constant =
-                                        constants.intern(Value::new(ValueKind::INTEGER(
-                                            lhs.wrapping_shr((rhs).try_into().unwrap_or_default()),
+                                        code.add_constant(Value::new(ValueKind::INTEGER(
+                                            lhs.wrapping_shr((*rhs).try_into().unwrap_or_default()),
                                         )));
-                                    modified.push(IR::new(Operation::Push, Some([constant, 0, 0])));
+                                    modified
+                                        .push(IR::new(Operation::Const, Some([constant, 0, 0])));
                                 }
                                 _ => modified.push(*op),
                             }
@@ -641,20 +577,18 @@ impl CompilationPass for ConstantFolding {
                             modified.get(last).map(|c| c.code()),
                             modified.get(last - 1).map(|c| c.code()),
                         ) {
-                            (Some(Operation::Push), Some(Operation::Push)) => {
+                            (Some(Operation::Const), Some(Operation::Const)) => {
                                 let rhs = modified.get(last).map(|ir| {
                                     ir.get(0)
-                                        .map(|c| code.constant(*c).copied().unwrap_or_default())
-                                        .unwrap_or_default()
+                                        .map(|c| code.constant(*c).unwrap_or(&default_value))
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 });
                                 let lhs = modified.get(last - 1).map(|ir| {
                                     ir.get(0)
-                                        .map(|c| code.constant(*c).copied().unwrap_or_default())
-                                        .unwrap_or_default()
+                                        .map(|c| code.constant(*c).unwrap_or(&default_value))
+                                        .unwrap_or(&default_value)
                                         .kind()
-                                        .clone()
                                 });
 
                                 match (lhs, rhs) {
@@ -667,10 +601,11 @@ impl CompilationPass for ConstantFolding {
                                         modified.pop();
 
                                         modified.push(IR::new(
-                                            Operation::Push,
+                                            Operation::Const,
                                             Some([
-                                                constants
-                                                    .intern(Value::new(ValueKind::RANGE(lhs, rhs))),
+                                                code.add_constant(Value::new(ValueKind::RANGE(
+                                                    *lhs, *rhs,
+                                                ))),
                                                 0,
                                                 0,
                                             ]),
@@ -689,18 +624,10 @@ impl CompilationPass for ConstantFolding {
                 cursor += 1;
             }
 
-            if modified.len() == phase.len() && modified == phase {
+            if code.with_code(modified) {
                 break;
             }
-
-            phase = modified.clone();
         }
-
-        Ok(Program::new(
-            modified,
-            constants,
-            code.strings(),
-            code.symbols(),
-        ))
+        Ok(code)
     }
 }

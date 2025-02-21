@@ -1,13 +1,19 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 use ahash::{HashMap, HashMapExt};
 
 use super::ref_counter::RefCounter;
 
-#[derive(PartialEq, Eq, Hash, Default, Debug, Copy, Clone)]
+#[derive(PartialEq, Eq, Hash, Default, Copy, Clone)]
 pub struct Key {
     slot: usize,
     version: u32,
+}
+
+impl Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({};{})", self.slot, self.version)
+    }
 }
 
 impl Display for Key {

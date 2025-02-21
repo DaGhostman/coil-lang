@@ -1,6 +1,7 @@
-use common::{error::Error, opcodes::Operation, Value, ValueKind};
+use common::{ValueKind, error::Error, opcodes::Operation, types::Type};
 
-use crate::{types::Type, CompilationPass};
+use crate::CompilationPass;
+use common::program::Program;
 
 #[derive(Debug, Default)]
 pub struct TypeChecker {
@@ -8,13 +9,13 @@ pub struct TypeChecker {
 }
 
 impl CompilationPass for TypeChecker {
-    fn compile(
+    fn compile<'pass>(
         &mut self,
-        code: parser::Program<common::opcodes::IR>,
-    ) -> Result<parser::Program<common::opcodes::IR>, Error> {
-        for op in code.code() {
+        program: &'pass mut Program<common::opcodes::IR>,
+    ) -> Result<&'pass mut Program<common::opcodes::IR>, Error> {
+        for op in program.code() {
             match op.code() {
-                Operation::Push => match code
+                Operation::Const => match program
                     .constant(op.get(0).copied().unwrap_or_default())
                     .map(|v| v.kind())
                 {
@@ -23,7 +24,8 @@ impl CompilationPass for TypeChecker {
                     Some(ValueKind::FLOAT(_)) => self.types.push(Type::Float),
                     Some(ValueKind::STRING(_)) => self.types.push(Type::String),
                     Some(ValueKind::NONE) => self.types.push(Type::None),
-                    a => {
+                    Some(ValueKind::FUNCTION(_, _)) => self.types.push(Type::Function),
+                    _ => {
                         return Err(Error::new(
                             common::error::ErrorOrigin::RUNTIME,
                             "Unknown type".to_string(),
@@ -36,6 +38,12 @@ impl CompilationPass for TypeChecker {
                             self.types.push(Type::Integer);
                         }
                         (Some(Type::Float), Some(Type::Float)) => {
+                            self.types.push(Type::Float);
+                        }
+                        (Some(Type::Integer), Some(Type::Float)) => {
+                            self.types.push(Type::Float);
+                        }
+                        (Some(Type::Float), Some(Type::Integer)) => {
                             self.types.push(Type::Float);
                         }
                         (Some(Type::String), Some(Type::String)) => {
@@ -75,6 +83,6 @@ impl CompilationPass for TypeChecker {
             }
         }
 
-        Ok(code)
+        Ok(program)
     }
 }

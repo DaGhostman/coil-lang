@@ -1,6 +1,6 @@
 use std::{
     borrow::{Borrow, BorrowMut},
-    fmt::{Debug, Display},
+    fmt::Debug,
 };
 
 #[derive(Default, PartialEq, Debug, Copy, Clone)]
@@ -39,10 +39,11 @@ pub enum Operation {
     Invoke,
     // ---
     Pop,
-    Push,
+    Const,
     Load,
     Store,
     Duplicate,
+    Argument,
     // ---
     Equal,
     NotEqual,
@@ -129,7 +130,7 @@ impl IR {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Byte {
     /// Terminate the execution of the program (unrecoverable)
@@ -150,44 +151,19 @@ pub enum Byte {
     Jump,
     /// Conditionally jump to relative offset
     Jumpz,
-    /// Sum float values
-    AddFloat,
-    /// Sum integer values
-    AddInteger,
-    /// Concatenate string
-    ConcatString,
-    /// Cast value to integer
-    IntCast,
-    /// Cast value to float
-    FloatCast,
-    /// Cast value to string
-    StringCast,
-    /// Cast value to boolean
-    BoolCast,
+    /// Sum 2 values
+    Add,
     /// Push a value on the stack
     Push,
     /// Pop a value from the stack
     Pop,
-    /// Load a variable
-    Load,
-    /// Store a variable
-    Store,
-    /// Create an array
-    Array,
-
     /// Prints the value from the top of the stack
     Print,
-    /// A range of numbers
-    Range,
-
     /// Call a function
     Call,
-
-    /// Equality Check
-    Equal,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Code {
     byte: Byte,
     operands: Option<Vec<usize>>,
@@ -198,6 +174,13 @@ impl Code {
         Self {
             byte,
             operands: None,
+        }
+    }
+
+    pub fn new_with_operands(byte: Byte, operands: Vec<usize>) -> Self {
+        Self {
+            byte,
+            operands: Some(operands),
         }
     }
 

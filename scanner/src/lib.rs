@@ -141,7 +141,7 @@ impl Scanner {
         while let Some(ch) = self.current() {
             if is_float.is_none() && ch == '.' {
                 match (self.current(), self.peek(1)) {
-                    (Some('.'), Some('0'..'9')) => {
+                    (Some('.'), Some('0'..='9')) => {
                         is_float = Some(true);
                     }
                     _ => {
@@ -441,9 +441,14 @@ impl Scanner {
                 Some('a') => self.keyword_or_identifier(TokenKind::False, "false"),
                 Some('o') => self.keyword_or_identifier(TokenKind::For, "for"),
                 Some('n') => self.keyword_or_identifier(TokenKind::Function, "fn"),
+                Some('l') => self.keyword_or_identifier(TokenKind::Float, "float"),
                 _ => self.identifier(),
             },
-            Some('i') => self.keyword_or_identifier(TokenKind::If, "if"),
+            Some('i') => match self.peek(1) {
+                Some('f') => self.keyword_or_identifier(TokenKind::If, "if"),
+                Some('n') => self.keyword_or_identifier(TokenKind::Int, "int"),
+                _ => self.identifier(),
+            },
             Some('l') => match self.peek(2) {
                 Some('n') => self.keyword_or_identifier(TokenKind::Len, "len"),
                 Some('t') => self.keyword_or_identifier(TokenKind::Let, "let"),
@@ -482,11 +487,7 @@ impl Scanner {
                 self.advance();
                 self.scan()
             }
-            Some(ch) => {
-                eprintln!("invalid token UNKNOWN TOKEN: '{}'", ch);
-
-                self.identifier()
-            }
+            Some(_) => self.identifier(),
             None => self.make_token(TokenKind::EOF, ""),
         }
     }
@@ -494,7 +495,11 @@ impl Scanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::{buffer::Buffer, tokens::TokenKind, Scanner};
+    use crate::{
+        buffer::Buffer,
+        tokens::{Token, TokenKind},
+        Scanner,
+    };
 
     macro_rules! assert_scanned_tokens {
         ($code:expr, $expected:expr, $($token:expr),+) => {
@@ -522,12 +527,13 @@ mod tests {
                         }
                     }
                 }
-                            assert_eq!(
-                                output,
-                                $expected,
-                                "Unable to match expected lexeme to '{}'",
-                                $expected
-                            );
+
+                assert_eq!(
+                    output,
+                    $expected,
+                    "Unable to match expected lexeme to '{}'",
+                    $expected
+                );
             } else {
                 assert!(false, "Unable to build buffer for '{}'", $code);
             }
@@ -552,7 +558,6 @@ mod tests {
         assert_scanned_tokens!("0xff", "0xff", TokenKind::Number);
         assert_scanned_tokens!("0o88", "0o88", TokenKind::Number);
         assert_scanned_tokens!("1.2", "1.2", TokenKind::Double);
-
         assert_scanned_tokens!(
             "1..2",
             "1..2",
@@ -647,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_print_keyword_parsing() {
+    fn test_keyword_parsing() {
         assert_scanned_tokens!("as", "as", TokenKind::As);
         assert_scanned_tokens!("asd", "asd", TokenKind::Identifier);
         assert_scanned_tokens!("bool", "bool", TokenKind::Bool);

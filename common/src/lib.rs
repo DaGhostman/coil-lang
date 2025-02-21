@@ -3,14 +3,21 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
 };
 
-use memory::arena::Key;
+use crate::program::Program;
+
+// use memory::arena::Key;
+use opcodes::Code;
 
 pub mod error;
 pub mod interner;
-pub mod memory;
+pub mod symbols;
+// pub mod memory;
+pub mod memory2;
 pub mod opcodes;
+pub mod program;
+pub mod types;
 
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub enum ValueKind {
     #[default]
     NONE,
@@ -18,7 +25,8 @@ pub enum ValueKind {
     INTEGER(i64),
     FLOAT(f64),
     STRING(usize),
-    ARRAY(Key),
+    FUNCTION(usize, Program<Code>),
+    // ARRAY(Key),
     RANGE(i64, i64),
     FILE(usize),
 }
@@ -30,6 +38,8 @@ impl PartialOrd for ValueKind {
         match (self, other) {
             (ValueKind::INTEGER(lhs), ValueKind::INTEGER(rhs)) => lhs.partial_cmp(rhs),
             (ValueKind::FLOAT(lhs), ValueKind::FLOAT(rhs)) => lhs.partial_cmp(rhs),
+            (ValueKind::INTEGER(lhs), ValueKind::FLOAT(rhs)) => lhs.partial_cmp(&(*rhs as i64)),
+            (ValueKind::FLOAT(lhs), ValueKind::INTEGER(rhs)) => lhs.partial_cmp(&(*rhs as f64)),
             (ValueKind::BOOLEAN(lhs), ValueKind::BOOLEAN(rhs)) => lhs.partial_cmp(rhs),
             (ValueKind::NONE, ValueKind::NONE) => Some(std::cmp::Ordering::Equal),
             _ => None,
@@ -53,17 +63,16 @@ impl Hash for ValueKind {
             }
             ValueKind::FLOAT(value) => {
                 "f".hash(state);
-                (value.trunc() as isize).hash(state);
-                (value.fract() as isize).hash(state);
+                value.to_bits().hash(state);
             }
             ValueKind::STRING(value) => {
                 "s".hash(state);
                 value.hash(state);
             }
-            ValueKind::ARRAY(value) => {
-                "a".hash(state);
-                value.hash(state);
-            }
+            // ValueKind::ARRAY(value) => {
+            //     "a".hash(state);
+            //     value.hash(state);
+            // }
             ValueKind::RANGE(start, end) => {
                 "r".hash(state);
                 start.hash(state);
@@ -73,6 +82,11 @@ impl Hash for ValueKind {
                 "fs".hash(state);
                 fd.hash(state);
             }
+            ValueKind::FUNCTION(arity, _) => {
+                "fn".hash(state);
+                arity.hash(state);
+            }
+            _ => panic!("No support"),
         }
     }
 }
@@ -88,7 +102,8 @@ impl Display for ValueKind {
                 ValueKind::NONE => String::from("void"),
                 ValueKind::BOOLEAN(b) => format!("bool({})", b),
                 ValueKind::STRING(s) => format!("string({})", s),
-                ValueKind::ARRAY(a) => format!("arr({})", a),
+                ValueKind::FUNCTION(arity, _) => format!("fn({})", arity),
+                // ValueKind::ARRAY(a) => format!("arr({})", a),
                 ValueKind::RANGE(start, end) => format!("range({}, {})", start, end),
                 ValueKind::FILE(fd) => format!("file({})", fd),
             }
@@ -96,7 +111,7 @@ impl Display for ValueKind {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Value {
     kind: ValueKind,
     hash: u64,

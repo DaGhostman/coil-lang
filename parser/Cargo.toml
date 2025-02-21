@@ -1,9 +1,10 @@
 [package]
 name = "parser"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 
 common = { path = "../common" }
+rand = "0.9.0"
 scanner = { path = "../scanner" }

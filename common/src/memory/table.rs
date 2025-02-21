@@ -45,12 +45,12 @@ where
     }
 
     pub fn get(&self, key: E) -> Option<&E> {
-        let index = (key.hash() % self.buckets.len());
+        let index = key.hash() % self.buckets.len();
         self.buckets[index].as_ref().map(|(_, v)| v)
     }
 
     pub fn get_mut(&mut self, key: E) -> Option<&mut E> {
-        let index = (key.hash() % self.buckets.len());
+        let index = key.hash() % self.buckets.len();
         self.buckets[index].as_mut().map(|(_, v)| v)
     }
 
@@ -60,7 +60,7 @@ where
 
         for bucket in self.buckets.drain(..) {
             if let Some((k, v)) = bucket {
-                let index = (k.hash() % new_size);
+                let index = k.hash() % new_size;
                 buckets[index] = Some((k, v));
             }
         }

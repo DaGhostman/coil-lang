@@ -77,27 +77,39 @@ fn main() {
             compiler.attach(&mut constant_folder);
         }
 
-        if let Ok(program) = Parser::default().parse(&mut scanner) {
-            dbg!(&program.code());
-            if let Ok(opcodes) = compiler.compile(program) {
-                // let mut bytes = vec![];
-                // for p in opcodes.code().clone() {
-                // bytes.append(&mut p.bits());
-                // println!(
-                //     "{:?} ",
-                //     p.bits()
-                //         .iter()
-                //         .map(|b| b.to_string())
-                //         .collect::<Vec<String>>()
-                //         .join("|")
-                // );
-                // }
-
-                // println!("{:?}", bytes);
-                if let Err(err) = Machine::with_options(options).run(opcodes) {
-                    eprintln!("{}", err);
+        if let Ok(mut program) = Parser::default().parse(&mut scanner) {
+            // dbg!(&program.code());
+            match compiler.compile(&mut program) {
+                Ok(opcodes) => {
+                    if let Err(err) = Machine::with_options(options).run(opcodes) {
+                        eprintln!("{}", err);
+                    }
+                }
+                Err(e) => {
+                    dbg!(e);
                 }
             }
+            // if let Ok(opcodes) = compiler.compile(&mut program) {
+            // let mut bytes = vec![];
+            // for p in opcodes.code() {
+            //     bytes.append(&mut p.bits());
+            //     println!(
+            //         "{:?} ",
+            //         p.bits()
+            //             .iter()
+            //             .map(|b| b.to_string())
+            //             .collect::<Vec<String>>()
+            //             .join("|")
+            //     );
+            // }
+            //
+            // println!("{:?}", bytes);
+            // if let Err(err) = Machine::with_options(options).run(opcodes) {
+            // eprintln!("{}", err);
+            //     }
+            // } else {
+            //     eprintln!("NO CODE?");
+            // }
         }
     } else {
         eprintln!("Missing file");

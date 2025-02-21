@@ -61,7 +61,6 @@ impl Output {
                     dbg!(e);
                 }
             }
-            _ => (),
         }
     }
 

@@ -1,16 +1,19 @@
-use std::{fmt::Debug, str::FromStr};
+use rand::{Rng, distr::Alphanumeric, rng};
+use std::str::FromStr;
 
 pub mod precedence;
 
+use common::types::Type;
 use common::{
-    interner::Interner,
-    opcodes::{Byte, Operation, IR},
     Value, ValueKind,
+    interner::Interner,
+    opcodes::{IR, Operation},
 };
+use common::{program::Program, symbols::SymbolTable};
 use precedence::Precedence;
 use scanner::{
-    tokens::{Token, TokenKind},
     Scanner,
+    tokens::{Token, TokenKind},
 };
 
 pub struct Context<'ctx> {
@@ -46,89 +49,9 @@ impl<'ctx> Context<'ctx> {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct Program<T> {
-    code: Vec<T>,
-    constants: Interner<Value>,
-    strings: Interner<String>,
-    symbols: Interner<String>,
-}
-
-impl<T> Debug for Program<T>
-where
-    T: Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.code.iter().for_each(|code| {
-            let _ = write!(f, "{:?} ", code);
-        });
-
-        write!(f, "")
-    }
-}
-
-impl<T> Program<T>
-where
-    T: Clone,
-{
-    pub fn new(
-        code: Vec<T>,
-        constants: Interner<Value>,
-        strings: Interner<String>,
-        symbols: Interner<String>,
-    ) -> Self {
-        Self {
-            code,
-            constants,
-            strings,
-            symbols,
-        }
-    }
-
-    pub fn push(&mut self, instruction: T) {
-        self.code.push(instruction);
-    }
-
-    pub fn get(&self, index: usize) -> Option<&T> {
-        self.code.get(index)
-    }
-
-    pub fn constant(&self, idx: usize) -> Option<&Value> {
-        self.constants.lookup(idx)
-    }
-
-    pub fn string(&self, idx: usize) -> Option<&String> {
-        self.strings.lookup(idx)
-    }
-
-    pub fn symbol(&self, idx: usize) -> Option<&String> {
-        self.symbols.lookup(idx)
-    }
-
-    pub fn len(&self) -> usize {
-        self.code.len()
-    }
-
-    pub fn code(&self) -> Vec<T> {
-        self.code.clone()
-    }
-
-    pub fn strings(&self) -> Interner<String> {
-        self.strings.clone()
-    }
-
-    pub fn constants(&self) -> Interner<Value> {
-        self.constants.clone()
-    }
-
-    pub fn symbols(&self) -> Interner<String> {
-        self.symbols.clone()
-    }
-}
-
 pub struct Parser {
     constants: Interner<Value>,
-    symbols: Interner<String>,
+    symbols: SymbolTable,
     strings: Interner<String>,
 }
 
@@ -137,22 +60,17 @@ impl Default for Parser {
         let mut constants = Interner::default();
         constants.intern(Value::new(ValueKind::NONE));
 
-        let mut symbols = Interner::default();
-        symbols.intern(String::from("main"));
-
-        let strings = Interner::default();
-
         Self {
             constants,
-            symbols,
-            strings,
+            symbols: SymbolTable::new(),
+            strings: Interner::default(),
         }
     }
 }
 
 impl Parser {
     fn matches(&self, ctx: &Context, token: TokenKind) -> bool {
-        dbg!(ctx.current.kind());
+        // dbg!(ctx.current.kind());
         ctx.current.kind() == token || ctx.current.kind() == TokenKind::EOF
     }
 
@@ -184,7 +102,7 @@ impl Parser {
     fn patch(&self, tokens: &mut [IR], idx: usize) {
         let length = tokens.len();
         if let Some(token) = tokens.get_mut(idx) {
-            dbg!(&length, &idx);
+            // dbg!(&length, &idx);
             *token = match token.code() {
                 Operation::ConditionJump => {
                     IR::new(Operation::ConditionJump, Some([length - idx, 0, 0]))
@@ -220,7 +138,7 @@ impl Parser {
         let constant = self.constants.intern(value);
 
         ctx.advance();
-        vec![IR::new(Operation::Push, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn number(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -258,7 +176,7 @@ impl Parser {
 
         let constant = self.constants.intern(value);
 
-        vec![IR::new(Operation::Push, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn float(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -271,7 +189,7 @@ impl Parser {
         ctx.advance();
         let constant = self.constants.intern(value);
 
-        vec![IR::new(Operation::Push, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn string(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -279,11 +197,13 @@ impl Parser {
         let constant = self.constants.intern(Value::new(ValueKind::STRING(string)));
 
         ctx.advance();
-        vec![IR::new(Operation::Push, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn identifier(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let symbol = self.symbols.intern(ctx.current().lexeme().to_string());
+        let symbol = self
+            .symbols
+            .insert(ctx.current().lexeme().to_string(), None);
         ctx.advance();
 
         if self.consume(ctx, TokenKind::LeftParenthesis) {
@@ -498,7 +418,9 @@ impl Parser {
                 }
             }
             TokenKind::Identifier => {
-                let symbol = self.symbols.intern(ctx.current().lexeme().to_string());
+                let symbol = self
+                    .symbols
+                    .insert(ctx.current().lexeme().to_string(), None);
                 tokens.push(IR::new(Operation::Store, Some([symbol, 0, 0])));
                 // ctx.advance();
                 tokens.append(&mut self.expression(ctx));
@@ -528,7 +450,7 @@ impl Parser {
 
     fn match_expression2(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.expect(ctx, TokenKind::Match, "Expected 'match' keyword'");
-        let mut expr = self.expression(ctx);
+        let expr = self.expression(ctx);
 
         let mut tokens: Vec<IR> = vec![];
 
@@ -647,7 +569,11 @@ impl Parser {
 
                     tokens.push(IR::new(
                         Operation::Invoke,
-                        Some([self.symbols.intern(name.lexeme().to_string()), arity, 0]),
+                        Some([
+                            self.symbols.insert(name.lexeme().to_string(), None),
+                            arity,
+                            0,
+                        ]),
                     ));
                 }
             } // TODO: Implement Increment for properties
@@ -741,21 +667,72 @@ impl Parser {
         tokens
     }
 
-    fn named_function(&mut self, ctx: &mut Context) -> Vec<IR> {
+    fn function(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut tokens = vec![];
-        if self.expect(ctx, TokenKind::Identifier, "Expected function name") {
-            self.expect(
-                ctx,
-                TokenKind::LeftParenthesis,
-                "Missing '(' for argument list",
-            );
 
-            while !self.consume(ctx, TokenKind::RightParenthesis) {
-                // if self.consume(ctx, TokenKind::Identifier)
-                self.consume(ctx, TokenKind::Identifier);
-                self.consume(ctx, TokenKind::Comma);
+        let name: String = if self.expect(ctx, TokenKind::Identifier, "Expected function name") {
+            ctx.current.lexeme().to_string()
+        } else {
+            rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(8)
+                .map(char::from)
+                .collect()
+        };
+
+        let mut body = vec![];
+        self.expect(
+            ctx,
+            TokenKind::LeftParenthesis,
+            "Missing '(' for argument list",
+        );
+
+        let mut arity: usize = 0;
+        while !self.consume(ctx, TokenKind::RightParenthesis) {
+            arity += 1;
+            let type_ = match ctx.current.kind() {
+                TokenKind::Int => Type::Integer,
+                TokenKind::Str => Type::String,
+                TokenKind::Bool => Type::Bool,
+                TokenKind::Float => Type::Float,
+                _ => todo!(
+                    "Unknown type: {}. Investigate support for additional types.",
+                    ctx.current().lexeme()
+                ),
+            };
+            ctx.advance();
+            let argument = ctx.current().clone();
+
+            if self.expect(
+                ctx,
+                TokenKind::Identifier,
+                "Expected function argument identifier",
+            ) {
+                body.insert(
+                    0,
+                    IR::new(
+                        Operation::Argument,
+                        Some([
+                            self.symbols.insert(argument.lexeme().to_string(), None),
+                            type_.into(),
+                            arity,
+                        ]),
+                    ),
+                );
+            }
+
+            if self.consume(ctx, TokenKind::Comma) {
+                break;
             }
         }
+        body.append(&mut self.block(ctx));
+
+        let func = self
+            .constants
+            .intern(Value::new(ValueKind::FUNCTION(arity, Program::new(vec![]))));
+        let symbol = self.symbols.insert(name, Some(func));
+
+        tokens.push(IR::new(Operation::Const, Some([symbol, 0, 0])));
 
         tokens
     }
@@ -785,7 +762,7 @@ impl Parser {
             }
             TokenKind::Function => {
                 ctx.advance();
-                self.named_function(ctx)
+                self.function(ctx)
             }
             _ => self.expr_statement(ctx),
         }
@@ -799,19 +776,18 @@ impl Parser {
             code.append(&mut self.statement(&mut ctx));
         }
 
-        Ok(Program::new(
-            code,
-            self.constants.clone(),
-            self.strings.clone(),
-            self.symbols.clone(),
-        ))
+        let mut program = Program::new(code);
+        program.with_constants(self.constants.dump());
+        program.with_symbols(self.symbols.clone());
+
+        Ok(program)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use common::opcodes::Operation;
-    use scanner::{buffer::Buffer, Scanner};
+    use scanner::{Scanner, buffer::Buffer};
 
     use crate::Parser;
 
@@ -827,6 +803,7 @@ mod tests {
                     for i in diff..program.code().len() {
                         eprintln!("'{}'\t- Assertion is missing '{:?}' in expectation", $code, program.get(i));
                     }
+
                     for (idx, token) in tokens.iter().enumerate() {
                         assert_eq!(
                             program.get(idx).map(|t| t.code()),
@@ -837,7 +814,10 @@ mod tests {
                             (*token),
                         )
                     }
+
                     assert_eq!(tokens.len(), program.len());
+                } else {
+                    assert!(false, "Unable to parse {}", $code);
                 }
             } else {
                 assert!(false, "Unable to build buffer for '{}'", $code);
@@ -845,20 +825,34 @@ mod tests {
         };
     }
 
-    // #[test]
-    // fn test_literals() {
-    //     assert_parsed_expression!("42;", Operation::Push, Operation::Pop);
-    //     assert_parsed_expression!("1.2;", Operation::Push, Operation::Pop);
-    //     assert_parsed_expression!("'Hello, World';", Operation::Push, Operation::Pop);
-    //     assert_parsed_expression!("\"Hello, World\";", Operation::Push, Operation::Pop);
-    // }
+    #[test]
+    fn test_literals() {
+        assert_parsed_expression!("42;", Operation::Const, Operation::Pop);
+        assert_parsed_expression!("1.2;", Operation::Const, Operation::Pop);
+        assert_parsed_expression!("'Hello, World';", Operation::Const, Operation::Pop);
+        assert_parsed_expression!("\"Hello, World\";", Operation::Const, Operation::Pop);
+    }
 
     #[test]
     fn test_simple_expressions() {
         assert_parsed_expression!(
+            "0.1 + 0.2;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Add,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
             "42 + 69;",
-            Operation::Push,
-            Operation::Push,
+            Operation::Const,
+            Operation::Const,
+            Operation::Add,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42.1 + 69.3;",
+            Operation::Const,
+            Operation::Const,
             Operation::Add,
             Operation::Pop
         );

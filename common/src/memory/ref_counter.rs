@@ -52,7 +52,6 @@ where
     pub fn collect(&mut self) -> Vec<K> {
         let mut keys = vec![];
         self.storage
-            .clone()
             .iter()
             .filter(|(_, count)| **count == 0)
             .map(|(key, _)| key)

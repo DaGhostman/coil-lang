@@ -1,7 +1,6 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader, Read, Seek},
-    path::Path,
+    io::{BufReader, Read},
 };
 
 pub struct Buffer {
