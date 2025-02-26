@@ -44,6 +44,7 @@ pub enum Operation {
     Store,
     Duplicate,
     Argument,
+    Function,
     // ---
     Equal,
     NotEqual,
@@ -105,11 +106,11 @@ impl IR {
         }
     }
 
-    pub fn operands(&self) -> &[usize] {
+    pub fn operands(&self) -> &[usize; 3] {
         self.operands.borrow()
     }
 
-    pub fn operands_mut(&mut self) -> &mut [usize] {
+    pub fn operands_mut(&mut self) -> &mut [usize; 3] {
         self.operands.borrow_mut()
     }
 
@@ -135,6 +136,8 @@ impl IR {
 pub enum Byte {
     /// Terminate the execution of the program (unrecoverable)
     Halt,
+    /// Label a position in the bytecode
+    Label,
     /// Suspend the execution of the program (recoverable)
     Pause,
     /// Spawn a new instance of the machine
@@ -157,10 +160,14 @@ pub enum Byte {
     Push,
     /// Pop a value from the stack
     Pop,
+    /// Return item at offset from the stack top
+    Peek,
     /// Prints the value from the top of the stack
     Print,
     /// Call a function
     Call,
+    /// Load a variable
+    Load,
 }
 
 #[derive(Clone, Debug, PartialEq)]

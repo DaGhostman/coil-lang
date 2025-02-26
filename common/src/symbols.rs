@@ -2,7 +2,7 @@ use ahash::HashMap;
 
 use crate::interner::Interner;
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct SymbolTable {
     names: Interner<String>,
     mapping: HashMap<usize, usize>,
@@ -31,5 +31,14 @@ impl SymbolTable {
 
     pub fn name(&self, symbol: usize) -> Option<&String> {
         self.names.lookup(symbol)
+    }
+
+    pub fn dump(&self) -> Vec<(usize, Option<&usize>, String)> {
+        self.names
+            .dump()
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, self.mapping.get(&i), v.clone()))
+            .collect::<Vec<(usize, Option<&usize>, String)>>()
     }
 }

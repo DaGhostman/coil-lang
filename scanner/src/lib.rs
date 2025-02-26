@@ -25,7 +25,7 @@ impl Scanner {
             buffer,
             column: 0,
             line: 0,
-            file: file.unwrap_or(String::new()),
+            file: file.unwrap_or_default(),
 
             in_template: false,
             in_template_expr: false,
@@ -98,13 +98,10 @@ impl Scanner {
 
         let mut token = Token::begin(TokenKind::String, self.line, self.column, "file-name");
         while self.current() != Some(separator) && !self.buffer.is_consumed() {
-            match (self.current(), self.peek(1)) {
-                (Some('\\'), Some(ch)) => {
-                    if ch == separator {
-                        self.advance();
-                    }
+            if let (Some('\\'), Some(ch)) = (self.current(), self.peek(1)) {
+                if ch == separator {
+                    self.advance();
                 }
-                _ => (),
             }
 
             self.advance();
@@ -496,9 +493,9 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use crate::{
+        Scanner,
         buffer::Buffer,
         tokens::{Token, TokenKind},
-        Scanner,
     };
 
     macro_rules! assert_scanned_tokens {

@@ -2,31 +2,20 @@ mod frame;
 pub mod options;
 mod utils;
 
+use std::collections::HashMap;
 use std::io::{stderr, stdout};
 
+use common::Value;
 use common::memory2::Memory;
 use common::program::Program;
-use common::Value;
 use common::{
+    ValueKind,
     error::{Error, ErrorOrigin},
     opcodes::{Byte, Code},
-    ValueKind,
 };
 use frame::Frame;
 use options::MachineOptions;
 use utils::output::Output;
-
-// struct Suspension {
-//     program: Program<Byte>,
-//     memory: Memory,
-// }
-
-// #[derive(PartialEq, Debug)]
-// pub enum ExecutionStatus {
-//     Complete,
-//     Halt,
-//     Pause,
-// }
 
 pub struct Machine {
     stdout: Output,
@@ -37,9 +26,23 @@ pub struct Machine {
 
     ip: usize,
     memory: Memory<Value>,
-    frame: Frame,
+    frame: Option<Frame>,
+
+    labels: HashMap<usize, usize>,
 
     options: MachineOptions,
+}
+
+macro_rules! enter {
+    ($frame:expr, $ip:expr, $arity:expr) => {
+        println!("->");
+    };
+}
+
+macro_rules! leave {
+    ($frame:expr) => {
+        println!("<-");
+    };
 }
 
 impl Default for Machine {
@@ -49,10 +52,11 @@ impl Default for Machine {
             memento: None,
             ip: 0,
             memory: Memory::new(32),
-            frame: Frame::default(),
+            frame: None,
             options: MachineOptions::default(),
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
             stderr: Output::new(&MachineOptions::default(), || Box::new(stderr().lock())),
+            labels: HashMap::default(),
         }
     }
 }
@@ -67,36 +71,56 @@ impl Machine {
         this
     }
 
-    fn call(&mut self, ip: usize, arity: usize) {}
-
-    fn execute(&mut self, code: Program<Code>) -> Result<ValueKind, Error> {
-        self.memory.import_constants(code.get_constants());
-
+    fn execute(&mut self, code: Program<Code>) -> Result<(), Error> {
         while let Some(op) = code.get(self.ip) {
-            // eprintln!("#{:0>8} {:?}\t{:?}", self.ip, op.byte(), self.memory);
+            // eprintln!(
+            //     "#{:0>8} {:?}\t{:?}",
+            //     self.ip,
+            //     op.byte(),
+            //     self.memory.stack_values()
+            // );
             match op.byte() {
-                Byte::Call => {}
+                Byte::Label => {
+                    if let (Some(label), Some(size)) = (op.operand(0), op.operand(1)) {
+                        self.labels.insert(label, self.ip);
+                        self.ip += size;
+                    }
+                }
+                Byte::Call => {
+                    if let Some(func) = self.memory.pop_value().map(|value| value.kind()).cloned() {
+                        if let ValueKind::FUNCTION(arity, label) = func {
+                            self.enter(arity);
+                            if let Some(position) = self.labels.get(&label) {
+                                self.ip = *position;
+                            }
+                        }
+                    } else {
+                        return Err(Error::new(
+                            ErrorOrigin::RUNTIME,
+                            "Unable to invoke function as it does not exists".to_string(),
+                        ));
+                    }
+                }
                 Byte::Halt => {
                     self.halt = true;
                 }
-                Byte::Enter => self.enter(None),
+                Byte::Enter => self.enter(0),
                 Byte::Leave => self.leave(),
                 Byte::Push => {
                     if let Some(constant) = op.operand(0) {
-                        // dbg!(&code.get_constants());
                         if let Err(e) = self.memory.push(constant) {
                             match e {
                                 common::memory2::MemoryError::StackOverflow => {
                                     return Err(Error::new(
                                         ErrorOrigin::RUNTIME,
                                         "Stackoverflow".to_string(),
-                                    ))
+                                    ));
                                 }
                                 common::memory2::MemoryError::StackUnderflow => {
                                     return Err(Error::new(
                                         ErrorOrigin::RUNTIME,
                                         "Stackunderflow".to_string(),
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -109,6 +133,59 @@ impl Machine {
                 }
                 Byte::Pop => {
                     self.memory.pop();
+                }
+                Byte::Peek => {
+                    if let [Some(symbol), Some(offset)] = [op.operand(0), op.operand(1)] {
+                        if let Some(frame) = self.frame.as_mut() {
+                            let size = frame.stack();
+                            frame.store(symbol, size + offset);
+                        } else {
+                            panic!("NO FRAME");
+                        }
+                    }
+                }
+                Byte::Load => {
+                    if let Some(name) = op.operand(0) {
+                        if let Some(frame) = self.frame.as_mut() {
+                            if let Some(position) = frame.lookup(name) {
+                                if let Some(value) = self.memory.peek(position) {
+                                    if let Err(e) = self.memory.push(*value) {
+                                        return Err(Error::new(
+                                            ErrorOrigin::RUNTIME,
+                                            match e {
+                                                common::memory2::MemoryError::StackOverflow => {
+                                                    "Stack overflow".to_string()
+                                                }
+                                                common::memory2::MemoryError::StackUnderflow => {
+                                                    "Stack underflow".to_string()
+                                                }
+                                            },
+                                        ));
+                                    }
+                                } else {
+                                    return Err(Error::new(
+                                        ErrorOrigin::RUNTIME,
+                                        "Unable to locate value on stack".to_string(),
+                                    ));
+                                }
+                            } else {
+                                return Err(Error::new(
+                                    ErrorOrigin::RUNTIME,
+                                    "Undefined variable".to_string(),
+                                ));
+                            }
+                        } else {
+                            return Err(Error::new(
+                                ErrorOrigin::RUNTIME,
+                                "No call frame available".to_string(),
+                            ));
+                        }
+                    } else {
+                        return Err(Error::new(
+                            ErrorOrigin::RUNTIME,
+                            "Missing operand".to_string(),
+                        ));
+                    }
                 }
                 Byte::Add => {
                     let rhs = self.memory.pop_value().map(|v| v.kind()).cloned();
@@ -126,7 +203,8 @@ impl Machine {
                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
                             Value::new(ValueKind::INTEGER(lhs.wrapping_add(rhs)))
                         }
-                        _ => {
+                        a => {
+                            dbg!(&a);
                             return Err(Error::new(
                                 ErrorOrigin::RUNTIME,
                                 String::from("Operands do not match any valid types"),
@@ -177,7 +255,7 @@ impl Machine {
                             }
                         });
 
-                    if op.operand(0).is_some() {
+                    if op.operand(0).is_some() && op.operand(0).unwrap() == 1 {
                         self.stdout.write("\n".to_string());
                     }
                 }
@@ -203,12 +281,9 @@ impl Machine {
             self.ip += 1;
         }
 
-        if self.halt {
-            return Ok(ValueKind::NONE);
-        }
-        if self.memento.is_some() {
-            return Ok(ValueKind::NONE);
-        }
+        // if self.memento.is_some() {
+        //     return Ok(ValueKind::NONE);
+        // }
 
         // let result = if !self.halt && self.memento.is_none() {
         //     if self.memory.len() == 0 {
@@ -219,64 +294,68 @@ impl Machine {
         // } else {
         //     ValueKind::NONE
         // };
-        Ok(self
-            .memory
-            .pop_value()
-            .map(|v| v.kind().clone())
-            .unwrap_or_default())
-    }
 
-    pub fn resume(&mut self) -> Result<ValueKind, Error> {
-        if let Some(program) = self.memento.take() {
-            self.memento = None;
-            self.execute(program)
-        } else {
-            Err(Error::new(
-                ErrorOrigin::RUNTIME,
-                "Attempting to resume a non-suspended program".to_string(),
-            ))
-        }
+        Ok(())
     }
 
     pub fn run(&mut self, code: Program<Code>) -> Result<ValueKind, Error> {
-        self.execute(code)
+        self.memory.import_constants(code.get_constants());
+        self.enter(0);
+        self.execute(code)?;
+
+        Ok(self
+            .memory
+            .pop_value()
+            .map(|v| *v.kind())
+            .unwrap_or_default())
     }
 
-    pub fn enter(&mut self, stack_offset: Option<usize>) {
-        let frame = self.frame.to_owned();
-        self.frame = Frame::new(
-            self.ip,
-            self.memory.stack_size() - stack_offset.unwrap_or(0),
-        );
-        self.frame.with_parent(frame);
+    pub fn enter(&mut self, stack_offset: usize) {
+        // enter!(self.frame, self.ip, stack_offset);
+        let mut f = Frame::new(self.ip, self.memory.stack_size() - stack_offset);
+        if let Some(frame) = self.frame.take() {
+            f.with_parent(frame);
+        }
+
+        self.frame = Some(f);
     }
 
     pub fn leave(&mut self) {
-        let f = self.frame.parent();
-        let val = self.memory.pop();
-
-        self.memory.truncate(self.frame.stack());
-        if let Some(k) = val {
-            if let Err(e) = self.memory.push(k) {
-                eprintln!("ERR: {:?}", e);
+        // leave!(self.frame);
+        if let Some(c) = &self.frame {
+            let val = self.memory.pop();
+            self.memory.truncate(c.stack());
+            if let Some(k) = val {
+                if let Err(e) = self.memory.push(k) {
+                    eprintln!("ERR: {:?}", e);
+                }
             }
-        }
 
-        if !self.frame.is_scoped() {
-            self.ip = self.frame.tell();
+            if !c.is_scoped() {
+                self.ip = c.tell();
+            }
+
+            if let Some(f) = c.parent() {
+                self.frame = Some(f.clone());
+            } else {
+                self.frame = None;
+                self.halt = true;
+            }
+        } else {
+            self.frame = None;
+            self.halt = true;
         }
-        self.frame = f.cloned().unwrap_or_default();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use common::program::Program;
     use common::{
+        Value, ValueKind,
         interner::Interner,
         opcodes::{Byte, Code},
-        Value, ValueKind,
     };
-    use parser::program::Program;
 
     use crate::Machine;
 

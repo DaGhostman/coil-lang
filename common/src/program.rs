@@ -74,8 +74,20 @@ where
         self.strings.lookup(idx)
     }
 
-    pub fn symbol(&self, idx: usize) -> Option<&String> {
+    pub fn symbol_name(&self, idx: usize) -> Option<&String> {
         self.symbols.name(idx)
+    }
+
+    pub fn symbol_constant(&self, idx: usize) -> Option<&usize> {
+        self.symbols.constant(idx)
+    }
+
+    pub fn symbols(&self) -> SymbolTable {
+        self.symbols.clone()
+    }
+
+    pub fn symbol(&mut self, symbol: String, constant: Option<usize>) -> usize {
+        self.symbols.insert(symbol, constant)
     }
 
     pub fn len(&self) -> usize {

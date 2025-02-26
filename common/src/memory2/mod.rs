@@ -21,7 +21,7 @@ where
 
 impl<V> Debug for Memory<V>
 where
-    V: Eq + Hash + Clone,
+    V: Eq + Hash + Clone + Default,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.stack)
@@ -30,7 +30,7 @@ where
 
 impl<'memory, V> Memory<V>
 where
-    V: Eq + Hash + Clone + Debug,
+    V: Eq + Hash + Clone + Debug + Default,
 {
     pub fn new(stack_size: usize) -> Self {
         Memory {
@@ -83,6 +83,18 @@ where
         }
     }
 
+    pub fn peek(&self, idx: usize) -> Option<&usize> {
+        self.stack.get(idx)
+    }
+
+    pub fn peek_value(&self, idx: usize) -> Option<&V> {
+        if let Some(constant) = self.peek(idx) {
+            self.constants.lookup(*constant)
+        } else {
+            None
+        }
+    }
+
     // pub fn lookup(&'memory self, key: Key) -> Option<&'memory V> {
     //     self.heap.get(key)
     // }
@@ -97,6 +109,13 @@ where
 
     pub fn truncate(&mut self, length: usize) {
         self.stack.truncate(length);
+    }
+
+    pub fn stack_values(&self) -> Vec<V> {
+        self.stack
+            .iter()
+            .map(|c| self.constants.lookup(*c).cloned().unwrap_or_default())
+            .collect::<Vec<V>>()
     }
 }
 

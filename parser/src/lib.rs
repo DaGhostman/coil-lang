@@ -1,15 +1,16 @@
+use common::symbols::SymbolTable;
 use rand::{Rng, distr::Alphanumeric, rng};
 use std::str::FromStr;
 
 pub mod precedence;
 
+use common::program::Program;
 use common::types::Type;
 use common::{
     Value, ValueKind,
     interner::Interner,
     opcodes::{IR, Operation},
 };
-use common::{program::Program, symbols::SymbolTable};
 use precedence::Precedence;
 use scanner::{
     Scanner,
@@ -19,29 +20,32 @@ use scanner::{
 pub struct Context<'ctx> {
     scanner: &'ctx mut Scanner,
     current: Token,
+    previous: Option<Token>,
 }
 
 impl<'ctx> Context<'ctx> {
     pub fn new(scanner: &'ctx mut Scanner) -> Self {
-        let current = if let Ok(token) = scanner.scan() {
-            token
-        } else {
-            Token::default()
-        };
+        let current = scanner.scan().unwrap_or_default();
 
-        Self { scanner, current }
+        Self {
+            scanner,
+            current,
+            previous: None,
+        }
     }
 
     pub fn current(&self) -> &Token {
         &self.current
     }
 
+    pub fn previous(&self) -> Option<Token> {
+        self.previous.clone()
+    }
+
     pub fn advance(&mut self) {
-        self.current = if let Ok(token) = self.scanner.scan() {
-            token
-        } else {
-            Token::default()
-        };
+        self.previous = Some(self.current.clone());
+
+        self.current = self.scanner.scan().unwrap_or_default();
     }
 
     pub fn tell(&self) -> usize {
@@ -70,7 +74,6 @@ impl Default for Parser {
 
 impl Parser {
     fn matches(&self, ctx: &Context, token: TokenKind) -> bool {
-        // dbg!(ctx.current.kind());
         ctx.current.kind() == token || ctx.current.kind() == TokenKind::EOF
     }
 
@@ -165,7 +168,7 @@ impl Parser {
                 }
             }
             _ => {
-                if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 10) {
+                if let Ok(int) = ctx.current().lexeme().parse::<i64>() {
                     Value::new(ValueKind::INTEGER(int))
                 } else {
                     todo!("Fail to parse '{}' as decimal", ctx.current().lexeme());
@@ -206,8 +209,8 @@ impl Parser {
             .insert(ctx.current().lexeme().to_string(), None);
         ctx.advance();
 
+        let mut tokens = vec![];
         if self.consume(ctx, TokenKind::LeftParenthesis) {
-            let mut tokens = vec![];
             let mut arity = 0;
             while !self.consume(ctx, TokenKind::RightParenthesis) {
                 tokens.append(&mut self.expression(ctx));
@@ -216,11 +219,12 @@ impl Parser {
             }
 
             tokens.push(IR::new(Operation::Call, Some([symbol, arity, 0])));
-
-            return tokens;
+        } else {
+            // tokens.append(&mut self.expression(ctx));
+            tokens.push(IR::new(Operation::Load, Some([symbol, 0, 0])));
         } // TODO: handle other tokens on identifiers, like increment, decrement, etc.
 
-        vec![IR::new(Operation::Load, Some([symbol, 0, 0]))]
+        tokens
     }
 
     fn array(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -514,6 +518,8 @@ impl Parser {
     }
 
     fn if_expression(&mut self, ctx: &mut Context) -> Vec<IR> {
+        self.consume(ctx, TokenKind::If);
+
         let mut condition = self.expression(ctx);
         let mut body = if self.matches(ctx, TokenKind::LeftBracket) {
             self.block(ctx)
@@ -527,16 +533,18 @@ impl Parser {
         }
 
         let mut tokens = vec![];
+        let condition_len = condition.len();
+        let body_len = body.len();
         tokens.append(&mut condition);
         tokens.append(&mut body);
-        tokens.append(&mut alternative);
         tokens.insert(
             0,
             IR::new(
                 Operation::Condition,
-                Some([condition.len(), body.len(), alternative.len()]),
+                Some([condition_len, body_len, alternative.len()]),
             ),
         );
+        tokens.append(&mut alternative);
 
         tokens
     }
@@ -544,7 +552,11 @@ impl Parser {
     fn else_expression(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.consume(ctx, TokenKind::Else);
 
-        vec![]
+        if self.matches(ctx, TokenKind::LeftBracket) {
+            self.block(ctx)
+        } else {
+            self.expression(ctx)
+        }
     }
 
     fn call(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -554,28 +566,24 @@ impl Parser {
         let mut arity = 0;
 
         if self.expect(ctx, TokenKind::Identifier, "Expected function name") {
-            if self.matches(ctx, TokenKind::LeftParenthesis) {
-                if self.expect(
-                    ctx,
-                    TokenKind::LeftParenthesis,
-                    "Expected '(' as part of the method call",
-                ) {
-                    while !self.consume(ctx, TokenKind::RightParenthesis) {
-                        arity += 1;
-                        tokens.append(&mut self.expression(ctx));
+            if self.consume(ctx, TokenKind::LeftParenthesis) {
+                while !self.consume(ctx, TokenKind::RightParenthesis) {
+                    arity += 1;
+                    tokens.append(&mut self.expression(ctx));
 
-                        self.consume(ctx, TokenKind::Comma);
-                    }
-
-                    tokens.push(IR::new(
-                        Operation::Invoke,
-                        Some([
-                            self.symbols.insert(name.lexeme().to_string(), None),
-                            arity,
-                            0,
-                        ]),
-                    ));
+                    self.consume(ctx, TokenKind::Comma);
                 }
+
+                tokens.push(IR::new(
+                    Operation::Invoke,
+                    Some([
+                        self.symbols.insert(name.lexeme().to_string(), None),
+                        arity,
+                        0,
+                    ]),
+                ));
+            } else {
+                todo!("Handle remainder of cases");
             } // TODO: Implement Increment for properties
         }
 
@@ -653,15 +661,15 @@ impl Parser {
     }
 
     fn block(&mut self, ctx: &mut Context) -> Vec<IR> {
-        self.expect(
+        let mut tokens = vec![];
+        if self.expect(
             ctx,
             TokenKind::LeftBracket,
             "Expecting '{' at the start of a block",
-        );
-
-        let mut tokens = vec![];
-        while !self.consume(ctx, TokenKind::RightBracket) {
-            tokens.append(&mut self.statement(ctx));
+        ) {
+            while !self.consume(ctx, TokenKind::RightBracket) {
+                tokens.append(&mut self.statement(ctx));
+            }
         }
 
         tokens
@@ -671,7 +679,7 @@ impl Parser {
         let mut tokens = vec![];
 
         let name: String = if self.expect(ctx, TokenKind::Identifier, "Expected function name") {
-            ctx.current.lexeme().to_string()
+            ctx.previous().unwrap_or_default().lexeme().to_string()
         } else {
             rand::rng()
                 .sample_iter(&Alphanumeric)
@@ -689,7 +697,6 @@ impl Parser {
 
         let mut arity: usize = 0;
         while !self.consume(ctx, TokenKind::RightParenthesis) {
-            arity += 1;
             let type_ = match ctx.current.kind() {
                 TokenKind::Int => Type::Integer,
                 TokenKind::Str => Type::String,
@@ -720,19 +727,25 @@ impl Parser {
                     ),
                 );
             }
+            arity += 1;
 
-            if self.consume(ctx, TokenKind::Comma) {
+            if !self.consume(ctx, TokenKind::Comma) {
                 break;
             }
         }
+        self.expect(
+            ctx,
+            TokenKind::RightParenthesis,
+            "Expected ')' to close off argument list.",
+        );
         body.append(&mut self.block(ctx));
 
-        let func = self
-            .constants
-            .intern(Value::new(ValueKind::FUNCTION(arity, Program::new(vec![]))));
-        let symbol = self.symbols.insert(name, Some(func));
-
-        tokens.push(IR::new(Operation::Const, Some([symbol, 0, 0])));
+        let symbol = self.symbols.insert(name, None);
+        tokens.push(IR::new(
+            Operation::Function,
+            Some([symbol, arity, body.len()]),
+        ));
+        tokens.append(&mut body);
 
         tokens
     }
@@ -763,6 +776,10 @@ impl Parser {
             TokenKind::Function => {
                 ctx.advance();
                 self.function(ctx)
+            }
+            TokenKind::If => {
+                ctx.advance();
+                self.if_expression(ctx)
             }
             _ => self.expr_statement(ctx),
         }

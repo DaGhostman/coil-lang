@@ -2,7 +2,7 @@ use std::hash::Hash;
 
 use ahash::{HashMap, HashMapExt};
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Interner<V>
 where
     V: Hash + Clone + Eq,
@@ -53,11 +53,15 @@ impl<V: Hash + Clone + Eq> Interner<V> {
     }
 
     pub fn lookup(&self, key: usize) -> Option<&V> {
-        self.storage.get(key as usize)
+        self.storage.get(key)
     }
 
     pub fn len(&self) -> usize {
         self.uniq.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.uniq.is_empty()
     }
 
     pub fn dump(&self) -> Vec<V> {

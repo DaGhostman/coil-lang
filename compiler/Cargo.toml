@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 parser = { path = "../parser" }
+rand = "0.9.0"
 

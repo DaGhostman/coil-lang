@@ -10,9 +10,9 @@ pub enum ErrorOrigin {
     CUSTOM,
 }
 
-impl Into<&str> for ErrorOrigin {
-    fn into(self) -> &'static str {
-        match self {
+impl From<ErrorOrigin> for &str {
+    fn from(value: ErrorOrigin) -> &'static str {
+        match value {
             ErrorOrigin::SCAN => "SCANNER",
             ErrorOrigin::PARSE => "PARSER",
             ErrorOrigin::LEX => "LEXER",

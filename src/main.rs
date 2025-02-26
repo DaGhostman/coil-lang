@@ -2,12 +2,12 @@ use std::{fs::File, io::Read, path::Path};
 
 use clap::{ArgAction, Parser as Clap, ValueHint};
 use compiler::{
-    passes::{constant_folding::ConstantFolding, typechecker::TypeChecker},
     Compiler,
+    passes::{constant_folding::ConstantFolding, typechecker::TypeChecker},
 };
-use machine::{options::MachineOptions, Machine};
+use machine::{Machine, options::MachineOptions};
 use parser::Parser;
-use scanner::{buffer::Buffer, Scanner};
+use scanner::{Scanner, buffer::Buffer};
 
 #[derive(Clap)]
 struct Options {
@@ -60,11 +60,6 @@ fn main() {
     options.set_quiet(args.quiet);
 
     if let Ok(buffer) = Buffer::new(&args.file) {
-        // if let Ok(buffer) = Buffer::try_from("match true { Some(Some(val)) => { print 'Some'; } };") {
-        // if let Ok(buffer) = Buffer::try_from("print 1 + 2 + 3 + 4 + 5;") {
-        // if let Ok(buffer) = Buffer::try_from("print 1..10;") {
-        // if let Ok(buffer) = Buffer::try_from("print foo.say('hello').bar();") {
-        // if let Ok(buffer) = Buffer::try_from("print [5, 4, 3, 2, 1];") {
         let mut scanner = Scanner::new(buffer, Some(args.file));
         let mut compiler = Compiler::default();
 
@@ -77,9 +72,8 @@ fn main() {
             compiler.attach(&mut constant_folder);
         }
 
-        if let Ok(mut program) = Parser::default().parse(&mut scanner) {
-            // dbg!(&program.code());
-            match compiler.compile(&mut program) {
+        if let Ok(program) = Parser::default().parse(&mut scanner) {
+            match compiler.compile(program) {
                 Ok(opcodes) => {
                     if let Err(err) = Machine::with_options(options).run(opcodes) {
                         eprintln!("{}", err);

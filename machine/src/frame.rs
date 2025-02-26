@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct Frame {
     ip: usize,
     stack: usize,
@@ -9,20 +9,6 @@ pub struct Frame {
     // ----
     variables: HashMap<usize, usize>,
     upvalues: HashSet<usize>,
-}
-
-impl Default for Frame {
-    fn default() -> Self {
-        Frame {
-            ip: 0,
-            stack: 0,
-            parent: None,
-            scoped: false,
-
-            variables: HashMap::default(),
-            upvalues: HashSet::default(),
-        }
-    }
 }
 
 impl Frame {

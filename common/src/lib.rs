@@ -1,5 +1,5 @@
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display},
     hash::{DefaultHasher, Hash, Hasher},
 };
 
@@ -17,7 +17,7 @@ pub mod opcodes;
 pub mod program;
 pub mod types;
 
-#[derive(Default, Debug, Clone, PartialEq)]
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
 pub enum ValueKind {
     #[default]
     NONE,
@@ -25,7 +25,7 @@ pub enum ValueKind {
     INTEGER(i64),
     FLOAT(f64),
     STRING(usize),
-    FUNCTION(usize, Program<Code>),
+    FUNCTION(usize, usize),
     // ARRAY(Key),
     RANGE(i64, i64),
     FILE(usize),
@@ -111,7 +111,7 @@ impl Display for ValueKind {
     }
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub struct Value {
     kind: ValueKind,
     hash: u64,
@@ -145,6 +145,12 @@ impl Hash for Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
+    }
+}
+
+impl Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)
     }
 }
 

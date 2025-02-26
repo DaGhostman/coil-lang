@@ -78,7 +78,7 @@ impl Precedence {
     }
 
     pub fn next(&self) -> Precedence {
-        ((*self as u8) + 1 as u8).into()
+        ((*self as u8) + 1_u8).into()
     }
 }
 
