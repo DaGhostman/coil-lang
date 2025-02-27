@@ -1,13 +1,7 @@
-use std::ops::{Add, Rem, Shl, Sub};
-
 use common::interner::Interner;
 use common::opcodes::{Byte, Code};
-use common::program::Program;
 use common::symbols::SymbolTable;
-use common::{
-    Value, ValueKind,
-    opcodes::{IR, Operation},
-};
+use common::{Value, ValueKind};
 
 use crate::CompilationPass;
 
@@ -17,7 +11,7 @@ pub struct ConstantFolding {}
 impl CompilationPass for ConstantFolding {
     fn compile<'pass>(
         &mut self,
-        code: &'pass Vec<Code>,
+        code: &'pass [Code],
         constants: &mut Interner<Value>,
         symbols: &mut SymbolTable,
     ) -> Result<Vec<Code>, common::error::Error> {
@@ -41,7 +35,7 @@ impl CompilationPass for ConstantFolding {
                             ) {
                                 modified.push(Code::new_with_operands(
                                     Byte::Label,
-                                    vec![op.operand(0).unwrap(), chunk.len()],
+                                    vec![op.operand(0).copied().unwrap(), chunk.len()],
                                 ));
                                 modified.append(&mut chunk);
                             }
@@ -58,13 +52,13 @@ impl CompilationPass for ConstantFolding {
                             match (
                                 lhs.map(|c| {
                                     constants
-                                        .lookup(c.operand(0).unwrap_or_default())
+                                        .lookup(c.operand(0).copied().unwrap_or_default())
                                         .unwrap_or(&default_value)
                                         .kind()
                                 }),
                                 rhs.map(|c| {
                                     constants
-                                        .lookup(c.operand(0).unwrap_or_default())
+                                        .lookup(c.operand(0).copied().unwrap_or_default())
                                         .unwrap_or(&default_value)
                                         .kind()
                                 }),
@@ -97,7 +91,7 @@ impl CompilationPass for ConstantFolding {
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, vec![c]));
                                 }
-                                (a, b) => {
+                                _ => {
                                     // dbg!("NONO", &a, &b);
                                     modified.push(op.to_owned());
                                 }

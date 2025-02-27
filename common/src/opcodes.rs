@@ -156,6 +156,10 @@ pub enum Byte {
     Jumpz,
     /// Sum 2 values
     Add,
+    /// Subtract,
+    Subtract,
+    /// Less than
+    Less,
     /// Push a value on the stack
     Push,
     /// Pop a value from the stack
@@ -173,49 +177,38 @@ pub enum Byte {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Code {
     byte: Byte,
-    operands: Option<Vec<usize>>,
+    operands: Vec<usize>,
 }
 
 impl Code {
     pub fn new(byte: Byte) -> Self {
         Self {
             byte,
-            operands: None,
+            operands: Vec::default(),
         }
     }
 
     pub fn new_with_operands(byte: Byte, operands: Vec<usize>) -> Self {
-        Self {
-            byte,
-            operands: Some(operands),
-        }
+        Self { byte, operands }
     }
 
     pub fn with_operands(&mut self, operands: Vec<usize>) {
-        self.operands = Some(operands);
+        self.operands = operands;
     }
 
-    pub fn byte(&self) -> Byte {
-        self.byte
+    pub fn byte(&self) -> &Byte {
+        &self.byte
     }
 
-    pub fn operand(&self, idx: usize) -> Option<usize> {
-        if let Some(operand) = self.operands.clone() {
-            operand.get(idx).copied()
-        } else {
-            None
-        }
+    pub fn operand(&self, idx: usize) -> Option<&usize> {
+        self.operands.get(idx)
     }
 
     pub fn bits(&self) -> Vec<u8> {
-        let mut bytes = (self.byte() as u8).to_le_bytes().to_vec();
-        if let Some(operands) = &self.operands {
-            bytes.push(operands.len() as u8);
-            for op in operands {
-                bytes.append(&mut op.to_le_bytes().to_vec());
-            }
-        } else {
-            bytes.push(0u8);
+        let mut bytes = (*self.byte() as u8).to_le_bytes().to_vec();
+        bytes.push(self.operands.len() as u8);
+        for op in &self.operands {
+            bytes.append(&mut op.to_le_bytes().to_vec());
         }
 
         bytes

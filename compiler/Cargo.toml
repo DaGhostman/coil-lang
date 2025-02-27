@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ahash = "0.8.11"
 common = { path = "../common" }
 parser = { path = "../parser" }
 rand = "0.9.0"

@@ -1,22 +1,20 @@
-use std::collections::HashMap;
-
 use common::{ValueKind, error::Error, opcodes::Operation, types::Type};
 
 use crate::CompilationPass;
-use common::program::Program;
 
 #[derive(Debug, Default)]
 pub struct TypeChecker {
-    types: Vec<Type>,
+    _types: Vec<Type>,
 }
 
 impl CompilationPass for TypeChecker {
     fn compile<'compilation>(
         &mut self,
-        code: &Vec<common::opcodes::Code>,
-        constants: &mut common::interner::Interner<common::Value>,
-        symbols: &mut common::symbols::SymbolTable,
+        code: &'compilation [common::opcodes::Code],
+        _constants: &mut common::interner::Interner<common::Value>,
+        _symbols: &mut common::symbols::SymbolTable,
     ) -> Result<Vec<common::opcodes::Code>, Error> {
+        Ok(code.to_owned())
         // let mut variables: HashMap<usize, Type> = HashMap::new();
         //
         // for op in program.code() {
@@ -106,7 +104,5 @@ impl CompilationPass for TypeChecker {
         //         _ => (),
         //     }
         // }
-
-        Ok(code.to_owned())
     }
 }

@@ -1,7 +1,9 @@
 use std::{
     fmt::{Debug, Display},
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
 };
+
+use ahash::AHasher as DefaultHasher;
 
 use crate::program::Program;
 
@@ -12,6 +14,7 @@ pub mod error;
 pub mod interner;
 pub mod symbols;
 // pub mod memory;
+pub mod hasher;
 pub mod memory2;
 pub mod opcodes;
 pub mod program;
@@ -102,7 +105,7 @@ impl Display for ValueKind {
                 ValueKind::NONE => String::from("void"),
                 ValueKind::BOOLEAN(b) => format!("bool({})", b),
                 ValueKind::STRING(s) => format!("string({})", s),
-                ValueKind::FUNCTION(arity, _) => format!("fn({})", arity),
+                ValueKind::FUNCTION(_, symbol) => format!("fn({})", symbol),
                 // ValueKind::ARRAY(a) => format!("arr({})", a),
                 ValueKind::RANGE(start, end) => format!("range({}, {})", start, end),
                 ValueKind::FILE(fd) => format!("file({})", fd),
@@ -111,40 +114,38 @@ impl Display for ValueKind {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Value {
     kind: ValueKind,
-    hash: u64,
+    // hash: u64,
 }
 
 impl Value {
     pub fn new(kind: ValueKind) -> Self {
-        let mut hasher = DefaultHasher::default();
-        kind.hash(&mut hasher);
+        // let mut hasher = DefaultHasher::default();
+        // kind.hash(&mut hasher);
         Self {
             kind,
-            hash: hasher.finish(),
+            // hash: hasher.finish(),
         }
     }
 
     pub fn kind(&self) -> &ValueKind {
         &self.kind
     }
-
-    pub fn hash(&self) -> &u64 {
-        &self.hash
-    }
 }
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.kind.hash(state);
+        self.kind.hash(state)
+        // state.write_u64(self.hash);
     }
 }
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.kind == other.kind
+        // self.hash == other.hash
     }
 }
 

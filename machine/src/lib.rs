@@ -2,7 +2,7 @@ mod frame;
 pub mod options;
 mod utils;
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::io::{stderr, stdout};
 
 use common::Value;
@@ -22,37 +22,21 @@ pub struct Machine {
     stderr: Output,
     halt: bool,
 
-    memento: Option<Program<Code>>,
-
     ip: usize,
     memory: Memory<Value>,
-    frame: Option<Frame>,
+    frame: Vec<Frame>,
 
     labels: HashMap<usize, usize>,
 
     options: MachineOptions,
 }
-
-macro_rules! enter {
-    ($frame:expr, $ip:expr, $arity:expr) => {
-        println!("->");
-    };
-}
-
-macro_rules! leave {
-    ($frame:expr) => {
-        println!("<-");
-    };
-}
-
 impl Default for Machine {
     fn default() -> Self {
         Self {
             halt: false,
-            memento: None,
             ip: 0,
-            memory: Memory::new(32),
-            frame: None,
+            memory: Memory::new(),
+            frame: Vec::with_capacity(32),
             options: MachineOptions::default(),
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
             stderr: Output::new(&MachineOptions::default(), || Box::new(stderr().lock())),
@@ -72,6 +56,7 @@ impl Machine {
     }
 
     fn execute(&mut self, code: Program<Code>) -> Result<(), Error> {
+        self.ip = 0;
         while let Some(op) = code.get(self.ip) {
             // eprintln!(
             //     "#{:0>8} {:?}\t{:?}",
@@ -82,12 +67,12 @@ impl Machine {
             match op.byte() {
                 Byte::Label => {
                     if let (Some(label), Some(size)) = (op.operand(0), op.operand(1)) {
-                        self.labels.insert(label, self.ip);
+                        self.labels.insert(*label, self.ip);
                         self.ip += size;
                     }
                 }
                 Byte::Call => {
-                    if let Some(func) = self.memory.pop_value().map(|value| value.kind()).cloned() {
+                    if let Some(func) = self.memory.pop_value().map(|value| value.kind()).copied() {
                         if let ValueKind::FUNCTION(arity, label) = func {
                             self.enter(arity);
                             if let Some(position) = self.labels.get(&label) {
@@ -108,7 +93,7 @@ impl Machine {
                 Byte::Leave => self.leave(),
                 Byte::Push => {
                     if let Some(constant) = op.operand(0) {
-                        if let Err(e) = self.memory.push(constant) {
+                        if let Err(e) = self.memory.push(*constant) {
                             match e {
                                 common::memory2::MemoryError::StackOverflow => {
                                     return Err(Error::new(
@@ -136,7 +121,7 @@ impl Machine {
                 }
                 Byte::Peek => {
                     if let [Some(symbol), Some(offset)] = [op.operand(0), op.operand(1)] {
-                        if let Some(frame) = self.frame.as_mut() {
+                        if let Some(frame) = self.frame.last_mut() {
                             let size = frame.stack();
                             frame.store(symbol, size + offset);
                         } else {
@@ -146,26 +131,20 @@ impl Machine {
                 }
                 Byte::Load => {
                     if let Some(name) = op.operand(0) {
-                        if let Some(frame) = self.frame.as_mut() {
+                        if let Some(frame) = self.frame.last_mut() {
                             if let Some(position) = frame.lookup(name) {
-                                if let Some(value) = self.memory.peek(position) {
-                                    if let Err(e) = self.memory.push(*value) {
-                                        return Err(Error::new(
-                                            ErrorOrigin::RUNTIME,
-                                            match e {
-                                                common::memory2::MemoryError::StackOverflow => {
-                                                    "Stack overflow".to_string()
-                                                }
-                                                common::memory2::MemoryError::StackUnderflow => {
-                                                    "Stack underflow".to_string()
-                                                }
-                                            },
-                                        ));
-                                    }
-                                } else {
+                                let value = self.memory.peek(*position);
+                                if let Err(e) = self.memory.push(*value) {
                                     return Err(Error::new(
                                         ErrorOrigin::RUNTIME,
-                                        "Unable to locate value on stack".to_string(),
+                                        match e {
+                                            common::memory2::MemoryError::StackOverflow => {
+                                                "Stack overflow".to_string()
+                                            }
+                                            common::memory2::MemoryError::StackUnderflow => {
+                                                "Stack underflow".to_string()
+                                            }
+                                        },
                                     ));
                                 }
                             } else {
@@ -187,9 +166,26 @@ impl Machine {
                         ));
                     }
                 }
+                Byte::Less => {
+                    let rhs = self.memory.pop_value().map(|v| *v.kind());
+                    let lhs = self.memory.pop_value().map(|v| *v.kind());
+
+                    let result = match (lhs, rhs) {
+                        (Some(ValueKind::INTEGER(l)), Some(ValueKind::INTEGER(r))) => {
+                            ValueKind::BOOLEAN(l < r)
+                        }
+                        (a, b) => {
+                            dbg!(a, b);
+                            panic!("Unsupported values");
+                        }
+                    };
+
+                    let constant = self.memory.define(Value::new(result));
+                    let _ = self.memory.push(constant);
+                }
                 Byte::Add => {
-                    let rhs = self.memory.pop_value().map(|v| v.kind()).cloned();
-                    let lhs = self.memory.pop_value().map(|v| v.kind()).cloned();
+                    let lhs = self.memory.pop_value().map(|v| *v.kind());
+                    let rhs = self.memory.pop_value().map(|v| *v.kind());
                     let result = self.memory.define(match (lhs, rhs) {
                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
                             Value::new(ValueKind::FLOAT(lhs + rhs))
@@ -214,6 +210,33 @@ impl Machine {
 
                     let _ = self.memory.push(result);
                 }
+                Byte::Subtract => {
+                    let lhs = self.memory.pop_value().map(|v| *v.kind());
+                    let rhs = self.memory.pop_value().map(|v| *v.kind());
+                    let result = self.memory.define(match (lhs, rhs) {
+                        (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
+                            Value::new(ValueKind::FLOAT(lhs - rhs))
+                        }
+                        (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::FLOAT(lhs))) => {
+                            Value::new(ValueKind::FLOAT(lhs - rhs as f64))
+                        }
+                        (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::INTEGER(lhs))) => {
+                            Value::new(ValueKind::FLOAT(lhs as f64 - rhs))
+                        }
+                        (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
+                            Value::new(ValueKind::INTEGER(lhs.wrapping_sub(rhs)))
+                        }
+                        a => {
+                            dbg!(&a);
+                            return Err(Error::new(
+                                ErrorOrigin::RUNTIME,
+                                String::from("Operands do not match any valid types"),
+                            ));
+                        }
+                    });
+
+                    let _ = self.memory.push(result);
+                }
                 Byte::Print => {
                     self.stdout
                         .write(match self.memory.pop_value().map(|v| v.kind()) {
@@ -221,6 +244,8 @@ impl Machine {
                             Some(ValueKind::BOOLEAN(bit)) => format!("{}", bit),
                             Some(ValueKind::INTEGER(num)) => format!("{}", num),
                             Some(ValueKind::FLOAT(num)) => format!("{:.?}", num),
+                            Some(ValueKind::FUNCTION(_, symbol)) => format!("fn({})", symbol),
+                            // Some(ValueKind::STRING(v)) => format!("str({})", v),
                             // Some(Some(ValueKind::STRING(num))) => {
                             //     if let Some(str) = code.string(num) {
                             //         format!("{}", str)
@@ -250,17 +275,55 @@ impl Machine {
                             //     }
                             // }
                             a => {
-                                dbg!(a);
+                                // dbg!(a);
                                 String::new()
                             }
                         });
 
-                    if op.operand(0).is_some() && op.operand(0).unwrap() == 1 {
+                    if op.operand(0).is_some() && op.operand(0).unwrap() == &1 {
                         self.stdout.write("\n".to_string());
                     }
                 }
+                Byte::Jump => {
+                    if let Some(label) = op.operand(0) {
+                        if let Some(position) = self.labels.get(&label) {
+                            self.ip = *position;
+                        }
+                    }
+                }
+                Byte::Jumpz => {
+                    let value = self.memory.pop_value().map(|ev| ev.kind());
+                    if !matches!(value, Some(ValueKind::BOOLEAN(_))) {
+                        eprintln!("Condition does not evaluate to boolean, using fallback checks");
+                    }
 
-                _ => (),
+                    let state = match value {
+                        Some(ValueKind::NONE) => false,
+                        Some(ValueKind::BOOLEAN(byte)) => *byte,
+                        Some(ValueKind::FLOAT(value)) => *value != 0.0,
+                        Some(ValueKind::INTEGER(value)) => *value != 0,
+                        _ => panic!("Unable to evaluate"),
+                    };
+
+                    let (then, branch) = (
+                        op.operand(0).expect("Missing jump label"),
+                        op.operand(1).expect("Missing alternate label"),
+                    );
+
+                    if let Some(v) = self.labels.get(if state { then } else { branch }) {
+                        self.ip = *v;
+                    } else {
+                        panic!("Unknown label");
+                    }
+                }
+                // Byte::Scope => {
+                //     if let Some(current) = self.frame.last() {
+                //         self.frame.push(current.scope());
+                //     }
+                // }
+                _ => {
+                    dbg!(&op);
+                }
             }
 
             if self.halt {
@@ -300,7 +363,14 @@ impl Machine {
 
     pub fn run(&mut self, code: Program<Code>) -> Result<ValueKind, Error> {
         self.memory.import_constants(code.get_constants());
-        self.enter(0);
+
+        for (position, byte) in code.code().to_vec().iter().enumerate() {
+            if byte.byte() == &Byte::Label {
+                self.labels
+                    .insert(byte.operand(0).copied().unwrap_or_default(), position);
+            }
+        }
+
         self.execute(code)?;
 
         Ok(self
@@ -312,37 +382,25 @@ impl Machine {
 
     pub fn enter(&mut self, stack_offset: usize) {
         // enter!(self.frame, self.ip, stack_offset);
-        let mut f = Frame::new(self.ip, self.memory.stack_size() - stack_offset);
-        if let Some(frame) = self.frame.take() {
-            f.with_parent(frame);
-        }
-
-        self.frame = Some(f);
+        self.frame
+            .push(Frame::new(self.ip, self.memory.stack_size() - stack_offset));
     }
 
     pub fn leave(&mut self) {
-        // leave!(self.frame);
-        if let Some(c) = &self.frame {
+        if let Some(c) = self.frame.last() {
             let val = self.memory.pop();
+
+            self.ip = c.tell();
             self.memory.truncate(c.stack());
-            if let Some(k) = val {
-                if let Err(e) = self.memory.push(k) {
-                    eprintln!("ERR: {:?}", e);
-                }
+
+            if let Err(e) = self.memory.push(val) {
+                eprintln!("ERR: {:?}", e);
             }
 
-            if !c.is_scoped() {
-                self.ip = c.tell();
-            }
-
-            if let Some(f) = c.parent() {
-                self.frame = Some(f.clone());
-            } else {
-                self.frame = None;
+            if self.frame.pop().is_none() {
                 self.halt = true;
             }
         } else {
-            self.frame = None;
             self.halt = true;
         }
     }

@@ -73,6 +73,7 @@ impl Precedence {
             TokenKind::DotDot => Precedence::Unary,
             TokenKind::Dot => Precedence::Call,
             TokenKind::Match | TokenKind::If => Precedence::Primary,
+            TokenKind::Identifier => Precedence::None,
             _ => Precedence::None,
         }
     }

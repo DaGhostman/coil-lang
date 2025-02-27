@@ -13,9 +13,10 @@ pub struct Memory<V>
 where
     V: Eq + Hash + Clone,
 {
-    stack_size: usize,
     constants: Interner<V>,
-    stack: Vec<usize>,
+    // Experiment with the stack
+    stack: [usize; 4096],
+    sp: usize,
     // heap: Arena<V>,
 }
 
@@ -24,7 +25,7 @@ where
     V: Eq + Hash + Clone + Default,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.stack)
+        write!(f, "{:?}", self.stack[0..self.sp].to_vec())
     }
 }
 
@@ -32,12 +33,12 @@ impl<'memory, V> Memory<V>
 where
     V: Eq + Hash + Clone + Debug + Default,
 {
-    pub fn new(stack_size: usize) -> Self {
+    pub fn new() -> Self {
         Memory {
             constants: Interner::default(),
             // heap: Arena::with_capacity(8, Some(4)),
-            stack_size,
-            stack: Vec::with_capacity(stack_size),
+            sp: 0,
+            stack: [0; 4096],
         }
     }
 
@@ -58,41 +59,38 @@ where
     // }
 
     pub fn push(&mut self, value: usize) -> Result<(), MemoryError> {
-        if self.stack.len() >= self.stack_size - 1 {
-            return Err(MemoryError::StackOverflow);
-        }
+        // if self.stack.len() >= self.stack_size - 1 {
+        //     return Err(MemoryError::StackOverflow);
+        // }
 
-        self.stack.push(value);
+        self.stack[self.sp] = value;
+        self.sp += 1;
+        // self.stack.push(value);
 
         Ok(())
     }
 
-    pub fn pop(&mut self) -> Option<usize> {
-        if self.stack.is_empty() {
-            return None;
-        }
+    pub fn pop(&mut self) -> usize {
+        self.sp -= 1;
 
-        self.stack.pop()
+        self.stack[self.sp]
     }
 
     pub fn pop_value(&mut self) -> Option<&V> {
-        if let Some(idx) = self.pop() {
-            self.constants.lookup(idx)
-        } else {
-            None
-        }
+        let idx = self.pop();
+
+        self.constants.lookup(idx)
     }
 
-    pub fn peek(&self, idx: usize) -> Option<&usize> {
-        self.stack.get(idx)
+    pub fn peek(&self, idx: usize) -> &usize {
+        &self.stack[idx]
+        // self.stack.get(idx)
     }
 
     pub fn peek_value(&self, idx: usize) -> Option<&V> {
-        if let Some(constant) = self.peek(idx) {
-            self.constants.lookup(*constant)
-        } else {
-            None
-        }
+        let constant = self.peek(idx);
+
+        self.constants.lookup(*constant)
     }
 
     // pub fn lookup(&'memory self, key: Key) -> Option<&'memory V> {
@@ -104,15 +102,16 @@ where
     // }
 
     pub fn stack_size(&self) -> usize {
-        self.stack.len()
+        self.sp
+        // self.stack.len()
     }
 
     pub fn truncate(&mut self, length: usize) {
-        self.stack.truncate(length);
+        self.sp = length;
     }
 
     pub fn stack_values(&self) -> Vec<V> {
-        self.stack
+        self.stack[0..self.sp]
             .iter()
             .map(|c| self.constants.lookup(*c).cloned().unwrap_or_default())
             .collect::<Vec<V>>()
@@ -125,7 +124,7 @@ mod tests {
 
     #[test]
     fn initialization() {
-        let mut mem: Memory<usize> = Memory::new(4);
+        let mut mem: Memory<usize> = Memory::new();
         let k = mem.define(42);
 
         if let Err(e) = mem.push(k) {

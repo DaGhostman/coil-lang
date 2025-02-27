@@ -610,6 +610,7 @@ impl Parser {
             TokenKind::LeftBrace => self.array(ctx),
             TokenKind::Match => self.match_expression2(ctx),
             TokenKind::If => self.if_expression(ctx),
+            TokenKind::Function => self.function(ctx),
             _ => todo!("Unimplemented token '{:?}'", ctx.current()),
         }
     }
@@ -678,7 +679,9 @@ impl Parser {
     fn function(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut tokens = vec![];
 
-        let name: String = if self.expect(ctx, TokenKind::Identifier, "Expected function name") {
+        self.consume(ctx, TokenKind::Function);
+
+        let name: String = if self.consume(ctx, TokenKind::Identifier) {
             ctx.previous().unwrap_or_default().lexeme().to_string()
         } else {
             rand::rng()
@@ -696,7 +699,7 @@ impl Parser {
         );
 
         let mut arity: usize = 0;
-        while !self.consume(ctx, TokenKind::RightParenthesis) {
+        while !self.matches(ctx, TokenKind::RightParenthesis) {
             let type_ = match ctx.current.kind() {
                 TokenKind::Int => Type::Integer,
                 TokenKind::Str => Type::String,
