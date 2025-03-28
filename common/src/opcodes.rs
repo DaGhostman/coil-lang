@@ -4,12 +4,14 @@ use std::{
 };
 
 #[derive(Default, PartialEq, Debug, Copy, Clone)]
+#[repr(u8)]
 pub enum Operation {
     #[default]
     Noop,
     Halt,
     // ---
     Add,
+    Not,
     BitAnd,
     BitOr,
     BitXor,
@@ -40,11 +42,21 @@ pub enum Operation {
     // ---
     Pop,
     Const,
+    Declare,
     Load,
+    Upvalue,
     Store,
+    Assign,
     Duplicate,
     Argument,
     Function,
+    Class,
+    Prop,
+    Method,
+    Instantiate,
+    This,
+    PropAssign,
+    PropLoad,
     // ---
     Equal,
     NotEqual,
@@ -77,7 +89,7 @@ pub struct Metadata {
 #[derive(Copy, Clone, PartialEq)]
 pub struct IR {
     code: Operation,
-    operands: [usize; 3],
+    operands: [usize; 5],
     metadata: Option<Metadata>,
 }
 
@@ -98,7 +110,7 @@ impl Debug for IR {
 }
 
 impl IR {
-    pub fn new(code: Operation, values: Option<[usize; 3]>) -> Self {
+    pub fn new(code: Operation, values: Option<[usize; 5]>) -> Self {
         Self {
             code,
             operands: values.unwrap_or_default(),
@@ -106,11 +118,11 @@ impl IR {
         }
     }
 
-    pub fn operands(&self) -> &[usize; 3] {
+    pub fn operands(&self) -> &[usize; 5] {
         self.operands.borrow()
     }
 
-    pub fn operands_mut(&mut self) -> &mut [usize; 3] {
+    pub fn operands_mut(&mut self) -> &mut [usize; 5] {
         self.operands.borrow_mut()
     }
 
@@ -154,12 +166,41 @@ pub enum Byte {
     Jump,
     /// Conditionally jump to relative offset
     Jumpz,
+    /// Flip the expression
+    Not,
+    /// Negate
+    Negate,
+    /// Concatenate 2 strings
+    Concat,
+
     /// Sum 2 values
     Add,
     /// Subtract,
-    Subtract,
+    Sub,
+    /// Multiplication,
+    Mul,
+    /// Division
+    Div,
+    /// Modulo
+    Mod,
+    /// Left Shift
+    LShift,
+    /// Right Shift
+    RShift,
+    /// Xor
+    Xor,
+    /// Bit And
+    BAnd,
+    /// Bit Or
+    BOr,
+    /// And
+    And,
+    /// Or
+    Or,
     /// Less than
     Less,
+    /// Greater than
+    Greater,
     /// Push a value on the stack
     Push,
     /// Pop a value from the stack
@@ -172,6 +213,27 @@ pub enum Byte {
     Call,
     /// Load a variable
     Load,
+    /// Store a variable
+    Store,
+    /// Upvalue
+    Upvalue,
+    /// Class
+    Class,
+    /// Property
+    Prop,
+    /// Method
+    Method,
+    /// Instantiate
+    Instantiate,
+    /// Invoke method
+    Invoke,
+    /// This
+    This,
+
+    /// Range of numerical values
+    Range,
+    /// Array of elements
+    Array,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,6 +264,10 @@ impl Code {
 
     pub fn operand(&self, idx: usize) -> Option<&usize> {
         self.operands.get(idx)
+    }
+
+    pub fn operands(&self) -> &Vec<usize> {
+        &self.operands
     }
 
     pub fn bits(&self) -> Vec<u8> {

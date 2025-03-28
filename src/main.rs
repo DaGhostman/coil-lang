@@ -5,7 +5,7 @@ use compiler::{
     Compiler,
     passes::{constant_folding::ConstantFolding, typechecker::TypeChecker},
 };
-use machine::{Machine, options::MachineOptions};
+use machine::{options::MachineOptions, stack::Machine};
 use parser::Parser;
 use scanner::{Scanner, buffer::Buffer};
 
@@ -30,6 +30,24 @@ struct Options {
 }
 
 fn main() {
+    // match DynamicLibrary::load("./examples/dynamic_library.so") {
+    //     Ok(mut lib) => {
+    //         lib.add_function(0, "fib".to_owned())
+    //             .returns(Type::String)
+    //             .add_argument(Type::Integer)
+    //             .returns(Type::Integer);
+    //
+    //         let mut data = Data::default();
+    //
+    //         if let Ok(value) = lib.call(0, &[Value::from(38)], &mut data) {
+    //             println!("FIB: {}", value.kind());
+    //         }
+    //     }
+    //     Err(e) => {
+    //         eprintln!("Unable to load: {}", e);
+    //     }
+    // }
+
     let args = Options::parse();
 
     let mut options = MachineOptions::default();
@@ -83,27 +101,6 @@ fn main() {
                     dbg!(e);
                 }
             }
-            // if let Ok(opcodes) = compiler.compile(&mut program) {
-            // let mut bytes = vec![];
-            // for p in opcodes.code() {
-            //     bytes.append(&mut p.bits());
-            //     println!(
-            //         "{:?} ",
-            //         p.bits()
-            //             .iter()
-            //             .map(|b| b.to_string())
-            //             .collect::<Vec<String>>()
-            //             .join("|")
-            //     );
-            // }
-            //
-            // println!("{:?}", bytes);
-            // if let Err(err) = Machine::with_options(options).run(opcodes) {
-            // eprintln!("{}", err);
-            //     }
-            // } else {
-            //     eprintln!("NO CODE?");
-            // }
         }
     } else {
         eprintln!("Missing file");

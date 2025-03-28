@@ -1,16 +1,5 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct MemoryOptions {
-    limit: usize,
-}
-
-impl MemoryOptions {
-    pub fn limit(&self) -> usize {
-        self.limit * 1024
-    }
-}
-
 #[derive(Default, Debug, Clone, Copy, Deserialize)]
 pub enum OutputBufferingMode {
     None,
@@ -35,13 +24,41 @@ impl OutputBuffering {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct GcOptions {
+    growth: usize,
+    threshold: usize,
+}
+
+impl Default for GcOptions {
+    fn default() -> Self {
+        Self {
+            growth: 2,
+            threshold: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct StackOptions {
+    size: usize,
+}
+
+impl Default for StackOptions {
+    fn default() -> Self {
+        Self { size: 16 }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MachineOptions {
     debug: bool,
     quiet: bool,
 
-    memory: MemoryOptions,
     buffering: OutputBuffering,
+
+    gc: GcOptions,
+    stack: StackOptions,
 }
 
 impl MachineOptions {
@@ -69,8 +86,16 @@ impl MachineOptions {
         self.buffering
     }
 
-    pub fn memory(&self) -> MemoryOptions {
-        self.memory
+    pub fn gc_growth(&self) -> usize {
+        self.gc.growth
+    }
+
+    pub fn gc_threshold(&self) -> usize {
+        self.gc.threshold
+    }
+
+    pub fn stack_size(&self) -> usize {
+        self.stack.size
     }
 }
 
@@ -84,7 +109,8 @@ impl Default for MachineOptions {
                 mode: OutputBufferingMode::None,
                 size: 0,
             },
-            memory: MemoryOptions { limit: 1024 },
+            gc: GcOptions::default(),
+            stack: StackOptions::default(),
         }
     }
 }

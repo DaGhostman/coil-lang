@@ -1,23 +1,13 @@
-use ahash::AHashMap as HashMap;
-
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     ip: usize,
     stack: usize,
-    // ----
-    variables: HashMap<usize, usize>,
+    size: usize,
+    variables: Vec<usize>,
+    used: bool,
 }
 
 impl Frame {
-    pub fn new(ip: usize, stack: usize) -> Self {
-        Frame {
-            ip,
-            stack,
-
-            variables: HashMap::with_capacity(16),
-        }
-    }
-
     pub fn tell(&self) -> usize {
         self.ip
     }
@@ -26,11 +16,27 @@ impl Frame {
         self.stack
     }
 
-    pub fn lookup(&self, key: &usize) -> Option<&usize> {
-        self.variables.get(key)
+    pub fn replace(&mut self, ip: usize, stack: usize) {
+        self.ip = ip;
+        self.stack = stack;
+
+        if self.used {
+            // self.variables.clear();
+            self.size = 0;
+        }
+        self.used = true;
     }
 
-    pub fn store(&mut self, key: &usize, position: usize) {
-        self.variables.insert(*key, position);
+    pub fn overwrite(&mut self, symbol: usize, position: usize) {
+        if self.size == symbol {
+            self.variables.resize(self.size + 4, usize::MAX);
+            self.size += 4;
+        }
+
+        self.variables[symbol] = position;
+    }
+
+    pub fn lookup(&self, index: usize) -> usize {
+        self.variables[index]
     }
 }

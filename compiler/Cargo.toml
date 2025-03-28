@@ -8,4 +8,5 @@ ahash = "0.8.11"
 common = { path = "../common" }
 parser = { path = "../parser" }
 rand = "0.9.0"
+rustc-hash = { version = "2.1.1", features = ["rand"] }
 

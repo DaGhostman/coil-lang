@@ -1,14 +1,13 @@
-use common::symbols::SymbolTable;
-use rand::{Rng, distr::Alphanumeric, rng};
+use common::program::data::Data;
+use rand::{Rng, distr::Alphanumeric};
 use std::str::FromStr;
 
 pub mod precedence;
 
-use common::program::Program;
+use common::program::program::Program;
 use common::types::Type;
 use common::{
-    Value, ValueKind,
-    interner::Interner,
+    Value,
     opcodes::{IR, Operation},
 };
 use precedence::Precedence;
@@ -53,23 +52,9 @@ impl<'ctx> Context<'ctx> {
     }
 }
 
+#[derive(Default)]
 pub struct Parser {
-    constants: Interner<Value>,
-    symbols: SymbolTable,
-    strings: Interner<String>,
-}
-
-impl Default for Parser {
-    fn default() -> Self {
-        let mut constants = Interner::default();
-        constants.intern(Value::new(ValueKind::NONE));
-
-        Self {
-            constants,
-            symbols: SymbolTable::new(),
-            strings: Interner::default(),
-        }
-    }
+    data: Data,
 }
 
 impl Parser {
@@ -108,9 +93,9 @@ impl Parser {
             // dbg!(&length, &idx);
             *token = match token.code() {
                 Operation::ConditionJump => {
-                    IR::new(Operation::ConditionJump, Some([length - idx, 0, 0]))
+                    IR::new(Operation::ConditionJump, Some([length - idx, 0, 0, 0, 0]))
                 }
-                Operation::Jump => IR::new(Operation::Jump, Some([length - idx, 0, 0])),
+                Operation::Jump => IR::new(Operation::Jump, Some([length - idx, 0, 0, 0, 0])),
                 // Operation::Break => IR::new(Operation::Break, Some([tokens.len() - (idx) - 1, 0,0])),
                 // Operation::Continue => IR::new(Operation::Continue, Some([tokens.len() - (idx) - 1, 0,0])),
                 _ => unreachable!("Should not attempt to jump patch non-jumping instruction"),
@@ -134,42 +119,42 @@ impl Parser {
 
     fn boolean(&mut self, ctx: &mut Context) -> Vec<IR> {
         let value = match ctx.current().kind() {
-            TokenKind::True => Value::new(ValueKind::BOOLEAN(true)),
-            TokenKind::False => Value::new(ValueKind::BOOLEAN(false)),
+            TokenKind::True => (Value::BOOLEAN(true)),
+            TokenKind::False => (Value::BOOLEAN(false)),
             _ => todo!("Fail to build a boolean"),
         };
-        let constant = self.constants.intern(value);
+        let constant = self.data.add_constant(value);
 
         ctx.advance();
-        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
     }
 
     fn number(&mut self, ctx: &mut Context) -> Vec<IR> {
         let value = match ctx.current().lexeme().as_bytes().get(1).map(|c| *c as char) {
             Some('o') => {
                 if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 8) {
-                    Value::new(ValueKind::INTEGER(int))
+                    (Value::INTEGER(int))
                 } else {
                     todo!("Fail to parse number as octal");
                 }
             }
             Some('x') => {
                 if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 16) {
-                    Value::new(ValueKind::INTEGER(int))
+                    (Value::INTEGER(int))
                 } else {
                     todo!("Fail to parse number as hexadecimal");
                 }
             }
             Some('b') => {
                 if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 2) {
-                    Value::new(ValueKind::INTEGER(int))
+                    (Value::INTEGER(int))
                 } else {
                     todo!("Fail to parse number as binary");
                 }
             }
             _ => {
                 if let Ok(int) = ctx.current().lexeme().parse::<i64>() {
-                    Value::new(ValueKind::INTEGER(int))
+                    (Value::INTEGER(int))
                 } else {
                     todo!("Fail to parse '{}' as decimal", ctx.current().lexeme());
                 }
@@ -177,36 +162,36 @@ impl Parser {
         };
         ctx.advance();
 
-        let constant = self.constants.intern(value);
+        let constant = self.data.add_constant(value);
 
-        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
     }
 
     fn float(&mut self, ctx: &mut Context) -> Vec<IR> {
         let value = if let Ok(value) = f64::from_str(ctx.current().lexeme()) {
-            Value::new(ValueKind::FLOAT(value))
+            (Value::FLOAT(value))
         } else {
             todo!("Fail to parse number as float");
         };
 
         ctx.advance();
-        let constant = self.constants.intern(value);
+        let constant = self.data.add_constant(value);
 
-        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
     }
 
     fn string(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let string = self.strings.intern(ctx.current().lexeme().to_string());
-        let constant = self.constants.intern(Value::new(ValueKind::STRING(string)));
+        let string = self.data.add_string(ctx.current().lexeme().to_string());
+        let constant = self.data.add_constant(Value::STR(string));
 
         ctx.advance();
-        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
     }
 
     fn identifier(&mut self, ctx: &mut Context) -> Vec<IR> {
         let symbol = self
-            .symbols
-            .insert(ctx.current().lexeme().to_string(), None);
+            .data
+            .add_symbol(ctx.current().lexeme().to_string(), None);
         ctx.advance();
 
         let mut tokens = vec![];
@@ -218,10 +203,13 @@ impl Parser {
                 arity += 1;
             }
 
-            tokens.push(IR::new(Operation::Call, Some([symbol, arity, 0])));
+            tokens.push(IR::new(Operation::Call, Some([symbol, arity, 0, 0, 0])));
+        } else if self.consume(ctx, TokenKind::Equal) {
+            tokens.append(&mut self.expression(ctx));
+            tokens.push(IR::new(Operation::Declare, Some([symbol, 0, 0, 0, 0])));
         } else {
             // tokens.append(&mut self.expression(ctx));
-            tokens.push(IR::new(Operation::Load, Some([symbol, 0, 0])));
+            tokens.push(IR::new(Operation::Load, Some([symbol, 0, 0, 0, 0])));
         } // TODO: handle other tokens on identifiers, like increment, decrement, etc.
 
         tokens
@@ -238,7 +226,7 @@ impl Parser {
             }
         }
 
-        tokens.push(IR::new(Operation::Array, Some([arity, 0, 0])));
+        tokens.push(IR::new(Operation::Array, Some([arity, 0, 0, 0, 0])));
 
         tokens
     }
@@ -356,7 +344,7 @@ impl Parser {
             0,
             IR::new(
                 Operation::Check,
-                Some([full_predicate.len(), tokens.len(), 0]),
+                Some([full_predicate.len(), tokens.len(), 0, 0, 0]),
             ),
         );
 
@@ -423,11 +411,11 @@ impl Parser {
             }
             TokenKind::Identifier => {
                 let symbol = self
-                    .symbols
-                    .insert(ctx.current().lexeme().to_string(), None);
-                tokens.push(IR::new(Operation::Store, Some([symbol, 0, 0])));
+                    .data
+                    .add_symbol(ctx.current().lexeme().to_string(), None);
                 // ctx.advance();
                 tokens.append(&mut self.expression(ctx));
+                tokens.push(IR::new(Operation::Store, Some([symbol, 0, 0, 0, 0])));
             }
             _ => {
                 tokens.append(&mut self.expression(ctx));
@@ -471,7 +459,10 @@ impl Parser {
             self.consume(ctx, TokenKind::Comma);
         }
 
-        tokens.insert(0, IR::new(Operation::Match, Some([tokens.len(), 0, 0])));
+        tokens.insert(
+            0,
+            IR::new(Operation::Match, Some([tokens.len(), 0, 0, 0, 0])),
+        );
 
         tokens
     }
@@ -541,7 +532,7 @@ impl Parser {
             0,
             IR::new(
                 Operation::Condition,
-                Some([condition_len, body_len, alternative.len()]),
+                Some([condition_len, body_len, alternative.len(), 0, 0]),
             ),
         );
         tokens.append(&mut alternative);
@@ -577,13 +568,37 @@ impl Parser {
                 tokens.push(IR::new(
                     Operation::Invoke,
                     Some([
-                        self.symbols.insert(name.lexeme().to_string(), None),
+                        self.data.add_symbol(name.lexeme().to_string(), None),
                         arity,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ));
+            } else if self.consume(ctx, TokenKind::Equal) {
+                tokens.append(&mut self.expression(ctx));
+                tokens.push(IR::new(
+                    Operation::PropAssign,
+                    Some([
+                        self.data.add_symbol(name.lexeme().to_string(), None),
+                        0,
+                        0,
+                        0,
                         0,
                     ]),
                 ));
             } else {
-                todo!("Handle remainder of cases");
+                tokens.push(IR::new(
+                    Operation::PropLoad,
+                    Some([
+                        self.data.add_symbol(name.lexeme().to_string(), None),
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ));
+                // todo!("Handle remainder of cases");
             } // TODO: Implement Increment for properties
         }
 
@@ -607,10 +622,12 @@ impl Parser {
             TokenKind::String => self.string(ctx),
             TokenKind::Dot => self.call(ctx),
             TokenKind::Identifier => self.identifier(ctx),
+            TokenKind::This => self.this(ctx),
             TokenKind::LeftBrace => self.array(ctx),
             TokenKind::Match => self.match_expression2(ctx),
             TokenKind::If => self.if_expression(ctx),
             TokenKind::Function => self.function(ctx),
+            TokenKind::New => self.initialize(ctx),
             _ => todo!("Unimplemented token '{:?}'", ctx.current()),
         }
     }
@@ -662,7 +679,8 @@ impl Parser {
     }
 
     fn block(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let mut tokens = vec![];
+        let mut tokens = vec![IR::new(Operation::Begin, None)];
+
         if self.expect(
             ctx,
             TokenKind::LeftBracket,
@@ -672,6 +690,53 @@ impl Parser {
                 tokens.append(&mut self.statement(ctx));
             }
         }
+
+        tokens.push(IR::new(Operation::End, None));
+
+        tokens
+    }
+
+    fn variable(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let name = ctx.current().clone();
+        // self.expect(
+        //     ctx,
+        //     TokenKind::Identifier,
+        //     "Expected identifier for variable name",
+        // );
+        let mut tokens = self.expr(ctx);
+        tokens.push(IR::new(
+            Operation::Assign,
+            Some([
+                self.data.add_symbol(name.lexeme().to_string(), None),
+                0,
+                0,
+                0,
+                0,
+            ]),
+        ));
+
+        tokens
+    }
+    fn constant(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let name = ctx.current().clone();
+        // self.expect(
+        //     ctx,
+        //     TokenKind::Identifier,
+        //     "Expected identifier for variable name",
+        // );
+        let mut tokens = self.expr(ctx);
+        tokens.pop();
+
+        tokens.push(IR::new(
+            Operation::Declare,
+            Some([
+                self.data.add_symbol(name.lexeme().to_string(), None),
+                1,
+                0,
+                0,
+                0,
+            ]),
+        ));
 
         tokens
     }
@@ -723,9 +788,11 @@ impl Parser {
                     IR::new(
                         Operation::Argument,
                         Some([
-                            self.symbols.insert(argument.lexeme().to_string(), None),
+                            self.data.add_symbol(argument.lexeme().to_string(), None),
                             type_.into(),
                             arity,
+                            0,
+                            0,
                         ]),
                     ),
                 );
@@ -741,20 +808,148 @@ impl Parser {
             TokenKind::RightParenthesis,
             "Expected ')' to close off argument list.",
         );
+        if self.consume(ctx, TokenKind::Use) {
+            self.consume(ctx, TokenKind::LeftParenthesis);
+
+            let mut upvalues = vec![];
+            while !self.consume(ctx, TokenKind::RightParenthesis) {
+                let name = ctx.current().clone();
+                self.expect(ctx, TokenKind::Identifier, "Expected variable name");
+                upvalues.push(IR::new(
+                    Operation::Upvalue,
+                    Some([
+                        self.data.add_symbol(name.lexeme().to_string(), None),
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ));
+                self.consume(ctx, TokenKind::Comma);
+            }
+
+            body.append(&mut upvalues);
+        }
         body.append(&mut self.block(ctx));
 
-        let symbol = self.symbols.insert(name, None);
+        let symbol = self.data.add_symbol(name, None);
         tokens.push(IR::new(
             Operation::Function,
-            Some([symbol, arity, body.len()]),
+            Some([symbol, arity, body.len(), 0, 0]),
         ));
         tokens.append(&mut body);
 
         tokens
     }
 
+    fn class(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let name = if self.consume(ctx, TokenKind::Identifier) {
+            ctx.previous().unwrap().lexeme().to_string()
+        } else {
+            "asd".to_string()
+        };
+        let name_symbol = self.data.add_symbol(name, None);
+
+        self.expect(
+            ctx,
+            TokenKind::LeftBracket,
+            "Expected '}' denoting class body",
+        );
+        let mut class = vec![];
+        while !self.consume(ctx, TokenKind::RightBracket) {
+            let public = self.consume(ctx, TokenKind::Pub);
+            if self.consume(ctx, TokenKind::Prop) {
+                let prop_name = ctx.current.lexeme().to_string();
+                self.consume(ctx, TokenKind::Identifier);
+
+                let mut prop = if !self.consume(ctx, TokenKind::SemiColon) {
+                    self.expr_statement(ctx)
+                } else {
+                    vec![]
+                };
+                prop.push(IR::new(
+                    Operation::Prop,
+                    Some([
+                        name_symbol,
+                        self.data.add_symbol(prop_name, None),
+                        public as usize,
+                        0,
+                        0,
+                    ]),
+                ));
+
+                prop.append(&mut class);
+                class = prop;
+            } else if self.matches(ctx, TokenKind::Function) {
+                let mut method = self.function(ctx);
+                if let Some(code) = method.first_mut() {
+                    let operands = code.operands();
+                    let method = IR::new(
+                        Operation::Method,
+                        Some([
+                            name_symbol,
+                            operands[0],
+                            operands[1],
+                            operands[2],
+                            operands[3],
+                        ]),
+                    );
+                    *code = method;
+                }
+                class.append(&mut method);
+            }
+        }
+
+        class.insert(0, IR::new(Operation::Begin, None));
+        class.insert(
+            0,
+            IR::new(Operation::Class, Some([name_symbol, class.len(), 0, 0, 0])),
+        );
+        class.push(IR::new(Operation::End, None));
+
+        class
+    }
+
+    fn initialize(&mut self, ctx: &mut Context) -> Vec<IR> {
+        ctx.advance();
+        let mut result = vec![];
+        let name = ctx.current().lexeme().to_string();
+        if self.expect(ctx, TokenKind::Identifier, "Expecting class name") {
+            let mut arity = 0;
+            self.expect(ctx, TokenKind::LeftParenthesis, "Expecting '('");
+            while !self.consume(ctx, TokenKind::RightParenthesis) {
+                result.append(&mut self.expression(ctx));
+                arity += 1;
+                self.consume(ctx, TokenKind::Comma);
+            }
+
+            result.push(IR::new(
+                Operation::Instantiate,
+                Some([self.data.add_symbol(name, None), arity, 0, 0, 0]),
+            ));
+        }
+
+        result
+    }
+
+    fn this(&mut self, ctx: &mut Context) -> Vec<IR> {
+        ctx.advance();
+        let mut result = self.expression(ctx);
+        result.insert(0, IR::new(Operation::This, None));
+
+        result
+    }
+
     fn statement(&mut self, ctx: &mut Context) -> Vec<IR> {
         match ctx.current().kind() {
+            TokenKind::Let => {
+                ctx.advance();
+                self.variable(ctx)
+            }
+            TokenKind::Const => {
+                ctx.advance();
+                self.constant(ctx)
+            }
             TokenKind::Print => {
                 ctx.advance();
                 let mut tokens = self.expr(ctx);
@@ -765,7 +960,7 @@ impl Parser {
             TokenKind::PrintLn => {
                 ctx.advance();
                 let mut tokens = self.expr(ctx);
-                tokens.push(IR::new(Operation::Print, Some([1, 0, 0])));
+                tokens.push(IR::new(Operation::Print, Some([1, 0, 0, 0, 0])));
 
                 tokens
             }
@@ -779,6 +974,10 @@ impl Parser {
             TokenKind::Function => {
                 ctx.advance();
                 self.function(ctx)
+            }
+            TokenKind::Class => {
+                ctx.advance();
+                self.class(ctx)
             }
             TokenKind::If => {
                 ctx.advance();
@@ -797,8 +996,7 @@ impl Parser {
         }
 
         let mut program = Program::new(code);
-        program.with_constants(self.constants.dump());
-        program.with_symbols(self.symbols.clone());
+        program.with_data(self.data.clone());
 
         Ok(program)
     }
@@ -876,202 +1074,203 @@ mod tests {
             Operation::Add,
             Operation::Pop
         );
-        // assert_parsed_expression!(
-        //     "42 - 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Subtract,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 * 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Multiply,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 / 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Divide,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 % 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Modulo,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 ** 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Pow,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 << 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::LeftShift,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 >> 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::RightShift,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 ^ 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::BitXor,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 | 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::BitOr,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 & 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::BitAnd,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 == 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Equal,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 != 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::NotEqual,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 < 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Less,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 <= 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::LessEqual,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 > 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Greater,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "42 >= 69;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::GreaterEqual,
-        //     Operation::Pop
-        // );
-        // assert_parsed_expression!(
-        //     "true or true;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::Or
-        // );
-        // assert_parsed_expression!(
-        //     "true and true;",
-        //     Operation::Push,
-        //     Operation::Push,
-        //     Operation::And,
-        //     Operation::Pop
-        // );
+        assert_parsed_expression!(
+            "42 - 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Subtract,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 * 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Multiply,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 / 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Divide,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 % 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Modulo,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 ** 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Pow,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 << 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::LeftShift,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 >> 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::RightShift,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 ^ 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::BitXor,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 | 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::BitOr,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 & 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::BitAnd,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 == 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Equal,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 != 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::NotEqual,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 < 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Less,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 <= 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::LessEqual,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 > 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Greater,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "42 >= 69;",
+            Operation::Const,
+            Operation::Const,
+            Operation::GreaterEqual,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "true or true;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Or,
+            Operation::Pop
+        );
+        assert_parsed_expression!(
+            "true and true;",
+            Operation::Const,
+            Operation::Const,
+            Operation::And,
+            Operation::Pop
+        );
     }
 
-    // #[test]
-    // fn test_precedence() {
-    //     assert_parsed_expression!(
-    //         "3 * 4 + 2",
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Multiply,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Pop
-    //     );
-    //
-    //     assert_parsed_expression!(
-    //         "3 * (4 + 2)",
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Multiply,
-    //         Operation::Pop
-    //     );
-    //
-    //     assert_parsed_expression!(
-    //         "3 * (4 + 2) + 5;",
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Multiply,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Pop
-    //     );
-    //
-    //     assert_parsed_expression!(
-    //         "3 * ((4 + 2) + 5);",
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Multiply,
-    //         Operation::Pop
-    //     );
-    // }
-    //
-    // #[test]
-    // fn test_template_expression() {
-    //     assert_parsed_expression!(
-    //         "`Hello, ${name}`;",
-    //         Operation::Push,
-    //         Operation::Load,
-    //         Operation::Add,
-    //         Operation::Push,
-    //         Operation::Add,
-    //         Operation::Pop
-    //     );
-    // }
-    //
+    #[test]
+    fn test_precedence() {
+        assert_parsed_expression!(
+            "3 * 4 + 2",
+            Operation::Const,
+            Operation::Const,
+            Operation::Multiply,
+            Operation::Const,
+            Operation::Add,
+            Operation::Pop
+        );
+
+        assert_parsed_expression!(
+            "3 * (4 + 2)",
+            Operation::Const,
+            Operation::Const,
+            Operation::Const,
+            Operation::Add,
+            Operation::Multiply,
+            Operation::Pop
+        );
+
+        assert_parsed_expression!(
+            "3 * (4 + 2) + 5;",
+            Operation::Const,
+            Operation::Const,
+            Operation::Const,
+            Operation::Add,
+            Operation::Multiply,
+            Operation::Const,
+            Operation::Add,
+            Operation::Pop
+        );
+
+        assert_parsed_expression!(
+            "3 * ((4 + 2) + 5);",
+            Operation::Const,
+            Operation::Const,
+            Operation::Const,
+            Operation::Add,
+            Operation::Const,
+            Operation::Add,
+            Operation::Multiply,
+            Operation::Pop
+        );
+    }
+
+    #[test]
+    fn test_template_expression() {
+        assert_parsed_expression!(
+            "`Hello, ${name}`;",
+            Operation::Const,
+            Operation::Load,
+            Operation::Add,
+            Operation::Const,
+            Operation::Add,
+            Operation::Pop
+        );
+    }
+
     // #[test]
     // fn test_match_expression() {
     //     assert_parsed_expression!(
     //         "match true { true => 'sadge' };",
-    //         Operation::Push,  // Left
-    //         Operation::Push,  // Right
+    //         Operation::Const, // Left
+    //         Operation::Const, // Right
     //         Operation::Equal, // Equals
     //         Operation::Match, // conditional jump
-    //         Operation::Push,  // the match arm body
+    //         Operation::Const, // the match arm body
     //         Operation::Jump   // jump out of the match expr
     //     );
     // }

@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::{options::OutputBufferingMode, MachineOptions};
+use crate::options::{MachineOptions, OutputBufferingMode};
 
 pub type WriterFactory = fn() -> Box<dyn Write>;
 

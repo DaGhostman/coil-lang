@@ -1,4 +1,4 @@
-use common::{ValueKind, error::Error, opcodes::Operation, types::Type};
+use common::{error::Error, opcodes::Operation, program::data::Data, types::Type};
 
 use crate::CompilationPass;
 
@@ -11,8 +11,7 @@ impl CompilationPass for TypeChecker {
     fn compile<'compilation>(
         &mut self,
         code: &'compilation [common::opcodes::Code],
-        _constants: &mut common::interner::Interner<common::Value>,
-        _symbols: &mut common::symbols::SymbolTable,
+        _data: &mut Data,
     ) -> Result<Vec<common::opcodes::Code>, Error> {
         Ok(code.to_owned())
         // let mut variables: HashMap<usize, Type> = HashMap::new();

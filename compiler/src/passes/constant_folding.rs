@@ -1,7 +1,6 @@
-use common::interner::Interner;
+use common::Value;
 use common::opcodes::{Byte, Code};
-use common::symbols::SymbolTable;
-use common::{Value, ValueKind};
+use common::program::data::Data;
 
 use crate::CompilationPass;
 
@@ -12,8 +11,7 @@ impl CompilationPass for ConstantFolding {
     fn compile<'pass>(
         &mut self,
         code: &'pass [Code],
-        constants: &mut Interner<Value>,
-        symbols: &mut SymbolTable,
+        data: &mut Data,
     ) -> Result<Vec<Code>, common::error::Error> {
         let default_value = Value::default();
         let mut length = code.len();
@@ -28,11 +26,9 @@ impl CompilationPass for ConstantFolding {
                 match op.byte() {
                     Byte::Label => {
                         if let Some(offset) = op.operand(1) {
-                            if let Ok(mut chunk) = self.compile(
-                                &code[cursor..cursor + offset].to_vec(),
-                                constants,
-                                symbols,
-                            ) {
+                            if let Ok(mut chunk) =
+                                self.compile(&code[cursor..cursor + offset].to_vec(), data)
+                            {
                                 modified.push(Code::new_with_operands(
                                     Byte::Label,
                                     vec![op.operand(0).copied().unwrap(), chunk.len()],
@@ -51,42 +47,34 @@ impl CompilationPass for ConstantFolding {
                         {
                             match (
                                 lhs.map(|c| {
-                                    constants
-                                        .lookup(c.operand(0).copied().unwrap_or_default())
+                                    data.constant(c.operand(0).copied().unwrap_or_default())
                                         .unwrap_or(&default_value)
-                                        .kind()
                                 }),
                                 rhs.map(|c| {
-                                    constants
-                                        .lookup(c.operand(0).copied().unwrap_or_default())
+                                    data.constant(c.operand(0).copied().unwrap_or_default())
                                         .unwrap_or(&default_value)
-                                        .kind()
                                 }),
                             ) {
-                                (Some(ValueKind::INTEGER(lhs)), Some(ValueKind::INTEGER(rhs))) => {
-                                    let c =
-                                        constants.intern(Value::new(ValueKind::INTEGER(lhs + rhs)));
+                                (Some(Value::INTEGER(lhs)), Some(Value::INTEGER(rhs))) => {
+                                    let c = data.add_constant((Value::INTEGER(lhs + rhs)));
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, vec![c]));
                                 }
-                                (Some(ValueKind::FLOAT(lhs)), Some(ValueKind::FLOAT(rhs))) => {
-                                    let c =
-                                        constants.intern(Value::new(ValueKind::FLOAT(lhs + rhs)));
+                                (Some(Value::FLOAT(lhs)), Some(Value::FLOAT(rhs))) => {
+                                    let c = data.add_constant(Value::from(lhs + rhs));
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, vec![c]));
                                 }
-                                (Some(ValueKind::INTEGER(lhs)), Some(ValueKind::FLOAT(rhs))) => {
-                                    let c = constants
-                                        .intern(Value::new(ValueKind::FLOAT((*lhs as f64) + rhs)));
+                                (Some(Value::INTEGER(lhs)), Some(Value::FLOAT(rhs))) => {
+                                    let c = data.add_constant(Value::from((*lhs as f64) + rhs));
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, vec![c]));
                                 }
-                                (Some(ValueKind::FLOAT(lhs)), Some(ValueKind::INTEGER(rhs))) => {
-                                    let c = constants
-                                        .intern(Value::new(ValueKind::FLOAT(lhs + (*rhs as f64))));
+                                (Some(Value::FLOAT(lhs)), Some(Value::INTEGER(rhs))) => {
+                                    let c = data.add_constant(Value::from(lhs + (*rhs as f64)));
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, vec![c]));
@@ -137,7 +125,7 @@ impl CompilationPass for ConstantFolding {
             //                         }),
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant(Value::new(
+            //                             let constant = code.add_constant((
             //                                 ValueKind::INTEGER(lhs.wrapping_add(*rhs)),
             //                             ));
             //                             modified
@@ -146,7 +134,7 @@ impl CompilationPass for ConstantFolding {
             //                         }
             //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::FLOAT(lhs.add(rhs))));
+            //                                 .add_constant((ValueKind::FLOAT(lhs.add(rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                             modified.push(IR::new(Operation::Noop, None));
@@ -181,7 +169,7 @@ impl CompilationPass for ConstantFolding {
             //                         }),
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant(Value::new(
+            //                             let constant = code.add_constant((
             //                                 ValueKind::INTEGER(lhs.wrapping_sub(*rhs)),
             //                             ));
             //                             modified
@@ -189,7 +177,7 @@ impl CompilationPass for ConstantFolding {
             //                         }
             //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
+            //                                 .add_constant((ValueKind::FLOAT(lhs.sub(rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -223,7 +211,7 @@ impl CompilationPass for ConstantFolding {
             //                         }),
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant(Value::new(
+            //                             let constant = code.add_constant((
             //                                 ValueKind::INTEGER(lhs.wrapping_mul(*rhs)),
             //                             ));
             //                             modified
@@ -231,7 +219,7 @@ impl CompilationPass for ConstantFolding {
             //                         }
             //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
+            //                                 .add_constant((ValueKind::FLOAT(lhs.sub(rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -265,7 +253,7 @@ impl CompilationPass for ConstantFolding {
             //                         }),
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant(Value::new(
+            //                             let constant = code.add_constant((
             //                                 ValueKind::INTEGER(lhs.wrapping_div(*rhs)),
             //                             ));
             //                             modified
@@ -273,7 +261,7 @@ impl CompilationPass for ConstantFolding {
             //                         }
             //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::FLOAT(lhs.sub(rhs))));
+            //                                 .add_constant((ValueKind::FLOAT(lhs.sub(rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -307,7 +295,7 @@ impl CompilationPass for ConstantFolding {
             //                         }),
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant(Value::new(
+            //                             let constant = code.add_constant((
             //                                 ValueKind::INTEGER(lhs.wrapping_rem(*rhs)),
             //                             ));
             //                             modified
@@ -315,7 +303,7 @@ impl CompilationPass for ConstantFolding {
             //                         }
             //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::FLOAT(lhs.rem(rhs))));
+            //                                 .add_constant((ValueKind::FLOAT(lhs.rem(rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -350,7 +338,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
             //                             let constant =
-            //                                 code.add_constant(Value::new(ValueKind::INTEGER(
+            //                                 code.add_constant((ValueKind::INTEGER(
             //                                     lhs.wrapping_pow((*rhs).try_into().unwrap_or_default()),
             //                                 )));
             //                             modified
@@ -358,12 +346,12 @@ impl CompilationPass for ConstantFolding {
             //                         }
             //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::FLOAT(lhs.powf(*rhs))));
+            //                                 .add_constant((ValueKind::FLOAT(lhs.powf(*rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code.add_constant(Value::new(ValueKind::FLOAT(
+            //                             let constant = code.add_constant((ValueKind::FLOAT(
             //                                 lhs.powi((*rhs).try_into().unwrap_or_default()),
             //                             )));
             //                             modified
@@ -400,7 +388,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(rhs), Some(lhs)) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::BOOLEAN(lhs == rhs)));
+            //                                 .add_constant((ValueKind::BOOLEAN(lhs == rhs)));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -435,7 +423,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(rhs), Some(lhs)) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::BOOLEAN(lhs != rhs)));
+            //                                 .add_constant((ValueKind::BOOLEAN(lhs != rhs)));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -470,7 +458,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(rhs), Some(lhs)) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::BOOLEAN(lhs < rhs)));
+            //                                 .add_constant((ValueKind::BOOLEAN(lhs < rhs)));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -505,7 +493,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(rhs), Some(lhs)) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::BOOLEAN(lhs <= rhs)));
+            //                                 .add_constant((ValueKind::BOOLEAN(lhs <= rhs)));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -540,7 +528,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(rhs), Some(lhs)) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::BOOLEAN(lhs > rhs)));
+            //                                 .add_constant((ValueKind::BOOLEAN(lhs > rhs)));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -575,7 +563,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(rhs), Some(lhs)) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::BOOLEAN(lhs >= rhs)));
+            //                                 .add_constant((ValueKind::BOOLEAN(lhs >= rhs)));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -610,7 +598,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
             //                             let constant = code
-            //                                 .add_constant(Value::new(ValueKind::INTEGER(lhs.shl(rhs))));
+            //                                 .add_constant((ValueKind::INTEGER(lhs.shl(rhs))));
             //                             modified
             //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
             //                         }
@@ -645,7 +633,7 @@ impl CompilationPass for ConstantFolding {
             //                     ) {
             //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
             //                             let constant =
-            //                                 code.add_constant(Value::new(ValueKind::INTEGER(
+            //                                 code.add_constant((ValueKind::INTEGER(
             //                                     lhs.wrapping_shr((*rhs).try_into().unwrap_or_default()),
             //                                 )));
             //                             modified
@@ -693,7 +681,7 @@ impl CompilationPass for ConstantFolding {
             //                                 modified.push(IR::new(
             //                                     Operation::Const,
             //                                     Some([
-            //                                         code.add_constant(Value::new(ValueKind::RANGE(
+            //                                         code.add_constant((ValueKind::RANGE(
             //                                             *lhs, *rhs,
             //                                         ))),
             //                                         0,

@@ -427,9 +427,13 @@ impl Scanner {
                 _ => self.identifier(),
             },
             Some('b') => self.keyword_or_identifier(TokenKind::Bool, "bool"),
-            Some('c') => match self.peek(3) {
-                Some('s') => self.keyword_or_identifier(TokenKind::Const, "const"),
-                Some('t') => self.keyword_or_identifier(TokenKind::Continue, "continue"),
+            Some('c') => match self.peek(1) {
+                Some('l') => self.keyword_or_identifier(TokenKind::Class, "class"),
+                Some('o') => match self.peek(3) {
+                    Some('s') => self.keyword_or_identifier(TokenKind::Const, "const"),
+                    Some('t') => self.keyword_or_identifier(TokenKind::Continue, "continue"),
+                    _ => self.identifier(),
+                },
                 _ => self.identifier(),
             },
             Some('d') => self.keyword_or_identifier(TokenKind::Default, "default"),
@@ -452,7 +456,11 @@ impl Scanner {
                 _ => self.identifier(),
             },
             Some('m') => self.keyword_or_identifier(TokenKind::Match, "match"),
-            Some('n') => self.keyword_or_identifier(TokenKind::None, "none"),
+            Some('n') => match self.peek(1) {
+                Some('e') => self.keyword_or_identifier(TokenKind::New, "new"),
+                Some('o') => self.keyword_or_identifier(TokenKind::None, "none"),
+                _ => self.identifier(),
+            },
             Some('o') => self.keyword_or_identifier(TokenKind::Or, "or"),
             Some('p') => match self.peek(1) {
                 Some('u') => self.keyword_or_identifier(TokenKind::Pub, "pub"),
@@ -492,11 +500,7 @@ impl Scanner {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Scanner,
-        buffer::Buffer,
-        tokens::{Token, TokenKind},
-    };
+    use crate::{Scanner, buffer::Buffer, tokens::TokenKind};
 
     macro_rules! assert_scanned_tokens {
         ($code:expr, $expected:expr, $($token:expr),+) => {
