@@ -315,7 +315,7 @@ impl Debug for Value {
                 // ValueKind::ARRAY(a) => format!("arr({})", a),
                 Value::RANGE(start, end) => format!("range({}, {})", start, end),
                 Value::FILE(fd) => format!("file({})", fd),
-                Value::RESOURCE(_) => format!("resuorce",),
+                Value::RESOURCE(_) => "resuorce".to_string(),
                 Value::POINTER(n) => format!("pointer({})", n),
                 Value::FFI(id) => format!("dynamic({})", id),
                 Value::REFERENCE(idx) => format!("ref({:?})", idx),
@@ -330,62 +330,41 @@ impl Debug for Value {
 
 impl Value {
     pub fn try_into_raw(&self) -> Option<*mut c_void> {
-        return Some(match self {
+        Some(match self {
             Value::NONE => Box::into_raw(Box::new(std::ptr::null::<c_void>())) as *mut c_void,
             Value::BOOLEAN(state) => Box::into_raw(Box::new(*state as u8)) as *mut c_void,
             Value::INTEGER(number) => Box::into_raw(Box::new(*number)) as *mut c_void,
             Value::FLOAT(number) => Box::into_raw(Box::new(*number)) as *mut c_void,
             _ => return None,
-        } as *mut c_void);
+        } as *mut c_void)
     }
 
     pub fn ptr(&self, data: &mut Data) -> Option<ValuePtr> {
         match self {
             Value::STR(index) => {
-                if let Some(string) = data.string(*index) {
-                    if let Ok(value) = CString::new(string.as_str()) {
-                        Some(ValuePtr {
-                            ptr: Box::into_raw(Box::new(value)) as *const c_void,
-                            kind: Type::from(self),
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            Value::RESOURCE(ptr) => {
-                if let Some(ptr) = data.pointer(*ptr) {
+                let string = data.string(*index);
+                if let Ok(value) = CString::new(string.as_str()) {
                     Some(ValuePtr {
-                        ptr,
-                        kind: Type::Resource,
-                    })
-                } else {
-                    None
-                }
-            }
-            Value::POINTER(ptr) => {
-                if let Some(ptr) = data.pointer(*ptr) {
-                    Some(ValuePtr {
-                        ptr: Box::into_raw(Box::new(ptr)) as *const _,
-                        kind: Type::Pointer,
-                    })
-                } else {
-                    None
-                }
-            }
-
-            _ => {
-                if let Some(ptr) = self.try_into_raw() {
-                    Some(ValuePtr {
-                        ptr,
+                        ptr: Box::into_raw(Box::new(value)) as *const c_void,
                         kind: Type::from(self),
                     })
                 } else {
                     None
                 }
             }
+            Value::RESOURCE(ptr) => data.pointer(*ptr).map(|ptr| ValuePtr {
+                ptr,
+                kind: Type::Resource,
+            }),
+            Value::POINTER(ptr) => data.pointer(*ptr).map(|ptr| ValuePtr {
+                ptr: Box::into_raw(Box::new(ptr)) as *const _,
+                kind: Type::Pointer,
+            }),
+
+            _ => self.try_into_raw().map(|ptr| ValuePtr {
+                ptr,
+                kind: Type::from(self),
+            }),
         }
     }
 
@@ -460,9 +439,9 @@ impl Drop for ValuePtr {
     }
 }
 
-impl Into<Type> for Value {
-    fn into(self) -> Type {
-        match self {
+impl From<Value> for Type {
+    fn from(val: Value) -> Self {
+        match val {
             Value::NONE => Type::None,
             Value::BOOLEAN(_) => Type::Bool,
             Value::INTEGER(_) => Type::Integer,

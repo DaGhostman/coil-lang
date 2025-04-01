@@ -20,7 +20,7 @@ where
 impl<V: Eq + Hash + Clone> Default for Interner<V> {
     fn default() -> Self {
         Interner {
-            uniq: HashMap::with_capacity_and_hasher(32, FxBuildHasher::default()),
+            uniq: HashMap::with_capacity_and_hasher(32, FxBuildHasher),
             storage: Vec::with_capacity(32),
         }
     }
@@ -30,19 +30,19 @@ impl<V: Hash + Clone + Eq + std::fmt::Debug> Interner<V> {
     pub fn intern(&mut self, value: V) -> usize {
         let hash = calculate_hash(&value);
 
-        return *self.uniq.entry(hash).or_insert_with(|| {
+        *self.uniq.entry(hash).or_insert_with(|| {
             self.storage.push(value);
 
             self.storage.len() - 1
-        });
+        })
     }
 
-    pub fn lookup(&self, key: usize) -> Option<&V> {
-        self.storage.get(key)
+    pub fn lookup(&self, key: usize) -> &V {
+        &self.storage[key]
     }
 
-    pub fn lookup_mut(&mut self, key: usize) -> Option<&mut V> {
-        self.storage.get_mut(key)
+    pub fn lookup_mut(&mut self, key: usize) -> &mut V {
+        &mut self.storage[key]
     }
 
     pub fn len(&self) -> usize {

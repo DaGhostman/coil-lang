@@ -21,15 +21,15 @@ impl FFIResult {
     }
 }
 
-impl Into<usize> for FFIResult {
-    fn into(self) -> usize {
-        self.value as *const _ as usize
+impl From<FFIResult> for usize {
+    fn from(val: FFIResult) -> Self {
+        val.value as *const _ as usize
     }
 }
 
-impl Into<isize> for FFIResult {
-    fn into(self) -> isize {
-        self.value as *const _ as isize
+impl From<FFIResult> for isize {
+    fn from(val: FFIResult) -> Self {
+        val.value as *const _ as isize
     }
 }
 

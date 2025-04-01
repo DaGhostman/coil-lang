@@ -6,6 +6,8 @@ pub mod object;
 
 use std::fmt::Debug;
 
+const STACK_SIZE: usize = 8192;
+
 #[derive(Debug)]
 pub enum MemoryError {
     StackOverflow,
@@ -16,18 +18,27 @@ pub struct Stack<T>
 where
     T: Copy,
 {
-    stack: Vec<T>,
+    stack: [T; STACK_SIZE],
     sp: usize,
+}
+
+impl<T> Default for Stack<T>
+where
+    T: Copy + Default + Debug,
+ {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> Stack<T>
 where
     T: Copy + Default + Debug,
 {
-    pub fn new(size: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             sp: 0,
-            stack: vec![Default::default(); size],
+            stack: [Default::default(); STACK_SIZE],
         }
     }
 
@@ -45,10 +56,6 @@ where
     }
 
     pub fn push(&mut self, value: T) {
-        if self.stack.len() == self.sp {
-            self.stack.resize(self.stack.len() + 4, Default::default());
-        }
-
         self.stack[self.sp] = value;
         self.sp += 1;
     }
@@ -67,10 +74,11 @@ where
         self.stack[position]
     }
 
+    pub fn last_mut(&mut self) -> &mut T {
+        &mut self.stack[self.sp - 1]
+    }
+
     pub fn copy(&mut self, src: usize, dst: usize) {
-        if self.stack.len() == self.sp {
-            self.stack.resize(self.stack.len() + 4, Default::default());
-        }
         self.stack[dst] = self.stack[src];
     }
 
@@ -80,7 +88,11 @@ where
         self.sp += 1;
     }
 
-    pub fn iter<'iter>(&'iter self) -> StackIterator<'iter, T> {
+    pub fn len(&self) -> usize {
+        self.sp
+    }
+
+    pub fn iter(&self) -> StackIterator<'_, T> {
         StackIterator {
             cursor: 0,
             length: self.sp,
@@ -95,7 +107,7 @@ pub struct StackIterator<'iter, T> {
     cursor: usize,
 }
 
-impl<'iter, T> Iterator for StackIterator<'iter, T>
+impl<T> Iterator for StackIterator<'_, T>
 where
     T: Copy,
 {
@@ -174,6 +186,10 @@ impl Heap {
 
     pub fn threshold(&self) -> usize {
         self.threshold
+    }
+
+    pub fn has_allocated(&self) -> bool {
+        self.size > 0
     }
 
     pub fn dealloc(&mut self, object: Objects) {

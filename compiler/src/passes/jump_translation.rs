@@ -5,9 +5,9 @@ use crate::CompilationPass;
 pub struct LabelUnrolling {}
 
 impl CompilationPass for LabelUnrolling {
-    fn compile<'compilation>(
+    fn compile(
         &mut self,
-        code: &'compilation [common::opcodes::Code],
+        code: &[common::opcodes::Code],
         data: &mut Data,
     ) -> Result<Vec<common::opcodes::Code>, common::error::Error> {
         todo!()

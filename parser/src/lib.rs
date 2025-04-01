@@ -119,8 +119,8 @@ impl Parser {
 
     fn boolean(&mut self, ctx: &mut Context) -> Vec<IR> {
         let value = match ctx.current().kind() {
-            TokenKind::True => (Value::BOOLEAN(true)),
-            TokenKind::False => (Value::BOOLEAN(false)),
+            TokenKind::True => Value::BOOLEAN(true),
+            TokenKind::False => Value::BOOLEAN(false),
             _ => todo!("Fail to build a boolean"),
         };
         let constant = self.data.add_constant(value);
@@ -133,28 +133,28 @@ impl Parser {
         let value = match ctx.current().lexeme().as_bytes().get(1).map(|c| *c as char) {
             Some('o') => {
                 if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 8) {
-                    (Value::INTEGER(int))
+                    Value::INTEGER(int)
                 } else {
                     todo!("Fail to parse number as octal");
                 }
             }
             Some('x') => {
                 if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 16) {
-                    (Value::INTEGER(int))
+                    Value::INTEGER(int)
                 } else {
                     todo!("Fail to parse number as hexadecimal");
                 }
             }
             Some('b') => {
                 if let Ok(int) = i64::from_str_radix(ctx.current().lexeme(), 2) {
-                    (Value::INTEGER(int))
+                    Value::INTEGER(int)
                 } else {
                     todo!("Fail to parse number as binary");
                 }
             }
             _ => {
                 if let Ok(int) = ctx.current().lexeme().parse::<i64>() {
-                    (Value::INTEGER(int))
+                    Value::INTEGER(int)
                 } else {
                     todo!("Fail to parse '{}' as decimal", ctx.current().lexeme());
                 }
@@ -169,7 +169,7 @@ impl Parser {
 
     fn float(&mut self, ctx: &mut Context) -> Vec<IR> {
         let value = if let Ok(value) = f64::from_str(ctx.current().lexeme()) {
-            (Value::FLOAT(value))
+            Value::FLOAT(value)
         } else {
             todo!("Fail to parse number as float");
         };

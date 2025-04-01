@@ -239,22 +239,22 @@ pub enum Byte {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Code {
     byte: Byte,
-    operands: Vec<usize>,
+    operands: [usize; 5],
 }
 
 impl Code {
     pub fn new(byte: Byte) -> Self {
         Self {
             byte,
-            operands: Vec::default(),
+            operands: [0, 0, 0, 0, 0],
         }
     }
 
-    pub fn new_with_operands(byte: Byte, operands: Vec<usize>) -> Self {
+    pub fn new_with_operands(byte: Byte, operands: [usize; 5]) -> Self {
         Self { byte, operands }
     }
 
-    pub fn with_operands(&mut self, operands: Vec<usize>) {
+    pub fn with_operands(&mut self, operands: [usize; 5]) {
         self.operands = operands;
     }
 
@@ -262,11 +262,11 @@ impl Code {
         &self.byte
     }
 
-    pub fn operand(&self, idx: usize) -> Option<&usize> {
-        self.operands.get(idx)
+    pub fn operand(&self, idx: usize) -> usize {
+        self.operands[idx]
     }
 
-    pub fn operands(&self) -> &Vec<usize> {
+    pub fn operands(&self) -> &[usize; 5] {
         &self.operands
     }
 

@@ -16,7 +16,7 @@ impl Data {
         self.strings.intern(value)
     }
 
-    pub fn string(&self, index: usize) -> Option<&String> {
+    pub fn string(&self, index: usize) -> &String {
         self.strings.lookup(index)
     }
 
@@ -24,10 +24,10 @@ impl Data {
         self.constants.intern(value)
     }
 
-    pub fn constant(&self, index: usize) -> Option<&Value> {
+    pub fn constant(&self, index: usize) -> &Value {
         self.constants.lookup(index)
     }
-    pub fn constant_mut(&mut self, index: usize) -> Option<&mut Value> {
+    pub fn constant_mut(&mut self, index: usize) -> &mut Value {
         self.constants.lookup_mut(index)
     }
 
@@ -35,20 +35,17 @@ impl Data {
         self.symbols.insert(symbol, constant)
     }
 
-    pub fn symbol_name(&self, symbol: usize) -> Option<&String> {
+    pub fn symbol_name(&self, symbol: usize) -> &String {
         self.symbols.name(symbol)
     }
 
-    pub fn symbol_constant(&self, symbol: usize) -> Option<&usize> {
+    pub fn symbol_constant(&self, symbol: usize) -> usize {
         self.symbols.constant(symbol)
     }
 
-    pub fn symbol_constant_value(&self, symbol: usize) -> Option<&Value> {
-        if let Some(constant) = self.symbols.constant(symbol) {
-            self.constants.lookup(*constant)
-        } else {
-            None
-        }
+    pub fn symbol_constant_value(&self, symbol: usize) -> &Value {
+        let constant = self.symbols.constant(symbol);
+        self.constants.lookup(constant)
     }
 
     pub fn add_pointer(&mut self, ptr: *mut c_void) -> usize {

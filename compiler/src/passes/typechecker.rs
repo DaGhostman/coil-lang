@@ -1,4 +1,4 @@
-use common::{error::Error, opcodes::Operation, program::data::Data, types::Type};
+use common::{error::Error, program::data::Data, types::Type};
 
 use crate::CompilationPass;
 
@@ -8,9 +8,9 @@ pub struct TypeChecker {
 }
 
 impl CompilationPass for TypeChecker {
-    fn compile<'compilation>(
+    fn compile(
         &mut self,
-        code: &'compilation [common::opcodes::Code],
+        code: &[common::opcodes::Code],
         _data: &mut Data,
     ) -> Result<Vec<common::opcodes::Code>, Error> {
         Ok(code.to_owned())

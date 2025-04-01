@@ -13,6 +13,9 @@ use common::{
     opcodes::{Byte, Code},
 };
 
+const FRAME_SIZE: usize = 64;
+const MAX_LABELS: usize = u16::MAX as usize;
+
 pub struct Machine {
     stdout: Output,
     stderr: Output,
@@ -23,9 +26,10 @@ pub struct Machine {
     frames: Vec<Frame>,
     stack: Stack<Value>,
     heap: Heap,
-    labels: HashMap<usize, usize>,
+    labels: [usize; MAX_LABELS],
     // owner => name => label
     methods: HashMap<usize, HashMap<usize, usize>>,
+    properties: HashMap<usize, Vec<usize>>,
 
     options: MachineOptions,
 
@@ -37,14 +41,15 @@ impl Default for Machine {
             halt: false,
             ip: 0,
             fp: 0,
-            stack: Stack::new(32),
-            frames: vec![Default::default(); 4],
+            stack: Stack::new(),
+            frames: vec![Default::default(); FRAME_SIZE],
             heap: Heap::new(2, 1024 * 1024),
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
             stderr: Output::new(&MachineOptions::default(), || Box::new(stderr().lock())),
             options: MachineOptions::default(),
-            labels: HashMap::default(),
+            labels: [0; MAX_LABELS],
             methods: HashMap::default(),
+            properties: HashMap::default(),
             grey_objects: Vec::default(),
         }
     }
@@ -79,16 +84,6 @@ macro_rules! unary_op {
     };
 }
 
-macro_rules! operand {
-    ($code: expr, $idx: literal, $msg: literal) => {
-        if let Some(op) = $code.operand($idx) {
-            op
-        } else {
-            return Err(Error::new(ErrorOrigin::RUNTIME, $msg.to_string()));
-        }
-    };
-}
-
 impl Machine {
     pub fn with_options(options: MachineOptions) -> Self {
         let mut this = Self::default();
@@ -96,7 +91,7 @@ impl Machine {
         this.stdout = Output::new(&this.options, || Box::new(stdout().lock()));
         this.stderr = Output::new(&this.options, || Box::new(stderr().lock()));
         this.heap = Heap::new(this.options.gc_growth(), this.options.gc_threshold());
-        this.stack = Stack::new(this.options.stack_size());
+        this.stack = Stack::new();
 
         this
     }
@@ -113,16 +108,12 @@ impl Machine {
             // );
             match op.byte() {
                 Byte::Label => {
-                    self.labels.insert(
-                        *operand!(op, 0, "Missing label identifier operand"),
-                        self.ip,
-                    );
-                    self.ip += *operand!(op, 1, "Missing jump offset for operand");
+                    self.ip += op.operand(1);
                 }
                 Byte::Call => {
                     if let Value::FUNCTION(arity, label) = self.stack.pop() {
                         self.enter(arity);
-                        self.ip = self.labels[&label];
+                        self.ip = self.labels[label];
                     } else {
                         unreachable!("Attempting to call non-existing function");
                     }
@@ -131,47 +122,42 @@ impl Machine {
                     self.halt = true;
                 }
                 Byte::Enter => self.enter(0),
-                Byte::Leave => self.leave()?,
-                Byte::Push => {
-                    if let Some(constant) =
-                        code.data()
-                            .constant(*operand!(op, 0, "Unable to fetch constant operand"))
-                    {
-                        self.stack.push(*constant);
+                Byte::Leave => {
+                    if self.fp == 0 {
+                        self.halt = true;
                     } else {
-                        return Err(Error::new(
-                            ErrorOrigin::RUNTIME,
-                            String::from("Opcode doesn't have operand"),
-                        ));
+                        self.fp -= 1;
                     }
+                    let frame = &self.frames[self.fp];
+
+                    self.ip = frame.tell();
+                    self.stack.restore(frame.stack());
+                    if self.heap.has_allocated() {
+                        self.gc();
+                    }
+
+                    // self.leave()?
+                }
+                Byte::Push => {
+                    let constant = code.data().constant(op.operand(0));
+                    self.stack.push(*constant);
                 }
                 Byte::Pop => {
                     self.stack.pop();
                 }
                 Byte::Peek => {
-                    let size = self.frames[self.fp - 1].stack();
-                    self.reassign(
-                        *operand!(op, 0, "Unable to get name"),
-                        size + operand!(op, 1, "Unable to retrieve peek offset"),
-                    );
+                    self.reassign(op.operand(0), (self.stack.len() - 1) - op.operand(1));
                 }
                 Byte::Upvalue => {
-                    let frame = operand!(op, 0, "Unable to fetch frame operand");
-                    let name = operand!(op, 1, "Unable to fetch upvalue name");
-                    let upvalue = operand!(op, 2, "Unable to fetch upvalue operand");
+                    let frame = op.operand(0);
+                    let name = op.operand(1);
+                    let upvalue = op.operand(2);
 
-                    self.reassign(*name, self.lookup_upvalue(*frame, *upvalue));
+                    self.reassign(name, self.lookup_upvalue(frame, upvalue));
                 }
-                Byte::Store => self.reassign(
-                    *operand!(op, 0, "Unable to get store operand"),
-                    self.stack.tell(1),
-                ),
+                Byte::Store => self.reassign(op.operand(0), self.stack.tell(1)),
                 Byte::Load => {
-                    self.stack.copy_to_top(self.lookup(*operand!(
-                        op,
-                        0,
-                        "Missing variable operand"
-                    )));
+                    self.stack.copy_to_top(self.lookup(op.operand(0)));
                 }
                 Byte::Not => {
                     let rhs = self.stack.pop();
@@ -254,21 +240,20 @@ impl Machine {
                     self.stack.push(binary_op!(rhs, lhs, |))
                 }
                 Byte::Print => {
-                    self.stdout.write(format!(
-                        "{}",
-                        match self.stack.pop() {
-                            Value::STR(idx) =>
-                                code.data().string(idx).expect("Missing string").to_string(),
+                    self.stdout.write(
+                        (match self.stack.pop() {
+                            Value::STR(idx) => code.data().string(idx).to_string(),
                             value => value.to_string(),
-                        }
-                    ));
+                        })
+                        .to_string(),
+                    );
 
-                    if op.operand(0).is_some() && op.operand(0).unwrap() == &1 {
+                    if op.operand(0) == 1 {
                         self.stdout.write("\n".to_string());
                     }
                 }
                 Byte::Jump => {
-                    self.ip = self.labels[operand!(op, 0, "Missing destination label")];
+                    self.ip = self.labels[op.operand(0)];
                 }
                 Byte::Jumpz => {
                     let value = self.stack.pop();
@@ -284,18 +269,14 @@ impl Machine {
                         _ => panic!("Unable to evaluate"),
                     };
 
-                    self.ip = self.labels[if state {
-                        operand!(op, 0, "Missing jump label")
-                    } else {
-                        operand!(op, 1, "Missing alternate label")
-                    }];
+                    self.ip = self.labels[if state { op.operand(0) } else { op.operand(1) }];
                 }
                 Byte::Range => {
                     let last = self.stack.pop();
                     let first = self.stack.pop();
 
                     if let (Value::INTEGER(start), Value::INTEGER(end)) = (first, last) {
-                        let items: Vec<Value> = (start..end).into_iter().map(Value::from).collect();
+                        let items: Vec<Value> = (start..end).map(Value::from).collect();
 
                         let (obj_array, _) = self.heap.alloc(ObjArray::from(items), Objects::Array);
 
@@ -305,25 +286,17 @@ impl Machine {
                     }
                 }
                 Byte::Array => {
-                    let len = operand!(op, 0, "Unable to get array length");
-                    let mut items = Vec::with_capacity(*len);
-                    items.append(&mut self.stack.npop(*len).to_vec());
+                    let len = op.operand(0);
+                    let mut items = Vec::with_capacity(len);
+                    items.append(&mut self.stack.npop(len).to_vec());
 
                     let (obj_array, _) = self.heap.alloc(ObjArray::from(items), Objects::Array);
                     self.stack.push(Value::OBJECT(obj_array));
                 }
-                Byte::Method => {
-                    let operands = op.operands();
-                    let (owner, name, label) = (operands[0], operands[1], operands[2]);
-
-                    self.methods.entry(owner).and_modify(|entry| {
-                        entry.insert(name, label);
-                    });
-                }
                 Byte::Instantiate => {
-                    let fields = op.operands();
-                    let mut object = ObjInstance::new(fields[0]);
-                    for (idx, field) in fields.into_iter().enumerate() {
+                    let owner = op.operands()[0];
+                    let mut object = ObjInstance::new(owner);
+                    for (idx, field) in self.properties[&owner].iter().enumerate() {
                         if idx == 0 {
                             continue;
                         }
@@ -343,7 +316,7 @@ impl Machine {
                         let owner = instance.as_ref().name();
 
                         self.enter(arity);
-                        self.ip = self.labels[&self.methods[&owner][&name]];
+                        self.ip = self.labels[self.methods[&owner][&name]];
                     }
                 }
                 Byte::This => {
@@ -353,19 +326,31 @@ impl Machine {
                 Byte::Prop => {
                     let operands = op.operands();
                     if let Value::OBJECT(Objects::Object(mut obj)) = self.peek_obj(0) {
-                        if operands[1] == 1 {
-                            obj.as_mut().update(operands[0], self.stack.pop());
-                            self.stack.pop();
-                        } else {
-                            self.stack.pop();
-                            if let Some(value) = obj.as_ref().get(operands[0]) {
-                                self.stack.push(*value);
-                            } else {
-                                unreachable!("Unable to fetch state field");
+                        match operands[1] {
+                            0 => {
+                                self.stack.pop();
+                                if let Some(value) = obj.as_ref().get(operands[0]) {
+                                    self.stack.push(*value);
+                                }
                             }
+                            1 => {
+                                obj.as_mut().update(operands[0], self.stack.pop());
+                                self.stack.pop();
+                            }
+                            2 => {
+                                let [owner, _, field, ..] = op.operands();
+                                self.properties
+                                    .entry(*owner)
+                                    .and_modify(|state| {
+                                        state.push(*field);
+                                    })
+                                    .or_insert_with(|| vec![*field]);
+                            }
+                            _ => unreachable!("Unable to fetch state field"),
                         }
                     }
                 }
+                Byte::Method => (),
                 op => {
                     return Err(Error::new(
                         ErrorOrigin::RUNTIME,
@@ -390,8 +375,7 @@ impl Machine {
         for (position, byte) in bytes {
             match byte.byte() {
                 Byte::Label => {
-                    self.labels
-                        .insert(byte.operand(0).copied().unwrap_or_default(), position);
+                    self.labels[byte.operand(0)] = position;
                 }
                 Byte::Method => {
                     let operands = byte.operands();
@@ -445,8 +429,9 @@ impl Machine {
     }
 
     fn enter(&mut self, arity: usize) {
-        if self.frames.len() == self.fp {
-            self.frames.resize(self.fp + 4, Default::default());
+        let length = self.frames.len();
+        if length < self.fp {
+            self.frames.resize(length + FRAME_SIZE, Default::default());
         }
 
         self.frames[self.fp].replace(self.ip, self.stack.tell(arity));
@@ -463,9 +448,11 @@ impl Machine {
 
         self.ip = frame.tell();
         self.stack.restore(frame.stack());
-        self.gc();
+        if self.heap.has_allocated() {
+            self.gc();
+        }
 
-        return Ok(());
+        Ok(())
     }
 
     fn lookup(&self, name: usize) -> usize {
@@ -477,10 +464,6 @@ impl Machine {
     }
 
     fn reassign(&mut self, symbol: usize, position: usize) {
-        if self.frames.len() == self.fp {
-            self.frames.resize(self.fp + 4, Default::default());
-        }
-
         self.frames[self.fp].overwrite(symbol, position);
     }
 
@@ -509,9 +492,9 @@ mod tests {
     #[test]
     fn test_integer_addition() {
         let mut values = Data::default();
-        let num = values.add_constant((Value::INTEGER(2)));
+        let num = values.add_constant(Value::INTEGER(2));
         let mut constant = Code::new(Byte::Push);
-        constant.with_operands(vec![num]);
+        constant.with_operands([num, 0, 0, 0, 0]);
 
         let mut program = Program::new(vec![
             constant.clone(),
@@ -528,8 +511,8 @@ mod tests {
     #[test]
     fn test_float_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant((Value::FLOAT(0.8)))]);
-        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant((Value::FLOAT(0.1)))]);
+        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.8))]);
+        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.1))]);
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
@@ -542,8 +525,8 @@ mod tests {
     #[test]
     fn test_int_float_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant((Value::INTEGER(8)))]);
-        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant((Value::FLOAT(0.1)))]);
+        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::INTEGER(8))]);
+        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.1))]);
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
@@ -556,8 +539,8 @@ mod tests {
     #[test]
     fn test_float_int_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant((Value::FLOAT(0.8)))]);
-        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant((Value::INTEGER(1)))]);
+        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.8))]);
+        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::INTEGER(1))]);
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);

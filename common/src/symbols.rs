@@ -1,4 +1,3 @@
-// use ahash::HashMap;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::interner::Interner;
@@ -26,11 +25,11 @@ impl SymbolTable {
         idx
     }
 
-    pub fn constant(&self, symbol: usize) -> Option<&usize> {
-        self.mapping.get(&symbol)
+    pub fn constant(&self, symbol: usize) -> usize {
+        self.mapping[&symbol]
     }
 
-    pub fn name(&self, symbol: usize) -> Option<&String> {
+    pub fn name(&self, symbol: usize) -> &String {
         self.names.lookup(symbol)
     }
 }

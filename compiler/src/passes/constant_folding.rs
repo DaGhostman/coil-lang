@@ -8,9 +8,9 @@ use crate::CompilationPass;
 pub struct ConstantFolding {}
 
 impl CompilationPass for ConstantFolding {
-    fn compile<'pass>(
+    fn compile(
         &mut self,
-        code: &'pass [Code],
+        code: &[Code],
         data: &mut Data,
     ) -> Result<Vec<Code>, common::error::Error> {
         let default_value = Value::default();
@@ -25,18 +25,15 @@ impl CompilationPass for ConstantFolding {
 
                 match op.byte() {
                     Byte::Label => {
-                        if let Some(offset) = op.operand(1) {
-                            if let Ok(mut chunk) =
-                                self.compile(&code[cursor..cursor + offset].to_vec(), data)
-                            {
-                                modified.push(Code::new_with_operands(
-                                    Byte::Label,
-                                    vec![op.operand(0).copied().unwrap(), chunk.len()],
-                                ));
-                                modified.append(&mut chunk);
-                            }
-                            cursor += offset;
+                        let offset = op.operand(1);
+                        if let Ok(mut chunk) = self.compile(&code[cursor..cursor + offset], data) {
+                            modified.push(Code::new_with_operands(
+                                Byte::Label,
+                                [op.operand(0), chunk.len(), 0, 0, 0],
+                            ));
+                            modified.append(&mut chunk);
                         }
+                        cursor += offset;
                     }
                     Byte::Add => {
                         let rhs = modified.last();
@@ -46,38 +43,36 @@ impl CompilationPass for ConstantFolding {
                             (rhs.map(|o| o.byte()), lhs.map(|o| o.byte()))
                         {
                             match (
-                                lhs.map(|c| {
-                                    data.constant(c.operand(0).copied().unwrap_or_default())
-                                        .unwrap_or(&default_value)
-                                }),
-                                rhs.map(|c| {
-                                    data.constant(c.operand(0).copied().unwrap_or_default())
-                                        .unwrap_or(&default_value)
-                                }),
+                                lhs.map(|c| data.constant(c.operand(0))),
+                                rhs.map(|c| data.constant(c.operand(0))),
                             ) {
                                 (Some(Value::INTEGER(lhs)), Some(Value::INTEGER(rhs))) => {
-                                    let c = data.add_constant((Value::INTEGER(lhs + rhs)));
+                                    let c = data.add_constant(Value::INTEGER(lhs + rhs));
                                     modified.pop();
                                     modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, vec![c]));
+                                    modified
+                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
                                 }
                                 (Some(Value::FLOAT(lhs)), Some(Value::FLOAT(rhs))) => {
                                     let c = data.add_constant(Value::from(lhs + rhs));
                                     modified.pop();
                                     modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, vec![c]));
+                                    modified
+                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
                                 }
                                 (Some(Value::INTEGER(lhs)), Some(Value::FLOAT(rhs))) => {
                                     let c = data.add_constant(Value::from((*lhs as f64) + rhs));
                                     modified.pop();
                                     modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, vec![c]));
+                                    modified
+                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
                                 }
                                 (Some(Value::FLOAT(lhs)), Some(Value::INTEGER(rhs))) => {
                                     let c = data.add_constant(Value::from(lhs + (*rhs as f64)));
                                     modified.pop();
                                     modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, vec![c]));
+                                    modified
+                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
                                 }
                                 _ => {
                                     // dbg!("NONO", &a, &b);

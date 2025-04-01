@@ -4,7 +4,6 @@ use std::{
     borrow::Borrow,
     fmt::Display,
     hash::{Hash, Hasher},
-    ops::Deref,
 };
 
 fn calculate_hash<V: Hash>(value: &V) -> u64 {

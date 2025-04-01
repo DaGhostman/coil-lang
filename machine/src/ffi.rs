@@ -10,7 +10,7 @@ use libffi::{
     low::{CodePtr, call, prep_cif},
     raw::{ffi_abi_FFI_DEFAULT_ABI, ffi_cif, ffi_type},
 };
-use libloading::{Error as LoadingError, Library, Symbol};
+use libloading::{Library, Symbol};
 use std::ffi::c_void;
 
 #[derive(Debug)]
@@ -99,7 +99,7 @@ impl FFIFunction {
 
         let function = format!("{}\0", self.name);
         let func: Symbol<*mut c_void> = unsafe {
-            lib.get(&function.as_bytes())
+            lib.get(function.as_bytes())
                 .map_err(|e| Error::new(ErrorOrigin::FFI, format!("{}", e)))?
         };
 
