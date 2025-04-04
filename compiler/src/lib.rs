@@ -607,10 +607,11 @@ impl<'compilation> Compiler<'compilation> {
                     self.context.leave();
 
                     self.context.add_method(*owner, *name, label, *arity);
-                    result.insert(
-                        0,
-                        Code::new_with_operands(Byte::Method, [*owner, *name, label, *arity, 0]),
-                    );
+                    self.data.add_method(*owner, *name, label);
+                    // result.insert(
+                    //     0,
+                    //     Code::new_with_operands(Byte::Method, [*owner, *name, label, *arity, 0]),
+                    // );
 
                     result
                 }
@@ -672,6 +673,9 @@ impl<'compilation> Compiler<'compilation> {
             Ok(mut bytecode) => {
                 for compiler in &mut self.pipeline {
                     bytecode = if let Ok(code) = compiler.compile(&bytecode, &mut self.data) {
+                        // _ = &code.iter().enumerate().for_each(|(idx, c)| {
+                        //     println!("#{} {:?}", idx, c.byte());
+                        // });
                         code
                     } else {
                         return Err(Error::new(

@@ -19,6 +19,28 @@ pub mod memory2;
 pub mod opcodes;
 pub mod program;
 pub mod types;
+pub mod vec_array;
+
+#[inline]
+#[cold]
+fn cold() {}
+
+#[inline]
+pub fn likely(b: bool) -> bool {
+    if !b {
+        cold();
+    }
+
+    b
+}
+
+pub fn unlikely(b: bool) -> bool {
+    if b {
+        cold();
+    }
+
+    b
+}
 
 #[derive(Default, Copy, Clone)]
 pub enum Value {
@@ -75,153 +97,153 @@ impl PartialOrd for Value {
 }
 
 impl Add for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs + rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs + rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs as f64 + rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Some(Value::FLOAT(lhs + rhs as f64)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs + rhs)),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs + rhs)),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 + rhs)),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs + rhs as f64)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Sub for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn sub(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs - rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs - rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs as f64 - rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Some(Value::FLOAT(lhs - rhs as f64)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs - rhs)),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs - rhs)),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 - rhs)),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs - rhs as f64)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Mul for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn mul(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs * rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs * rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs as f64 * rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Some(Value::FLOAT(lhs * rhs as f64)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs * rhs)),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs * rhs)),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 * rhs)),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs * rhs as f64)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Div for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn div(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs / rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs / rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs as f64 / rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Some(Value::FLOAT(lhs / rhs as f64)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs / rhs)),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs / rhs)),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 / rhs)),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs / rhs as f64)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Rem for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn rem(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs % rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs % rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Some(Value::FLOAT(lhs as f64 % rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Some(Value::FLOAT(lhs % rhs as f64)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs % rhs)),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs % rhs)),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 % rhs)),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs % rhs as f64)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Shl for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn shl(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs << rhs)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs << rhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Shr for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn shr(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs >> rhs)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs >> rhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl BitAnd for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn bitand(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs & rhs)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Some(Value::BOOLEAN(lhs & rhs)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs & rhs)),
+            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => (Value::BOOLEAN(lhs & rhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl BitOr for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn bitor(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs | rhs)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Some(Value::BOOLEAN(lhs | rhs)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs | rhs)),
+            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => (Value::BOOLEAN(lhs | rhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl BitXor for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn bitxor(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Some(Value::INTEGER(lhs ^ rhs)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Some(Value::BOOLEAN(lhs ^ rhs)),
-            _ => None,
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs ^ rhs)),
+            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => (Value::BOOLEAN(lhs ^ rhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Not for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn not(self) -> Self::Output {
         match self {
-            Value::INTEGER(lhs) => Some(Value::INTEGER(!lhs)),
-            Value::BOOLEAN(lhs) => Some(Value::BOOLEAN(!lhs)),
-            _ => None,
+            Value::INTEGER(lhs) => (Value::INTEGER(!lhs)),
+            Value::BOOLEAN(lhs) => (Value::BOOLEAN(!lhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }
 
 impl Neg for Value {
-    type Output = Option<Value>;
+    type Output = Value;
 
     fn neg(self) -> Self::Output {
         match self {
-            Value::INTEGER(rhs) => Some(Value::INTEGER(-rhs)),
-            Value::FLOAT(rhs) => Some(Value::FLOAT(-rhs)),
-            _ => None,
+            Value::INTEGER(rhs) => (Value::INTEGER(-rhs)),
+            Value::FLOAT(rhs) => (Value::FLOAT(-rhs)),
+            _ => unreachable!("Invalid operation"),
         }
     }
 }

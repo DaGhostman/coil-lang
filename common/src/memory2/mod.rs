@@ -6,13 +6,7 @@ pub mod object;
 
 use std::fmt::Debug;
 
-const STACK_SIZE: usize = 8192;
-
-#[derive(Debug)]
-pub enum MemoryError {
-    StackOverflow,
-    StackUnderflow,
-}
+const STACK_SIZE: usize = 2048;
 
 pub struct Stack<T>
 where
@@ -25,7 +19,7 @@ where
 impl<T> Default for Stack<T>
 where
     T: Copy + Default + Debug,
- {
+{
     fn default() -> Self {
         Self::new()
     }
@@ -97,6 +91,13 @@ where
             cursor: 0,
             length: self.sp,
             items: self.stack[..self.sp].as_ref(),
+        }
+    }
+    pub fn iter_from(&self, index: usize) -> StackIterator<'_, T> {
+        StackIterator {
+            cursor: 0,
+            length: self.sp,
+            items: self.stack[index..self.sp].as_ref(),
         }
     }
 }

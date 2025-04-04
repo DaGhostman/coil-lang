@@ -3,7 +3,10 @@ use std::{fs::File, io::Read, path::Path};
 use clap::{ArgAction, Parser as Clap, ValueHint};
 use compiler::{
     Compiler,
-    passes::{constant_folding::ConstantFolding, typechecker::TypeChecker},
+    passes::{
+        constant_folding::ConstantFolding, jump_translation::LabelUnrolling,
+        typechecker::TypeChecker,
+    },
 };
 use machine::{options::MachineOptions, stack::Machine};
 use parser::Parser;
@@ -83,12 +86,15 @@ fn main() {
 
         let mut typechecker = TypeChecker::default();
         let mut constant_folder = ConstantFolding::default();
+        let mut label_conversion = LabelUnrolling::default();
 
         compiler.attach(&mut typechecker);
 
         if args.optimize {
             compiler.attach(&mut constant_folder);
         }
+
+        compiler.attach(&mut label_conversion);
 
         if let Ok(program) = Parser::default().parse(&mut scanner) {
             match compiler.compile(program) {

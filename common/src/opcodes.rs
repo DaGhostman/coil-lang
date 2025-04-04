@@ -162,8 +162,10 @@ pub enum Byte {
     Scope,
     /// Leave a stack frame
     Leave,
-    /// Jump to relative offset
+    /// Jump to absolute offset
     Jump,
+    /// Jump to relative offset
+    Jumpr,
     /// Conditionally jump to relative offset
     Jumpz,
     /// Flip the expression
@@ -236,7 +238,7 @@ pub enum Byte {
     Array,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Code {
     byte: Byte,
     operands: [usize; 5],

@@ -37,6 +37,10 @@ impl<V: Hash + Clone + Eq + std::fmt::Debug> Interner<V> {
         })
     }
 
+    pub fn replace(&mut self, index: usize, value: V) {
+        self.storage[index] = value;
+    }
+
     pub fn lookup(&self, key: usize) -> &V {
         &self.storage[key]
     }
@@ -86,6 +90,6 @@ mod tests {
         let key = interner.intern("bar");
         interner.intern("baz");
 
-        assert_eq!(Some(&"bar"), interner.lookup(key));
+        assert_eq!(&"bar", interner.lookup(key));
     }
 }

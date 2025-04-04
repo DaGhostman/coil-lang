@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap as HashMap;
 use std::ffi::c_void;
 
 use crate::{Value, interner::Interner, symbols::SymbolTable};
@@ -7,6 +8,7 @@ pub struct Data {
     constants: Interner<Value>,
     strings: Interner<String>,
     symbols: SymbolTable,
+    methods: HashMap<usize, HashMap<usize, usize>>,
 
     pointers: Vec<*mut c_void>,
 }
@@ -22,6 +24,10 @@ impl Data {
 
     pub fn add_constant(&mut self, value: Value) -> usize {
         self.constants.intern(value)
+    }
+
+    pub fn replace_constant(&mut self, index: usize, value: Value) {
+        self.constants.replace(index, value);
     }
 
     pub fn constant(&self, index: usize) -> &Value {
@@ -41,6 +47,23 @@ impl Data {
 
     pub fn symbol_constant(&self, symbol: usize) -> usize {
         self.symbols.constant(symbol)
+    }
+
+    pub fn add_method(&mut self, owner: usize, name: usize, label: usize) {
+        self.methods
+            .entry(owner)
+            .and_modify(|c| {
+                c.insert(name, label);
+            })
+            .or_insert_with(|| HashMap::from_iter(vec![(name, label)]));
+    }
+
+    pub fn get_methods(&self, owner: usize) -> &HashMap<usize, usize> {
+        &self.methods[&owner]
+    }
+
+    pub fn get_method_label(&self, owner: usize, name: usize) -> usize {
+        self.methods[&owner][&name]
     }
 
     pub fn symbol_constant_value(&self, symbol: usize) -> &Value {
