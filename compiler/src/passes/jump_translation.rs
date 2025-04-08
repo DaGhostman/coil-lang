@@ -30,23 +30,18 @@ impl CompilationPass for LabelUnrolling {
 
         for bytecode in bytecode.iter_mut() {
             *bytecode = match bytecode.byte() {
-                Byte::Jump => Code::new_with_operands(
-                    Byte::Jump,
-                    [labels.get(bytecode.operand(0)) + 1, 0, 0, 0, 0],
-                ),
+                Byte::Jump => {
+                    Code::new_with_operands(Byte::Jump, [labels.get(bytecode.operand(0)) + 1, 0, 0])
+                }
                 Byte::Jumpz => Code::new_with_operands(
                     Byte::Jumpz,
                     [
                         labels.get(bytecode.operand(0)) + 1,
                         labels.get(bytecode.operand(1)) + 1,
                         0,
-                        0,
-                        0,
                     ],
                 ),
-                Byte::Label => {
-                    Code::new_with_operands(Byte::Jumpr, [bytecode.operand(1), 0, 0, 0, 0])
-                }
+                Byte::Label => Code::new_with_operands(Byte::Jumpr, [bytecode.operand(1), 0, 0]),
                 Byte::Push => {
                     if let Value::FUNCTION(arity, label) = data.constant(bytecode.operand(0)) {
                         data.replace_constant(

@@ -89,7 +89,7 @@ pub struct Metadata {
 #[derive(Copy, Clone, PartialEq)]
 pub struct IR {
     code: Operation,
-    operands: [usize; 5],
+    operands: [usize; 3],
     metadata: Option<Metadata>,
 }
 
@@ -110,7 +110,7 @@ impl Debug for IR {
 }
 
 impl IR {
-    pub fn new(code: Operation, values: Option<[usize; 5]>) -> Self {
+    pub fn new(code: Operation, values: Option<[usize; 3]>) -> Self {
         Self {
             code,
             operands: values.unwrap_or_default(),
@@ -118,11 +118,11 @@ impl IR {
         }
     }
 
-    pub fn operands(&self) -> &[usize; 5] {
+    pub fn operands(&self) -> &[usize; 3] {
         self.operands.borrow()
     }
 
-    pub fn operands_mut(&mut self) -> &mut [usize; 5] {
+    pub fn operands_mut(&mut self) -> &mut [usize; 3] {
         self.operands.borrow_mut()
     }
 
@@ -203,6 +203,8 @@ pub enum Byte {
     Less,
     /// Greater than
     Greater,
+    /// Equal
+    Equal,
     /// Push a value on the stack
     Push,
     /// Pop a value from the stack
@@ -241,22 +243,22 @@ pub enum Byte {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Code {
     byte: Byte,
-    operands: [usize; 5],
+    operands: [usize; 3],
 }
 
 impl Code {
     pub fn new(byte: Byte) -> Self {
         Self {
             byte,
-            operands: [0, 0, 0, 0, 0],
+            operands: [0, 0, 0],
         }
     }
 
-    pub fn new_with_operands(byte: Byte, operands: [usize; 5]) -> Self {
+    pub fn new_with_operands(byte: Byte, operands: [usize; 3]) -> Self {
         Self { byte, operands }
     }
 
-    pub fn with_operands(&mut self, operands: [usize; 5]) {
+    pub fn with_operands(&mut self, operands: [usize; 3]) {
         self.operands = operands;
     }
 
@@ -268,7 +270,7 @@ impl Code {
         self.operands[idx]
     }
 
-    pub fn operands(&self) -> &[usize; 5] {
+    pub fn operands(&self) -> &[usize; 3] {
         &self.operands
     }
 

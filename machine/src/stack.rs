@@ -16,7 +16,7 @@ use common::{
     unlikely,
 };
 
-const FRAME_SIZE: usize = 64;
+const FRAME_SIZE: usize = 512;
 
 pub struct Machine {
     stdout: Output,
@@ -25,7 +25,7 @@ pub struct Machine {
 
     ip: usize,
     fp: usize,
-    frames: VecArray<Frame, FRAME_SIZE>,
+    frames: [Frame; FRAME_SIZE],
     stack: Stack<Value>,
     heap: Heap,
     // owner => name => label
@@ -36,14 +36,11 @@ pub struct Machine {
 }
 impl Default for Machine {
     fn default() -> Self {
-        let mut frames: VecArray<Frame, FRAME_SIZE> = Default::default();
-        frames.insert(0, Default::default());
-
         Self {
             halt: false,
             ip: 0,
             fp: 0,
-            frames,
+            frames: std::array::from_fn::<Frame, FRAME_SIZE, _>(|_| Default::default()),
             stack: Stack::new(),
             heap: Heap::new(2, 1024 * 1024),
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
@@ -125,9 +122,6 @@ impl Machine {
                         unreachable!("Attempting to call non-existing function");
                     }
                 }
-                Byte::Halt => {
-                    self.halt = true;
-                }
                 Byte::Leave => {
                     self.leave();
                 }
@@ -141,13 +135,6 @@ impl Machine {
                 Byte::Peek => {
                     self.reassign(op.operand(0), (self.stack.len() - 1) - op.operand(1));
                 }
-                Byte::Upvalue => {
-                    let frame = op.operand(0);
-                    let name = op.operand(1);
-                    let upvalue = op.operand(2);
-
-                    self.reassign(name, self.lookup_upvalue(frame, upvalue));
-                }
                 Byte::Store => {
                     // likely(true);
                     self.reassign(op.operand(0), self.stack.tell(1))
@@ -160,6 +147,7 @@ impl Machine {
                 Byte::Negate => unary_handler!(self, -),
                 Byte::Less => binary_handler!(self, <, BOOLEAN),
                 Byte::Greater => binary_handler!(self, >, BOOLEAN),
+                Byte::Equal => binary_handler!(self, ==, BOOLEAN),
                 Byte::Add => binary_handler!(self, +),
                 Byte::Sub => binary_handler!(self, -),
                 Byte::Mul => binary_handler!(self, *),
@@ -257,7 +245,7 @@ impl Machine {
                 }
                 Byte::This => {
                     // likely(true);
-                    let ptr = self.stack.peek(self.frames.get(self.fp - 1).tell() - 1);
+                    let ptr = self.stack.peek(self.frames[self.fp - 1].tell() - 1);
                     self.stack.push(ptr);
                 }
                 Byte::Prop => {
@@ -288,8 +276,18 @@ impl Machine {
                         }
                     }
                 }
+                Byte::Upvalue => {
+                    let frame = op.operand(0);
+                    let name = op.operand(1);
+                    let upvalue = op.operand(2);
+
+                    self.reassign(name, self.lookup_upvalue(frame, upvalue));
+                }
                 Byte::Label => {
                     self.ip += op.operand(1);
+                }
+                Byte::Halt => {
+                    self.halt = true;
                 }
                 _ => (),
             }
@@ -365,10 +363,9 @@ impl Machine {
 
     // #[inline]
     fn enter(&mut self, arity: usize) {
-        self.frames
-            .get_mut(self.fp)
-            .replace(self.ip, self.stack.tell(arity));
+        self.frames[self.fp].replace(self.ip, self.stack.tell(arity));
         self.fp += 1;
+        // self.frames[self.fp].clear();
     }
 
     // #[inline]
@@ -378,7 +375,7 @@ impl Machine {
         } else {
             self.fp -= 1;
         }
-        let frame = &self.frames.get(self.fp);
+        let frame = &self.frames[self.fp];
 
         self.ip = frame.tell();
         self.stack.restore(frame.stack());
@@ -386,16 +383,16 @@ impl Machine {
 
     // #[inline]
     fn lookup(&self, name: usize) -> usize {
-        self.frames.get(self.fp).lookup(name)
+        self.frames[self.fp].lookup(name)
     }
 
     fn lookup_upvalue(&self, frame: usize, name: usize) -> usize {
-        self.frames.get(frame).lookup(name)
+        self.frames[frame].lookup(name)
     }
 
     // #[inline]
     fn reassign(&mut self, symbol: usize, position: usize) {
-        self.frames.get_mut(self.fp).overwrite(symbol, position);
+        self.frames[self.fp].overwrite(symbol, position);
     }
 
     // #[inline]
@@ -426,7 +423,7 @@ mod tests {
         let mut values = Data::default();
         let num = values.add_constant(Value::INTEGER(2));
         let mut constant = Code::new(Byte::Push);
-        constant.with_operands([num, 0, 0, 0, 0]);
+        constant.with_operands([num, 0, 0]);
 
         let mut program = Program::new(vec![
             constant.clone(),
@@ -443,8 +440,8 @@ mod tests {
     #[test]
     fn test_float_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.8))]);
-        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.1))]);
+        let a = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.8)), 0, 0]);
+        let b = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.1)), 0, 0]);
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
@@ -457,8 +454,8 @@ mod tests {
     #[test]
     fn test_int_float_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::INTEGER(8))]);
-        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.1))]);
+        let a = Code::new_with_operands(Byte::Push, [values.add_constant(Value::INTEGER(8)), 0, 0]);
+        let b = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.1)), 0, 0]);
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
@@ -471,8 +468,8 @@ mod tests {
     #[test]
     fn test_float_int_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::FLOAT(0.8))]);
-        let b = Code::new_with_operands(Byte::Push, vec![values.add_constant(Value::INTEGER(1))]);
+        let a = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.8)), 0, 0]);
+        let b = Code::new_with_operands(Byte::Push, [values.add_constant(Value::INTEGER(1)), 0, 0]);
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);

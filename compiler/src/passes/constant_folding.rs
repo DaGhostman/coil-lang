@@ -29,7 +29,7 @@ impl CompilationPass for ConstantFolding {
                         if let Ok(mut chunk) = self.compile(&code[cursor..cursor + offset], data) {
                             modified.push(Code::new_with_operands(
                                 Byte::Label,
-                                [op.operand(0), chunk.len(), 0, 0, 0],
+                                [op.operand(0), chunk.len(), 0],
                             ));
                             modified.append(&mut chunk);
                         }
@@ -50,29 +50,25 @@ impl CompilationPass for ConstantFolding {
                                     let c = data.add_constant(Value::INTEGER(lhs + rhs));
                                     modified.pop();
                                     modified.pop();
-                                    modified
-                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
+                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 (Some(Value::FLOAT(lhs)), Some(Value::FLOAT(rhs))) => {
                                     let c = data.add_constant(Value::from(lhs + rhs));
                                     modified.pop();
                                     modified.pop();
-                                    modified
-                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
+                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 (Some(Value::INTEGER(lhs)), Some(Value::FLOAT(rhs))) => {
                                     let c = data.add_constant(Value::from((*lhs as f64) + rhs));
                                     modified.pop();
                                     modified.pop();
-                                    modified
-                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
+                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 (Some(Value::FLOAT(lhs)), Some(Value::INTEGER(rhs))) => {
                                     let c = data.add_constant(Value::from(lhs + (*rhs as f64)));
                                     modified.pop();
                                     modified.pop();
-                                    modified
-                                        .push(Code::new_with_operands(Byte::Push, [c, 0, 0, 0, 0]));
+                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 _ => {
                                     // dbg!("NONO", &a, &b);

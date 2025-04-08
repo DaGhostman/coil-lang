@@ -93,9 +93,9 @@ impl Parser {
             // dbg!(&length, &idx);
             *token = match token.code() {
                 Operation::ConditionJump => {
-                    IR::new(Operation::ConditionJump, Some([length - idx, 0, 0, 0, 0]))
+                    IR::new(Operation::ConditionJump, Some([length - idx, 0, 0]))
                 }
-                Operation::Jump => IR::new(Operation::Jump, Some([length - idx, 0, 0, 0, 0])),
+                Operation::Jump => IR::new(Operation::Jump, Some([length - idx, 0, 0])),
                 // Operation::Break => IR::new(Operation::Break, Some([tokens.len() - (idx) - 1, 0,0])),
                 // Operation::Continue => IR::new(Operation::Continue, Some([tokens.len() - (idx) - 1, 0,0])),
                 _ => unreachable!("Should not attempt to jump patch non-jumping instruction"),
@@ -126,7 +126,7 @@ impl Parser {
         let constant = self.data.add_constant(value);
 
         ctx.advance();
-        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn number(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -164,7 +164,7 @@ impl Parser {
 
         let constant = self.data.add_constant(value);
 
-        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn float(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -177,7 +177,7 @@ impl Parser {
         ctx.advance();
         let constant = self.data.add_constant(value);
 
-        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn string(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -185,7 +185,7 @@ impl Parser {
         let constant = self.data.add_constant(Value::STR(string));
 
         ctx.advance();
-        vec![IR::new(Operation::Const, Some([constant, 0, 0, 0, 0]))]
+        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn identifier(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -203,13 +203,13 @@ impl Parser {
                 arity += 1;
             }
 
-            tokens.push(IR::new(Operation::Call, Some([symbol, arity, 0, 0, 0])));
+            tokens.push(IR::new(Operation::Call, Some([symbol, arity, 0])));
         } else if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
-            tokens.push(IR::new(Operation::Declare, Some([symbol, 0, 0, 0, 0])));
+            tokens.push(IR::new(Operation::Declare, Some([symbol, 0, 0])));
         } else {
             // tokens.append(&mut self.expression(ctx));
-            tokens.push(IR::new(Operation::Load, Some([symbol, 0, 0, 0, 0])));
+            tokens.push(IR::new(Operation::Load, Some([symbol, 0, 0])));
         } // TODO: handle other tokens on identifiers, like increment, decrement, etc.
 
         tokens
@@ -226,7 +226,7 @@ impl Parser {
             }
         }
 
-        tokens.push(IR::new(Operation::Array, Some([arity, 0, 0, 0, 0])));
+        tokens.push(IR::new(Operation::Array, Some([arity, 0, 0])));
 
         tokens
     }
@@ -344,7 +344,7 @@ impl Parser {
             0,
             IR::new(
                 Operation::Check,
-                Some([full_predicate.len(), tokens.len(), 0, 0, 0]),
+                Some([full_predicate.len(), tokens.len(), 0]),
             ),
         );
 
@@ -415,7 +415,7 @@ impl Parser {
                     .add_symbol(ctx.current().lexeme().to_string(), None);
                 // ctx.advance();
                 tokens.append(&mut self.expression(ctx));
-                tokens.push(IR::new(Operation::Store, Some([symbol, 0, 0, 0, 0])));
+                tokens.push(IR::new(Operation::Store, Some([symbol, 0, 0])));
             }
             _ => {
                 tokens.append(&mut self.expression(ctx));
@@ -459,10 +459,7 @@ impl Parser {
             self.consume(ctx, TokenKind::Comma);
         }
 
-        tokens.insert(
-            0,
-            IR::new(Operation::Match, Some([tokens.len(), 0, 0, 0, 0])),
-        );
+        tokens.insert(0, IR::new(Operation::Match, Some([tokens.len(), 0, 0])));
 
         tokens
     }
@@ -532,7 +529,7 @@ impl Parser {
             0,
             IR::new(
                 Operation::Condition,
-                Some([condition_len, body_len, alternative.len(), 0, 0]),
+                Some([condition_len, body_len, alternative.len()]),
             ),
         );
         tokens.append(&mut alternative);
@@ -571,32 +568,18 @@ impl Parser {
                         self.data.add_symbol(name.lexeme().to_string(), None),
                         arity,
                         0,
-                        0,
-                        0,
                     ]),
                 ));
             } else if self.consume(ctx, TokenKind::Equal) {
                 tokens.append(&mut self.expression(ctx));
                 tokens.push(IR::new(
                     Operation::PropAssign,
-                    Some([
-                        self.data.add_symbol(name.lexeme().to_string(), None),
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]),
+                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
                 ));
             } else {
                 tokens.push(IR::new(
                     Operation::PropLoad,
-                    Some([
-                        self.data.add_symbol(name.lexeme().to_string(), None),
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]),
+                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
                 ));
                 // todo!("Handle remainder of cases");
             } // TODO: Implement Increment for properties
@@ -706,13 +689,7 @@ impl Parser {
         let mut tokens = self.expr(ctx);
         tokens.push(IR::new(
             Operation::Assign,
-            Some([
-                self.data.add_symbol(name.lexeme().to_string(), None),
-                0,
-                0,
-                0,
-                0,
-            ]),
+            Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
         ));
 
         tokens
@@ -729,13 +706,7 @@ impl Parser {
 
         tokens.push(IR::new(
             Operation::Declare,
-            Some([
-                self.data.add_symbol(name.lexeme().to_string(), None),
-                1,
-                0,
-                0,
-                0,
-            ]),
+            Some([self.data.add_symbol(name.lexeme().to_string(), None), 1, 0]),
         ));
 
         tokens
@@ -789,9 +760,7 @@ impl Parser {
                         Operation::Argument,
                         Some([
                             self.data.add_symbol(argument.lexeme().to_string(), None),
-                            type_.into(),
                             arity,
-                            0,
                             0,
                         ]),
                     ),
@@ -817,13 +786,7 @@ impl Parser {
                 self.expect(ctx, TokenKind::Identifier, "Expected variable name");
                 upvalues.push(IR::new(
                     Operation::Upvalue,
-                    Some([
-                        self.data.add_symbol(name.lexeme().to_string(), None),
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]),
+                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
                 ));
                 self.consume(ctx, TokenKind::Comma);
             }
@@ -835,7 +798,7 @@ impl Parser {
         let symbol = self.data.add_symbol(name, None);
         tokens.push(IR::new(
             Operation::Function,
-            Some([symbol, arity, body.len(), 0, 0]),
+            Some([symbol, arity, body.len()]),
         ));
         tokens.append(&mut body);
 
@@ -848,7 +811,7 @@ impl Parser {
         } else {
             "asd".to_string()
         };
-        let name_symbol = self.data.add_symbol(name, None);
+        let owner = self.data.add_symbol(name, None);
 
         self.expect(
             ctx,
@@ -870,11 +833,9 @@ impl Parser {
                 prop.push(IR::new(
                     Operation::Prop,
                     Some([
-                        name_symbol,
+                        owner,
                         self.data.add_symbol(prop_name, None),
                         public as usize,
-                        0,
-                        0,
                     ]),
                 ));
 
@@ -884,16 +845,8 @@ impl Parser {
                 let mut method = self.function(ctx);
                 if let Some(code) = method.first_mut() {
                     let operands = code.operands();
-                    let method = IR::new(
-                        Operation::Method,
-                        Some([
-                            name_symbol,
-                            operands[0],
-                            operands[1],
-                            operands[2],
-                            operands[3],
-                        ]),
-                    );
+                    let method =
+                        IR::new(Operation::Method, Some([owner, operands[0], operands[2]]));
                     *code = method;
                 }
                 class.append(&mut method);
@@ -901,10 +854,7 @@ impl Parser {
         }
 
         class.insert(0, IR::new(Operation::Begin, None));
-        class.insert(
-            0,
-            IR::new(Operation::Class, Some([name_symbol, class.len(), 0, 0, 0])),
-        );
+        class.insert(0, IR::new(Operation::Class, Some([owner, class.len(), 0])));
         class.push(IR::new(Operation::End, None));
 
         class
@@ -925,7 +875,7 @@ impl Parser {
 
             result.push(IR::new(
                 Operation::Instantiate,
-                Some([self.data.add_symbol(name, None), arity, 0, 0, 0]),
+                Some([self.data.add_symbol(name, None), arity, 0]),
             ));
         }
 
@@ -960,7 +910,7 @@ impl Parser {
             TokenKind::PrintLn => {
                 ctx.advance();
                 let mut tokens = self.expr(ctx);
-                tokens.push(IR::new(Operation::Print, Some([1, 0, 0, 0, 0])));
+                tokens.push(IR::new(Operation::Print, Some([1, 0, 0])));
 
                 tokens
             }

@@ -2,7 +2,7 @@ use std::ops::{Index, IndexMut};
 
 use crate::likely;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VecArray<T, const N: usize>
 where
     T: Clone,
@@ -102,6 +102,11 @@ where
         }
     }
 
+    pub fn clear(&mut self) {
+        self.storage = core::array::from_fn::<T, N, _>(|_| Default::default());
+        self.expansions.clear();
+        self.size = 0;
+    }
     pub fn len(&self) -> usize {
         self.size
     }

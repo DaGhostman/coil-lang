@@ -316,7 +316,7 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::GreaterEqual => vec![Code::new(Byte::Less), Code::new(Byte::Not)],
                 Operation::Print => vec![Code::new_with_operands(
                     Byte::Print,
-                    [if op.operands()[0] == 1 { 1 } else { 0 }, 0, 0, 0, 0],
+                    [if op.operands()[0] == 1 { 1 } else { 0 }, 0, 0],
                 )],
                 Operation::Leave => {
                     // if self.context.is_tco() {
@@ -345,14 +345,12 @@ impl<'compilation> Compiler<'compilation> {
                         Ok(mut body) => {
                             body.push(Code::new_with_operands(
                                 Byte::Push,
-                                [self.data.add_constant(Value::NONE), 0, 0, 0, 0],
+                                [self.data.add_constant(Value::NONE), 0, 0],
                             ));
                             body.push(Code::new(Byte::Leave));
 
-                            result.push(Code::new_with_operands(
-                                Byte::Label,
-                                [label, body.len(), 0, 0, 0],
-                            ));
+                            result
+                                .push(Code::new_with_operands(Byte::Label, [label, body.len(), 0]));
                             result.append(&mut body);
                         }
                         Err(err) => {
@@ -362,7 +360,7 @@ impl<'compilation> Compiler<'compilation> {
                     self.context.leave();
 
                     let mut func = Code::new(Byte::Push);
-                    func.with_operands([constant, 0, 0, 0, 0]);
+                    func.with_operands([constant, 0, 0]);
                     result.push(func);
 
                     result
@@ -385,7 +383,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     vec![Code::new_with_operands(
                         Byte::Store,
-                        [self.context.variables().create(operands[0]), 0, 0, 0, 0],
+                        [self.context.variables().create(operands[0]), 0, 0],
                     )]
                 }
                 Operation::Declare => {
@@ -397,7 +395,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     vec![Code::new_with_operands(
                         Byte::Store,
-                        [self.context.variables().create(operands[0]), 0, 0, 0, 0],
+                        [self.context.variables().create(operands[0]), 0, 0],
                     )]
                 }
                 Operation::Upvalue => {
@@ -407,7 +405,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     vec![Code::new_with_operands(
                         Byte::Upvalue,
-                        [self.context.frame(), variable, upvalue, 0, 0],
+                        [self.context.frame(), variable, upvalue],
                     )]
                 }
                 Operation::Argument => {
@@ -416,7 +414,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     vec![Code::new_with_operands(
                         Byte::Peek,
-                        [position, operands[2], 0, 0, 0],
+                        [position, operands[2], 0],
                     )]
                 }
                 Operation::Load => {
@@ -442,13 +440,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     vec![Code::new_with_operands(
                         Byte::Load,
-                        [
-                            self.context.variables().get(operands[0]).position,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ],
+                        [self.context.variables().get(operands[0]).position, 0, 0],
                     )]
                 }
                 Operation::Call => {
@@ -474,19 +466,13 @@ impl<'compilation> Compiler<'compilation> {
                             {
                                 self.context.set_tco(true);
 
-                                result.push(Code::new_with_operands(
-                                    Byte::Jump,
-                                    [*symbol, 0, 0, 0, 0],
-                                ));
+                                result.push(Code::new_with_operands(Byte::Jump, [*symbol, 0, 0]));
                             } else {
-                                result.push(Code::new_with_operands(
-                                    Byte::Push,
-                                    [constant, 0, 0, 0, 0],
-                                ));
+                                result.push(Code::new_with_operands(Byte::Push, [constant, 0, 0]));
 
                                 result.push(Code::new_with_operands(
                                     Byte::Call,
-                                    [*declaration_arity, 0, 0, 0, 0],
+                                    [*declaration_arity, 0, 0],
                                 ));
                             }
                         }
@@ -515,7 +501,7 @@ impl<'compilation> Compiler<'compilation> {
 
                         result.push(Code::new_with_operands(
                             Byte::Jumpz,
-                            [then_label, else_label, 0, 0, 0],
+                            [then_label, else_label, 0],
                         ));
 
                         if let Some(body_length) = op.get(1) {
@@ -526,20 +512,12 @@ impl<'compilation> Compiler<'compilation> {
                             local_cursor += body_length;
                             skips += body_length;
 
-                            result.push(Code::new_with_operands(
-                                Byte::Jump,
-                                [then_label, 0, 0, 0, 0],
-                            ));
-                            result.push(Code::new_with_operands(
-                                Byte::Label,
-                                [then_label, size, 0, 0, 0],
-                            ));
+                            result.push(Code::new_with_operands(Byte::Jump, [then_label, 0, 0]));
+                            result
+                                .push(Code::new_with_operands(Byte::Label, [then_label, size, 0]));
                             // result.push(Code::new(Byte::Scope));
                             result.append(&mut chunk);
-                            result.push(Code::new_with_operands(
-                                Byte::Jump,
-                                [outside_label, 0, 0, 0, 0],
-                            ));
+                            result.push(Code::new_with_operands(Byte::Jump, [outside_label, 0, 0]));
                             if let Some(alternative_length) = op.get(2) {
                                 let mut chunk = self.do_compile(
                                     &code[local_cursor..local_cursor + alternative_length],
@@ -548,13 +526,13 @@ impl<'compilation> Compiler<'compilation> {
 
                                 result.push(Code::new_with_operands(
                                     Byte::Label,
-                                    [else_label, chunk.len(), 0, 0, 0],
+                                    [else_label, chunk.len(), 0],
                                 ));
                                 // result.push(Code::new(Byte::Scope));
                                 result.append(&mut chunk);
                                 result.push(Code::new_with_operands(
                                     Byte::Label,
-                                    [outside_label, 0, 0, 0, 0],
+                                    [outside_label, 0, 0],
                                 ));
                             }
                         }
@@ -568,19 +546,19 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::Range => vec![Code::new(Byte::Range)],
                 Operation::Array => vec![Code::new_with_operands(
                     Byte::Array,
-                    [*op.get(0).unwrap(), 0, 0, 0, 0],
+                    [*op.get(0).unwrap(), 0, 0],
                 )],
                 Operation::Prop => {
                     let [owner, name, ..] = op.operands();
                     self.context.add_property(*owner, *name, 0);
                     let owner = op.operands()[0];
-                    vec![Code::new_with_operands(Byte::Prop, [owner, 2, *name, 0, 0])]
+                    vec![Code::new_with_operands(Byte::Prop, [owner, 2, *name])]
 
                     // vec![Code::new_with_operands(Byte::Prop, vec![*owner, *name])]
                 }
                 Operation::Method => {
                     let mut result = vec![];
-                    let [owner, name, arity, len, ..] = op.operands();
+                    let [owner, name, len, ..] = op.operands();
                     let label = self.label(self.data.symbol_name(*name).to_owned());
 
                     skips += len;
@@ -590,13 +568,13 @@ impl<'compilation> Compiler<'compilation> {
                         Ok(mut body) => {
                             body.push(Code::new_with_operands(
                                 Byte::Push,
-                                [self.data.add_constant(Value::default()), 0, 0, 0, 0],
+                                [self.data.add_constant(Value::default()), 0, 0],
                             ));
                             body.push(Code::new(Byte::Leave));
 
                             result.insert(
                                 0,
-                                Code::new_with_operands(Byte::Label, [label, body.len(), 0, 0, 0]),
+                                Code::new_with_operands(Byte::Label, [label, body.len(), 0]),
                             );
                             result.append(&mut body);
                         }
@@ -606,7 +584,18 @@ impl<'compilation> Compiler<'compilation> {
                     }
                     self.context.leave();
 
-                    self.context.add_method(*owner, *name, label, *arity);
+                    let arity = result
+                        .iter()
+                        .filter_map(|byte| {
+                            if byte.byte() == &Byte::Peek {
+                                Some(())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<()>>()
+                        .len();
+                    self.context.add_method(*owner, *name, label, arity);
                     self.data.add_method(*owner, *name, label);
                     // result.insert(
                     //     0,
@@ -639,7 +628,7 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::Instantiate => {
                     vec![Code::new_with_operands(
                         Byte::Instantiate,
-                        [op.operands()[0], 0, 0, 0, 0],
+                        [op.operands()[0], 0, 0],
                     )]
                 }
                 Operation::Invoke => vec![Code::new_with_operands(Byte::Invoke, *op.operands())],
@@ -695,7 +684,7 @@ impl<'compilation> Compiler<'compilation> {
         program.with_data(self.data.clone());
 
         let mut bytes = program.code().to_vec();
-        bytes.insert(0, Code::new_with_operands(Byte::Push, [void, 0, 0, 0, 0]));
+        bytes.insert(0, Code::new_with_operands(Byte::Push, [void, 0, 0]));
         bytes.push(Code::new(Byte::Leave));
         program.with_code(bytes);
 
