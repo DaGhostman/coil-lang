@@ -1,7 +1,3 @@
-use std::ops::{Index, IndexMut};
-
-use crate::likely;
-
 #[derive(Clone, Debug)]
 pub struct VecArray<T, const N: usize>
 where
@@ -13,7 +9,7 @@ where
 }
 
 fn get_slot_index(index: usize, max: usize) -> (usize, usize) {
-    let slot = (index / max);
+    let slot = (index / max) - 1;
 
     (slot, index % max)
 }
@@ -55,50 +51,44 @@ where
             &mut self.storage[index]
         } else {
             let (slot, idx) = get_slot_index(index, N);
-
             &mut self.expansions[slot][idx]
         }
     }
+    pub fn push(&mut self, value: T) {
+        self.insert(self.size, value);
+    }
+    pub fn insert(&mut self, index: usize, value: T) {
+        if self.size <= index {
+            self.size = self.size.max(index) + 1;
+        }
 
-    pub fn push(&mut self, value: T) -> usize {
-        let size = self.size;
-
-        if size < N {
-            self.storage[size] = value;
+        if index < N {
+            self.storage[index] = value
         } else {
-            let (slot, index) = get_slot_index(size, N);
-            if self.expansions.len() == slot {
-                let (max_slot, _) = get_slot_index(size, N);
+            let (slot, index) = get_slot_index(index, N);
+
+            if self.expansions.len() <= slot {
                 self.expansions.resize(
-                    max_slot + 4,
+                    slot + 4,
                     core::array::from_fn::<T, N, _>(|_| Default::default()),
                 );
             }
 
             self.expansions[slot][index] = value;
         }
-
-        self.size += 1;
-
-        size
     }
 
-    pub fn insert(&mut self, index: usize, value: T) {
-        if index < N {
-            self.storage[index] = value;
+    pub fn modify_or_insert<F: FnOnce(&mut T) -> ()>(&mut self, index: usize, or: F) {
+        if self.size > index {
+            or(if index < N {
+                &mut self.storage[index]
+            } else {
+                let (slot, idx) = get_slot_index(index, N);
+
+                &mut self.expansions[slot][idx]
+            });
         } else {
-            self.size = self.size.max(index) + 1;
-
-            let (slot, index) = get_slot_index(index, N);
-            if self.expansions.len() <= slot {
-                let (max_slot, _) = get_slot_index(index, N);
-                self.expansions.resize(
-                    max_slot + 4,
-                    core::array::from_fn::<T, N, _>(|_| Default::default()),
-                );
-            }
-
-            self.expansions[slot][index] = value;
+            self.insert(index, Default::default());
         }
     }
 
@@ -111,42 +101,6 @@ where
         self.size
     }
 }
-
-// impl<T, const N: usize> IndexMut<usize> for VecArray<T, N>
-// where
-//     T: Clone + Default,
-// {
-//     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-//         if index < N {
-//             likely(true);
-//             &mut self.storage[index]
-//         } else {
-//             let (slot, idx) = get_slot_index(index, N);
-//             if !self.contains_key(index) {
-//                 self.insert(index, Default::default());
-//             }
-//
-//             &mut self.expansions[slot][idx]
-//         }
-//     }
-// }
-//
-// impl<T, const N: usize> Index<usize> for VecArray<T, N>
-// where
-//     T: Clone + Default,
-// {
-//     type Output = T;
-//
-//     fn index(&self, index: usize) -> &Self::Output {
-//         if index < N {
-//             likely(true);
-//             &self.storage[index]
-//         } else {
-//             let (slot, index) = get_slot_index(index, N);
-//             &self.expansions[slot][index]
-//         }
-//     }
-// }
 
 #[cfg(test)]
 mod test {

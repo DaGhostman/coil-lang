@@ -4,7 +4,7 @@ use common::vec_array::VecArray;
 pub struct Frame {
     ip: usize,
     stack: usize,
-    variables: VecArray<usize, 32>,
+    variables: VecArray<usize, 8>,
 }
 
 impl Default for Frame {
@@ -41,7 +41,7 @@ impl Frame {
         self.variables.insert(symbol, position);
     }
 
-    pub fn lookup(&self, index: usize) -> usize {
-        *self.variables.get(index)
-    }
+    // pub fn lookup(&self, index: usize) -> usize {
+    //     *self.variables.get(index)
+    // }
 }

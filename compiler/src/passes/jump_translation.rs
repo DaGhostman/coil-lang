@@ -52,6 +52,7 @@ impl CompilationPass for LabelUnrolling {
 
                     *bytecode
                 }
+                // Byte::Method => {}
                 _ => *bytecode,
             }
         }

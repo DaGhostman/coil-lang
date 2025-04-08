@@ -6,7 +6,7 @@ pub mod object;
 
 use std::fmt::Debug;
 
-const STACK_SIZE: usize = 2048;
+pub const STACK_SIZE: usize = 2048;
 
 pub struct Stack<T>
 where
@@ -130,6 +130,17 @@ pub struct Heap {
     size: usize,
     growth: usize,
     threshold: usize,
+}
+
+impl Default for Heap {
+    fn default() -> Self {
+        Self {
+            head: None,
+            size: 0,
+            growth: 2,
+            threshold: 1024 * 1024,
+        }
+    }
 }
 
 impl Heap {

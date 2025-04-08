@@ -597,10 +597,10 @@ impl<'compilation> Compiler<'compilation> {
                         .len();
                     self.context.add_method(*owner, *name, label, arity);
                     self.data.add_method(*owner, *name, label);
-                    // result.insert(
-                    //     0,
-                    //     Code::new_with_operands(Byte::Method, [*owner, *name, label, *arity, 0]),
-                    // );
+                    result.insert(
+                        0,
+                        Code::new_with_operands(Byte::Method, [*owner, *name, label]),
+                    );
 
                     result
                 }

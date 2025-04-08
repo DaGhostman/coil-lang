@@ -1,22 +1,22 @@
+use common::likely;
 use common::memory2::object::{ObjArray, ObjInstance, Objects};
 use common::vec_array::VecArray;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
 use std::io::{stderr, stdout};
 
 use crate::frame::Frame;
 use crate::options::MachineOptions;
 use crate::utils::output::Output;
-use common::memory2::{Heap, Stack};
+use common::memory2::{Heap, STACK_SIZE, Stack};
 use common::program::program::Program;
 use common::{
     Value,
     error::{Error, ErrorOrigin},
-    likely,
     opcodes::{Byte, Code},
-    unlikely,
 };
 
-const FRAME_SIZE: usize = 512;
+const STACK_FRAMES: usize = 2048;
+const STORAGE_CHUNKS: usize = 64;
 
 pub struct Machine {
     stdout: Output,
@@ -25,7 +25,8 @@ pub struct Machine {
 
     ip: usize,
     fp: usize,
-    frames: [Frame; FRAME_SIZE],
+    stack_frames: [(usize, usize); STACK_FRAMES],
+    variables: [VecArray<usize, STORAGE_CHUNKS>; STACK_FRAMES],
     stack: Stack<Value>,
     heap: Heap,
     // owner => name => label
@@ -39,10 +40,13 @@ impl Default for Machine {
         Self {
             halt: false,
             ip: 0,
-            fp: 0,
-            frames: std::array::from_fn::<Frame, FRAME_SIZE, _>(|_| Default::default()),
+            fp: 1,
+            stack_frames: [(0, 0); STACK_FRAMES],
+            variables: std::array::from_fn::<VecArray<usize, STORAGE_CHUNKS>, STACK_FRAMES, _>(
+                |_| Default::default(),
+            ),
             stack: Stack::new(),
-            heap: Heap::new(2, 1024 * 1024),
+            heap: Default::default(),
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
             stderr: Output::new(&MachineOptions::default(), || Box::new(stderr().lock())),
             options: MachineOptions::default(),
@@ -245,7 +249,7 @@ impl Machine {
                 }
                 Byte::This => {
                     // likely(true);
-                    let ptr = self.stack.peek(self.frames[self.fp - 1].tell() - 1);
+                    let ptr = self.stack.peek(self.stack_frames[self.fp - 1].1 - 1);
                     self.stack.push(ptr);
                 }
                 Byte::Prop => {
@@ -281,7 +285,8 @@ impl Machine {
                     let name = op.operand(1);
                     let upvalue = op.operand(2);
 
-                    self.reassign(name, self.lookup_upvalue(frame, upvalue));
+                    let val = self.lookup_upvalue(frame, upvalue);
+                    self.reassign(name, val);
                 }
                 Byte::Label => {
                     self.ip += op.operand(1);
@@ -292,7 +297,7 @@ impl Machine {
                 _ => (),
             }
 
-            if self.halt {
+            if self.halt || self.fp == 0 {
                 break;
             }
 
@@ -363,36 +368,35 @@ impl Machine {
 
     // #[inline]
     fn enter(&mut self, arity: usize) {
-        self.frames[self.fp].replace(self.ip, self.stack.tell(arity));
+        self.stack_frames[self.fp] = (self.ip, self.stack.tell(arity));
         self.fp += 1;
-        // self.frames[self.fp].clear();
+        // self.variables.modify_or_insert(self.fp, |_| ());
     }
 
     // #[inline]
     fn leave(&mut self) {
-        if self.fp == 0 {
-            self.halt = true;
-        } else {
-            self.fp -= 1;
-        }
-        let frame = &self.frames[self.fp];
+        self.fp -= 1;
 
-        self.ip = frame.tell();
-        self.stack.restore(frame.stack());
+        let (ip, stack) = self.stack_frames[self.fp];
+
+        self.ip = ip;
+        self.stack.restore(stack);
     }
 
     // #[inline]
-    fn lookup(&self, name: usize) -> usize {
-        self.frames[self.fp].lookup(name)
+    fn lookup(&mut self, name: usize) -> usize {
+        *self.variables[self.fp].get(name)
+        // *self.variables.get(self.fp).get(name)
     }
 
-    fn lookup_upvalue(&self, frame: usize, name: usize) -> usize {
-        self.frames[frame].lookup(name)
+    fn lookup_upvalue(&mut self, frame: usize, name: usize) -> usize {
+        *self.variables[frame].get(name)
+        // *self.variables.get(name)
     }
 
     // #[inline]
     fn reassign(&mut self, symbol: usize, position: usize) {
-        self.frames[self.fp].overwrite(symbol, position);
+        self.variables[self.fp].insert(symbol, position);
     }
 
     // #[inline]
