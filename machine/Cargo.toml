@@ -12,7 +12,7 @@ ahash = "0.8.11"
 common = { path = "../common" }
 gc = { version = "0.5.0", features = ["derive"] }
 generational-arena = "0.2.9"
-libffi = "3.2.0"
+libffi = "4.0.0"
 libloading = "0.8.6"
 parser = { path = "../parser" }
 rustc-hash = { version = "2.1.1", features = ["rand"] }
