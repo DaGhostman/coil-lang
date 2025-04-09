@@ -1,12 +1,7 @@
-use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHasher};
-use std::hash::{Hash, Hasher};
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
+use std::hash::Hash;
 
-fn calculate_hash<V: Hash>(value: &V) -> u64 {
-    let mut hash = FxHasher::default();
-    value.hash(&mut hash);
-
-    hash.finish()
-}
+use crate::calculate_hash;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Interner<V>

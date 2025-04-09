@@ -1,21 +1,19 @@
-use common::likely;
 use common::memory2::object::{ObjArray, ObjInstance, Objects};
 use common::vec_array::VecArray;
-use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
+use rustc_hash::FxHashMap as HashMap;
 use std::io::{stderr, stdout};
 
-use crate::frame::Frame;
 use crate::options::MachineOptions;
 use crate::utils::output::Output;
-use common::memory2::{Heap, STACK_SIZE, Stack};
+use common::memory2::{Heap, Stack};
 use common::program::program::Program;
 use common::{
     Value,
-    error::{Error, ErrorOrigin},
+    error::Error,
     opcodes::{Byte, Code},
 };
 
-const STACK_FRAMES: usize = 2048;
+const STACK_FRAMES: usize = 1024;
 const STORAGE_CHUNKS: usize = 64;
 
 pub struct Machine {
@@ -25,7 +23,7 @@ pub struct Machine {
 
     ip: usize,
     fp: usize,
-    stack_frames: [(usize, usize); STACK_FRAMES],
+    call_stack: [(usize, usize); STACK_FRAMES],
     variables: [VecArray<usize, STORAGE_CHUNKS>; STACK_FRAMES],
     stack: Stack<Value>,
     heap: Heap,
@@ -41,7 +39,7 @@ impl Default for Machine {
             halt: false,
             ip: 0,
             fp: 1,
-            stack_frames: [(0, 0); STACK_FRAMES],
+            call_stack: [(0, 0); STACK_FRAMES],
             variables: std::array::from_fn::<VecArray<usize, STORAGE_CHUNKS>, STACK_FRAMES, _>(
                 |_| Default::default(),
             ),
@@ -139,10 +137,7 @@ impl Machine {
                 Byte::Peek => {
                     self.reassign(op.operand(0), (self.stack.len() - 1) - op.operand(1));
                 }
-                Byte::Store => {
-                    // likely(true);
-                    self.reassign(op.operand(0), self.stack.tell(1))
-                }
+                Byte::Store => self.reassign(op.operand(0), self.stack.tell(1)),
                 Byte::Load => {
                     let pos = self.lookup(op.operand(0));
                     self.stack.copy_to_top(pos);
@@ -249,7 +244,7 @@ impl Machine {
                 }
                 Byte::This => {
                     // likely(true);
-                    let ptr = self.stack.peek(self.stack_frames[self.fp - 1].1 - 1);
+                    let ptr = self.stack.peek(self.call_stack[self.fp - 1].1 - 1);
                     self.stack.push(ptr);
                 }
                 Byte::Prop => {
@@ -311,23 +306,20 @@ impl Machine {
         // let bytes: Vec<(usize, Code)> = code.code().to_vec().iter().cloned().enumerate().collect();
 
         for byte in code.code() {
-            match byte.byte() {
-                Byte::Method => {
-                    let operands = byte.operands();
+            if byte.byte() == &Byte::Method {
+                let operands = byte.operands();
 
-                    self.methods
-                        .entry(operands[0])
-                        .and_modify(|entry| {
-                            entry.insert(operands[1], operands[2]);
-                        })
-                        .or_insert_with(|| {
-                            let mut fields = HashMap::default();
-                            fields.insert(operands[1], operands[2]);
+                self.methods
+                    .entry(operands[0])
+                    .and_modify(|entry| {
+                        entry.insert(operands[1], operands[2]);
+                    })
+                    .or_insert_with(|| {
+                        let mut fields = HashMap::default();
+                        fields.insert(operands[1], operands[2]);
 
-                            fields
-                        });
-                }
-                _ => (),
+                        fields
+                    });
             }
         }
 
@@ -368,16 +360,21 @@ impl Machine {
 
     // #[inline]
     fn enter(&mut self, arity: usize) {
-        self.stack_frames[self.fp] = (self.ip, self.stack.tell(arity));
+        self.call_stack[self.fp] = (self.ip, self.stack.tell(arity));
+        // .insert(self.fp, (self.ip, self.stack.tell(arity)));
         self.fp += 1;
-        // self.variables.modify_or_insert(self.fp, |_| ());
+        // if self.stack_frames.capacity() <= self.fp {
+        //     self.variables.grow(1);
+        //     // self.stack_frames.grow(1);
+        // }
     }
 
     // #[inline]
     fn leave(&mut self) {
         self.fp -= 1;
 
-        let (ip, stack) = self.stack_frames[self.fp];
+        // let (ip, stack) = self.call_stack.get(self.fp);
+        let (ip, stack) = self.call_stack[self.fp];
 
         self.ip = ip;
         self.stack.restore(stack);
@@ -386,12 +383,10 @@ impl Machine {
     // #[inline]
     fn lookup(&mut self, name: usize) -> usize {
         *self.variables[self.fp].get(name)
-        // *self.variables.get(self.fp).get(name)
     }
 
     fn lookup_upvalue(&mut self, frame: usize, name: usize) -> usize {
         *self.variables[frame].get(name)
-        // *self.variables.get(name)
     }
 
     // #[inline]
@@ -429,11 +424,7 @@ mod tests {
         let mut constant = Code::new(Byte::Push);
         constant.with_operands([num, 0, 0]);
 
-        let mut program = Program::new(vec![
-            constant.clone(),
-            constant.clone(),
-            Code::new(Byte::Add),
-        ]);
+        let mut program = Program::new(vec![constant, constant, Code::new(Byte::Add)]);
         program.with_data(values);
         let result = Machine::default().run(program);
 

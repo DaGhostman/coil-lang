@@ -42,6 +42,13 @@ pub fn unlikely(b: bool) -> bool {
     b
 }
 
+pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
+    let mut hash = rustc_hash::FxHasher::default();
+    value.hash(&mut hash);
+
+    hash.finish()
+}
+
 #[derive(Default, Copy, Clone)]
 pub enum Value {
     #[default]
@@ -101,10 +108,10 @@ impl Add for Value {
 
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs + rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs + rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 + rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs + rhs as f64)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs + rhs),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs + rhs),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 + rhs),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs + rhs as f64),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -115,10 +122,10 @@ impl Sub for Value {
 
     fn sub(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs - rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs - rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 - rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs - rhs as f64)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs - rhs),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs - rhs),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 - rhs),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs - rhs as f64),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -129,10 +136,10 @@ impl Mul for Value {
 
     fn mul(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs * rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs * rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 * rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs * rhs as f64)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs * rhs),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs * rhs),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 * rhs),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs * rhs as f64),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -143,10 +150,10 @@ impl Div for Value {
 
     fn div(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs / rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs / rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 / rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs / rhs as f64)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs / rhs),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs / rhs),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 / rhs),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs / rhs as f64),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -157,10 +164,10 @@ impl Rem for Value {
 
     fn rem(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs % rhs)),
-            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs % rhs)),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => (Value::FLOAT(lhs as f64 % rhs)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => (Value::FLOAT(lhs % rhs as f64)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs % rhs),
+            (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs % rhs),
+            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 % rhs),
+            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs % rhs as f64),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -171,7 +178,7 @@ impl Shl for Value {
 
     fn shl(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs << rhs)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs << rhs),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -182,7 +189,7 @@ impl Shr for Value {
 
     fn shr(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs >> rhs)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs >> rhs),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -193,8 +200,8 @@ impl BitAnd for Value {
 
     fn bitand(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs & rhs)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => (Value::BOOLEAN(lhs & rhs)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs & rhs),
+            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Value::BOOLEAN(lhs & rhs),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -205,8 +212,8 @@ impl BitOr for Value {
 
     fn bitor(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs | rhs)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => (Value::BOOLEAN(lhs | rhs)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs | rhs),
+            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Value::BOOLEAN(lhs | rhs),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -217,8 +224,8 @@ impl BitXor for Value {
 
     fn bitxor(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => (Value::INTEGER(lhs ^ rhs)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => (Value::BOOLEAN(lhs ^ rhs)),
+            (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs ^ rhs),
+            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Value::BOOLEAN(lhs ^ rhs),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -229,8 +236,8 @@ impl Not for Value {
 
     fn not(self) -> Self::Output {
         match self {
-            Value::INTEGER(lhs) => (Value::INTEGER(!lhs)),
-            Value::BOOLEAN(lhs) => (Value::BOOLEAN(!lhs)),
+            Value::INTEGER(lhs) => Value::INTEGER(!lhs),
+            Value::BOOLEAN(lhs) => Value::BOOLEAN(!lhs),
             _ => unreachable!("Invalid operation"),
         }
     }
@@ -241,8 +248,8 @@ impl Neg for Value {
 
     fn neg(self) -> Self::Output {
         match self {
-            Value::INTEGER(rhs) => (Value::INTEGER(-rhs)),
-            Value::FLOAT(rhs) => (Value::FLOAT(-rhs)),
+            Value::INTEGER(rhs) => Value::INTEGER(-rhs),
+            Value::FLOAT(rhs) => Value::FLOAT(-rhs),
             _ => unreachable!("Invalid operation"),
         }
     }

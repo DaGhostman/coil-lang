@@ -1,7 +1,7 @@
 use common::{
     Value,
     opcodes::{Byte, Code},
-    program::{data::Data, program::Program},
+    program::data::Data,
     vec_array::VecArray,
 };
 

@@ -1,3 +1,5 @@
+use std::ops::Index;
+
 #[derive(Clone, Debug)]
 pub struct VecArray<T, const N: usize>
 where
@@ -9,9 +11,7 @@ where
 }
 
 fn get_slot_index(index: usize, max: usize) -> (usize, usize) {
-    let slot = (index / max) - 1;
-
-    (slot, index % max)
+    (index / max, index % max)
 }
 
 impl<T, const N: usize> Default for VecArray<T, N>
@@ -31,7 +31,6 @@ impl<T, const N: usize> VecArray<T, N>
 where
     T: Default + Clone,
 {
-    #[inline]
     pub fn contains_key(&self, index: usize) -> bool {
         self.size > index
     }
@@ -67,24 +66,28 @@ where
         } else {
             let (slot, index) = get_slot_index(index, N);
 
-            if self.expansions.len() <= slot {
-                self.expansions.resize(
-                    slot + 4,
-                    core::array::from_fn::<T, N, _>(|_| Default::default()),
-                );
-            }
-
             self.expansions[slot][index] = value;
         }
     }
 
-    pub fn modify_or_insert<F: FnOnce(&mut T) -> ()>(&mut self, index: usize, or: F) {
+    pub fn grow(&mut self, items: usize) {
+        if items >= self.size {
+            let (slot, _) = get_slot_index(self.size, N);
+            if self.expansions.len() <= slot {
+                self.expansions.resize(
+                    slot + 1,
+                    core::array::from_fn::<T, N, _>(|_| Default::default()),
+                );
+            }
+        }
+    }
+
+    pub fn modify_or_insert<F: FnOnce(&mut T)>(&mut self, index: usize, or: F) {
         if self.size > index {
             or(if index < N {
                 &mut self.storage[index]
             } else {
                 let (slot, idx) = get_slot_index(index, N);
-
                 &mut self.expansions[slot][idx]
             });
         } else {
@@ -97,8 +100,28 @@ where
         self.expansions.clear();
         self.size = 0;
     }
+
     pub fn len(&self) -> usize {
         self.size
+    }
+
+    pub fn slots(&self) -> usize {
+        1 + self.expansions.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots() * N
+    }
+}
+
+impl<T, const N: usize> Index<usize> for VecArray<T, N>
+where
+    T: Clone + Default,
+{
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index)
     }
 }
 

@@ -55,13 +55,13 @@ where
     }
 
     pub fn tell(&self, offset: usize) -> usize {
-        self.sp.wrapping_sub(offset)
+        self.sp - offset
     }
 
     pub fn restore(&mut self, size: usize) {
         self.stack[size] = self.stack[self.sp - 1];
-        self.sp = size;
-        self.sp += 1;
+        self.sp = size + 1;
+        // self.sp += 1;
     }
 
     pub fn peek(&self, position: usize) -> T {

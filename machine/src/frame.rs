@@ -1,21 +1,13 @@
 use common::vec_array::VecArray;
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct Frame {
     ip: usize,
     stack: usize,
     variables: VecArray<usize, 8>,
 }
 
-impl Default for Frame {
-    fn default() -> Self {
-        Self {
-            ip: 0,
-            stack: 0,
-            variables: VecArray::default(),
-        }
-    }
-}
 
 impl Frame {
     pub fn tell(&self) -> usize {

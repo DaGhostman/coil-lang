@@ -47,11 +47,7 @@ impl Buffer {
     }
 
     pub fn string_at_range(&self, start: usize, end: usize) -> Option<String> {
-        if let Ok(value) = String::from_utf8(self.content[start..end].to_vec()) {
-            Some(value)
-        } else {
-            None
-        }
+        String::from_utf8(self.content[start..end].to_vec()).ok()
     }
 }
 
