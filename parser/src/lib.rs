@@ -206,7 +206,7 @@ impl Parser {
             tokens.push(IR::new(Operation::Call, Some([symbol, arity, 0])));
         } else if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
-            tokens.push(IR::new(Operation::Declare, Some([symbol, 0, 0])));
+            tokens.push(IR::new(Operation::Assign, Some([symbol, 0, 0])));
         } else {
             // tokens.append(&mut self.expression(ctx));
             tokens.push(IR::new(Operation::Load, Some([symbol, 0, 0])));
@@ -547,6 +547,46 @@ impl Parser {
         }
     }
 
+    fn boomer_loop(&mut self, ctx: &mut Context) -> Vec<IR> {
+        self.consume(ctx, TokenKind::For);
+        let mut result = vec![];
+
+        self.expect(
+            ctx,
+            TokenKind::LeftParenthesis,
+            "Expecting '(' for block loop header",
+        );
+        let mut initializer = self.expression(ctx);
+        self.expect(ctx, TokenKind::SemiColon, "Expecting ';' after initializer");
+        let mut condition = self.expression(ctx);
+        self.expect(ctx, TokenKind::SemiColon, "Expecting ';' after condition");
+        let mut action = self.expression(ctx);
+        self.expect(
+            ctx,
+            TokenKind::RightParenthesis,
+            "Expecting ')' for block loop header",
+        );
+
+        let mut body = if self.matches(ctx, TokenKind::LeftBracket) {
+            self.block(ctx)
+        } else {
+            self.expr_statement(ctx)
+        };
+
+        body.append(&mut action);
+
+        result.append(&mut initializer);
+        result.push(IR::new(
+            Operation::Loop,
+            Some([condition.len(), body.len(), 0]),
+        ));
+        result.append(&mut condition);
+        // result.push(IR::new(Operation::Rewind, Some([body.len(), 0, 0])));
+        result.append(&mut body);
+
+        result
+    }
+
     fn call(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.expect(ctx, TokenKind::Dot, "Expected '.' for call expression");
         let mut tokens = vec![];
@@ -561,6 +601,10 @@ impl Parser {
 
                     self.consume(ctx, TokenKind::Comma);
                 }
+
+                // let metadata = Metadata {
+                //     line:
+                // };
 
                 tokens.push(IR::new(
                     Operation::Invoke,
@@ -609,6 +653,7 @@ impl Parser {
             TokenKind::LeftBrace => self.array(ctx),
             TokenKind::Match => self.match_expression2(ctx),
             TokenKind::If => self.if_expression(ctx),
+            TokenKind::Let => self.variable(ctx),
             TokenKind::Function => self.function(ctx),
             TokenKind::New => self.initialize(ctx),
             _ => todo!("Unimplemented token '{:?}'", ctx.current()),
@@ -680,15 +725,25 @@ impl Parser {
     }
 
     fn variable(&mut self, ctx: &mut Context) -> Vec<IR> {
+        self.consume(ctx, TokenKind::Let);
         let name = ctx.current().clone();
-        // self.expect(
-        //     ctx,
-        //     TokenKind::Identifier,
-        //     "Expected identifier for variable name",
-        // );
-        let mut tokens = self.expr(ctx);
+        self.expect(
+            ctx,
+            TokenKind::Identifier,
+            "Expected identifier for variable name",
+        );
+        let mut tokens = vec![];
+        if self.consume(ctx, TokenKind::Equal) {
+            tokens.append(&mut self.expression(ctx));
+        } else {
+            tokens.push(IR::new(
+                Operation::Const,
+                Some([self.data.add_constant(Value::NONE), 0, 0]),
+            ));
+        }
+
         tokens.push(IR::new(
-            Operation::Assign,
+            Operation::Declare,
             Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
         ));
 
@@ -932,6 +987,10 @@ impl Parser {
             TokenKind::If => {
                 ctx.advance();
                 self.if_expression(ctx)
+            }
+            TokenKind::For => {
+                ctx.advance();
+                self.boomer_loop(ctx)
             }
             _ => self.expr_statement(ctx),
         }

@@ -32,4 +32,14 @@ impl SymbolTable {
     pub fn name(&self, symbol: usize) -> &String {
         self.names.lookup(symbol)
     }
+
+    pub fn symbol(&self, symbol: String) -> usize {
+        let mut interner = self.names.clone();
+        interner.intern(symbol)
+    }
+
+    pub fn contains(&self, symbol: String) -> bool {
+        let mut interner = self.names.clone();
+        self.mapping.get(&interner.intern(symbol)).is_some()
+    }
 }

@@ -69,7 +69,7 @@ impl Precedence {
             | TokenKind::Bang
             | TokenKind::Tilde
             | TokenKind::As => Precedence::Unary,
-            TokenKind::Equal => Precedence::Assign,
+            TokenKind::Let | TokenKind::Equal => Precedence::Assign,
             TokenKind::DotDot => Precedence::Unary,
             TokenKind::Dot => Precedence::Call,
             TokenKind::Match | TokenKind::If => Precedence::Primary,

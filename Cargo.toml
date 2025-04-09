@@ -5,6 +5,12 @@ members = [
     "scanner",
 ]
 
+[features]
+trace = ["machine/trace"]
+stress_gc = ["machine/stress"]
+dump = ["compiler/dump"]
+debug = ["trace", "stress_gc", "dump"]
+
 [package]
 name = "zero"
 version = "0.1.0"

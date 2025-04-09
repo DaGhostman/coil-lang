@@ -1,4 +1,4 @@
-use std::ops::Index;
+use std::{ops::Index, vec::IntoIter};
 
 #[derive(Clone, Debug)]
 pub struct VecArray<T, const N: usize>
@@ -11,7 +11,8 @@ where
 }
 
 fn get_slot_index(index: usize, max: usize) -> (usize, usize) {
-    (index / max, index % max)
+    let slot = (index / max) - 1;
+    (slot, index % max)
 }
 
 impl<T, const N: usize> Default for VecArray<T, N>
@@ -64,15 +65,20 @@ where
         if index < N {
             self.storage[index] = value
         } else {
+            self.grow(index);
             let (slot, index) = get_slot_index(index, N);
 
             self.expansions[slot][index] = value;
         }
     }
 
-    pub fn grow(&mut self, items: usize) {
-        if items >= self.size {
-            let (slot, _) = get_slot_index(self.size, N);
+    pub fn grow(&mut self, index: usize) {
+        if index < N {
+            return;
+        }
+
+        if index >= self.size - 1 {
+            let (slot, _) = get_slot_index(index, N);
             if self.expansions.len() <= slot {
                 self.expansions.resize(
                     slot + 1,
@@ -111,6 +117,25 @@ where
 
     pub fn capacity(&self) -> usize {
         self.slots() * N
+    }
+}
+
+impl<T, const N: usize> IntoIterator for VecArray<T, N>
+where
+    T: Clone,
+{
+    type Item = T;
+
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let mut iterable = self.storage.to_vec();
+        iterable.reserve(self.expansions.len() * N);
+        for slot in self.expansions {
+            iterable.append(&mut slot.to_vec());
+        }
+
+        iterable.into_iter()
     }
 }
 

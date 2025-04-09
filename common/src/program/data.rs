@@ -49,6 +49,13 @@ impl Data {
         self.symbols.constant(symbol)
     }
 
+    pub fn symbol_exists(&self, symbol: String) -> bool {
+        self.symbols.contains(symbol)
+    }
+
+    pub fn symbol_index(&self, symbol: String) -> usize {
+        self.symbols.symbol(symbol)
+    }
     pub fn add_method(&mut self, owner: usize, name: usize, label: usize) {
         self.methods
             .entry(owner)

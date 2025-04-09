@@ -290,9 +290,10 @@ impl Hash for Value {
                 "fs".hash(state);
                 fd.hash(state);
             }
-            Value::FUNCTION(arity, _) => {
+            Value::FUNCTION(arity, l) => {
                 "fn".hash(state);
                 arity.hash(state);
+                l.hash(state);
             }
             Value::RESOURCE(ptr) | Value::POINTER(ptr) => {
                 "res".hash(state);

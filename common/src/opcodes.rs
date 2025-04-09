@@ -1,6 +1,6 @@
 use std::{
     borrow::{Borrow, BorrowMut},
-    fmt::Debug,
+    fmt::{Debug, Display},
 };
 
 #[derive(Default, PartialEq, Debug, Copy, Clone)]
@@ -77,13 +77,26 @@ pub enum Operation {
 
     // Experimental
     Condition,
+    Loop,
 }
 
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub struct Metadata {
     line: usize,
     column: usize,
-    // file: String,
+    // file: ,
+}
+
+impl Metadata {
+    pub fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+}
+
+impl Display for Metadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.line, self.column)
+    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -116,6 +129,12 @@ impl IR {
             operands: values.unwrap_or_default(),
             metadata: None,
         }
+    }
+
+    pub fn with_metadata(&mut self, metadata: Metadata) -> &mut Self {
+        self.metadata = Some(metadata);
+
+        self
     }
 
     pub fn operands(&self) -> &[usize; 3] {

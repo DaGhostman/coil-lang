@@ -14,12 +14,13 @@ use common::{
 };
 
 const STACK_FRAMES: usize = 1024;
-const STORAGE_CHUNKS: usize = 64;
+const STORAGE_CHUNKS: usize = 32;
 
 pub struct Machine {
     stdout: Output,
     stderr: Output,
     halt: bool,
+    bootstrap: bool,
 
     ip: usize,
     fp: usize,
@@ -37,6 +38,7 @@ impl Default for Machine {
     fn default() -> Self {
         Self {
             halt: false,
+            bootstrap: false,
             ip: 0,
             fp: 1,
             call_stack: [(0, 0); STACK_FRAMES],
@@ -107,19 +109,32 @@ impl Machine {
     fn execute(&mut self, code: &Program<Code>) -> Result<(), Error> {
         self.ip = 0;
         while let Some(op) = code.get(self.ip) {
-            // eprintln!(
-            //     "({:0>2})#{:0>8} {:?}\t{:?}",
-            //     self.fp,
-            //     self.ip,
-            //     op.byte(),
-            //     self.stack.iter().collect::<Vec<Value>>()
-            // );
+            #[cfg(feature = "trace")]
+            {
+                eprintln!(
+                    "({:0>2})#{:0>8} {:?}\t{:?}",
+                    self.fp,
+                    self.ip,
+                    op.byte(),
+                    self.stack.iter().collect::<Vec<Value>>()
+                );
+            }
+            #[cfg(feature = "trace")]
+            {
+                if self.fp > 32 {
+                    break;
+                }
+            }
             match op.byte() {
                 Byte::Call => {
-                    // likely(true);
                     if let Value::FUNCTION(arity, position) = self.stack.pop() {
+                        if op.operand(1) == 1 {
+                            self.fp = 0;
+                        }
+
                         self.enter(arity);
                         self.ip = position;
+                        continue;
                     } else {
                         unreachable!("Attempting to call non-existing function");
                     }
@@ -170,8 +185,10 @@ impl Machine {
                         self.stdout.write("\n".to_string());
                     }
                 }
-                Byte::Jump => self.ip = op.operand(0),
-                Byte::Jumpr => self.ip += op.operand(0),
+                Byte::Jump => {
+                    self.ip = op.operand(0);
+                    continue;
+                }
                 Byte::Jumpz => {
                     let value = self.stack.pop();
                     if !matches!(value, Value::BOOLEAN(_)) {
@@ -186,7 +203,10 @@ impl Machine {
                         _ => panic!("Unable to evaluate"),
                     };
 
-                    self.ip = if state { op.operand(0) } else { op.operand(1) };
+                    if !state {
+                        self.ip = op.operand(0);
+                        continue;
+                    }
                 }
                 Byte::Range => {
                     let last = self.stack.pop();
@@ -240,6 +260,7 @@ impl Machine {
 
                         self.enter(arity);
                         self.ip = self.methods[&owner][&name];
+                        continue;
                     }
                 }
                 Byte::This => {
@@ -283,13 +304,15 @@ impl Machine {
                     let val = self.lookup_upvalue(frame, upvalue);
                     self.reassign(name, val);
                 }
-                Byte::Label => {
-                    self.ip += op.operand(1);
-                }
                 Byte::Halt => {
                     self.halt = true;
                 }
                 _ => (),
+            }
+
+            #[cfg(feature = "stress")]
+            {
+                self.gc()
             }
 
             if self.halt || self.fp == 0 {

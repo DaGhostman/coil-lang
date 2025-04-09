@@ -33,14 +33,14 @@ impl Output {
         match self.mode {
             OutputBufferingMode::None => {
                 if let Err(e) = self.flush() {
-                    dbg!(e);
+                    unreachable!("{:?}", e);
                 }
             }
             OutputBufferingMode::Sized => {
                 self.buffer.append(&mut value.as_bytes().to_vec());
                 if self.buffer.len() >= self.hwm {
                     if let Err(e) = self.flush() {
-                        dbg!(e);
+                        unreachable!("{:?}", e);
                     }
                 }
             }
@@ -58,7 +58,7 @@ impl Output {
                 if let Err(e) =
                     (self.factory)().write_all(&self.buffer.drain(0..last).collect::<Vec<u8>>())
                 {
-                    dbg!(e);
+                    unreachable!("{:?}", e);
                 }
             }
         }
