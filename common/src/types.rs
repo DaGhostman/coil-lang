@@ -65,6 +65,9 @@ impl From<&Value> for Type {
                 unreachable!("FFI wrapping modules must not be converted to types")
             }
             Value::OBJECT(_) => Type::Object,
+            Value::ITERATOR(_) => {
+                unreachable!("Iterator how to");
+            }
         }
     }
 }

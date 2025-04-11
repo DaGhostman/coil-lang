@@ -8,7 +8,7 @@ use std::fmt::Debug;
 
 pub struct Stack<T, const N: usize>
 where
-    T: Copy,
+    T: Copy + PartialEq + PartialOrd,
 {
     stack: [T; N],
     sp: usize,
@@ -16,7 +16,7 @@ where
 
 impl<T, const N: usize> Default for Stack<T, N>
 where
-    T: Copy + Default + Debug,
+    T: Copy + Default + Debug + PartialEq + PartialOrd,
 {
     fn default() -> Self {
         Self::new()
@@ -25,7 +25,7 @@ where
 
 impl<T, const N: usize> Stack<T, N>
 where
-    T: Copy + Default + Debug,
+    T: Copy + Default + Debug + PartialEq + PartialOrd,
 {
     #[must_use]
     pub fn new() -> Self {
@@ -36,16 +36,14 @@ where
     }
 
     pub fn pop(&mut self) -> T {
-        self.sp -= 1;
-
-        self.stack[self.sp]
+        self.npop(1)[0]
     }
 
-    pub fn npop(&mut self, n: usize) -> Vec<T> {
+    pub fn npop(&mut self, n: usize) -> &[T] {
         let slice = &self.stack[self.sp - n..self.sp];
         self.sp -= n;
 
-        slice.to_vec()
+        slice
     }
 
     pub fn push(&mut self, value: T) {
@@ -58,9 +56,8 @@ where
     }
 
     pub fn restore(&mut self, size: usize) {
-        self.stack[size] = self.stack[self.sp - 1];
+        self.pop_to(size);
         self.sp = size + 1;
-        // self.sp += 1;
     }
 
     pub fn peek(&self, position: usize) -> T {
@@ -76,8 +73,7 @@ where
     }
 
     pub fn pop_to(&mut self, dst: usize) {
-        let diff = self.sp - dst;
-        if diff > 0 {
+        if self.sp - dst != 1 {
             self.sp -= 1;
             self.stack[dst] = self.stack[self.sp];
         }
@@ -111,7 +107,7 @@ where
 
 impl<T, const N: usize> IntoIterator for &Stack<T, N>
 where
-    T: Copy + Default + Debug,
+    T: Copy + Default + Debug + PartialEq + PartialOrd,
 {
     type Item = T;
 

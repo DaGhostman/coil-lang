@@ -28,7 +28,7 @@ impl Output {
             return;
         }
 
-        self.buffer.append(&mut value.as_bytes().to_vec());
+        self.buffer.extend(value.as_bytes());
 
         match self.mode {
             OutputBufferingMode::None => {
@@ -37,7 +37,7 @@ impl Output {
                 }
             }
             OutputBufferingMode::Sized => {
-                self.buffer.append(&mut value.as_bytes().to_vec());
+                self.buffer.extend(value.as_bytes());
                 if self.buffer.len() >= self.hwm {
                     if let Err(e) = self.flush() {
                         unreachable!("{:?}", e);
@@ -45,7 +45,7 @@ impl Output {
                 }
             }
             OutputBufferingMode::NewLine => {
-                self.buffer.append(&mut value.as_bytes().to_vec());
+                self.buffer.extend(value.as_bytes());
                 let mut last = 0;
                 if self.buffer.contains(&10) {
                     for (idx, ch) in self.buffer.iter().enumerate() {

@@ -76,6 +76,10 @@ impl CompilationPass for LabelUnrolling {
                 Byte::Label => {
                     continue;
                 } // Code::new(Byte::Noop),
+                Byte::Iterate => Code::new_with_operands(
+                    Byte::Iterate,
+                    [self.jump_at(code.operand(0)), code.operand(1), 0],
+                ),
                 Byte::Push => {
                     if let Value::FUNCTION(arity, label) = data.constant(code.operand(0)) {
                         if !funcs.contains(&code.operand(0)) {

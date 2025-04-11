@@ -67,6 +67,7 @@ pub enum Value {
     FFI(usize),
     STRING(Objects),
     OBJECT(Objects),
+    ITERATOR(usize),
 }
 
 impl PartialEq for Value {
@@ -238,6 +239,7 @@ impl Not for Value {
         match self {
             Value::INTEGER(lhs) => Value::INTEGER(!lhs),
             Value::BOOLEAN(lhs) => Value::BOOLEAN(!lhs),
+            Value::NONE => Value::BOOLEAN(true),
             _ => Value::NONE,
         }
     }
@@ -311,6 +313,10 @@ impl Hash for Value {
                 "o".hash(state);
                 object.hash(state);
             }
+            Value::ITERATOR(n) => {
+                "iter".hash(state);
+                n.hash(state);
+            }
             _ => panic!("No support"),
         }
     }
@@ -354,6 +360,7 @@ impl Debug for Value {
                 Value::FFI(id) => format!("dynamic({id})"),
                 Value::REFERENCE(idx) => format!("ref({idx:?})"),
                 Value::OBJECT(obj) => format!("obj({})", std::ptr::addr_of!(obj) as u64),
+                Value::ITERATOR(cursor) => format!("iter({})", cursor),
             }
         )
     }

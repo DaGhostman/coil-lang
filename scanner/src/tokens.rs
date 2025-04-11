@@ -67,6 +67,7 @@ pub enum TokenKind {
     For,
     Function,
     If,
+    In,
     Int,
     Len,
     Let,
@@ -96,11 +97,13 @@ pub struct TokenPosition {
 }
 
 impl TokenPosition {
-    #[must_use] pub fn line(&self) -> usize {
+    #[must_use]
+    pub fn line(&self) -> usize {
         self.line
     }
 
-    #[must_use] pub fn column(&self) -> usize {
+    #[must_use]
+    pub fn column(&self) -> usize {
         self.column
     }
 }
@@ -127,7 +130,8 @@ impl Default for Token {
 }
 
 impl Token {
-    #[must_use] pub fn begin(kind: TokenKind, line: usize, column: usize, file: &str) -> Self {
+    #[must_use]
+    pub fn begin(kind: TokenKind, line: usize, column: usize, file: &str) -> Self {
         Token {
             kind,
             start: TokenPosition { line, column },
@@ -143,27 +147,33 @@ impl Token {
         self.lexeme = lexeme;
     }
 
-    #[must_use] pub fn start_line(&self) -> usize {
+    #[must_use]
+    pub fn start_line(&self) -> usize {
         self.start.line
     }
 
-    #[must_use] pub fn start_column(&self) -> usize {
+    #[must_use]
+    pub fn start_column(&self) -> usize {
         self.start.column
     }
 
-    #[must_use] pub fn end_line(&self) -> usize {
+    #[must_use]
+    pub fn end_line(&self) -> usize {
         self.end.line
     }
 
-    #[must_use] pub fn end_column(&self) -> usize {
+    #[must_use]
+    pub fn end_column(&self) -> usize {
         self.end.column
     }
 
-    #[must_use] pub fn kind(&self) -> TokenKind {
+    #[must_use]
+    pub fn kind(&self) -> TokenKind {
         self.kind
     }
 
-    #[must_use] pub fn lexeme(&self) -> &str {
+    #[must_use]
+    pub fn lexeme(&self) -> &str {
         self.lexeme.as_ref()
     }
 }

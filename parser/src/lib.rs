@@ -571,6 +571,32 @@ impl Parser {
     //     result
     // }
 
+    fn for_in(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let mut result = vec![];
+        let name = ctx.current().to_owned();
+        if self.expect(
+            ctx,
+            TokenKind::Identifier,
+            "Expecting variable name to hold iteration",
+        ) {
+            if self.expect(ctx, TokenKind::In, "Expecting 'in' for loop") {
+                result.append(&mut self.expression(ctx));
+                let mut body = self.block(ctx);
+                result.push(IR::new(
+                    Operation::Iterate,
+                    Some([
+                        self.data.add_symbol(name.lexeme().to_string(), None),
+                        body.len(),
+                        0,
+                    ]),
+                ));
+                result.append(&mut body);
+            }
+        }
+
+        result
+    }
+
     fn boomer_loop(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.consume(ctx, TokenKind::For);
         let mut result = vec![];
@@ -1024,7 +1050,11 @@ impl Parser {
             }
             TokenKind::For => {
                 ctx.advance();
-                self.boomer_loop(ctx)
+                if self.matches(ctx, TokenKind::LeftParenthesis) {
+                    self.boomer_loop(ctx)
+                } else {
+                    self.for_in(ctx)
+                }
             }
             _ => self.expr_statement(ctx),
         }

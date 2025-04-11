@@ -127,9 +127,9 @@ where
 
     fn into_iter(self) -> Self::IntoIter {
         let mut iterable = self.storage.to_vec();
-        iterable.reserve(self.expansions.len() * N);
+        iterable.reserve(self.expansions.len() * (N - 1));
         for slot in self.expansions {
-            iterable.append(&mut slot.to_vec());
+            iterable.extend(slot);
         }
 
         iterable.into_iter()

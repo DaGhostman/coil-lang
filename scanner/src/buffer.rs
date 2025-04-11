@@ -38,15 +38,18 @@ impl Buffer {
         }
     }
 
-    #[must_use] pub fn is_consumed(&self) -> bool {
+    #[must_use]
+    pub fn is_consumed(&self) -> bool {
         self.cursor == self.length
     }
 
-    #[must_use] pub fn tell(&self) -> usize {
+    #[must_use]
+    pub fn tell(&self) -> usize {
         self.cursor
     }
 
-    #[must_use] pub fn string_at_range(&self, start: usize, end: usize) -> Option<String> {
+    #[must_use]
+    pub fn string_at_range(&self, start: usize, end: usize) -> Option<String> {
         String::from_utf8(self.content[start..end].to_vec()).ok()
     }
 }

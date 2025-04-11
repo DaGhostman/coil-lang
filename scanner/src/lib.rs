@@ -449,7 +449,10 @@ impl Scanner {
             },
             Some('i') => match self.peek(1) {
                 Some('f') => self.keyword_or_identifier(TokenKind::If, "if"),
-                Some('n') => self.keyword_or_identifier(TokenKind::Int, "int"),
+                Some('n') => match self.peek(2) {
+                    Some('t') => self.keyword_or_identifier(TokenKind::Int, "int"),
+                    _ => self.keyword_or_identifier(TokenKind::In, "in"),
+                },
                 _ => self.identifier(),
             },
             Some('l') => match self.peek(2) {

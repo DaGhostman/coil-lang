@@ -33,17 +33,27 @@ pub(crate) struct Variable {
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct Variables {
-    storage: HashMap<usize, Variable>,
+    storage: HashMap<(usize, usize), Variable>,
     scope: usize,
+    scopes: Vec<usize>,
 }
 
 impl Variables {
     pub fn enter(&mut self) {
         self.scope += 1;
+        self.scopes.push(self.storage.len());
     }
 
-    pub fn leave(&mut self) {
+    pub fn leave(&mut self) -> usize {
         self.scope -= 1;
+
+        if let Some(size) = self.scopes.pop() {
+            self.storage
+                .retain(|(slot, _), var| var.position <= size && *slot <= self.scope);
+            return size - self.storage.len();
+        } else {
+            panic!("SADGE");
+        }
     }
 
     pub fn clear(&mut self) -> usize {
@@ -54,11 +64,12 @@ impl Variables {
     }
 
     pub fn create(&mut self, symbol: usize) -> usize {
-        let length = self.storage.len();
+        let position = self.storage.len();
+
         self.storage
-            .entry(symbol)
+            .entry((self.scope, symbol))
             .or_insert_with(|| Variable {
-                position: length,
+                position,
                 scope: self.scope,
                 readonly: false,
                 assigned: false,
@@ -67,14 +78,15 @@ impl Variables {
     }
 
     pub fn seal(&mut self, symbol: usize) {
-        let length = self.storage.len();
+        let position = self.storage.len();
+
         self.storage
-            .entry(symbol)
+            .entry((self.scope, symbol))
             .and_modify(|v| {
                 v.readonly = true;
             })
             .or_insert_with(|| Variable {
-                position: length,
+                position,
                 scope: self.scope,
                 readonly: true,
                 assigned: true,
@@ -82,14 +94,15 @@ impl Variables {
     }
 
     pub fn assign(&mut self, symbol: usize) {
-        let length = self.storage.len();
+        let position = self.storage.len();
+
         self.storage
-            .entry(symbol)
+            .entry((self.scope, symbol))
             .and_modify(|v| {
                 v.assigned = true;
             })
             .or_insert_with(|| Variable {
-                position: length,
+                position,
                 scope: self.scope,
                 readonly: false,
                 assigned: true,
@@ -98,36 +111,58 @@ impl Variables {
 
     pub fn is_sealed(&mut self, symbol: usize) -> bool {
         self.storage
-            .get(&symbol)
+            .get(&(self.scope, symbol))
             .filter(|v| v.readonly && v.assigned)
             .is_some()
     }
 
     pub fn available(&self, symbol: usize) -> bool {
-        self.storage
-            .get(&symbol)
-            .filter(|v| v.position <= self.scope)
-            .is_some()
+        !self.storage.contains_key(&(self.scope, symbol))
+        // self.storage
+        //     .get(&(self.scope, symbol))
+        //     .filter(|v| v.scope <= self.scope)
+        //     .is_some()
     }
 
     pub fn has(&self, symbol: usize) -> bool {
-        self.storage.contains_key(&symbol)
-            && self
-                .storage
-                .get(&symbol)
-                .map(|v| v.scope <= self.scope)
-                .is_some()
+        !self
+            .storage
+            .keys()
+            .filter(|(slot, value)| &self.scope >= slot && &symbol == value)
+            .collect::<Vec<_>>()
+            .is_empty()
+
+        // self.storage.contains_key(&(self.scope, symbol))
+        //     && self
+        //         .storage
+        //         .get(&(self.scope, symbol))
+        //         .map(|v| v.scope <= self.scope)
+        //         .is_some()
     }
 
     pub fn get(&self, symbol: usize) -> Variable {
-        if !self.storage.contains_key(&symbol) {
+        let scope = self
+            .storage
+            .keys()
+            .filter_map(|(slot, name)| {
+                if &self.scope < slot && name == &symbol {
+                    None
+                } else {
+                    Some(*slot)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if scope.is_empty() {
+            // }
+            // if !self.storage.contains_key(&(scope, symbol)) {
             unreachable!("Attempting to access invalid symbol");
         }
 
-        self.storage[&symbol]
+        self.storage[&(*scope.last().unwrap(), symbol)]
     }
     pub fn get_mut(&mut self, symbol: usize) -> Option<&mut Variable> {
-        self.storage.get_mut(&symbol)
+        self.storage.get_mut(&(self.scope, symbol))
     }
 }
 
@@ -157,7 +192,7 @@ pub(crate) struct Context {
     tco: Vec<bool>,
     current: Vec<usize>,
     frame: usize,
-    variables: Vec<Variables>,
+    variables: Variables,
     classes: HashMap<usize, ClassDefinition>,
 }
 
@@ -173,6 +208,7 @@ impl Context {
     pub fn enter(&mut self, scope: usize) {
         self.tco.push(false);
         self.current.push(scope);
+        self.variables.enter();
         self.frame += 1;
     }
 
@@ -183,7 +219,7 @@ impl Context {
     pub fn leave(&mut self) -> usize {
         self.current.pop();
         self.tco.pop();
-        let count = self.variables[self.frame].clear();
+        let count = self.variables.leave();
         self.frame -= 1;
 
         count
@@ -203,31 +239,28 @@ impl Context {
         }
     }
 
-    pub fn get_upvalue(&self, symbol: usize) -> Variable {
-        self.variables[self.frame - 1].get(symbol)
-    }
+    // pub fn get_upvalue(&self, symbol: usize) -> Variable {
+    //     self.variables[self.frame - 1].get(symbol)
+    // }
 
-    pub fn upvalue(&mut self, symbol: usize) -> usize {
-        let upvalue = self.variables[self.frame - 1].get(symbol);
-        self.variables[self.frame].create(symbol);
-        if let Some(var) = self.variables[self.frame].get_mut(symbol) {
-            var.assigned = upvalue.assigned;
-            var.readonly = upvalue.readonly;
-        }
-
-        upvalue.position
-    }
+    // pub fn upvalue(&mut self, symbol: usize) -> usize {
+    //     let upvalue = self.variables[self.frame - 1].get(symbol);
+    //
+    //     self.variables[self.frame].create(symbol);
+    //     if let Some(var) = self.variables[self.frame].get_mut(symbol) {
+    //         var.assigned = upvalue.assigned;
+    //         var.readonly = upvalue.readonly;
+    //     }
+    //
+    //     upvalue.position
+    // }
 
     pub fn frame(&self) -> usize {
         self.frame - 1
     }
 
     pub fn variables(&mut self) -> &mut Variables {
-        if self.variables.len() <= self.frame {
-            self.variables.resize(self.frame + 4, Default::default());
-        }
-
-        &mut self.variables[self.frame]
+        &mut self.variables
     }
 
     pub fn define_class(&mut self, name: usize) {
@@ -306,8 +339,8 @@ impl<'compilation> Compiler<'compilation> {
                     vec![]
                 }
                 Operation::End => {
-                    self.context.variables().leave();
-                    vec![]
+                    let count = self.context.variables().leave();
+                    vec![Code::new_with_operands(Byte::Pop, [count, 0, 0])]
                 }
                 Operation::Noop => continue,
                 Operation::Pop => vec![Code::new_with_operands(Byte::Pop, [1, 0, 0])],
@@ -412,16 +445,16 @@ impl<'compilation> Compiler<'compilation> {
                         [self.context.variables().create(operands[0]), 0, 0],
                     )]
                 }
-                Operation::Upvalue => {
-                    let operands = op.operands();
-                    let variable = self.context.variables().create(operands[0]);
-                    let upvalue = self.context.upvalue(operands[0]);
-
-                    vec![Code::new_with_operands(
-                        Byte::Upvalue,
-                        [self.context.frame(), variable, upvalue],
-                    )]
-                }
+                // Operation::Upvalue => {
+                //     let operands = op.operands();
+                //     let variable = self.context.variables().create(operands[0]);
+                //     let upvalue = self.context.upvalue(operands[0]);
+                //
+                //     vec![Code::new_with_operands(
+                //         Byte::Upvalue,
+                //         [self.context.frame(), variable, upvalue],
+                //     )]
+                // }
                 Operation::Argument => {
                     let operands = op.operands();
                     self.context.variables().create(operands[0]);
@@ -490,6 +523,46 @@ impl<'compilation> Compiler<'compilation> {
                             ));
                         }
                     }
+
+                    result
+                }
+                Operation::Iterate => {
+                    let mut result = vec![];
+                    let [name, length, ..] = op.operands();
+                    skips += length;
+
+                    let rand = self.random_label();
+                    self.context
+                        .variables()
+                        .create(self.data.add_symbol(rand, None));
+                    let rand = self.random_label();
+                    let iter = self
+                        .context
+                        .variables()
+                        .create(self.data.add_symbol(rand, None));
+                    let position = self.context.variables().create(*name);
+
+                    let mut body = self.do_compile(&code[cursor..cursor + length])?;
+                    let inside_label = self.label(None);
+                    let outside_label = self.label(None);
+
+                    result.push(Code::new_with_operands(
+                        Byte::Push,
+                        [self.data.add_constant(Value::ITERATOR(0)), 0, 0],
+                    ));
+                    result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
+                    result.push(Code::new_with_operands(
+                        Byte::Iterate,
+                        [outside_label, iter, 0],
+                    ));
+                    // dbg!(position);
+                    // result.push(Code::new_with_operands(Byte::Jumpz, [outside_label, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Store, [position, 0, 0]));
+                    result.append(&mut body);
+                    result.push(Code::new_with_operands(Byte::Pop, [1, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Jump, [inside_label, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Label, [outside_label, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Pop, [1, 0, 0]));
 
                     result
                 }
@@ -604,7 +677,10 @@ impl<'compilation> Compiler<'compilation> {
                                 Byte::Push,
                                 [self.data.add_constant(Value::default()), 0, 0],
                             ));
-                            body.push(Code::new(Byte::Leave));
+                            body.push(Code::new_with_operands(
+                                Byte::Leave,
+                                [self.context.leave(), 0, 0],
+                            ));
 
                             result.insert(0, Code::new_with_operands(Byte::Label, [label, 0, 0]));
                             result.append(&mut body);
@@ -613,7 +689,6 @@ impl<'compilation> Compiler<'compilation> {
                             return Err(err);
                         }
                     }
-                    self.context.leave();
 
                     let arity = result
                         .iter()
@@ -685,7 +760,7 @@ impl<'compilation> Compiler<'compilation> {
     pub fn compile(&mut self, code: &Program<IR>) -> Result<Program<Code>, Error> {
         let mut program = Program::new(vec![]);
         self.data = code.data().clone();
-        let code = code.code().to_vec();
+        let code = code.code();
 
         // self.context.enter();
 
@@ -785,6 +860,9 @@ impl<'compilation> Compiler<'compilation> {
                         // Byte::Load | Byte::Store | Byte::Peek => {
                         //     format!("{}", self.data.symbol_name(c.operand(0)))
                         // }
+                        Byte::Load => {
+                            format!("{}", c.operand(0))
+                        }
                         Byte::Jump => {
                             format!("={}", c.operand(0))
                         }

@@ -128,6 +128,16 @@ pub struct ObjArray {
     items: Vec<Value>,
 }
 
+impl ObjArray {
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn item(&self, index: usize) -> &Value {
+        &self.items[index]
+    }
+}
+
 impl GcSized for ObjArray {
     fn size(&self) -> usize {
         std::mem::size_of_val(&self.length) + std::mem::size_of_val(&self.items)

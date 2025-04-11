@@ -25,12 +25,12 @@ impl CompilationPass for ConstantFolding {
                 match op.byte() {
                     Byte::Label => {
                         let offset = op.operand(1);
-                        if let Ok(mut chunk) = self.compile(&code[cursor..cursor + offset], data) {
+                        if let Ok(chunk) = self.compile(&code[cursor..cursor + offset], data) {
                             modified.push(Code::new_with_operands(
                                 Byte::Label,
                                 [op.operand(0), chunk.len(), 0],
                             ));
-                            modified.append(&mut chunk);
+                            modified.extend(chunk);
                         }
                         cursor += offset;
                     }

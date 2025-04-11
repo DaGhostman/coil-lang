@@ -39,6 +39,7 @@ pub enum Operation {
     Apply,
     Call,
     Invoke,
+    Iterate,
     // ---
     Pop,
     Const,
@@ -257,6 +258,8 @@ pub enum Byte {
     Instantiate,
     /// Invoke method
     Invoke,
+    /// ??
+    Iterate,
     /// This
     This,
 

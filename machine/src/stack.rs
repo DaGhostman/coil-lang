@@ -144,14 +144,9 @@ impl Machine {
                 Byte::Duplicate => {
                     self.stack.copy_to_top(self.stack.tell(1));
                 }
-                Byte::Store => {
-                    let pos = self.call_stack[self.fp].1 + op.operand(0);
-                    let top = self.stack.tell(1);
-
-                    if pos != top {
-                        self.stack.pop_to(pos)
-                    }
-                }
+                Byte::Store => self
+                    .stack
+                    .pop_to(self.call_stack[self.fp].1 + op.operand(0)),
                 Byte::Load => {
                     self.stack
                         .copy_to_top(op.operand(0) + self.call_stack[self.fp - 1].1);
@@ -221,11 +216,29 @@ impl Machine {
                     // likely(true);
                     let len = op.operand(0);
                     let mut items = Vec::with_capacity(len);
-                    items.append(&mut self.stack.npop(len).clone());
+                    items.copy_from_slice(self.stack.npop(len));
 
                     self.gc();
                     let (obj_array, _) = self.heap.alloc(ObjArray::from(items), Objects::Array);
                     self.stack.push(Value::OBJECT(obj_array));
+                }
+                Byte::Iterate => {
+                    let iter = self.stack.pop();
+                    let arr = self.stack.peek(self.stack.tell(1));
+                    if let (Value::ITERATOR(n), Value::OBJECT(Objects::Array(arr))) = (iter, arr) {
+                        if n >= arr.as_ref().len() {
+                            self.ip = op.operand(0);
+                            continue;
+                        }
+
+                        self.stack.push(Value::ITERATOR(n + 1));
+                        self.stack.pop_to(op.operand(1));
+                        self.stack.push(*arr.as_ref().item(n));
+                    } else {
+                        todo!(
+                            "Handle cases where value is not an array, but object that actually implements iterator interface or error if it is not a valid iterable"
+                        );
+                    }
                 }
                 Byte::Instantiate => {
                     // likely(true);
@@ -403,7 +416,7 @@ impl Machine {
 
     // #[inline]
     fn peek_obj(&self, position: usize) -> Value {
-        match self.stack.peek(self.stack.tell(position + 1)) {
+        match self.stack.peek(self.stack.tell(position)) {
             Value::REFERENCE(n) => self.stack.peek(n),
             v => {
                 dbg!(&v);
