@@ -45,6 +45,7 @@ impl From<u8> for Precedence {
 }
 
 impl Precedence {
+    #[must_use]
     pub fn get(code: TokenKind) -> Precedence {
         match code {
             TokenKind::LeftParenthesis => Precedence::Call,
@@ -69,7 +70,7 @@ impl Precedence {
             | TokenKind::Bang
             | TokenKind::Tilde
             | TokenKind::As => Precedence::Unary,
-            TokenKind::Let | TokenKind::Equal => Precedence::Assign,
+            TokenKind::Equal => Precedence::Assign,
             TokenKind::DotDot => Precedence::Unary,
             TokenKind::Dot => Precedence::Call,
             TokenKind::Match | TokenKind::If => Precedence::Primary,
@@ -78,6 +79,7 @@ impl Precedence {
         }
     }
 
+    #[must_use]
     pub fn next(&self) -> Precedence {
         ((*self as u8) + 1_u8).into()
     }

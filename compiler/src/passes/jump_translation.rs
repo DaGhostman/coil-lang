@@ -60,7 +60,7 @@ impl CompilationPass for LabelUnrolling {
         let mut funcs = rustc_hash::FxHashSet::default();
 
         let mut bytecode = Vec::with_capacity(code.len());
-        for code in code.iter() {
+        for code in code {
             bytecode.push(match code.byte() {
                 Byte::Jump => {
                     Code::new_with_operands(Byte::Jump, [self.jump_at(code.operand(0)), 0, 0])

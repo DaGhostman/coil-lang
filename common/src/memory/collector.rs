@@ -31,7 +31,7 @@ impl<T> Gc<T> {
     }
 
     pub fn set_next(&mut self, next: Option<Objects>) {
-        self.next.set(next)
+        self.next.set(next);
     }
 
     pub fn is_marked(&self) -> bool {
@@ -48,7 +48,7 @@ impl<T> Gc<T> {
     }
 
     pub fn unmark(&mut self) {
-        self.marked.set(false)
+        self.marked.set(false);
     }
 }
 
@@ -82,7 +82,7 @@ pub struct Collectable<T> {
 }
 
 impl<T> Collectable<T> {
-    pub fn new(boxed: Box<Gc<T>>) -> Self {
+    #[must_use] pub fn new(boxed: Box<Gc<T>>) -> Self {
         Self {
             ptr: NonNull::from(Box::leak(boxed)),
         }
@@ -92,7 +92,7 @@ impl<T> Collectable<T> {
         _ = unsafe { Box::from_raw(self.ptr.as_ptr()) }
     }
 
-    pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
+    #[must_use] pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
         lhs.ptr.eq(&rhs.ptr)
     }
 }

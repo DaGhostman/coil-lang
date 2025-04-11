@@ -96,11 +96,11 @@ pub struct TokenPosition {
 }
 
 impl TokenPosition {
-    pub fn line(&self) -> usize {
+    #[must_use] pub fn line(&self) -> usize {
         self.line
     }
 
-    pub fn column(&self) -> usize {
+    #[must_use] pub fn column(&self) -> usize {
         self.column
     }
 }
@@ -120,14 +120,14 @@ impl Default for Token {
             start: TokenPosition { line: 0, column: 0 },
             end: TokenPosition { line: 0, column: 0 },
             lexeme: String::from("\0"),
-            file: String::from(""),
+            file: String::new(),
             kind: TokenKind::EOF,
         }
     }
 }
 
 impl Token {
-    pub fn begin(kind: TokenKind, line: usize, column: usize, file: &str) -> Self {
+    #[must_use] pub fn begin(kind: TokenKind, line: usize, column: usize, file: &str) -> Self {
         Token {
             kind,
             start: TokenPosition { line, column },
@@ -143,27 +143,27 @@ impl Token {
         self.lexeme = lexeme;
     }
 
-    pub fn start_line(&self) -> usize {
+    #[must_use] pub fn start_line(&self) -> usize {
         self.start.line
     }
 
-    pub fn start_column(&self) -> usize {
+    #[must_use] pub fn start_column(&self) -> usize {
         self.start.column
     }
 
-    pub fn end_line(&self) -> usize {
+    #[must_use] pub fn end_line(&self) -> usize {
         self.end.line
     }
 
-    pub fn end_column(&self) -> usize {
+    #[must_use] pub fn end_column(&self) -> usize {
         self.end.column
     }
 
-    pub fn kind(&self) -> TokenKind {
+    #[must_use] pub fn kind(&self) -> TokenKind {
         self.kind
     }
 
-    pub fn lexeme(&self) -> &str {
+    #[must_use] pub fn lexeme(&self) -> &str {
         self.lexeme.as_ref()
     }
 }

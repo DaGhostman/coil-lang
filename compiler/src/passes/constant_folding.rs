@@ -13,7 +13,6 @@ impl CompilationPass for ConstantFolding {
         code: &[Code],
         data: &mut Data,
     ) -> Result<Vec<Code>, common::error::Error> {
-        let default_value = Value::default();
         let mut length = code.len();
 
         loop {
@@ -39,9 +38,10 @@ impl CompilationPass for ConstantFolding {
                         let rhs = modified.last();
                         let lhs = modified.get(modified.len() - 2);
 
-                        if let (Some(Byte::Push), Some(Byte::Push)) =
-                            (rhs.map(|o| o.byte()), lhs.map(|o| o.byte()))
-                        {
+                        if let (Some(Byte::Push), Some(Byte::Push)) = (
+                            rhs.map(common::opcodes::Code::byte),
+                            lhs.map(common::opcodes::Code::byte),
+                        ) {
                             match (
                                 lhs.map(|c| data.constant(c.operand(0))),
                                 rhs.map(|c| data.constant(c.operand(0))),

@@ -1,168 +1,282 @@
-use std::{collections::HashMap, fmt::Debug};
+use collector::{Collectable, Gc, GcSized};
+use object::Objects;
 
-use crate::{Value, ValueKind};
-use arena::{Arena, Key};
+pub mod collector;
+pub mod object;
 
-pub mod allocator;
-pub mod arena;
-pub mod ref_counter;
-pub mod table;
+use std::fmt::Debug;
 
-#[derive(Clone)]
-pub struct Instance<T> {
-    kind: usize,
-    fields: HashMap<usize, T>,
+pub struct Stack<T, const N: usize>
+where
+    T: Copy,
+{
+    stack: [T; N],
+    sp: usize,
 }
 
-#[derive(Clone, Debug)]
-pub struct Array<T> {
-    items: HashMap<usize, T>,
+impl<T, const N: usize> Default for Stack<T, N>
+where
+    T: Copy + Default + Debug,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl<T: Copy> Array<T> {
-    pub fn with_items(items: Vec<T>) -> Self {
-        let mut members = HashMap::with_capacity(items.len());
-
-        items.iter().enumerate().for_each(|(key, v)| {
-            members.insert(key, *v);
-        });
-
-        Self { items: members }
+impl<T, const N: usize> Stack<T, N>
+where
+    T: Copy + Default + Debug,
+{
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sp: 0,
+            stack: [Default::default(); N],
+        }
     }
 
-    pub fn item(&self, idx: usize) -> Option<&T> {
-        self.items.get(&idx)
+    pub fn pop(&mut self) -> T {
+        self.sp -= 1;
+
+        self.stack[self.sp]
+    }
+
+    pub fn npop(&mut self, n: usize) -> Vec<T> {
+        let slice = &self.stack[self.sp - n..self.sp];
+        self.sp -= n;
+
+        slice.to_vec()
+    }
+
+    pub fn push(&mut self, value: T) {
+        self.stack[self.sp] = value;
+        self.sp += 1;
+    }
+
+    pub fn tell(&self, offset: usize) -> usize {
+        self.sp - offset
+    }
+
+    pub fn restore(&mut self, size: usize) {
+        self.stack[size] = self.stack[self.sp - 1];
+        self.sp = size + 1;
+        // self.sp += 1;
+    }
+
+    pub fn peek(&self, position: usize) -> T {
+        self.stack[position]
+    }
+
+    pub fn last_mut(&mut self) -> &mut T {
+        &mut self.stack[self.sp - 1]
+    }
+
+    pub fn copy(&mut self, src: usize, dst: usize) {
+        self.stack[dst] = self.stack[src];
+    }
+
+    pub fn pop_to(&mut self, dst: usize) {
+        let diff = self.sp - dst;
+        if diff > 0 {
+            self.sp -= 1;
+            self.stack[dst] = self.stack[self.sp];
+        }
+    }
+
+    pub fn copy_to_top(&mut self, src: usize) {
+        self.stack[self.sp] = self.stack[src];
+
+        self.sp += 1;
     }
 
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.sp
+    }
+
+    pub fn iter(&self) -> StackIterator<T> {
+        StackIterator {
+            cursor: 0,
+            length: self.sp,
+            items: self.stack[..self.sp].to_vec(),
+        }
+    }
+    pub fn iter_range(&self, from: usize, to: usize) -> StackIterator<T> {
+        StackIterator {
+            cursor: 0,
+            length: self.sp,
+            items: self.stack[from..to].to_vec(),
+        }
     }
 }
 
-#[derive(Clone)]
-pub struct Str {
-    len: usize,
-    content: String,
+impl<T, const N: usize> IntoIterator for &Stack<T, N>
+where
+    T: Copy + Default + Debug,
+{
+    type Item = T;
+
+    type IntoIter = StackIterator<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
-#[derive(Clone)]
-pub enum Object<T: Clone + Copy> {
-    Object(Instance<T>),
-    Array(Array<T>),
-    String(Str),
+pub struct StackIterator<T> {
+    items: Vec<T>,
+    length: usize,
+    cursor: usize,
 }
 
-pub struct Memory {
-    stack: Vec<Value>,
-    heap: Arena<Object<ValueKind>>,
+impl<T> Iterator for StackIterator<T>
+where
+    T: Copy,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor != self.length {
+            self.cursor += 1;
+
+            return Some(self.items[self.cursor - 1]);
+        }
+
+        None
+    }
 }
 
-impl Memory {
-    pub fn new(stack_capacity: usize, heap_capacity: usize) -> Self {
+pub struct Heap {
+    head: Option<Objects>,
+    size: usize,
+    growth: usize,
+    threshold: usize,
+}
+
+impl Default for Heap {
+    fn default() -> Self {
         Self {
-            stack: Vec::with_capacity(stack_capacity),
-            heap: Arena::with_capacity(heap_capacity, None),
+            head: None,
+            size: 0,
+            growth: 2,
+            threshold: 1024 * 1024,
+        }
+    }
+}
+
+impl Heap {
+    #[must_use]
+    pub fn new(growth: usize, threshold: usize) -> Self {
+        Self {
+            head: None,
+            size: 0,
+            growth,
+            threshold,
         }
     }
 
-    pub fn push(&mut self, value: Value) {
-        if self.stack.capacity() - 1 <= self.stack.len() {
-            panic!("Stack overflow");
-        }
+    pub fn alloc<T: GcSized, F>(&mut self, value: T, map: F) -> (Objects, Collectable<T>)
+    where
+        F: Fn(Collectable<T>) -> Objects,
+    {
+        let boxed = Box::new(Gc::new(self.head, value));
+        let content = Collectable::new(boxed);
+        let object = map(content);
+        self.size += object.size();
+        self.head = Some(object);
 
-        match value.kind() {
-            ValueKind::ARRAY(key) => self.heap.reference(*key),
-            _ => (),
-        }
-
-        self.stack.push(value);
+        (object, content)
     }
 
-    pub fn pop(&mut self) -> Option<Value> {
-        if self.stack.len() == 0 {
-            eprintln!("Stack underflow");
-        }
+    pub fn sweep(&mut self) {
+        let mut prev_obj: Option<Objects> = None;
+        let mut curr_obj = self.head;
 
-        let val = self.stack.pop();
-        match val.map(|v| v.kind().clone()) {
-            Some(ValueKind::ARRAY(key)) => self.heap.dereference(key),
-            _ => (),
-        }
-
-        val
-    }
-
-    pub fn peek(&mut self, offset: usize) -> Option<&Value> {
-        if self.stack.is_empty() {
-            None
-        } else if self.stack.len() < offset {
-            None
-        } else {
-            self.stack.get(self.stack.len() - offset)
-        }
-    }
-
-    pub fn alloc(&mut self, value: Object<ValueKind>) -> Key {
-        self.heap.alloc(value)
-    }
-
-    pub fn lookup(&self, key: Key) -> Option<&Object<ValueKind>> {
-        self.heap.get(key)
-    }
-
-    pub fn lookup_mut(&mut self, key: Key) -> Option<&mut Object<ValueKind>> {
-        self.heap.get_mut(key)
-    }
-
-    pub fn free(&mut self, key: Key) -> Option<Object<ValueKind>> {
-        if let Some(value) = self.heap.get(key).cloned() {
-            self.heap.free(key);
-
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    pub fn truncate(&mut self, index: usize) {
-        for value in self
-            .stack
-            .drain(index..self.stack.len())
-            .collect::<Vec<Value>>()
-            .iter()
-            .copied()
-        {
-            match value.kind() {
-                ValueKind::ARRAY(key) => {
-                    self.heap.dereference(*key);
+        while let Some(mut curr_ref) = curr_obj {
+            let next = curr_ref.get_next();
+            if curr_ref.is_marked() {
+                curr_ref.unmark();
+                prev_obj = curr_obj;
+                curr_obj = next;
+            } else {
+                self.dealloc(curr_ref);
+                curr_obj = next;
+                if let Some(mut prev_ref) = prev_obj {
+                    prev_ref.set_next(next);
+                } else {
+                    self.head = curr_obj;
                 }
-                _ => (),
             }
         }
+
+        if self.size <= self.threshold - self.growth {
+            self.threshold = (self.size.max(1) * self.growth).max(self.threshold);
+        }
     }
 
-    pub fn len(&self) -> usize {
-        self.stack.len()
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.size
     }
 
-    // pub fn size(&self) -> usize {
-    //     let mut size = std::mem::size_of_val(&self);
-    //     size += self.heap.size();
-    //     size += self.stack.len() * size_of::<T>();
-    //
-    //     size
-    // }
+    #[must_use]
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    #[must_use]
+    pub fn has_allocated(&self) -> bool {
+        self.size > 0
+    }
+
+    pub fn dealloc(&mut self, object: Objects) {
+        let size = object.size();
+        self.size -= size;
+
+        match object {
+            Objects::None => (),
+            Objects::Array(value) => value.release(),
+            Objects::String(value) => value.release(),
+            Objects::Object(value) => value.release(),
+        }
+    }
+
+    pub fn iter(&self) -> Iter {
+        <&Self as IntoIterator>::into_iter(self)
+    }
 }
 
-impl Debug for Memory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:?}",
-            self.stack
-                .iter()
-                .map(|v| *v.kind())
-                .collect::<Vec<ValueKind>>()
-        )
+impl Drop for Heap {
+    fn drop(&mut self) {
+        for object in &*self {
+            self.dealloc(object);
+        }
+    }
+}
+
+impl IntoIterator for &Heap {
+    type Item = Objects;
+
+    type IntoIter = Iter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Self::IntoIter { next: self.head }
+    }
+}
+
+pub struct Iter {
+    next: Option<Objects>,
+}
+
+impl Iterator for Iter {
+    type Item = Objects;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(node) = self.next {
+            self.next = node.get_next();
+
+            return Some(node);
+        }
+
+        None
     }
 }

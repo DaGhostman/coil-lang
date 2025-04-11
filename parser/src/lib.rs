@@ -24,7 +24,7 @@ pub struct Context<'ctx> {
 
 impl<'ctx> Context<'ctx> {
     pub fn new(scanner: &'ctx mut Scanner) -> Self {
-        let current = scanner.scan().unwrap_or_default();
+        let current = scanner.scan();
 
         Self {
             scanner,
@@ -33,10 +33,12 @@ impl<'ctx> Context<'ctx> {
         }
     }
 
+    #[must_use]
     pub fn current(&self) -> &Token {
         &self.current
     }
 
+    #[must_use]
     pub fn previous(&self) -> Option<Token> {
         self.previous.clone()
     }
@@ -44,9 +46,10 @@ impl<'ctx> Context<'ctx> {
     pub fn advance(&mut self) {
         self.previous = Some(self.current.clone());
 
-        self.current = self.scanner.scan().unwrap_or_default();
+        self.current = self.scanner.scan();
     }
 
+    #[must_use]
     pub fn tell(&self) -> usize {
         self.scanner.tell()
     }
@@ -547,6 +550,27 @@ impl Parser {
         }
     }
 
+    fn while_(&mut self, ctx: &mut Context) -> Vec<IR> {
+        self.consume(ctx, TokenKind::While);
+        let mut result = self.expression(ctx);
+        let condition_len = result.len();
+        result.append(&mut self.block(ctx));
+        let body_len = result.len() - condition_len;
+
+        result.insert(
+            0,
+            IR::new(Operation::Loop, Some([condition_len, body_len, 0])),
+        );
+
+        result
+    }
+
+    // fn loop_(&mut self, ctx: &mut Context, condition: Vec<IR>, body: Vec<IR>) -> Vec<IR> {
+    //     let mut result = vec![];
+    //
+    //     result
+    // }
+
     fn boomer_loop(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.consume(ctx, TokenKind::For);
         let mut result = vec![];
@@ -573,6 +597,7 @@ impl Parser {
             self.expr_statement(ctx)
         };
 
+        action.push(IR::new(Operation::Pop, None));
         body.append(&mut action);
 
         result.append(&mut initializer);
@@ -701,6 +726,7 @@ impl Parser {
 
     fn expr_statement(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut tokens = self.expr(ctx);
+
         tokens.push(IR::new(Operation::Pop, None));
 
         tokens
@@ -741,6 +767,8 @@ impl Parser {
                 Some([self.data.add_constant(Value::NONE), 0, 0]),
             ));
         }
+
+        // self.consume(ctx, TokenKind::SemiColon);
 
         tokens.push(IR::new(
             Operation::Declare,
@@ -809,8 +837,8 @@ impl Parser {
                 TokenKind::Identifier,
                 "Expected function argument identifier",
             ) {
-                body.insert(
-                    0,
+                body.push(
+                    // 0,
                     IR::new(
                         Operation::Argument,
                         Some([
@@ -880,17 +908,17 @@ impl Parser {
                 let prop_name = ctx.current.lexeme().to_string();
                 self.consume(ctx, TokenKind::Identifier);
 
-                let mut prop = if !self.consume(ctx, TokenKind::SemiColon) {
-                    self.expr_statement(ctx)
-                } else {
+                let mut prop = if self.consume(ctx, TokenKind::SemiColon) {
                     vec![]
+                } else {
+                    self.expr_statement(ctx)
                 };
                 prop.push(IR::new(
                     Operation::Prop,
                     Some([
                         owner,
                         self.data.add_symbol(prop_name, None),
-                        public as usize,
+                        usize::from(public),
                     ]),
                 ));
 
@@ -949,7 +977,13 @@ impl Parser {
         match ctx.current().kind() {
             TokenKind::Let => {
                 ctx.advance();
-                self.variable(ctx)
+                let result = self.variable(ctx);
+                self.consume(ctx, TokenKind::SemiColon);
+                result
+            }
+            TokenKind::While => {
+                ctx.advance();
+                self.while_(ctx)
             }
             TokenKind::Const => {
                 ctx.advance();

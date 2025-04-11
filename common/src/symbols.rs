@@ -9,6 +9,7 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             names: Interner::default(),
@@ -25,21 +26,25 @@ impl SymbolTable {
         idx
     }
 
+    #[must_use]
     pub fn constant(&self, symbol: usize) -> usize {
         self.mapping[&symbol]
     }
 
+    #[must_use]
     pub fn name(&self, symbol: usize) -> &String {
         self.names.lookup(symbol)
     }
 
+    #[must_use]
     pub fn symbol(&self, symbol: String) -> usize {
         let mut interner = self.names.clone();
         interner.intern(symbol)
     }
 
+    #[must_use]
     pub fn contains(&self, symbol: String) -> bool {
         let mut interner = self.names.clone();
-        self.mapping.get(&interner.intern(symbol)).is_some()
+        self.mapping.contains_key(&interner.intern(symbol))
     }
 }

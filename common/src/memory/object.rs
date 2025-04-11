@@ -13,7 +13,7 @@ fn calculate_hash<V: Hash>(value: &V) -> u64 {
     hash.finish()
 }
 
-use crate::{Value, memory2::GcSized};
+use crate::{Value, memory::GcSized};
 
 use super::collector::Collectable;
 
@@ -67,6 +67,7 @@ impl Objects {
         }
     }
 
+    #[must_use]
     pub fn is_marked(&self) -> bool {
         match self {
             Self::None => true,
@@ -90,6 +91,7 @@ impl Objects {
         }
     }
 
+    #[must_use]
     pub fn get_next(&self) -> Option<Self> {
         match self {
             Self::None => None,
@@ -194,6 +196,7 @@ pub struct ObjInstance {
 }
 
 impl ObjInstance {
+    #[must_use]
     pub fn new(name: usize) -> Self {
         Self {
             name,
@@ -202,6 +205,7 @@ impl ObjInstance {
         }
     }
 
+    #[must_use]
     pub fn name(&self) -> usize {
         self.name
     }
@@ -211,10 +215,12 @@ impl ObjInstance {
         self.hash = calculate_hash(self);
     }
 
+    #[must_use]
     pub fn get(&self, name: usize) -> Option<&Value> {
         self.state.get(&name)
     }
 
+    #[must_use]
     pub fn all(&self) -> &HashMap<usize, Value> {
         &self.state
     }

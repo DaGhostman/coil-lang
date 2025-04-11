@@ -32,15 +32,15 @@ pub struct Error {
 }
 
 impl Error {
-    pub fn new(origin: ErrorOrigin, message: String) -> Self {
+    #[must_use] pub fn new(origin: ErrorOrigin, message: String) -> Self {
         Self { origin, message }
     }
 
-    pub fn message(&self) -> &str {
+    #[must_use] pub fn message(&self) -> &str {
         self.message.as_str()
     }
 
-    pub fn origin(&self) -> ErrorOrigin {
+    #[must_use] pub fn origin(&self) -> ErrorOrigin {
         self.origin
     }
 }

@@ -23,7 +23,7 @@ impl Output {
         }
     }
 
-    pub fn write(&mut self, value: String) {
+    pub fn write(&mut self, value: &str) {
         if self.quiet {
             return;
         }

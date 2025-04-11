@@ -1,32 +1,29 @@
-use common::memory2::object::{ObjArray, ObjInstance, Objects};
-use common::vec_array::VecArray;
+use common::memory::object::{ObjArray, ObjInstance, Objects};
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{stderr, stdout};
 
 use crate::options::MachineOptions;
 use crate::utils::output::Output;
-use common::memory2::{Heap, Stack};
+use common::memory::{Heap, Stack};
 use common::program::program::Program;
 use common::{
     Value,
-    error::Error,
     opcodes::{Byte, Code},
 };
 
-const STACK_FRAMES: usize = 1024;
-const STORAGE_CHUNKS: usize = 32;
+const FRAMES: usize = 1024;
+const STACK: usize = 8192;
 
 pub struct Machine {
     stdout: Output,
     stderr: Output,
     halt: bool,
-    bootstrap: bool,
 
     ip: usize,
     fp: usize,
-    call_stack: [(usize, usize); STACK_FRAMES],
-    variables: [VecArray<usize, STORAGE_CHUNKS>; STACK_FRAMES],
-    stack: Stack<Value>,
+    // Figure out a way to not use
+    call_stack: [(usize, usize); FRAMES],
+    stack: Stack<Value, STACK>,
     heap: Heap,
     // owner => name => label
     methods: HashMap<usize, HashMap<usize, usize>>,
@@ -38,13 +35,9 @@ impl Default for Machine {
     fn default() -> Self {
         Self {
             halt: false,
-            bootstrap: false,
             ip: 0,
             fp: 1,
-            call_stack: [(0, 0); STACK_FRAMES],
-            variables: std::array::from_fn::<VecArray<usize, STORAGE_CHUNKS>, STACK_FRAMES, _>(
-                |_| Default::default(),
-            ),
+            call_stack: [(0, 0); FRAMES],
             stack: Stack::new(),
             heap: Default::default(),
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
@@ -106,7 +99,8 @@ impl Machine {
         this
     }
 
-    fn execute(&mut self, code: &Program<Code>) -> Result<(), Error> {
+    #[allow(clippy::too_many_lines)]
+    fn execute(&mut self, code: &Program<Code>) {
         self.ip = 0;
         while let Some(op) = code.get(self.ip) {
             #[cfg(feature = "trace")]
@@ -135,8 +129,6 @@ impl Machine {
                         self.enter(arity);
                         self.ip = position;
                         continue;
-                    } else {
-                        unreachable!("Attempting to call non-existing function");
                     }
                 }
                 Byte::Leave => {
@@ -147,15 +139,22 @@ impl Machine {
                     self.stack.push(*constant);
                 }
                 Byte::Pop => {
-                    self.stack.pop();
+                    self.stack.npop(op.operand(0));
                 }
-                Byte::Peek => {
-                    self.reassign(op.operand(0), (self.stack.len() - 1) - op.operand(1));
+                Byte::Duplicate => {
+                    self.stack.copy_to_top(self.stack.tell(1));
                 }
-                Byte::Store => self.reassign(op.operand(0), self.stack.tell(1)),
+                Byte::Store => {
+                    let pos = self.call_stack[self.fp].1 + op.operand(0);
+                    let top = self.stack.tell(1);
+
+                    if pos != top {
+                        self.stack.pop_to(pos)
+                    }
+                }
                 Byte::Load => {
-                    let pos = self.lookup(op.operand(0));
-                    self.stack.copy_to_top(pos);
+                    self.stack
+                        .copy_to_top(op.operand(0) + self.call_stack[self.fp - 1].1);
                 }
                 Byte::Not => unary_handler!(self, !),
                 Byte::Negate => unary_handler!(self, -),
@@ -173,16 +172,13 @@ impl Machine {
                 Byte::And => binary_handler!(self, &),
                 Byte::Or => binary_handler!(self, |),
                 Byte::Print => {
-                    self.stdout.write(
-                        (match self.stack.pop() {
-                            Value::STR(idx) => code.data().string(idx).to_string(),
-                            value => value.to_string(),
-                        })
-                        .to_string(),
-                    );
+                    self.stdout.write(&match self.stack.pop() {
+                        Value::STR(idx) => code.data().string(idx).to_string(),
+                        value => value.to_string(),
+                    });
 
                     if op.operand(0) == 1 {
-                        self.stdout.write("\n".to_string());
+                        self.stdout.write("\n");
                     }
                 }
                 Byte::Jump => {
@@ -200,7 +196,7 @@ impl Machine {
                         Value::BOOLEAN(byte) => byte,
                         Value::FLOAT(value) => value != 0.0,
                         Value::INTEGER(value) => value != 0,
-                        _ => panic!("Unable to evaluate"),
+                        _ => true,
                     };
 
                     if !state {
@@ -219,15 +215,13 @@ impl Machine {
                         let (obj_array, _) = self.heap.alloc(ObjArray::from(items), Objects::Array);
 
                         self.stack.push(Value::OBJECT(obj_array));
-                    } else {
-                        unreachable!("Invalid start & end for range");
                     }
                 }
                 Byte::Array => {
                     // likely(true);
                     let len = op.operand(0);
                     let mut items = Vec::with_capacity(len);
-                    items.append(&mut self.stack.npop(len).to_vec());
+                    items.append(&mut self.stack.npop(len).clone());
 
                     self.gc();
                     let (obj_array, _) = self.heap.alloc(ObjArray::from(items), Objects::Array);
@@ -247,7 +241,7 @@ impl Machine {
                     let (instance, _) = self.heap.alloc(object, Objects::Object);
 
                     self.stack.push(Value::OBJECT(instance));
-                    self.stack.push(Value::POINTER(self.stack.tell(1)));
+                    self.stack.push(Value::REFERENCE(self.stack.tell(1)));
                 }
                 Byte::Invoke => {
                     // likely(true);
@@ -292,17 +286,15 @@ impl Machine {
                                     })
                                     .or_insert_with(|| vec![*field]);
                             }
-                            _ => unreachable!("Unable to fetch state field"),
+                            _ => (),
                         }
                     }
                 }
                 Byte::Upvalue => {
                     let frame = op.operand(0);
-                    let name = op.operand(1);
                     let upvalue = op.operand(2);
 
-                    let val = self.lookup_upvalue(frame, upvalue);
-                    self.reassign(name, val);
+                    self.stack.copy_to_top(self.call_stack[frame].1 + upvalue);
                 }
                 Byte::Halt => {
                     self.halt = true;
@@ -321,13 +313,9 @@ impl Machine {
 
             self.ip += 1;
         }
-
-        Ok(())
     }
 
-    pub fn run(&mut self, code: Program<Code>) -> Result<Value, Error> {
-        // let bytes: Vec<(usize, Code)> = code.code().to_vec().iter().cloned().enumerate().collect();
-
+    pub fn run(&mut self, code: &Program<Code>) -> Value {
         for byte in code.code() {
             if byte.byte() == &Byte::Method {
                 let operands = byte.operands();
@@ -346,36 +334,37 @@ impl Machine {
             }
         }
 
-        self.execute(&code)?;
+        self.execute(code);
 
-        Ok(self.stack.pop())
+        self.stack.pop()
     }
 
     fn gc(&mut self) {
+        #[cfg(not(feature = "stress"))]
         if self.heap.size() <= self.heap.threshold() {
             return;
         }
 
-        let mut grey = Vec::with_capacity(32);
-        self.mark_sweep(&mut grey);
+        self.mark_sweep();
     }
 
     // #[inline]
-    fn mark_sweep(&mut self, grey_objects: &mut Vec<Objects>) {
-        self.mark_roots(grey_objects);
+    fn mark_sweep(&mut self) {
+        let mut grey_objects = Vec::with_capacity(32);
+        self.mark_roots(&mut grey_objects);
         while let Some(object) = grey_objects.pop() {
-            object.mark_references(grey_objects);
+            object.mark_references(&mut grey_objects);
         }
+
         self.heap.sweep();
     }
 
     // #[inline]
     fn mark_roots(&mut self, grey_objects: &mut Vec<Objects>) {
         grey_objects.clear();
-        for value in self.stack.iter() {
+        for value in &self.stack {
             match value {
-                Value::OBJECT(mut o) => o.mark(grey_objects),
-                Value::STRING(mut o) => o.mark(grey_objects),
+                Value::OBJECT(mut o) | Value::STRING(mut o) => o.mark(grey_objects),
                 _ => (),
             }
         }
@@ -384,12 +373,7 @@ impl Machine {
     // #[inline]
     fn enter(&mut self, arity: usize) {
         self.call_stack[self.fp] = (self.ip, self.stack.tell(arity));
-        // .insert(self.fp, (self.ip, self.stack.tell(arity)));
         self.fp += 1;
-        // if self.stack_frames.capacity() <= self.fp {
-        //     self.variables.grow(1);
-        //     // self.stack_frames.grow(1);
-        // }
     }
 
     // #[inline]
@@ -403,24 +387,24 @@ impl Machine {
         self.stack.restore(stack);
     }
 
-    // #[inline]
-    fn lookup(&mut self, name: usize) -> usize {
-        *self.variables[self.fp].get(name)
-    }
-
-    fn lookup_upvalue(&mut self, frame: usize, name: usize) -> usize {
-        *self.variables[frame].get(name)
-    }
-
-    // #[inline]
-    fn reassign(&mut self, symbol: usize, position: usize) {
-        self.variables[self.fp].insert(symbol, position);
-    }
+    // // #[inline]
+    // fn lookup(&mut self, name: usize) -> usize {
+    //     *self.variables[self.fp].get(name)
+    // }
+    //
+    // fn lookup_upvalue(&mut self, frame: usize, name: usize) -> usize {
+    //     *self.variables[frame].get(name)
+    // }
+    //
+    // // #[inline]
+    // fn reassign(&mut self, symbol: usize, position: usize) {
+    //     self.variables[self.fp].insert(symbol, position);
+    // }
 
     // #[inline]
     fn peek_obj(&self, position: usize) -> Value {
         match self.stack.peek(self.stack.tell(position + 1)) {
-            Value::POINTER(n) => self.stack.peek(n),
+            Value::REFERENCE(n) => self.stack.peek(n),
             v => {
                 dbg!(&v);
                 v
@@ -449,10 +433,9 @@ mod tests {
 
         let mut program = Program::new(vec![constant, constant, Code::new(Byte::Add)]);
         program.with_data(values);
-        let result = Machine::default().run(program);
+        let result = Machine::default().run(&program);
 
-        assert!(result.is_ok());
-        assert_eq!(result, Ok(Value::INTEGER(4)));
+        assert_eq!(result, Value::INTEGER(4));
     }
 
     #[test]
@@ -464,9 +447,8 @@ mod tests {
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
 
-        let result = Machine::default().run(program);
-        assert!(result.is_ok());
-        assert_eq!(result, Ok(Value::FLOAT(0.9)));
+        let result = Machine::default().run(&program);
+        assert_eq!(result, Value::FLOAT(0.9));
     }
 
     #[test]
@@ -478,9 +460,8 @@ mod tests {
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
 
-        let result = Machine::default().run(program);
-        assert!(result.is_ok());
-        assert_eq!(result, Ok(Value::FLOAT(8.1)));
+        let result = Machine::default().run(&program);
+        assert_eq!(result, Value::FLOAT(8.1));
     }
 
     #[test]
@@ -492,8 +473,7 @@ mod tests {
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
         program.with_data(values);
 
-        let result = Machine::default().run(program);
-        assert!(result.is_ok());
-        assert_eq!(result, Ok(Value::FLOAT(1.8)));
+        let result = Machine::default().run(&program);
+        assert_eq!(result, Value::FLOAT(1.8));
     }
 }

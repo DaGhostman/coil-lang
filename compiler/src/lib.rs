@@ -19,10 +19,7 @@ pub trait CompilationPass {
 #[derive(Default)]
 pub struct Compiler<'compilation> {
     pipeline: Vec<&'compilation mut dyn CompilationPass>,
-
     data: Data,
-
-    // labels: HashMap<String, usize>,
     context: Context,
 }
 
@@ -47,6 +44,13 @@ impl Variables {
 
     pub fn leave(&mut self) {
         self.scope -= 1;
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let len = self.storage.len();
+        self.storage.clear();
+
+        len
     }
 
     pub fn create(&mut self, symbol: usize) -> usize {
@@ -92,9 +96,9 @@ impl Variables {
             });
     }
 
-    pub fn is_sealed(&mut self, symbol: &usize) -> bool {
+    pub fn is_sealed(&mut self, symbol: usize) -> bool {
         self.storage
-            .get(symbol)
+            .get(&symbol)
             .filter(|v| v.readonly && v.assigned)
             .is_some()
     }
@@ -106,13 +110,13 @@ impl Variables {
             .is_some()
     }
 
-    pub fn has(&self, symbol: &usize) -> bool {
-        self.storage.contains_key(symbol)
+    pub fn has(&self, symbol: usize) -> bool {
+        self.storage.contains_key(&symbol)
             && self
                 .storage
-                .get(symbol)
+                .get(&symbol)
                 .map(|v| v.scope <= self.scope)
-                .unwrap()
+                .is_some()
     }
 
     pub fn get(&self, symbol: usize) -> Variable {
@@ -176,10 +180,13 @@ impl Context {
         self.current.last()
     }
 
-    pub fn leave(&mut self) {
+    pub fn leave(&mut self) -> usize {
         self.current.pop();
         self.tco.pop();
+        let count = self.variables[self.frame].clear();
         self.frame -= 1;
+
+        count
     }
 
     pub fn set_tco(&mut self, state: bool) {
@@ -270,10 +277,11 @@ impl<'compilation> Compiler<'compilation> {
 
     pub fn random_label(&mut self) -> String {
         rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect::<String>().to_string()
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect::<String>()
+            .to_string()
     }
 
     pub fn attach(&mut self, pass: &'compilation mut dyn CompilationPass) {
@@ -302,7 +310,8 @@ impl<'compilation> Compiler<'compilation> {
                     vec![]
                 }
                 Operation::Noop => continue,
-                Operation::Pop => vec![Code::new(Byte::Pop)],
+                Operation::Pop => vec![Code::new_with_operands(Byte::Pop, [1, 0, 0])],
+
                 Operation::Const => {
                     vec![Code::new_with_operands(Byte::Push, *op.operands())]
                 }
@@ -318,7 +327,7 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::GreaterEqual => vec![Code::new(Byte::Less), Code::new(Byte::Not)],
                 Operation::Print => vec![Code::new_with_operands(
                     Byte::Print,
-                    [if op.operands()[0] == 1 { 1 } else { 0 }, 0, 0],
+                    [usize::from(op.operands()[0] == 1), 0, 0],
                 )],
                 Operation::Leave => {
                     // if self.context.is_tco() {
@@ -358,7 +367,7 @@ impl<'compilation> Compiler<'compilation> {
                         Err(err) => {
                             return Err(err);
                         }
-                    };
+                    }
                     self.context.leave();
 
                     let mut func = Code::new(Byte::Push);
@@ -369,12 +378,12 @@ impl<'compilation> Compiler<'compilation> {
                 }
                 Operation::Assign => {
                     let operands = op.operands();
-                    if !self.context.variables().has(&operands[0]) {
+                    if !self.context.variables().has(operands[0]) {
                         return Err(Error::new(
                             ErrorOrigin::COMPILE,
                             "Unable to assign to non-existing variable".to_string(),
                         ));
-                    } else if self.context.variables().is_sealed(&operands[0]) {
+                    } else if self.context.variables().is_sealed(operands[0]) {
                         return Err(Error::new(
                             ErrorOrigin::COMPILE,
                             "Assigning to a constant variable is not allowed".to_string(),
@@ -383,10 +392,13 @@ impl<'compilation> Compiler<'compilation> {
 
                     self.context.variables().assign(operands[0]);
 
-                    vec![Code::new_with_operands(
-                        Byte::Store,
-                        [self.context.variables().create(operands[0]), 0, 0],
-                    )]
+                    vec![
+                        Code::new(Byte::Duplicate),
+                        Code::new_with_operands(
+                            Byte::Store,
+                            [self.context.variables().create(operands[0]), 0, 0],
+                        ),
+                    ]
                 }
                 Operation::Declare => {
                     let operands = op.operands();
@@ -412,17 +424,18 @@ impl<'compilation> Compiler<'compilation> {
                 }
                 Operation::Argument => {
                     let operands = op.operands();
-                    let position = self.context.variables().create(operands[0]);
+                    self.context.variables().create(operands[0]);
 
-                    vec![Code::new_with_operands(
-                        Byte::Peek,
-                        [position, operands[2], 0],
-                    )]
+                    vec![]
+                    // vec![Code::new_with_operands(
+                    //     Byte::Peek,
+                    //     [position, operands[2], 0],
+                    // )]
                 }
                 Operation::Load => {
                     let operands = op.operands();
 
-                    if !self.context.variables().has(&operands[0]) {
+                    if !self.context.variables().has(operands[0]) {
                         return Err(Error::new(
                             ErrorOrigin::COMPILE,
                             format!(
@@ -451,17 +464,7 @@ impl<'compilation> Compiler<'compilation> {
                     let const_ = self.data.symbol_constant(*symbol);
 
                     if let Value::FUNCTION(definition_arity, _) = self.data.constant(const_) {
-                        if call_arity != definition_arity {
-                            return Err(Error::new(
-                                common::error::ErrorOrigin::COMPILE,
-                                format!(
-                                    "Function '{}' called with {} arguments, while expecting {}",
-                                    self.data.symbol_name(*symbol),
-                                    call_arity,
-                                    definition_arity,
-                                ),
-                            ));
-                        } else {
+                        if call_arity == definition_arity {
                             let constant = self.data.symbol_constant(*symbol);
                             if self.context.current() == Some(symbol)
                                 && code[cursor].code() == Operation::Leave
@@ -475,6 +478,16 @@ impl<'compilation> Compiler<'compilation> {
                                 result
                                     .push(Code::new_with_operands(Byte::Call, [*call_arity, 0, 0]));
                             }
+                        } else {
+                            return Err(Error::new(
+                                common::error::ErrorOrigin::COMPILE,
+                                format!(
+                                    "Function '{}' called with {} arguments, while expecting {}",
+                                    self.data.symbol_name(*symbol),
+                                    call_arity,
+                                    definition_arity,
+                                ),
+                            ));
                         }
                     }
 
@@ -483,14 +496,12 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::Loop => {
                     let mut result = vec![];
                     if let Some(condition_length) = op.get(0) {
-                        let loop_label = self.label(None);
-
                         let inside_label = self.label(None);
                         let outside_label = self.label(None);
 
                         skips += condition_length;
-                        result.push(Code::new_with_operands(Byte::Label, [loop_label, 0, 0]));
                         let mut local_cursor = cursor;
+                        result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
                         result
                             .append(&mut self.do_compile(
                                 &code[local_cursor..local_cursor + condition_length],
@@ -499,16 +510,15 @@ impl<'compilation> Compiler<'compilation> {
                         local_cursor += condition_length;
 
                         result.push(Code::new_with_operands(Byte::Jumpz, [outside_label, 0, 0]));
-                        result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
 
                         if let Some(body_length) = op.get(1) {
                             skips += body_length;
 
                             let mut chunk =
                                 self.do_compile(&code[local_cursor..local_cursor + body_length])?;
-                            result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
 
                             result.append(&mut chunk);
+                            result.push(Code::new_with_operands(Byte::Jump, [inside_label, 0, 0]));
                             result
                                 .push(Code::new_with_operands(Byte::Label, [outside_label, 0, 0]));
                         }
@@ -538,7 +548,6 @@ impl<'compilation> Compiler<'compilation> {
                         if let Some(body_length) = op.get(1) {
                             let mut chunk =
                                 self.do_compile(&code[local_cursor..=local_cursor + body_length])?;
-                            let size = chunk.len();
 
                             local_cursor += body_length;
                             skips += body_length;
@@ -618,7 +627,7 @@ impl<'compilation> Compiler<'compilation> {
                         .collect::<Vec<()>>()
                         .len();
                     self.context.add_method(*owner, *name, label, arity);
-                    self.data.add_method(*owner, *name, label);
+                    // self.data.add_method(*owner, *name, label);
                     result.insert(
                         0,
                         Code::new_with_operands(Byte::Method, [*owner, *name, label]),
@@ -630,7 +639,7 @@ impl<'compilation> Compiler<'compilation> {
                     let mut class = vec![];
 
                     let [owner, len, ..] = op.operands();
-                    self.context.enter(*owner);
+                    // self.context.enter(*owner);
                     match self.do_compile(&code[cursor..cursor + len]) {
                         Ok(mut body) => {
                             // class.push(Code::new_with_operands(Byte::Class, vec![*owner, body.len()]));
@@ -640,7 +649,7 @@ impl<'compilation> Compiler<'compilation> {
                             return Err(err);
                         }
                     }
-                    self.context.leave();
+                    // self.context.leave();
 
                     self.context.define_class(*owner);
 
@@ -673,7 +682,7 @@ impl<'compilation> Compiler<'compilation> {
         Ok(bytecode)
     }
 
-    pub fn compile(&mut self, code: Program<IR>) -> Result<Program<Code>, Error> {
+    pub fn compile(&mut self, code: &Program<IR>) -> Result<Program<Code>, Error> {
         let mut program = Program::new(vec![]);
         self.data = code.data().clone();
         let code = code.code().to_vec();
@@ -693,6 +702,7 @@ impl<'compilation> Compiler<'compilation> {
                             format!("{:?}", c.byte()).to_uppercase(),
                             match c.byte() {
                                 Byte::Push => format!("{:?}", self.data.constant(c.operand(0))),
+                                Byte::Pop => format!("{}", c.operand(0)),
                                 Byte::Call => format!(
                                     "{}({})",
                                     self.data.symbol_name(c.operand(0)),
@@ -715,27 +725,26 @@ impl<'compilation> Compiler<'compilation> {
 
                 let entrypoint = self.data.symbol_index("main".to_string());
                 let alt = self.data.symbol_index("@#$%".to_string());
-                if entrypoint != alt {
-                    let entrypoint_constant = self.data.symbol_constant_value(entrypoint);
-                    if let Value::FUNCTION(_, _) = entrypoint_constant {
-                        bytecode.insert(0, Code::new_with_operands(Byte::Call, [0, 1, 0]));
-                        bytecode.insert(
-                            0,
-                            Code::new_with_operands(
-                                Byte::Push,
-                                [self.data.symbol_constant(entrypoint), 0, 0],
-                            ),
-                        );
-                    } else {
-                        return Err(Error::new(
-                            ErrorOrigin::COMPILE,
-                            "Main label exists, but is not a function".to_string(),
-                        ));
-                    }
-                } else {
+                if entrypoint == alt {
                     return Err(Error::new(
                         ErrorOrigin::COMPILE,
                         "Missing main function".to_string(),
+                    ));
+                }
+                let entrypoint_constant = self.data.symbol_constant_value(entrypoint);
+                if let Value::FUNCTION(_, _) = entrypoint_constant {
+                    bytecode.insert(0, Code::new_with_operands(Byte::Call, [0, 1, 0]));
+                    bytecode.insert(
+                        0,
+                        Code::new_with_operands(
+                            Byte::Push,
+                            [self.data.symbol_constant(entrypoint), 0, 0],
+                        ),
+                    );
+                } else {
+                    return Err(Error::new(
+                        ErrorOrigin::COMPILE,
+                        "Main label exists, but is not a function".to_string(),
                     ));
                 }
 
@@ -754,8 +763,7 @@ impl<'compilation> Compiler<'compilation> {
                 program.with_data(self.data.clone());
             }
             Err(e) => return Err(e),
-        };
-        // self.context.leave();
+        }
 
         program.with_data(self.data.clone());
 
@@ -771,6 +779,7 @@ impl<'compilation> Compiler<'compilation> {
                     format!("{:?}", c.byte()).to_uppercase(),
                     match c.byte() {
                         Byte::Push => format!("{:?}", self.data.constant(c.operand(0))),
+                        Byte::Pop => format!("{}", c.operand(0)),
                         // Byte::Call =>
                         //     format!("{}({})", self.data.symbol_name(c.operand(0)), c.operand(1)),
                         // Byte::Load | Byte::Store | Byte::Peek => {

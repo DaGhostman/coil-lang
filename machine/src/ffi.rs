@@ -1,10 +1,10 @@
-use ahash::AHashMap as HashMap;
 use common::{
     Value, ValuePtr,
     error::{Error, ErrorOrigin},
     program::data::Data,
     types::Type,
 };
+use rustc_hash::FxHashMap as HashMap;
 
 use libffi::{
     low::{CodePtr, call, prep_cif},
@@ -118,14 +118,13 @@ impl FFIFunction {
             let result =
                 call::<*mut c_void>(&mut cif, CodePtr::from_ptr(ptr), argument_bag.as_mut_ptr());
 
-            types.iter().for_each(|t| {
-                drop(Box::from_raw(*t));
-            });
+            for t in types {
+                drop(Box::from_raw(t));
+            }
 
             Ok(match self.return_type {
-                Type::Resource => Value::resource(data.add_pointer(result as *mut c_void)),
-                Type::Pointer => Value::pointer(data.add_pointer(result as *mut c_void)),
-                _ => Value::from_ptr_and_type(result as *mut c_void, self.return_type, data),
+                Type::Resource | Type::Pointer => Value::pointer(result),
+                _ => Value::from_ptr_and_type(result, self.return_type, data),
             })
         }
     }
@@ -148,7 +147,7 @@ impl DynamicLibrary {
 
         Ok(Self {
             lib,
-            functions: HashMap::with_capacity(8),
+            functions: HashMap::default(),
         })
     }
 

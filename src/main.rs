@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, path::Path};
+use std::path::Path;
 
 use clap::{ArgAction, Parser as Clap, ValueHint};
 use compiler::{
@@ -55,24 +55,17 @@ fn main() {
 
     let mut options = MachineOptions::default();
 
-    if let Some(location) = args.config {
-        if let Ok(mut file) = File::open(location) {
-            let mut buff = vec![];
-            if let Ok(len) = file.read_to_end(&mut buff) {
-                if len > 0 {
-                    options = toml::from_str::<MachineOptions>(
-                        &String::from_utf8(buff).unwrap_or_default(),
-                    )
-                    .unwrap();
-                }
-            }
-        }
-    }
+    // if let Some(location) = args.config {
+    //     if let Ok(mut file) = File::open(location) {
+    //         let mut buff = vec![];
+    //         if let Ok(len) = file.read_to_end(&mut buff) {}
+    //     }
+    // }
 
     if let Some(cwd) = args.cwd {
         let directory = Path::new(&cwd);
         if let Err(err) = std::env::set_current_dir(directory) {
-            eprintln!("Unable to use '{}' as working directory: {}", cwd, err);
+            eprintln!("Unable to use '{cwd}' as working directory: {err}");
 
             return;
         }
@@ -97,11 +90,9 @@ fn main() {
         compiler.attach(&mut label_conversion);
 
         if let Ok(program) = Parser::default().parse(&mut scanner) {
-            match compiler.compile(program) {
+            match compiler.compile(&program) {
                 Ok(opcodes) => {
-                    if let Err(err) = Machine::with_options(options).run(opcodes) {
-                        eprintln!("{}", err);
-                    }
+                    Machine::with_options(options).run(&opcodes);
                 }
                 Err(e) => {
                     dbg!(e);

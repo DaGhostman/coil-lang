@@ -1,5 +1,4 @@
-use generational_arena::Index;
-use memory2::object::Objects;
+use memory::object::Objects;
 use std::{
     ffi::{CStr, CString, c_void},
     fmt::{Debug, Display},
@@ -14,8 +13,7 @@ pub mod error;
 pub mod interner;
 pub mod symbols;
 // pub mod memory;
-pub mod hasher;
-pub mod memory2;
+pub mod memory;
 pub mod opcodes;
 pub mod program;
 pub mod types;
@@ -26,6 +24,7 @@ pub mod vec_array;
 fn cold() {}
 
 #[inline]
+#[must_use]
 pub fn likely(b: bool) -> bool {
     if !b {
         cold();
@@ -34,6 +33,7 @@ pub fn likely(b: bool) -> bool {
     b
 }
 
+#[must_use]
 pub fn unlikely(b: bool) -> bool {
     if b {
         cold();
@@ -61,9 +61,9 @@ pub enum Value {
     // ARRAY(Key),
     RANGE(i64, i64),
     FILE(usize),
-    REFERENCE(Index),
+    REFERENCE(usize),
     RESOURCE(usize),
-    POINTER(usize),
+    POINTER(*mut c_void),
     FFI(usize),
     STRING(Objects),
     OBJECT(Objects),
@@ -112,7 +112,7 @@ impl Add for Value {
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs + rhs),
             (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 + rhs),
             (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs + rhs as f64),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -126,7 +126,7 @@ impl Sub for Value {
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs - rhs),
             (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 - rhs),
             (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs - rhs as f64),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -140,7 +140,7 @@ impl Mul for Value {
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs * rhs),
             (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 * rhs),
             (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs * rhs as f64),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -154,7 +154,7 @@ impl Div for Value {
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs / rhs),
             (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 / rhs),
             (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs / rhs as f64),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -168,7 +168,7 @@ impl Rem for Value {
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs % rhs),
             (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 % rhs),
             (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs % rhs as f64),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -179,7 +179,7 @@ impl Shl for Value {
     fn shl(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs << rhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -190,7 +190,7 @@ impl Shr for Value {
     fn shr(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs >> rhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -202,7 +202,7 @@ impl BitAnd for Value {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs & rhs),
             (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Value::BOOLEAN(lhs & rhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -214,7 +214,7 @@ impl BitOr for Value {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs | rhs),
             (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Value::BOOLEAN(lhs | rhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -226,7 +226,7 @@ impl BitXor for Value {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs ^ rhs),
             (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => Value::BOOLEAN(lhs ^ rhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -238,7 +238,7 @@ impl Not for Value {
         match self {
             Value::INTEGER(lhs) => Value::INTEGER(!lhs),
             Value::BOOLEAN(lhs) => Value::BOOLEAN(!lhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -250,7 +250,7 @@ impl Neg for Value {
         match self {
             Value::INTEGER(rhs) => Value::INTEGER(-rhs),
             Value::FLOAT(rhs) => Value::FLOAT(-rhs),
-            _ => unreachable!("Invalid operation"),
+            _ => Value::NONE,
         }
     }
 }
@@ -295,8 +295,12 @@ impl Hash for Value {
                 arity.hash(state);
                 l.hash(state);
             }
-            Value::RESOURCE(ptr) | Value::POINTER(ptr) => {
+            Value::RESOURCE(ptr) => {
                 "res".hash(state);
+                format!("{ptr:p}").hash(state);
+            }
+            Value::POINTER(ptr) => {
+                "ptr".hash(state);
                 format!("{:p}", ptr).hash(state);
             }
             Value::REFERENCE(idx) => {
@@ -318,12 +322,12 @@ impl Display for Value {
             f,
             "{}",
             match self {
-                Value::INTEGER(int) => format!("{}", int),
-                Value::FLOAT(f) => format!("{:.?}", f),
-                Value::NONE => String::from(""),
-                Value::BOOLEAN(b) => format!("{}", b),
-                Value::STR(s) => format!("{}", s),
-                value => format!("{:?}", value),
+                Value::INTEGER(int) => format!("{int}"),
+                Value::FLOAT(f) => format!("{f:.?}"),
+                Value::NONE => String::new(),
+                Value::BOOLEAN(b) => format!("{b}"),
+                Value::STR(s) => format!("{s}"),
+                value => format!("{value:?}"),
             }
         )
     }
@@ -335,20 +339,20 @@ impl Debug for Value {
             f,
             "{}",
             match self {
-                Value::INTEGER(int) => format!("int({})", int),
-                Value::FLOAT(f) => format!("float({:.?})", f),
+                Value::INTEGER(int) => format!("int({int})"),
+                Value::FLOAT(f) => format!("float({f:.?})"),
                 Value::NONE => String::from("void"),
-                Value::BOOLEAN(b) => format!("bool({})", b),
-                Value::STR(s) => format!("string({})", s),
-                Value::STRING(s) => format!("string({})", s),
-                Value::FUNCTION(_, symbol) => format!("fn({})", symbol),
+                Value::BOOLEAN(b) => format!("bool({b})"),
+                Value::STR(s) => format!("string({s})"),
+                Value::STRING(s) => format!("string({s})"),
+                Value::FUNCTION(_, symbol) => format!("fn({symbol})"),
                 // ValueKind::ARRAY(a) => format!("arr({})", a),
-                Value::RANGE(start, end) => format!("range({}, {})", start, end),
-                Value::FILE(fd) => format!("file({})", fd),
+                Value::RANGE(start, end) => format!("range({start}, {end})"),
+                Value::FILE(fd) => format!("file({fd})"),
                 Value::RESOURCE(_) => "resuorce".to_string(),
-                Value::POINTER(n) => format!("pointer({})", n),
-                Value::FFI(id) => format!("dynamic({})", id),
-                Value::REFERENCE(idx) => format!("ref({:?})", idx),
+                Value::POINTER(n) => format!("pointer({:p})", n),
+                Value::FFI(id) => format!("dynamic({id})"),
+                Value::REFERENCE(idx) => format!("ref({idx:?})"),
                 Value::OBJECT(obj) => format!("obj({})", std::ptr::addr_of!(obj) as u64),
             }
         )
@@ -359,14 +363,18 @@ impl Debug for Value {
 //  drop
 
 impl Value {
+    #[must_use]
     pub fn try_into_raw(&self) -> Option<*mut c_void> {
-        Some(match self {
-            Value::NONE => Box::into_raw(Box::new(std::ptr::null::<c_void>())) as *mut c_void,
-            Value::BOOLEAN(state) => Box::into_raw(Box::new(*state as u8)) as *mut c_void,
-            Value::INTEGER(number) => Box::into_raw(Box::new(*number)) as *mut c_void,
-            Value::FLOAT(number) => Box::into_raw(Box::new(*number)) as *mut c_void,
-            _ => return None,
-        } as *mut c_void)
+        Some(
+            (match self {
+                Value::NONE => Box::into_raw(Box::new(std::ptr::null::<c_void>())).cast::<c_void>(),
+                Value::BOOLEAN(state) => Box::into_raw(Box::new(u8::from(*state))).cast::<c_void>(),
+                Value::INTEGER(number) => Box::into_raw(Box::new(*number)).cast::<c_void>(),
+                Value::FLOAT(number) => Box::into_raw(Box::new(*number)).cast::<c_void>(),
+                _ => return None,
+            })
+            .cast::<c_void>(),
+        )
     }
 
     pub fn ptr(&self, data: &mut Data) -> Option<ValuePtr> {
@@ -382,11 +390,11 @@ impl Value {
                     None
                 }
             }
-            Value::RESOURCE(ptr) => data.pointer(*ptr).map(|ptr| ValuePtr {
-                ptr,
-                kind: Type::Resource,
-            }),
-            Value::POINTER(ptr) => data.pointer(*ptr).map(|ptr| ValuePtr {
+            // Value::RESOURCE(ptr) => data.pointer(*ptr).map(|ptr| ValuePtr {
+            //     ptr,
+            //     kind: Type::Resource,
+            // }),
+            Value::POINTER(ptr) => Some(ValuePtr {
                 ptr: Box::into_raw(Box::new(ptr)) as *const _,
                 kind: Type::Pointer,
             }),
@@ -401,9 +409,9 @@ impl Value {
     pub fn from_ptr_and_type(ptr: *mut c_void, kind: Type, data: &mut Data) -> Self {
         match kind {
             Type::None => Self::default(),
-            Type::Bool => Self::from((ptr as *mut u8) as u8 != 0),
-            Type::Integer => Self::from((ptr as *mut i64) as i64),
-            Type::Float => Self::from(f64::from_bits((ptr as *mut u64) as u64)),
+            Type::Bool => Self::from(ptr.cast::<u8>() as u8 != 0),
+            Type::Integer => Self::from(ptr.cast::<i64>() as i64),
+            Type::Float => Self::from(f64::from_bits(ptr.cast::<u64>() as u64)),
             Type::String => {
                 let string = unsafe {
                     CStr::from_ptr(ptr as *const i8)
@@ -412,20 +420,22 @@ impl Value {
                 };
                 Self::string(data.add_string(string))
             }
-            Type::Resource => Self::resource(data.add_pointer(ptr)),
-            Type::Pointer => Self::pointer(data.add_pointer(ptr)),
+            Type::Resource | Type::Pointer => Self::pointer(ptr),
             _ => todo!(),
         }
     }
+    #[must_use]
     pub fn string(identifier: usize) -> Value {
         Self::STR(identifier)
     }
 
+    #[must_use]
     pub fn resource(identifier: usize) -> Value {
         Self::RESOURCE(identifier)
     }
 
-    pub fn pointer(identifier: usize) -> Value {
+    #[must_use]
+    pub fn pointer(identifier: *mut c_void) -> Value {
         Self::POINTER(identifier)
     }
 }
@@ -437,17 +447,20 @@ pub struct ValuePtr {
 }
 
 impl ValuePtr {
+    #[must_use]
     pub fn new(ptr: *const c_void, kind: Type) -> Self {
         Self { ptr, kind }
     }
+    #[must_use]
     pub fn ptr<R>(&self) -> *const R {
-        self.ptr as *const R
+        self.ptr.cast::<R>()
     }
 
     pub fn ptr_mut<R>(&mut self) -> *mut R {
         self.ptr as *mut R
     }
 
+    #[must_use]
     pub fn kind(&self) -> Type {
         self.kind
     }
@@ -457,15 +470,15 @@ impl Drop for ValuePtr {
     fn drop(&mut self) {
         // dbg!(unsafe { Box::from_raw(self.ptr as *mut &str) });
         match self.kind {
-            Type::None => unsafe { drop(Box::from_raw(self.ptr as *mut c_void)) },
+            Type::None => unsafe { drop(Box::from_raw(self.ptr.cast_mut())) },
             Type::Bool => unsafe { drop(Box::from_raw(self.ptr as *mut u8)) },
             Type::Integer => unsafe { drop(Box::from_raw(self.ptr as *mut isize)) },
             Type::Float => unsafe { drop(Box::from_raw(self.ptr as *mut f64)) },
             Type::String => unsafe { drop(Box::from_raw(self.ptr as *mut CString)) },
-            Type::Resource => unsafe { drop(Box::from_raw(self.ptr as *mut c_void)) },
+            Type::Resource => unsafe { drop(Box::from_raw(self.ptr.cast_mut())) },
             Type::Pointer => unsafe { drop(Box::from_raw(self.ptr as *mut *mut c_void)) },
             _ => (),
-        };
+        }
     }
 }
 

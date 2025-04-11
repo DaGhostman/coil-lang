@@ -16,10 +16,12 @@ pub struct Scanner {
 }
 
 impl Scanner {
+    #[must_use]
     pub fn tell(&self) -> usize {
         self.buffer.tell()
     }
 
+    #[must_use]
     pub fn new(buffer: Buffer, file: Option<String>) -> Self {
         Scanner {
             buffer,
@@ -91,7 +93,7 @@ impl Scanner {
         true
     }
 
-    fn string(&mut self) -> Result<Token, Error> {
+    fn string(&mut self) -> Token {
         let separator = self.current().unwrap();
         self.advance();
         let start = self.buffer.tell();
@@ -119,17 +121,17 @@ impl Scanner {
                 .replace("\\r", "\r")
                 .replace("\\t", "\t")
                 .replace(
-                    format!("\\{}", separator).as_str(),
-                    format!("{}", separator).as_str(),
+                    format!("\\{separator}").as_str(),
+                    format!("{separator}").as_str(),
                 ),
             self.line,
             self.column,
         );
 
-        Ok(token)
+        token
     }
 
-    fn digit(&mut self) -> Result<Token, Error> {
+    fn digit(&mut self) -> Token {
         let start = self.buffer.tell();
         let mut token = Token::begin(TokenKind::EOF, self.line, self.column, "file-name");
         let mut is_float = None;
@@ -187,10 +189,10 @@ impl Scanner {
             self.column,
         );
 
-        Ok(token)
+        token
     }
 
-    fn identifier(&mut self) -> Result<Token, Error> {
+    fn identifier(&mut self) -> Token {
         let start = self.buffer.tell();
         let mut token = Token::begin(TokenKind::Identifier, self.line, self.column, "file-name");
         match self.current().map(|c| c.to_ascii_lowercase()) {
@@ -214,10 +216,10 @@ impl Scanner {
             self.column,
         );
 
-        Ok(token)
+        token
     }
 
-    fn make_token(&mut self, kind: TokenKind, lexeme: &str) -> Result<Token, Error> {
+    fn make_token(&mut self, kind: TokenKind, lexeme: &str) -> Token {
         let start = self.buffer.tell();
         let mut token = Token::begin(kind, self.line, self.column, "file-name");
 
@@ -236,10 +238,10 @@ impl Scanner {
             self.column,
         );
 
-        Ok(token)
+        token
     }
 
-    fn keyword_or_identifier(&mut self, kind: TokenKind, lexeme: &str) -> Result<Token, Error> {
+    fn keyword_or_identifier(&mut self, kind: TokenKind, lexeme: &str) -> Token {
         if self.matches(lexeme) {
             if !self
                 .peek(lexeme.len())
@@ -262,13 +264,13 @@ impl Scanner {
                 self.column - lexeme.len(),
             );
 
-            Ok(token)
+            token
         } else {
             self.identifier()
         }
     }
 
-    fn skip_comment(&mut self) -> Result<Token, Error> {
+    fn skip_comment(&mut self) -> Token {
         let line = self.line;
 
         while line == self.line && self.current().is_some() {
@@ -281,7 +283,7 @@ impl Scanner {
         self.scan()
     }
 
-    fn make_template(&mut self) -> Result<Token, Error> {
+    fn make_template(&mut self) -> Token {
         if self.in_template {
             self.column += 1;
             // We are in template parsing, which means this is a closing so we return an
@@ -325,10 +327,10 @@ impl Scanner {
             self.column,
         );
 
-        Ok(token)
+        token
     }
 
-    pub fn scan(&mut self) -> Result<Token, Error> {
+    pub fn scan(&mut self) -> Token {
         match self.current().map(|c| c.to_ascii_lowercase()) {
             // Some('\n') => {
             //     self.advance();
@@ -336,7 +338,7 @@ impl Scanner {
             //
             //     token
             // }
-            Some('\'') | Some('"') => self.string(),
+            Some('\'' | '"') => self.string(),
             Some('`') => self.make_template(),
             Some('#') => self.skip_comment(),
             Some('$') => {
@@ -511,22 +513,16 @@ mod tests {
                 let mut output = String::new();
 
                 for t in tokens {
-                    match scanner.scan() {
-                        Ok(token) => {
-                            assert_eq!(
-                                token.kind(),
-                                t,
-                                "Unable to match expected token '{:?}', found '{:?}' {}",
-                                t,
-                                token,
-                                $code,
-                            );
-                            output = format!("{}{}", output, token.lexeme());
-                        }
-                        Err(err) => {
-                            assert!(false, "ERROR: {}", err);
-                        }
-                    }
+                    let token = scanner.scan();
+                    assert_eq!(
+                        token.kind(),
+                        t,
+                        "Unable to match expected token '{:?}', found '{:?}' {}",
+                        t,
+                        token,
+                        $code,
+                    );
+                    output = format!("{}{}", output, token.lexeme());
                 }
 
                 assert_eq!(
@@ -594,28 +590,28 @@ mod tests {
         if let Ok(buffer) = Buffer::try_from("`hello, ${name}`") {
             let mut scanner = Scanner::new(buffer, None);
 
-            if let Ok(token) = scanner.scan() {
+            if let token = scanner.scan() {
                 assert_eq!(token.kind(), TokenKind::String);
                 assert_eq!(token.lexeme(), "hello, ");
             }
 
-            if let Ok(token) = scanner.scan() {
+            if let token = scanner.scan() {
                 assert_eq!(token.kind(), TokenKind::Plus);
                 assert_eq!(token.lexeme(), "${");
             }
-            if let Ok(token) = scanner.scan() {
+            if let token = scanner.scan() {
                 assert_eq!(token.kind(), TokenKind::Identifier);
                 assert_eq!(token.lexeme(), "name");
             }
-            if let Ok(token) = scanner.scan() {
+            if let token = scanner.scan() {
                 assert_eq!(token.kind(), TokenKind::Plus);
                 assert_eq!(token.lexeme(), "}");
             }
-            if let Ok(token) = scanner.scan() {
+            if let token = scanner.scan() {
                 assert_eq!(token.kind(), TokenKind::String);
                 assert_eq!(token.lexeme(), "");
             }
-            if let Ok(token) = scanner.scan() {
+            if let token = scanner.scan() {
                 assert_eq!(token.kind(), TokenKind::EOF);
             }
         }

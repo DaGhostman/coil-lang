@@ -123,6 +123,7 @@ impl Debug for IR {
 }
 
 impl IR {
+    #[must_use]
     pub fn new(code: Operation, values: Option<[usize; 3]>) -> Self {
         Self {
             code,
@@ -137,6 +138,7 @@ impl IR {
         self
     }
 
+    #[must_use]
     pub fn operands(&self) -> &[usize; 3] {
         self.operands.borrow()
     }
@@ -149,14 +151,17 @@ impl IR {
         self.metadata = Some(metadata);
     }
 
+    #[must_use]
     pub fn code(&self) -> Operation {
         self.code
     }
 
+    #[must_use]
     pub fn get(&self, idx: usize) -> Option<&usize> {
         self.operands.get(idx)
     }
 
+    #[must_use]
     pub fn metadata(&self) -> Option<&Metadata> {
         self.metadata.as_ref()
     }
@@ -230,6 +235,8 @@ pub enum Byte {
     Pop,
     /// Return item at offset from the stack top
     Peek,
+    /// Duplicate the last value on the stack
+    Duplicate,
     /// Prints the value from the top of the stack
     Print,
     /// Call a function
@@ -266,6 +273,7 @@ pub struct Code {
 }
 
 impl Code {
+    #[must_use]
     pub fn new(byte: Byte) -> Self {
         Self {
             byte,
@@ -273,6 +281,7 @@ impl Code {
         }
     }
 
+    #[must_use]
     pub fn new_with_operands(byte: Byte, operands: [usize; 3]) -> Self {
         Self { byte, operands }
     }
@@ -281,18 +290,22 @@ impl Code {
         self.operands = operands;
     }
 
+    #[must_use]
     pub fn byte(&self) -> &Byte {
         &self.byte
     }
 
+    #[must_use]
     pub fn operand(&self, idx: usize) -> usize {
         self.operands[idx]
     }
 
+    #[must_use]
     pub fn operands(&self) -> &[usize; 3] {
         &self.operands
     }
 
+    #[must_use]
     pub fn bits(&self) -> Vec<u8> {
         let mut bytes = (*self.byte() as u8).to_le_bytes().to_vec();
         bytes.push(self.operands.len() as u8);

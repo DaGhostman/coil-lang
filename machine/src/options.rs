@@ -1,6 +1,4 @@
-use serde::Deserialize;
-
-#[derive(Default, Debug, Clone, Copy, Deserialize)]
+#[derive(Default, Debug, Clone, Copy)]
 pub enum OutputBufferingMode {
     None,
     #[default]
@@ -8,7 +6,7 @@ pub enum OutputBufferingMode {
     Sized,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct OutputBuffering {
     mode: OutputBufferingMode,
     size: usize,
@@ -24,7 +22,7 @@ impl OutputBuffering {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct GcOptions {
     growth: usize,
     threshold: usize,
@@ -39,7 +37,7 @@ impl Default for GcOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct StackOptions {
     size: usize,
 }
@@ -50,7 +48,7 @@ impl Default for StackOptions {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct MachineOptions {
     debug: bool,
     quiet: bool,

@@ -17,12 +17,12 @@ fn get_slot_index(index: usize, max: usize) -> (usize, usize) {
 
 impl<T, const N: usize> Default for VecArray<T, N>
 where
-    T: Default + Clone,
+    T: Default + Clone + Copy,
 {
     fn default() -> Self {
         Self {
             size: 0,
-            storage: core::array::from_fn::<T, N, _>(|_| Default::default()),
+            storage: [T::default(); N],
             expansions: vec![],
         }
     }
@@ -30,7 +30,7 @@ where
 
 impl<T, const N: usize> VecArray<T, N>
 where
-    T: Default + Clone,
+    T: Default + Clone + Copy,
 {
     pub fn contains_key(&self, index: usize) -> bool {
         self.size > index
@@ -63,7 +63,7 @@ where
         }
 
         if index < N {
-            self.storage[index] = value
+            self.storage[index] = value;
         } else {
             self.grow(index);
             let (slot, index) = get_slot_index(index, N);
@@ -80,10 +80,7 @@ where
         if index >= self.size - 1 {
             let (slot, _) = get_slot_index(index, N);
             if self.expansions.len() <= slot {
-                self.expansions.resize(
-                    slot + 1,
-                    core::array::from_fn::<T, N, _>(|_| Default::default()),
-                );
+                self.expansions.resize(slot + 1, [T::default(); N]);
             }
         }
     }
@@ -102,7 +99,7 @@ where
     }
 
     pub fn clear(&mut self) {
-        self.storage = core::array::from_fn::<T, N, _>(|_| Default::default());
+        self.storage = [T::default(); N];
         self.expansions.clear();
         self.size = 0;
     }
@@ -141,12 +138,27 @@ where
 
 impl<T, const N: usize> Index<usize> for VecArray<T, N>
 where
-    T: Clone + Default,
+    T: Clone + Copy + Default,
 {
     type Output = T;
 
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index)
+    }
+}
+
+impl<T, const N: usize> Into<Vec<T>> for VecArray<T, N>
+where
+    T: Clone + Copy,
+{
+    fn into(self) -> Vec<T> {
+        let mut result = Vec::with_capacity(self.size);
+        result.copy_from_slice(&self.storage);
+        for slice in self.expansions {
+            result.copy_from_slice(&slice);
+        }
+
+        result
     }
 }
 
