@@ -201,8 +201,10 @@ impl Scanner {
             _ => (),
         }
 
-        while matches!(self.current(), Some('a'..='z' | '_' | '0'..='9'))
-            && !self.buffer.is_consumed()
+        while matches!(
+            self.current().map(|c| c.to_ascii_lowercase()),
+            Some('a'..='z' | '_' | '0'..='9')
+        ) && !self.buffer.is_consumed()
         {
             self.advance();
         }
