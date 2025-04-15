@@ -85,11 +85,10 @@ pub enum Operation {
     Loop,
 }
 
-#[derive(PartialEq, Debug, Copy, Clone)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Metadata {
     line: usize,
     column: usize,
-    // file: ,
 }
 
 impl Metadata {
@@ -100,7 +99,7 @@ impl Metadata {
 
 impl Display for Metadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.line, self.column)
+        write!(f, "@{}:{}", self.line, self.column)
     }
 }
 

@@ -117,7 +117,7 @@ impl Machine {
             }
             #[cfg(feature = "trace")]
             {
-                if self.fp > 8 {
+                if self.fp > 32 {
                     break;
                 }
             }
@@ -143,6 +143,9 @@ impl Machine {
                 }
                 Byte::Pop => {
                     self.stack.npop(op.operand(0));
+                }
+                Byte::Duplicate => {
+                    self.stack.push(self.stack.peek(0));
                 }
                 Byte::Store => self
                     .stack

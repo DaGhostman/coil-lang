@@ -7,6 +7,7 @@ pub enum ErrorOrigin {
     LEX,
     COMPILE,
     RUNTIME,
+    TYPE,
     FFI,
     CUSTOM,
 }
@@ -17,6 +18,7 @@ impl From<ErrorOrigin> for &str {
             ErrorOrigin::SCAN => "SCANNER",
             ErrorOrigin::PARSE => "PARSER",
             ErrorOrigin::LEX => "LEXER",
+            ErrorOrigin::TYPE => "TYPE",
             ErrorOrigin::COMPILE => "COMPILER",
             ErrorOrigin::RUNTIME => "RUNTIME",
             ErrorOrigin::FFI => "FFI RUNTIME",

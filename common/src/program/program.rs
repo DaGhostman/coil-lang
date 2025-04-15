@@ -21,7 +21,7 @@ where
 
 impl<T> Program<T>
 where
-    T: Clone + Copy,
+    T: Clone,
 {
     #[must_use]
     pub fn new(code: Vec<T>) -> Self {

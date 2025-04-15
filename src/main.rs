@@ -6,12 +6,11 @@ use compiler::{
     Compiler,
     passes::{
         constant_folding::ConstantFolding, jump_translation::LabelUnrolling,
-        redundancy_removal::RedundancyRemoval, typechecker::TypeChecker,
+        redundancy_removal::RedundancyRemoval,
     },
 };
 use machine::{options::MachineOptions, stack::Machine};
 use parser::Parser;
-use scanner::{Scanner, buffer::Buffer};
 
 #[derive(Clap)]
 struct Options {
@@ -74,37 +73,29 @@ fn main() {
 
     options.set_quiet(args.quiet);
 
-    if let Ok(buffer) = Buffer::new(&args.file) {
-        let mut data = Data::default();
+    let mut data = Data::default();
 
-        let mut scanner = Scanner::new(buffer, Some(args.file));
-        if let Ok(program) = Parser::new(&mut data).parse(&mut scanner) {
-            let mut compiler = Compiler::new(data.clone());
+    if let Ok(program) = Parser::new(args.file, &mut data).parse() {
+        let mut compiler = Compiler::new(data.clone());
 
-            let mut typechecker: TypeChecker<64> = TypeChecker::default();
-            let mut constant_folder = ConstantFolding::default();
-            let mut label_conversion = LabelUnrolling::default();
-            let mut redundancy_removal = RedundancyRemoval::default();
+        let mut constant_folder = ConstantFolding::default();
+        let mut label_conversion = LabelUnrolling::default();
+        let mut redundancy_removal = RedundancyRemoval::default();
 
-            // compiler.attach(&mut typechecker);
+        if args.optimize {
+            compiler.attach(&mut constant_folder);
+        }
 
-            if args.optimize {
-                compiler.attach(&mut constant_folder);
+        compiler.attach(&mut redundancy_removal);
+        compiler.attach(&mut label_conversion);
+
+        match compiler.compile(&program) {
+            Ok((opcodes, data)) => {
+                Machine::with_options(options).run(&opcodes, &data);
             }
-
-            compiler.attach(&mut redundancy_removal);
-            compiler.attach(&mut label_conversion);
-
-            match compiler.compile(&program) {
-                Ok((opcodes, data)) => {
-                    Machine::with_options(options).run(&opcodes, &data);
-                }
-                Err(e) => {
-                    dbg!(e);
-                }
+            Err(e) => {
+                dbg!(e);
             }
         }
-    } else {
-        eprintln!("Missing file");
     }
 }

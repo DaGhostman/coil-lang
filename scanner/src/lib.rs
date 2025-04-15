@@ -1,5 +1,4 @@
 use buffer::Buffer;
-use common::error::Error;
 use tokens::{Token, TokenKind};
 
 pub mod buffer;
@@ -26,7 +25,7 @@ impl Scanner {
         Scanner {
             buffer,
             column: 0,
-            line: 0,
+            line: 1,
             file: file.unwrap_or_default(),
 
             in_template: false,
@@ -98,7 +97,12 @@ impl Scanner {
         self.advance();
         let start = self.buffer.tell();
 
-        let mut token = Token::begin(TokenKind::String, self.line, self.column, "file-name");
+        let mut token = Token::begin(
+            TokenKind::String,
+            self.line,
+            self.column,
+            self.file.as_ref(),
+        );
         while self.current() != Some(separator) && !self.buffer.is_consumed() {
             if let (Some('\\'), Some(ch)) = (self.current(), self.peek(1)) {
                 if ch == separator {
@@ -133,7 +137,7 @@ impl Scanner {
 
     fn digit(&mut self) -> Token {
         let start = self.buffer.tell();
-        let mut token = Token::begin(TokenKind::EOF, self.line, self.column, "file-name");
+        let mut token = Token::begin(TokenKind::EOF, self.line, self.column, self.file.as_ref());
         let mut is_float = None;
 
         let mut hex = false;
@@ -194,7 +198,12 @@ impl Scanner {
 
     fn identifier(&mut self) -> Token {
         let start = self.buffer.tell();
-        let mut token = Token::begin(TokenKind::Identifier, self.line, self.column, "file-name");
+        let mut token = Token::begin(
+            TokenKind::Identifier,
+            self.line,
+            self.column,
+            self.file.as_ref(),
+        );
         match self.current().map(|c| c.to_ascii_lowercase()) {
             Some('a'..='z' | '_') => self.advance(),
             Some(i) => unreachable!("Invalid identifier: '{}'", i),
@@ -223,7 +232,7 @@ impl Scanner {
 
     fn make_token(&mut self, kind: TokenKind, lexeme: &str) -> Token {
         let start = self.buffer.tell();
-        let mut token = Token::begin(kind, self.line, self.column, "file-name");
+        let mut token = Token::begin(kind, self.line, self.column, self.file.as_ref());
 
         if !self.matches(lexeme) {
             unreachable!("Dafuq happened with '{}'", lexeme);
@@ -310,7 +319,12 @@ impl Scanner {
             return self.make_token(TokenKind::String, "");
         }
 
-        let mut token = Token::begin(TokenKind::String, self.line, self.column, "file-name");
+        let mut token = Token::begin(
+            TokenKind::String,
+            self.line,
+            self.column,
+            self.file.as_ref(),
+        );
 
         while self.current() != Some('`') {
             self.advance();

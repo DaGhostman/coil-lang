@@ -498,7 +498,7 @@ impl<'compilation> Compiler<'compilation> {
                     self.context.variables().assign(operands[0]);
 
                     vec![
-                        // Code::new(Byte::Duplicate),
+                        Code::new(Byte::Duplicate),
                         Code::new_with_operands(
                             Byte::Store,
                             [

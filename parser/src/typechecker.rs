@@ -1,15 +1,14 @@
 use common::{
     error::{Error, ErrorOrigin},
-    opcodes::{IR, Operation},
+    opcodes::{IR, Metadata, Operation},
     program::data::Data,
     types::{Kind, Type},
 };
 
-// use std::collections::HashMap;
 use rustc_hash::FxHashMap as HashMap;
 
-#[derive(Debug)]
 pub struct TypeChecker<const N: usize> {
+    file: String,
     stack: [Type; N],
     sp: usize,
     errors: Vec<Error>,
@@ -20,6 +19,7 @@ pub struct TypeChecker<const N: usize> {
 impl<const N: usize> Default for TypeChecker<N> {
     fn default() -> Self {
         Self {
+            file: String::new(),
             sp: 0,
             stack: [Type::default(); N],
             errors: Vec::with_capacity(8),
@@ -64,15 +64,21 @@ impl<const N: usize> TypeChecker<N> {
         &self.errors
     }
 
-    fn error(&mut self, message: String, start: (usize, usize), end: (usize, usize)) {
-        let mut fmt = format!("{message}");
-        if start.0 != end.0 {
-            fmt = format!("{fmt} @ {}:{}-{}:{}", start.0, start.1, end.0, end.1);
-        } else {
-            fmt = format!("{fmt} @ {}:{}-{}", start.0, start.1, end.1);
-        }
+    pub fn set_file(&mut self, file: String) {
+        self.file = file;
+    }
 
-        self.errors.push(Error::new(ErrorOrigin::PARSE, fmt));
+    fn error(&mut self, message: String, metadata: &Metadata) {
+        // if start.0 != end.0 {
+        //     fmt = format!("{fmt} @ {}:{}-{}:{}", start.0, start.1, end.0, end.1);
+        // } else {
+        //     fmt = format!("{fmt} @ {}:{}-{}", start.0, start.1, end.1);
+        // }
+
+        self.errors.push(Error::new(
+            ErrorOrigin::TYPE,
+            format!("'{message}' in {metadata}"),
+        ));
     }
 
     fn clear(&mut self) {
@@ -80,7 +86,7 @@ impl<const N: usize> TypeChecker<N> {
         self.stack = [Type::new(Kind::None); N];
     }
 
-    pub fn check(&mut self, code: &[IR], data: &mut Data) -> Vec<IR> {
+    pub fn check(&mut self, code: &[IR], data: &Data) -> Vec<IR> {
         self.clear();
         let mut bytecode = Vec::with_capacity(code.len());
         let mut variables = HashMap::default();
@@ -88,7 +94,7 @@ impl<const N: usize> TypeChecker<N> {
         let mut ip = 0;
 
         while ip < code.len() {
-            let mut op = code[ip];
+            let mut op = &code[ip];
 
             match op.code() {
                 Operation::Const => {
@@ -107,25 +113,55 @@ impl<const N: usize> TypeChecker<N> {
                     {
                         self.push(Type::new(Kind::Float));
                     } else {
-                        self.errors.push(Error::new(
-                            ErrorOrigin::PARSE,
-                            "Invalid operation".to_string(),
-                        ));
+                        self.error(
+                            format!(
+                                "Unsupported operation '{:?}' using, {:?} and {:?}",
+                                op.code(),
+                                self.peek(1),
+                                self.peek(0)
+                            ),
+                            op.metadata().unwrap(),
+                        );
                     }
                 }
-                Operation::Store | Operation::Declare | Operation::Assign | Operation::Argument => {
+                Operation::Argument => {
+                    let [name, ..] = op.operands();
+                    variables.insert(name, op.kind());
+                }
+                Operation::Store | Operation::Declare | Operation::Assign => {
                     let [name, ..] = op.operands();
 
+                    let ty = self.pop(1);
                     if variables.contains_key(name) {
-                        let ty = self.pop(1);
-                        if ty != variables[name] {
-                            self.errors.push(Error::new(
-                                ErrorOrigin::COMPILE,
-                                format!("Unable to assign value of type {:?} to '{}' because it expects {:?}", ty, data.symbol_name(*name), variables[name])
-                            ));
+                        if variables.contains_key(name) {
+                            if ty != variables[name]
+                            /* && variables[name].kind() != Kind::None */
+                            {
+                                self.error(
+                                    format!("Unable to assign value of type {:?} to '{}' because it expects {:?}", ty, data.symbol_name(*name), variables[name]),
+                                    op.metadata().unwrap(),
+
+                                );
+                            }
+                        } else {
+                            variables.insert(
+                                name,
+                                if op.kind().kind() != Kind::None {
+                                    op.kind()
+                                } else {
+                                    ty
+                                },
+                            );
                         }
                     } else {
-                        variables.insert(op.operands()[0], op.kind());
+                        variables.insert(
+                            name,
+                            if op.kind().kind() != Kind::None {
+                                op.kind()
+                            } else {
+                                ty
+                            },
+                        );
                     }
                 }
                 Operation::Instantiate => {
@@ -166,16 +202,9 @@ impl<const N: usize> TypeChecker<N> {
                         }
 
                         result = Type::new(method.returns());
-                        op = IR::new(Operation::Invoke, Some([*name, *arity, n]));
                     }
-                    self.pop(1 + op.operands()[1]);
+                    self.pop(1 + arity);
                     self.push(result);
-
-                    // dbg!(self.peek(op.operands()[1]), &self.stack[..self.sp]);
-                    // self.pop(1 + op.operands()[1]);
-                    // self.push(op.kind());
-                    // dbg!(&self.stack[..self.sp]);
-                    // dbg!(op.operands());
                 }
                 Operation::Function => {
                     self.functions.insert(op.operands()[0], op.kind());
@@ -211,124 +240,10 @@ impl<const N: usize> TypeChecker<N> {
                 _ => (),
             }
 
-            bytecode.push(op);
+            bytecode.push(*op);
             ip += 1;
         }
 
         bytecode
     }
 }
-
-// impl<const N: usize> CompilationPass for TypeChecker<N> {
-//     fn compile(
-//         &mut self,
-//         code: &[common::opcodes::IR],
-//         data: &mut Data,
-//     ) -> Result<Vec<common::opcodes::IR>, Error> {
-//         let code = self.do_compile(code, data);
-//
-//         if !self.errors.is_empty() {
-//             let error = (Error::new(
-//                 ErrorOrigin::COMPILE,
-//                 "Unable to finish compilation due to the following type errors".to_string(),
-//             ));
-//
-//             for error in &self.errors {
-//                 eprintln!("{}", error);
-//             }
-//
-//             return Err(error);
-//         }
-//
-//         Ok(code)
-//         // let mut variables: HashMap<usize, Type> = HashMap::new();
-//         //
-//         // for op in program.code() {
-//         //     match op.code() {
-//         //         Operation::Const => {
-//         //             match program
-//         //                 .constant(op.get(0).copied().unwrap_or_default())
-//         //                 .map(|v| v.kind())
-//         //             {
-//         //                 Some(ValueType::BOOLEAN(_)) => self.types.push(Type::Bool),
-//         //                 Some(ValueType::INTEGER(_)) => self.types.push(Type::Integer),
-//         //                 Some(ValueType::FLOAT(_)) => self.types.push(Type::Float),
-//         //                 Some(ValueType::STRING(_)) => self.types.push(Type::String),
-//         //                 Some(ValueType::NONE) => self.types.push(Type::None),
-//         //                 Some(ValueType::FUNCTION(_, _)) => self.types.push(Type::Function),
-//         //                 a => {
-//         //                     return Err(Error::new(
-//         //                         common::error::ErrorOrigin::RUNTIME,
-//         //                         "Unknown type".to_string(),
-//         //                     ));
-//         //                 }
-//         //             }
-//         //         }
-//         //
-//         //         Operation::Add | Operation::Subtract | Operation::Multiply | Operation::Divide => {
-//         //             match (self.types.pop(), self.types.pop()) {
-//         //                 (Some(Type::Integer), Some(Type::Integer)) => {
-//         //                     self.types.push(Type::Integer);
-//         //                 }
-//         //                 (Some(Type::Float), Some(Type::Float)) => {
-//         //                     self.types.push(Type::Float);
-//         //                 }
-//         //                 (Some(Type::Integer), Some(Type::Float)) => {
-//         //                     self.types.push(Type::Float);
-//         //                 }
-//         //                 (Some(Type::Float), Some(Type::Integer)) => {
-//         //                     self.types.push(Type::Float);
-//         //                 }
-//         //                 (Some(Type::String), Some(Type::String)) => {
-//         //                     self.types.push(Type::String);
-//         //                 }
-//         //                 _ => todo!("Not implemented operation check"),
-//         //             }
-//         //         }
-//         //         Operation::Modulo
-//         //         | Operation::BitAnd
-//         //         | Operation::BitOr
-//         //         | Operation::BitXor
-//         //         | Operation::LeftShift
-//         //         | Operation::RightShift => {
-//         //             if let (Some(Type::Integer), Some(Type::Integer)) =
-//         //                 (self.types.pop(), self.types.pop())
-//         //             {
-//         //                 self.types.push(Type::Integer);
-//         //             } else {
-//         //                 todo!("Operation not supported for types other than integers")
-//         //             }
-//         //         }
-//         //         Operation::Equal
-//         //         | Operation::Less
-//         //         | Operation::LessEqual
-//         //         | Operation::Greater
-//         //         | Operation::GreaterEqual => {
-//         //             if let (Some(rhs), Some(lhs)) = (self.types.pop(), self.types.pop()) {
-//         //                 if lhs != rhs {
-//         //                     todo!("Unable to handle comparison between incompatible types")
-//         //                 } else {
-//         //                     self.types.push(Type::Bool)
-//         //                 }
-//         //             }
-//         //         }
-//         //         Operation::Argument => {
-//         //             // name, type, offset
-//         //             variables.insert(
-//         //                 op.get(0).cloned().unwrap_or(0),
-//         //                 (op.get(1).cloned().unwrap_or(0)).into(),
-//         //             );
-//         //         }
-//         //         Operation::Load => {
-//         //             self.types.push(
-//         //                 variables
-//         //                     .get(&op.operands()[0])
-//         //                     .cloned()
-//         //                     .unwrap_or_default(),
-//         //             );
-//         //         }
-//         //         _ => (),
-//         //     }
-//         // }
-//     }
-// }

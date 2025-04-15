@@ -181,4 +181,8 @@ impl Token {
     pub fn lexeme(&self) -> &str {
         self.lexeme.as_ref()
     }
+
+    pub fn file(&self) -> &str {
+        self.file.as_ref()
+    }
 }
