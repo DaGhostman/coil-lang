@@ -1,4 +1,5 @@
 use common::memory::object::{ObjArray, ObjInstance, Objects};
+use common::program::data::Data;
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{stderr, stdout};
 
@@ -26,7 +27,7 @@ pub struct Machine {
     stack: Stack<Value, STACK>,
     heap: Heap,
     // owner => name => label
-    methods: HashMap<usize, HashMap<usize, usize>>,
+    // methods: HashMap<usize, HashMap<usize, usize>>,
     properties: HashMap<usize, Vec<usize>>,
 
     options: MachineOptions,
@@ -43,7 +44,7 @@ impl Default for Machine {
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
             stderr: Output::new(&MachineOptions::default(), || Box::new(stderr().lock())),
             options: MachineOptions::default(),
-            methods: HashMap::default(),
+            // methods: HashMap::default(),
             properties: HashMap::default(),
         }
     }
@@ -100,8 +101,9 @@ impl Machine {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute(&mut self, code: &Program<Code>) {
+    fn execute(&mut self, code: &Program<Code>, data: &Data) {
         self.ip = 0;
+        // for (let i = 0; i < code.len(); i++) {
         while let Some(op) = code.get(self.ip) {
             #[cfg(feature = "trace")]
             {
@@ -115,7 +117,7 @@ impl Machine {
             }
             #[cfg(feature = "trace")]
             {
-                if self.fp > 32 {
+                if self.fp > 8 {
                     break;
                 }
             }
@@ -133,28 +135,32 @@ impl Machine {
                 }
                 Byte::Leave => {
                     self.leave();
+                    // continue;
                 }
                 Byte::Push => {
-                    let constant = code.data().constant(op.operand(0));
+                    let constant = data.constant(op.operand(0));
                     self.stack.push(*constant);
                 }
                 Byte::Pop => {
                     self.stack.npop(op.operand(0));
                 }
-                Byte::Duplicate => {
-                    self.stack.copy_to_top(self.stack.tell(1));
-                }
                 Byte::Store => self
                     .stack
-                    .pop_to(self.call_stack[self.fp].1 + op.operand(0)),
+                    .pop_to(self.call_stack[self.fp - 1].1 + op.operand(0)),
                 Byte::Load => {
-                    self.stack
-                        .copy_to_top(op.operand(0) + self.call_stack[self.fp - 1].1);
+                    let pos = self.call_stack[self.fp - 1].1 + op.operand(0);
+                    if let Value::OBJECT(_) = self.stack.peek_at(pos) {
+                        self.stack.push(Value::REFERENCE(pos));
+                    } else {
+                        self.stack.copy_to_top(pos)
+                    }
                 }
                 Byte::Not => unary_handler!(self, !),
                 Byte::Negate => unary_handler!(self, -),
                 Byte::Less => binary_handler!(self, <, BOOLEAN),
+                Byte::LessEqual => binary_handler!(self, <=, BOOLEAN),
                 Byte::Greater => binary_handler!(self, >, BOOLEAN),
+                Byte::GreaterEqual => binary_handler!(self, >=, BOOLEAN),
                 Byte::Equal => binary_handler!(self, ==, BOOLEAN),
                 Byte::Add => binary_handler!(self, +),
                 Byte::Sub => binary_handler!(self, -),
@@ -168,7 +174,7 @@ impl Machine {
                 Byte::Or => binary_handler!(self, |),
                 Byte::Print => {
                     self.stdout.write(&match self.stack.pop() {
-                        Value::STR(idx) => code.data().string(idx).to_string(),
+                        Value::STR(idx) => data.string(idx).to_string(),
                         value => value.to_string(),
                     });
 
@@ -182,22 +188,20 @@ impl Machine {
                 }
                 Byte::Jumpz => {
                     let value = self.stack.pop();
-                    if !matches!(value, Value::BOOLEAN(_)) {
-                        eprintln!("Condition does not evaluate to boolean, using fallback checks");
-                    }
 
-                    let state = match value {
-                        Value::NONE => false,
-                        Value::BOOLEAN(byte) => byte,
-                        Value::FLOAT(value) => value != 0.0,
-                        Value::INTEGER(value) => value != 0,
-                        _ => true,
+                    match value {
+                        Value::NONE => {
+                            self.ip = op.operand(0);
+                            continue;
+                        }
+                        Value::BOOLEAN(byte) => {
+                            if !byte {
+                                self.ip = op.operand(0);
+                                continue;
+                            }
+                        }
+                        _ => (),
                     };
-
-                    if !state {
-                        self.ip = op.operand(0);
-                        continue;
-                    }
                 }
                 Byte::Range => {
                     let last = self.stack.pop();
@@ -224,7 +228,7 @@ impl Machine {
                 }
                 Byte::Iterate => {
                     let iter = self.stack.pop();
-                    let arr = self.stack.peek(self.stack.tell(1));
+                    let arr = self.stack.peek_at(self.stack.tell(1));
                     if let (Value::ITERATOR(n), Value::OBJECT(Objects::Array(arr))) = (iter, arr) {
                         if n >= arr.as_ref().len() {
                             self.ip = op.operand(0);
@@ -241,42 +245,44 @@ impl Machine {
                     }
                 }
                 Byte::Instantiate => {
-                    // likely(true);
                     let owner = op.operands()[0];
                     let mut object = ObjInstance::new(owner);
-                    for (idx, field) in self.properties[&owner].iter().enumerate() {
-                        if idx == 0 {
-                            continue;
+                    if self.properties.contains_key(&owner) {
+                        for (idx, field) in self.properties[&owner].iter().enumerate() {
+                            if idx == 0 {
+                                continue;
+                            }
+                            object.update(*field, Default::default());
                         }
-                        object.update(*field, Default::default());
                     }
                     self.gc();
                     let (instance, _) = self.heap.alloc(object, Objects::Object);
 
                     self.stack.push(Value::OBJECT(instance));
-                    self.stack.push(Value::REFERENCE(self.stack.tell(1)));
                 }
                 Byte::Invoke => {
-                    // likely(true);
                     let operands = op.operands();
-                    let name = operands[0];
                     let arity = operands[1];
 
-                    if let Value::OBJECT(Objects::Object(instance)) = self.peek_obj(arity) {
-                        let owner = instance.as_ref().name();
-
-                        self.enter(arity);
-                        self.ip = self.methods[&owner][&name];
+                    if let Value::OBJECT(Objects::Object(_)) = self.peek_obj(arity) {
+                        self.enter(arity + 1);
+                        self.ip = op.operand(0) - 1;
                         continue;
+                    } else {
+                        eprintln!("Attempting to call method on non-object");
                     }
                 }
                 Byte::This => {
-                    // likely(true);
-                    let ptr = self.stack.peek(self.call_stack[self.fp - 1].1 - 1);
-                    self.stack.push(ptr);
+                    if let Value::REFERENCE(ref_) =
+                        self.stack.peek_at(self.call_stack[self.fp - 1].1 - 1)
+                    {
+                        self.stack.push(Value::REFERENCE(ref_));
+                    } else {
+                        self.stack
+                            .push(Value::REFERENCE(self.call_stack[self.fp - 1].1 - 1));
+                    }
                 }
                 Byte::Prop => {
-                    // likely(true);
                     let operands = op.operands();
                     if let Value::OBJECT(Objects::Object(mut obj)) = self.peek_obj(0) {
                         match operands[1] {
@@ -328,28 +334,29 @@ impl Machine {
         }
     }
 
-    pub fn run(&mut self, code: &Program<Code>) -> Value {
-        for byte in code.code() {
-            if byte.byte() == &Byte::Method {
-                let operands = byte.operands();
+    pub fn run(&mut self, code: &Program<Code>, data: &Data) -> Value {
+        // for byte in code.code() {
+        //     if byte.byte() == &Byte::Method {
+        //         let operands = byte.operands();
+        //
+        //         self.methods
+        //             .entry(operands[0])
+        //             .and_modify(|entry| {
+        //                 entry.insert(operands[1], operands[2]);
+        //             })
+        //             .or_insert_with(|| {
+        //                 let mut fields = HashMap::default();
+        //                 fields.insert(operands[1], operands[2]);
+        //
+        //                 fields
+        //             });
+        //     }
+        // }
 
-                self.methods
-                    .entry(operands[0])
-                    .and_modify(|entry| {
-                        entry.insert(operands[1], operands[2]);
-                    })
-                    .or_insert_with(|| {
-                        let mut fields = HashMap::default();
-                        fields.insert(operands[1], operands[2]);
+        self.execute(code, data);
 
-                        fields
-                    });
-            }
-        }
-
-        self.execute(code);
-
-        self.stack.pop()
+        Value::default()
+        // self.stack.pop()
     }
 
     fn gc(&mut self) {
@@ -416,12 +423,9 @@ impl Machine {
 
     // #[inline]
     fn peek_obj(&self, position: usize) -> Value {
-        match self.stack.peek(self.stack.tell(position)) {
-            Value::REFERENCE(n) => self.stack.peek(n),
-            v => {
-                dbg!(&v);
-                v
-            }
+        match self.stack.peek(position) {
+            Value::REFERENCE(n) => self.stack.peek_at(n),
+            v => v,
         }
     }
 }

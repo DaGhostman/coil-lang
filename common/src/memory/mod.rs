@@ -35,6 +35,7 @@ where
         }
     }
 
+    #[inline(always)]
     pub fn pop(&mut self) -> T {
         self.npop(1)[0]
     }
@@ -60,7 +61,11 @@ where
         self.sp = size + 1;
     }
 
-    pub fn peek(&self, position: usize) -> T {
+    pub fn peek(&self, offset: usize) -> T {
+        self.stack[self.sp - 1 - offset]
+    }
+
+    pub fn peek_at(&self, position: usize) -> T {
         self.stack[position]
     }
 
@@ -73,10 +78,10 @@ where
     }
 
     pub fn pop_to(&mut self, dst: usize) {
-        if self.sp - dst != 1 {
-            self.sp -= 1;
-            self.stack[dst] = self.stack[self.sp];
-        }
+        // if self.sp - dst != 1 {
+        self.sp -= 1;
+        self.stack[dst] = self.stack[self.sp];
+        // }
     }
 
     pub fn copy_to_top(&mut self, src: usize) {
@@ -96,6 +101,7 @@ where
             items: self.stack[..self.sp].to_vec(),
         }
     }
+
     pub fn iter_range(&self, from: usize, to: usize) -> StackIterator<T> {
         StackIterator {
             cursor: 0,

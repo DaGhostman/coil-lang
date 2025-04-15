@@ -75,9 +75,21 @@ impl CompilationPass for LabelUnrolling {
                 ),
                 Byte::Label => {
                     continue;
-                } // Code::new(Byte::Noop),
+                }
                 Byte::Iterate => Code::new_with_operands(
                     Byte::Iterate,
+                    [self.jump_at(code.operand(0)), code.operand(1), 0],
+                ),
+                Byte::Method => Code::new_with_operands(
+                    Byte::Method,
+                    [
+                        code.operand(0),
+                        code.operand(1),
+                        self.jump_at(code.operand(2)),
+                    ],
+                ),
+                Byte::Invoke => Code::new_with_operands(
+                    Byte::Invoke,
                     [self.jump_at(code.operand(0)), code.operand(1), 0],
                 ),
                 Byte::Push => {
@@ -86,6 +98,7 @@ impl CompilationPass for LabelUnrolling {
                             data.replace_constant(
                                 code.operand(0),
                                 Value::FUNCTION(*arity, self.jump_at(*label)),
+                                code.get_type(),
                             );
                             funcs.insert(code.operand(0));
                         }

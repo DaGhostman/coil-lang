@@ -2,7 +2,7 @@ use common::{
     Value, ValuePtr,
     error::{Error, ErrorOrigin},
     program::data::Data,
-    types::Type,
+    types::Kind,
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -22,8 +22,8 @@ pub struct DynamicLibrary {
 #[derive(Default, Debug)]
 pub struct FFIFunction {
     name: String,
-    arguments: Vec<Type>,
-    return_type: Type,
+    arguments: Vec<Kind>,
+    return_type: Kind,
 }
 
 impl FFIFunction {
@@ -31,17 +31,17 @@ impl FFIFunction {
         Self {
             name,
             arguments: Vec::with_capacity(4),
-            return_type: Type::default(),
+            return_type: Kind::default(),
         }
     }
 
-    pub fn add_argument(&mut self, type_: Type) -> &mut Self {
+    pub fn add_argument(&mut self, type_: Kind) -> &mut Self {
         self.arguments.push(type_);
 
         self
     }
 
-    pub fn returns(&mut self, type_: Type) -> &mut Self {
+    pub fn returns(&mut self, type_: Kind) -> &mut Self {
         self.return_type = type_;
 
         self
@@ -66,7 +66,7 @@ impl FFIFunction {
 
         for (idx, argument) in arguments.iter().enumerate() {
             if Some(&(argument.to_owned()).into()) != self.arguments.get(idx)
-                && self.arguments.get(idx) != Some(&Type::Pointer)
+                && self.arguments.get(idx) != Some(&Kind::Pointer)
             {
                 return Err(Error::new(
                     ErrorOrigin::FFI,
@@ -91,7 +91,7 @@ impl FFIFunction {
         for (idx, arg) in arguments.iter_mut().enumerate() {
             types.insert(
                 idx,
-                Box::into_raw(Box::from(<Type as Into<ffi_type>>::into(arg.kind()))),
+                Box::into_raw(Box::from(<Kind as Into<ffi_type>>::into(arg.kind()))),
             );
 
             argument_bag.insert(idx, arg.ptr_mut::<c_void>());
@@ -123,7 +123,7 @@ impl FFIFunction {
             }
 
             Ok(match self.return_type {
-                Type::Resource | Type::Pointer => Value::pointer(result),
+                Kind::Resource | Kind::Pointer => Value::pointer(result),
                 _ => Value::from_ptr_and_type(result, self.return_type, data),
             })
         }

@@ -25,22 +25,25 @@ impl From<ErrorOrigin> for &str {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Error {
     origin: ErrorOrigin,
     message: String,
 }
 
 impl Error {
-    #[must_use] pub fn new(origin: ErrorOrigin, message: String) -> Self {
+    #[must_use]
+    pub fn new(origin: ErrorOrigin, message: String) -> Self {
         Self { origin, message }
     }
 
-    #[must_use] pub fn message(&self) -> &str {
+    #[must_use]
+    pub fn message(&self) -> &str {
         self.message.as_str()
     }
 
-    #[must_use] pub fn origin(&self) -> ErrorOrigin {
+    #[must_use]
+    pub fn origin(&self) -> ErrorOrigin {
         self.origin
     }
 }

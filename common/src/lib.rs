@@ -7,7 +7,7 @@ use std::{
 };
 
 use program::data::Data;
-use types::Type;
+use types::Kind;
 
 pub mod error;
 pub mod interner;
@@ -391,7 +391,7 @@ impl Value {
                 if let Ok(value) = CString::new(string.as_str()) {
                     Some(ValuePtr {
                         ptr: Box::into_raw(Box::new(value)) as *const c_void,
-                        kind: Type::from(self),
+                        kind: Kind::from(self),
                     })
                 } else {
                     None
@@ -403,23 +403,23 @@ impl Value {
             // }),
             Value::POINTER(ptr) => Some(ValuePtr {
                 ptr: Box::into_raw(Box::new(ptr)) as *const _,
-                kind: Type::Pointer,
+                kind: Kind::Pointer,
             }),
 
             _ => self.try_into_raw().map(|ptr| ValuePtr {
                 ptr,
-                kind: Type::from(self),
+                kind: Kind::from(self),
             }),
         }
     }
 
-    pub fn from_ptr_and_type(ptr: *mut c_void, kind: Type, data: &mut Data) -> Self {
+    pub fn from_ptr_and_type(ptr: *mut c_void, kind: Kind, data: &mut Data) -> Self {
         match kind {
-            Type::None => Self::default(),
-            Type::Bool => Self::from(ptr.cast::<u8>() as u8 != 0),
-            Type::Integer => Self::from(ptr.cast::<i64>() as i64),
-            Type::Float => Self::from(f64::from_bits(ptr.cast::<u64>() as u64)),
-            Type::String => {
+            Kind::None => Self::default(),
+            Kind::Bool => Self::from(ptr.cast::<u8>() as u8 != 0),
+            Kind::Integer => Self::from(ptr.cast::<i64>() as i64),
+            Kind::Float => Self::from(f64::from_bits(ptr.cast::<u64>() as u64)),
+            Kind::String => {
                 let string = unsafe {
                     CStr::from_ptr(ptr as *const i8)
                         .to_string_lossy()
@@ -427,7 +427,7 @@ impl Value {
                 };
                 Self::string(data.add_string(string))
             }
-            Type::Resource | Type::Pointer => Self::pointer(ptr),
+            Kind::Resource | Kind::Pointer => Self::pointer(ptr),
             _ => todo!(),
         }
     }
@@ -450,12 +450,12 @@ impl Value {
 #[derive(Debug)]
 pub struct ValuePtr {
     ptr: *const c_void,
-    kind: Type,
+    kind: Kind,
 }
 
 impl ValuePtr {
     #[must_use]
-    pub fn new(ptr: *const c_void, kind: Type) -> Self {
+    pub fn new(ptr: *const c_void, kind: Kind) -> Self {
         Self { ptr, kind }
     }
     #[must_use]
@@ -468,7 +468,7 @@ impl ValuePtr {
     }
 
     #[must_use]
-    pub fn kind(&self) -> Type {
+    pub fn kind(&self) -> Kind {
         self.kind
     }
 }
@@ -477,29 +477,29 @@ impl Drop for ValuePtr {
     fn drop(&mut self) {
         // dbg!(unsafe { Box::from_raw(self.ptr as *mut &str) });
         match self.kind {
-            Type::None => unsafe { drop(Box::from_raw(self.ptr.cast_mut())) },
-            Type::Bool => unsafe { drop(Box::from_raw(self.ptr as *mut u8)) },
-            Type::Integer => unsafe { drop(Box::from_raw(self.ptr as *mut isize)) },
-            Type::Float => unsafe { drop(Box::from_raw(self.ptr as *mut f64)) },
-            Type::String => unsafe { drop(Box::from_raw(self.ptr as *mut CString)) },
-            Type::Resource => unsafe { drop(Box::from_raw(self.ptr.cast_mut())) },
-            Type::Pointer => unsafe { drop(Box::from_raw(self.ptr as *mut *mut c_void)) },
+            Kind::None => unsafe { drop(Box::from_raw(self.ptr.cast_mut())) },
+            Kind::Bool => unsafe { drop(Box::from_raw(self.ptr as *mut u8)) },
+            Kind::Integer => unsafe { drop(Box::from_raw(self.ptr as *mut isize)) },
+            Kind::Float => unsafe { drop(Box::from_raw(self.ptr as *mut f64)) },
+            Kind::String => unsafe { drop(Box::from_raw(self.ptr as *mut CString)) },
+            Kind::Resource => unsafe { drop(Box::from_raw(self.ptr.cast_mut())) },
+            Kind::Pointer => unsafe { drop(Box::from_raw(self.ptr as *mut *mut c_void)) },
             _ => (),
         }
     }
 }
 
-impl From<Value> for Type {
+impl From<Value> for Kind {
     fn from(val: Value) -> Self {
         match val {
-            Value::NONE => Type::None,
-            Value::BOOLEAN(_) => Type::Bool,
-            Value::INTEGER(_) => Type::Integer,
-            Value::FLOAT(_) => Type::Float,
-            Value::STR(_) => Type::String,
-            Value::FUNCTION(_, _) => Type::Function,
-            Value::RESOURCE(_) => Type::Resource,
-            Value::POINTER(_) => Type::Pointer,
+            Value::NONE => Kind::None,
+            Value::BOOLEAN(_) => Kind::Bool,
+            Value::INTEGER(_) => Kind::Integer,
+            Value::FLOAT(_) => Kind::Float,
+            Value::STR(_) => Kind::String,
+            Value::FUNCTION(_, _) => Kind::Function,
+            Value::RESOURCE(_) => Kind::Resource,
+            Value::POINTER(_) => Kind::Pointer,
             _ => todo!("Handle remaining value to type conversion cases"),
         }
     }

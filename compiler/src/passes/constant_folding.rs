@@ -1,6 +1,7 @@
 use common::Value;
 use common::opcodes::{Byte, Code};
 use common::program::data::Data;
+use common::types::{Kind, Type};
 
 use crate::CompilationPass;
 
@@ -47,25 +48,37 @@ impl CompilationPass for ConstantFolding {
                                 rhs.map(|c| data.constant(c.operand(0))),
                             ) {
                                 (Some(Value::INTEGER(lhs)), Some(Value::INTEGER(rhs))) => {
-                                    let c = data.add_constant(Value::INTEGER(lhs + rhs));
+                                    let c = data.add_constant(
+                                        Value::INTEGER(lhs + rhs),
+                                        Type::new(Kind::Integer),
+                                    );
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 (Some(Value::FLOAT(lhs)), Some(Value::FLOAT(rhs))) => {
-                                    let c = data.add_constant(Value::from(lhs + rhs));
+                                    let c = data.add_constant(
+                                        Value::from(lhs + rhs),
+                                        Type::new(Kind::Float),
+                                    );
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 (Some(Value::INTEGER(lhs)), Some(Value::FLOAT(rhs))) => {
-                                    let c = data.add_constant(Value::from((*lhs as f64) + rhs));
+                                    let c = data.add_constant(
+                                        Value::from((*lhs as f64) + rhs),
+                                        Type::new(Kind::Float),
+                                    );
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
                                 }
                                 (Some(Value::FLOAT(lhs)), Some(Value::INTEGER(rhs))) => {
-                                    let c = data.add_constant(Value::from(lhs + (*rhs as f64)));
+                                    let c = data.add_constant(
+                                        Value::from(lhs + (*rhs as f64)),
+                                        Type::new(Kind::Float),
+                                    );
                                     modified.pop();
                                     modified.pop();
                                     modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));

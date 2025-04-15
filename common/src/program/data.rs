@@ -1,10 +1,10 @@
 // use std::ffi::c_void;
 
-use crate::{Value, interner::Interner, symbols::SymbolTable};
+use crate::{Value, interner::Interner, symbols::SymbolTable, types::Type};
 
 #[derive(Debug, Default, Clone)]
 pub struct Data {
-    constants: Interner<Value>,
+    constants: Interner<(Value, Type)>,
     strings: Interner<String>,
     symbols: SymbolTable,
     // methods: HashMap<usize, HashMap<usize, usize>>,
@@ -21,20 +21,27 @@ impl Data {
         self.strings.lookup(index)
     }
 
-    pub fn add_constant(&mut self, value: Value) -> usize {
-        self.constants.intern(value)
+    pub fn add_constant(&mut self, value: Value, r#type: Type) -> usize {
+        self.constants.intern((value, r#type))
     }
 
-    pub fn replace_constant(&mut self, index: usize, value: Value) {
-        self.constants.replace(index, value);
+    pub fn replace_constant(&mut self, index: usize, value: Value, r#type: Type) {
+        self.constants.replace(index, (value, r#type));
     }
 
     #[must_use]
     pub fn constant(&self, index: usize) -> &Value {
-        self.constants.lookup(index)
+        &self.constants.lookup(index).0
     }
     pub fn constant_mut(&mut self, index: usize) -> &mut Value {
-        self.constants.lookup_mut(index)
+        &mut self.constants.lookup_mut(index).0
+    }
+
+    pub fn constant_type(&self, index: usize) -> &Type {
+        &self.constants.lookup(index).1
+    }
+    pub fn constant_type_mut(&mut self, index: usize) -> &mut Type {
+        &mut self.constants.lookup_mut(index).1
     }
 
     pub fn add_symbol(&mut self, symbol: String, constant: Option<usize>) -> usize {
@@ -49,6 +56,11 @@ impl Data {
     #[must_use]
     pub fn symbol_constant(&self, symbol: usize) -> usize {
         self.symbols.constant(symbol)
+    }
+
+    pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
+        let constant = self.symbol_constant(symbol);
+        self.constant_type(constant)
     }
 
     #[must_use]
@@ -80,7 +92,11 @@ impl Data {
     #[must_use]
     pub fn symbol_constant_value(&self, symbol: usize) -> &Value {
         let constant = self.symbols.constant(symbol);
-        self.constants.lookup(constant)
+        &self.constants.lookup(constant).0
+    }
+    pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
+        let constant = self.symbols.constant(symbol);
+        &self.constants.lookup(constant).1
     }
 
     // pub fn add_pointer(&mut self, ptr: *mut c_void) -> usize {

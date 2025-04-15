@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use clap::{ArgAction, Parser as Clap, ValueHint};
+use common::program::data::Data;
 use compiler::{
     Compiler,
     passes::{
         constant_folding::ConstantFolding, jump_translation::LabelUnrolling,
-        typechecker::TypeChecker,
+        redundancy_removal::RedundancyRemoval, typechecker::TypeChecker,
     },
 };
 use machine::{options::MachineOptions, stack::Machine};
@@ -74,25 +75,29 @@ fn main() {
     options.set_quiet(args.quiet);
 
     if let Ok(buffer) = Buffer::new(&args.file) {
+        let mut data = Data::default();
+
         let mut scanner = Scanner::new(buffer, Some(args.file));
-        let mut compiler = Compiler::default();
+        if let Ok(program) = Parser::new(&mut data).parse(&mut scanner) {
+            let mut compiler = Compiler::new(data.clone());
 
-        let mut typechecker = TypeChecker::default();
-        let mut constant_folder = ConstantFolding::default();
-        let mut label_conversion = LabelUnrolling::default();
+            let mut typechecker: TypeChecker<64> = TypeChecker::default();
+            let mut constant_folder = ConstantFolding::default();
+            let mut label_conversion = LabelUnrolling::default();
+            let mut redundancy_removal = RedundancyRemoval::default();
 
-        compiler.attach(&mut typechecker);
+            // compiler.attach(&mut typechecker);
 
-        if args.optimize {
-            compiler.attach(&mut constant_folder);
-        }
+            if args.optimize {
+                compiler.attach(&mut constant_folder);
+            }
 
-        compiler.attach(&mut label_conversion);
+            compiler.attach(&mut redundancy_removal);
+            compiler.attach(&mut label_conversion);
 
-        if let Ok(program) = Parser::default().parse(&mut scanner) {
             match compiler.compile(&program) {
-                Ok(opcodes) => {
-                    Machine::with_options(options).run(&opcodes);
+                Ok((opcodes, data)) => {
+                    Machine::with_options(options).run(&opcodes, &data);
                 }
                 Err(e) => {
                     dbg!(e);

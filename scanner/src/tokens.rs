@@ -36,6 +36,8 @@ pub enum TokenKind {
     Caret,
     Tilde,
     Comma,
+    Colon,
+    ColonColon,
     SemiColon,
 
     Dot,
@@ -67,8 +69,10 @@ pub enum TokenKind {
     For,
     Function,
     If,
+    Implement,
     In,
     Int,
+    Interface,
     Len,
     Let,
     Match,
@@ -86,6 +90,7 @@ pub enum TokenKind {
     Trait,
     This,
     Use,
+    Void,
     While,
     Yield,
 }

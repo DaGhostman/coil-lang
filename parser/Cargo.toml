@@ -7,4 +7,5 @@ edition = "2024"
 
 common = { path = "../common" }
 rand = "0.9.0"
+rustc-hash = { version = "2.1.1", features = ["rand"] }
 scanner = { path = "../scanner" }

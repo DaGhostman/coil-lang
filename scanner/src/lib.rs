@@ -424,6 +424,7 @@ impl Scanner {
                 _ => self.make_token(TokenKind::Equal, "="),
             },
             Some(';') => self.make_token(TokenKind::SemiColon, ";"),
+            Some(':') => self.make_token(TokenKind::Colon, ":"),
             Some('0'..='9') => self.digit(),
             Some('a') => match self.peek(1) {
                 Some('s') => self.keyword_or_identifier(TokenKind::As, "as"),
@@ -450,9 +451,13 @@ impl Scanner {
                 _ => self.identifier(),
             },
             Some('i') => match self.peek(1) {
+                Some('m') => self.keyword_or_identifier(TokenKind::Implement, "implement"),
                 Some('f') => self.keyword_or_identifier(TokenKind::If, "if"),
                 Some('n') => match self.peek(2) {
-                    Some('t') => self.keyword_or_identifier(TokenKind::Int, "int"),
+                    Some('t') => match self.peek(3) {
+                        Some('e') => self.keyword_or_identifier(TokenKind::Interface, "interface"),
+                        _ => self.keyword_or_identifier(TokenKind::Int, "int"),
+                    },
                     _ => self.keyword_or_identifier(TokenKind::In, "in"),
                 },
                 _ => self.identifier(),
@@ -485,7 +490,10 @@ impl Scanner {
                 Some('e') => self.keyword_or_identifier(TokenKind::Return, "return"),
                 _ => self.identifier(),
             },
-            Some('s') => self.keyword_or_identifier(TokenKind::Some, "some"),
+            Some('s') => match self.peek(1) {
+                Some('t') => self.keyword_or_identifier(TokenKind::Str, "string"),
+                _ => self.keyword_or_identifier(TokenKind::Some, "some"),
+            },
             Some('t') => match self.peek(2) {
                 Some('u') => self.keyword_or_identifier(TokenKind::True, "true"),
                 Some('a') => self.keyword_or_identifier(TokenKind::Trait, "trait"),
@@ -493,6 +501,7 @@ impl Scanner {
                 _ => self.identifier(),
             },
             Some('u') => self.keyword_or_identifier(TokenKind::Use, "use"),
+            Some('v') => self.keyword_or_identifier(TokenKind::Void, "void"),
             Some('w') => self.keyword_or_identifier(TokenKind::While, "while"),
             Some('y') => self.keyword_or_identifier(TokenKind::Yield, "yield"),
             Some(' ') => {

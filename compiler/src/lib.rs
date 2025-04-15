@@ -1,6 +1,7 @@
 pub mod passes;
 use common::error::ErrorOrigin;
 use common::program::data::Data;
+use common::types::{Kind, Type};
 use rand::{Rng, distr::Alphanumeric};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -16,7 +17,6 @@ pub trait CompilationPass {
     fn compile(&mut self, code: &[Code], data: &mut Data) -> Result<Vec<Code>, Error>;
 }
 
-#[derive(Default)]
 pub struct Compiler<'compilation> {
     pipeline: Vec<&'compilation mut dyn CompilationPass>,
     data: Data,
@@ -29,6 +29,7 @@ pub(crate) struct Variable {
     pub(crate) scope: usize,
     pub(crate) readonly: bool,
     pub(crate) assigned: bool,
+    pub(crate) r#type: Type,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -56,6 +57,20 @@ impl Variables {
         }
     }
 
+    pub fn variables_in_scope(&self) -> usize {
+        self.storage
+            .iter()
+            .filter_map(|((scope, _), _)| {
+                if self.scope == *scope {
+                    Some(scope)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .len()
+    }
+
     pub fn clear(&mut self) -> usize {
         let len = self.storage.len();
         self.storage.clear();
@@ -63,16 +78,20 @@ impl Variables {
         len
     }
 
-    pub fn create(&mut self, symbol: usize) -> usize {
+    pub fn create(&mut self, symbol: usize, r#type: Type) -> usize {
         let position = self.storage.len();
 
         self.storage
             .entry((self.scope, symbol))
+            .and_modify(|entry| {
+                entry.r#type = r#type;
+            })
             .or_insert_with(|| Variable {
                 position,
                 scope: self.scope,
                 readonly: false,
                 assigned: false,
+                r#type,
             })
             .position
     }
@@ -90,6 +109,7 @@ impl Variables {
                 scope: self.scope,
                 readonly: true,
                 assigned: true,
+                r#type: Type::new(Kind::None),
             });
     }
 
@@ -106,6 +126,7 @@ impl Variables {
                 scope: self.scope,
                 readonly: false,
                 assigned: true,
+                r#type: Type::new(Kind::None),
             });
     }
 
@@ -117,11 +138,15 @@ impl Variables {
     }
 
     pub fn available(&self, symbol: usize) -> bool {
-        !self.storage.contains_key(&(self.scope, symbol))
-        // self.storage
-        //     .get(&(self.scope, symbol))
-        //     .filter(|v| v.scope <= self.scope)
-        //     .is_some()
+        // !self.has(symbol)
+        // self.storage.contains_key(&(self.scope, symbol))
+        !self
+            .storage
+            .keys()
+            // .get(&(self.scope, symbol))
+            .filter(|(scope, name)| *scope <= self.scope && name == &symbol)
+            .collect::<Vec<_>>()
+            .is_empty()
     }
 
     pub fn has(&self, symbol: usize) -> bool {
@@ -145,7 +170,9 @@ impl Variables {
             .storage
             .keys()
             .filter_map(|(slot, name)| {
-                if &self.scope < slot && name == &symbol {
+                if &self.scope < slot {
+                    None
+                } else if name != &symbol {
                     None
                 } else {
                     Some(*slot)
@@ -166,15 +193,15 @@ impl Variables {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ClassDefinition {
     state: Vec<(usize, usize)>,
-    methods: HashMap<usize, (usize, usize)>,
+    methods: HashMap<usize, usize>,
 }
 
 impl ClassDefinition {
-    pub fn add_method(&mut self, name: usize, label: usize, arity: usize) {
-        self.methods.insert(name, (label, arity));
+    pub fn add_method(&mut self, name: usize, label: usize) {
+        self.methods.insert(name, label);
     }
 
     pub fn add_prop(&mut self, name: usize, type_: usize) {
@@ -187,13 +214,25 @@ impl ClassDefinition {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
+pub(crate) struct InterfaceDefinition {
+    methods: HashMap<usize, Vec<IR>>,
+}
+
+impl InterfaceDefinition {
+    pub fn add_method(&mut self, name: usize, body: Vec<IR>) {
+        self.methods.insert(name, body);
+    }
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct Context {
     tco: Vec<bool>,
     current: Vec<usize>,
     frame: usize,
     variables: Variables,
     classes: HashMap<usize, ClassDefinition>,
+    interfaces: HashMap<usize, InterfaceDefinition>,
 }
 
 impl Context {
@@ -216,13 +255,19 @@ impl Context {
         self.current.last()
     }
 
-    pub fn leave(&mut self) -> usize {
+    pub fn parent(&self) -> Option<&usize> {
+        self.current.get(self.frame - 2)
+    }
+
+    pub fn leave(&mut self) {
         self.current.pop();
         self.tco.pop();
-        let count = self.variables.leave();
+        self.variables.leave();
         self.frame -= 1;
+    }
 
-        count
+    pub fn tell(&self) -> usize {
+        self.variables.variables_in_scope()
     }
 
     pub fn set_tco(&mut self, state: bool) {
@@ -267,9 +312,9 @@ impl Context {
         self.classes.insert(name, Default::default());
     }
 
-    pub fn add_method(&mut self, owner: usize, name: usize, label: usize, arity: usize) {
+    pub fn add_method(&mut self, owner: usize, name: usize, label: usize) {
         self.classes.entry(owner).and_modify(|entry| {
-            entry.add_method(name, label, arity);
+            entry.add_method(name, label);
         });
     }
 
@@ -279,7 +324,19 @@ impl Context {
         });
     }
 
+    pub fn define_interface(&mut self, name: usize) {
+        self.interfaces.insert(name, Default::default());
+    }
+
+    pub fn add_contract(&mut self, owner: usize, name: usize, body: Vec<IR>) {
+        self.interfaces.entry(owner).and_modify(|entry| {
+            entry.add_method(name, body);
+        });
+    }
+
     pub fn extend(&mut self, target: usize, source: usize) {
+        // TODO: Is extending really necessary
+
         if let (Some(mut t), Some(source)) = (
             self.classes.get(&target).cloned(),
             self.classes.get(&source),
@@ -297,6 +354,13 @@ impl Context {
 }
 
 impl<'compilation> Compiler<'compilation> {
+    pub fn new(data: Data) -> Self {
+        Self {
+            data,
+            context: Context::default(),
+            pipeline: Vec::with_capacity(4),
+        }
+    }
     pub fn label(&mut self, name: Option<String>) -> usize {
         let key = format!(
             "@{}{}::{}",
@@ -339,8 +403,9 @@ impl<'compilation> Compiler<'compilation> {
                     vec![]
                 }
                 Operation::End => {
-                    let count = self.context.variables().leave();
-                    vec![Code::new_with_operands(Byte::Pop, [count, 0, 0])]
+                    let vars = self.context.tell();
+                    self.context.variables().leave();
+                    vec![Code::new_with_operands(Byte::Pop, [vars, 0, 0])]
                 }
                 Operation::Noop => continue,
                 Operation::Pop => vec![Code::new_with_operands(Byte::Pop, [1, 0, 0])],
@@ -355,9 +420,9 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::Multiply => vec![Code::new(Byte::Mul)],
                 Operation::Modulo => vec![Code::new(Byte::Mod)],
                 Operation::Less => vec![Code::new(Byte::Less)],
-                Operation::LessEqual => vec![Code::new(Byte::Greater), Code::new(Byte::Not)],
+                Operation::LessEqual => vec![Code::new(Byte::LessEqual)],
                 Operation::Greater => vec![Code::new(Byte::Greater)],
-                Operation::GreaterEqual => vec![Code::new(Byte::Less), Code::new(Byte::Not)],
+                Operation::GreaterEqual => vec![Code::new(Byte::GreaterEqual)],
                 Operation::Print => vec![Code::new_with_operands(
                     Byte::Print,
                     [usize::from(op.operands()[0] == 1), 0, 0],
@@ -379,7 +444,9 @@ impl<'compilation> Compiler<'compilation> {
 
                     skips += len;
 
-                    let constant = self.data.add_constant(Value::FUNCTION(*arity, label));
+                    let constant = self
+                        .data
+                        .add_constant(Value::FUNCTION(*arity, label), op.kind());
                     let symbol = self.data.symbol_name(*name);
                     self.data.add_symbol(symbol.to_owned(), Some(constant));
 
@@ -390,7 +457,11 @@ impl<'compilation> Compiler<'compilation> {
                         Ok(mut body) => {
                             body.push(Code::new_with_operands(
                                 Byte::Push,
-                                [self.data.add_constant(Value::NONE), 0, 0],
+                                [
+                                    self.data.add_constant(Value::NONE, Type::new(Kind::None)),
+                                    0,
+                                    0,
+                                ],
                             ));
                             body.push(Code::new(Byte::Leave));
 
@@ -405,6 +476,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     let mut func = Code::new(Byte::Push);
                     func.with_operands([constant, 0, 0]);
+                    func.with_type(op.kind());
                     result.push(func);
 
                     result
@@ -426,10 +498,14 @@ impl<'compilation> Compiler<'compilation> {
                     self.context.variables().assign(operands[0]);
 
                     vec![
-                        Code::new(Byte::Duplicate),
+                        // Code::new(Byte::Duplicate),
                         Code::new_with_operands(
                             Byte::Store,
-                            [self.context.variables().create(operands[0]), 0, 0],
+                            [
+                                self.context.variables().create(operands[0], op.kind()),
+                                0,
+                                0,
+                            ],
                         ),
                     ]
                 }
@@ -440,10 +516,15 @@ impl<'compilation> Compiler<'compilation> {
                         self.context.variables().seal(operands[0]);
                     }
 
-                    vec![Code::new_with_operands(
-                        Byte::Store,
-                        [self.context.variables().create(operands[0]), 0, 0],
-                    )]
+                    self.context.variables().create(operands[0], op.kind());
+
+                    vec![
+                        // Code::new(Byte::Duplicate),
+                        // Code::new_with_operands(
+                        //     Byte::Store,
+                        //     [self.context.variables().create(operands[0]), 0, 0],
+                        // ),
+                    ]
                 }
                 // Operation::Upvalue => {
                 //     let operands = op.operands();
@@ -457,7 +538,7 @@ impl<'compilation> Compiler<'compilation> {
                 // }
                 Operation::Argument => {
                     let operands = op.operands();
-                    self.context.variables().create(operands[0]);
+                    self.context.variables().create(operands[0], op.kind());
 
                     vec![]
                     // vec![Code::new_with_operands(
@@ -486,10 +567,12 @@ impl<'compilation> Compiler<'compilation> {
                         ));
                     }
 
-                    vec![Code::new_with_operands(
-                        Byte::Load,
-                        [self.context.variables().get(operands[0]).position, 0, 0],
-                    )]
+                    let var = self.context.variables().get(operands[0]);
+                    let mut load = Code::new_with_operands(Byte::Load, [var.position, 0, 0]);
+
+                    load.with_type(var.r#type);
+
+                    vec![load]
                 }
                 Operation::Call => {
                     let mut result = vec![];
@@ -507,9 +590,13 @@ impl<'compilation> Compiler<'compilation> {
                                 result.push(Code::new_with_operands(Byte::Jump, [*symbol, 0, 0]));
                             } else {
                                 result.push(Code::new_with_operands(Byte::Push, [constant, 0, 0]));
+                                let mut call =
+                                    Code::new_with_operands(Byte::Call, [*call_arity, 0, 0]);
+                                call.with_type(Type::new(
+                                    self.data.symbol_constant_type(*symbol).returns(),
+                                ));
 
-                                result
-                                    .push(Code::new_with_operands(Byte::Call, [*call_arity, 0, 0]));
+                                result.push(call);
                             }
                         } else {
                             return Err(Error::new(
@@ -534,13 +621,13 @@ impl<'compilation> Compiler<'compilation> {
                     let rand = self.random_label();
                     self.context
                         .variables()
-                        .create(self.data.add_symbol(rand, None));
+                        .create(self.data.add_symbol(rand, None), Type::new(Kind::None));
                     let rand = self.random_label();
                     let iter = self
                         .context
                         .variables()
-                        .create(self.data.add_symbol(rand, None));
-                    let position = self.context.variables().create(*name);
+                        .create(self.data.add_symbol(rand, None), Type::new(Kind::None));
+                    let position = self.context.variables().create(*name, op.kind());
 
                     let mut body = self.do_compile(&code[cursor..cursor + length])?;
                     let inside_label = self.label(None);
@@ -548,7 +635,12 @@ impl<'compilation> Compiler<'compilation> {
 
                     result.push(Code::new_with_operands(
                         Byte::Push,
-                        [self.data.add_constant(Value::ITERATOR(0)), 0, 0],
+                        [
+                            self.data
+                                .add_constant(Value::ITERATOR(0), Type::new(Kind::List(0))),
+                            0,
+                            0,
+                        ],
                     ));
                     result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
                     result.push(Code::new_with_operands(
@@ -666,21 +758,30 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::Method => {
                     let mut result = vec![];
                     let [owner, name, len, ..] = op.operands();
-                    let label = self.label(Some(self.data.symbol_name(*name).to_owned()));
+                    let label = if self.context.classes[owner].methods.contains_key(name) {
+                        self.context.classes[owner].methods[name]
+                    } else {
+                        self.label(Some(self.data.symbol_name(*name).to_owned()))
+                    };
 
                     skips += len;
 
+                    self.context.add_method(*owner, *name, label);
                     self.context.enter(*name);
+                    let this = self.data.add_symbol("this".to_string(), None);
+                    self.context.variables().seal(this);
                     match self.do_compile(&code[cursor..cursor + len]) {
                         Ok(mut body) => {
                             body.push(Code::new_with_operands(
                                 Byte::Push,
-                                [self.data.add_constant(Value::default()), 0, 0],
+                                [
+                                    self.data
+                                        .add_constant(Value::default(), Type::new(Kind::None)),
+                                    0,
+                                    0,
+                                ],
                             ));
-                            body.push(Code::new_with_operands(
-                                Byte::Leave,
-                                [self.context.leave(), 0, 0],
-                            ));
+                            body.push(Code::new(Byte::Leave));
 
                             result.insert(0, Code::new_with_operands(Byte::Label, [label, 0, 0]));
                             result.append(&mut body);
@@ -689,32 +790,67 @@ impl<'compilation> Compiler<'compilation> {
                             return Err(err);
                         }
                     }
-
-                    let arity = result
-                        .iter()
-                        .filter_map(|byte| {
-                            if byte.byte() == &Byte::Peek {
-                                Some(())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<()>>()
-                        .len();
-                    self.context.add_method(*owner, *name, label, arity);
-                    // self.data.add_method(*owner, *name, label);
-                    result.insert(
-                        0,
-                        Code::new_with_operands(Byte::Method, [*owner, *name, label]),
-                    );
+                    self.context.leave();
 
                     result
+                }
+                Operation::Implement => {
+                    let mut implementation = vec![];
+                    let [interface, class, len] = op.operands();
+
+                    let methods = self.context.interfaces[interface].methods.clone();
+
+                    self.context.enter(*class);
+                    for (name, method) in methods {
+                        self.context.enter(name);
+                        if let Ok(mut body) = self.do_compile(&method) {
+                            if let Some(method) = body.first_mut() {
+                                self.context.add_method(*class, name, method.operand(2));
+                                *method = Code::new_with_operands(
+                                    Byte::Method,
+                                    [*class, method.operand(1), method.operand(2)],
+                                );
+                            }
+
+                            implementation.append(&mut body);
+                        }
+                        self.context.leave();
+                    }
+
+                    // Continue parsing the actual body
+                    if let Ok(mut body) = self.do_compile(&code[cursor..cursor + len]) {
+                        implementation.append(&mut body);
+                        skips += len;
+                    }
+
+                    self.context.leave();
+
+                    implementation
+                }
+                Operation::Interface => {
+                    let mut interface = vec![];
+                    let [owner, len, ..] = op.operands();
+                    self.context.define_interface(*owner);
+
+                    for (idx, byte) in code[cursor..cursor + len].iter().enumerate() {
+                        if byte.code() == Operation::Method {
+                            let [owner, name, mlen] = op.operands();
+                            self.context.add_contract(
+                                *owner,
+                                *name,
+                                code[idx..idx + mlen].to_vec(),
+                            );
+                        }
+                    }
+                    skips += len;
+                    interface
                 }
                 Operation::Class => {
                     let mut class = vec![];
 
                     let [owner, len, ..] = op.operands();
-                    // self.context.enter(*owner);
+                    self.context.define_class(*owner);
+                    self.context.enter(*owner);
                     match self.do_compile(&code[cursor..cursor + len]) {
                         Ok(mut body) => {
                             // class.push(Code::new_with_operands(Byte::Class, vec![*owner, body.len()]));
@@ -724,20 +860,37 @@ impl<'compilation> Compiler<'compilation> {
                             return Err(err);
                         }
                     }
-                    // self.context.leave();
-
-                    self.context.define_class(*owner);
+                    self.context.leave();
 
                     class
                 }
                 Operation::Instantiate => {
+                    let mut code =
+                        Code::new_with_operands(Byte::Instantiate, [op.operands()[0], 0, 0]);
+                    code.with_type(Type::new(Kind::Object(op.operands()[0])));
+
+                    vec![code]
+                }
+                Operation::Invoke => {
+                    let [name, arity, owner] = op.operands();
+
                     vec![Code::new_with_operands(
-                        Byte::Instantiate,
-                        [op.operands()[0], 0, 0],
+                        Byte::Invoke,
+                        [self.context.classes[owner].methods[name], *arity, 0],
                     )]
                 }
-                Operation::Invoke => vec![Code::new_with_operands(Byte::Invoke, *op.operands())],
-                Operation::This => vec![Code::new(Byte::This)],
+                Operation::This => {
+                    let this = self
+                        .context
+                        .variables()
+                        .get(self.data.add_symbol("this".to_string(), None));
+                    let mut this = Code::new_with_operands(Byte::Load, [this.position, 0, 0]);
+                    if let Some(class) = self.context.parent() {
+                        this.with_type(Type::new(Kind::Object(*class)));
+                    }
+
+                    vec![this]
+                }
                 Operation::PropAssign => {
                     let mut operands = *op.operands();
                     operands[1] = 1;
@@ -757,12 +910,13 @@ impl<'compilation> Compiler<'compilation> {
         Ok(bytecode)
     }
 
-    pub fn compile(&mut self, code: &Program<IR>) -> Result<Program<Code>, Error> {
+    pub fn compile(&mut self, code: &Program<IR>) -> Result<(Program<Code>, Data), Error> {
         let mut program = Program::new(vec![]);
-        self.data = code.data().clone();
         let code = code.code();
 
-        // self.context.enter();
+        let symbol = self.data.add_symbol("root".to_string(), None);
+
+        self.context.enter(symbol);
 
         match self.do_compile(&code) {
             Ok(mut bytecode) => {
@@ -778,14 +932,14 @@ impl<'compilation> Compiler<'compilation> {
                             match c.byte() {
                                 Byte::Push => format!("{:?}", self.data.constant(c.operand(0))),
                                 Byte::Pop => format!("{}", c.operand(0)),
-                                Byte::Call => format!(
+                                Byte::Call | Byte::Invoke => format!(
                                     "{}({})",
                                     self.data.symbol_name(c.operand(0)),
                                     c.operand(1)
                                 ),
-                                // Byte::Load | Byte::Store | Byte::Peek => {
-                                //     format!("{}", self.data.symbol_name(c.operand(0)))
-                                // }
+                                Byte::Load | Byte::Store | Byte::Peek => {
+                                    format!("@{}", c.operand(0))
+                                }
                                 Byte::Jump | Byte::Label => {
                                     format!("{}", self.data.symbol_name(c.operand(0)))
                                 }
@@ -835,12 +989,9 @@ impl<'compilation> Compiler<'compilation> {
                 }
 
                 program.with_code(bytecode);
-                program.with_data(self.data.clone());
             }
             Err(e) => return Err(e),
         }
-
-        program.with_data(self.data.clone());
 
         #[cfg(feature = "dump")]
         {
@@ -857,26 +1008,21 @@ impl<'compilation> Compiler<'compilation> {
                         Byte::Pop => format!("{}", c.operand(0)),
                         // Byte::Call =>
                         //     format!("{}({})", self.data.symbol_name(c.operand(0)), c.operand(1)),
-                        // Byte::Load | Byte::Store | Byte::Peek => {
-                        //     format!("{}", self.data.symbol_name(c.operand(0)))
-                        // }
-                        Byte::Load => {
-                            format!("{}", c.operand(0))
+                        Byte::Load | Byte::Store | Byte::Peek => {
+                            format!("@{}", c.operand(0))
                         }
-                        Byte::Jump => {
+                        Byte::Jump | Byte::Jumpz | Byte::Invoke => {
                             format!("={}", c.operand(0))
                         }
                         Byte::Jumpr => {
                             format!("+{}", c.operand(0))
-                        }
-                        Byte::Jumpz => {
-                            format!("={}", c.operand(0))
                         }
                         Byte::Leave
                         | Byte::Load
                         | Byte::Store
                         | Byte::Peek
                         | Byte::Call
+                        | Byte::Invoke
                         | Byte::Print
                         | Byte::Add
                         | Byte::Sub
@@ -892,6 +1038,6 @@ impl<'compilation> Compiler<'compilation> {
             }
         }
 
-        Ok(program)
+        Ok((program, self.data.clone()))
     }
 }

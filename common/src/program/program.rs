@@ -1,12 +1,9 @@
 use core::fmt::Debug;
 
-use super::data::Data;
-
 #[derive(Clone, Default, PartialEq)]
 pub struct Program<T> {
     length: usize,
     code: Vec<T>,
-    data: Data,
 }
 
 impl<T> Debug for Program<T>
@@ -24,19 +21,14 @@ where
 
 impl<T> Program<T>
 where
-    T: Clone,
+    T: Clone + Copy,
 {
     #[must_use]
     pub fn new(code: Vec<T>) -> Self {
         Self {
             length: code.len(),
             code,
-            data: Data::default(),
         }
-    }
-
-    pub fn with_data(&mut self, data: Data) {
-        self.data = data;
     }
 
     pub fn with_code(&mut self, code: Vec<T>) -> bool {
@@ -58,20 +50,11 @@ where
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.length
+        self.code.len()
     }
 
     #[must_use]
     pub fn code(&self) -> &[T] {
         self.code.as_slice()
-    }
-
-    #[must_use]
-    pub fn data(&self) -> &Data {
-        &self.data
-    }
-
-    pub fn data_mut(&mut self) -> &mut Data {
-        &mut self.data
     }
 }

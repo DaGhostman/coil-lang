@@ -1,3 +1,4 @@
+use common::opcodes::Metadata;
 use common::program::data::Data;
 use rand::{Rng, distr::Alphanumeric};
 use std::str::FromStr;
@@ -5,7 +6,7 @@ use std::str::FromStr;
 pub mod precedence;
 
 use common::program::program::Program;
-use common::types::Type;
+use common::types::{Kind, Type};
 use common::{
     Value,
     opcodes::{IR, Operation},
@@ -16,10 +17,16 @@ use scanner::{
     tokens::{Token, TokenKind},
 };
 
+mod typechecker;
+
+use typechecker::TypeChecker;
+
 pub struct Context<'ctx> {
     scanner: &'ctx mut Scanner,
     current: Token,
     previous: Option<Token>,
+
+    owner: Option<usize>,
 }
 
 impl<'ctx> Context<'ctx> {
@@ -30,6 +37,7 @@ impl<'ctx> Context<'ctx> {
             scanner,
             current,
             previous: None,
+            owner: None,
         }
     }
 
@@ -53,14 +61,75 @@ impl<'ctx> Context<'ctx> {
     pub fn tell(&self) -> usize {
         self.scanner.tell()
     }
+
+    pub fn set_owner(&mut self, owner: usize) {
+        self.owner = Some(owner);
+    }
+
+    pub fn clear_owner(&mut self) {
+        self.owner = None;
+    }
+
+    pub fn owner(&self) -> Option<usize> {
+        self.owner
+    }
 }
 
-#[derive(Default)]
-pub struct Parser {
-    data: Data,
+pub struct Parser<'data> {
+    data: &'data mut Data,
+    typechecker: TypeChecker<64>,
 }
 
-impl Parser {
+macro_rules! op {
+    ($this:expr, $ctx:expr, $op:ident, $($value:expr$(,)?)+) => {
+        {
+            let mut ir = IR::new(Operation::$op, Some([$($value,)+]));
+            if let Some(token) = $ctx.previous() {
+                let data = Metadata::new(token.start_line(), token.start_column());
+                ir.attach_metadata(data);
+            }
+
+            ir
+        }
+    };
+}
+
+impl<'data> Parser<'data> {
+    pub fn new(data: &'data mut Data) -> Self {
+        Self {
+            data,
+            typechecker: TypeChecker::default(),
+        }
+    }
+
+    // fn op(&mut self, ctx: &mut Context, op: Operation, operands: Option<[usize; 3]>) -> IR {
+    //     let mut ir = IR::new(op, operands);
+    //     dbg!(ctx.previous());
+    //
+    //     ir
+    // }
+
+    fn get_type(&mut self, ctx: &mut Context) -> Kind {
+        match ctx.current().kind() {
+            TokenKind::Int => Kind::Integer,
+            TokenKind::Float => Kind::Float,
+            TokenKind::Str => Kind::String,
+            TokenKind::Identifier => {
+                ctx.advance();
+                Kind::Object(
+                    self.data
+                        .add_symbol(ctx.current().lexeme().to_string(), None),
+                )
+            }
+            TokenKind::Void => Kind::None,
+            _ => {
+                eprintln!("Unknown token to be used as value: {:?}", ctx.current());
+
+                Kind::None
+            }
+        }
+    }
+
     fn matches(&self, ctx: &Context, token: TokenKind) -> bool {
         ctx.current.kind() == token || ctx.current.kind() == TokenKind::EOF
     }
@@ -90,22 +159,6 @@ impl Parser {
         matched
     }
 
-    fn patch(&self, tokens: &mut [IR], idx: usize) {
-        let length = tokens.len();
-        if let Some(token) = tokens.get_mut(idx) {
-            // dbg!(&length, &idx);
-            *token = match token.code() {
-                Operation::ConditionJump => {
-                    IR::new(Operation::ConditionJump, Some([length - idx, 0, 0]))
-                }
-                Operation::Jump => IR::new(Operation::Jump, Some([length - idx, 0, 0])),
-                // Operation::Break => IR::new(Operation::Break, Some([tokens.len() - (idx) - 1, 0,0])),
-                // Operation::Continue => IR::new(Operation::Continue, Some([tokens.len() - (idx) - 1, 0,0])),
-                _ => unreachable!("Should not attempt to jump patch non-jumping instruction"),
-            }
-        }
-    }
-
     fn grouping(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
 
@@ -126,7 +179,7 @@ impl Parser {
             TokenKind::False => Value::BOOLEAN(false),
             _ => todo!("Fail to build a boolean"),
         };
-        let constant = self.data.add_constant(value);
+        let constant = self.data.add_constant(value, Type::new(Kind::Bool));
 
         ctx.advance();
         vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
@@ -165,9 +218,10 @@ impl Parser {
         };
         ctx.advance();
 
-        let constant = self.data.add_constant(value);
+        let constant = self.data.add_constant(value, Type::new(Kind::Integer));
 
-        vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
+        // vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
+        vec![op!(self, ctx, Const, constant, 0, 0)]
     }
 
     fn float(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -178,14 +232,16 @@ impl Parser {
         };
 
         ctx.advance();
-        let constant = self.data.add_constant(value);
+        let constant = self.data.add_constant(value, Type::new(Kind::Float));
 
         vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
     }
 
     fn string(&mut self, ctx: &mut Context) -> Vec<IR> {
         let string = self.data.add_string(ctx.current().lexeme().to_string());
-        let constant = self.data.add_constant(Value::STR(string));
+        let constant = self
+            .data
+            .add_constant(Value::STR(string), Type::new(Kind::String));
 
         ctx.advance();
         vec![IR::new(Operation::Const, Some([constant, 0, 0]))]
@@ -565,12 +621,6 @@ impl Parser {
         result
     }
 
-    // fn loop_(&mut self, ctx: &mut Context, condition: Vec<IR>, body: Vec<IR>) -> Vec<IR> {
-    //     let mut result = vec![];
-    //
-    //     result
-    // }
-
     fn for_in(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut result = vec![];
         let name = ctx.current().to_owned();
@@ -623,7 +673,7 @@ impl Parser {
             self.expr_statement(ctx)
         };
 
-        action.push(IR::new(Operation::Pop, None));
+        action.push(IR::new(Operation::Pop, Some([1, 0, 0])));
         body.append(&mut action);
 
         result.append(&mut initializer);
@@ -707,6 +757,7 @@ impl Parser {
             TokenKind::Let => self.variable(ctx),
             TokenKind::Function => self.function(ctx),
             TokenKind::New => self.initialize(ctx),
+            TokenKind::LeftBracket => self.block(ctx),
             _ => todo!("Unimplemented token '{:?}'", ctx.current()),
         }
     }
@@ -736,6 +787,7 @@ impl Parser {
         //     self.if_expression(ctx)
         // } else {
         self.precedence(ctx, Precedence::Assign)
+
         // }
     }
 
@@ -784,39 +836,60 @@ impl Parser {
             TokenKind::Identifier,
             "Expected identifier for variable name",
         );
+        let mut kind = Kind::None;
+        if self.consume(ctx, TokenKind::Colon) {
+            kind = self.get_type(ctx);
+            ctx.advance();
+        }
+
         let mut tokens = vec![];
         if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
         } else {
             tokens.push(IR::new(
                 Operation::Const,
-                Some([self.data.add_constant(Value::NONE), 0, 0]),
+                Some([
+                    self.data.add_constant(Value::NONE, Type::new(Kind::None)),
+                    0,
+                    0,
+                ]),
             ));
         }
 
-        // self.consume(ctx, TokenKind::SemiColon);
-
-        tokens.push(IR::new(
+        let mut declaration = IR::new(
             Operation::Declare,
             Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
-        ));
+        );
+
+        declaration.set_type(Type::new(kind));
+        tokens.push(declaration);
 
         tokens
     }
     fn constant(&mut self, ctx: &mut Context) -> Vec<IR> {
+        self.consume(ctx, TokenKind::Const);
         let name = ctx.current().clone();
-        // self.expect(
-        //     ctx,
-        //     TokenKind::Identifier,
-        //     "Expected identifier for variable name",
-        // );
+        self.expect(
+            ctx,
+            TokenKind::Identifier,
+            "Expected identifier for variable name",
+        );
+        let mut kind = Kind::None;
+        if self.consume(ctx, TokenKind::Colon) {
+            kind = self.get_type(ctx);
+            ctx.advance();
+        }
+
         let mut tokens = self.expr(ctx);
         tokens.pop();
 
-        tokens.push(IR::new(
+        let mut declaration = IR::new(
             Operation::Declare,
             Some([self.data.add_symbol(name.lexeme().to_string(), None), 1, 0]),
-        ));
+        );
+
+        declaration.set_type(Type::new(kind));
+        tokens.push(declaration);
 
         tokens
     }
@@ -844,17 +917,10 @@ impl Parser {
         );
 
         let mut arity: usize = 0;
+        let mut argument_types = vec![];
         while !self.matches(ctx, TokenKind::RightParenthesis) {
-            let type_ = match ctx.current.kind() {
-                TokenKind::Int => Type::Integer,
-                TokenKind::Str => Type::String,
-                TokenKind::Bool => Type::Bool,
-                TokenKind::Float => Type::Float,
-                _ => todo!(
-                    "Unknown type: {}. Investigate support for additional types.",
-                    ctx.current().lexeme()
-                ),
-            };
+            // ctx.advance();
+            let kind = self.get_type(ctx);
             ctx.advance();
             let argument = ctx.current().clone();
 
@@ -863,17 +929,18 @@ impl Parser {
                 TokenKind::Identifier,
                 "Expected function argument identifier",
             ) {
-                body.push(
-                    // 0,
-                    IR::new(
-                        Operation::Argument,
-                        Some([
-                            self.data.add_symbol(argument.lexeme().to_string(), None),
-                            arity,
-                            0,
-                        ]),
-                    ),
+                let mut arg = IR::new(
+                    Operation::Argument,
+                    Some([
+                        self.data.add_symbol(argument.lexeme().to_string(), None),
+                        arity,
+                        0,
+                    ]),
                 );
+
+                arg.set_type(Type::new(kind));
+                argument_types.push(kind);
+                body.push(arg);
             }
             arity += 1;
 
@@ -902,30 +969,55 @@ impl Parser {
 
             body.append(&mut upvalues);
         }
+        let mut kind = Kind::None;
+        if self.consume(ctx, TokenKind::SlimArrow) {
+            kind = self.get_type(ctx);
+            ctx.advance();
+        }
         body.append(&mut self.block(ctx));
 
         let symbol = self.data.add_symbol(name, None);
-        tokens.push(IR::new(
-            Operation::Function,
-            Some([symbol, arity, body.len()]),
+        let mut func = IR::new(Operation::Function, Some([symbol, arity, body.len()]));
+        let mut func_type = Type::new(Kind::Function);
+        func_type.set_return(kind);
+        for arg in argument_types {
+            func_type.add(arg);
+        }
+
+        func.set_type(func_type);
+
+        tokens.push(func);
+        body.push(IR::new(
+            Operation::Const,
+            Some([
+                self.data.add_constant(Value::NONE, Type::new(Kind::None)),
+                0,
+                0,
+            ]),
         ));
+        body.push(IR::new(Operation::Leave, None));
         tokens.append(&mut body);
 
         tokens
     }
 
-    fn class(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let name = if self.consume(ctx, TokenKind::Identifier) {
-            ctx.previous().unwrap().lexeme().to_string()
-        } else {
-            "asd".to_string()
-        };
+    fn implement(&mut self, ctx: &mut Context) -> Vec<IR> {
+        self.consume(ctx, TokenKind::Identifier);
+        let interface = ctx.previous().unwrap().lexeme().to_string();
+        self.expect(
+            ctx,
+            TokenKind::For,
+            "Expected target for the contract implementation",
+        );
+        let contract = self.data.add_symbol(interface, None);
+        self.consume(ctx, TokenKind::Identifier);
+        let name = ctx.previous().unwrap().lexeme().to_string();
         let owner = self.data.add_symbol(name, None);
 
         self.expect(
             ctx,
             TokenKind::LeftBracket,
-            "Expected '}' denoting class body",
+            "Expected '{' denoting class body",
         );
         let mut class = vec![];
         while !self.consume(ctx, TokenKind::RightBracket) {
@@ -954,13 +1046,195 @@ impl Parser {
                 let mut method = self.function(ctx);
                 if let Some(code) = method.first_mut() {
                     let operands = code.operands();
-                    let method =
+                    let mut method =
                         IR::new(Operation::Method, Some([owner, operands[0], operands[2]]));
+                    method.set_type(code.kind());
                     *code = method;
                 }
                 class.append(&mut method);
             }
         }
+
+        class.insert(0, IR::new(Operation::Begin, None));
+        class.insert(
+            0,
+            IR::new(Operation::Implement, Some([contract, owner, class.len()])),
+        );
+        class.push(IR::new(Operation::End, None));
+
+        class
+    }
+
+    fn interface(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let mut interface = vec![];
+        let name = if self.consume(ctx, TokenKind::Identifier) {
+            ctx.previous().unwrap().lexeme().to_string()
+        } else {
+            "sad".to_string()
+        };
+        let owner = self.data.add_symbol(name, None);
+        ctx.advance();
+        while !self.consume(ctx, TokenKind::RightBracket) {
+            let mut method = vec![];
+            if self.consume(ctx, TokenKind::Pub) {
+                eprintln!("Interface methods are implicitly public, so 'pub' is not needed here");
+            }
+            self.expect(
+                ctx,
+                TokenKind::Function,
+                "Interfaces could define only functions",
+            );
+
+            self.expect(ctx, TokenKind::Identifier, "Expected method name");
+            let method_name = ctx.previous().unwrap().lexeme().to_string();
+            self.expect(
+                ctx,
+                TokenKind::LeftParenthesis,
+                "Expected '(' for argument list",
+            );
+            let mut body = vec![];
+            let mut arity = 0;
+            while !self.matches(ctx, TokenKind::RightParenthesis) {
+                let type_ = match ctx.current.kind() {
+                    TokenKind::Int => Kind::Integer,
+                    TokenKind::Str => Kind::String,
+                    TokenKind::Bool => Kind::Bool,
+                    TokenKind::Float => Kind::Float,
+                    _ => todo!(
+                        "Unknown type: {}. Investigate support for additional types.",
+                        ctx.current().lexeme()
+                    ),
+                };
+                ctx.advance();
+                let argument = ctx.current().clone();
+
+                if self.expect(
+                    ctx,
+                    TokenKind::Identifier,
+                    "Expected argument name identifier",
+                ) {
+                    body.push(IR::new(
+                        Operation::Argument,
+                        Some([
+                            self.data.add_symbol(argument.lexeme().to_string(), None),
+                            arity,
+                            0,
+                        ]),
+                    ));
+                    arity += 1;
+                    if !self.consume(ctx, TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+
+            self.expect(
+                ctx,
+                TokenKind::RightParenthesis,
+                "Expected ')' to close argument list",
+            );
+
+            if self.consume(ctx, TokenKind::SlimArrow) {
+                let type_ = match ctx.current.kind() {
+                    TokenKind::Int => Kind::Integer,
+                    TokenKind::Str => Kind::String,
+                    TokenKind::Bool => Kind::Bool,
+                    TokenKind::Float => Kind::Float,
+                    _ => todo!(
+                        "Unknown type: {}. Investigate support for additional types.",
+                        ctx.current().lexeme()
+                    ),
+                };
+                ctx.advance();
+            }
+            if self.matches(ctx, TokenKind::LeftBracket) {
+                body.append(&mut self.block(ctx));
+            } else {
+                self.expect(
+                    ctx,
+                    TokenKind::SemiColon,
+                    "Expecting ';' at end of method declaration",
+                );
+            }
+
+            method.insert(
+                0,
+                IR::new(
+                    Operation::Method,
+                    Some([owner, self.data.add_symbol(method_name, None), body.len()]),
+                ),
+            );
+            method.append(&mut body);
+
+            interface.append(&mut method);
+        }
+
+        interface.insert(0, IR::new(Operation::Begin, None));
+        interface.push(IR::new(Operation::End, None));
+        interface.insert(
+            0,
+            IR::new(
+                Operation::Interface,
+                Some([owner, interface.len(), interface.len()]),
+            ),
+        );
+
+        interface
+    }
+
+    fn class(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let name = if self.consume(ctx, TokenKind::Identifier) {
+            ctx.previous().unwrap().lexeme().to_string()
+        } else {
+            "asd".to_string()
+        };
+        let owner = self.data.add_symbol(name, None);
+
+        self.expect(
+            ctx,
+            TokenKind::LeftBracket,
+            "Expected '{' denoting class body",
+        );
+        let mut class = vec![];
+        if ctx.owner().is_some() {
+            panic!("Classes can only be declared outisde any conditional blocks");
+        }
+        ctx.set_owner(owner);
+        while !self.consume(ctx, TokenKind::RightBracket) {
+            let public = self.consume(ctx, TokenKind::Pub);
+            if self.consume(ctx, TokenKind::Prop) {
+                let prop_name = ctx.current.lexeme().to_string();
+                self.consume(ctx, TokenKind::Identifier);
+
+                let mut prop = if self.consume(ctx, TokenKind::SemiColon) {
+                    vec![]
+                } else {
+                    self.expr_statement(ctx)
+                };
+                prop.push(IR::new(
+                    Operation::Prop,
+                    Some([
+                        owner,
+                        self.data.add_symbol(prop_name, None),
+                        usize::from(public),
+                    ]),
+                ));
+
+                prop.append(&mut class);
+                class = prop;
+            } else if self.matches(ctx, TokenKind::Function) {
+                let mut method = self.function(ctx);
+                if let Some(code) = method.first_mut() {
+                    let operands = code.operands();
+                    let mut method =
+                        IR::new(Operation::Method, Some([owner, operands[0], operands[2]]));
+                    method.set_type(code.kind());
+                    *code = method;
+                }
+                class.append(&mut method);
+            }
+        }
+        ctx.clear_owner();
 
         class.insert(0, IR::new(Operation::Begin, None));
         class.insert(0, IR::new(Operation::Class, Some([owner, class.len(), 0])));
@@ -982,10 +1256,11 @@ impl Parser {
                 self.consume(ctx, TokenKind::Comma);
             }
 
-            result.push(IR::new(
-                Operation::Instantiate,
-                Some([self.data.add_symbol(name, None), arity, 0]),
-            ));
+            let symbol = self.data.add_symbol(name, None);
+            let mut instance = IR::new(Operation::Instantiate, Some([symbol, arity, 0]));
+            instance.set_type(Type::new(Kind::Object(symbol)));
+
+            result.push(instance);
         }
 
         result
@@ -994,7 +1269,12 @@ impl Parser {
     fn this(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
         let mut result = self.expression(ctx);
-        result.insert(0, IR::new(Operation::This, None));
+        let mut this = IR::new(Operation::This, None);
+        if ctx.owner().is_none() {
+            panic!("Using 'this' outside of object context");
+        }
+        this.set_type(Type::new(Kind::Object(ctx.owner().unwrap())));
+        result.insert(0, this);
 
         result
     }
@@ -1040,9 +1320,17 @@ impl Parser {
                 ctx.advance();
                 self.function(ctx)
             }
+            TokenKind::Interface => {
+                ctx.advance();
+                self.interface(ctx)
+            }
             TokenKind::Class => {
                 ctx.advance();
                 self.class(ctx)
+            }
+            TokenKind::Implement => {
+                ctx.advance();
+                self.implement(ctx)
             }
             TokenKind::If => {
                 ctx.advance();
@@ -1065,19 +1353,27 @@ impl Parser {
         let mut code = vec![];
 
         while ctx.current().kind() != TokenKind::EOF {
-            code.append(&mut self.statement(&mut ctx));
+            let stmt = self.statement(&mut ctx);
+
+            code.append(&mut self.typechecker.check(&stmt, self.data));
         }
 
-        let mut program = Program::new(code);
-        program.with_data(self.data.clone());
+        if !self.typechecker.get_errors().is_empty() {
+            for err in self.typechecker.get_errors() {
+                eprintln!("{}", err);
+            }
 
-        Ok(program)
+            return Err("Encountered errors during parsing".to_string());
+        }
+
+        Ok(Program::new(code))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use common::opcodes::Operation;
+    use common::program::data::Data;
     use scanner::{Scanner, buffer::Buffer};
 
     use crate::Parser;
@@ -1086,8 +1382,9 @@ mod tests {
         ($code:expr, $($token:expr),+) => {
             if let Ok(buffer) = Buffer::try_from($code) {
                 let mut scanner = Scanner::new(buffer, None);
+                let mut data = Data::default();
 
-                if let Ok(program) = Parser::default().parse(&mut scanner) {
+                if let Ok(program) = Parser::new(&mut data).parse(&mut scanner) {
                     let tokens = [$($token),+];
 
                     let diff = (tokens.len()) + (program.code().len() - tokens.len());
