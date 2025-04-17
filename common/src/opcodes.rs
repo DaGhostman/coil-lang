@@ -56,6 +56,8 @@ pub enum Operation {
     Interface,
     Implement,
     Class,
+    ClassType,
+    ClassParam,
     Prop,
     Method,
     Instantiate,
@@ -99,7 +101,7 @@ impl Metadata {
 
 impl Display for Metadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "@{}:{}", self.line, self.column)
+        write!(f, "{}:{}", self.line, self.column)
     }
 }
 
@@ -108,7 +110,7 @@ pub struct IR {
     code: Operation,
     operands: [usize; 3],
     metadata: Option<Metadata>,
-    r#type: Type,
+    r#type: usize,
 }
 
 impl Debug for IR {
@@ -134,7 +136,7 @@ impl IR {
             code,
             operands: values.unwrap_or_default(),
             metadata: None,
-            r#type: Type::new(Kind::None),
+            r#type: 0,
         }
     }
 
@@ -172,11 +174,11 @@ impl IR {
         self.metadata.as_ref()
     }
 
-    pub fn set_type(&mut self, r#type: Type) {
+    pub fn set_type(&mut self, r#type: usize) {
         self.r#type = r#type;
     }
 
-    pub fn kind(&self) -> Type {
+    pub fn kind(&self) -> usize {
         self.r#type
     }
 }
@@ -290,7 +292,7 @@ pub enum Byte {
 pub struct Code {
     byte: Byte,
     operands: [usize; 3],
-    r#type: Type,
+    r#type: usize,
 }
 
 impl Code {
@@ -298,7 +300,7 @@ impl Code {
         Self {
             byte,
             operands: [0, 0, 0],
-            r#type: Type::new(Kind::default()),
+            r#type: 0,
         }
     }
 
@@ -306,7 +308,7 @@ impl Code {
         Self {
             byte,
             operands,
-            r#type: Type::new(Kind::default()),
+            r#type: 0,
         }
     }
 
@@ -314,7 +316,7 @@ impl Code {
         self.operands = operands;
     }
 
-    pub fn with_type(&mut self, r#type: Type) {
+    pub fn with_type(&mut self, r#type: usize) {
         self.r#type = r#type;
     }
 
@@ -330,7 +332,7 @@ impl Code {
         &self.operands
     }
 
-    pub fn get_type(&self) -> Type {
+    pub fn get_type(&self) -> usize {
         self.r#type
     }
 }

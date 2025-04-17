@@ -362,7 +362,7 @@ impl Scanner {
                     self.in_template_expr = true;
                     self.make_token(TokenKind::Plus, "${")
                 } else {
-                    todo!("Handle unexpected token");
+                    self.make_token(TokenKind::Dolar, "$")
                 }
             }
             Some('(') => self.make_token(TokenKind::LeftParenthesis, "("),
@@ -438,14 +438,21 @@ impl Scanner {
                 _ => self.make_token(TokenKind::Equal, "="),
             },
             Some(';') => self.make_token(TokenKind::SemiColon, ";"),
-            Some(':') => self.make_token(TokenKind::Colon, ":"),
+            Some(':') => match self.peek(1) {
+                Some(':') => self.make_token(TokenKind::ColonColon, "::"),
+                _ => self.make_token(TokenKind::Colon, ":"),
+            },
             Some('0'..='9') => self.digit(),
             Some('a') => match self.peek(1) {
                 Some('s') => self.keyword_or_identifier(TokenKind::As, "as"),
                 Some('n') => self.keyword_or_identifier(TokenKind::And, "and"),
                 _ => self.identifier(),
             },
-            Some('b') => self.keyword_or_identifier(TokenKind::Bool, "bool"),
+            Some('b') => match self.peek(1) {
+                Some('o') => self.keyword_or_identifier(TokenKind::Bool, "bool"),
+                Some('r') => self.keyword_or_identifier(TokenKind::Break, "break"),
+                _ => self.identifier(),
+            },
             Some('c') => match self.peek(1) {
                 Some('l') => self.keyword_or_identifier(TokenKind::Class, "class"),
                 Some('o') => match self.peek(3) {
@@ -501,7 +508,11 @@ impl Scanner {
             },
             Some('r') => match self.peek(1) {
                 Some('a') => self.keyword_or_identifier(TokenKind::Raise, "raise"),
-                Some('e') => self.keyword_or_identifier(TokenKind::Return, "return"),
+                Some('e') => match self.peek(2) {
+                    Some('t') => self.keyword_or_identifier(TokenKind::Return, "return"),
+                    Some('s') => self.keyword_or_identifier(TokenKind::Result, "result"),
+                    _ => self.identifier(),
+                },
                 _ => self.identifier(),
             },
             Some('s') => match self.peek(1) {

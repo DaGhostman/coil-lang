@@ -20,7 +20,7 @@ impl LabelUnrolling {
     fn reduce_jumps(&mut self, index: usize) {
         let offset = self.jumps[index];
         for (l, position) in self.jumps.clone().into_iter().enumerate() {
-            if offset < position {
+            if offset <= position {
                 self.jumps.insert(l, position - 1);
             }
         }
@@ -42,7 +42,7 @@ impl CompilationPass for LabelUnrolling {
             .enumerate()
             .filter_map(|(idx, code)| {
                 if Byte::Label == *code.byte() {
-                    Some((idx, code.operand(0)))
+                    Some((idx + 1, code.operand(0)))
                 } else {
                     None
                 }

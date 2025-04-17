@@ -2,7 +2,11 @@ use common::opcodes::Metadata;
 use common::program::data::Data;
 use rand::{Rng, distr::Alphanumeric};
 use scanner::buffer::Buffer;
+use std::ops::Add;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+use rustc_hash::FxHashMap as HashMap;
 
 pub mod precedence;
 
@@ -29,6 +33,8 @@ pub struct Context {
 
     owner: Option<usize>,
 }
+
+const INCLUDE_PATHS: [&str; 5] = ["src/", "lib/", "external/", "vendor/", "deps/"];
 
 impl Context {
     pub fn new(mut scanner: Scanner) -> Self {
@@ -80,6 +86,10 @@ pub struct Parser<'data> {
     data: &'data mut Data,
     file: String,
     typechecker: TypeChecker<64>,
+
+    scanned: Vec<String>,
+    aliases: HashMap<String, String>,
+    namespace: String,
 }
 
 macro_rules! op {
@@ -100,35 +110,137 @@ impl<'data> Parser<'data> {
             data,
             file,
             typechecker: TypeChecker::default(),
+            scanned: Vec::default(),
+            aliases: HashMap::default(),
+            namespace: String::new(),
         }
     }
 
-    // fn op(&mut self, ctx: &mut Context, op: Operation, operands: Option<[usize; 3]>) -> IR {
-    //     let mut ir = IR::new(op, operands);
-    //     dbg!(ctx.previous());
-    //
-    //     ir
-    // }
+    fn name(&mut self, name: String, constant: Option<usize>) -> usize {
+        self.data.add_symbol(
+            format!("{}::{}", self.namespace, name)
+                .trim_start_matches("::")
+                .to_string(),
+            constant,
+        )
+    }
 
-    fn get_type(&mut self, ctx: &mut Context) -> Kind {
-        match ctx.current().kind() {
-            TokenKind::Int => Kind::Integer,
-            TokenKind::Float => Kind::Float,
-            TokenKind::Str => Kind::String,
-            TokenKind::Identifier => {
-                ctx.advance();
-                Kind::Object(
-                    self.data
-                        .add_symbol(ctx.current().lexeme().to_string(), None),
-                )
-            }
-            TokenKind::Void => Kind::None,
-            _ => {
-                eprintln!("Unknown token to be used as value: {:?}", ctx.current());
+    fn get_type(&mut self, ctx: &mut Context) -> usize {
+        // ctx.advance();
+        let mut r#type = Type::new(if self.consume(ctx, TokenKind::Int) {
+            Kind::Integer
+        } else if self.consume(ctx, TokenKind::Float) {
+            Kind::Float
+        } else if self.consume(ctx, TokenKind::Str) {
+            Kind::String
+        } else if self.consume(ctx, TokenKind::Void) {
+            Kind::None
+        } else if self.consume(ctx, TokenKind::Result) {
+            Kind::Result
+        } else if self.consume(ctx, TokenKind::Dolar) {
+            let symbol = self
+                .data
+                .add_symbol(ctx.current().lexeme().to_string(), None);
+            self.expect(ctx, TokenKind::Identifier, "Expected generic identifier");
+            let mut kind = self.data.add_type(Type::void());
 
-                Kind::None
+            if self.consume(ctx, TokenKind::Equal) {
+                kind = self.get_type(ctx);
             }
+
+            Kind::Generic(symbol, kind)
+        } else if self.consume(ctx, TokenKind::Identifier) {
+            let mut name = ctx.current().lexeme().to_string();
+            if self.aliases.contains_key(&name) {
+                name = self.aliases[&name].to_string();
+            }
+
+            let n = self.data.add_symbol(name, None);
+
+            Kind::Object(n)
+        } else {
+            eprintln!(
+                "Unknown token to be used as type: {:?}",
+                ctx.previous().unwrap().lexeme()
+            );
+
+            Kind::None
+        });
+        // ctx.advance();
+
+        // let mut r#type = Type::new(match ctx.previous().map(|p| p.kind()) {
+        //     Some(TokenKind::Int) => Kind::Integer,
+        //     Some(TokenKind::Float) => Kind::Float,
+        //     Some(TokenKind::Str) => Kind::String,
+        //     // TokenKind::Identifier => {
+        //     //     ctx.advance();
+        //     //     Kind::Object(self.name(ctx.current().lexeme().to_string(), None))
+        //     // }
+        //     Some(TokenKind::Void) => Kind::None,
+        //     Some(TokenKind::Result) => Kind::Result,
+        //     Some(TokenKind::Identifier) => {
+        //         let mut name = ctx.current().lexeme().to_string();
+        //         if self.aliases.contains_key(&name) {
+        //             name = self.aliases[&name].to_string();
+        //         }
+        //
+        //         let n = self.data.add_symbol(name, None);
+        //
+        //         Kind::Object(n)
+        //     }
+        //     _ => {
+        //         eprintln!("Unknown token to be used as value: {:?}", ctx.current());
+        //
+        //         Kind::None
+        //     }
+        // });
+        // ctx.advance();
+
+        if self.consume(ctx, TokenKind::Less) {
+            r#type.add(self.get_type(ctx));
+            while self.consume(ctx, TokenKind::Comma) {
+                r#type.add(self.get_type(ctx));
+            }
+
+            self.expect(
+                ctx,
+                TokenKind::Greater,
+                "Expected '>' to close type parameter list.",
+            );
         }
+        // else if self.consume(ctx, TokenKind::And) {
+        //     let mut t = Type::new(Kind::Intersection);
+        //     t.add(self.data.add_type(r#type));
+        //     t.add(self.get_type(ctx));
+        //     while self.consume(ctx, TokenKind::Pipe) || self.matches(ctx, TokenKind::And) {
+        //         t.add(self.get_type(ctx));
+        //     }
+        //
+        //     r#type = t;
+        // } else if self.consume(ctx, TokenKind::Pipe) {
+        //     let mut t = Type::new(Kind::Union);
+        //     t.add(self.data.add_type(r#type));
+        //     t.add(self.get_type(ctx));
+        //     while self.consume(ctx, TokenKind::Pipe) || self.matches(ctx, TokenKind::And) {
+        //         t.add(self.get_type(ctx));
+        //     }
+        //
+        //     r#type = t;
+        // }
+        // else if self.consume(ctx, TokenKind::LeftParenthesis) {
+        //     while !self.consume(ctx, TokenKind::RightParenthesis) {
+        //         let mut t = r#type.add(kind);
+        //         t.add(
+        //     }
+        // }
+
+        // eprintln!(
+        //     "TYPE: {}: {}",
+        //     r#type.output(self.data),
+        //     ctx.current().lexeme()
+        // );
+
+        self.data.add_type(r#type)
     }
 
     fn matches(&self, ctx: &Context, token: TokenKind) -> bool {
@@ -155,6 +267,7 @@ impl<'data> Parser<'data> {
                 ctx.current.kind(),
                 ctx.current.lexeme()
             );
+            panic!("SADGE");
         }
 
         matched
@@ -180,7 +293,8 @@ impl<'data> Parser<'data> {
             TokenKind::False => Value::BOOLEAN(false),
             _ => todo!("Fail to build a boolean"),
         };
-        let constant = self.data.add_constant(value, Type::new(Kind::Bool));
+        let ty = self.data.add_type(Type::bool());
+        let constant = self.data.add_constant(value, ty);
 
         ctx.advance();
         vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
@@ -219,7 +333,8 @@ impl<'data> Parser<'data> {
         };
         ctx.advance();
 
-        let constant = self.data.add_constant(value, Type::new(Kind::Integer));
+        let ty = self.data.add_type(Type::integer());
+        let constant = self.data.add_constant(value, ty);
 
         vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
     }
@@ -232,7 +347,9 @@ impl<'data> Parser<'data> {
         };
 
         ctx.advance();
-        let constant = self.data.add_constant(value, Type::new(Kind::Float));
+        let constant = self
+            .data
+            .add_constant(value, self.data.find_type(Type::float()));
 
         vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
     }
@@ -241,16 +358,16 @@ impl<'data> Parser<'data> {
         let string = self.data.add_string(ctx.current().lexeme().to_string());
         let constant = self
             .data
-            .add_constant(Value::STR(string), Type::new(Kind::String));
+            .add_constant(Value::STR(string), self.data.find_type(Type::string()));
 
         ctx.advance();
         vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
     }
 
     fn identifier(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let symbol = self
-            .data
-            .add_symbol(ctx.current().lexeme().to_string(), None);
+        let mut name = ctx.current().lexeme().to_string();
+
+        let mut symbol = self.data.add_symbol(name.to_string(), None);
         ctx.advance();
 
         let mut tokens = vec![];
@@ -261,6 +378,11 @@ impl<'data> Parser<'data> {
                 self.consume(ctx, TokenKind::Comma);
                 arity += 1;
             }
+            if self.aliases.contains_key(&name) {
+                name = self.aliases[&name].clone();
+            }
+
+            symbol = self.data.add_symbol(name, None);
 
             tokens.push(op!(self, ctx, Call, Some([symbol, arity, 0])));
         } else if self.consume(ctx, TokenKind::Equal) {
@@ -401,9 +523,11 @@ impl<'data> Parser<'data> {
         result.append(&mut tokens);
         result.insert(
             0,
-            IR::new(
-                Operation::Check,
-                Some([full_predicate.len(), tokens.len(), 0]),
+            op!(
+                self,
+                ctx,
+                Check,
+                Some([full_predicate.len(), tokens.len(), 0])
             ),
         );
 
@@ -541,13 +665,6 @@ impl<'data> Parser<'data> {
             }
 
             self.expect(ctx, TokenKind::Comma, "Expected comma");
-            // if let Some(jump) = has_prev {
-            //     dbg!(tokens.get(jump));
-            //     self.patch(&mut tokens, jump);
-            //     dbg!(tokens.get(jump));
-            //     has_prev = None;
-            // }
-            // has_prev = Some(else_jump);
         }
 
         {
@@ -586,9 +703,11 @@ impl<'data> Parser<'data> {
         tokens.append(&mut body);
         tokens.insert(
             0,
-            IR::new(
-                Operation::Condition,
-                Some([condition_len, body_len, alternative.len()]),
+            op!(
+                self,
+                ctx,
+                Condition,
+                Some([condition_len, body_len, alternative.len()])
             ),
         );
         tokens.append(&mut alternative);
@@ -629,13 +748,15 @@ impl<'data> Parser<'data> {
             if self.expect(ctx, TokenKind::In, "Expecting 'in' for loop") {
                 result.append(&mut self.expression(ctx));
                 let mut body = self.block(ctx);
-                result.push(IR::new(
-                    Operation::Iterate,
+                result.push(op!(
+                    self,
+                    ctx,
+                    Iterate,
                     Some([
                         self.data.add_symbol(name.lexeme().to_string(), None),
                         body.len(),
                         0,
-                    ]),
+                    ])
                 ));
                 result.append(&mut body);
             }
@@ -674,10 +795,7 @@ impl<'data> Parser<'data> {
         body.append(&mut action);
 
         result.append(&mut initializer);
-        result.push(IR::new(
-            Operation::Loop,
-            Some([condition.len(), body.len(), 0]),
-        ));
+        result.push(op!(self, ctx, Loop, Some([condition.len(), body.len(), 0])));
         result.append(&mut condition);
         // result.push(op!(self, ctx,Rewind, Some([body.len(), 0, 0])));
         result.append(&mut body);
@@ -688,40 +806,42 @@ impl<'data> Parser<'data> {
     fn call(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.expect(ctx, TokenKind::Dot, "Expected '.' for call expression");
         let mut tokens = vec![];
-        let name = ctx.current().clone();
+        let name = ctx.current().lexeme().to_string();
+
         let mut arity = 0;
 
         if self.expect(ctx, TokenKind::Identifier, "Expected function name") {
             if self.consume(ctx, TokenKind::LeftParenthesis) {
+                let mut invoke = op!(
+                    self,
+                    ctx,
+                    Invoke,
+                    Some([self.data.add_symbol(name, None), arity, 0])
+                );
+
                 while !self.consume(ctx, TokenKind::RightParenthesis) {
                     arity += 1;
                     tokens.append(&mut self.expression(ctx));
 
                     self.consume(ctx, TokenKind::Comma);
                 }
+                invoke.operands_mut()[1] = arity;
 
-                // let metadata = Metadata {
-                //     line:
-                // };
-
-                tokens.push(IR::new(
-                    Operation::Invoke,
-                    Some([
-                        self.data.add_symbol(name.lexeme().to_string(), None),
-                        arity,
-                        0,
-                    ]),
-                ));
+                tokens.push(invoke);
             } else if self.consume(ctx, TokenKind::Equal) {
                 tokens.append(&mut self.expression(ctx));
-                tokens.push(IR::new(
-                    Operation::PropAssign,
-                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
+                tokens.push(op!(
+                    self,
+                    ctx,
+                    Prop,
+                    Some([self.data.add_symbol(name, None), 1, 0])
                 ));
             } else {
-                tokens.push(IR::new(
-                    Operation::PropLoad,
-                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
+                tokens.push(op!(
+                    self,
+                    ctx,
+                    Prop,
+                    Some([self.data.add_symbol(name, None), 0, 0])
                 ));
                 // todo!("Handle remainder of cases");
             } // TODO: Implement Increment for properties
@@ -833,32 +953,31 @@ impl<'data> Parser<'data> {
             TokenKind::Identifier,
             "Expected identifier for variable name",
         );
-        let mut kind = Kind::None;
+        let mut kind = self.data.add_type(Type::void());
         if self.consume(ctx, TokenKind::Colon) {
             kind = self.get_type(ctx);
-            ctx.advance();
         }
 
         let mut tokens = vec![];
         if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
         } else {
-            tokens.push(IR::new(
-                Operation::Const,
-                Some([
-                    self.data.add_constant(Value::NONE, Type::new(Kind::None)),
-                    0,
-                    0,
-                ]),
+            tokens.push(op!(
+                self,
+                ctx,
+                Const,
+                Some([self.data.add_constant(Value::NONE, 0), 0, 0,])
             ));
         }
 
-        let mut declaration = IR::new(
-            Operation::Declare,
-            Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
+        let mut declaration = op!(
+            self,
+            ctx,
+            Declare,
+            Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0])
         );
 
-        declaration.set_type(Type::new(kind));
+        declaration.set_type(kind);
         tokens.push(declaration);
 
         tokens
@@ -871,21 +990,22 @@ impl<'data> Parser<'data> {
             TokenKind::Identifier,
             "Expected identifier for variable name",
         );
-        let mut kind = Kind::None;
+        let mut kind = self.data.add_type(Type::void());
         if self.consume(ctx, TokenKind::Colon) {
             kind = self.get_type(ctx);
-            ctx.advance();
         }
 
         let mut tokens = self.expr(ctx);
         tokens.pop();
 
-        let mut declaration = IR::new(
-            Operation::Declare,
-            Some([self.data.add_symbol(name.lexeme().to_string(), None), 1, 0]),
+        let mut declaration = op!(
+            self,
+            ctx,
+            Declare,
+            Some([self.data.add_symbol(name.lexeme().to_string(), None), 1, 0])
         );
 
-        declaration.set_type(Type::new(kind));
+        declaration.set_type(kind);
         tokens.push(declaration);
 
         tokens
@@ -896,7 +1016,7 @@ impl<'data> Parser<'data> {
 
         self.consume(ctx, TokenKind::Function);
 
-        let name: String = if self.consume(ctx, TokenKind::Identifier) {
+        let mut name: String = if self.consume(ctx, TokenKind::Identifier) {
             ctx.previous().unwrap_or_default().lexeme().to_string()
         } else {
             rand::rng()
@@ -918,7 +1038,6 @@ impl<'data> Parser<'data> {
         while !self.matches(ctx, TokenKind::RightParenthesis) {
             // ctx.advance();
             let kind = self.get_type(ctx);
-            ctx.advance();
             let argument = ctx.current().clone();
 
             if self.expect(
@@ -926,16 +1045,18 @@ impl<'data> Parser<'data> {
                 TokenKind::Identifier,
                 "Expected function argument identifier",
             ) {
-                let mut arg = IR::new(
-                    Operation::Argument,
+                let mut arg = op!(
+                    self,
+                    ctx,
+                    Argument,
                     Some([
                         self.data.add_symbol(argument.lexeme().to_string(), None),
-                        arity,
+                        1,
                         0,
-                    ]),
+                    ])
                 );
 
-                arg.set_type(Type::new(kind));
+                arg.set_type(kind);
                 argument_types.push(kind);
                 body.push(arg);
             }
@@ -957,45 +1078,100 @@ impl<'data> Parser<'data> {
             while !self.consume(ctx, TokenKind::RightParenthesis) {
                 let name = ctx.current().clone();
                 self.expect(ctx, TokenKind::Identifier, "Expected variable name");
-                upvalues.push(IR::new(
-                    Operation::Upvalue,
-                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]),
+                upvalues.push(op!(
+                    self,
+                    ctx,
+                    Upvalue,
+                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0])
                 ));
                 self.consume(ctx, TokenKind::Comma);
             }
 
             body.append(&mut upvalues);
         }
-        let mut kind = Kind::None;
+        let mut kind = self.data.add_type(Type::void()); // Kind::None;
         if self.consume(ctx, TokenKind::SlimArrow) {
             kind = self.get_type(ctx);
-            ctx.advance();
         }
         body.append(&mut self.block(ctx));
 
-        let symbol = self.data.add_symbol(name, None);
+        let symbol = self.name(name, None);
+
         let mut func = op!(self, ctx, Function, Some([symbol, arity, body.len()]));
-        let mut func_type = Type::new(Kind::Function);
+        let mut func_type = Type::function();
         func_type.set_return(kind);
         for arg in argument_types {
             func_type.add(arg);
         }
 
-        func.set_type(func_type);
+        func.set_type(self.data.add_type(func_type));
 
         tokens.push(func);
-        body.push(IR::new(
-            Operation::Const,
-            Some([
-                self.data.add_constant(Value::NONE, Type::new(Kind::None)),
-                0,
-                0,
-            ]),
+        body.push(op!(
+            self,
+            ctx,
+            Const,
+            Some([self.data.add_constant(Value::NONE, 0), 0, 0,])
         ));
         body.push(op!(self, ctx, Leave, None));
         tokens.append(&mut body);
 
         tokens
+    }
+
+    fn prop(&mut self, ctx: &mut Context, owner: usize, public: bool) -> Vec<IR> {
+        let mut kind = self.data.add_type(Type::void());
+
+        if !self.matches(ctx, TokenKind::Identifier) {
+            kind = self.get_type(ctx);
+        }
+
+        let prop_name = ctx.current.lexeme().to_string();
+        self.consume(ctx, TokenKind::Identifier);
+
+        let mut prop = if self.consume(ctx, TokenKind::SemiColon) {
+            vec![op!(
+                self,
+                ctx,
+                Const,
+                Some([self.data.add_constant(Value::NONE, 0), 0, 0])
+            )]
+        } else {
+            self.expr_statement(ctx)
+        };
+        let mut symbol = owner;
+        symbol = symbol << 32;
+        symbol |= self.data.add_symbol(prop_name, None);
+
+        let mut property = op!(self, ctx, Prop, Some([symbol, 2, usize::from(public),]));
+        property.set_type(kind);
+        prop.push(property);
+
+        prop
+    }
+
+    fn method(&mut self, ctx: &mut Context, owner: usize, public: bool) -> Vec<IR> {
+        let ns = self.namespace.clone();
+        self.namespace = String::new();
+        let mut method = self.function(ctx);
+
+        method.insert(1, IR::new(Operation::This, None));
+        if let Some(code) = method.first_mut() {
+            let operands = code.operands();
+            let mut symbol = owner;
+            symbol = symbol << 16;
+            symbol |= operands[0];
+            symbol = symbol << 1;
+            symbol |= usize::from(public);
+
+            let mut method = op!(self, ctx, Method, Some([symbol, operands[1], operands[2]]));
+            method.set_type(code.kind());
+            // method.attach_metadata(*code.metadata().unwrap());
+            *code = method;
+        }
+        self.namespace = ns;
+
+        method
     }
 
     fn implement(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -1011,6 +1187,11 @@ impl<'data> Parser<'data> {
         let name = ctx.previous().unwrap().lexeme().to_string();
         let owner = self.data.add_symbol(name, None);
 
+        if ctx.owner().is_some() {
+            panic!("Classes can only be declared outisde any conditional blocks");
+        }
+
+        ctx.set_owner(owner);
         self.expect(
             ctx,
             TokenKind::LeftBracket,
@@ -1019,36 +1200,20 @@ impl<'data> Parser<'data> {
         let mut class = vec![];
         while !self.consume(ctx, TokenKind::RightBracket) {
             let public = self.consume(ctx, TokenKind::Pub);
+
             if self.consume(ctx, TokenKind::Prop) {
-                let prop_name = ctx.current.lexeme().to_string();
-                self.consume(ctx, TokenKind::Identifier);
-
-                let mut prop = if self.consume(ctx, TokenKind::SemiColon) {
-                    vec![]
-                } else {
-                    self.expr_statement(ctx)
-                };
-                prop.push(IR::new(
-                    Operation::Prop,
-                    Some([
-                        owner,
-                        self.data.add_symbol(prop_name, None),
-                        usize::from(public),
-                    ]),
-                ));
-
-                prop.append(&mut class);
-                class = prop;
+                class.append(&mut self.prop(ctx, owner, public));
             } else if self.matches(ctx, TokenKind::Function) {
-                let mut method = self.function(ctx);
-                if let Some(code) = method.first_mut() {
-                    let operands = code.operands();
-                    let mut method =
-                        op!(self, ctx, Method, Some([owner, operands[0], operands[2]]));
-                    method.set_type(code.kind());
-                    *code = method;
-                }
-                class.append(&mut method);
+                class.append(&mut self.method(ctx, owner, public));
+                // let mut method = self.function(ctx);
+                // if let Some(code) = method.first_mut() {
+                //     let operands = code.operands();
+                //     let mut method =
+                //         op!(self, ctx, Method, Some([owner, operands[0], operands[2]]));
+                //     method.set_type(code.kind());
+                //     *code = method;
+                // }
+                // class.append(&mut method);
             }
         }
 
@@ -1069,7 +1234,14 @@ impl<'data> Parser<'data> {
         } else {
             "sad".to_string()
         };
-        let owner = self.data.add_symbol(name, None);
+        let owner = self.name(name, None);
+        if ctx.owner().is_some() {
+            panic!("Classes can only be declared outisde any conditional blocks");
+        }
+        ctx.set_owner(owner);
+
+        let mut iface = op!(self, ctx, Interface, Some([owner, 0, 0]));
+
         ctx.advance();
         while !self.consume(ctx, TokenKind::RightBracket) {
             let mut method = vec![];
@@ -1110,13 +1282,15 @@ impl<'data> Parser<'data> {
                     TokenKind::Identifier,
                     "Expected argument name identifier",
                 ) {
-                    body.push(IR::new(
-                        Operation::Argument,
+                    body.push(op!(
+                        self,
+                        ctx,
+                        Argument,
                         Some([
                             self.data.add_symbol(argument.lexeme().to_string(), None),
-                            arity,
+                            1,
                             0,
-                        ]),
+                        ])
                     ));
                     arity += 1;
                     if !self.consume(ctx, TokenKind::Comma) {
@@ -1154,13 +1328,14 @@ impl<'data> Parser<'data> {
                 );
             }
 
-            method.insert(
-                0,
-                IR::new(
-                    Operation::Method,
-                    Some([owner, self.data.add_symbol(method_name, None), body.len()]),
-                ),
-            );
+            let name_symbol = self.data.add_symbol(method_name, None);
+            let mut symbol = owner;
+            symbol = symbol << 16;
+            symbol |= name_symbol;
+            symbol = symbol << 1;
+            symbol |= 1;
+
+            method.insert(0, op!(self, ctx, Method, Some([symbol, arity, body.len()])));
             method.append(&mut body);
 
             interface.append(&mut method);
@@ -1168,31 +1343,54 @@ impl<'data> Parser<'data> {
 
         interface.insert(0, op!(self, ctx, Begin, None));
         interface.push(op!(self, ctx, End, None));
-        interface.insert(
-            0,
-            IR::new(
-                Operation::Interface,
-                Some([owner, interface.len(), interface.len()]),
-            ),
-        );
+        iface.operands_mut()[1] = interface.len();
+        iface.operands_mut()[2] = interface.len();
+        interface.insert(0, iface);
 
         interface
     }
 
     fn class(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let mut class = vec![];
         let name = if self.consume(ctx, TokenKind::Identifier) {
             ctx.previous().unwrap().lexeme().to_string()
         } else {
             "asd".to_string()
         };
-        let owner = self.data.add_symbol(name, None);
+
+        let owner = self.name(name, None);
+
+        if self.consume(ctx, TokenKind::Less) {
+            while !self.consume(ctx, TokenKind::Greater) {
+                self.expect(
+                    ctx,
+                    TokenKind::Dolar,
+                    "Expecting '$' infront of generic type arguments",
+                );
+
+                let identifier = ctx.current().lexeme().to_string();
+                self.expect(
+                    ctx,
+                    TokenKind::Identifier,
+                    "Expected a valid identifier for type parameter",
+                );
+
+                let type_param = self.data.add_symbol(identifier, None);
+                let mut param = op!(self, ctx, ClassParam, Some([owner, type_param, 0]));
+                if self.consume(ctx, TokenKind::Colon) {
+                    param.set_type(self.get_type(ctx));
+                }
+                self.consume(ctx, TokenKind::Comma);
+
+                class.insert(0, param);
+            }
+        }
 
         self.expect(
             ctx,
             TokenKind::LeftBracket,
             "Expected '{' denoting class body",
         );
-        let mut class = vec![];
         if ctx.owner().is_some() {
             panic!("Classes can only be declared outisde any conditional blocks");
         }
@@ -1200,35 +1398,9 @@ impl<'data> Parser<'data> {
         while !self.consume(ctx, TokenKind::RightBracket) {
             let public = self.consume(ctx, TokenKind::Pub);
             if self.consume(ctx, TokenKind::Prop) {
-                let prop_name = ctx.current.lexeme().to_string();
-                self.consume(ctx, TokenKind::Identifier);
-
-                let mut prop = if self.consume(ctx, TokenKind::SemiColon) {
-                    vec![]
-                } else {
-                    self.expr_statement(ctx)
-                };
-                prop.push(IR::new(
-                    Operation::Prop,
-                    Some([
-                        owner,
-                        self.data.add_symbol(prop_name, None),
-                        usize::from(public),
-                    ]),
-                ));
-
-                prop.append(&mut class);
-                class = prop;
+                class.append(&mut self.prop(ctx, owner, public));
             } else if self.matches(ctx, TokenKind::Function) {
-                let mut method = self.function(ctx);
-                if let Some(code) = method.first_mut() {
-                    let operands = code.operands();
-                    let mut method =
-                        op!(self, ctx, Method, Some([owner, operands[0], operands[2]]));
-                    method.set_type(code.kind());
-                    *code = method;
-                }
-                class.append(&mut method);
+                class.append(&mut self.method(ctx, owner, public));
             }
         }
         ctx.clear_owner();
@@ -1243,8 +1415,33 @@ impl<'data> Parser<'data> {
     fn initialize(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
         let mut result = vec![];
-        let name = ctx.current().lexeme().to_string();
+        let mut name = ctx.current().lexeme().to_string();
+        if self.aliases.contains_key(&name) {
+            name = self.aliases[&name].to_string();
+        }
+        let symbol = self.data.add_symbol(name, None);
+
         if self.expect(ctx, TokenKind::Identifier, "Expecting class name") {
+            let mut ty = Type::object(symbol);
+            let mut type_arity = 0;
+            if self.consume(ctx, TokenKind::Less) {
+                while !self.consume(ctx, TokenKind::Greater) {
+                    // self.consume(ctx, TokenKind::Dolar);
+                    // let arg = self
+                    //     .data
+                    //     .add_symbol(ctx.current().lexeme().to_string(), None);
+                    //
+                    // let param_ty = self.get_type(ctx);
+                    // let param = self
+                    //     .data
+                    //     .add_type(Type::new(Kind::Generic(type_arity, param_ty)));
+
+                    ty.add_argument(self.get_type(ctx));
+                    self.consume(ctx, TokenKind::Comma);
+                    type_arity += 1;
+                }
+            }
+
             let mut arity = 0;
             self.expect(ctx, TokenKind::LeftParenthesis, "Expecting '('");
             while !self.consume(ctx, TokenKind::RightParenthesis) {
@@ -1253,9 +1450,9 @@ impl<'data> Parser<'data> {
                 self.consume(ctx, TokenKind::Comma);
             }
 
-            let symbol = self.data.add_symbol(name, None);
             let mut instance = op!(self, ctx, Instantiate, Some([symbol, arity, 0]));
-            instance.set_type(Type::new(Kind::Object(symbol)));
+
+            instance.set_type(self.data.add_type(ty));
 
             result.push(instance);
         }
@@ -1270,14 +1467,164 @@ impl<'data> Parser<'data> {
         if ctx.owner().is_none() {
             panic!("Using 'this' outside of object context");
         }
-        this.set_type(Type::new(Kind::Object(ctx.owner().unwrap())));
+        this.set_type(self.data.add_type(Type::object(ctx.owner().unwrap())));
         result.insert(0, this);
 
         result
     }
 
+    fn parse_imports(&mut self, ctx: &mut Context, ns: &Vec<String>) -> Vec<Vec<String>> {
+        let mut prefix = vec![];
+        let mut children = vec![];
+
+        self.expect(ctx, TokenKind::Identifier, "Expected module identifier");
+        if let Some(segment) = ctx.previous() {
+            prefix.push(segment.lexeme().to_string());
+        }
+
+        if self.consume(ctx, TokenKind::ColonColon) {
+            if self.consume(ctx, TokenKind::LeftBracket) {
+                let mut next = ns.clone();
+                next.append(&mut prefix.clone());
+
+                loop {
+                    self.parse_imports(ctx, &next).iter().for_each(|p| {
+                        let mut path = prefix.clone();
+                        path.append(&mut p.clone());
+                        children.push(path);
+                    });
+
+                    if !self.matches(ctx, TokenKind::Comma) {
+                        break;
+                    }
+                }
+
+                self.expect(
+                    ctx,
+                    TokenKind::RightBracket,
+                    "Expected '}' to close module group",
+                );
+            } else {
+                let mut next = ns.clone();
+                next.append(&mut prefix.clone());
+                self.parse_imports(ctx, &next).iter().for_each(|p| {
+                    let mut path = prefix.clone();
+                    path.append(&mut p.clone());
+                    children.push(path);
+                });
+            }
+        }
+
+        if self.consume(ctx, TokenKind::As) {
+            if self.expect(
+                ctx,
+                TokenKind::Identifier,
+                "Expected a valid identifier for import alias",
+            ) {
+                if let Some(prev) = ctx.previous() {
+                    self.aliases
+                        .entry(prev.lexeme().to_string())
+                        .or_insert_with(|| {
+                            format!("{}::{}", ns.join("::"), prefix.join("::"))
+                                .trim_start_matches("::")
+                                .to_string()
+                        });
+                }
+            }
+        } else if let Some(last) = prefix.last() {
+            self.aliases.entry(last.to_string()).or_insert_with(|| {
+                format!("{}::{}", ns.join("::"), prefix.join("::"))
+                    .trim_start_matches("::")
+                    .to_string()
+            });
+        }
+
+        if children.is_empty() {
+            return vec![prefix];
+        }
+
+        children.into_iter().filter(|s| !s.is_empty()).collect()
+    }
+
+    fn import(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let files = self.parse_imports(ctx, &vec![]);
+
+        self.expect(
+            ctx,
+            TokenKind::SemiColon,
+            "Expecting ';' at end of import statement",
+        );
+
+        let mut code = vec![];
+
+        for mut module in files {
+            let fqn = module.join("::");
+
+            if self.scanned.contains(&fqn) {
+                continue;
+            }
+
+            self.scanned.push(fqn.clone());
+            module.pop();
+
+            let mut joined = PathBuf::from("");
+            module.iter().for_each(|part| {
+                joined = joined.join(part);
+            });
+
+            let mut paths = vec![];
+            for p in INCLUDE_PATHS {
+                let mut file = PathBuf::from(p).join(&joined);
+                file.set_extension("0s");
+
+                if Path::new(&file).exists() {
+                    paths.push(file);
+                }
+            }
+
+            if paths.is_empty() {
+                panic!(
+                    "Unable to resolve '{}', because no suitable file has been found",
+                    fqn
+                );
+            } else if paths.len() > 1 {
+                panic!(
+                    "Unable to resolve '{}', because of multiple possible locations:\n\t{}",
+                    fqn,
+                    paths
+                        .iter()
+                        .map(|path| path.to_str().unwrap_or(""))
+                        .collect::<Vec<&str>>()
+                        .join("\n\t")
+                );
+            }
+
+            let ns = self.namespace.clone();
+            let aliases = self.aliases.clone();
+            self.aliases.clear();
+            self.namespace = module.join("::");
+
+            if let Some(path) = paths.first().map(|p| p.to_str()).unwrap() {
+                if let Ok(program) = self.parse_internal(path.to_string()) {
+                    self.typechecker.set_file(path.to_string());
+                    code.append(&mut program.code().to_vec());
+                    self.typechecker.set_file(self.file.to_string());
+                }
+            }
+            self.namespace = ns;
+            self.aliases = aliases;
+        }
+
+        code
+    }
+
     fn statement(&mut self, ctx: &mut Context) -> Vec<IR> {
         match ctx.current().kind() {
+            TokenKind::Use => {
+                ctx.advance();
+
+                self.import(ctx)
+            }
             TokenKind::Let => {
                 ctx.advance();
                 let result = self.variable(ctx);
@@ -1345,8 +1692,8 @@ impl<'data> Parser<'data> {
         }
     }
 
-    pub fn parse(&mut self) -> Result<Program<IR>, String> {
-        let buffer = if let Ok(buff) = Buffer::new(self.file.as_ref()) {
+    fn parse_internal(&mut self, file: String) -> Result<Program<IR>, String> {
+        let buffer = if let Ok(buff) = Buffer::new(file.as_ref()) {
             buff
         } else {
             return Err(format!("Unable to open file '{}'", &self.file));
@@ -1361,7 +1708,6 @@ impl<'data> Parser<'data> {
 
             code.append(&mut self.typechecker.check(&stmt, self.data));
         }
-
         if !self.typechecker.get_errors().is_empty() {
             for err in self.typechecker.get_errors() {
                 eprintln!("{}", err);
@@ -1371,6 +1717,10 @@ impl<'data> Parser<'data> {
         }
 
         Ok(Program::new(code))
+    }
+
+    pub fn parse(&mut self) -> Result<Program<IR>, String> {
+        self.parse_internal(self.file.clone())
     }
 }
 

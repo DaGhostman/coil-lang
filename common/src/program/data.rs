@@ -2,16 +2,55 @@
 
 use crate::{Value, interner::Interner, symbols::SymbolTable, types::Type};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Data {
-    constants: Interner<(Value, Type)>,
+    constants: Interner<(Value, usize)>,
     strings: Interner<String>,
     symbols: SymbolTable,
+    types: Interner<Type>,
     // methods: HashMap<usize, HashMap<usize, usize>>,
     // pointers: Vec<*mut c_void>,
 }
 
+impl Default for Data {
+    fn default() -> Self {
+        let mut types = Interner::default();
+        types.intern(Type::void());
+        types.intern(Type::bool());
+        types.intern(Type::integer());
+        types.intern(Type::float());
+        types.intern(Type::string());
+
+        let mut constants = Interner::default();
+        constants.intern((Value::NONE, 0));
+
+        Self {
+            constants,
+            types,
+            symbols: SymbolTable::default(),
+            strings: Interner::default(),
+        }
+    }
+}
+
 impl Data {
+    pub fn add_type(&mut self, value: Type) -> usize {
+        self.types.intern(value)
+    }
+
+    pub fn get_type(&self, index: usize) -> &Type {
+        self.types.lookup(index)
+    }
+
+    pub fn find_type(&self, value: Type) -> usize {
+        let mut this = self.types.clone();
+        let idx = this.intern(value);
+
+        debug_assert!(idx < self.types.len());
+
+        idx
+    }
+
     pub fn add_string(&mut self, value: String) -> usize {
         self.strings.intern(value)
     }
@@ -21,11 +60,11 @@ impl Data {
         self.strings.lookup(index)
     }
 
-    pub fn add_constant(&mut self, value: Value, r#type: Type) -> usize {
+    pub fn add_constant(&mut self, value: Value, r#type: usize) -> usize {
         self.constants.intern((value, r#type))
     }
 
-    pub fn replace_constant(&mut self, index: usize, value: Value, r#type: Type) {
+    pub fn replace_constant(&mut self, index: usize, value: Value, r#type: usize) {
         self.constants.replace(index, (value, r#type));
     }
 
@@ -38,10 +77,7 @@ impl Data {
     }
 
     pub fn constant_type(&self, index: usize) -> &Type {
-        &self.constants.lookup(index).1
-    }
-    pub fn constant_type_mut(&mut self, index: usize) -> &mut Type {
-        &mut self.constants.lookup_mut(index).1
+        self.types.lookup(self.constants.lookup(index).1)
     }
 
     pub fn add_symbol(&mut self, symbol: String, constant: Option<usize>) -> usize {
@@ -96,7 +132,7 @@ impl Data {
     }
     pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
         let constant = self.symbols.constant(symbol);
-        &self.constants.lookup(constant).1
+        &self.types.lookup(self.constants.lookup(constant).1)
     }
 
     // pub fn add_pointer(&mut self, ptr: *mut c_void) -> usize {

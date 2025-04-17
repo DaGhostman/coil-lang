@@ -50,7 +50,7 @@ impl CompilationPass for ConstantFolding {
                                 (Some(Value::INTEGER(lhs)), Some(Value::INTEGER(rhs))) => {
                                     let c = data.add_constant(
                                         Value::INTEGER(lhs + rhs),
-                                        Type::new(Kind::Integer),
+                                        data.find_type(Type::new(Kind::Integer)),
                                     );
                                     modified.pop();
                                     modified.pop();
@@ -59,7 +59,7 @@ impl CompilationPass for ConstantFolding {
                                 (Some(Value::FLOAT(lhs)), Some(Value::FLOAT(rhs))) => {
                                     let c = data.add_constant(
                                         Value::from(lhs + rhs),
-                                        Type::new(Kind::Float),
+                                        data.find_type(Type::new(Kind::Float)),
                                     );
                                     modified.pop();
                                     modified.pop();
@@ -68,7 +68,7 @@ impl CompilationPass for ConstantFolding {
                                 (Some(Value::INTEGER(lhs)), Some(Value::FLOAT(rhs))) => {
                                     let c = data.add_constant(
                                         Value::from((*lhs as f64) + rhs),
-                                        Type::new(Kind::Float),
+                                        data.find_type(Type::new(Kind::Float)),
                                     );
                                     modified.pop();
                                     modified.pop();
@@ -77,7 +77,7 @@ impl CompilationPass for ConstantFolding {
                                 (Some(Value::FLOAT(lhs)), Some(Value::INTEGER(rhs))) => {
                                     let c = data.add_constant(
                                         Value::from(lhs + (*rhs as f64)),
-                                        Type::new(Kind::Float),
+                                        data.find_type(Type::new(Kind::Float)),
                                     );
                                     modified.pop();
                                     modified.pop();

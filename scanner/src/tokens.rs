@@ -19,6 +19,7 @@ pub enum TokenKind {
     LeftBracket,
     RightBracket,
 
+    Dolar,
     Minus,
     MinusMinus,
     Plus,
@@ -60,6 +61,7 @@ pub enum TokenKind {
     And,
     As,
     Bool,
+    Break,
     Const,
     Continue,
     Class,
@@ -83,6 +85,7 @@ pub enum TokenKind {
     Prop,
     Pub,
     Raise,
+    Result,
     Return,
     Some,
     Str,

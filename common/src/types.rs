@@ -5,7 +5,7 @@ use libffi::{
 };
 use std::fmt::Debug;
 
-use crate::{Value, memory::object::Objects, vec_array::VecArray};
+use crate::{Value, memory::object::Objects, program::data::Data, vec_array::VecArray};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -23,54 +23,87 @@ pub enum Kind {
     Reference,
     Object(usize),
     List(usize),
+    Generic(usize, usize),
+    Result,
+    Error,
+    Union,
+    Intersection,
 }
 
-#[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Type {
     own: Kind,
     // This should be handled in such a case that upon reaching the limit, the
     // rest of the params will be unchecked
-    params: [Kind; 32],
-    return_type: Kind,
+    params: [usize; 32],
+    arguments: [usize; 32],
+    return_type: usize,
     has_return: bool,
-    counter: usize,
+    arity: usize,
+    placeholders: usize,
 }
 
 impl Type {
     pub fn new(kind: Kind) -> Self {
         Self {
             own: kind,
-            params: [Kind::default(); 32],
-            counter: 0,
+            params: [0; 32],
+            arguments: [0; 32],
+            arity: 0,
+            placeholders: 0,
             has_return: false,
-            return_type: Kind::default(),
+            return_type: 0,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.arity
     }
 
     pub fn kind(&self) -> Kind {
         self.own
     }
 
-    pub fn add(&mut self, kind: Kind) {
-        if self.counter >= 32 {
+    pub fn add(&mut self, kind: usize) {
+        if self.arity >= 32 {
             return;
         }
 
-        self.params[self.counter] = kind;
-        self.counter += 1;
+        self.params[self.arity] = kind;
+        self.arity += 1;
     }
 
-    pub fn get(&self, position: usize) -> Kind {
+    pub fn get(&self, position: usize) -> usize {
         self.params[position]
     }
 
-    pub fn set(&mut self, position: usize, kind: Kind) {
+    pub fn set(&mut self, position: usize, kind: usize) {
         self.params[position] = kind;
 
-        self.counter = self.counter.max(position);
+        self.arity = self.arity.max(position);
     }
 
-    pub fn set_return(&mut self, kind: Kind) {
+    pub fn add_argument(&mut self, r#type: usize) -> usize {
+        let key = self.placeholders;
+        self.placeholders += 1;
+        self.arguments[key] = r#type;
+
+        key
+    }
+
+    pub fn get_argument(&self, idx: usize) -> usize {
+        if idx >= 32 {
+            panic!("Too much arguments");
+        }
+
+        self.arguments[idx]
+    }
+
+    pub fn arguments(&self) -> &[usize] {
+        &self.arguments[..self.placeholders]
+    }
+
+    pub fn set_return(&mut self, kind: usize) {
         self.has_return = true;
         self.return_type = kind;
     }
@@ -79,31 +112,114 @@ impl Type {
         self.has_return
     }
 
-    pub fn returns(&self) -> Kind {
+    pub fn returns(&self) -> usize {
         self.return_type
     }
-}
 
-impl Debug for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut fmt = format!("{}", self.own);
-        if self.counter > 0 {
-            fmt = format!(
-                "{}({})",
-                fmt,
-                self.params[..self.counter]
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<String>>()
-                    .join(", ")
-                    .to_string()
-            )
-        }
+    pub fn integer() -> Self {
+        Type::new(Kind::Integer)
+    }
 
-        if self.has_return {
-            fmt = format!("{} -> {}", fmt, self.return_type);
+    pub fn float() -> Self {
+        Type::new(Kind::Float)
+    }
+
+    pub fn bool() -> Self {
+        Type::new(Kind::Bool)
+    }
+
+    pub fn string() -> Self {
+        Type::new(Kind::String)
+    }
+
+    pub fn object(id: usize) -> Self {
+        Type::new(Kind::Object(id))
+    }
+
+    pub fn array(n: usize) -> Self {
+        Type::new(Kind::List(n))
+    }
+
+    pub fn void() -> Self {
+        Type::new(Kind::None)
+    }
+
+    pub fn function() -> Self {
+        Type::new(Kind::Function)
+    }
+
+    pub fn output(&self, data: &Data) -> String {
+        match self.own {
+            Kind::Result => format!(
+                "Result<{}, {}>",
+                data.get_type(self.get(0)).output(data),
+                data.get_type(self.get(1)).output(data)
+            ),
+            Kind::Union => {
+                let mut fmt = String::new();
+                for idx in 0..self.arity {
+                    fmt = format!("{} | {}", fmt, data.get_type(self.get(idx)).output(data));
+                }
+
+                fmt.trim_start_matches(" | ").to_string()
+            }
+            Kind::Intersection => {
+                let mut fmt = String::new();
+                for idx in 0..self.arity {
+                    fmt = format!("{} & {}", fmt, data.get_type(self.get(idx)).output(data));
+                }
+
+                fmt.trim_start_matches(" & ").to_string()
+            }
+            Kind::Object(n) => {
+                format!(
+                    "{}({}){}",
+                    self.own,
+                    data.symbol_name(n),
+                    if self.placeholders > 0 {
+                        format!(
+                            "<{}>",
+                            self.arguments[..self.placeholders]
+                                .iter()
+                                .map(|t| data.get_type(*t).output(data))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    } else {
+                        String::new()
+                    }
+                )
+            }
+            Kind::Generic(name, _) => {
+                format!("${}", data.symbol_name(name))
+            }
+            _ => {
+                let mut fmt = format!("{}", self.own);
+                if self.arity > 0 {
+                    fmt = format!(
+                        "{}({})",
+                        fmt,
+                        self.params[..self.arity]
+                            .iter()
+                            .map(|t| data.get_type(*t).output(data))
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                            .to_string()
+                    )
+                }
+
+                if self.has_return {
+                    fmt = format!(
+                        "{} -> {}",
+                        fmt,
+                        data.get_type(self.return_type).output(data)
+                    );
+                }
+
+                fmt
+            }
+            _ => format!("{:?}", self.kind()),
         }
-        write!(f, "{}", fmt)
     }
 }
 
@@ -155,6 +271,11 @@ impl Display for Kind {
                 Kind::Reference => "reference",
                 Kind::Object(_) => "object",
                 Kind::List(_) => "array",
+                Kind::Result => "result",
+                Kind::Error => "error",
+                Kind::Intersection => "intersect",
+                Kind::Union => "union",
+                Kind::Generic(..) => "generic",
             }
         )
     }

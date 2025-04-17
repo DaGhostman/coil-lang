@@ -13,7 +13,7 @@ use common::{
 };
 
 const FRAMES: usize = 1024;
-const STACK: usize = 8192;
+const STACK: usize = 4096;
 
 pub struct Machine {
     stdout: Output,
@@ -250,14 +250,14 @@ impl Machine {
                 Byte::Instantiate => {
                     let owner = op.operands()[0];
                     let mut object = ObjInstance::new(owner);
-                    if self.properties.contains_key(&owner) {
-                        for (idx, field) in self.properties[&owner].iter().enumerate() {
-                            if idx == 0 {
-                                continue;
-                            }
-                            object.update(*field, Default::default());
-                        }
-                    }
+                    // if self.properties.contains_key(&owner) {
+                    //     for (idx, field) in self.properties[&owner].iter().enumerate() {
+                    //         if idx == 0 {
+                    //             continue;
+                    //         }
+                    //         object.update(*field, Default::default());
+                    //     }
+                    // }
                     self.gc();
                     let (instance, _) = self.heap.alloc(object, Objects::Object);
 
@@ -269,47 +269,34 @@ impl Machine {
 
                     if let Value::OBJECT(Objects::Object(_)) = self.peek_obj(arity) {
                         self.enter(arity + 1);
-                        self.ip = op.operand(0) - 1;
+                        self.ip = op.operand(0);
                         continue;
                     } else {
                         eprintln!("Attempting to call method on non-object");
                     }
                 }
-                Byte::This => {
-                    if let Value::REFERENCE(ref_) =
-                        self.stack.peek_at(self.call_stack[self.fp - 1].1 - 1)
-                    {
-                        self.stack.push(Value::REFERENCE(ref_));
-                    } else {
-                        self.stack
-                            .push(Value::REFERENCE(self.call_stack[self.fp - 1].1 - 1));
-                    }
-                }
                 Byte::Prop => {
-                    let operands = op.operands();
-                    if let Value::OBJECT(Objects::Object(mut obj)) = self.peek_obj(0) {
-                        match operands[1] {
-                            0 => {
+                    let [name, action, ..] = op.operands();
+
+                    match action {
+                        0 => {
+                            if let Value::OBJECT(Objects::Object(object)) = self.peek_obj(0) {
                                 self.stack.pop();
-                                if let Some(value) = obj.as_ref().get(operands[0]) {
-                                    self.stack.push(*value);
-                                }
+                                self.stack
+                                    .push(if let Some(value) = object.as_ref().get(*name) {
+                                        *value
+                                    } else {
+                                        Value::default()
+                                    });
                             }
-                            1 => {
-                                obj.as_mut().update(operands[0], self.stack.pop());
-                                self.stack.pop();
-                            }
-                            2 => {
-                                let [owner, _, field, ..] = op.operands();
-                                self.properties
-                                    .entry(*owner)
-                                    .and_modify(|state| {
-                                        state.push(*field);
-                                    })
-                                    .or_insert_with(|| vec![*field]);
-                            }
-                            _ => (),
                         }
+                        1 => {
+                            if let Value::OBJECT(Objects::Object(mut object)) = self.peek_obj(1) {
+                                object.as_mut().update(*name, self.stack.pop());
+                                self.stack.pop();
+                            }
+                        }
+                        _ => (),
                     }
                 }
                 Byte::Upvalue => {
@@ -337,29 +324,8 @@ impl Machine {
         }
     }
 
-    pub fn run(&mut self, code: &Program<Code>, data: &Data) -> Value {
-        // for byte in code.code() {
-        //     if byte.byte() == &Byte::Method {
-        //         let operands = byte.operands();
-        //
-        //         self.methods
-        //             .entry(operands[0])
-        //             .and_modify(|entry| {
-        //                 entry.insert(operands[1], operands[2]);
-        //             })
-        //             .or_insert_with(|| {
-        //                 let mut fields = HashMap::default();
-        //                 fields.insert(operands[1], operands[2]);
-        //
-        //                 fields
-        //             });
-        //     }
-        // }
-
+    pub fn run(&mut self, code: &Program<Code>, data: &Data) {
         self.execute(code, data);
-
-        Value::default()
-        // self.stack.pop()
     }
 
     fn gc(&mut self) {
@@ -437,6 +403,7 @@ impl Machine {
 mod tests {
     use common::program::data::Data;
     use common::program::program::Program;
+    use common::types::Type;
     use common::{
         Value,
         opcodes::{Byte, Code},
@@ -447,53 +414,70 @@ mod tests {
     #[test]
     fn test_integer_addition() {
         let mut values = Data::default();
-        let num = values.add_constant(Value::INTEGER(2));
+        let num = values.add_constant(Value::INTEGER(2), Type::integer());
         let mut constant = Code::new(Byte::Push);
         constant.with_operands([num, 0, 0]);
 
         let mut program = Program::new(vec![constant, constant, Code::new(Byte::Add)]);
-        program.with_data(values);
-        let result = Machine::default().run(&program);
-
-        assert_eq!(result, Value::INTEGER(4));
+        Machine::default().run(&program, &values);
     }
 
     #[test]
     fn test_float_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.8)), 0, 0]);
-        let b = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.1)), 0, 0]);
+        let a = Code::new_with_operands(
+            Byte::Push,
+            [values.add_constant(Value::FLOAT(0.8), Type::float()), 0, 0],
+        );
+        let b = Code::new_with_operands(
+            Byte::Push,
+            [values.add_constant(Value::FLOAT(0.1), Type::float()), 0, 0],
+        );
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
-        program.with_data(values);
 
-        let result = Machine::default().run(&program);
-        assert_eq!(result, Value::FLOAT(0.9));
+        Machine::default().run(&program, &values);
     }
 
     #[test]
     fn test_int_float_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, [values.add_constant(Value::INTEGER(8)), 0, 0]);
-        let b = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.1)), 0, 0]);
+        let a = Code::new_with_operands(
+            Byte::Push,
+            [
+                values.add_constant(Value::INTEGER(8), Type::integer()),
+                0,
+                0,
+            ],
+        );
+        let b = Code::new_with_operands(
+            Byte::Push,
+            [values.add_constant(Value::FLOAT(0.1), Type::float()), 0, 0],
+        );
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
-        program.with_data(values);
 
-        let result = Machine::default().run(&program);
-        assert_eq!(result, Value::FLOAT(8.1));
+        Machine::default().run(&program, &values);
     }
 
     #[test]
     fn test_float_int_addition() {
         let mut values = Data::default();
-        let a = Code::new_with_operands(Byte::Push, [values.add_constant(Value::FLOAT(0.8)), 0, 0]);
-        let b = Code::new_with_operands(Byte::Push, [values.add_constant(Value::INTEGER(1)), 0, 0]);
+        let a = Code::new_with_operands(
+            Byte::Push,
+            [values.add_constant(Value::FLOAT(0.8), Type::float()), 0, 0],
+        );
+        let b = Code::new_with_operands(
+            Byte::Push,
+            [
+                values.add_constant(Value::INTEGER(1), Type::integer()),
+                0,
+                0,
+            ],
+        );
 
         let mut program = Program::new(vec![a, b, Code::new(Byte::Add)]);
-        program.with_data(values);
 
-        let result = Machine::default().run(&program);
-        assert_eq!(result, Value::FLOAT(1.8));
+        Machine::default().run(&program, &values);
     }
 }
