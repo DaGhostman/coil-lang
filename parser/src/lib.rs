@@ -142,7 +142,7 @@ impl<'data> Parser<'data> {
                 .data
                 .add_symbol(ctx.current().lexeme().to_string(), None);
             self.expect(ctx, TokenKind::Identifier, "Expected generic identifier");
-            let mut kind = self.data.add_type(Type::void());
+            let mut kind = self.data.add_type(Type::any());
 
             if self.consume(ctx, TokenKind::Equal) {
                 kind = self.get_type(ctx);
@@ -166,6 +166,7 @@ impl<'data> Parser<'data> {
 
             Kind::None
         });
+
         // ctx.advance();
 
         // let mut r#type = Type::new(match ctx.previous().map(|p| p.kind()) {
@@ -197,9 +198,9 @@ impl<'data> Parser<'data> {
         // ctx.advance();
 
         if self.consume(ctx, TokenKind::Less) {
-            r#type.add(self.get_type(ctx));
+            r#type.add_argument(self.get_type(ctx));
             while self.consume(ctx, TokenKind::Comma) {
-                r#type.add(self.get_type(ctx));
+                r#type.add_argument(self.get_type(ctx));
             }
 
             self.expect(
@@ -207,26 +208,25 @@ impl<'data> Parser<'data> {
                 TokenKind::Greater,
                 "Expected '>' to close type parameter list.",
             );
+        } else if self.consume(ctx, TokenKind::Ampersand) {
+            let mut t = Type::new(Kind::Intersection);
+            t.add(self.data.add_type(r#type));
+            t.add(self.get_type(ctx));
+            while self.consume(ctx, TokenKind::Pipe) || self.matches(ctx, TokenKind::And) {
+                t.add(self.get_type(ctx));
+            }
+
+            r#type = t;
+        } else if self.consume(ctx, TokenKind::Pipe) {
+            let mut t = Type::new(Kind::Union);
+            t.add(self.data.add_type(r#type));
+            t.add(self.get_type(ctx));
+            while self.consume(ctx, TokenKind::Pipe) || self.matches(ctx, TokenKind::And) {
+                t.add(self.get_type(ctx));
+            }
+
+            r#type = t;
         }
-        // else if self.consume(ctx, TokenKind::And) {
-        //     let mut t = Type::new(Kind::Intersection);
-        //     t.add(self.data.add_type(r#type));
-        //     t.add(self.get_type(ctx));
-        //     while self.consume(ctx, TokenKind::Pipe) || self.matches(ctx, TokenKind::And) {
-        //         t.add(self.get_type(ctx));
-        //     }
-        //
-        //     r#type = t;
-        // } else if self.consume(ctx, TokenKind::Pipe) {
-        //     let mut t = Type::new(Kind::Union);
-        //     t.add(self.data.add_type(r#type));
-        //     t.add(self.get_type(ctx));
-        //     while self.consume(ctx, TokenKind::Pipe) || self.matches(ctx, TokenKind::And) {
-        //         t.add(self.get_type(ctx));
-        //     }
-        //
-        //     r#type = t;
-        // }
         // else if self.consume(ctx, TokenKind::LeftParenthesis) {
         //     while !self.consume(ctx, TokenKind::RightParenthesis) {
         //         let mut t = r#type.add(kind);
@@ -953,7 +953,7 @@ impl<'data> Parser<'data> {
             TokenKind::Identifier,
             "Expected identifier for variable name",
         );
-        let mut kind = self.data.add_type(Type::void());
+        let mut kind = self.data.add_type(Type::any());
         if self.consume(ctx, TokenKind::Colon) {
             kind = self.get_type(ctx);
         }
@@ -990,7 +990,7 @@ impl<'data> Parser<'data> {
             TokenKind::Identifier,
             "Expected identifier for variable name",
         );
-        let mut kind = self.data.add_type(Type::void());
+        let mut kind = self.data.add_type(Type::any());
         if self.consume(ctx, TokenKind::Colon) {
             kind = self.get_type(ctx);
         }
@@ -1089,7 +1089,7 @@ impl<'data> Parser<'data> {
 
             body.append(&mut upvalues);
         }
-        let mut kind = self.data.add_type(Type::void()); // Kind::None;
+        let mut kind = self.data.add_type(Type::any()); // Kind::None;
         if self.consume(ctx, TokenKind::SlimArrow) {
             kind = self.get_type(ctx);
         }
@@ -1120,7 +1120,7 @@ impl<'data> Parser<'data> {
     }
 
     fn prop(&mut self, ctx: &mut Context, owner: usize, public: bool) -> Vec<IR> {
-        let mut kind = self.data.add_type(Type::void());
+        let mut kind = self.data.add_type(Type::any());
 
         if !self.matches(ctx, TokenKind::Identifier) {
             kind = self.get_type(ctx);
@@ -1359,6 +1359,7 @@ impl<'data> Parser<'data> {
         };
 
         let owner = self.name(name, None);
+        let mut instance = Type::object(owner);
 
         if self.consume(ctx, TokenKind::Less) {
             while !self.consume(ctx, TokenKind::Greater) {
@@ -1376,13 +1377,17 @@ impl<'data> Parser<'data> {
                 );
 
                 let type_param = self.data.add_symbol(identifier, None);
-                let mut param = op!(self, ctx, ClassParam, Some([owner, type_param, 0]));
-                if self.consume(ctx, TokenKind::Colon) {
-                    param.set_type(self.get_type(ctx));
-                }
-                self.consume(ctx, TokenKind::Comma);
 
-                class.insert(0, param);
+                let mut kind = self.data.add_type(Type::any());
+                if self.consume(ctx, TokenKind::Colon) {
+                    kind = self.get_type(ctx);
+                }
+
+                instance.add_argument(
+                    self.data
+                        .add_type(Type::new(Kind::Generic(type_param, kind))),
+                );
+                self.consume(ctx, TokenKind::Comma);
             }
         }
 
@@ -1406,7 +1411,9 @@ impl<'data> Parser<'data> {
         ctx.clear_owner();
 
         class.insert(0, op!(self, ctx, Begin, None));
-        class.insert(0, op!(self, ctx, Class, Some([owner, class.len(), 0])));
+        let mut cls = op!(self, ctx, Class, Some([owner, class.len(), 0]));
+        cls.set_type(self.data.add_type(instance));
+        class.insert(0, cls);
         class.push(op!(self, ctx, End, None));
 
         class
@@ -1423,7 +1430,6 @@ impl<'data> Parser<'data> {
 
         if self.expect(ctx, TokenKind::Identifier, "Expecting class name") {
             let mut ty = Type::object(symbol);
-            let mut type_arity = 0;
             if self.consume(ctx, TokenKind::Less) {
                 while !self.consume(ctx, TokenKind::Greater) {
                     // self.consume(ctx, TokenKind::Dolar);
@@ -1438,7 +1444,6 @@ impl<'data> Parser<'data> {
 
                     ty.add_argument(self.get_type(ctx));
                     self.consume(ctx, TokenKind::Comma);
-                    type_arity += 1;
                 }
             }
 
@@ -1451,7 +1456,6 @@ impl<'data> Parser<'data> {
             }
 
             let mut instance = op!(self, ctx, Instantiate, Some([symbol, arity, 0]));
-
             instance.set_type(self.data.add_type(ty));
 
             result.push(instance);

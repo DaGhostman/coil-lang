@@ -839,7 +839,6 @@ impl<'compilation> Compiler<'compilation> {
 
                     vec![this]
                 }
-                Operation::ClassParam | Operation::ClassType => vec![],
                 _ => todo!("Unable to compile {:?}", op.code()),
             });
         }

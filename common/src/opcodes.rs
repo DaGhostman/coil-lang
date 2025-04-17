@@ -56,8 +56,6 @@ pub enum Operation {
     Interface,
     Implement,
     Class,
-    ClassType,
-    ClassParam,
     Prop,
     Method,
     Instantiate,

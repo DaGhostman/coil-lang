@@ -28,6 +28,7 @@ pub enum Kind {
     Error,
     Union,
     Intersection,
+    Wildcard,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -78,6 +79,8 @@ impl Type {
     }
 
     pub fn set(&mut self, position: usize, kind: usize) {
+        self.arity = self.arity.max(position.max(1));
+
         self.params[position] = kind;
 
         self.arity = self.arity.max(position);
@@ -140,6 +143,10 @@ impl Type {
         Type::new(Kind::List(n))
     }
 
+    pub fn any() -> Self {
+        Type::new(Kind::Wildcard)
+    }
+
     pub fn void() -> Self {
         Type::new(Kind::None)
     }
@@ -190,9 +197,18 @@ impl Type {
                     }
                 )
             }
-            Kind::Generic(name, _) => {
-                format!("${}", data.symbol_name(name))
+            Kind::Generic(name, constraint) => {
+                format!(
+                    "${}{}",
+                    data.symbol_name(name),
+                    if constraint != 0 {
+                        format!(": {}", data.get_type(constraint).output(data))
+                    } else {
+                        String::new()
+                    }
+                )
             }
+            Kind::Wildcard => "%".to_string(),
             _ => {
                 let mut fmt = format!("{}", self.own);
                 if self.arity > 0 {
@@ -220,6 +236,14 @@ impl Type {
             }
             _ => format!("{:?}", self.kind()),
         }
+    }
+
+    pub fn matches(&self, other: Self) -> bool {
+        false
+    }
+
+    pub fn intersect(&self, lhs: Self, rhs: Self) -> bool {
+        lhs.matches(rhs) && rhs.matches(lhs)
     }
 }
 
@@ -276,6 +300,7 @@ impl Display for Kind {
                 Kind::Intersection => "intersect",
                 Kind::Union => "union",
                 Kind::Generic(..) => "generic",
+                Kind::Wildcard => "%",
             }
         )
     }

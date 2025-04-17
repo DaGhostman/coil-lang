@@ -15,6 +15,7 @@ pub struct Data {
 impl Default for Data {
     fn default() -> Self {
         let mut types = Interner::default();
+        types.intern(Type::any());
         types.intern(Type::void());
         types.intern(Type::bool());
         types.intern(Type::integer());

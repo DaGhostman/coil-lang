@@ -103,10 +103,16 @@ impl<const N: usize> TypeChecker<N> {
     }
 
     fn resolve_type(&self, data: &Data, entry: usize) -> usize {
+        // return entry;
+        // return entry;
         match data.get_type(entry).kind() {
             Kind::Generic(name, constraint) => {
                 if self.type_arguments.contains_key(&self.scope) && self.type_arguments[&self.scope].contains_key(&name) {
-                    self.resolve_type(data, self.type_arguments[&self.scope][&name])
+                
+                    data.find_type(Type::new(Kind::Generic(name, self.type_arguments[&self.scope][&name])))
+                } else if self.class_params.contains_key(&self.scope) && self.class_params[&self.scope].contains_key(&name) {
+                    data.find_type(Type::new(Kind::Generic(name, self.class_params[&self.scope][&name])))
+                    // self.resolve_type(data, self.class_params[&self.scope][&name])
                 } else {
                     entry
                 }
@@ -115,9 +121,30 @@ impl<const N: usize> TypeChecker<N> {
         }
     }
 
+    fn substitute_type(&self, data: &mut Data, entry: usize) -> usize {
+
+        match data.get_type(entry).kind() {
+            Kind::Generic(name, constraint) => {
+                if self.type_arguments.contains_key(&self.scope) && self.type_arguments[&self.scope].contains_key(&name) {
+                
+                    data.add_type(Type::new(Kind::Generic(name, self.type_arguments[&self.scope][&name])))
+                } else if self.class_params.contains_key(&self.scope) && self.class_params[&self.scope].contains_key(&name) {
+                    data.add_type(Type::new(Kind::Generic(name, self.class_params[&self.scope][&name])))
+                } else {
+                    constraint
+                }
+            }
+            _ => entry,
+        }
+    }
+
     fn match_type(&self, data: &Data, actual: usize, expectation: usize, ) -> bool {
-        let ty = data.get_type(self.resolve_type(data, actual));
-        let expectation = self.resolve_type(data, expectation);
+        if expectation == 0 || actual == 0 || expectation == actual {
+            return true;
+        }
+
+        let ty = data.get_type(self.resolve_type(data, expectation));
+        let expectation = self.resolve_type(data, actual); //self.resolve_type(data, expectation);
 
         match ty.kind() {
             Kind::Union => {
@@ -139,7 +166,7 @@ impl<const N: usize> TypeChecker<N> {
                 state
             }
             Kind::Generic(_, constraint) => {
-                expectation == actual || self.match_type(data, actual, constraint)
+                expectation == actual || actual == constraint || self.match_type(data, actual, constraint)
             }
             _ => {
                 let a = ty;
@@ -164,7 +191,7 @@ impl<const N: usize> TypeChecker<N> {
         }
     }
 
-    pub fn check(&mut self, code: &[IR], data: &Data) -> Vec<IR> {
+    pub fn check(&mut self, code: &[IR], data: &mut Data) -> Vec<IR> {
         let sp = self.sp;
         self.clear();
         let mut bytecode = Vec::with_capacity(code.len());
@@ -183,18 +210,18 @@ impl<const N: usize> TypeChecker<N> {
                 Operation::Const => {
                     self.push(data.find_type(*data.constant_type(op.operands()[0])));
                 }
-                Operation::ClassParam => {
-                    let [owner, name, ..] = op.operands();
-
-
-                    self.class_params.entry(*owner).and_modify(|entry| {
-                        entry.insert(*name, op.kind());
-                    }).or_insert_with(|| {
-                        let mut params = HashMap::default();
-                        params.insert(*name, op.kind());
-
-                        params
+                Operation::Class => {
+                    let [owner, ..] = op.operands();
+                    let entry = self.class_params.entry(*owner).or_insert_with(|| {
+                        HashMap::default()
                     });
+
+                    let class = data.get_type(op.kind());
+                    for param in class.arguments() {
+                        if let Kind::Generic(n, _) = data.get_type(*param).kind() {
+                            entry.insert(n, *param);
+                        }
+                    }
                 }
                 Operation::Add
                 | Operation::Subtract
@@ -263,10 +290,11 @@ impl<const N: usize> TypeChecker<N> {
                     let [name, ..] = op.operands();
 
                     let ty = self.pop(1);
+
+
                     if variables.contains_key(name) {
                         if variables.contains_key(name) {
                             if ty != variables[name]
-                            /* && variables[name].kind() != Kind::None */
                             {
                                 self.error(
                                     format!(
@@ -282,7 +310,7 @@ impl<const N: usize> TypeChecker<N> {
                         } else {
                             variables.insert(
                                 name,
-                                if op.kind() != data.find_type(Type::void()) {
+                                if op.kind() != data.find_type(Type::any()) {
                                     op.kind()
                                 } else {
                                     ty
@@ -292,7 +320,7 @@ impl<const N: usize> TypeChecker<N> {
                     } else {
                         variables.insert(
                             name,
-                            if op.kind() != data.find_type(Type::void()) {
+                            if op.kind() != data.find_type(Type::any()) {
                                 op.kind()
                             } else {
                                 ty
@@ -316,7 +344,7 @@ impl<const N: usize> TypeChecker<N> {
                                 }
 
                                 let constraint = self.resolve_type(data, self.class_params[&n][&name]);
-                                if !self.match_type(data, substitute, constraint) && constraint != 0 {
+                                if !self.match_type(data, substitute, constraint) {
                                     self.error(format!(
                                         "Generic parameter ${} = '{}' is constrained by '{}', which has not been satisfied",
                                         data.symbol_name(name),
@@ -332,13 +360,19 @@ impl<const N: usize> TypeChecker<N> {
                     }
                 }, 
                 Operation::This => self.push(op.kind()),
-                Operation::Load => self.push(variables[&op.operands()[0]]),
+                Operation::Load => {
+                    self.push(variables[&op.operands()[0]])
+                }
                 Operation::Call => {
                     let [name, arity, _] = op.operands();
                     let mut kind = data.find_type(Type::void());
                     if let Some(func) = self.functions.get(name) {
+                        let fn_type = data.get_type(*func);
                         for idx in 0..*arity {
-                            if !self.match_type(data, data.get_type(*func).get(idx), self.peek(idx)) {
+
+
+
+                            if !self.match_type(data, self.peek(idx), fn_type.get(idx)) {
                                 self.errors.push(Error::new(ErrorOrigin::PARSE, format!(
                                     "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
                                     idx + 1,
@@ -437,8 +471,13 @@ impl<const N: usize> TypeChecker<N> {
                         }
 
                         for idx in 0..*call_arity {
-                            if !self.match_type(data, existing_method.get(idx), self.peek(idx)) {
-                                self.errors.push(Error::new(ErrorOrigin::PARSE, format!("Argument #{} of method '{fqn}' does not match expected type {:?}, got {:?}", idx + 1, data.get_type(self.resolve_type(data, existing_method.get(idx))).output(data), data.get_type(self.resolve_type(data, self.peek(idx))).output(data))));
+                            if !self.match_type(data, self.peek(idx), existing_method.get(idx), ) {
+                                self.errors.push(Error::new(
+                                    ErrorOrigin::PARSE, format!(
+                                        "Argument #{} of method '{fqn}' does not match expected type {:?}, got {:?}",
+                                        idx + 1,
+                                        data.get_type(self.resolve_type(data, existing_method.get(idx))).output(data),
+                                        data.get_type(self.resolve_type(data, self.peek(idx))).output(data))));
                             }
                         }
 
@@ -455,12 +494,14 @@ impl<const N: usize> TypeChecker<N> {
 
                         result = self.resolve_type(data, data.get_type(method).returns());
                         bytecode.push(IR::new(Operation::Invoke, Some([*name, *call_arity, n])));
+                    } else {
+                        println!(" !-- {}", object.output(data));
                     }
                     self.pop(1 + call_arity);
                     self.push(result);
-                    ip += 1;
 
                     self.scope = scope;
+                    ip += 1;
                     continue;
                 }
                 Operation::Function => {
@@ -508,12 +549,12 @@ impl<const N: usize> TypeChecker<N> {
                 }
                 Operation::Leave => {
                     if let Some(expected) = self.expects_return {
-                        let expected_ty = data.get_type(expected);
-                        dbg!(expected_ty.kind());
-                        if !self.match_type(data, self.peek(0), expected) && (self.peek(0) != 0) {
+                        let sub_expected = self.substitute_type(data, expected);
+                        // println!("{}", data.get_type(sub_expected).output(data));
+                        if !self.match_type(data, self.peek(0), sub_expected) && (self.peek(0) != 0) {
                             self.error(format!(
                                 "Expected to return '{}' but it has branch that returns '{}'",
-                                data.get_type(self.resolve_type(data, expected)).output(data),
+                                data.get_type(self.resolve_type(data, sub_expected)).output(data),
                                 data.get_type(self.resolve_type(data, self.peek(0))).output(data),
                             ), op.metadata().unwrap());
                         }
