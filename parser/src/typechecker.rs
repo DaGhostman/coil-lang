@@ -331,7 +331,13 @@ impl<const N: usize> TypeChecker<N> {
                 Operation::Instantiate => {
                     let instance = data.get_type(op.kind());
                     if let Kind::Object(n) = instance.kind() {
-                        // let definition = self.class_params[&n];
+                        if !self.classes.contains_key(&n) {
+                            self.error(
+                                format!("Attempting to instantiate a non-existing class '{}'", data.symbol_name(n)),
+                                op.metadata().unwrap(),
+                            );
+                        }
+
                         for param in instance.arguments() {
                             if let Kind::Generic(name, substitute) = data.get_type(*param).kind() {
                                 if !self.class_params[&n].contains_key(&name) {
