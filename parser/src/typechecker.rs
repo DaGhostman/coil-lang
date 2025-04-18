@@ -1,8 +1,8 @@
 use common::{
     error::{Error, ErrorOrigin},
-    opcodes::{IR, Metadata, Operation},
+    opcodes::{Metadata, Operation, IR},
     program::data::Data,
-    types::{Kind, Type},
+    types::{Kind, Type}, Value,
 };
 
 use rustc_hash::FxHashMap as HashMap;
@@ -202,9 +202,9 @@ impl<const N: usize> TypeChecker<N> {
         while ip < code.len() {
             let op = &code[ip];
 
-            // println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
-            //     data.get_type(*n).output(data)
-            // }).collect::<Vec<String>>().join(", "));
+            println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
+                data.get_type(*n).output(data)
+            }).collect::<Vec<String>>().join(", "));
 
             match op.code() {
                 Operation::Const => {
@@ -285,6 +285,17 @@ impl<const N: usize> TypeChecker<N> {
 
 
                     variables.insert(name, op.kind());
+                }
+                Operation::TypeOf => {
+                    let ty = self.pop(1);
+
+                    let constant_type = data.add_type(Type::new(Kind::Type));
+                    let constant = data.add_constant(Value::TYPE(ty), constant_type);
+
+                    self.push(constant_type);
+                    bytecode.push(IR::new(Operation::Const, [constant, 0, 0]));
+                    ip += 1;
+                    continue;
                 }
                 Operation::Store | Operation::Declare | Operation::Assign => {
                     let [name, ..] = op.operands();

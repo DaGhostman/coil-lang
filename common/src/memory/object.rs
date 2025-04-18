@@ -129,11 +129,11 @@ pub struct ObjArray {
 }
 
 impl ObjArray {
-    pub fn len(&self) -> usize {
+    #[must_use] pub fn len(&self) -> usize {
         self.length
     }
 
-    pub fn item(&self, index: usize) -> &Value {
+    #[must_use] pub fn item(&self, index: usize) -> &Value {
         &self.items[index]
     }
 }

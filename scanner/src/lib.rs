@@ -475,6 +475,7 @@ impl Scanner {
                 Some('m') => self.keyword_or_identifier(TokenKind::Implement, "implement"),
                 Some('f') => self.keyword_or_identifier(TokenKind::If, "if"),
                 Some('n') => match self.peek(2) {
+                    Some('s') => self.keyword_or_identifier(TokenKind::InstanceOf, "instanceof"),
                     Some('t') => match self.peek(3) {
                         Some('e') => self.keyword_or_identifier(TokenKind::Interface, "interface"),
                         _ => self.keyword_or_identifier(TokenKind::Int, "int"),
@@ -519,11 +520,14 @@ impl Scanner {
                 Some('t') => self.keyword_or_identifier(TokenKind::Str, "string"),
                 _ => self.keyword_or_identifier(TokenKind::Some, "some"),
             },
-            Some('t') => match self.peek(2) {
-                Some('u') => self.keyword_or_identifier(TokenKind::True, "true"),
-                Some('a') => self.keyword_or_identifier(TokenKind::Trait, "trait"),
-                Some('i') => self.keyword_or_identifier(TokenKind::This, "this"),
-                _ => self.identifier(),
+            Some('t') => match self.peek(1) {
+                Some('y') => self.keyword_or_identifier(TokenKind::TypeOf, "typeof"),
+                _ => match self.peek(2) {
+                    Some('u') => self.keyword_or_identifier(TokenKind::True, "true"),
+                    Some('a') => self.keyword_or_identifier(TokenKind::Trait, "trait"),
+                    Some('i') => self.keyword_or_identifier(TokenKind::This, "this"),
+                    _ => self.identifier(),
+                },
             },
             Some('u') => self.keyword_or_identifier(TokenKind::Use, "use"),
             Some('v') => self.keyword_or_identifier(TokenKind::Void, "void"),

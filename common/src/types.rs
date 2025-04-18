@@ -5,7 +5,7 @@ use libffi::{
 };
 use std::fmt::Debug;
 
-use crate::{Value, memory::object::Objects, program::data::Data, vec_array::VecArray};
+use crate::{Value, memory::object::Objects, program::data::Data};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -28,6 +28,7 @@ pub enum Kind {
     Error,
     Union,
     Intersection,
+    Type,
     Wildcard,
 }
 
@@ -45,6 +46,7 @@ pub struct Type {
 }
 
 impl Type {
+    #[must_use]
     pub fn new(kind: Kind) -> Self {
         Self {
             own: kind,
@@ -57,10 +59,12 @@ impl Type {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.arity
     }
 
+    #[must_use]
     pub fn kind(&self) -> Kind {
         self.own
     }
@@ -74,6 +78,7 @@ impl Type {
         self.arity += 1;
     }
 
+    #[must_use]
     pub fn get(&self, position: usize) -> usize {
         self.params[position]
     }
@@ -94,14 +99,14 @@ impl Type {
         key
     }
 
+    #[must_use]
     pub fn get_argument(&self, idx: usize) -> usize {
-        if idx >= 32 {
-            panic!("Too much arguments");
-        }
+        assert!((idx < 32), "Too much arguments");
 
         self.arguments[idx]
     }
 
+    #[must_use]
     pub fn arguments(&self) -> &[usize] {
         &self.arguments[..self.placeholders]
     }
@@ -111,50 +116,62 @@ impl Type {
         self.return_type = kind;
     }
 
+    #[must_use]
     pub fn has_return_type(&self) -> bool {
         self.has_return
     }
 
+    #[must_use]
     pub fn returns(&self) -> usize {
         self.return_type
     }
 
+    #[must_use]
     pub fn integer() -> Self {
         Type::new(Kind::Integer)
     }
 
+    #[must_use]
     pub fn float() -> Self {
         Type::new(Kind::Float)
     }
 
+    #[must_use]
     pub fn bool() -> Self {
         Type::new(Kind::Bool)
     }
 
+    #[must_use]
     pub fn string() -> Self {
         Type::new(Kind::String)
     }
 
+    #[must_use]
     pub fn object(id: usize) -> Self {
         Type::new(Kind::Object(id))
     }
 
+    #[must_use]
     pub fn array(n: usize) -> Self {
         Type::new(Kind::List(n))
     }
 
+    #[must_use]
     pub fn any() -> Self {
         Type::new(Kind::Wildcard)
     }
 
+    #[must_use]
     pub fn void() -> Self {
         Type::new(Kind::None)
     }
 
+    #[must_use]
     pub fn function() -> Self {
         Type::new(Kind::Function)
     }
 
+    #[must_use]
     pub fn output(&self, data: &Data) -> String {
         match self.own {
             Kind::Result => format!(
@@ -220,8 +237,7 @@ impl Type {
                             .map(|t| data.get_type(*t).output(data))
                             .collect::<Vec<String>>()
                             .join(", ")
-                            .to_string()
-                    )
+                    );
                 }
 
                 if self.has_return {
@@ -238,10 +254,12 @@ impl Type {
         }
     }
 
+    #[must_use]
     pub fn matches(&self, other: Self) -> bool {
         false
     }
 
+    #[must_use]
     pub fn intersect(&self, lhs: Self, rhs: Self) -> bool {
         lhs.matches(rhs) && rhs.matches(lhs)
     }
@@ -273,6 +291,7 @@ impl From<&Value> for Kind {
             Value::ITERATOR(_) => {
                 unreachable!("Iterator how to");
             }
+            Value::TYPE(_) => Kind::Type,
         }
     }
 }
@@ -301,6 +320,7 @@ impl Display for Kind {
                 Kind::Union => "union",
                 Kind::Generic(..) => "generic",
                 Kind::Wildcard => "%",
+                Kind::Type => "@type",
             }
         )
     }

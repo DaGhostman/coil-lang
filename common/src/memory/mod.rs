@@ -242,7 +242,7 @@ impl Heap {
         }
     }
 
-    pub fn iter(&self) -> Iter {
+    #[must_use] pub fn iter(&self) -> Iter {
         <&Self as IntoIterator>::into_iter(self)
     }
 }

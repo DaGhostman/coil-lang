@@ -879,6 +879,7 @@ impl<'data> Parser<'data> {
             TokenKind::Function => self.function(ctx),
             TokenKind::New => self.initialize(ctx),
             TokenKind::LeftBracket => self.block(ctx),
+            TokenKind::TypeOf => self.typeof_(ctx),
             _ => todo!("Unimplemented token '{:?}'", ctx.current()),
         }
     }
@@ -1630,6 +1631,15 @@ impl<'data> Parser<'data> {
         }
 
         code
+    }
+
+    fn typeof_(&mut self, ctx: &mut Context) -> Vec<IR> {
+        ctx.advance();
+        let op = op!(self, ctx, TypeOf);
+        let mut result = self.precedence(ctx, Precedence::Unary);
+        result.push(op);
+
+        result
     }
 
     fn statement(&mut self, ctx: &mut Context) -> Vec<IR> {

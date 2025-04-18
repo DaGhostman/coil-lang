@@ -3,8 +3,6 @@ use std::{
     fmt::{Debug, Display},
 };
 
-use crate::types::{Kind, Type};
-
 #[derive(Default, PartialEq, Debug, Copy, Clone)]
 #[repr(u8)]
 pub enum Operation {
@@ -60,6 +58,7 @@ pub enum Operation {
     Method,
     Instantiate,
     This,
+    TypeOf,
     PropAssign,
     PropLoad,
     // ---
@@ -92,6 +91,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    #[must_use]
     pub fn new(line: usize, column: usize) -> Self {
         Self { line, column }
     }
@@ -176,6 +176,7 @@ impl IR {
         self.r#type = r#type;
     }
 
+    #[must_use]
     pub fn kind(&self) -> usize {
         self.r#type
     }
@@ -294,6 +295,7 @@ pub struct Code {
 }
 
 impl Code {
+    #[must_use]
     pub fn new(byte: Byte) -> Self {
         Self {
             byte,
@@ -302,6 +304,7 @@ impl Code {
         }
     }
 
+    #[must_use]
     pub fn new_with_operands(byte: Byte, operands: [usize; 3]) -> Self {
         Self {
             byte,
@@ -318,18 +321,22 @@ impl Code {
         self.r#type = r#type;
     }
 
+    #[must_use]
     pub fn byte(&self) -> &Byte {
         &self.byte
     }
 
+    #[must_use]
     pub fn operand(&self, idx: usize) -> usize {
         self.operands[idx]
     }
 
+    #[must_use]
     pub fn operands(&self) -> &[usize; 3] {
         &self.operands
     }
 
+    #[must_use]
     pub fn get_type(&self) -> usize {
         self.r#type
     }

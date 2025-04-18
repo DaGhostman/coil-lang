@@ -147,14 +147,14 @@ where
     }
 }
 
-impl<T, const N: usize> Into<Vec<T>> for VecArray<T, N>
+impl<T, const N: usize> From<VecArray<T, N>> for Vec<T>
 where
     T: Clone + Copy,
 {
-    fn into(self) -> Vec<T> {
-        let mut result = Vec::with_capacity(self.size);
-        result.copy_from_slice(&self.storage);
-        for slice in self.expansions {
+    fn from(val: VecArray<T, N>) -> Self {
+        let mut result = Vec::with_capacity(val.size);
+        result.copy_from_slice(&val.storage);
+        for slice in val.expansions {
             result.copy_from_slice(&slice);
         }
 

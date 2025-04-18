@@ -39,11 +39,11 @@ impl Data {
         self.types.intern(value)
     }
 
-    pub fn get_type(&self, index: usize) -> &Type {
+    #[must_use] pub fn get_type(&self, index: usize) -> &Type {
         self.types.lookup(index)
     }
 
-    pub fn find_type(&self, value: Type) -> usize {
+    #[must_use] pub fn find_type(&self, value: Type) -> usize {
         let mut this = self.types.clone();
         let idx = this.intern(value);
 
@@ -77,7 +77,7 @@ impl Data {
         &mut self.constants.lookup_mut(index).0
     }
 
-    pub fn constant_type(&self, index: usize) -> &Type {
+    #[must_use] pub fn constant_type(&self, index: usize) -> &Type {
         self.types.lookup(self.constants.lookup(index).1)
     }
 
@@ -95,7 +95,7 @@ impl Data {
         self.symbols.constant(symbol)
     }
 
-    pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
+    #[must_use] pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
         let constant = self.symbol_constant(symbol);
         self.constant_type(constant)
     }
@@ -131,9 +131,9 @@ impl Data {
         let constant = self.symbols.constant(symbol);
         &self.constants.lookup(constant).0
     }
-    pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
+    #[must_use] pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
         let constant = self.symbols.constant(symbol);
-        &self.types.lookup(self.constants.lookup(constant).1)
+        self.types.lookup(self.constants.lookup(constant).1)
     }
 
     // pub fn add_pointer(&mut self, ptr: *mut c_void) -> usize {

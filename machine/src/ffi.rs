@@ -27,7 +27,7 @@ pub struct FFIFunction {
 }
 
 impl FFIFunction {
-    pub fn new(name: String) -> Self {
+    #[must_use] pub fn new(name: String) -> Self {
         Self {
             name,
             arguments: Vec::with_capacity(4),
@@ -100,7 +100,7 @@ impl FFIFunction {
         let function = format!("{}\0", self.name);
         let func: Symbol<*mut c_void> = unsafe {
             lib.get(function.as_bytes())
-                .map_err(|e| Error::new(ErrorOrigin::FFI, format!("{}", e)))?
+                .map_err(|e| Error::new(ErrorOrigin::FFI, format!("{e}")))?
         };
 
         unsafe {
@@ -129,7 +129,7 @@ impl FFIFunction {
         }
     }
 
-    pub fn arity(&self) -> usize {
+    #[must_use] pub fn arity(&self) -> usize {
         self.arguments.len()
     }
 }
@@ -140,7 +140,7 @@ impl DynamicLibrary {
             Library::new(name).map_err(|e| {
                 Error::new(
                     ErrorOrigin::FFI,
-                    format!("Unable to load dynamic library '{}': {}", name, e),
+                    format!("Unable to load dynamic library '{name}': {e}"),
                 )
             })?
         };
@@ -157,7 +157,7 @@ impl DynamicLibrary {
             .or_insert_with(|| FFIFunction::new(name))
     }
 
-    pub fn function(&self, symbol: usize) -> Option<&FFIFunction> {
+    #[must_use] pub fn function(&self, symbol: usize) -> Option<&FFIFunction> {
         self.functions.get(&symbol)
     }
 

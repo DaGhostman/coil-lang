@@ -13,11 +13,11 @@ pub struct OutputBuffering {
 }
 
 impl OutputBuffering {
-    pub fn mode(&self) -> OutputBufferingMode {
+    #[must_use] pub fn mode(&self) -> OutputBufferingMode {
         self.mode
     }
 
-    pub fn size(&self) -> usize {
+    #[must_use] pub fn size(&self) -> usize {
         self.size
     }
 }
@@ -72,27 +72,27 @@ impl MachineOptions {
         self.buffering = buffering;
     }
 
-    pub fn is_debug(&self) -> bool {
+    #[must_use] pub fn is_debug(&self) -> bool {
         self.debug
     }
 
-    pub fn is_quiet(&self) -> bool {
+    #[must_use] pub fn is_quiet(&self) -> bool {
         self.quiet
     }
 
-    pub fn output_buffering(&self) -> OutputBuffering {
+    #[must_use] pub fn output_buffering(&self) -> OutputBuffering {
         self.buffering
     }
 
-    pub fn gc_growth(&self) -> usize {
+    #[must_use] pub fn gc_growth(&self) -> usize {
         self.gc.growth
     }
 
-    pub fn gc_threshold(&self) -> usize {
+    #[must_use] pub fn gc_threshold(&self) -> usize {
         self.gc.threshold
     }
 
-    pub fn stack_size(&self) -> usize {
+    #[must_use] pub fn stack_size(&self) -> usize {
         self.stack.size
     }
 }

@@ -390,6 +390,7 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::LessEqual => vec![Code::new(Byte::LessEqual)],
                 Operation::Greater => vec![Code::new(Byte::Greater)],
                 Operation::GreaterEqual => vec![Code::new(Byte::GreaterEqual)],
+                Operation::Equal => vec![Code::new(Byte::Equal)],
                 Operation::Print => vec![Code::new_with_operands(
                     Byte::Print,
                     [usize::from(op.operands()[0] == 1), 0, 0],

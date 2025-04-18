@@ -1,6 +1,5 @@
 use common::memory::object::{ObjArray, ObjInstance, Objects};
 use common::program::data::Data;
-use rustc_hash::FxHashMap as HashMap;
 use std::io::{stderr, stdout};
 
 use crate::options::MachineOptions;
@@ -13,7 +12,7 @@ use common::{
 };
 
 const FRAMES: usize = 2048;
-const STACK: usize = 8192;
+const STACK: usize = i16::MAX as usize;
 
 pub struct Machine {
     stdout: Output,
@@ -83,6 +82,7 @@ macro_rules! unary_handler {
 }
 
 impl Machine {
+    #[must_use]
     pub fn with_options(options: MachineOptions) -> Self {
         let mut this = Self::default();
         this.options = options;
@@ -149,7 +149,7 @@ impl Machine {
                     if let Value::OBJECT(_) = self.stack.peek_at(pos) {
                         self.stack.push(Value::REFERENCE(pos));
                     } else {
-                        self.stack.copy_to_top(pos)
+                        self.stack.copy_to_top(pos);
                     }
                 }
                 Byte::Not => unary_handler!(self, !),
@@ -172,6 +172,7 @@ impl Machine {
                 Byte::Print => {
                     self.stdout.write(&match self.stack.pop() {
                         Value::STR(idx) => data.string(idx).to_string(),
+                        Value::TYPE(ty) => data.get_type(ty).output(data),
                         value => value.to_string(),
                     });
 
@@ -197,8 +198,10 @@ impl Machine {
                                 continue;
                             }
                         }
-                        _ => (),
-                    };
+                        a => {
+                            dbg!(a);
+                        }
+                    }
                 }
                 Byte::Range => {
                     let last = self.stack.pop();
@@ -266,9 +269,8 @@ impl Machine {
                         self.enter(arity + 1);
                         self.ip = *ip;
                         continue;
-                    } else {
-                        eprintln!("Attempting to call method on non-object");
                     }
+                    eprintln!("Attempting to call method on non-object");
                 }
                 Byte::Prop => {
                     let [name, action, ..] = op.operands();

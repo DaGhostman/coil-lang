@@ -68,6 +68,7 @@ pub enum Value {
     STRING(Objects),
     OBJECT(Objects),
     ITERATOR(usize),
+    TYPE(usize),
 }
 
 impl PartialEq for Value {
@@ -303,7 +304,7 @@ impl Hash for Value {
             }
             Value::POINTER(ptr) => {
                 "ptr".hash(state);
-                format!("{:p}", ptr).hash(state);
+                format!("{ptr:p}").hash(state);
             }
             Value::REFERENCE(idx) => {
                 "ref".hash(state);
@@ -315,6 +316,10 @@ impl Hash for Value {
             }
             Value::ITERATOR(n) => {
                 "iter".hash(state);
+                n.hash(state);
+            }
+            Value::TYPE(n) => {
+                "ty".hash(state);
                 n.hash(state);
             }
             _ => panic!("No support"),
@@ -356,11 +361,12 @@ impl Debug for Value {
                 Value::RANGE(start, end) => format!("range({start}, {end})"),
                 Value::FILE(fd) => format!("file({fd})"),
                 Value::RESOURCE(_) => "resuorce".to_string(),
-                Value::POINTER(n) => format!("pointer({:p})", n),
+                Value::POINTER(n) => format!("pointer({n:p})"),
                 Value::FFI(id) => format!("dynamic({id})"),
                 Value::REFERENCE(idx) => format!("ref({idx:?})"),
                 Value::OBJECT(obj) => format!("obj({})", std::ptr::addr_of!(obj) as u64),
-                Value::ITERATOR(cursor) => format!("iter({})", cursor),
+                Value::ITERATOR(cursor) => format!("iter({cursor})"),
+                Value::TYPE(n) => format!("type({n})"),
             }
         )
     }
