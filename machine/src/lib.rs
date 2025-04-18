@@ -3,6 +3,9 @@ pub mod options;
 mod utils;
 
 pub mod stack;
+
+pub use options::MachineOptions;
+pub use stack::Machine;
 //
 // use std::{
 //     ffi::{CStr, c_void},

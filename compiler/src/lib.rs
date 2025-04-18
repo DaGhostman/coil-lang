@@ -26,7 +26,6 @@ pub struct Compiler<'compilation> {
 #[derive(Default, Clone, Copy, Debug)]
 pub(crate) struct Variable {
     pub(crate) position: usize,
-    pub(crate) scope: usize,
     pub(crate) readonly: bool,
     pub(crate) assigned: bool,
     pub(crate) r#type: usize,
@@ -88,7 +87,6 @@ impl Variables {
             })
             .or_insert_with(|| Variable {
                 position,
-                scope: self.scope,
                 readonly: false,
                 assigned: false,
                 r#type,
@@ -106,7 +104,6 @@ impl Variables {
             })
             .or_insert_with(|| Variable {
                 position,
-                scope: self.scope,
                 readonly: true,
                 assigned: true,
                 r#type: 0,
@@ -123,7 +120,6 @@ impl Variables {
             })
             .or_insert_with(|| Variable {
                 position,
-                scope: self.scope,
                 readonly: false,
                 assigned: true,
                 r#type: 0,
@@ -489,32 +485,40 @@ impl<'compilation> Compiler<'compilation> {
                     )]
                 }
                 Operation::Load => {
-                    let operands = op.operands();
+                    let [name, ..] = op.operands();
 
-                    if !self.context.variables().has(operands[0]) {
+                    if !self.context.variables().has(*name) {
                         return Err(Error::new(
                             ErrorOrigin::COMPILE,
                             format!(
                                 "Variable '{}' does not exist.",
-                                self.data.symbol_name(operands[0])
+                                self.data.symbol_name(*name)
                             ),
                         ));
-                    } else if !self.context.variables().available(operands[0]) {
+                    } else if !self.context.variables().available(*name) {
                         return Err(Error::new(
                             ErrorOrigin::COMPILE,
                             format!(
                                 "Variable '{}' is defined in lower scope than the current one.",
-                                self.data.symbol_name(operands[0])
+                                self.data.symbol_name(*name)
                             ),
                         ));
                     }
 
-                    let var = self.context.variables().get(operands[0]);
-                    let mut load = Code::new_with_operands(Byte::Load, [var.position, 0, 0]);
+                    let mut result;
+                    if self.context.variables().is_sealed(*name) {
+                        // We are loading a constant
+                        let constant = self.data.symbol_constant(*name);
+                        result = vec![Code::new_with_operands(Byte::Push, [constant, 0, 0])];
+                    } else {
+                        let var = self.context.variables().get(*name);
+                        let mut load = Code::new_with_operands(Byte::Load, [var.position, 0, 0]);
 
-                    load.with_type(var.r#type);
+                        load.with_type(var.r#type);
+                        result = vec![load];
+                    }
 
-                    vec![load]
+                    result
                 }
                 Operation::Call => {
                     let mut result = vec![];
@@ -525,7 +529,7 @@ impl<'compilation> Compiler<'compilation> {
                     if let Value::FUNCTION(definition_arity, _) = self.data.constant(const_) {
                         if call_arity == definition_arity {
                             let constant = self.data.symbol_constant(*symbol);
-                            if self.context.current() == Some(symbol)
+                            if self.context.current() == Some(&symbol)
                                 && code[cursor].code() == Operation::Leave
                             {
                                 self.context.set_tco(true);
@@ -596,81 +600,72 @@ impl<'compilation> Compiler<'compilation> {
                     result
                 }
                 Operation::Loop => {
+                    let [condition_length, body_length, _] = op.operands();
                     let mut result = vec![];
-                    if let Some(condition_length) = op.get(0) {
-                        let inside_label = self.label(None);
-                        let outside_label = self.label(None);
+                    // let condition_length = op.get(0);
+                    let inside_label = self.label(None);
+                    let outside_label = self.label(None);
 
-                        skips += condition_length;
-                        let mut local_cursor = cursor;
-                        result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
-                        result
-                            .append(&mut self.do_compile(
-                                &code[local_cursor..local_cursor + condition_length],
-                            )?);
+                    skips += condition_length;
+                    let mut local_cursor = cursor;
+                    result.push(Code::new_with_operands(Byte::Label, [inside_label, 0, 0]));
+                    result.append(
+                        &mut self
+                            .do_compile(&code[local_cursor..local_cursor + condition_length])?,
+                    );
 
-                        local_cursor += condition_length;
+                    local_cursor += condition_length;
 
-                        result.push(Code::new_with_operands(Byte::Jumpz, [outside_label, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Jumpz, [outside_label, 0, 0]));
 
-                        if let Some(body_length) = op.get(1) {
-                            skips += body_length;
+                    // let body_length = op.get(1);
+                    skips += body_length;
 
-                            let mut chunk =
-                                self.do_compile(&code[local_cursor..local_cursor + body_length])?;
+                    let mut chunk =
+                        self.do_compile(&code[local_cursor..local_cursor + body_length])?;
 
-                            result.append(&mut chunk);
-                            result.push(Code::new_with_operands(Byte::Jump, [inside_label, 0, 0]));
-                            result
-                                .push(Code::new_with_operands(Byte::Label, [outside_label, 0, 0]));
-                        }
-                    }
+                    result.append(&mut chunk);
+                    result.push(Code::new_with_operands(Byte::Jump, [inside_label, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Label, [outside_label, 0, 0]));
 
                     result
                 }
                 Operation::Condition => {
+                    let [condition_length, body_length, alternative_length] = op.operands();
                     let mut result = vec![];
-                    if let Some(condition_length) = op.get(0) {
-                        let mut local_cursor = cursor;
+                    // let condition_length = op.get(0);
+                    let mut local_cursor = cursor;
 
-                        let mut condition =
-                            self.do_compile(&code[local_cursor..local_cursor + condition_length])?;
-                        local_cursor += condition_length;
-                        skips += condition_length;
+                    let mut condition =
+                        self.do_compile(&code[local_cursor..local_cursor + condition_length])?;
+                    local_cursor += condition_length;
+                    skips += condition_length;
 
-                        result.append(&mut condition);
+                    result.append(&mut condition);
 
-                        let then_label = self.label(None);
-                        let else_label = self.label(None);
-                        let outside_label = self.label(None);
+                    let then_label = self.label(None);
+                    let else_label = self.label(None);
+                    let outside_label = self.label(None);
 
-                        result.push(Code::new_with_operands(Byte::Jumpz, [else_label, 0, 0]));
+                    result.push(Code::new_with_operands(Byte::Jumpz, [else_label, 0, 0]));
 
-                        if let Some(body_length) = op.get(1) {
-                            let mut chunk =
-                                self.do_compile(&code[local_cursor..=local_cursor + body_length])?;
+                    // let body_length = op.get(1);
+                    let mut chunk =
+                        self.do_compile(&code[local_cursor..=local_cursor + body_length])?;
 
-                            local_cursor += body_length;
-                            skips += body_length;
+                    local_cursor += body_length;
+                    skips += body_length;
 
-                            result.push(Code::new_with_operands(Byte::Label, [then_label, 0, 0]));
-                            result.append(&mut chunk);
-                            if let Some(alternative_length) = op.get(2) {
-                                let mut chunk = self.do_compile(
-                                    &code[local_cursor..local_cursor + alternative_length],
-                                )?;
-                                skips += alternative_length;
+                    result.push(Code::new_with_operands(Byte::Label, [then_label, 0, 0]));
+                    result.append(&mut chunk);
+                    // let alternative_length = op.get(2);
+                    let mut chunk =
+                        self.do_compile(&code[local_cursor..local_cursor + alternative_length])?;
+                    skips += alternative_length;
 
-                                result
-                                    .push(Code::new_with_operands(Byte::Label, [else_label, 0, 0]));
-                                result.append(&mut chunk);
-                                result.push(Code::new_with_operands(
-                                    Byte::Label,
-                                    [outside_label, 0, 0],
-                                ));
-                            }
-                        }
-                    }
+                    result.push(Code::new_with_operands(Byte::Label, [else_label, 0, 0]));
+                    result.append(&mut chunk);
+                    result.push(Code::new_with_operands(Byte::Label, [outside_label, 0, 0]));
 
                     result
                 }
@@ -678,10 +673,7 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::BitOr | Operation::Or => vec![Code::new(Byte::Or)],
                 Operation::BitXor | Operation::Xor => vec![Code::new(Byte::Xor)],
                 Operation::Range => vec![Code::new(Byte::Range)],
-                Operation::Array => vec![Code::new_with_operands(
-                    Byte::Array,
-                    [*op.get(0).unwrap(), 0, 0],
-                )],
+                Operation::Array => vec![Code::new_with_operands(Byte::Array, [op.get(0), 0, 0])],
                 Operation::Prop => {
                     let [owner, name, ..] = op.operands();
                     self.context.add_property(*owner, *name, 0);
@@ -737,7 +729,7 @@ impl<'compilation> Compiler<'compilation> {
                     let mut implementation = vec![];
                     let [interface, class, len] = op.operands();
 
-                    let methods = self.context.interfaces[interface].methods.clone();
+                    let methods = self.context.interfaces[&interface].methods.clone();
 
                     self.context.enter(*class);
                     for (name, method) in methods {
@@ -774,7 +766,7 @@ impl<'compilation> Compiler<'compilation> {
 
                     for (idx, byte) in code[cursor..cursor + len].iter().enumerate() {
                         if byte.code() == Operation::Method {
-                            let [owner, name, mlen] = op.operands();
+                            let [owner, name, mlen, ..] = op.operands();
                             self.context.add_contract(
                                 *owner,
                                 *name,
@@ -813,7 +805,7 @@ impl<'compilation> Compiler<'compilation> {
                 Operation::Invoke => {
                     let [name, arity, owner] = op.operands();
 
-                    let (label, public) = self.context.classes[owner].methods[name];
+                    let (label, public) = self.context.classes[&owner].methods[&name];
 
                     if !public {
                         if let Some(current) = self.context.current() {

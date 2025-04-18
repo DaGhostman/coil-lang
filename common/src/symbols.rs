@@ -20,7 +20,12 @@ impl SymbolTable {
     pub fn insert(&mut self, symbol: String, constant: Option<usize>) -> usize {
         let idx = self.names.intern(symbol);
         if let Some(constant) = constant {
-            self.mapping.entry(idx).or_insert(constant);
+            self.mapping
+                .entry(idx)
+                .and_modify(|val| {
+                    *val = constant;
+                })
+                .or_insert(constant);
         }
 
         idx

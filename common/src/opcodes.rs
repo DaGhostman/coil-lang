@@ -85,7 +85,7 @@ pub enum Operation {
     Loop,
 }
 
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Default, Debug, Clone, Copy)]
 pub struct Metadata {
     line: usize,
     column: usize,
@@ -107,7 +107,7 @@ impl Display for Metadata {
 pub struct IR {
     code: Operation,
     operands: [usize; 3],
-    metadata: Option<Metadata>,
+    metadata: Metadata,
     r#type: usize,
 }
 
@@ -129,17 +129,17 @@ impl Debug for IR {
 
 impl IR {
     #[must_use]
-    pub fn new(code: Operation, values: Option<[usize; 3]>) -> Self {
+    pub fn new(code: Operation, operands: [usize; 3]) -> Self {
         Self {
             code,
-            operands: values.unwrap_or_default(),
-            metadata: None,
+            operands,
+            metadata: Metadata::default(),
             r#type: 0,
         }
     }
 
     pub fn with_metadata(&mut self, metadata: Metadata) -> &mut Self {
-        self.metadata = Some(metadata);
+        self.metadata = metadata;
 
         self
     }
@@ -154,7 +154,7 @@ impl IR {
     }
 
     pub fn attach_metadata(&mut self, metadata: Metadata) {
-        self.metadata = Some(metadata);
+        self.metadata = metadata;
     }
 
     #[must_use]
@@ -163,13 +163,13 @@ impl IR {
     }
 
     #[must_use]
-    pub fn get(&self, idx: usize) -> Option<&usize> {
-        self.operands.get(idx)
+    pub fn get(&self, idx: usize) -> usize {
+        self.operands[idx]
     }
 
     #[must_use]
-    pub fn metadata(&self) -> Option<&Metadata> {
-        self.metadata.as_ref()
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 
     pub fn set_type(&mut self, r#type: usize) {

@@ -4,12 +4,9 @@ use clap::{ArgAction, Parser as Clap, ValueHint};
 use common::program::data::Data;
 use compiler::{
     Compiler,
-    passes::{
-        constant_folding::ConstantFolding, jump_translation::LabelUnrolling,
-        redundancy_removal::RedundancyRemoval,
-    },
+    passes::{ConstantFolding, LabelUnrolling, RedundancyRemoval},
 };
-use machine::{options::MachineOptions, stack::Machine};
+use machine::{Machine, MachineOptions};
 use parser::Parser;
 
 #[derive(Clap)]

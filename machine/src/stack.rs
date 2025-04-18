@@ -12,8 +12,8 @@ use common::{
     opcodes::{Byte, Code},
 };
 
-const FRAMES: usize = 1024;
-const STACK: usize = 4096;
+const FRAMES: usize = 2048;
+const STACK: usize = 8192;
 
 pub struct Machine {
     stdout: Output,
@@ -26,10 +26,6 @@ pub struct Machine {
     call_stack: [(usize, usize); FRAMES],
     stack: Stack<Value, STACK>,
     heap: Heap,
-    // owner => name => label
-    // methods: HashMap<usize, HashMap<usize, usize>>,
-    properties: HashMap<usize, Vec<usize>>,
-
     options: MachineOptions,
 }
 impl Default for Machine {
@@ -44,8 +40,6 @@ impl Default for Machine {
             stdout: Output::new(&MachineOptions::default(), || Box::new(stdout().lock())),
             stderr: Output::new(&MachineOptions::default(), || Box::new(stderr().lock())),
             options: MachineOptions::default(),
-            // methods: HashMap::default(),
-            properties: HashMap::default(),
         }
     }
 }
@@ -248,8 +242,8 @@ impl Machine {
                     }
                 }
                 Byte::Instantiate => {
-                    let owner = op.operands()[0];
-                    let mut object = ObjInstance::new(owner);
+                    let owner = op.operand(0);
+                    let object = ObjInstance::new(owner);
                     // if self.properties.contains_key(&owner) {
                     //     for (idx, field) in self.properties[&owner].iter().enumerate() {
                     //         if idx == 0 {
@@ -264,12 +258,13 @@ impl Machine {
                     self.stack.push(Value::OBJECT(instance));
                 }
                 Byte::Invoke => {
-                    let operands = op.operands();
-                    let arity = operands[1];
+                    let [ip, arity, _] = op.operands();
+                    // let operands = op.operands();
+                    // let arity = operands[1];
 
-                    if let Value::OBJECT(Objects::Object(_)) = self.peek_obj(arity) {
+                    if let Value::OBJECT(Objects::Object(_)) = self.peek_obj(*arity) {
                         self.enter(arity + 1);
-                        self.ip = op.operand(0);
+                        self.ip = *ip;
                         continue;
                     } else {
                         eprintln!("Attempting to call method on non-object");
@@ -300,10 +295,11 @@ impl Machine {
                     }
                 }
                 Byte::Upvalue => {
-                    let frame = op.operand(0);
-                    let upvalue = op.operand(2);
+                    let [frame, _, upvalue] = op.operands();
+                    // let frame = op.operand(0);
+                    // let upvalue = op.operand(2);
 
-                    self.stack.copy_to_top(self.call_stack[frame].1 + upvalue);
+                    self.stack.copy_to_top(self.call_stack[*frame].1 + *upvalue);
                 }
                 Byte::Halt => {
                     self.halt = true;

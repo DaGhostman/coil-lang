@@ -97,7 +97,16 @@ macro_rules! op {
         let mut ir = IR::new(Operation::$op, $value);
         if let Some(token) = $ctx.previous() {
             let data = Metadata::new(token.start_line(), token.start_column());
-            ir.attach_metadata(data);
+            ir.with_metadata(data);
+        }
+
+        ir
+    }};
+    ($this:expr, $ctx:expr, $op:ident) => {{
+        let mut ir = IR::new(Operation::$op, Default::default());
+        if let Some(token) = $ctx.previous() {
+            let data = Metadata::new(token.start_line(), token.start_column());
+            ir.with_metadata(data);
         }
 
         ir
@@ -297,7 +306,7 @@ impl<'data> Parser<'data> {
         let constant = self.data.add_constant(value, ty);
 
         ctx.advance();
-        vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
+        vec![op!(self, ctx, Const, [constant, 0, 0])]
     }
 
     fn number(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -336,7 +345,7 @@ impl<'data> Parser<'data> {
         let ty = self.data.add_type(Type::integer());
         let constant = self.data.add_constant(value, ty);
 
-        vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
+        vec![op!(self, ctx, Const, [constant, 0, 0])]
     }
 
     fn float(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -351,7 +360,7 @@ impl<'data> Parser<'data> {
             .data
             .add_constant(value, self.data.find_type(Type::float()));
 
-        vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
+        vec![op!(self, ctx, Const, [constant, 0, 0])]
     }
 
     fn string(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -361,7 +370,7 @@ impl<'data> Parser<'data> {
             .add_constant(Value::STR(string), self.data.find_type(Type::string()));
 
         ctx.advance();
-        vec![op!(self, ctx, Const, Some([constant, 0, 0]))]
+        vec![op!(self, ctx, Const, [constant, 0, 0])]
     }
 
     fn identifier(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -384,13 +393,13 @@ impl<'data> Parser<'data> {
 
             symbol = self.data.add_symbol(name, None);
 
-            tokens.push(op!(self, ctx, Call, Some([symbol, arity, 0])));
+            tokens.push(op!(self, ctx, Call, [symbol, arity, 0]));
         } else if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
-            tokens.push(op!(self, ctx, Assign, Some([symbol, 0, 0])));
+            tokens.push(op!(self, ctx, Assign, [symbol, 0, 0]));
         } else {
             // tokens.append(&mut self.expression(ctx));
-            tokens.push(op!(self, ctx, Load, Some([symbol, 0, 0])));
+            tokens.push(op!(self, ctx, Load, [symbol, 0, 0]));
         } // TODO: handle other tokens on identifiers, like increment, decrement, etc.
 
         tokens
@@ -407,7 +416,7 @@ impl<'data> Parser<'data> {
             }
         }
 
-        tokens.push(op!(self, ctx, Array, Some([arity, 0, 0])));
+        tokens.push(op!(self, ctx, Array, [arity, 0, 0]));
 
         tokens
     }
@@ -418,10 +427,10 @@ impl<'data> Parser<'data> {
         let mut tokens = self.precedence(ctx, Precedence::get(operator.kind()).next());
 
         match operator.kind() {
-            TokenKind::Less => tokens.push(op!(self, ctx, Less, None)),
-            TokenKind::LessEqual => tokens.push(op!(self, ctx, LessEqual, None)),
-            TokenKind::Greater => tokens.push(op!(self, ctx, Greater, None)),
-            TokenKind::GreaterEqual => tokens.push(op!(self, ctx, GreaterEqual, None)),
+            TokenKind::Less => tokens.push(op!(self, ctx, Less)),
+            TokenKind::LessEqual => tokens.push(op!(self, ctx, LessEqual)),
+            TokenKind::Greater => tokens.push(op!(self, ctx, Greater)),
+            TokenKind::GreaterEqual => tokens.push(op!(self, ctx, GreaterEqual)),
             _ => unreachable!("No other comparison"),
         }
 
@@ -434,8 +443,8 @@ impl<'data> Parser<'data> {
         let mut tokens = self.precedence(ctx, Precedence::get(operator.kind()).next());
 
         match operator.kind() {
-            TokenKind::EqualEqual => tokens.push(op!(self, ctx, Equal, None)),
-            TokenKind::BangEqual => tokens.push(op!(self, ctx, NotEqual, None)),
+            TokenKind::EqualEqual => tokens.push(op!(self, ctx, Equal)),
+            TokenKind::BangEqual => tokens.push(op!(self, ctx, NotEqual)),
             _ => unreachable!("No other equality"),
         }
 
@@ -448,21 +457,21 @@ impl<'data> Parser<'data> {
         let mut tokens = self.precedence(ctx, Precedence::get(operator.kind()).next());
 
         match operator.kind() {
-            TokenKind::Plus => tokens.push(op!(self, ctx, Add, None)),
-            TokenKind::Minus => tokens.push(op!(self, ctx, Subtract, None)),
-            TokenKind::Star => tokens.push(op!(self, ctx, Multiply, None)),
-            TokenKind::StarStar => tokens.push(op!(self, ctx, Pow, None)),
-            TokenKind::Slash => tokens.push(op!(self, ctx, Divide, None)),
-            TokenKind::Percent => tokens.push(op!(self, ctx, Modulo, None)),
-            TokenKind::Less => tokens.push(op!(self, ctx, Less, None)),
-            TokenKind::LessLess => tokens.push(op!(self, ctx, LeftShift, None)),
-            TokenKind::Greater => tokens.push(op!(self, ctx, Greater, None)),
-            TokenKind::GreaterGreater => tokens.push(op!(self, ctx, RightShift, None)),
-            TokenKind::Caret => tokens.push(op!(self, ctx, BitXor, None)),
-            TokenKind::Pipe => tokens.push(op!(self, ctx, BitOr, None)),
-            TokenKind::Ampersand => tokens.push(op!(self, ctx, BitAnd, None)),
-            TokenKind::Or => tokens.push(op!(self, ctx, Or, None)),
-            TokenKind::And => tokens.push(op!(self, ctx, And, None)),
+            TokenKind::Plus => tokens.push(op!(self, ctx, Add)),
+            TokenKind::Minus => tokens.push(op!(self, ctx, Subtract)),
+            TokenKind::Star => tokens.push(op!(self, ctx, Multiply)),
+            TokenKind::StarStar => tokens.push(op!(self, ctx, Pow)),
+            TokenKind::Slash => tokens.push(op!(self, ctx, Divide)),
+            TokenKind::Percent => tokens.push(op!(self, ctx, Modulo)),
+            TokenKind::Less => tokens.push(op!(self, ctx, Less)),
+            TokenKind::LessLess => tokens.push(op!(self, ctx, LeftShift)),
+            TokenKind::Greater => tokens.push(op!(self, ctx, Greater)),
+            TokenKind::GreaterGreater => tokens.push(op!(self, ctx, RightShift)),
+            TokenKind::Caret => tokens.push(op!(self, ctx, BitXor)),
+            TokenKind::Pipe => tokens.push(op!(self, ctx, BitOr)),
+            TokenKind::Ampersand => tokens.push(op!(self, ctx, BitAnd)),
+            TokenKind::Or => tokens.push(op!(self, ctx, Or)),
+            TokenKind::And => tokens.push(op!(self, ctx, And)),
             _ => unreachable!("Unknown binary operator '{}'", operator.lexeme()),
         }
 
@@ -510,7 +519,7 @@ impl<'data> Parser<'data> {
                 self.block(ctx)
             } else {
                 let mut t = self.expression(ctx);
-                t.push(op!(self, ctx, Leave, None));
+                t.push(op!(self, ctx, Leave));
 
                 t
             }
@@ -523,12 +532,7 @@ impl<'data> Parser<'data> {
         result.append(&mut tokens);
         result.insert(
             0,
-            op!(
-                self,
-                ctx,
-                Check,
-                Some([full_predicate.len(), tokens.len(), 0])
-            ),
+            op!(self, ctx, Check, [full_predicate.len(), tokens.len(), 0]),
         );
 
         result
@@ -546,7 +550,7 @@ impl<'data> Parser<'data> {
                         TokenKind::LeftParenthesis,
                         "Expected '(' for sub-pattern",
                     );
-                    tokens.push(op!(self, ctx, Unwrap, None));
+                    tokens.push(op!(self, ctx, Unwrap));
                     tokens.append(&mut self.parse_pattern(ctx, predicate));
                     self.expect(
                         ctx,
@@ -565,7 +569,7 @@ impl<'data> Parser<'data> {
                         TokenKind::LeftParenthesis,
                         "Expected '(' for sub-pattern",
                     );
-                    tokens.push(op!(self, ctx, UnwrapError, None));
+                    tokens.push(op!(self, ctx, UnwrapError));
                     tokens.append(&mut self.parse_pattern(ctx, predicate));
                     self.expect(
                         ctx,
@@ -598,7 +602,7 @@ impl<'data> Parser<'data> {
                     .add_symbol(ctx.current().lexeme().to_string(), None);
                 // ctx.advance();
                 tokens.append(&mut self.expression(ctx));
-                tokens.push(op!(self, ctx, Store, Some([symbol, 0, 0])));
+                tokens.push(op!(self, ctx, Store, [symbol, 0, 0]));
             }
             _ => {
                 tokens.append(&mut self.expression(ctx));
@@ -613,11 +617,11 @@ impl<'data> Parser<'data> {
         if self.matches(ctx, TokenKind::Pipe) {
             ctx.advance();
             tokens.append(&mut self.parse_pattern(ctx, predicate));
-            tokens.push(op!(self, ctx, Or, None));
+            tokens.push(op!(self, ctx, Or));
         }
 
         tokens.append(&mut predicate.clone());
-        tokens.push(op!(self, ctx, Equal, None));
+        tokens.push(op!(self, ctx, Equal));
         // tokens.push(op!(self, ctx,ConditionJump, None));
 
         tokens
@@ -642,7 +646,7 @@ impl<'data> Parser<'data> {
             self.consume(ctx, TokenKind::Comma);
         }
 
-        tokens.insert(0, op!(self, ctx, Match, Some([tokens.len(), 0, 0])));
+        tokens.insert(0, op!(self, ctx, Match, [tokens.len(), 0, 0]));
 
         tokens
     }
@@ -707,7 +711,7 @@ impl<'data> Parser<'data> {
                 self,
                 ctx,
                 Condition,
-                Some([condition_len, body_len, alternative.len()])
+                [condition_len, body_len, alternative.len()]
             ),
         );
         tokens.append(&mut alternative);
@@ -732,7 +736,7 @@ impl<'data> Parser<'data> {
         result.append(&mut self.block(ctx));
         let body_len = result.len() - condition_len;
 
-        result.insert(0, op!(self, ctx, Loop, Some([condition_len, body_len, 0])));
+        result.insert(0, op!(self, ctx, Loop, [condition_len, body_len, 0]));
 
         result
     }
@@ -752,11 +756,11 @@ impl<'data> Parser<'data> {
                     self,
                     ctx,
                     Iterate,
-                    Some([
+                    [
                         self.data.add_symbol(name.lexeme().to_string(), None),
                         body.len(),
                         0,
-                    ])
+                    ]
                 ));
                 result.append(&mut body);
             }
@@ -791,11 +795,11 @@ impl<'data> Parser<'data> {
             self.expr_statement(ctx)
         };
 
-        action.push(op!(self, ctx, Pop, Some([1, 0, 0])));
+        action.push(op!(self, ctx, Pop, [1, 0, 0]));
         body.append(&mut action);
 
         result.append(&mut initializer);
-        result.push(op!(self, ctx, Loop, Some([condition.len(), body.len(), 0])));
+        result.push(op!(self, ctx, Loop, [condition.len(), body.len(), 0]));
         result.append(&mut condition);
         // result.push(op!(self, ctx,Rewind, Some([body.len(), 0, 0])));
         result.append(&mut body);
@@ -816,7 +820,7 @@ impl<'data> Parser<'data> {
                     self,
                     ctx,
                     Invoke,
-                    Some([self.data.add_symbol(name, None), arity, 0])
+                    [self.data.add_symbol(name, None), arity, 0]
                 );
 
                 while !self.consume(ctx, TokenKind::RightParenthesis) {
@@ -834,14 +838,14 @@ impl<'data> Parser<'data> {
                     self,
                     ctx,
                     Prop,
-                    Some([self.data.add_symbol(name, None), 1, 0])
+                    [self.data.add_symbol(name, None), 1, 0]
                 ));
             } else {
                 tokens.push(op!(
                     self,
                     ctx,
                     Prop,
-                    Some([self.data.add_symbol(name, None), 0, 0])
+                    [self.data.add_symbol(name, None), 0, 0]
                 ));
                 // todo!("Handle remainder of cases");
             } // TODO: Implement Increment for properties
@@ -853,7 +857,7 @@ impl<'data> Parser<'data> {
     fn range(&mut self, ctx: &mut Context) -> Vec<IR> {
         self.expect(ctx, TokenKind::DotDot, "Expected range symbol");
         let mut tokens = self.expression(ctx);
-        tokens.push(op!(self, ctx, Range, None));
+        tokens.push(op!(self, ctx, Range));
 
         tokens
     }
@@ -922,13 +926,13 @@ impl<'data> Parser<'data> {
     fn expr_statement(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut tokens = self.expr(ctx);
 
-        tokens.push(op!(self, ctx, Pop, None));
+        tokens.push(op!(self, ctx, Pop));
 
         tokens
     }
 
     fn block(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let mut tokens = vec![op!(self, ctx, Begin, None)];
+        let mut tokens = vec![op!(self, ctx, Begin)];
 
         if self.expect(
             ctx,
@@ -940,7 +944,7 @@ impl<'data> Parser<'data> {
             }
         }
 
-        tokens.push(op!(self, ctx, End, None));
+        tokens.push(op!(self, ctx, End));
 
         tokens
     }
@@ -966,7 +970,7 @@ impl<'data> Parser<'data> {
                 self,
                 ctx,
                 Const,
-                Some([self.data.add_constant(Value::NONE, 0), 0, 0,])
+                [self.data.add_constant(Value::NONE, 0), 0, 0,]
             ));
         }
 
@@ -974,7 +978,7 @@ impl<'data> Parser<'data> {
             self,
             ctx,
             Declare,
-            Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0])
+            [self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]
         );
 
         declaration.set_type(kind);
@@ -995,15 +999,24 @@ impl<'data> Parser<'data> {
             kind = self.get_type(ctx);
         }
 
-        let mut tokens = self.expr(ctx);
-        tokens.pop();
+        let mut tokens = vec![];
+        let params: [usize; 3] = [self.data.add_symbol(name.lexeme().to_string(), None), 1, 0];
 
-        let mut declaration = op!(
-            self,
-            ctx,
-            Declare,
-            Some([self.data.add_symbol(name.lexeme().to_string(), None), 1, 0])
-        );
+        if self.consume(ctx, TokenKind::Equal) {
+            tokens = self.expr(ctx);
+            if tokens.len() == 1
+                && matches!(tokens.last().map(|o| o.code()), Some(Operation::Const))
+            {
+                if let Some(op) = tokens.last() {
+                    let [constant, ..] = op.operands();
+
+                    self.data
+                        .add_symbol(name.lexeme().to_string(), Some(*constant));
+                }
+            }
+        }
+
+        let mut declaration = op!(self, ctx, Declare, params);
 
         declaration.set_type(kind);
         tokens.push(declaration);
@@ -1016,7 +1029,7 @@ impl<'data> Parser<'data> {
 
         self.consume(ctx, TokenKind::Function);
 
-        let mut name: String = if self.consume(ctx, TokenKind::Identifier) {
+        let name: String = if self.consume(ctx, TokenKind::Identifier) {
             ctx.previous().unwrap_or_default().lexeme().to_string()
         } else {
             rand::rng()
@@ -1049,11 +1062,11 @@ impl<'data> Parser<'data> {
                     self,
                     ctx,
                     Argument,
-                    Some([
+                    [
                         self.data.add_symbol(argument.lexeme().to_string(), None),
                         1,
                         0,
-                    ])
+                    ]
                 );
 
                 arg.set_type(kind);
@@ -1082,7 +1095,7 @@ impl<'data> Parser<'data> {
                     self,
                     ctx,
                     Upvalue,
-                    Some([self.data.add_symbol(name.lexeme().to_string(), None), 0, 0])
+                    [self.data.add_symbol(name.lexeme().to_string(), None), 0, 0]
                 ));
                 self.consume(ctx, TokenKind::Comma);
             }
@@ -1097,7 +1110,7 @@ impl<'data> Parser<'data> {
 
         let symbol = self.name(name, None);
 
-        let mut func = op!(self, ctx, Function, Some([symbol, arity, body.len()]));
+        let mut func = op!(self, ctx, Function, [symbol, arity, body.len()]);
         let mut func_type = Type::function();
         func_type.set_return(kind);
         for arg in argument_types {
@@ -1111,9 +1124,9 @@ impl<'data> Parser<'data> {
             self,
             ctx,
             Const,
-            Some([self.data.add_constant(Value::NONE, 0), 0, 0,])
+            [self.data.add_constant(Value::NONE, 0), 0, 0,]
         ));
-        body.push(op!(self, ctx, Leave, None));
+        body.push(op!(self, ctx, Leave));
         tokens.append(&mut body);
 
         tokens
@@ -1134,7 +1147,7 @@ impl<'data> Parser<'data> {
                 self,
                 ctx,
                 Const,
-                Some([self.data.add_constant(Value::NONE, 0), 0, 0])
+                [self.data.add_constant(Value::NONE, 0), 0, 0]
             )]
         } else {
             self.expr_statement(ctx)
@@ -1143,7 +1156,7 @@ impl<'data> Parser<'data> {
         symbol = symbol << 32;
         symbol |= self.data.add_symbol(prop_name, None);
 
-        let mut property = op!(self, ctx, Prop, Some([symbol, 2, usize::from(public),]));
+        let mut property = op!(self, ctx, Prop, [symbol, 2, usize::from(public),]);
         property.set_type(kind);
         prop.push(property);
 
@@ -1155,7 +1168,7 @@ impl<'data> Parser<'data> {
         self.namespace = String::new();
         let mut method = self.function(ctx);
 
-        method.insert(1, IR::new(Operation::This, None));
+        method.insert(1, IR::new(Operation::This, Default::default()));
         if let Some(code) = method.first_mut() {
             let operands = code.operands();
             let mut symbol = owner;
@@ -1164,7 +1177,7 @@ impl<'data> Parser<'data> {
             symbol = symbol << 1;
             symbol |= usize::from(public);
 
-            let mut method = op!(self, ctx, Method, Some([symbol, operands[1], operands[2]]));
+            let mut method = op!(self, ctx, Method, [symbol, operands[1], operands[2]]);
             method.set_type(code.kind());
             // method.attach_metadata(*code.metadata().unwrap());
             *code = method;
@@ -1217,12 +1230,9 @@ impl<'data> Parser<'data> {
             }
         }
 
-        class.insert(0, op!(self, ctx, Begin, None));
-        class.insert(
-            0,
-            op!(self, ctx, Implement, Some([contract, owner, class.len()])),
-        );
-        class.push(op!(self, ctx, End, None));
+        class.insert(0, op!(self, ctx, Begin));
+        class.insert(0, op!(self, ctx, Implement, [contract, owner, class.len()]));
+        class.push(op!(self, ctx, End));
 
         class
     }
@@ -1240,7 +1250,7 @@ impl<'data> Parser<'data> {
         }
         ctx.set_owner(owner);
 
-        let mut iface = op!(self, ctx, Interface, Some([owner, 0, 0]));
+        let mut iface = op!(self, ctx, Interface, [owner, 0, 0]);
 
         ctx.advance();
         while !self.consume(ctx, TokenKind::RightBracket) {
@@ -1286,11 +1296,11 @@ impl<'data> Parser<'data> {
                         self,
                         ctx,
                         Argument,
-                        Some([
+                        [
                             self.data.add_symbol(argument.lexeme().to_string(), None),
                             1,
                             0,
-                        ])
+                        ]
                     ));
                     arity += 1;
                     if !self.consume(ctx, TokenKind::Comma) {
@@ -1335,14 +1345,14 @@ impl<'data> Parser<'data> {
             symbol = symbol << 1;
             symbol |= 1;
 
-            method.insert(0, op!(self, ctx, Method, Some([symbol, arity, body.len()])));
+            method.insert(0, op!(self, ctx, Method, [symbol, arity, body.len()]));
             method.append(&mut body);
 
             interface.append(&mut method);
         }
 
-        interface.insert(0, op!(self, ctx, Begin, None));
-        interface.push(op!(self, ctx, End, None));
+        interface.insert(0, op!(self, ctx, Begin));
+        interface.push(op!(self, ctx, End));
         iface.operands_mut()[1] = interface.len();
         iface.operands_mut()[2] = interface.len();
         interface.insert(0, iface);
@@ -1410,11 +1420,11 @@ impl<'data> Parser<'data> {
         }
         ctx.clear_owner();
 
-        class.insert(0, op!(self, ctx, Begin, None));
-        let mut cls = op!(self, ctx, Class, Some([owner, class.len(), 0]));
+        class.insert(0, op!(self, ctx, Begin));
+        let mut cls = op!(self, ctx, Class, [owner, class.len(), 0]);
         cls.set_type(self.data.add_type(instance));
         class.insert(0, cls);
-        class.push(op!(self, ctx, End, None));
+        class.push(op!(self, ctx, End));
 
         class
     }
@@ -1455,7 +1465,7 @@ impl<'data> Parser<'data> {
                 self.consume(ctx, TokenKind::Comma);
             }
 
-            let mut instance = op!(self, ctx, Instantiate, Some([symbol, arity, 0]));
+            let mut instance = op!(self, ctx, Instantiate, [symbol, arity, 0]);
             instance.set_type(self.data.add_type(ty));
 
             result.push(instance);
@@ -1467,7 +1477,7 @@ impl<'data> Parser<'data> {
     fn this(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
         let mut result = self.expression(ctx);
-        let mut this = op!(self, ctx, This, None);
+        let mut this = op!(self, ctx, This);
         if ctx.owner().is_none() {
             panic!("Using 'this' outside of object context");
         }
@@ -1646,21 +1656,21 @@ impl<'data> Parser<'data> {
             TokenKind::Print => {
                 ctx.advance();
                 let mut tokens = self.expr(ctx);
-                tokens.push(op!(self, ctx, Print, None));
+                tokens.push(op!(self, ctx, Print));
 
                 tokens
             }
             TokenKind::PrintLn => {
                 ctx.advance();
                 let mut tokens = self.expr(ctx);
-                tokens.push(op!(self, ctx, Print, Some([1, 0, 0])));
+                tokens.push(op!(self, ctx, Print, [1, 0, 0]));
 
                 tokens
             }
             TokenKind::Return => {
                 ctx.advance();
                 let mut tokens = self.expr(ctx);
-                tokens.push(op!(self, ctx, Leave, None));
+                tokens.push(op!(self, ctx, Leave));
 
                 tokens
             }

@@ -251,7 +251,7 @@ impl<const N: usize> TypeChecker<N> {
                                 data.get_type(lhs).output(data),
                                 data.get_type(rhs).output(data),
                             ),
-                            op.metadata().unwrap(),
+                            op.metadata(),
                         );
                     }
                 }
@@ -291,19 +291,17 @@ impl<const N: usize> TypeChecker<N> {
 
                     let ty = self.pop(1);
 
-
-                    if variables.contains_key(name) {
-                        if variables.contains_key(name) {
-                            if ty != variables[name]
+                        if variables.contains_key(&name) {
+                            if ty != variables[&name]
                             {
                                 self.error(
                                     format!(
                                         "Unable to assign value of type {:?} to '{}' because it expects {:?}", 
                                         ty,
                                         data.symbol_name(*name),
-                                        data.get_type(variables[name]).output(data)
+                                        data.get_type(variables[&name]).output(data)
                                     ),
-                                    op.metadata().unwrap(),
+                                    op.metadata(),
 
                                 );
                             }
@@ -317,16 +315,6 @@ impl<const N: usize> TypeChecker<N> {
                                 },
                             );
                         }
-                    } else {
-                        variables.insert(
-                            name,
-                            if op.kind() != data.find_type(Type::any()) {
-                                op.kind()
-                            } else {
-                                ty
-                            },
-                        );
-                    }
                 }
                 Operation::Instantiate => {
                     let instance = data.get_type(op.kind());
@@ -334,7 +322,7 @@ impl<const N: usize> TypeChecker<N> {
                         if !self.classes.contains_key(&n) {
                             self.error(
                                 format!("Attempting to instantiate a non-existing class '{}'", data.symbol_name(n)),
-                                op.metadata().unwrap(),
+                                op.metadata(),
                             );
                         }
 
@@ -345,7 +333,7 @@ impl<const N: usize> TypeChecker<N> {
                                         "Unknown generic parameter: ${} used for {}",
                                         data.symbol_name(name),
                                         data.symbol_name(n),
-                                    ), op.metadata().unwrap());
+                                    ), op.metadata());
                                     continue;
                                 }
 
@@ -356,7 +344,7 @@ impl<const N: usize> TypeChecker<N> {
                                         data.symbol_name(name),
                                         data.get_type(substitute).output(data),
                                         data.get_type(constraint).output(data),
-                                    ), op.metadata().unwrap());
+                                    ), op.metadata());
                                 }
                             }
                         }
@@ -439,13 +427,13 @@ impl<const N: usize> TypeChecker<N> {
                         _ => {
                             self.error(
                                 "Unable to perform unknown operation on property".to_string(),
-                                op.metadata().unwrap(),
+                                op.metadata(),
                             );
                         }
                     }
                 }
                 Operation::Invoke => {
-                    let [name, call_arity, _] = op.operands();
+                    let [name, call_arity, ..] = op.operands();
                     let mut result = data.find_type(Type::void());
                     let object = data.get_type(self.peek(*call_arity));
 
@@ -473,7 +461,7 @@ impl<const N: usize> TypeChecker<N> {
                         let fqn = format!("{}::{}", data.symbol_name(n), data.symbol_name(*name));
 
                         if *call_arity != declared_arity {
-                            self.error(format!("Called '{fqn}' with {call_arity} argument(s), but it was defined with {declared_arity}"), op.metadata().unwrap());
+                            self.error(format!("Called '{fqn}' with {call_arity} argument(s), but it was defined with {declared_arity}"), op.metadata());
                         }
 
                         for idx in 0..*call_arity {
@@ -493,13 +481,13 @@ impl<const N: usize> TypeChecker<N> {
                                     format!(
                                         "Calling a private method '{fqn}' from outside is forbidden"
                                     ),
-                                    op.metadata().unwrap(),
+                                    op.metadata(),
                                 );
                             }
                         }
 
                         result = self.resolve_type(data, data.get_type(method).returns());
-                        bytecode.push(IR::new(Operation::Invoke, Some([*name, *call_arity, n])));
+                        bytecode.push(IR::new(Operation::Invoke, [*name, *call_arity, n]));
                     } else {
                         println!(" !-- {}", object.output(data));
                     }
@@ -562,7 +550,7 @@ impl<const N: usize> TypeChecker<N> {
                                 "Expected to return '{}' but it has branch that returns '{}'",
                                 data.get_type(self.resolve_type(data, sub_expected)).output(data),
                                 data.get_type(self.resolve_type(data, self.peek(0))).output(data),
-                            ), op.metadata().unwrap());
+                            ), op.metadata());
                         }
                     }
                 }
