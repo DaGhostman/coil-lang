@@ -11,6 +11,7 @@ pub enum Operation {
     Halt,
     // ---
     Add,
+    Negate,
     Not,
     BitAnd,
     BitOr,
@@ -20,6 +21,8 @@ pub enum Operation {
     Divide,
     Modulo,
     Pow,
+    Inc,
+    Dec,
     LeftShift,
     RightShift,
     Or,
@@ -51,12 +54,14 @@ pub enum Operation {
     Duplicate,
     Argument,
     Function,
+    Closure,
     Interface,
     Implement,
     Class,
     Prop,
     Method,
     Instantiate,
+    Bind,
     This,
     TypeOf,
     PropAssign,
@@ -224,6 +229,8 @@ pub enum Byte {
     Div,
     /// Modulo
     Mod,
+    /// Raise $lhs to the power of $rhs
+    Pow,
     /// Left Shift
     LShift,
     /// Right Shift
@@ -276,10 +283,14 @@ pub enum Byte {
     Instantiate,
     /// Invoke method
     Invoke,
+    ///
+    Iterator,
     /// ??
     Iterate,
     /// This
     This,
+    /// Gets the type of the last item on the stack
+    TypeOf,
 
     /// Range of numerical values
     Range,

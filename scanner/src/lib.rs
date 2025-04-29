@@ -72,6 +72,26 @@ impl Scanner {
     }
 
     fn matches(&mut self, lexeme: &str) -> bool {
+        if self.peek(0).is_none() {
+            return lexeme == "";
+        }
+
+        if lexeme
+            .as_bytes()
+            .iter()
+            .filter(|c| c.is_ascii_punctuation() || c.is_ascii_whitespace() || c.is_ascii_control())
+            .collect::<Vec<_>>()
+            .is_empty()
+        {
+            if self
+                .peek(lexeme.len())
+                .filter(|c| c.is_ascii_whitespace() || *c != '_' || c.is_ascii_control())
+                .is_none()
+            {
+                return false;
+            }
+        }
+
         for position in 0..lexeme.len() {
             if self.peek(position).map(|c| c.to_ascii_lowercase())
                 != lexeme.chars().nth(position).map(|c| c.to_ascii_lowercase())
@@ -235,7 +255,7 @@ impl Scanner {
         let mut token = Token::begin(kind, self.line, self.column, self.file.as_ref());
 
         if !self.matches(lexeme) {
-            unreachable!("Dafuq happened with '{}'", lexeme);
+            unreachable!("Dafuq happened with '{lexeme}' - {}", self.line);
         }
 
         self.advance_by(lexeme.len());
@@ -413,6 +433,7 @@ impl Scanner {
             Some('.') => match self.peek(1) {
                 Some('.') => match self.peek(2) {
                     Some('.') => self.make_token(TokenKind::DotDotDot, "..."),
+                    Some('=') => self.make_token(TokenKind::DotDotEqual, "..="),
                     _ => self.make_token(TokenKind::DotDot, ".."),
                 },
                 _ => self.make_token(TokenKind::Dot, "."),

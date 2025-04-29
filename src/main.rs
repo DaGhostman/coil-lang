@@ -4,7 +4,7 @@ use clap::{ArgAction, Parser as Clap, ValueHint};
 use common::program::data::Data;
 use compiler::{
     Compiler,
-    passes::{ConstantFolding, LabelUnrolling, RedundancyRemoval},
+    passes::{ConstantFolding, DCE, LabelUnrolling, RedundancyRemoval},
 };
 use machine::{Machine, MachineOptions};
 use parser::Parser;
@@ -78,12 +78,14 @@ fn main() {
         let mut constant_folder = ConstantFolding::default();
         let mut label_conversion = LabelUnrolling::default();
         let mut redundancy_removal = RedundancyRemoval::default();
+        let mut dce = DCE::default();
 
-        if args.optimize {
-            compiler.attach(&mut constant_folder);
-        }
+        // if args.optimize {
+        compiler.attach(&mut constant_folder);
+        // }
 
         compiler.attach(&mut redundancy_removal);
+        compiler.attach(&mut dce);
         compiler.attach(&mut label_conversion);
 
         match compiler.compile(&program) {

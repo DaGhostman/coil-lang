@@ -44,6 +44,7 @@ pub enum TokenKind {
     Dot,
     DotDot,
     DotDotDot,
+    DotDotEqual,
     FatArrow,
     Less,
     LessEqual,

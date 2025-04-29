@@ -202,13 +202,16 @@ impl<const N: usize> TypeChecker<N> {
         while ip < code.len() {
             let op = &code[ip];
 
-            println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
-                data.get_type(*n).output(data)
-            }).collect::<Vec<String>>().join(", "));
+            // println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
+            //     data.get_type(*n).output(data)
+            // }).collect::<Vec<String>>().join(", "));
 
             match op.code() {
                 Operation::Const => {
                     self.push(data.find_type(*data.constant_type(op.operands()[0])));
+                }
+                Operation::Pop => {
+                    self.pop(op.get(0));
                 }
                 Operation::Class => {
                     let [owner, ..] = op.operands();
@@ -223,6 +226,9 @@ impl<const N: usize> TypeChecker<N> {
                         }
                     }
                 }
+                Operation::Inc | Operation::Dec => {
+                    self.push(variables[&op.get(0)]);
+                }
                 Operation::Add
                 | Operation::Subtract
                 | Operation::Multiply
@@ -233,6 +239,7 @@ impl<const N: usize> TypeChecker<N> {
 
                     let int = data.find_type(Type::integer());
                     let float = data.find_type(Type::float());
+                    let string = data.find_type(Type::string());
 
                     if self.match_type(data, rhs, int) && self.match_type(data, lhs, int) {
                         self.push(int)
@@ -243,6 +250,8 @@ impl<const N: usize> TypeChecker<N> {
                         (self.match_type(data, rhs, float) && self.match_type(data, lhs, int))
                     {
                         self.push(float);
+                    } else if self.match_type(data, lhs, string) {
+                        self.push(string);
                     } else {
                         self.error(
                             format!(
@@ -255,6 +264,34 @@ impl<const N: usize> TypeChecker<N> {
                         );
                     }
                 }
+                Operation::Pow => {
+                    let rhs = self.pop(1);
+                    let lhs = self.pop(1);
+
+                    let int = data.add_type(Type::integer());
+                    let float = data.add_type(Type::float());
+
+                    if !(self.match_type(data, lhs, int) || self.match_type(data, lhs,float)) {
+                        self.error(format!("Unable to raise value of type {lhs} to power"), op.metadata());
+                    } else if !(self.match_type(data, rhs, int) || self.match_type(data, rhs, float)) {
+                        self.error(format!("Unabel to use {rhs} as power"), op.metadata());
+                    } else {
+                        self.push(lhs);
+                    }
+                }
+                Operation::LeftShift | Operation::RightShift | Operation::BitAnd | Operation::BitOr | Operation::BitXor => {
+                    let rhs = self.pop(1);
+                    let lhs = self.pop(1);
+
+                    let int = data.add_type(Type::integer());
+                    if !self.match_type(data, lhs, int) {
+                        self.error(format!("Unable to perform bitwise operation on non-integer({lhs}) value"), op.metadata());
+                    } else if !self.match_type(data, rhs, int) {
+                        self.error(format!("Unabele to perform bitwise operation on integer using non-integer({rhs}) operand"), op.metadata());
+                    }
+
+                    self.push(int);
+                },
                 Operation::Greater
                 | Operation::GreaterEqual
                 | Operation::LessEqual
@@ -283,19 +320,16 @@ impl<const N: usize> TypeChecker<N> {
                 Operation::Argument => {
                     let [name, ..] = op.operands();
 
-
                     variables.insert(name, op.kind());
                 }
+                Operation::Print => {
+                    self.pop(1);
+                }
                 Operation::TypeOf => {
-                    let ty = self.pop(1);
+                    let _ = self.pop(1);
 
                     let constant_type = data.add_type(Type::new(Kind::Type));
-                    let constant = data.add_constant(Value::TYPE(ty), constant_type);
-
                     self.push(constant_type);
-                    bytecode.push(IR::new(Operation::Const, [constant, 0, 0]));
-                    ip += 1;
-                    continue;
                 }
                 Operation::Store | Operation::Declare | Operation::Assign => {
                     let [name, ..] = op.operands();
@@ -337,6 +371,9 @@ impl<const N: usize> TypeChecker<N> {
                             );
                         }
 
+                        self.pop(op.get(1));
+
+
                         for param in instance.arguments() {
                             if let Kind::Generic(name, substitute) = data.get_type(*param).kind() {
                                 if !self.class_params[&n].contains_key(&name) {
@@ -357,7 +394,7 @@ impl<const N: usize> TypeChecker<N> {
                                         data.get_type(constraint).output(data),
                                     ), op.metadata());
                                 }
-                            }
+                            } 
                         }
 
 
@@ -366,7 +403,38 @@ impl<const N: usize> TypeChecker<N> {
                 }, 
                 Operation::This => self.push(op.kind()),
                 Operation::Load => {
-                    self.push(variables[&op.operands()[0]])
+                    // for (n, t) in &variables {
+                    //     println!("{}: {}", data.symbol_name(**n), data.get_type(*t).kind());
+                    // }
+                    // println!("Expected: {}: {}", data.symbol_name(op.operands()[0]), data.get_type(op.kind()).kind());
+
+                    if variables.contains_key(&op.operands()[0]) {
+                        self.push(variables[&op.operands()[0]])
+                    } else {
+                        self.push(op.kind());
+                    }
+                }
+                Operation::Range => {
+                    let end = self.pop(1);
+                    let start = self.pop(1);
+
+                    let int = data.add_type(Type::integer());
+
+                    if start == end && start == int {
+                        let ty = data.add_type(Type::new(Kind::Range(start)));
+                        self.push(ty);
+                    } else {
+                        self.error(format!("Unable to build a range with {start} and {end}"), op.metadata());
+                    }
+                }
+                Operation::Iterate => {
+                    let [name, ..] = op.operands();
+                    if let Kind::Range(n) = data.get_type(self.peek(0)).kind() {
+                        
+                        variables.insert(&name, n);
+                    } else {
+                        variables.insert(&name, data.find_type(Type::any()));
+                    }
                 }
                 Operation::Call => {
                     let [name, arity, _] = op.operands();
@@ -374,9 +442,6 @@ impl<const N: usize> TypeChecker<N> {
                     if let Some(func) = self.functions.get(name) {
                         let fn_type = data.get_type(*func);
                         for idx in 0..*arity {
-
-
-
                             if !self.match_type(data, self.peek(idx), fn_type.get(idx)) {
                                 self.errors.push(Error::new(ErrorOrigin::PARSE, format!(
                                     "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
@@ -399,6 +464,7 @@ impl<const N: usize> TypeChecker<N> {
                     match action {
                         0 => {
                             if let Kind::Object(n) = data.get_type(self.peek(0)).kind() {
+                                self.pop(1);
                                 self.push(self.state[&n][name]);
                             }
                         }
@@ -500,13 +566,27 @@ impl<const N: usize> TypeChecker<N> {
                         result = self.resolve_type(data, data.get_type(method).returns());
                         bytecode.push(IR::new(Operation::Invoke, [*name, *call_arity, n]));
                     } else {
-                        println!(" !-- {}", object.output(data));
+                        todo!("Error out on call for non-object");
                     }
+
                     self.pop(1 + call_arity);
                     self.push(result);
 
                     self.scope = scope;
                     ip += 1;
+                    continue;
+                }
+                Operation::Closure => {
+                    let [name, len, ..] = op.operands();
+
+                    self.functions.insert(*name, op.kind());
+                    self.push(op.kind());
+
+                    bytecode.push(*op);
+                    self.expects_return = Some(self.resolve_type(data, data.get_type(op.kind()).returns()));
+                    bytecode.append(&mut self.check(&code[ip + 1..ip + 1+ len ], data));
+
+                    ip += len + 1;
                     continue;
                 }
                 Operation::Function => {
@@ -516,7 +596,7 @@ impl<const N: usize> TypeChecker<N> {
 
                     bytecode.push(*op);
                     self.expects_return = Some(self.resolve_type(data, data.get_type(op.kind()).returns()));
-                    bytecode.append(&mut self.check(&code[ip + 1..ip + 1 + len], data));
+                    bytecode.append(&mut self.check(&code[ip + 1..ip + 1+ len], data));
 
                     ip += len + 1;
                     continue;
@@ -542,6 +622,8 @@ impl<const N: usize> TypeChecker<N> {
                             state
                         });
 
+
+
                     let scope = self.scope;
                     self.scope = owner;
                     bytecode.push(*op);
@@ -555,7 +637,6 @@ impl<const N: usize> TypeChecker<N> {
                 Operation::Leave => {
                     if let Some(expected) = self.expects_return {
                         let sub_expected = self.substitute_type(data, expected);
-                        // println!("{}", data.get_type(sub_expected).output(data));
                         if !self.match_type(data, self.peek(0), sub_expected) && (self.peek(0) != 0) {
                             self.error(format!(
                                 "Expected to return '{}' but it has branch that returns '{}'",

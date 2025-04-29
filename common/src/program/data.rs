@@ -39,11 +39,13 @@ impl Data {
         self.types.intern(value)
     }
 
-    #[must_use] pub fn get_type(&self, index: usize) -> &Type {
+    #[must_use]
+    pub fn get_type(&self, index: usize) -> &Type {
         self.types.lookup(index)
     }
 
-    #[must_use] pub fn find_type(&self, value: Type) -> usize {
+    #[must_use]
+    pub fn find_type(&self, value: Type) -> usize {
         let mut this = self.types.clone();
         let idx = this.intern(value);
 
@@ -77,12 +79,19 @@ impl Data {
         &mut self.constants.lookup_mut(index).0
     }
 
-    #[must_use] pub fn constant_type(&self, index: usize) -> &Type {
+    #[must_use]
+    pub fn constant_type(&self, index: usize) -> &Type {
         self.types.lookup(self.constants.lookup(index).1)
     }
 
     pub fn add_symbol(&mut self, symbol: String, constant: Option<usize>) -> usize {
         self.symbols.insert(symbol, constant)
+        // let x = self.symbols.insert(symbol.clone(), constant);
+        //
+        // if x == 11 || x == 10 || x == 8 {
+        //     println!("{symbol}/{x}");
+        // }
+        // x
     }
 
     #[must_use]
@@ -95,7 +104,12 @@ impl Data {
         self.symbols.constant(symbol)
     }
 
-    #[must_use] pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
+    pub fn symbol_constant_exists(&self, symbol: usize) -> bool {
+        self.symbols.has_constant(symbol)
+    }
+
+    #[must_use]
+    pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
         let constant = self.symbol_constant(symbol);
         self.constant_type(constant)
     }
@@ -131,7 +145,8 @@ impl Data {
         let constant = self.symbols.constant(symbol);
         &self.constants.lookup(constant).0
     }
-    #[must_use] pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
+    #[must_use]
+    pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
         let constant = self.symbols.constant(symbol);
         self.types.lookup(self.constants.lookup(constant).1)
     }

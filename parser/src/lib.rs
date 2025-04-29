@@ -397,6 +397,10 @@ impl<'data> Parser<'data> {
         } else if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
             tokens.push(op!(self, ctx, Assign, [symbol, 0, 0]));
+        } else if self.consume(ctx, TokenKind::PlusPlus) {
+            tokens.push(op!(self, ctx, Inc, [symbol, 0, 0]));
+        } else if self.consume(ctx, TokenKind::MinusMinus) {
+            tokens.push(op!(self, ctx, Dec, [symbol, 0, 0]));
         } else {
             // tokens.append(&mut self.expression(ctx));
             tokens.push(op!(self, ctx, Load, [symbol, 0, 0]));
@@ -451,6 +455,21 @@ impl<'data> Parser<'data> {
         tokens
     }
 
+    fn unary(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let operator = ctx.current().clone();
+        ctx.advance();
+
+        let mut tokens = self.precedence(ctx, Precedence::Assign);
+
+        match operator.kind() {
+            TokenKind::Minus => tokens.push(op!(this, ctx, Negate)),
+            TokenKind::Bang => tokens.push(op!(this, ctx, Not)),
+            _ => unreachable!("Unexpected prefix operator"),
+        }
+
+        tokens
+    }
+
     fn binary(&mut self, ctx: &mut Context, _assignment: bool) -> Vec<IR> {
         let operator = ctx.current().clone();
         ctx.advance();
@@ -458,7 +477,9 @@ impl<'data> Parser<'data> {
 
         match operator.kind() {
             TokenKind::Plus => tokens.push(op!(self, ctx, Add)),
+            TokenKind::PlusPlus => tokens.push(op!(self, ctx, Inc)),
             TokenKind::Minus => tokens.push(op!(self, ctx, Subtract)),
+            TokenKind::MinusMinus => tokens.push(op!(self, ctx, Dec)),
             TokenKind::Star => tokens.push(op!(self, ctx, Multiply)),
             TokenKind::StarStar => tokens.push(op!(self, ctx, Pow)),
             TokenKind::Slash => tokens.push(op!(self, ctx, Divide)),
@@ -499,7 +520,7 @@ impl<'data> Parser<'data> {
             | TokenKind::Greater
             | TokenKind::GreaterEqual => self.comparison(ctx),
             TokenKind::Dot => self.call(ctx),
-            TokenKind::DotDot => self.range(ctx),
+            TokenKind::DotDot | TokenKind::DotDotEqual => self.range(ctx),
             _ => todo!("Unexpected token '{}'", ctx.current.lexeme()),
         }
     }
@@ -742,7 +763,9 @@ impl<'data> Parser<'data> {
     }
 
     fn for_in(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let mut result = vec![];
+        let begin = op!(self, ctx, Begin);
+        let end = op!(self, ctx, End);
+        let mut result = vec![begin];
         let name = ctx.current().to_owned();
         if self.expect(
             ctx,
@@ -765,6 +788,8 @@ impl<'data> Parser<'data> {
                 result.append(&mut body);
             }
         }
+
+        result.push(end);
 
         result
     }
@@ -855,15 +880,60 @@ impl<'data> Parser<'data> {
     }
 
     fn range(&mut self, ctx: &mut Context) -> Vec<IR> {
-        self.expect(ctx, TokenKind::DotDot, "Expected range symbol");
+        let op = ctx.current().kind();
+        ctx.advance();
+
         let mut tokens = self.expression(ctx);
-        tokens.push(op!(self, ctx, Range));
+        tokens.push(op!(
+            self,
+            ctx,
+            Range,
+            [
+                match op {
+                    TokenKind::DotDotEqual => 1,
+                    _ => 0,
+                },
+                0,
+                0
+            ]
+        ));
 
         tokens
     }
 
     fn prefix(&mut self, ctx: &mut Context, _assignment: bool) -> Vec<IR> {
         match ctx.current().kind() {
+            TokenKind::PlusPlus | TokenKind::MinusMinus => {
+                let op = ctx.current().clone();
+                ctx.advance();
+
+                let name = ctx.current.clone();
+                self.expect(ctx, TokenKind::Identifier, "Expected identifier");
+                let mut result = vec![];
+                match op.kind() {
+                    TokenKind::MinusMinus => {
+                        result.push(op!(
+                            self,
+                            ctx,
+                            Dec,
+                            [self.data.add_symbol(name.lexeme().to_string(), None), 1, 0]
+                        ));
+                    }
+                    TokenKind::PlusPlus => {
+                        result.push(op!(
+                            self,
+                            ctx,
+                            Inc,
+                            [self.data.add_symbol(name.lexeme().to_string(), None), 1, 0]
+                        ));
+                    }
+                    _ => (),
+                }
+
+                result
+            }
+            TokenKind::Bang | TokenKind::Minus => self.unary(ctx),
+
             TokenKind::LeftParenthesis => self.grouping(ctx),
             TokenKind::True | TokenKind::False => self.boolean(ctx),
             TokenKind::Number => self.number(ctx),
@@ -876,7 +946,7 @@ impl<'data> Parser<'data> {
             TokenKind::Match => self.match_expression2(ctx),
             TokenKind::If => self.if_expression(ctx),
             TokenKind::Let => self.variable(ctx),
-            TokenKind::Function => self.function(ctx),
+            TokenKind::Function => self.function_expr(ctx),
             TokenKind::New => self.initialize(ctx),
             TokenKind::LeftBracket => self.block(ctx),
             TokenKind::TypeOf => self.typeof_(ctx),
@@ -1025,20 +1095,33 @@ impl<'data> Parser<'data> {
         tokens
     }
 
+    fn function_expr(&mut self, ctx: &mut Context) -> Vec<IR> {
+        let mut result = self.function(ctx);
+
+        if let Some(func) = result.first().copied() {
+            let mut expr = IR::new(Operation::Closure, [func.get(0), result.len(), 0]);
+            expr.set_type(func.kind());
+            result.insert(0, expr);
+        }
+
+        result
+    }
+
     fn function(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut tokens = vec![];
 
         self.consume(ctx, TokenKind::Function);
 
-        let name: String = if self.consume(ctx, TokenKind::Identifier) {
-            ctx.previous().unwrap_or_default().lexeme().to_string()
-        } else {
-            rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(8)
-                .map(char::from)
-                .collect()
-        };
+        let name: String =
+            if self.consume(ctx, TokenKind::Identifier) || self.consume(ctx, TokenKind::New) {
+                ctx.previous().unwrap_or_default().lexeme().to_string()
+            } else {
+                rand::rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(12)
+                    .map(char::from)
+                    .collect()
+            };
 
         let mut body = vec![];
         self.expect(
@@ -1108,8 +1191,17 @@ impl<'data> Parser<'data> {
             kind = self.get_type(ctx);
         }
         body.append(&mut self.block(ctx));
+        // body.push(op!(
+        //     self,
+        //     ctx,
+        //     Const,
+        //     [self.data.add_constant(Value::NONE, 0), 0, 0,]
+        // ));
+        // body.push(op!(self, ctx, Leave));
 
         let symbol = self.name(name, None);
+        body.insert(0, op!(self, ctx, Begin, [symbol, 0, 0]));
+        body.push(op!(self, ctx, End, [symbol, 0, 0]));
 
         let mut func = op!(self, ctx, Function, [symbol, arity, body.len()]);
         let mut func_type = Type::function();
@@ -1121,13 +1213,6 @@ impl<'data> Parser<'data> {
         func.set_type(self.data.add_type(func_type));
 
         tokens.push(func);
-        body.push(op!(
-            self,
-            ctx,
-            Const,
-            [self.data.add_constant(Value::NONE, 0), 0, 0,]
-        ));
-        body.push(op!(self, ctx, Leave));
         tokens.append(&mut body);
 
         tokens
@@ -1169,20 +1254,19 @@ impl<'data> Parser<'data> {
         self.namespace = String::new();
         let mut method = self.function(ctx);
 
-        method.insert(1, IR::new(Operation::This, Default::default()));
         if let Some(code) = method.first_mut() {
-            let operands = code.operands();
+            let [name, arity, len] = code.operands().to_owned();
             let mut symbol = owner;
             symbol = symbol << 16;
-            symbol |= operands[0];
+            symbol |= name;
             symbol = symbol << 1;
             symbol |= usize::from(public);
 
-            let mut method = op!(self, ctx, Method, [symbol, operands[1], operands[2]]);
+            let mut method = op!(self, ctx, Method, [symbol, arity, len]);
             method.set_type(code.kind());
-            // method.attach_metadata(*code.metadata().unwrap());
             *code = method;
-        }
+        };
+        method.insert(1, IR::new(Operation::Bind, Default::default()));
         self.namespace = ns;
 
         method
@@ -1231,9 +1315,9 @@ impl<'data> Parser<'data> {
             }
         }
 
-        class.insert(0, op!(self, ctx, Begin));
+        class.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
         class.insert(0, op!(self, ctx, Implement, [contract, owner, class.len()]));
-        class.push(op!(self, ctx, End));
+        class.push(op!(self, ctx, End, [owner, 0, 0]));
 
         class
     }
@@ -1352,8 +1436,8 @@ impl<'data> Parser<'data> {
             interface.append(&mut method);
         }
 
-        interface.insert(0, op!(self, ctx, Begin));
-        interface.push(op!(self, ctx, End));
+        interface.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
+        interface.push(op!(self, ctx, End, [owner, 0, 0]));
         iface.operands_mut()[1] = interface.len();
         iface.operands_mut()[2] = interface.len();
         interface.insert(0, iface);
@@ -1421,11 +1505,11 @@ impl<'data> Parser<'data> {
         }
         ctx.clear_owner();
 
-        class.insert(0, op!(self, ctx, Begin));
+        class.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
         let mut cls = op!(self, ctx, Class, [owner, class.len(), 0]);
         cls.set_type(self.data.add_type(instance));
-        class.insert(0, cls);
-        class.push(op!(self, ctx, End));
+        class.insert(1, cls);
+        class.push(op!(self, ctx, End, [owner, 0, 0]));
 
         class
     }
@@ -1459,9 +1543,10 @@ impl<'data> Parser<'data> {
             }
 
             let mut arity = 0;
+            let mut arguments = vec![];
             self.expect(ctx, TokenKind::LeftParenthesis, "Expecting '('");
             while !self.consume(ctx, TokenKind::RightParenthesis) {
-                result.append(&mut self.expression(ctx));
+                arguments.append(&mut self.expression(ctx));
                 arity += 1;
                 self.consume(ctx, TokenKind::Comma);
             }
@@ -1470,6 +1555,7 @@ impl<'data> Parser<'data> {
             instance.set_type(self.data.add_type(ty));
 
             result.push(instance);
+            result.append(&mut arguments);
         }
 
         result
@@ -1477,15 +1563,13 @@ impl<'data> Parser<'data> {
 
     fn this(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
-        let mut result = self.expression(ctx);
+        // let mut result = self.expression(ctx);
         let mut this = op!(self, ctx, This);
         if ctx.owner().is_none() {
             panic!("Using 'this' outside of object context");
         }
         this.set_type(self.data.add_type(Type::object(ctx.owner().unwrap())));
-        result.insert(0, this);
-
-        result
+        vec![this]
     }
 
     fn parse_imports(&mut self, ctx: &mut Context, ns: &Vec<String>) -> Vec<Vec<String>> {

@@ -67,7 +67,7 @@ pub enum Value {
     FFI(usize),
     STRING(Objects),
     OBJECT(Objects),
-    ITERATOR(usize),
+    // ITERATOR(Objects, usize),
     TYPE(usize),
 }
 
@@ -314,10 +314,16 @@ impl Hash for Value {
                 "o".hash(state);
                 object.hash(state);
             }
-            Value::ITERATOR(n) => {
-                "iter".hash(state);
-                n.hash(state);
-            }
+            // Value::ITERATOR(o, n) => {
+            //     "iter".hash(state);
+            //     match o {
+            //         Objects::Array(arr) => arr.hash(state),
+            //         Objects::Object(obj) => obj.hash(state),
+            //         Objects::String(val) => val.hash(state),
+            //         Objects::None => 0.hash(state),
+            //     }
+            //     n.hash(state);
+            // }
             Value::TYPE(n) => {
                 "ty".hash(state);
                 n.hash(state);
@@ -352,7 +358,7 @@ impl Debug for Value {
             match self {
                 Value::INTEGER(int) => format!("int({int})"),
                 Value::FLOAT(f) => format!("float({f:.?})"),
-                Value::NONE => String::from("void"),
+                Value::NONE | Value::OBJECT(Objects::None) => String::from("void"),
                 Value::BOOLEAN(b) => format!("bool({b})"),
                 Value::STR(s) => format!("string({s})"),
                 Value::STRING(s) => format!("string({s})"),
@@ -364,8 +370,26 @@ impl Debug for Value {
                 Value::POINTER(n) => format!("pointer({n:p})"),
                 Value::FFI(id) => format!("dynamic({id})"),
                 Value::REFERENCE(idx) => format!("ref({idx:?})"),
-                Value::OBJECT(obj) => format!("obj({})", std::ptr::addr_of!(obj) as u64),
-                Value::ITERATOR(cursor) => format!("iter({cursor})"),
+                Value::OBJECT(Objects::Array(obj)) =>
+                    format!("array(0x{:0x})", std::ptr::addr_of!(obj) as u64),
+                Value::OBJECT(Objects::Object(obj)) =>
+                    format!("obj(0x{:0x})", std::ptr::addr_of!(obj) as u64),
+                Value::OBJECT(Objects::String(obj)) =>
+                    format!("str(0x{:0x})", std::ptr::addr_of!(obj) as u64),
+                Value::OBJECT(Objects::Iterator(obj)) => format!(
+                    "iter(0x{:0x}, {})",
+                    std::ptr::addr_of!(obj) as u64,
+                    obj.as_ref().tell()
+                ),
+                // Value::ITERATOR(obj, cursor) => format!(
+                //     "iter(0x{:0x}, {cursor})",
+                //     match obj {
+                //         Objects::Array(arr) => std::ptr::addr_of!(*arr.as_ref()) as u64,
+                //         Objects::Object(obj) => std::ptr::addr_of!(*obj.as_ref()) as u64,
+                //         Objects::String(val) => std::ptr::addr_of!(*val.as_ref()) as u64,
+                //         Objects::None => 0,
+                //     }
+                // ),
                 Value::TYPE(n) => format!("type({n})"),
             }
         )

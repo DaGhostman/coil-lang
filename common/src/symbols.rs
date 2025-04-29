@@ -36,6 +36,10 @@ impl SymbolTable {
         self.mapping[&symbol]
     }
 
+    pub fn has_constant(&self, symbol: usize) -> bool {
+        self.mapping.contains_key(&symbol)
+    }
+
     #[must_use]
     pub fn name(&self, symbol: usize) -> &String {
         self.names.lookup(symbol)

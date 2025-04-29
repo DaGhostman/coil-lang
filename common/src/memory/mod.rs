@@ -35,14 +35,15 @@ where
         }
     }
 
-    #[inline(always)]
     pub fn pop(&mut self) -> T {
-        self.npop(1)[0]
+        self.sp -= 1;
+        self.stack[self.sp]
     }
 
     pub fn npop(&mut self, n: usize) -> &[T] {
-        let slice = &self.stack[self.sp - n..self.sp];
+        let boundary = self.sp;
         self.sp -= n;
+        let slice = &self.stack[self.sp..boundary];
 
         slice
     }
@@ -52,13 +53,21 @@ where
         self.sp += 1;
     }
 
+    pub fn insert(&mut self, idx: usize, value: T) {
+        self.sp = self.sp.max(idx + 1);
+
+        self.stack[idx] = value;
+    }
+
     pub fn tell(&self, offset: usize) -> usize {
         self.sp - offset
     }
 
     pub fn restore(&mut self, size: usize) {
-        self.pop_to(size);
-        self.sp = size + 1;
+        let val = self.stack[self.sp - 1];
+        self.sp = size;
+        self.stack[self.sp] = val;
+        self.sp += 1;
     }
 
     pub fn peek(&self, offset: usize) -> T {
@@ -77,16 +86,8 @@ where
         self.stack[dst] = self.stack[src];
     }
 
-    pub fn pop_to(&mut self, dst: usize) {
-        // if self.sp - dst != 1 {
-        self.sp -= 1;
-        self.stack[dst] = self.stack[self.sp];
-        // }
-    }
-
     pub fn copy_to_top(&mut self, src: usize) {
         self.stack[self.sp] = self.stack[src];
-
         self.sp += 1;
     }
 
@@ -124,6 +125,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct StackIterator<T> {
     items: Vec<T>,
     length: usize,
@@ -195,6 +197,7 @@ impl Heap {
 
         while let Some(mut curr_ref) = curr_obj {
             let next = curr_ref.get_next();
+
             if curr_ref.is_marked() {
                 curr_ref.unmark();
                 prev_obj = curr_obj;
@@ -239,10 +242,12 @@ impl Heap {
             Objects::Array(value) => value.release(),
             Objects::String(value) => value.release(),
             Objects::Object(value) => value.release(),
+            Objects::Iterator(value) => value.release(),
         }
     }
 
-    #[must_use] pub fn iter(&self) -> Iter {
+    #[must_use]
+    pub fn iter(&self) -> Iter {
         <&Self as IntoIterator>::into_iter(self)
     }
 }

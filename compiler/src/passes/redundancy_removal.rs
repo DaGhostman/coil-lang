@@ -3,6 +3,8 @@ use common::{
     program::program::Program,
 };
 
+use rustc_hash::FxHashMap as HashMap;
+
 use crate::CompilationPass;
 
 #[derive(Default)]
@@ -16,12 +18,21 @@ impl CompilationPass for RedundancyRemoval {
     ) -> Result<Vec<common::opcodes::Code>, common::error::Error> {
         let mut new_code = Vec::with_capacity(code.len());
         let mut ip = 0;
-        while ip < code.len() {
+
+        // HashMap<label, (position, length)>
+        // let labels: HashMap<usize, (usize, usize)> = Default::default();
+
+        // for op in code {
+        //     if *op.byte() == Byte::Label {
+        //         labels.insert(op.operand(0), ());
+        //     }
+        // }
+        let length = code.len();
+
+        while ip < length {
             match code[ip].byte() {
                 Byte::Pop => {
-                    if code[ip].operand(0) == 0 {
-                        ();
-                    } else if *code[ip + 1].byte() == Byte::Pop {
+                    if *code[ip + 1].byte() == Byte::Pop {
                         new_code.push(Code::new_with_operands(
                             Byte::Pop,
                             [code[ip].operand(0) + code[ip + 1].operand(0), 0, 0],
@@ -36,6 +47,7 @@ impl CompilationPass for RedundancyRemoval {
 
             ip += 1;
         }
+
         Ok(new_code)
     }
 }

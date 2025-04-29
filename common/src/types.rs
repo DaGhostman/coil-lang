@@ -16,7 +16,7 @@ pub enum Kind {
     Integer,
     Float,
     String,
-    Range,
+    Range(usize),
     Function,
     Resource,
     Pointer,
@@ -273,7 +273,7 @@ impl From<&Value> for Kind {
             Value::INTEGER(_) => Kind::Integer,
             Value::FLOAT(_) => Kind::Float,
             Value::OBJECT(Objects::String(_)) | Value::STR(_) | Value::STRING(_) => Kind::String,
-            Value::RANGE(_, _) => Kind::Range,
+            // Value::RANGE(_, _) => Kind::Range,
             // ValueKind::FILE(_) => Type::
             Value::FUNCTION(_, _) => Kind::Function,
             Value::FILE(_) | Value::RESOURCE(_) => Kind::Resource,
@@ -288,10 +288,8 @@ impl From<&Value> for Kind {
             }
             Value::OBJECT(Objects::Object(o)) => Kind::Object(o.as_ref().name()),
             Value::OBJECT(Objects::Array(a)) => Kind::List(a.as_ref().len()),
-            Value::ITERATOR(_) => {
-                unreachable!("Iterator how to");
-            }
             Value::TYPE(_) => Kind::Type,
+            _ => Kind::Wildcard,
         }
     }
 }
@@ -308,7 +306,7 @@ impl Display for Kind {
                 Kind::Float => "float",
                 Kind::String => "string",
                 Kind::Function => "func",
-                Kind::Range => "range",
+                Kind::Range(_) => "range",
                 Kind::Resource => "resource",
                 Kind::Pointer => "pointer",
                 Kind::Reference => "reference",
@@ -333,7 +331,7 @@ impl From<Kind> for FFIType {
             Kind::Bool => unsafe { uint8 },
             Kind::Integer => unsafe { sint64 },
             Kind::Float => unsafe { double },
-            Kind::String | Kind::Range => unsafe { pointer },
+            Kind::String | Kind::Range(_) => unsafe { pointer },
             Kind::Resource | Kind::Pointer => unsafe { pointer },
             _ => todo!("Handle other types"),
         }

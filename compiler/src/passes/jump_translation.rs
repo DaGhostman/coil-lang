@@ -78,7 +78,11 @@ impl CompilationPass for LabelUnrolling {
                 }
                 Byte::Iterate => Code::new_with_operands(
                     Byte::Iterate,
-                    [self.jump_at(code.operand(0)), code.operand(1), 0],
+                    [
+                        self.jump_at(code.operand(0)),
+                        code.operand(1),
+                        code.operand(2),
+                    ],
                 ),
                 Byte::Method => Code::new_with_operands(
                     Byte::Method,
@@ -106,7 +110,6 @@ impl CompilationPass for LabelUnrolling {
 
                     *code
                 }
-                // Byte::Method => {}
                 _ => *code,
             });
         }

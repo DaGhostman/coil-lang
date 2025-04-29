@@ -14,701 +14,310 @@ impl CompilationPass for ConstantFolding {
         code: &[Code],
         data: &mut Data,
     ) -> Result<Vec<Code>, common::error::Error> {
+        let mut code = code.to_vec();
         let mut length = code.len();
+        let mut modified: Vec<Code> = Vec::with_capacity(length);
+
+        macro_rules! binary {
+            ($lhs:expr, $rhs:expr, $op:tt) => {
+                {
+                        let result = Value::from($lhs $op $rhs);
+                        let r#type = data.find_type(Type::new(result.into()));
+                        let result = data.add_constant(result, r#type);
+
+                        modified.pop();
+                        modified.pop();
+                        modified.push(Code::new_with_operands(Byte::Push, [result, 0, 0]));
+                }
+            };
+        }
+
+        macro_rules! unary {
+            ($rhs:expr, $op:tt) => {
+                {
+                    let result = Value::from($op $rhs);
+                        let r#type = data.find_type(Type::new(result.into()));
+                        let result = data.add_constant(result, r#type);
+
+                        modified.pop();
+                        modified.push(Code::new_with_operands(Byte::Push, [result, 0, 0]));
+                }
+            }
+        }
+
+        macro_rules! comparison {
+            ($lhs:expr, $rhs: expr, $op: tt, $current:expr) => {{
+                if *$lhs.byte() == Byte::Push && *$rhs.byte() == Byte::Push {
+                    let r#type = data.add_type(Type::bool());
+                    let result = data.add_constant(Value::from(data.constant($lhs.operand(0)) $op data.constant($rhs.operand(0))), r#type);
+
+                    modified.pop();
+                    modified.pop();
+                    modified.push(Code::new_with_operands(Byte::Push, [result, 0, 0]));
+                } else {
+                    modified.push(*$current);
+                }
+            }};
+        }
+
+        macro_rules! math {
+            ($lhs:expr, $rhs: expr, $op: tt, $current:expr) => {{
+                if *$lhs.byte() == Byte::Push && *$rhs.byte() == Byte::Push {
+                    let l = data.constant($lhs.operand(0)).to_owned();
+                    let r = data.constant($rhs.operand(0)).to_owned();
+
+                    match (l, r) {
+                        (Value::INTEGER(lhs), Value::INTEGER(rhs)) => binary!(lhs, rhs, $op),
+                        (Value::FLOAT(lhs), Value::FLOAT(rhs)) => binary!(lhs, rhs, $op),
+                        (Value::INTEGER(lhs), Value::FLOAT(rhs)) => binary!(lhs as f64, rhs, $op),
+                        (Value::FLOAT(lhs), Value::INTEGER(rhs)) => binary!(lhs, rhs as f64, $op),
+                        (Value::STR(lhs), Value::STR(rhs)) => {
+                            let r#type = data.add_type(Type::string());
+                            let concatenated = data.add_string(format!(
+                                "{}{}",
+                                data.string(lhs),
+                                data.string(rhs)
+                            ));
+                            let result = data.add_constant(Value::STR(concatenated), r#type);
+
+                            modified.push(Code::new_with_operands(Byte::Push, [result, 0, 0]));
+                        }
+                        _ => {
+                            modified.push(*$current);
+                        }
+                    }
+                } else {
+                    modified.push(*$current);
+                }
+            }};
+        }
+        macro_rules! bitwise {
+            ($lhs:expr, $rhs: expr, $op: tt, $current:expr) => {{
+                if *$lhs.byte() == Byte::Push && *$rhs.byte() == Byte::Push {
+                    match (
+                        data.constant($lhs.operand(0)),
+                        data.constant($rhs.operand(0)),
+                    ) {
+                        (Value::INTEGER(lhs), Value::INTEGER(rhs)) => binary!(lhs, rhs, $op),
+                        _ => {
+                            modified.push(*$current);
+                        }
+                    }
+                } else {
+                    modified.push(*$current);
+                }
+            }};
+        }
+
+        macro_rules! prefix {
+            ($rhs:expr, $op: tt, $current:expr) => {{
+                if *$rhs.byte() == Byte::Push {
+                    match data.constant($rhs.operand(0)) {
+                        Value::INTEGER(rhs) => unary!(rhs, $op),
+                        _ => {
+                            modified.push(*$current);
+                        }
+                    }
+                } else {
+                    modified.push(*$current);
+                }
+            }};
+        }
 
         loop {
-            let mut modified: Vec<Code> = Vec::with_capacity(code.len());
-
             let mut cursor = 0;
             while let Some(op) = code.get(cursor) {
                 cursor += 1;
 
                 match op.byte() {
                     Byte::Label => {
+                        modified.push(*op);
                         let offset = op.operand(1);
-                        if let Ok(chunk) = self.compile(&code[cursor..cursor + offset], data) {
+                        if let Ok(mut chunk) = self.compile(&code[cursor..cursor + offset], data) {
                             modified.push(Code::new_with_operands(
                                 Byte::Label,
                                 [op.operand(0), chunk.len(), 0],
                             ));
-                            modified.extend(chunk);
+                            modified.append(&mut chunk);
                         }
                         cursor += offset;
                     }
-                    Byte::Add => {
-                        let rhs = modified.last();
-                        let lhs = modified.get(modified.len() - 2);
+                    Byte::TypeOf => {
+                        let prev = modified.last();
 
-                        if let (Some(Byte::Push), Some(Byte::Push)) = (
-                            rhs.map(common::opcodes::Code::byte),
-                            lhs.map(common::opcodes::Code::byte),
-                        ) {
-                            match (
-                                lhs.map(|c| data.constant(c.operand(0))),
-                                rhs.map(|c| data.constant(c.operand(0))),
-                            ) {
-                                (Some(Value::INTEGER(lhs)), Some(Value::INTEGER(rhs))) => {
-                                    let c = data.add_constant(
-                                        Value::INTEGER(lhs + rhs),
-                                        data.find_type(Type::new(Kind::Integer)),
-                                    );
-                                    modified.pop();
-                                    modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
-                                }
-                                (Some(Value::FLOAT(lhs)), Some(Value::FLOAT(rhs))) => {
-                                    let c = data.add_constant(
-                                        Value::from(lhs + rhs),
-                                        data.find_type(Type::new(Kind::Float)),
-                                    );
-                                    modified.pop();
-                                    modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
-                                }
-                                (Some(Value::INTEGER(lhs)), Some(Value::FLOAT(rhs))) => {
-                                    let c = data.add_constant(
-                                        Value::from((*lhs as f64) + rhs),
-                                        data.find_type(Type::new(Kind::Float)),
-                                    );
-                                    modified.pop();
-                                    modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
-                                }
-                                (Some(Value::FLOAT(lhs)), Some(Value::INTEGER(rhs))) => {
-                                    let c = data.add_constant(
-                                        Value::from(lhs + (*rhs as f64)),
-                                        data.find_type(Type::new(Kind::Float)),
-                                    );
-                                    modified.pop();
-                                    modified.pop();
-                                    modified.push(Code::new_with_operands(Byte::Push, [c, 0, 0]));
-                                }
-                                _ => {
-                                    // dbg!("NONO", &a, &b);
-                                    modified.push(op.to_owned());
-                                }
-                            }
+                        if let Some((Byte::Push, ty)) =
+                            prev.map(|code| (code.byte(), code.get_type()))
+                        {
+                            modified.pop();
+
+                            let val = Value::TYPE(ty);
+                            let ty = data.add_type(Type::new(Kind::Type));
+                            let constant = data.add_constant(val, ty);
+
+                            modified.pop();
+                            modified.push(Code::new_with_operands(Byte::Push, [constant, 0, 0]));
                         } else {
-                            modified.push(op.to_owned());
+                            modified.push(*op);
                         }
                     }
+                    Byte::Negate => {
+                        let rhs = modified[modified.len() - 1];
+
+                        prefix!(rhs, -, op);
+                    }
+                    Byte::Not => {
+                        let rhs = modified[modified.len() - 1];
+
+                        prefix!(rhs, !, op);
+                    }
+                    Byte::Add => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        math!(lhs, rhs, +, op);
+                    }
+                    Byte::Sub => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        math!(lhs, rhs, -, op);
+                    }
+                    Byte::Mul => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        math!(lhs, rhs, *, op);
+                    }
+                    Byte::Div => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        math!(lhs, rhs, /, op);
+                    }
+                    Byte::Mod => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        math!(lhs, rhs, %, op);
+                    }
+                    Byte::Pow => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        if *lhs.byte() == Byte::Push && *rhs.byte() == Byte::Push {
+                            let lhs = *data.constant(lhs.operand(0));
+                            let rhs = *data.constant(rhs.operand(0));
+
+                            let result = match (lhs, rhs) {
+                                (Value::INTEGER(lhs), Value::INTEGER(rhs)) => {
+                                    modified.pop();
+                                    modified.pop();
+                                    Value::INTEGER(lhs.pow(rhs as u32))
+                                }
+                                (Value::FLOAT(lhs), Value::INTEGER(rhs)) => {
+                                    modified.pop();
+                                    modified.pop();
+                                    Value::FLOAT(lhs.powf(rhs as f64))
+                                }
+                                (Value::INTEGER(lhs), Value::FLOAT(rhs)) => {
+                                    modified.pop();
+                                    modified.pop();
+                                    Value::INTEGER(lhs.pow(rhs as u32))
+                                }
+                                (Value::FLOAT(lhs), Value::FLOAT(rhs)) => {
+                                    modified.pop();
+                                    modified.pop();
+                                    Value::FLOAT(lhs.powf(rhs))
+                                }
+                                _ => {
+                                    modified.pop();
+                                    modified.pop();
+
+                                    Value::NONE
+                                }
+                            };
+
+                            let r#type = data.add_type(Type::new(result.into()));
+                            let result = data.add_constant(result, r#type);
+
+                            modified.push(Code::new_with_operands(Byte::Push, [result, 0, 0]));
+                        } else {
+                            modified.push(*op);
+                        }
+                    }
+                    Byte::LShift => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        bitwise!(lhs, rhs, <<, op);
+                    }
+                    Byte::RShift => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        bitwise!(lhs, rhs, >>, op);
+                    }
+                    Byte::BOr => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        bitwise!(lhs, rhs, |, op);
+                    }
+                    Byte::BAnd => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        bitwise!(lhs, rhs, &, op);
+                    }
+                    Byte::Xor => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        bitwise!(lhs, rhs, ^, op);
+                    }
+                    Byte::Less => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        comparison!(lhs, rhs, <, op);
+                    }
+                    Byte::LessEqual => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        comparison!(lhs, rhs, <=, op);
+                    }
+                    Byte::Equal => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        comparison!(lhs, rhs, ==, op);
+                    }
+                    Byte::GreaterEqual => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        comparison!(lhs, rhs, >=, op);
+                    }
+                    Byte::Greater => {
+                        let rhs = modified[modified.len() - 1];
+                        let lhs = modified[modified.len() - 2];
+
+                        comparison!(lhs, rhs, >, op);
+                    }
                     _ => {
-                        modified.push(op.to_owned());
+                        modified.push(*op);
                     }
                 }
             }
 
-            //
-            // loop {
-            //     let mut cursor = 0;
-            //     modified = vec![];
-            //
-            //     while let Some(op) = code.get(cursor) {
-            //         match op.code() {
-            //             Operation::Add => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant((
-            //                                 ValueKind::INTEGER(lhs.wrapping_add(*rhs)),
-            //                             ));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                             modified.push(IR::new(Operation::Noop, None));
-            //                         }
-            //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::FLOAT(lhs.add(rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                             modified.push(IR::new(Operation::Noop, None));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Subtract => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant((
-            //                                 ValueKind::INTEGER(lhs.wrapping_sub(*rhs)),
-            //                             ));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::FLOAT(lhs.sub(rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Multiply => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant((
-            //                                 ValueKind::INTEGER(lhs.wrapping_mul(*rhs)),
-            //                             ));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::FLOAT(lhs.sub(rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Divide => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant((
-            //                                 ValueKind::INTEGER(lhs.wrapping_div(*rhs)),
-            //                             ));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::FLOAT(lhs.sub(rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Modulo => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code.add_constant((
-            //                                 ValueKind::INTEGER(lhs.wrapping_rem(*rhs)),
-            //                             ));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::FLOAT(lhs.rem(rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Pow => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant =
-            //                                 code.add_constant((ValueKind::INTEGER(
-            //                                     lhs.wrapping_pow((*rhs).try_into().unwrap_or_default()),
-            //                                 )));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         (Some(ValueKind::FLOAT(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::FLOAT(lhs.powf(*rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::FLOAT(lhs))) => {
-            //                             let constant = code.add_constant((ValueKind::FLOAT(
-            //                                 lhs.powi((*rhs).try_into().unwrap_or_default()),
-            //                             )));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Equal => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(rhs), Some(lhs)) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::BOOLEAN(lhs == rhs)));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::NotEqual => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(rhs), Some(lhs)) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::BOOLEAN(lhs != rhs)));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Less => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(rhs), Some(lhs)) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::BOOLEAN(lhs < rhs)));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::LessEqual => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(rhs), Some(lhs)) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::BOOLEAN(lhs <= rhs)));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::Greater => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(rhs), Some(lhs)) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::BOOLEAN(lhs > rhs)));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::GreaterEqual => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(rhs), Some(lhs)) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::BOOLEAN(lhs >= rhs)));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::LeftShift => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant = code
-            //                                 .add_constant((ValueKind::INTEGER(lhs.shl(rhs))));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::RightShift => {
-            //                 let rhs = modified.get(modified.len() - 1);
-            //                 let lhs = modified.get(modified.len() - 2);
-            //
-            //                 if let (Some(Operation::Const), Some(Operation::Const)) =
-            //                     (rhs.map(|c| c.code()), lhs.map(|c| c.code()))
-            //                 {
-            //                     // Here we pop so we can remove the values
-            //                     // this heavily relies that the type-checker
-            //                     // has covered all the cases and the folding
-            //                     // will not result in any type-errors
-            //                     match (
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                         modified.pop().map(|c| {
-            //                             constants.lookup(c.get(0).copied().unwrap_or_default())
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         }),
-            //                     ) {
-            //                         (Some(ValueKind::INTEGER(rhs)), Some(ValueKind::INTEGER(lhs))) => {
-            //                             let constant =
-            //                                 code.add_constant((ValueKind::INTEGER(
-            //                                     lhs.wrapping_shr((*rhs).try_into().unwrap_or_default()),
-            //                                 )));
-            //                             modified
-            //                                 .push(IR::new(Operation::Const, Some([constant, 0, 0])));
-            //                         }
-            //                         _ => modified.push(*op),
-            //                     }
-            //                 } else {
-            //                     modified.push(*op);
-            //                 }
-            //             }
-            //             Operation::ConditionJump => {
-            //                 eprintln!("Handle JUMP elimination");
-            //                 modified.push(*op);
-            //             }
-            //             Operation::Range => {
-            //                 let last = modified.len() - 1;
-            //                 match (
-            //                     modified.get(last).map(|c| c.code()),
-            //                     modified.get(last - 1).map(|c| c.code()),
-            //                 ) {
-            //                     (Some(Operation::Const), Some(Operation::Const)) => {
-            //                         let rhs = modified.get(last).map(|ir| {
-            //                             ir.get(0)
-            //                                 .map(|c| constants.lookup(*c).unwrap_or(&default_value))
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         });
-            //                         let lhs = modified.get(last - 1).map(|ir| {
-            //                             ir.get(0)
-            //                                 .map(|c| constants.lookup(*c).unwrap_or(&default_value))
-            //                                 .unwrap_or(&default_value)
-            //                                 .kind()
-            //                         });
-            //
-            //                         match (lhs, rhs) {
-            //                             (
-            //                                 Some(ValueKind::INTEGER(lhs)),
-            //                                 Some(ValueKind::INTEGER(rhs)),
-            //                             ) => {
-            //                                 // drop the ranges for a single value range
-            //                                 modified.pop();
-            //                                 modified.pop();
-            //
-            //                                 modified.push(IR::new(
-            //                                     Operation::Const,
-            //                                     Some([
-            //                                         code.add_constant((ValueKind::RANGE(
-            //                                             *lhs, *rhs,
-            //                                         ))),
-            //                                         0,
-            //                                         0,
-            //                                     ]),
-            //                                 ));
-            //                             }
-            //                             _ => (),
-            //                         }
-            //                     }
-            //                     _ => (),
-            //                 }
-            //             }
-            //             _ => {
-            //                 modified.push(*op);
-            //             }
-            //         }
-            //         cursor += 1;
-            //     }
+            length = modified.len().to_owned();
             if length == modified.len() {
                 return Ok(modified);
             }
-            length = modified.len();
+
+            code = modified.clone();
+            modified.drain(0..);
         }
     }
 }
