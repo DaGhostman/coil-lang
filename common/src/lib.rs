@@ -381,6 +381,8 @@ impl Debug for Value {
                     std::ptr::addr_of!(obj) as u64,
                     obj.as_ref().tell()
                 ),
+                Value::OBJECT(Objects::Coroutine(coro)) =>
+                    format!("coro(0x{:0x})", std::ptr::addr_of!(coro) as u64,),
                 // Value::ITERATOR(obj, cursor) => format!(
                 //     "iter(0x{:0x}, {cursor})",
                 //     match obj {

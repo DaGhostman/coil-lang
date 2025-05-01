@@ -50,7 +50,7 @@ impl Variables {
         if let Some(size) = self.scopes.pop() {
             self.storage
                 .retain(|(slot, _), var| var.position <= size && *slot <= self.scope);
-            return size - self.storage.len();
+            size - self.storage.len()
         } else {
             unreachable!("There are no more scopes available");
         }
@@ -206,7 +206,7 @@ impl Variables {
         }
         let key = scope.first().unwrap();
 
-        self.storage.get_mut(&key)
+        self.storage.get_mut(key)
     }
 }
 
@@ -284,16 +284,16 @@ impl Context {
 
     pub fn leave(&mut self) -> usize {
         // let scope = self.current.pop();
+        // println!(
+        //     "{}Leaving: {}",
+        //     "-".repeat(self.current.len()),
+        //     scope.unwrap_or(42069)
+        // );
         self.current.pop();
         self.tco.pop();
         if self.frame > 0 {
             self.frame -= 1;
         }
-        // println!(
-        //     "{}Leaving: {}",
-        //     "-".repeat(self.current.len()),
-        //     scope.unwrap()
-        // );
         self.variables.leave()
     }
 
@@ -367,7 +367,7 @@ impl Context {
 }
 
 impl<'compilation> Compiler<'compilation> {
-    pub fn new(data: Data) -> Self {
+    #[must_use] pub fn new(data: Data) -> Self {
         Self {
             data,
             context: Context::default(),
@@ -409,9 +409,11 @@ impl<'compilation> Compiler<'compilation> {
                 skips -= 1;
                 continue;
             }
+            // eprintln!("#{cursor:0>8}\t{:?}", op.code());
 
             bytecode.append(&mut match op.code() {
                 Operation::Begin => {
+                    // println!("Name: {}", self.data.symbol_name(op.get(0)));
                     self.context.enter(op.get(0));
                     vec![]
                 }
@@ -544,6 +546,7 @@ impl<'compilation> Compiler<'compilation> {
                     let symbol = self.data.symbol_name(*name);
                     self.data.add_symbol(symbol.to_owned(), Some(constant));
 
+                    // dbg!(&code[cursor..], self.data.symbol_name(*name));
                     let chunk = &code[cursor..cursor + len];
 
                     match self.do_compile(chunk) {
@@ -616,7 +619,6 @@ impl<'compilation> Compiler<'compilation> {
                     let [name, ..] = op.operands();
 
                     if !self.context.variables().has(*name) {
-                        dbg!(op.metadata());
                         return Err(Error::new(
                             ErrorOrigin::COMPILE,
                             format!(
@@ -650,6 +652,9 @@ impl<'compilation> Compiler<'compilation> {
 
                     result
                 }
+                Operation::Yield => {
+                    vec![Code::new(Byte::Yield)]
+                }
                 Operation::Call => {
                     let mut result = vec![];
                     let [symbol, call_arity, ..] = op.operands();
@@ -658,49 +663,47 @@ impl<'compilation> Compiler<'compilation> {
                         let const_ = self.data.symbol_constant(*symbol);
 
 
-                    if let Value::FUNCTION(definition_arity, _) = self.data.constant(const_) {
-                        if call_arity == definition_arity {
-                            let constant = self.data.symbol_constant(*symbol);
-                            // if self.context.current() == Some(&symbol)
-                            //     && code[cursor].code() == Operation::Leave
-                            // {
-                            //     self.context.set_tco(true);
-                            //
-                            //     result.push(Code::new_with_operands(Byte::Jump, [*symbol, 0, 0]));
-                            // } else {
-                                result.push(Code::new_with_operands(Byte::Push, [constant, 0, 0]));
-                                let mut call =
-                                    Code::new_with_operands(Byte::Call, [*call_arity, 0, 0]);
+                        if let Value::FUNCTION(definition_arity, _) = self.data.constant(const_) {
+                            if call_arity == definition_arity {
+                                let constant = self.data.symbol_constant(*symbol);
+                                // if self.context.current() == Some(&symbol)
+                                //     && code[cursor].code() == Operation::Leave
+                                // {
+                                //     self.context.set_tco(true);
+                                //
+                                //     result.push(Code::new_with_operands(Byte::Jump, [*symbol, 0, 0]));
+                                // } else {
+                                    result.push(Code::new_with_operands(Byte::Push, [constant, 0, 0]));
+                                    let mut call =
+                                        Code::new_with_operands(Byte::Call, [*call_arity, 0, 0]);
 
-                                call.with_type(self.data.symbol_constant_type(*symbol).returns());
+                                    call.with_type(self.data.symbol_constant_type(*symbol).returns());
 
-                                result.push(call);
-                            // }
-                        } else {
-                            return Err(Error::new(
-                                common::error::ErrorOrigin::COMPILE,
-                                format!(
-                                    "Function '{}' called with {} arguments, while expecting {}",
-                                    self.data.symbol_name(*symbol),
-                                    call_arity,
-                                    definition_arity,
-                                ),
-                            ));
+                                    result.push(call);
+                                // }
+                            } else {
+                                return Err(Error::new(
+                                    common::error::ErrorOrigin::COMPILE,
+                                    format!(
+                                        "Function '{}' called with {} arguments, while expecting {}",
+                                        self.data.symbol_name(*symbol),
+                                        call_arity,
+                                        definition_arity,
+                                    ),
+                                ));
+                            }
                         }
-                    }
-                    } else {
-                        if self.context.variables.has(*symbol) {
+                    } else if self.context.variables.has(*symbol) {
                         let variable = self.context.variables().get(*symbol);
 
                         result.push(Code::new_with_operands(Byte::Load, [variable.position, 0, 0]));
                         let mut call = Code::new_with_operands(Byte::Call, [*call_arity, 0, 0]);
                         call.with_type(self.data.get_type(variable.r#type).returns());
                         result.push(call);
-                        } else {
-                            panic!("Unable to call '{}' as function as it does not exist", self.data.symbol_name(*symbol));
-                        }
-
+                    } else {
+                        panic!("Unable to call '{}' as function as it does not exist", self.data.symbol_name(*symbol));
                     }
+
 
                     result
                 }
@@ -888,7 +891,7 @@ impl<'compilation> Compiler<'compilation> {
                         self.label(Some(self.data.symbol_name(name).to_owned()))
                     };
 
-                    skips += len;
+                    skips += len + 1;
 
                     self.context.add_method(public, owner, name, label);
                     // self.context.enter(name);
@@ -898,7 +901,7 @@ impl<'compilation> Compiler<'compilation> {
                     // dbg!(self.context.variables().seal(this));
                     // let var = self.context.variables().get(this).position;
                     // result.push(Code::new_with_operands(Byte::Load, [var, 0, 0]));
-                    match self.do_compile(&code[cursor..cursor + len]) {
+                    match self.do_compile(&code[cursor..=(cursor + len)]) {
                         Ok(mut body) => {
                             let ty = self.data.add_type(Type::void());
                             body.push(Code::new_with_operands(
@@ -921,7 +924,7 @@ impl<'compilation> Compiler<'compilation> {
                     let mut implementation = vec![];
                     let [interface, class, len] = op.operands();
 
-                    let methods = self.context.interfaces[&interface].methods.clone();
+                    let methods = self.context.interfaces[interface].methods.clone();
 
                     for (name, method) in methods {
                         if let Ok(mut body) = self.do_compile(&method) {
@@ -970,7 +973,9 @@ impl<'compilation> Compiler<'compilation> {
 
                     let [owner, len, ..] = op.operands();
                     self.context.define_class(*owner);
-                    skips += len - 1;
+                    skips += len;
+
+
                     match self.do_compile(&code[cursor..cursor + len]) {
                         Ok(mut body) => {
                             class.append(&mut body);
@@ -994,27 +999,35 @@ impl<'compilation> Compiler<'compilation> {
                         .methods
                         .contains_key(&constructor)
                     {
-                        let (label, _) = self.context.classes[&name].methods[&constructor];
+                        let (label, _) = self.context.classes[name].methods[&constructor];
                         result.push(Code::new_with_operands(Byte::Invoke, [label, *arity, 0]));
                     }
 
                     result
                 }
                 Operation::Invoke => {
-                    let &[name, mut arity, owner] = op.operands();
+                    let &[name, mut arity, ..] = op.operands();
                     arity += 1;
+                    let owner = self.context.current().copied().unwrap_or(usize::MAX);
 
-                    let (label, public) = self.context.classes[&owner].methods[&name];
+                    // dbg!(self.data.symbol_name(owner), self.data.symbol_name(name));
+                    if self.context.classes.contains_key(&owner) {
 
-                    if !public {
-                        if let Some(current) = self.context.current() {
-                            if *current != owner {
-                                println!("Calling a private method is forbidden");
+
+                        let (label, public) = self.context.classes[&owner].methods[&name];
+
+                        if !public {
+                            if let Some(current) = self.context.current() {
+                                if *current != owner {
+                                    println!("Calling a private method is forbidden");
+                                }
                             }
                         }
+                        vec![Code::new_with_operands(Byte::Invoke, [label, arity, 0])]
+                    } else {
+                        vec![Code::new_with_operands(Byte::Invoke, [name, arity, 0])]
                     }
 
-                    vec![Code::new_with_operands(Byte::Invoke, [label, arity, 0])]
                 }
                 Operation::Bind => {
                     let mut t = Code::new(Byte::This);
@@ -1053,7 +1066,7 @@ impl<'compilation> Compiler<'compilation> {
 
         self.context.enter(symbol);
 
-        match self.do_compile(&code) {
+        match self.do_compile(code) {
             Ok(mut bytecode) => {
                 #[cfg(feature = "dump")]
                 {

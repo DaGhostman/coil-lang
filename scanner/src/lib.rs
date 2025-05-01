@@ -73,7 +73,7 @@ impl Scanner {
 
     fn matches(&mut self, lexeme: &str) -> bool {
         if self.peek(0).is_none() {
-            return lexeme == "";
+            return lexeme.is_empty();
         }
 
         if lexeme
@@ -82,14 +82,12 @@ impl Scanner {
             .filter(|c| c.is_ascii_punctuation() || c.is_ascii_whitespace() || c.is_ascii_control())
             .collect::<Vec<_>>()
             .is_empty()
-        {
-            if self
+            && self
                 .peek(lexeme.len())
                 .filter(|c| c.is_ascii_whitespace() || *c != '_' || c.is_ascii_control())
                 .is_none()
-            {
-                return false;
-            }
+        {
+            return false;
         }
 
         for position in 0..lexeme.len() {
@@ -292,7 +290,7 @@ impl Scanner {
                     .string_at_range(start, self.buffer.tell())
                     .unwrap_or_default(),
                 self.line,
-                self.column - lexeme.len(),
+                self.column.wrapping_sub(lexeme.len()),
             );
 
             token
@@ -477,6 +475,7 @@ impl Scanner {
             Some('c') => match self.peek(1) {
                 Some('l') => self.keyword_or_identifier(TokenKind::Class, "class"),
                 Some('o') => match self.peek(3) {
+                    Some('o') => self.keyword_or_identifier(TokenKind::Coroutine, "coroutine"),
                     Some('s') => self.keyword_or_identifier(TokenKind::Const, "const"),
                     Some('t') => self.keyword_or_identifier(TokenKind::Continue, "continue"),
                     _ => self.identifier(),

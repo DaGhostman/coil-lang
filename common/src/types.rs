@@ -23,6 +23,7 @@ pub enum Kind {
     Reference,
     Object(usize),
     List(usize),
+    Coroutine(usize),
     Generic(usize, usize),
     Result,
     Error,
@@ -225,6 +226,9 @@ impl Type {
                     }
                 )
             }
+            Kind::Coroutine(n) => {
+                format!("~{}", data.symbol_name(n))
+            }
             Kind::Wildcard => "%".to_string(),
             _ => {
                 let mut fmt = format!("{}", self.own);
@@ -288,6 +292,7 @@ impl From<&Value> for Kind {
             }
             Value::OBJECT(Objects::Object(o)) => Kind::Object(o.as_ref().name()),
             Value::OBJECT(Objects::Array(a)) => Kind::List(a.as_ref().len()),
+            Value::OBJECT(Objects::Coroutine(_)) => Kind::Coroutine(0),
             Value::TYPE(_) => Kind::Type,
             _ => Kind::Wildcard,
         }
@@ -317,6 +322,7 @@ impl Display for Kind {
                 Kind::Intersection => "intersect",
                 Kind::Union => "union",
                 Kind::Generic(..) => "generic",
+                Kind::Coroutine(..) => "coroutine",
                 Kind::Wildcard => "%",
                 Kind::Type => "@type",
             }

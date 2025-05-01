@@ -80,6 +80,7 @@ pub enum Operation {
     Range,
     // ---
     Array,
+    Yield,
     // ---
     Unwrap,
     UnwrapError,
@@ -291,6 +292,8 @@ pub enum Byte {
     This,
     /// Gets the type of the last item on the stack
     TypeOf,
+    /// Yield from the current function, suspending it
+    Yield,
 
     /// Range of numerical values
     Range,

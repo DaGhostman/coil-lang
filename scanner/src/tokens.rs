@@ -65,6 +65,7 @@ pub enum TokenKind {
     Break,
     Const,
     Continue,
+    Coroutine,
     Class,
     Default,
     Else,
@@ -188,6 +189,7 @@ impl Token {
         self.lexeme.as_ref()
     }
 
+    #[must_use]
     pub fn file(&self) -> &str {
         self.file.as_ref()
     }

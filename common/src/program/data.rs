@@ -86,12 +86,6 @@ impl Data {
 
     pub fn add_symbol(&mut self, symbol: String, constant: Option<usize>) -> usize {
         self.symbols.insert(symbol, constant)
-        // let x = self.symbols.insert(symbol.clone(), constant);
-        //
-        // if x == 11 || x == 10 || x == 8 {
-        //     println!("{symbol}/{x}");
-        // }
-        // x
     }
 
     #[must_use]
@@ -104,6 +98,7 @@ impl Data {
         self.symbols.constant(symbol)
     }
 
+    #[must_use]
     pub fn symbol_constant_exists(&self, symbol: usize) -> bool {
         self.symbols.has_constant(symbol)
     }

@@ -1,9 +1,5 @@
-use common::{
-    opcodes::{Byte, Code},
-    program::program::Program,
-};
+use common::opcodes::{Byte, Code};
 
-use rustc_hash::FxHashMap as HashMap;
 
 use crate::CompilationPass;
 

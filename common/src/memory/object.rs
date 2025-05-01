@@ -26,6 +26,7 @@ pub enum Objects {
     Iterator(Collectable<ObjIterator>),
     String(Collectable<ObjString>),
     Object(Collectable<ObjInstance>),
+    Coroutine(Collectable<ObjCoroutine>),
 }
 
 impl Display for Objects {
@@ -43,6 +44,8 @@ impl Display for Objects {
                     <Collectable<ObjArray> as Borrow<ObjArray>>::borrow(value).to_string(),
                 Objects::Object(value) =>
                     <Collectable<ObjInstance> as Borrow<ObjInstance>>::borrow(value).to_string(),
+                Objects::Coroutine(value) =>
+                    <Collectable<ObjCoroutine> as Borrow<ObjCoroutine>>::borrow(value).to_string(),
             }
         )
     }
@@ -53,7 +56,7 @@ impl Objects {
         let marked = match self {
             Self::None => false,
             Self::Array(value) => {
-                for item in value.as_mut().items.iter_mut() {
+                for item in &mut value.as_mut().items {
                     match item {
                         Value::OBJECT(Objects::Object(val)) => {
                             val.mark();
@@ -65,25 +68,25 @@ impl Objects {
                             val.mark();
                         }
                         _ => (),
-                    };
+                    }
                 }
                 value.mark()
             }
             Self::String(value) => value.mark(),
             Self::Object(value) => {
-                for (_, value) in &mut value.as_mut().state {
-                    match value {
-                        &mut Value::OBJECT(Objects::Object(mut val)) => {
+                for value in value.as_mut().state.values_mut() {
+                    match *value {
+                        Value::OBJECT(Objects::Object(mut val)) => {
                             val.mark();
                         }
-                        &mut Value::OBJECT(Objects::Array(mut val)) => {
+                        Value::OBJECT(Objects::Array(mut val)) => {
                             val.mark();
                         }
-                        &mut Value::OBJECT(Objects::Iterator(mut val)) => {
+                        Value::OBJECT(Objects::Iterator(mut val)) => {
                             val.mark();
                         }
                         _ => (),
-                    };
+                    }
                 }
                 value.mark()
             }
@@ -99,8 +102,27 @@ impl Objects {
                         val.mark();
                     }
                     _ => (),
-                };
+                }
                 value.mark()
+            }
+            Self::Coroutine(i) => {
+                match i.as_mut().value {
+                    Value::OBJECT(mut v) | Value::STRING(mut v) => {
+                        v.mark(grey);
+                    }
+                    _ => (),
+                }
+
+                for val in &mut i.as_mut().stack {
+                    match val {
+                        Value::OBJECT(v) | Value::STRING(v) => {
+                            v.mark(grey);
+                        }
+                        _ => (),
+                    }
+                }
+
+                i.mark()
             }
         };
 
@@ -116,6 +138,7 @@ impl Objects {
             Self::String(value) => value.unmark(),
             Self::Object(value) => value.unmark(),
             Self::Iterator(value) => value.unmark(),
+            Self::Coroutine(value) => value.unmark(),
         }
     }
 
@@ -127,6 +150,7 @@ impl Objects {
             Self::String(value) => value.is_marked(),
             Self::Object(value) => value.is_marked(),
             Self::Iterator(value) => value.is_marked(),
+            Self::Coroutine(value) => value.is_marked(),
         }
     }
 
@@ -153,6 +177,19 @@ impl Objects {
                 Value::OBJECT(v) | Value::STRING(v) => v.mark_references(grey),
                 _ => (),
             },
+            Self::Coroutine(i) => {
+                match i.as_ref().value {
+                    Value::OBJECT(v) | Value::STRING(v) => v.mark_references(grey),
+                    _ => (),
+                }
+
+                for val in &i.as_ref().stack {
+                    match val {
+                        Value::OBJECT(v) | Value::STRING(v) => v.mark_references(grey),
+                        _ => (),
+                    }
+                }
+            }
         }
     }
 
@@ -164,6 +201,7 @@ impl Objects {
             Self::String(value) => value.get_next(),
             Self::Object(value) => value.get_next(),
             Self::Iterator(value) => value.get_next(),
+            Self::Coroutine(value) => value.get_next(),
         }
     }
 
@@ -174,6 +212,7 @@ impl Objects {
             Self::String(value) => value.set_next(next),
             Self::Object(value) => value.set_next(next),
             Self::Iterator(value) => value.set_next(next),
+            Self::Coroutine(value) => value.set_next(next),
         }
     }
 }
@@ -186,6 +225,7 @@ impl GcSized for Objects {
             Self::String(items) => items.size(),
             Self::Object(items) => items.size(),
             Self::Iterator(items) => items.size(),
+            Self::Coroutine(items) => items.size(),
         }
     }
 }
@@ -255,10 +295,12 @@ pub struct ObjString {
 }
 
 impl ObjString {
+    #[must_use]
     pub fn len(&self) -> usize {
         self.length
     }
 
+    #[must_use]
     pub fn hash(&self) -> u64 {
         self.hash
     }
@@ -303,6 +345,7 @@ impl Hash for ObjIterator {
 }
 
 impl ObjIterator {
+    #[must_use]
     pub fn new(iterable: Value) -> Self {
         ObjIterator {
             hash: 0,
@@ -311,10 +354,12 @@ impl ObjIterator {
         }
     }
 
+    #[must_use]
     pub fn tell(&self) -> usize {
         self.cursor
     }
 
+    #[must_use]
     pub fn valid(&self) -> bool {
         let length = match self.iterable {
             Value::OBJECT(Objects::Array(item)) => item.as_ref().len(),
@@ -335,6 +380,7 @@ impl ObjIterator {
         self.cursor += 1;
     }
 
+    #[must_use]
     pub fn get(&self) -> Value {
         match self.iterable {
             Value::OBJECT(Objects::Array(arr)) => arr.as_ref().item(self.cursor),
@@ -426,5 +472,53 @@ impl GcSized for ObjInstance {
 impl Display for ObjInstance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.hash)
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct ObjCoroutine {
+    ip: usize,
+    stack: Vec<Value>,
+
+    value: Value,
+}
+
+impl ObjCoroutine {
+    #[must_use] pub fn get(&self) -> Value {
+        self.value
+    }
+    pub fn set(&mut self, value: Value) {
+        self.value = value;
+    }
+
+    #[must_use] pub fn resume(&self) -> (usize, &Vec<Value>) {
+        (self.ip, &self.stack)
+    }
+
+    pub fn suspend(&mut self, ip: usize, stack: Vec<Value>) {
+        self.ip = ip;
+        self.stack = stack;
+    }
+}
+
+impl GcSized for ObjCoroutine {
+    fn size(&self) -> usize {
+        std::mem::size_of_val(&self.ip)
+            + std::mem::size_of_val(&self.stack)
+            + std::mem::size_of_val(&self.value)
+    }
+}
+
+impl Hash for ObjCoroutine {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ip.hash(state);
+        self.stack.hash(state);
+        self.value.hash(state);
+    }
+}
+
+impl Display for ObjCoroutine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.value)
     }
 }

@@ -37,6 +37,7 @@ pub struct Context {
 const INCLUDE_PATHS: [&str; 5] = ["src/", "lib/", "external/", "vendor/", "deps/"];
 
 impl Context {
+    #[must_use]
     pub fn new(mut scanner: Scanner) -> Self {
         let current = scanner.scan();
 
@@ -77,6 +78,7 @@ impl Context {
         self.owner = None;
     }
 
+    #[must_use]
     pub fn owner(&self) -> Option<usize> {
         self.owner
     }
@@ -136,7 +138,11 @@ impl<'data> Parser<'data> {
 
     fn get_type(&mut self, ctx: &mut Context) -> usize {
         // ctx.advance();
-        let mut r#type = Type::new(if self.consume(ctx, TokenKind::Int) {
+        let mut r#type = Type::new(if self.consume(ctx, TokenKind::Percent) {
+            Kind::Wildcard
+        } else if self.consume(ctx, TokenKind::Bool) {
+            Kind::Bool
+        } else if self.consume(ctx, TokenKind::Int) {
             Kind::Integer
         } else if self.consume(ctx, TokenKind::Float) {
             Kind::Float
@@ -158,19 +164,29 @@ impl<'data> Parser<'data> {
             }
 
             Kind::Generic(symbol, kind)
-        } else if self.consume(ctx, TokenKind::Identifier) {
+        } else if self.consume(ctx, TokenKind::Coroutine) {
+            self.expect(ctx, TokenKind::Less, "Expecting '<' for coroutine subtype");
+            let t = self.get_type(ctx);
+            self.expect(
+                ctx,
+                TokenKind::Greater,
+                "Expecting '>' for coroutine subtype",
+            );
+
+            Kind::Coroutine(t)
+        } else if self.matches(ctx, TokenKind::Identifier) {
             let mut name = ctx.current().lexeme().to_string();
+            ctx.advance();
             if self.aliases.contains_key(&name) {
                 name = self.aliases[&name].to_string();
             }
 
             let n = self.data.add_symbol(name, None);
-
             Kind::Object(n)
         } else {
-            eprintln!(
+            panic!(
                 "Unknown token to be used as type: {:?}",
-                ctx.previous().unwrap().lexeme()
+                ctx.current().lexeme()
             );
 
             Kind::None
@@ -271,10 +287,13 @@ impl<'data> Parser<'data> {
 
         if !matched {
             eprintln!(
-                "ERROR: {}. Current: {:?}('{}')",
+                "ERROR: {}. Current: {:?}('{}') in {}:{}:{}",
                 message,
                 ctx.current.kind(),
-                ctx.current.lexeme()
+                ctx.current.lexeme(),
+                ctx.current.file(),
+                ctx.current.start_line(),
+                ctx.current.start_column(),
             );
             panic!("SADGE");
         }
@@ -285,13 +304,19 @@ impl<'data> Parser<'data> {
     fn grouping(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
 
-        let tokens = self.expression(ctx);
+        let mut tokens = vec![];
 
-        self.expect(
-            ctx,
-            TokenKind::RightParenthesis,
-            "Expected ')' to close group",
-        );
+        while !self.consume(ctx, TokenKind::RightParenthesis) {
+            tokens.append(&mut self.expression(ctx));
+        }
+
+        // let tokens = self.expression(ctx);
+        //
+        // self.expect(
+        //     ctx,
+        //     TokenKind::RightParenthesis,
+        //     "Expected ')' to close group",
+        // );
 
         tokens
     }
@@ -521,6 +546,7 @@ impl<'data> Parser<'data> {
             | TokenKind::GreaterEqual => self.comparison(ctx),
             TokenKind::Dot => self.call(ctx),
             TokenKind::DotDot | TokenKind::DotDotEqual => self.range(ctx),
+            TokenKind::LeftParenthesis => self.grouping(ctx),
             _ => todo!("Unexpected token '{}'", ctx.current.lexeme()),
         }
     }
@@ -771,22 +797,21 @@ impl<'data> Parser<'data> {
             ctx,
             TokenKind::Identifier,
             "Expecting variable name to hold iteration",
-        ) {
-            if self.expect(ctx, TokenKind::In, "Expecting 'in' for loop") {
-                result.append(&mut self.expression(ctx));
-                let mut body = self.block(ctx);
-                result.push(op!(
-                    self,
-                    ctx,
-                    Iterate,
-                    [
-                        self.data.add_symbol(name.lexeme().to_string(), None),
-                        body.len(),
-                        0,
-                    ]
-                ));
-                result.append(&mut body);
-            }
+        ) && self.expect(ctx, TokenKind::In, "Expecting 'in' for loop")
+        {
+            result.append(&mut self.expression(ctx));
+            let mut body = self.block(ctx);
+            result.push(op!(
+                self,
+                ctx,
+                Iterate,
+                [
+                    self.data.add_symbol(name.lexeme().to_string(), None),
+                    body.len(),
+                    0,
+                ]
+            ));
+            result.append(&mut body);
         }
 
         result.push(end);
@@ -950,6 +975,7 @@ impl<'data> Parser<'data> {
             TokenKind::New => self.initialize(ctx),
             TokenKind::LeftBracket => self.block(ctx),
             TokenKind::TypeOf => self.typeof_(ctx),
+            TokenKind::Yield => self.yield_(ctx),
             _ => todo!("Unimplemented token '{:?}'", ctx.current()),
         }
     }
@@ -1076,7 +1102,10 @@ impl<'data> Parser<'data> {
         if self.consume(ctx, TokenKind::Equal) {
             tokens = self.expr(ctx);
             if tokens.len() == 1
-                && matches!(tokens.last().map(|o| o.code()), Some(Operation::Const))
+                && matches!(
+                    tokens.last().map(common::opcodes::IR::code),
+                    Some(Operation::Const)
+                )
             {
                 if let Some(op) = tokens.last() {
                     let [constant, ..] = op.operands();
@@ -1190,7 +1219,11 @@ impl<'data> Parser<'data> {
         if self.consume(ctx, TokenKind::SlimArrow) {
             kind = self.get_type(ctx);
         }
-        body.append(&mut self.block(ctx));
+        if self.consume(ctx, TokenKind::FatArrow) {
+            body.append(&mut self.expression(ctx));
+        } else {
+            body.append(&mut self.block(ctx));
+        }
         // body.push(op!(
         //     self,
         //     ctx,
@@ -1219,30 +1252,29 @@ impl<'data> Parser<'data> {
     }
 
     fn prop(&mut self, ctx: &mut Context, owner: usize, public: bool) -> Vec<IR> {
-        let mut kind = self.data.add_type(Type::any());
+        // let mut kind = self.data.add_type(Type::any());
 
-        if !self.matches(ctx, TokenKind::Identifier) {
-            kind = self.get_type(ctx);
-        }
+        // if !self.matches(ctx, TokenKind::Identifier) {
+        let kind = self.get_type(ctx);
+        // ctx.advance();
+        // }
 
+        dbg!(&ctx.current);
         let prop_name = ctx.current.lexeme().to_string();
         self.consume(ctx, TokenKind::Identifier);
 
-        let mut prop = if self.consume(ctx, TokenKind::SemiColon) {
-            vec![op!(
-                self,
-                ctx,
-                Const,
-                [self.data.add_constant(Value::NONE, 0), 0, 0]
-            )]
-        } else {
-            self.expr_statement(ctx)
-        };
+        let mut action = 2;
+        let mut prop = vec![];
+        if !self.consume(ctx, TokenKind::SemiColon) {
+            self.consume(ctx, TokenKind::Equal);
+            action = 1;
+            prop.append(&mut self.expr(ctx));
+        }
         let mut symbol = owner;
-        symbol = symbol << 32;
+        symbol <<= 32;
         symbol |= self.data.add_symbol(prop_name, None);
 
-        let mut property = op!(self, ctx, Prop, [symbol, 2, usize::from(public),]);
+        let mut property = op!(self, ctx, Prop, [symbol, action, usize::from(public),]);
         property.set_type(kind);
         prop.push(property);
 
@@ -1254,20 +1286,25 @@ impl<'data> Parser<'data> {
         self.namespace = String::new();
         let mut method = self.function(ctx);
 
-        if let Some(code) = method.first_mut() {
-            let [name, arity, len] = code.operands().to_owned();
+        // method.insert(1, op!(self, ctx, Begin));
+        method.insert(2, IR::new(Operation::Bind, Default::default()));
+        if let Some(func) = method.first() {
+            let [name, arity, len] = func.operands().to_owned();
             let mut symbol = owner;
-            symbol = symbol << 16;
+            symbol <<= 16;
             symbol |= name;
-            symbol = symbol << 1;
+            symbol <<= 1;
             symbol |= usize::from(public);
 
-            let mut method = op!(self, ctx, Method, [symbol, arity, len]);
-            method.set_type(code.kind());
-            *code = method;
-        };
-        method.insert(1, IR::new(Operation::Bind, Default::default()));
+            let mut member = op!(self, ctx, Method, [symbol, arity, len]);
+            member.set_type(func.kind());
+            // method.insert(1, op!(self, ctx, Begin, [name, 0, 0]));
+
+            method.insert(1, member);
+        }
         self.namespace = ns;
+        // method.push(op!(self, ctx, End));
+        method.drain(0..1);
 
         method
     }
@@ -1285,9 +1322,10 @@ impl<'data> Parser<'data> {
         let name = ctx.previous().unwrap().lexeme().to_string();
         let owner = self.data.add_symbol(name, None);
 
-        if ctx.owner().is_some() {
-            panic!("Classes can only be declared outisde any conditional blocks");
-        }
+        assert!(
+            ctx.owner().is_none(),
+            "Classes can only be declared outisde any conditional blocks"
+        );
 
         ctx.set_owner(owner);
         self.expect(
@@ -1330,9 +1368,10 @@ impl<'data> Parser<'data> {
             "sad".to_string()
         };
         let owner = self.name(name, None);
-        if ctx.owner().is_some() {
-            panic!("Classes can only be declared outisde any conditional blocks");
-        }
+        assert!(
+            ctx.owner().is_none(),
+            "Classes can only be declared outisde any conditional blocks"
+        );
         ctx.set_owner(owner);
 
         let mut iface = op!(self, ctx, Interface, [owner, 0, 0]);
@@ -1425,9 +1464,9 @@ impl<'data> Parser<'data> {
 
             let name_symbol = self.data.add_symbol(method_name, None);
             let mut symbol = owner;
-            symbol = symbol << 16;
+            symbol <<= 16;
             symbol |= name_symbol;
-            symbol = symbol << 1;
+            symbol <<= 1;
             symbol |= 1;
 
             method.insert(0, op!(self, ctx, Method, [symbol, arity, body.len()]));
@@ -1447,53 +1486,26 @@ impl<'data> Parser<'data> {
 
     fn class(&mut self, ctx: &mut Context) -> Vec<IR> {
         let mut class = vec![];
-        let name = if self.consume(ctx, TokenKind::Identifier) {
-            ctx.previous().unwrap().lexeme().to_string()
+        let ty = self.get_type(ctx);
+
+        let name = if let Kind::Object(name) = self.data.get_type(ty).kind() {
+            self.data.symbol_name(name).to_string()
         } else {
-            "asd".to_string()
+            unreachable!("Invalid symbol name");
         };
 
         let owner = self.name(name, None);
-        let mut instance = Type::object(owner);
-
-        if self.consume(ctx, TokenKind::Less) {
-            while !self.consume(ctx, TokenKind::Greater) {
-                self.expect(
-                    ctx,
-                    TokenKind::Dolar,
-                    "Expecting '$' infront of generic type arguments",
-                );
-
-                let identifier = ctx.current().lexeme().to_string();
-                self.expect(
-                    ctx,
-                    TokenKind::Identifier,
-                    "Expected a valid identifier for type parameter",
-                );
-
-                let type_param = self.data.add_symbol(identifier, None);
-
-                let mut kind = self.data.add_type(Type::any());
-                if self.consume(ctx, TokenKind::Colon) {
-                    kind = self.get_type(ctx);
-                }
-
-                instance.add_argument(
-                    self.data
-                        .add_type(Type::new(Kind::Generic(type_param, kind))),
-                );
-                self.consume(ctx, TokenKind::Comma);
-            }
-        }
+        let instance = Type::object(owner);
 
         self.expect(
             ctx,
             TokenKind::LeftBracket,
             "Expected '{' denoting class body",
         );
-        if ctx.owner().is_some() {
-            panic!("Classes can only be declared outisde any conditional blocks");
-        }
+        assert!(
+            ctx.owner().is_none(),
+            "Classes can only be declared outisde any conditional blocks"
+        );
         ctx.set_owner(owner);
         while !self.consume(ctx, TokenKind::RightBracket) {
             let public = self.consume(ctx, TokenKind::Pub);
@@ -1506,10 +1518,10 @@ impl<'data> Parser<'data> {
         ctx.clear_owner();
 
         class.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
+        class.push(op!(self, ctx, End, [owner, 0, 0]));
         let mut cls = op!(self, ctx, Class, [owner, class.len(), 0]);
         cls.set_type(self.data.add_type(instance));
         class.insert(1, cls);
-        class.push(op!(self, ctx, End, [owner, 0, 0]));
 
         class
     }
@@ -1565,9 +1577,10 @@ impl<'data> Parser<'data> {
         ctx.advance();
         // let mut result = self.expression(ctx);
         let mut this = op!(self, ctx, This);
-        if ctx.owner().is_none() {
-            panic!("Using 'this' outside of object context");
-        }
+        assert!(
+            ctx.owner().is_some(),
+            "Using 'this' outside of object context"
+        );
         this.set_type(self.data.add_type(Type::object(ctx.owner().unwrap())));
         vec![this]
     }
@@ -1667,9 +1680,9 @@ impl<'data> Parser<'data> {
             module.pop();
 
             let mut joined = PathBuf::from("");
-            module.iter().for_each(|part| {
+            for part in &module {
                 joined = joined.join(part);
-            });
+            }
 
             let mut paths = vec![];
             for p in INCLUDE_PATHS {
@@ -1682,10 +1695,7 @@ impl<'data> Parser<'data> {
             }
 
             if paths.is_empty() {
-                panic!(
-                    "Unable to resolve '{}', because no suitable file has been found",
-                    fqn
-                );
+                panic!("Unable to resolve '{fqn}', because no suitable file has been found");
             } else if paths.len() > 1 {
                 panic!(
                     "Unable to resolve '{}', because of multiple possible locations:\n\t{}",
@@ -1720,6 +1730,15 @@ impl<'data> Parser<'data> {
     fn typeof_(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
         let op = op!(self, ctx, TypeOf);
+        let mut result = self.precedence(ctx, Precedence::Unary);
+        result.push(op);
+
+        result
+    }
+
+    fn yield_(&mut self, ctx: &mut Context) -> Vec<IR> {
+        ctx.advance();
+        let op = op!(self, ctx, Yield);
         let mut result = self.precedence(ctx, Precedence::Unary);
         result.push(op);
 
@@ -1763,7 +1782,14 @@ impl<'data> Parser<'data> {
             }
             TokenKind::Return => {
                 ctx.advance();
-                let mut tokens = self.expr(ctx);
+                let mut tokens = if self.consume(ctx, TokenKind::SemiColon) {
+                    let constant = self.data.add_constant(Value::NONE, 0);
+
+                    vec![op!(this, ctx, Const, [constant, 0, 0])]
+                } else {
+                    self.expr(ctx)
+                };
+
                 tokens.push(op!(self, ctx, Leave));
 
                 tokens
@@ -1818,7 +1844,7 @@ impl<'data> Parser<'data> {
         }
         if !self.typechecker.get_errors().is_empty() {
             for err in self.typechecker.get_errors() {
-                eprintln!("{}", err);
+                eprintln!("{err}");
             }
 
             return Err("Encountered errors during parsing".to_string());

@@ -6,4 +6,3 @@ edition = "2024"
 [dependencies]
 libffi = "4.0.0"
 rustc-hash = { version = "2.1.1", features = ["rand"] }
-smallvec = "1.15.0"

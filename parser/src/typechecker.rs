@@ -2,7 +2,7 @@ use common::{
     error::{Error, ErrorOrigin},
     opcodes::{Metadata, Operation, IR},
     program::data::Data,
-    types::{Kind, Type}, Value,
+    types::{Kind, Type},
 };
 
 use rustc_hash::FxHashMap as HashMap;
@@ -214,7 +214,7 @@ impl<const N: usize> TypeChecker<N> {
                     self.pop(op.get(0));
                 }
                 Operation::Class => {
-                    let [owner, ..] = op.operands();
+                    let [owner, len, ..] = op.operands();
                     let entry = self.class_params.entry(*owner).or_insert_with(|| {
                         HashMap::default()
                     });
@@ -225,6 +225,14 @@ impl<const N: usize> TypeChecker<N> {
                             entry.insert(n, *param);
                         }
                     }
+
+                    let mut body = self.check(&code[ip + 1..ip + len], data);
+                    bytecode.push(IR::new(Operation::Class, [*owner, body.len(), 0]));
+                    bytecode.append(&mut body);
+                    ip += len;
+
+
+                    continue;
                 }
                 Operation::Inc | Operation::Dec => {
                     self.push(variables[&op.get(0)]);
@@ -242,7 +250,7 @@ impl<const N: usize> TypeChecker<N> {
                     let string = data.find_type(Type::string());
 
                     if self.match_type(data, rhs, int) && self.match_type(data, lhs, int) {
-                        self.push(int)
+                        self.push(int);
                     } else if 
                         (self.match_type(data, rhs, int) && self.match_type(data, lhs, int)) ||
                         (self.match_type(data, rhs, float) && self.match_type(data, lhs, float)) ||
@@ -336,28 +344,23 @@ impl<const N: usize> TypeChecker<N> {
 
                     let ty = self.pop(1);
 
-                        if variables.contains_key(&name) {
-                            if ty != variables[&name]
-                            {
-                                self.error(
-                                    format!(
-                                        "Unable to assign value of type {:?} to '{}' because it expects {:?}", 
-                                        ty,
-                                        data.symbol_name(*name),
-                                        data.get_type(variables[&name]).output(data)
-                                    ),
-                                    op.metadata(),
-
-                                );
-                            }
-                        } else {
-                            variables.insert(
-                                name,
-                                if op.kind() != data.find_type(Type::any()) {
-                                    op.kind()
-                                } else {
+                        if let std::collections::hash_map::Entry::Vacant(e) = variables.entry(name) {
+                            e.insert(if op.kind() == data.find_type(Type::any()) {
                                     ty
-                                },
+                                } else {
+                                    op.kind()
+                                });
+                        } else if ty != variables[&name]
+                        {
+                            self.error(
+                                format!(
+                                    "Unable to assign value of type {:?} to '{}' because it expects {:?}", 
+                                    data.get_type(ty).output(data),
+                                    data.symbol_name(*name),
+                                    data.get_type(variables[&name]).output(data)
+                                ),
+                                op.metadata(),
+
                             );
                         }
                 }
@@ -409,7 +412,7 @@ impl<const N: usize> TypeChecker<N> {
                     // println!("Expected: {}: {}", data.symbol_name(op.operands()[0]), data.get_type(op.kind()).kind());
 
                     if variables.contains_key(&op.operands()[0]) {
-                        self.push(variables[&op.operands()[0]])
+                        self.push(variables[&op.operands()[0]]);
                     } else {
                         self.push(op.kind());
                     }
@@ -431,9 +434,9 @@ impl<const N: usize> TypeChecker<N> {
                     let [name, ..] = op.operands();
                     if let Kind::Range(n) = data.get_type(self.peek(0)).kind() {
                         
-                        variables.insert(&name, n);
+                        variables.insert(name, n);
                     } else {
-                        variables.insert(&name, data.find_type(Type::any()));
+                        variables.insert(name, data.find_type(Type::any()));
                     }
                 }
                 Operation::Call => {
@@ -464,8 +467,20 @@ impl<const N: usize> TypeChecker<N> {
                     match action {
                         0 => {
                             if let Kind::Object(n) = data.get_type(self.peek(0)).kind() {
+                                // dbg!(data.symbol_name(*name));
                                 self.pop(1);
-                                self.push(self.state[&n][name]);
+                                if self.state[&n].contains_key(name) {
+                                    self.push(self.state[&n][name]);
+                                } else {
+                                    self.error(format!("Attempting to access undeclared property '{}' on {}", data.symbol_name(*name), data.symbol_name(n)), op.metadata());
+                                }
+                            } else {
+                                let ty =data.get_type(self.pop(1)).output(data); 
+                                self.error(format!(
+                                    "Unable to access property {} on {} as it is not an object",
+                                    data.symbol_name(*name),
+                                    ty,
+                                ), op.metadata());
                             }
                         }
                         1 => {
@@ -482,6 +497,7 @@ impl<const N: usize> TypeChecker<N> {
                                         props
                                     });
                                 self.pop(2);
+
                             }
                         }
                         2 => {
@@ -552,19 +568,25 @@ impl<const N: usize> TypeChecker<N> {
                             }
                         }
 
-                        if !public {
-                            if self.scope != n {
-                                self.error(
-                                    format!(
-                                        "Calling a private method '{fqn}' from outside is forbidden"
-                                    ),
-                                    op.metadata(),
-                                );
-                            }
+                        if !public && self.scope != n {
+                            self.error(
+                                format!(
+                                    "Calling a private method '{fqn}' from outside is forbidden"
+                                ),
+                                op.metadata(),
+                            );
                         }
 
                         result = self.resolve_type(data, data.get_type(method).returns());
                         bytecode.push(IR::new(Operation::Invoke, [*name, *call_arity, n]));
+                    } else if let Kind::Coroutine(t) = object.kind() {
+                        if data.symbol_name(op.get(0)) == "get" {
+                            result = t;
+                            // self.push(t)
+
+                        } else {
+                            self.error(format!("Coroutine does not have method named {}", data.symbol_name(op.get(0))), op.metadata());
+                        }
                     } else {
                         todo!("Error out on call for non-object");
                     }
@@ -580,23 +602,28 @@ impl<const N: usize> TypeChecker<N> {
                     let [name, len, ..] = op.operands();
 
                     self.functions.insert(*name, op.kind());
-                    self.push(op.kind());
 
-                    bytecode.push(*op);
                     self.expects_return = Some(self.resolve_type(data, data.get_type(op.kind()).returns()));
-                    bytecode.append(&mut self.check(&code[ip + 1..ip + 1+ len ], data));
+                    let body = &mut self.check(&code[ip + 1..ip + 1+ len], data); 
+
+                    bytecode.push(IR::new(Operation::Closure, [*name, body.len(), 0]));
+                    bytecode.append(body);
+                    
 
                     ip += len + 1;
                     continue;
                 }
                 Operation::Function => {
-                    let [name, _, len] = op.operands();
+                    let [name, arity, len] = op.operands();
 
                     self.functions.insert(*name, op.kind());
 
-                    bytecode.push(*op);
                     self.expects_return = Some(self.resolve_type(data, data.get_type(op.kind()).returns()));
-                    bytecode.append(&mut self.check(&code[ip + 1..ip + 1+ len], data));
+                    let body =&mut self.check(&code[ip + 1..ip + 1+ len], data); 
+
+                    bytecode.push(IR::new(Operation::Function, [*name, *arity, body.len()]));
+                    bytecode.append(body);
+                    
 
                     ip += len + 1;
                     continue;
@@ -626,9 +653,12 @@ impl<const N: usize> TypeChecker<N> {
 
                     let scope = self.scope;
                     self.scope = owner;
-                    bytecode.push(*op);
+                    // bytecode.push(*op);
                     self.expects_return = Some(data.get_type(op.kind()).returns());
-                    bytecode.append(&mut self.check(&code[ip + 1..ip + 1 + len], data));
+                    let mut body = self.check(&code[ip + 1..ip + 1 + len], data);
+                    bytecode.push(IR::new(Operation::Method, [symbol, arity, body.len()]));
+                    bytecode.append(&mut body);
+
                     self.expects_return = None;
                     self.scope = scope;
                     ip += len + 1;

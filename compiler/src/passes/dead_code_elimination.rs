@@ -63,7 +63,9 @@ impl CompilationPass for DCE {
                             //     // This condition will always be true, so the else branch needs be
                             //     // eliminated
                             // } else
-                            if !state {
+                            if *state {
+                                modified.push(op);
+                            } else {
                                 // This condition will always be false, so the then branch needs be
                                 // eliminated, i.e which is easy since it needs to just compile
                                 // the else part. BUT the handling for `if true` is more
@@ -72,8 +74,6 @@ impl CompilationPass for DCE {
                                 // shouldn't actually skip that, because it will be handled by
                                 // the continuation of this handling.
                                 cursor += labels[&op.operand(0)] - cursor;
-                            } else {
-                                modified.push(op);
                             }
                         } else {
                             modified.push(op);

@@ -43,9 +43,8 @@ where
     pub fn npop(&mut self, n: usize) -> &[T] {
         let boundary = self.sp;
         self.sp -= n;
-        let slice = &self.stack[self.sp..boundary];
 
-        slice
+        (&self.stack[self.sp..boundary]) as _
     }
 
     pub fn push(&mut self, value: T) {
@@ -243,6 +242,7 @@ impl Heap {
             Objects::String(value) => value.release(),
             Objects::Object(value) => value.release(),
             Objects::Iterator(value) => value.release(),
+            Objects::Coroutine(value) => value.release(),
         }
     }
 
