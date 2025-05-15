@@ -38,7 +38,7 @@ impl<V: Hash + Eq + std::fmt::Debug> Interner<V> {
         self.storage[index] = value;
     }
 
-    pub fn lookup(&self, key: usize) -> &V {
+    #[must_use] pub fn lookup(&self, key: usize) -> &V {
         assert!(key < self.storage.len());
         &self.storage[key]
     }
@@ -49,7 +49,7 @@ impl<V: Hash + Eq + std::fmt::Debug> Interner<V> {
         &mut self.storage[key]
     }
 
-    pub fn len(&self) -> usize {
+    #[must_use] pub fn len(&self) -> usize {
         self.uniq.len()
     }
 }

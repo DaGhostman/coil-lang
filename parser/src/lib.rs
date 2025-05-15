@@ -1497,8 +1497,7 @@ impl<'data> Parser<'data> {
                 TokenKind::RightBracket,
                 "Expected '}' to close module group",
             );
-        } else {
-        }
+        } 
 
         if self.consume(ctx, TokenKind::As) {
             if self.expect(
