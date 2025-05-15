@@ -223,14 +223,14 @@ impl Scanner {
             self.file.as_ref(),
         );
         match self.current().map(|c| c.to_ascii_lowercase()) {
-            Some('a'..='z' | '_') => self.advance(),
+            Some('a'..='z' | '_' | ':') => self.advance(),
             Some(i) => unreachable!("Invalid identifier: '{}'", i),
             _ => (),
         }
 
         while matches!(
             self.current().map(|c| c.to_ascii_lowercase()),
-            Some('a'..='z' | '_' | '0'..='9')
+            Some('a'..='z' | '_' | ':' | '0'..='9')
         ) && !self.buffer.is_consumed()
         {
             self.advance();
@@ -527,13 +527,15 @@ impl Scanner {
                 },
                 _ => self.identifier(),
             },
-            Some('r') => match self.peek(1) {
-                Some('a') => self.keyword_or_identifier(TokenKind::Raise, "raise"),
-                Some('e') => match self.peek(2) {
-                    Some('t') => self.keyword_or_identifier(TokenKind::Return, "return"),
-                    Some('s') => self.keyword_or_identifier(TokenKind::Result, "result"),
-                    _ => self.identifier(),
-                },
+            Some('r') => match self.peek(2) {
+                Some('i') => self.keyword_or_identifier(TokenKind::Raise, "raise"),
+                Some('t') => self.keyword_or_identifier(TokenKind::Return, "return"),
+                // Some('s') => self.keyword_or_identifier(TokenKind::Resume, "resume"),
+                // Some('a') => self.keyword_or_identifier(TokenKind::Raise, "raise"),
+                // Some('e') => match self.peek(2) {
+                // Some('t') => self.keyword_or_identifier(TokenKind::Return, "return"),
+                // _ => self.keyword_or_identifier(TokenKind::Resume, "resume"),
+                // },
                 _ => self.identifier(),
             },
             Some('s') => match self.peek(1) {

@@ -266,6 +266,8 @@ pub enum Byte {
     Duplicate,
     /// Prints the value from the top of the stack
     Print,
+    /// Call a native module function
+    Native,
     /// Call a function
     Call,
     /// Load a variable

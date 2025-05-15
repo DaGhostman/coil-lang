@@ -42,6 +42,7 @@ pub fn unlikely(b: bool) -> bool {
     b
 }
 
+#[inline]
 pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
     let mut hash = rustc_hash::FxHasher::default();
     value.hash(&mut hash);
@@ -58,6 +59,7 @@ pub enum Value {
     FLOAT(f64),
     STR(usize),
     FUNCTION(usize, usize),
+    EXTERNAL(usize),
     // ARRAY(Key),
     RANGE(i64, i64),
     FILE(usize),
@@ -83,6 +85,15 @@ impl PartialEq for Value {
             (Self::RESOURCE(l), Self::RESOURCE(r)) => l == r,
             (Self::POINTER(l), Self::POINTER(r)) => l == r,
             (Self::FFI(l), Self::FFI(r)) => l == r,
+            (Self::STRING(Objects::String(l)), Self::STRING(Objects::String(r))) => {
+                l.as_ref().hash() == r.as_ref().hash()
+            }
+            (Self::OBJECT(Objects::Object(l)), Self::OBJECT(Objects::Object(r))) => {
+                let l = calculate_hash(l.as_ref());
+                let r = calculate_hash(r.as_ref());
+
+                l == r
+            }
             _ => false,
         }
     }
@@ -96,86 +107,86 @@ impl PartialOrd for Value {
         match (self, other) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => lhs.partial_cmp(rhs),
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => lhs.partial_cmp(rhs),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => lhs.partial_cmp(&(*rhs as i64)),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => lhs.partial_cmp(&(*rhs as f64)),
-            (Value::BOOLEAN(lhs), Value::BOOLEAN(rhs)) => lhs.partial_cmp(rhs),
+            (Value::INTEGER(lhs), &Value::FLOAT(rhs)) => lhs.partial_cmp(&(rhs as i64)),
+            (Value::FLOAT(lhs), &Value::INTEGER(rhs)) => lhs.partial_cmp(&(rhs as f64)),
+            (Value::BOOLEAN(lhs), &Value::BOOLEAN(rhs)) => lhs.partial_cmp(&rhs),
             (Value::NONE, Value::NONE) => Some(std::cmp::Ordering::Equal),
             _ => None,
         }
     }
 }
 
-impl Add for Value {
+impl Add for &Value {
     type Output = Value;
 
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs + rhs),
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs + rhs),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 + rhs),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs + rhs as f64),
+            (&Value::INTEGER(lhs), &Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 + rhs),
+            (&Value::FLOAT(lhs), &Value::INTEGER(rhs)) => Value::FLOAT(lhs + rhs as f64),
             _ => Value::NONE,
         }
     }
 }
 
-impl Sub for Value {
+impl Sub for &Value {
     type Output = Value;
 
     fn sub(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs - rhs),
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs - rhs),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 - rhs),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs - rhs as f64),
+            (&Value::INTEGER(lhs), &Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 - rhs),
+            (&Value::FLOAT(lhs), &Value::INTEGER(rhs)) => Value::FLOAT(lhs - rhs as f64),
             _ => Value::NONE,
         }
     }
 }
 
-impl Mul for Value {
+impl Mul for &Value {
     type Output = Value;
 
     fn mul(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs * rhs),
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs * rhs),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 * rhs),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs * rhs as f64),
+            (&Value::INTEGER(lhs), &Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 * rhs),
+            (&Value::FLOAT(lhs), &Value::INTEGER(rhs)) => Value::FLOAT(lhs * rhs as f64),
             _ => Value::NONE,
         }
     }
 }
 
-impl Div for Value {
+impl Div for &Value {
     type Output = Value;
 
     fn div(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs / rhs),
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs / rhs),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 / rhs),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs / rhs as f64),
+            (&Value::INTEGER(lhs), &Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 / rhs),
+            (&Value::FLOAT(lhs), &Value::INTEGER(rhs)) => Value::FLOAT(lhs / rhs as f64),
             _ => Value::NONE,
         }
     }
 }
 
-impl Rem for Value {
+impl Rem for &Value {
     type Output = Value;
 
     fn rem(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Value::INTEGER(lhs), Value::INTEGER(rhs)) => Value::INTEGER(lhs % rhs),
             (Value::FLOAT(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs % rhs),
-            (Value::INTEGER(lhs), Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 % rhs),
-            (Value::FLOAT(lhs), Value::INTEGER(rhs)) => Value::FLOAT(lhs % rhs as f64),
+            (&Value::INTEGER(lhs), &Value::FLOAT(rhs)) => Value::FLOAT(lhs as f64 % rhs),
+            (&Value::FLOAT(lhs), &Value::INTEGER(rhs)) => Value::FLOAT(lhs % rhs as f64),
             _ => Value::NONE,
         }
     }
 }
 
-impl Shl for Value {
+impl Shl for &Value {
     type Output = Value;
 
     fn shl(self, rhs: Self) -> Self::Output {
@@ -186,7 +197,7 @@ impl Shl for Value {
     }
 }
 
-impl Shr for Value {
+impl Shr for &Value {
     type Output = Value;
 
     fn shr(self, rhs: Self) -> Self::Output {
@@ -197,7 +208,7 @@ impl Shr for Value {
     }
 }
 
-impl BitAnd for Value {
+impl BitAnd for &Value {
     type Output = Value;
 
     fn bitand(self, rhs: Self) -> Self::Output {
@@ -209,7 +220,7 @@ impl BitAnd for Value {
     }
 }
 
-impl BitOr for Value {
+impl BitOr for &Value {
     type Output = Value;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -221,7 +232,7 @@ impl BitOr for Value {
     }
 }
 
-impl BitXor for Value {
+impl BitXor for &Value {
     type Output = Value;
 
     fn bitxor(self, rhs: Self) -> Self::Output {
@@ -233,7 +244,7 @@ impl BitXor for Value {
     }
 }
 
-impl Not for Value {
+impl Not for &Value {
     type Output = Value;
 
     fn not(self) -> Self::Output {
@@ -246,7 +257,7 @@ impl Not for Value {
     }
 }
 
-impl Neg for Value {
+impl Neg for &Value {
     type Output = Value;
 
     fn neg(self) -> Self::Output {
@@ -328,7 +339,15 @@ impl Hash for Value {
                 "ty".hash(state);
                 n.hash(state);
             }
-            _ => panic!("No support"),
+            Value::EXTERNAL(func) => {
+                "ext".hash(state);
+                func.hash(state);
+            }
+            _ => {
+                eprintln!("Value does not support hashing");
+
+                state.write_u8(0);
+            }
         }
     }
 }
@@ -370,6 +389,7 @@ impl Debug for Value {
                 Value::POINTER(n) => format!("pointer({n:p})"),
                 Value::FFI(id) => format!("dynamic({id})"),
                 Value::REFERENCE(idx) => format!("ref({idx:?})"),
+                Value::EXTERNAL(_) => "ext_fn".to_string(),
                 Value::OBJECT(Objects::Array(obj)) =>
                     format!("array(0x{:0x})", std::ptr::addr_of!(obj) as u64),
                 Value::OBJECT(Objects::Object(obj)) =>
@@ -460,7 +480,11 @@ impl Value {
                 Self::string(data.add_string(string))
             }
             Kind::Resource | Kind::Pointer => Self::pointer(ptr),
-            _ => todo!(),
+            _ => {
+                eprintln!("Unable to create value from pointer & type");
+
+                Self::default()
+            }
         }
     }
     #[must_use]
@@ -532,7 +556,8 @@ impl From<Value> for Kind {
             Value::FUNCTION(_, _) => Kind::Function,
             Value::RESOURCE(_) => Kind::Resource,
             Value::POINTER(_) => Kind::Pointer,
-            _ => todo!("Handle remaining value to type conversion cases"),
+            Value::OBJECT(Objects::Coroutine(_)) => Kind::Coroutine(0),
+            _ => Kind::None,
         }
     }
 }

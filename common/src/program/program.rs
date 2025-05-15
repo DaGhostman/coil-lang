@@ -43,18 +43,17 @@ where
         self.code.push(instruction);
     }
 
-    #[must_use]
-    pub fn get(&self, index: usize) -> Option<&T> {
-        self.code.get(index)
+    #[must_use] pub fn get(&self, index: usize) -> &T {
+        assert!(index < self.code.len());
+
+        &self.code[index]
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
+    #[must_use] pub fn len(&self) -> usize {
         self.code.len()
     }
 
-    #[must_use]
-    pub fn code(&self) -> &[T] {
+    #[must_use] pub fn code(&self) -> &[T] {
         self.code.as_slice()
     }
 }

@@ -88,6 +88,7 @@ pub enum TokenKind {
     Prop,
     Pub,
     Raise,
+    Resume,
     Result,
     Return,
     Some,

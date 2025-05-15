@@ -2,7 +2,6 @@ use common::opcodes::Metadata;
 use common::program::data::Data;
 use rand::{Rng, distr::Alphanumeric};
 use scanner::buffer::Buffer;
-use std::ops::Add;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -87,6 +86,7 @@ impl Context {
 pub struct Parser<'data> {
     data: &'data mut Data,
     file: String,
+    natives: HashMap<usize, usize>,
     typechecker: TypeChecker<64>,
 
     scanned: Vec<String>,
@@ -123,8 +123,18 @@ impl<'data> Parser<'data> {
             typechecker: TypeChecker::default(),
             scanned: Vec::default(),
             aliases: HashMap::default(),
+            natives: HashMap::default(),
             namespace: String::new(),
         }
+    }
+
+    pub fn register(&mut self, native: usize, type_: usize) {
+        let name = self.data.symbol_name(native);
+
+        self.scanned.push(name.to_owned());
+        self.aliases.insert(name.to_owned(), name.to_owned());
+
+        self.natives.insert(native, type_);
     }
 
     fn name(&mut self, name: String, constant: Option<usize>) -> usize {
@@ -137,7 +147,6 @@ impl<'data> Parser<'data> {
     }
 
     fn get_type(&mut self, ctx: &mut Context) -> usize {
-        // ctx.advance();
         let mut r#type = Type::new(if self.consume(ctx, TokenKind::Percent) {
             Kind::Wildcard
         } else if self.consume(ctx, TokenKind::Bool) {
@@ -188,39 +197,7 @@ impl<'data> Parser<'data> {
                 "Unknown token to be used as type: {:?}",
                 ctx.current().lexeme()
             );
-
-            Kind::None
         });
-
-        // ctx.advance();
-
-        // let mut r#type = Type::new(match ctx.previous().map(|p| p.kind()) {
-        //     Some(TokenKind::Int) => Kind::Integer,
-        //     Some(TokenKind::Float) => Kind::Float,
-        //     Some(TokenKind::Str) => Kind::String,
-        //     // TokenKind::Identifier => {
-        //     //     ctx.advance();
-        //     //     Kind::Object(self.name(ctx.current().lexeme().to_string(), None))
-        //     // }
-        //     Some(TokenKind::Void) => Kind::None,
-        //     Some(TokenKind::Result) => Kind::Result,
-        //     Some(TokenKind::Identifier) => {
-        //         let mut name = ctx.current().lexeme().to_string();
-        //         if self.aliases.contains_key(&name) {
-        //             name = self.aliases[&name].to_string();
-        //         }
-        //
-        //         let n = self.data.add_symbol(name, None);
-        //
-        //         Kind::Object(n)
-        //     }
-        //     _ => {
-        //         eprintln!("Unknown token to be used as value: {:?}", ctx.current());
-        //
-        //         Kind::None
-        //     }
-        // });
-        // ctx.advance();
 
         if self.consume(ctx, TokenKind::Less) {
             r#type.add_argument(self.get_type(ctx));
@@ -252,18 +229,6 @@ impl<'data> Parser<'data> {
 
             r#type = t;
         }
-        // else if self.consume(ctx, TokenKind::LeftParenthesis) {
-        //     while !self.consume(ctx, TokenKind::RightParenthesis) {
-        //         let mut t = r#type.add(kind);
-        //         t.add(
-        //     }
-        // }
-
-        // eprintln!(
-        //     "TYPE: {}: {}",
-        //     r#type.output(self.data),
-        //     ctx.current().lexeme()
-        // );
 
         self.data.add_type(r#type)
     }
@@ -309,14 +274,6 @@ impl<'data> Parser<'data> {
         while !self.consume(ctx, TokenKind::RightParenthesis) {
             tokens.append(&mut self.expression(ctx));
         }
-
-        // let tokens = self.expression(ctx);
-        //
-        // self.expect(
-        //     ctx,
-        //     TokenKind::RightParenthesis,
-        //     "Expected ')' to close group",
-        // );
 
         tokens
     }
@@ -404,6 +361,15 @@ impl<'data> Parser<'data> {
         let mut symbol = self.data.add_symbol(name.to_string(), None);
         ctx.advance();
 
+        let mut type_ = Type::function();
+        if self.consume(ctx, TokenKind::Less) {
+            while !self.consume(ctx, TokenKind::Greater) {
+                let t = self.get_type(ctx);
+
+                type_.add_argument(t);
+            }
+        }
+
         let mut tokens = vec![];
         if self.consume(ctx, TokenKind::LeftParenthesis) {
             let mut arity = 0;
@@ -416,9 +382,15 @@ impl<'data> Parser<'data> {
                 name = self.aliases[&name].clone();
             }
 
-            symbol = self.data.add_symbol(name, None);
+            if let Some(ty) = self.natives.get(&symbol) {
+                type_ = *self.data.get_type(*ty);
+            }
 
-            tokens.push(op!(self, ctx, Call, [symbol, arity, 0]));
+            symbol = self.data.add_symbol(name, None);
+            let mut call = op!(self, ctx, Call, [symbol, arity, 0]);
+            call.set_type(self.data.add_type(type_));
+
+            tokens.push(call);
         } else if self.consume(ctx, TokenKind::Equal) {
             tokens.append(&mut self.expression(ctx));
             tokens.push(op!(self, ctx, Assign, [symbol, 0, 0]));
@@ -427,7 +399,6 @@ impl<'data> Parser<'data> {
         } else if self.consume(ctx, TokenKind::MinusMinus) {
             tokens.push(op!(self, ctx, Dec, [symbol, 0, 0]));
         } else {
-            // tokens.append(&mut self.expression(ctx));
             tokens.push(op!(self, ctx, Load, [symbol, 0, 0]));
         } // TODO: handle other tokens on identifiers, like increment, decrement, etc.
 
@@ -624,8 +595,7 @@ impl<'data> Parser<'data> {
                         "Expected ')' for sub-pattern",
                     );
                 } else {
-                    todo!("Handle is_some() kind of checks");
-                    todo!("Handle is_err kind of checks");
+                    todo!("Handle is_some() and is_err() kind of checks");
                 }
             }
             TokenKind::Default => {
@@ -647,18 +617,12 @@ impl<'data> Parser<'data> {
                 let symbol = self
                     .data
                     .add_symbol(ctx.current().lexeme().to_string(), None);
-                // ctx.advance();
                 tokens.append(&mut self.expression(ctx));
                 tokens.push(op!(self, ctx, Store, [symbol, 0, 0]));
             }
             _ => {
                 tokens.append(&mut self.expression(ctx));
-                // ctx.advance();
-                // tokens.append(&mut self.expression(ctx));
-            } // _ => {
-              //     ctx.advance();
-              //     tokens.append(&mut self.expression(ctx));
-              // }
+            }
         }
 
         if self.matches(ctx, TokenKind::Pipe) {
@@ -669,7 +633,6 @@ impl<'data> Parser<'data> {
 
         tokens.append(&mut predicate.clone());
         tokens.push(op!(self, ctx, Equal));
-        // tokens.push(op!(self, ctx,ConditionJump, None));
 
         tokens
     }
@@ -687,47 +650,12 @@ impl<'data> Parser<'data> {
         );
 
         while !self.consume(ctx, TokenKind::RightBracket) {
-            // self.parse_pattern_branch(ctx, &expr);
             tokens.append(&mut self.parse_pattern_branch(ctx, &expr));
 
             self.consume(ctx, TokenKind::Comma);
         }
 
         tokens.insert(0, op!(self, ctx, Match, [tokens.len(), 0, 0]));
-
-        tokens
-    }
-
-    fn match_expression(&mut self, ctx: &mut Context) -> Vec<IR> {
-        self.expect(ctx, TokenKind::Match, "Expected a 'match' keyword");
-        let mut tokens = vec![];
-        let predicate = self.expression(ctx);
-
-        self.expect(ctx, TokenKind::LeftBracket, "Expected '{' for match body");
-
-        // let mut has_prev = None;
-        let mut jumps = vec![];
-        while !self.matches(ctx, TokenKind::RightBracket) {
-            tokens.append(&mut self.parse_pattern_branch(ctx, &predicate));
-            jumps.push(tokens.len() - 1);
-
-            if !self.matches(ctx, TokenKind::Comma) {
-                break;
-            }
-
-            self.expect(ctx, TokenKind::Comma, "Expected comma");
-        }
-
-        {
-            // Handles the removal of trailing jump which is obsolete as the execution
-            // should continue normally onwards
-            jumps.pop();
-            tokens.pop();
-        }
-
-        // jumps.iter().for_each(|jump| self.patch(&mut tokens, *jump));
-
-        self.expect(ctx, TokenKind::RightBracket, "Unterminated match body");
 
         tokens
     }
@@ -851,7 +779,6 @@ impl<'data> Parser<'data> {
         result.append(&mut initializer);
         result.push(op!(self, ctx, Loop, [condition.len(), body.len(), 0]));
         result.append(&mut condition);
-        // result.push(op!(self, ctx,Rewind, Some([body.len(), 0, 0])));
         result.append(&mut body);
 
         result
@@ -897,7 +824,6 @@ impl<'data> Parser<'data> {
                     Prop,
                     [self.data.add_symbol(name, None), 0, 0]
                 ));
-                // todo!("Handle remainder of cases");
             } // TODO: Implement Increment for properties
         }
 
@@ -994,19 +920,7 @@ impl<'data> Parser<'data> {
     }
 
     fn expression(&mut self, ctx: &mut Context) -> Vec<IR> {
-        // if self.matches(ctx, TokenKind::Match) {
-        //     self.expect(
-        //         ctx,
-        //         TokenKind::Match,
-        //         "Something went wrong with parsing match",
-        //     );
-        //     self.match_expression(ctx)
-        // } else if self.matches(ctx, TokenKind::If) {
-        //     self.if_expression(ctx)
-        // } else {
         self.precedence(ctx, Precedence::Assign)
-
-        // }
     }
 
     fn expr(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -1162,7 +1076,6 @@ impl<'data> Parser<'data> {
         let mut arity: usize = 0;
         let mut argument_types = vec![];
         while !self.matches(ctx, TokenKind::RightParenthesis) {
-            // ctx.advance();
             let kind = self.get_type(ctx);
             let argument = ctx.current().clone();
 
@@ -1215,7 +1128,7 @@ impl<'data> Parser<'data> {
 
             body.append(&mut upvalues);
         }
-        let mut kind = self.data.add_type(Type::any()); // Kind::None;
+        let mut kind = self.data.add_type(Type::any());
         if self.consume(ctx, TokenKind::SlimArrow) {
             kind = self.get_type(ctx);
         }
@@ -1224,13 +1137,6 @@ impl<'data> Parser<'data> {
         } else {
             body.append(&mut self.block(ctx));
         }
-        // body.push(op!(
-        //     self,
-        //     ctx,
-        //     Const,
-        //     [self.data.add_constant(Value::NONE, 0), 0, 0,]
-        // ));
-        // body.push(op!(self, ctx, Leave));
 
         let symbol = self.name(name, None);
         body.insert(0, op!(self, ctx, Begin, [symbol, 0, 0]));
@@ -1252,14 +1158,8 @@ impl<'data> Parser<'data> {
     }
 
     fn prop(&mut self, ctx: &mut Context, owner: usize, public: bool) -> Vec<IR> {
-        // let mut kind = self.data.add_type(Type::any());
-
-        // if !self.matches(ctx, TokenKind::Identifier) {
         let kind = self.get_type(ctx);
-        // ctx.advance();
-        // }
 
-        dbg!(&ctx.current);
         let prop_name = ctx.current.lexeme().to_string();
         self.consume(ctx, TokenKind::Identifier);
 
@@ -1286,7 +1186,6 @@ impl<'data> Parser<'data> {
         self.namespace = String::new();
         let mut method = self.function(ctx);
 
-        // method.insert(1, op!(self, ctx, Begin));
         method.insert(2, IR::new(Operation::Bind, Default::default()));
         if let Some(func) = method.first() {
             let [name, arity, len] = func.operands().to_owned();
@@ -1298,12 +1197,10 @@ impl<'data> Parser<'data> {
 
             let mut member = op!(self, ctx, Method, [symbol, arity, len]);
             member.set_type(func.kind());
-            // method.insert(1, op!(self, ctx, Begin, [name, 0, 0]));
 
             method.insert(1, member);
         }
         self.namespace = ns;
-        // method.push(op!(self, ctx, End));
         method.drain(0..1);
 
         method
@@ -1341,15 +1238,6 @@ impl<'data> Parser<'data> {
                 class.append(&mut self.prop(ctx, owner, public));
             } else if self.matches(ctx, TokenKind::Function) {
                 class.append(&mut self.method(ctx, owner, public));
-                // let mut method = self.function(ctx);
-                // if let Some(code) = method.first_mut() {
-                //     let operands = code.operands();
-                //     let mut method =
-                //         op!(self, ctx, Method, Some([owner, operands[0], operands[2]]));
-                //     method.set_type(code.kind());
-                //     *code = method;
-                // }
-                // class.append(&mut method);
             }
         }
 
@@ -1398,7 +1286,7 @@ impl<'data> Parser<'data> {
             let mut body = vec![];
             let mut arity = 0;
             while !self.matches(ctx, TokenKind::RightParenthesis) {
-                let type_ = match ctx.current.kind() {
+                let _ = match ctx.current.kind() {
                     TokenKind::Int => Kind::Integer,
                     TokenKind::Str => Kind::String,
                     TokenKind::Bool => Kind::Bool,
@@ -1440,7 +1328,7 @@ impl<'data> Parser<'data> {
             );
 
             if self.consume(ctx, TokenKind::SlimArrow) {
-                let type_ = match ctx.current.kind() {
+                let _ = match ctx.current.kind() {
                     TokenKind::Int => Kind::Integer,
                     TokenKind::Str => Kind::String,
                     TokenKind::Bool => Kind::Bool,
@@ -1539,16 +1427,6 @@ impl<'data> Parser<'data> {
             let mut ty = Type::object(symbol);
             if self.consume(ctx, TokenKind::Less) {
                 while !self.consume(ctx, TokenKind::Greater) {
-                    // self.consume(ctx, TokenKind::Dolar);
-                    // let arg = self
-                    //     .data
-                    //     .add_symbol(ctx.current().lexeme().to_string(), None);
-                    //
-                    // let param_ty = self.get_type(ctx);
-                    // let param = self
-                    //     .data
-                    //     .add_type(Type::new(Kind::Generic(type_arity, param_ty)));
-
                     ty.add_argument(self.get_type(ctx));
                     self.consume(ctx, TokenKind::Comma);
                 }
@@ -1575,7 +1453,6 @@ impl<'data> Parser<'data> {
 
     fn this(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
-        // let mut result = self.expression(ctx);
         let mut this = op!(self, ctx, This);
         assert!(
             ctx.owner().is_some(),
@@ -1589,42 +1466,38 @@ impl<'data> Parser<'data> {
         let mut prefix = vec![];
         let mut children = vec![];
 
+        let segment = ctx.current();
+        prefix.append(
+            &mut segment
+                .lexeme()
+                .split("::")
+                .map(std::string::ToString::to_string)
+                .collect(),
+        );
         self.expect(ctx, TokenKind::Identifier, "Expected module identifier");
-        if let Some(segment) = ctx.previous() {
-            prefix.push(segment.lexeme().to_string());
-        }
 
-        if self.consume(ctx, TokenKind::ColonColon) {
-            if self.consume(ctx, TokenKind::LeftBracket) {
-                let mut next = ns.clone();
-                next.append(&mut prefix.clone());
+        if self.consume(ctx, TokenKind::LeftBracket) {
+            let mut next = ns.clone();
+            next.append(&mut prefix.clone());
 
-                loop {
-                    self.parse_imports(ctx, &next).iter().for_each(|p| {
-                        let mut path = prefix.clone();
-                        path.append(&mut p.clone());
-                        children.push(path);
-                    });
-
-                    if !self.matches(ctx, TokenKind::Comma) {
-                        break;
-                    }
-                }
-
-                self.expect(
-                    ctx,
-                    TokenKind::RightBracket,
-                    "Expected '}' to close module group",
-                );
-            } else {
-                let mut next = ns.clone();
-                next.append(&mut prefix.clone());
+            loop {
                 self.parse_imports(ctx, &next).iter().for_each(|p| {
                     let mut path = prefix.clone();
                     path.append(&mut p.clone());
                     children.push(path);
                 });
+
+                if !self.consume(ctx, TokenKind::Comma) {
+                    break;
+                }
             }
+
+            self.expect(
+                ctx,
+                TokenKind::RightBracket,
+                "Expected '}' to close module group",
+            );
+        } else {
         }
 
         if self.consume(ctx, TokenKind::As) {
@@ -1637,25 +1510,57 @@ impl<'data> Parser<'data> {
                     self.aliases
                         .entry(prev.lexeme().to_string())
                         .or_insert_with(|| {
-                            format!("{}::{}", ns.join("::"), prefix.join("::"))
-                                .trim_start_matches("::")
-                                .to_string()
+                            format!(
+                                "{}::{}",
+                                ns.join("::"),
+                                prefix
+                                    .clone()
+                                    .into_iter()
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join("::")
+                            )
+                            .trim_start_matches("::")
+                            .to_string()
                         });
                 }
             }
         } else if let Some(last) = prefix.last() {
             self.aliases.entry(last.to_string()).or_insert_with(|| {
-                format!("{}::{}", ns.join("::"), prefix.join("::"))
-                    .trim_start_matches("::")
-                    .to_string()
+                format!(
+                    "{}::{}",
+                    ns.iter()
+                        .filter(|&v| !v.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                    prefix
+                        .clone()
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                )
+                .trim_start_matches("::")
+                .to_string()
             });
         }
 
         if children.is_empty() {
-            return vec![prefix];
+            return vec![
+                prefix
+                    .clone()
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>(),
+            ];
         }
 
-        children.into_iter().filter(|s| !s.is_empty()).collect()
+        children
+            .clone()
+            .into_iter()
+            .map(|c| c.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
     }
 
     fn import(&mut self, ctx: &mut Context) -> Vec<IR> {
@@ -1882,12 +1787,12 @@ mod tests {
 
                     for (idx, token) in tokens.iter().enumerate() {
                         assert_eq!(
-                            program.get(idx).map(|t| t.code()),
-                            Some(*token),
+                            program.get(idx).code(),
+                            *token,
                             "Token #{}, '{:?}' does not match token '{:?}'",
                             idx + 1,
-                            program.get(idx).map(|t| t.code()).unwrap_or_default(),
-                            (*token),
+                            program.get(idx).code(),
+                            *token,
                         )
                     }
 
@@ -2119,17 +2024,4 @@ mod tests {
             Operation::Pop
         );
     }
-
-    // #[test]
-    // fn test_match_expression() {
-    //     assert_parsed_expression!(
-    //         "match true { true => 'sadge' };",
-    //         Operation::Const, // Left
-    //         Operation::Const, // Right
-    //         Operation::Equal, // Equals
-    //         Operation::Match, // conditional jump
-    //         Operation::Const, // the match arm body
-    //         Operation::Jump   // jump out of the match expr
-    //     );
-    // }
 }

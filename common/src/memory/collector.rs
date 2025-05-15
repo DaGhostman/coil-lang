@@ -76,13 +76,14 @@ impl<T: GcSized + Copy> GcSized for Cell<T> {
     }
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug, Hash, PartialOrd, PartialEq)]
 pub struct Collectable<T> {
     ptr: NonNull<Gc<T>>,
 }
 
 impl<T> Collectable<T> {
-    #[must_use] pub fn new(boxed: Box<Gc<T>>) -> Self {
+    #[must_use]
+    pub fn new(boxed: Box<Gc<T>>) -> Self {
         Self {
             ptr: NonNull::from(Box::leak(boxed)),
         }
@@ -92,7 +93,8 @@ impl<T> Collectable<T> {
         _ = unsafe { Box::from_raw(self.ptr.as_ptr()) }
     }
 
-    #[must_use] pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
+    #[must_use]
+    pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
         lhs.ptr.eq(&rhs.ptr)
     }
 }

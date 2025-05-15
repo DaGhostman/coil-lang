@@ -6,13 +6,13 @@ use crate::calculate_hash;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Interner<V>
 where
-    V: Hash + Clone + Eq,
+    V: Hash + Eq,
 {
     uniq: HashMap<u64, usize>,
     storage: Vec<V>,
 }
 
-impl<V: Eq + Hash + Clone> Default for Interner<V> {
+impl<V: Eq + Hash> Default for Interner<V> {
     fn default() -> Self {
         Interner {
             uniq: HashMap::with_capacity_and_hasher(8, FxBuildHasher),
@@ -21,7 +21,7 @@ impl<V: Eq + Hash + Clone> Default for Interner<V> {
     }
 }
 
-impl<V: Hash + Clone + Eq + std::fmt::Debug> Interner<V> {
+impl<V: Hash + Eq + std::fmt::Debug> Interner<V> {
     pub fn intern(&mut self, value: V) -> usize {
         let hash = calculate_hash(&value);
 
@@ -33,30 +33,28 @@ impl<V: Hash + Clone + Eq + std::fmt::Debug> Interner<V> {
     }
 
     pub fn replace(&mut self, index: usize, value: V) {
+        assert!(index < self.storage.len());
+
         self.storage[index] = value;
     }
 
-    #[must_use]
     pub fn lookup(&self, key: usize) -> &V {
+        assert!(key < self.storage.len());
         &self.storage[key]
     }
 
     pub fn lookup_mut(&mut self, key: usize) -> &mut V {
+        assert!(key < self.storage.len());
+
         &mut self.storage[key]
     }
 
-    #[must_use]
     pub fn len(&self) -> usize {
         self.uniq.len()
     }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.uniq.is_empty()
-    }
 }
 
-impl<V: Hash + Clone + Eq> IntoIterator for Interner<V> {
+impl<V: Hash + Eq> IntoIterator for Interner<V> {
     type Item = V;
 
     type IntoIter = std::vec::IntoIter<Self::Item>;

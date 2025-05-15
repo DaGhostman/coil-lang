@@ -22,7 +22,7 @@ use super::collector::Collectable;
 pub enum Objects {
     #[default]
     None,
-    Array(Collectable<ObjArray>), // Array(HashMap<usize, usize>),
+    Array(Collectable<ObjArray>),
     Iterator(Collectable<ObjIterator>),
     String(Collectable<ObjString>),
     Object(Collectable<ObjInstance>),
@@ -425,8 +425,8 @@ impl ObjInstance {
         self.name
     }
 
-    pub fn update(&mut self, name: usize, value: Value) {
-        self.state.insert(name, value);
+    pub fn update(&mut self, name: usize, value: &Value) {
+        self.state.insert(name, *value);
         self.hash = calculate_hash(self);
     }
 
@@ -484,14 +484,16 @@ pub struct ObjCoroutine {
 }
 
 impl ObjCoroutine {
-    #[must_use] pub fn get(&self) -> Value {
+    #[must_use]
+    pub fn get(&self) -> Value {
         self.value
     }
     pub fn set(&mut self, value: Value) {
         self.value = value;
     }
 
-    #[must_use] pub fn resume(&self) -> (usize, &Vec<Value>) {
+    #[must_use]
+    pub fn resume(&self) -> (usize, &Vec<Value>) {
         (self.ip, &self.stack)
     }
 

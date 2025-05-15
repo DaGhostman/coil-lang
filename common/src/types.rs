@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 use crate::{Value, memory::object::Objects, program::data::Data};
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, Eq, Hash)]
 #[repr(u8)]
 pub enum Kind {
     #[default]
@@ -31,6 +31,34 @@ pub enum Kind {
     Intersection,
     Type,
     Wildcard,
+}
+
+impl PartialEq for Kind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Wildcard, _)
+            | (_, Self::Wildcard)
+            | (Self::None, Self::None)
+            | (Self::Integer, Self::Integer)
+            | (Self::Float, Self::Float)
+            | (Self::String, Self::String)
+            | (Self::Function, Self::Function)
+            | (Self::Pointer, Self::Pointer)
+            | (Self::Reference, Self::Reference)
+            | (Self::Resource, Self::Resource)
+            | (Self::Result, Self::Result)
+            | (Self::Error, Self::Error)
+            | (Self::Union, Self::Union)
+            | (Self::Intersection, Self::Intersection)
+            | (Self::Type, Self::Type) => true,
+            (Self::Range(l), Self::Range(r))
+            | (Self::Object(l), Self::Object(r))
+            | (Self::List(l), Self::List(r))
+            | (Self::Coroutine(l), Self::Coroutine(r))
+            | (Self::Generic(_, l), Self::Generic(_, r)) => l == r,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -227,7 +255,7 @@ impl Type {
                 )
             }
             Kind::Coroutine(n) => {
-                format!("~{}", data.symbol_name(n))
+                format!("~{}", data.get_type(n).output(data))
             }
             Kind::Wildcard => "%".to_string(),
             _ => {
@@ -254,12 +282,11 @@ impl Type {
 
                 fmt
             }
-            _ => format!("{:?}", self.kind()),
         }
     }
 
     #[must_use]
-    pub fn matches(&self, other: Self) -> bool {
+    pub fn matches(&self, _: Self) -> bool {
         false
     }
 
@@ -277,22 +304,14 @@ impl From<&Value> for Kind {
             Value::INTEGER(_) => Kind::Integer,
             Value::FLOAT(_) => Kind::Float,
             Value::OBJECT(Objects::String(_)) | Value::STR(_) | Value::STRING(_) => Kind::String,
-            // Value::RANGE(_, _) => Kind::Range,
-            // ValueKind::FILE(_) => Type::
             Value::FUNCTION(_, _) => Kind::Function,
             Value::FILE(_) | Value::RESOURCE(_) => Kind::Resource,
             Value::POINTER(_) => Kind::Pointer,
-            Value::REFERENCE(_) => {
-                todo!(
-                    "Investigate how to transfer objects between C & Rust dynamically (if possible)"
-                );
-            }
             Value::FFI(_) => {
                 unreachable!("FFI wrapping modules must not be converted to types")
             }
             Value::OBJECT(Objects::Object(o)) => Kind::Object(o.as_ref().name()),
             Value::OBJECT(Objects::Array(a)) => Kind::List(a.as_ref().len()),
-            Value::OBJECT(Objects::Coroutine(_)) => Kind::Coroutine(0),
             Value::TYPE(_) => Kind::Type,
             _ => Kind::Wildcard,
         }

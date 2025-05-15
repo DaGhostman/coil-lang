@@ -41,17 +41,6 @@ impl<const N: usize> Default for TypeChecker<N> {
     }
 }
 
-macro_rules! binary_op {
-    ($this:expr, $l:ident, $r: ident) => {
-        if ($this.peek(0) == Kind::$r && $this.peek(1) == Kind::$l) {
-            $this.pop(2);
-            true
-        } else {
-            false
-        }
-    };
-}
-
 impl<const N: usize> TypeChecker<N> {
     fn push(&mut self, r#type: usize) {
         self.stack[self.sp] = r#type;
@@ -72,9 +61,6 @@ impl<const N: usize> TypeChecker<N> {
         self.stack[self.sp - 1 - offset]
     }
 
-    fn last(&self) -> usize {
-        self.stack[self.sp - 1]
-    }
 
     pub fn get_errors(&self) -> &Vec<Error> {
         &self.errors
@@ -85,11 +71,6 @@ impl<const N: usize> TypeChecker<N> {
     }
 
     fn error(&mut self, message: String, metadata: &Metadata) {
-        // if start.0 != end.0 {
-        //     fmt = format!("{fmt} @ {}:{}-{}:{}", start.0, start.1, end.0, end.1);
-        // } else {
-        //     fmt = format!("{fmt} @ {}:{}-{}", start.0, start.1, end.1);
-        // }
 
         self.errors.push(Error::new(
             ErrorOrigin::TYPE,
@@ -103,19 +84,18 @@ impl<const N: usize> TypeChecker<N> {
     }
 
     fn resolve_type(&self, data: &Data, entry: usize) -> usize {
-        // return entry;
-        // return entry;
         match data.get_type(entry).kind() {
             Kind::Generic(name, constraint) => {
                 if self.type_arguments.contains_key(&self.scope) && self.type_arguments[&self.scope].contains_key(&name) {
-                
                     data.find_type(Type::new(Kind::Generic(name, self.type_arguments[&self.scope][&name])))
                 } else if self.class_params.contains_key(&self.scope) && self.class_params[&self.scope].contains_key(&name) {
                     data.find_type(Type::new(Kind::Generic(name, self.class_params[&self.scope][&name])))
-                    // self.resolve_type(data, self.class_params[&self.scope][&name])
                 } else {
-                    entry
+                    constraint
                 }
+            }
+            Kind::Coroutine(constraint) => {
+                data.find_type(Type::new(Kind::Coroutine(self.resolve_type(data, constraint))))
             }
             _ => entry,
         }
@@ -134,6 +114,9 @@ impl<const N: usize> TypeChecker<N> {
                     constraint
                 }
             }
+            Kind::Coroutine(entry) => {
+                data.add_type(Type::new(Kind::Coroutine(self.resolve_type(data, entry))))
+            }
             _ => entry,
         }
     }
@@ -144,7 +127,8 @@ impl<const N: usize> TypeChecker<N> {
         }
 
         let ty = data.get_type(self.resolve_type(data, expectation));
-        let expectation = self.resolve_type(data, actual); //self.resolve_type(data, expectation);
+        let expectation = self.resolve_type(data, actual); 
+        
 
         match ty.kind() {
             Kind::Union => {
@@ -168,10 +152,17 @@ impl<const N: usize> TypeChecker<N> {
             Kind::Generic(_, constraint) => {
                 expectation == actual || actual == constraint || self.match_type(data, actual, constraint)
             }
+            Kind::Coroutine(constraint) => {
+                if let Kind::Coroutine(exp) = data.get_type(self.resolve_type(data, expectation)).kind() {
+                    self.match_type(data, exp, constraint)
+                } else {
+                    false
+                }
+            }
             _ => {
                 let a = ty;
                 let e = data.get_type(expectation);
-
+                
                 if a.kind() == e.kind() {
                     if a.len() != e.len() {
                         return false;
@@ -202,9 +193,10 @@ impl<const N: usize> TypeChecker<N> {
         while ip < code.len() {
             let op = &code[ip];
 
-            // println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
-            //     data.get_type(*n).output(data)
-            // }).collect::<Vec<String>>().join(", "));
+            #[cfg(feature = "debug")]
+            println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
+                data.get_type(*n).output(data)
+            }).collect::<Vec<String>>().join(", "));
 
             match op.code() {
                 Operation::Const => {
@@ -350,8 +342,7 @@ impl<const N: usize> TypeChecker<N> {
                                 } else {
                                     op.kind()
                                 });
-                        } else if ty != variables[&name]
-                        {
+                        } else if !self.match_type(data, ty, variables[&name]) {
                             self.error(
                                 format!(
                                     "Unable to assign value of type {:?} to '{}' because it expects {:?}", 
@@ -406,10 +397,6 @@ impl<const N: usize> TypeChecker<N> {
                 }, 
                 Operation::This => self.push(op.kind()),
                 Operation::Load => {
-                    // for (n, t) in &variables {
-                    //     println!("{}: {}", data.symbol_name(**n), data.get_type(*t).kind());
-                    // }
-                    // println!("Expected: {}: {}", data.symbol_name(op.operands()[0]), data.get_type(op.kind()).kind());
 
                     if variables.contains_key(&op.operands()[0]) {
                         self.push(variables[&op.operands()[0]]);
@@ -441,14 +428,17 @@ impl<const N: usize> TypeChecker<N> {
                 }
                 Operation::Call => {
                     let [name, arity, _] = op.operands();
-                    let mut kind = data.find_type(Type::void());
+                    let kind;
+
                     if let Some(func) = self.functions.get(name) {
-                        let fn_type = data.get_type(*func);
+                        let fn_type = *data.get_type(*func);
+
                         for idx in 0..*arity {
-                            if !self.match_type(data, self.peek(idx), fn_type.get(idx)) {
+                            let sub = self.substitute_type(data, fn_type.get(idx));
+                            if !self.match_type(data, self.peek(idx), sub) {
                                 self.errors.push(Error::new(ErrorOrigin::PARSE, format!(
                                     "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
-                                    idx + 1,
+                                    arity - idx ,
                                     data.symbol_name(op.operands()[0]),
                                     data.get_type(data.get_type(*func).get(idx)).output(data), 
                                     data.get_type(self.peek(idx)).output(data)
@@ -457,6 +447,24 @@ impl<const N: usize> TypeChecker<N> {
                         }
 
                         kind = self.resolve_type(data, data.get_type(*func).returns());
+                    } else {
+                        let fn_type = *data.get_type(op.kind());
+                        let func = data.find_type(fn_type);
+
+                        for idx in 0..*arity {
+                            let sub = self.substitute_type(data, fn_type.get(idx));
+                            if !self.match_type(data, self.peek(idx), sub) {
+                                self.errors.push(Error::new(ErrorOrigin::PARSE, format!(
+                                    "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
+                                    arity - idx ,
+                                    data.symbol_name(op.operands()[0]),
+                                    data.get_type(self.resolve_type(data, data.get_type(func).get(idx))).output(data), 
+                                    data.get_type(self.resolve_type(data, self.peek(idx))).output(data)
+                                )));
+                            }
+                        }
+
+                        kind = self.resolve_type(data, fn_type.returns());
                     }
 
                     self.pop(*arity);
@@ -467,7 +475,6 @@ impl<const N: usize> TypeChecker<N> {
                     match action {
                         0 => {
                             if let Kind::Object(n) = data.get_type(self.peek(0)).kind() {
-                                // dbg!(data.symbol_name(*name));
                                 self.pop(1);
                                 if self.state[&n].contains_key(name) {
                                     self.push(self.state[&n][name]);
@@ -582,7 +589,6 @@ impl<const N: usize> TypeChecker<N> {
                     } else if let Kind::Coroutine(t) = object.kind() {
                         if data.symbol_name(op.get(0)) == "get" {
                             result = t;
-                            // self.push(t)
 
                         } else {
                             self.error(format!("Coroutine does not have method named {}", data.symbol_name(op.get(0))), op.metadata());
@@ -631,6 +637,8 @@ impl<const N: usize> TypeChecker<N> {
                 Operation::Method => {
                     let &[mut symbol, arity, len] = op.operands();
 
+                    let original_symbol = symbol;
+
                     let public = (symbol & 1) == 1;
                     symbol >>= 1;
                     let name = symbol & 0xffff;
@@ -653,10 +661,9 @@ impl<const N: usize> TypeChecker<N> {
 
                     let scope = self.scope;
                     self.scope = owner;
-                    // bytecode.push(*op);
                     self.expects_return = Some(data.get_type(op.kind()).returns());
                     let mut body = self.check(&code[ip + 1..ip + 1 + len], data);
-                    bytecode.push(IR::new(Operation::Method, [symbol, arity, body.len()]));
+                    bytecode.push(IR::new(Operation::Method, [original_symbol, arity, body.len()]));
                     bytecode.append(&mut body);
 
                     self.expects_return = None;

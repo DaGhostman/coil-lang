@@ -1,13 +1,12 @@
+mod language;
+mod stdlib;
+
 use std::path::Path;
 
 use clap::{ArgAction, Parser as Clap, ValueHint};
-use common::program::data::Data;
-use compiler::{
-    Compiler,
-    passes::{ConstantFolding, DCE, LabelUnrolling, RedundancyRemoval},
-};
-use machine::{Machine, MachineOptions};
-use parser::Parser;
+use language::Language;
+use machine::MachineOptions;
+use stdlib::Coroutine;
 
 #[derive(Clap)]
 struct Options {
@@ -69,32 +68,38 @@ fn main() {
     }
 
     options.set_quiet(args.quiet);
+    let mut language = Language::default();
+    let coroutine = Coroutine::default();
 
-    let mut data = Data::default();
+    language.load(&coroutine);
 
-    if let Ok(program) = Parser::new(args.file, &mut data).parse() {
-        let mut compiler = Compiler::new(data.clone());
+    language.run(args.file);
 
-        let mut constant_folder = ConstantFolding::default();
-        let mut label_conversion = LabelUnrolling::default();
-        let mut redundancy_removal = RedundancyRemoval::default();
-        let mut dce = DCE::default();
-
-        // if args.optimize {
-        compiler.attach(&mut constant_folder);
-        // }
-
-        compiler.attach(&mut redundancy_removal);
-        compiler.attach(&mut dce);
-        compiler.attach(&mut label_conversion);
-
-        match compiler.compile(&program) {
-            Ok((opcodes, data)) => {
-                Machine::with_options(options).run(&opcodes, &data);
-            }
-            Err(e) => {
-                dbg!(e);
-            }
-        }
-    }
+    // let mut data = Data::default();
+    //
+    // if let Ok(program) = Parser::new(args.file, &mut data).parse() {
+    //     let mut compiler = Compiler::new(data.clone());
+    //
+    //     let mut constant_folder = ConstantFolding::default();
+    //     let mut label_conversion = LabelUnrolling::default();
+    //     let mut redundancy_removal = RedundancyRemoval::default();
+    //     let mut dce = DCE::default();
+    //
+    //     // if args.optimize {
+    //     compiler.attach(&mut constant_folder);
+    //     // }
+    //
+    //     compiler.attach(&mut redundancy_removal);
+    //     compiler.attach(&mut dce);
+    //     compiler.attach(&mut label_conversion);
+    //
+    //     match compiler.compile(&program) {
+    //         Ok((opcodes, data)) => {
+    //             Machine::with_options(options).run(&opcodes, &data);
+    //         }
+    //         Err(e) => {
+    //             dbg!(e);
+    //         }
+    //     }
+    // }
 }

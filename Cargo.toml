@@ -8,8 +8,9 @@ members = [
 [features]
 trace = ["machine/trace"]
 stress_gc = ["machine/stress"]
+typecheck = ["parser/debug"]
 dump = ["compiler/dump"]
-debug = ["trace", "stress_gc", "dump"]
+debug = ["trace", "stress_gc", "dump", "common/debug", "typecheck"]
 
 [package]
 name = "zero"
@@ -24,9 +25,18 @@ compiler = { path = "compiler" }
 machine = { path = "machine" }
 clap = { version = "4.5", features = ["derive"] }
 
+[dev-dependencies]
+criterion = "0.5"
+rustc-hash = "*"
+
+[[bench]]
+name = "language_benchmarks"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = false
+# split-debuginfo = "packed"
+# strip = "debuginfo"
 debug = 1
