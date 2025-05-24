@@ -1,10 +1,13 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{Value, interner::Interner, symbols::SymbolTable, types::Type};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Data {
     constants: Interner<(Value, usize)>,
     strings: Interner<String>,
     symbols: SymbolTable,
+    #[serde(skip)]
     types: Interner<Type>,
 }
 
@@ -35,11 +38,13 @@ impl Data {
         self.types.intern(value)
     }
 
-    #[must_use] pub fn get_type(&self, index: usize) -> &Type {
+    #[must_use]
+    pub fn get_type(&self, index: usize) -> &Type {
         self.types.lookup(index)
     }
 
-    #[must_use] pub fn find_type(&self, value: Type) -> usize {
+    #[must_use]
+    pub fn find_type(&self, value: Type) -> usize {
         let mut this = self.types.clone();
         let idx = this.intern(value);
 
@@ -52,8 +57,13 @@ impl Data {
         self.strings.intern(value)
     }
 
-    #[must_use] pub fn string(&self, index: usize) -> &String {
+    #[must_use]
+    pub fn string(&self, index: usize) -> &String {
         self.strings.lookup(index)
+    }
+
+    pub fn strings(&self) -> Vec<String> {
+        self.strings.collect()
     }
 
     pub fn add_constant(&mut self, value: Value, r#type: usize) -> usize {
@@ -64,14 +74,24 @@ impl Data {
         self.constants.replace(index, (value, r#type));
     }
 
-    #[must_use] pub fn constant(&self, index: usize) -> &Value {
+    #[must_use]
+    pub fn constant(&self, index: usize) -> &Value {
         &self.constants.lookup(index).0
     }
     pub fn constant_mut(&mut self, index: usize) -> &mut Value {
         &mut self.constants.lookup_mut(index).0
     }
 
-    #[must_use] pub fn constant_type(&self, index: usize) -> &Type {
+    pub fn constants(&self) -> Vec<Value> {
+        self.constants
+            .collect()
+            .iter()
+            .map(|(v, _)| *v)
+            .collect::<Vec<_>>()
+    }
+
+    #[must_use]
+    pub fn constant_type(&self, index: usize) -> &Type {
         self.types.lookup(self.constants.lookup(index).1)
     }
 
@@ -79,37 +99,45 @@ impl Data {
         self.symbols.insert(symbol, constant)
     }
 
-    #[must_use] pub fn symbol_name(&self, symbol: usize) -> &String {
+    #[must_use]
+    pub fn symbol_name(&self, symbol: usize) -> &String {
         self.symbols.name(symbol)
     }
 
-    #[must_use] pub fn symbol_constant(&self, symbol: usize) -> usize {
+    #[must_use]
+    pub fn symbol_constant(&self, symbol: usize) -> usize {
         self.symbols.constant(symbol)
     }
 
-    #[must_use] pub fn symbol_constant_exists(&self, symbol: usize) -> bool {
+    #[must_use]
+    pub fn symbol_constant_exists(&self, symbol: usize) -> bool {
         self.symbols.has_constant(symbol)
     }
 
-    #[must_use] pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
+    #[must_use]
+    pub fn symbol_constant_type(&self, symbol: usize) -> &Type {
         let constant = self.symbol_constant(symbol);
         self.constant_type(constant)
     }
 
-    #[must_use] pub fn symbol_exists(&self, symbol: String) -> bool {
+    #[must_use]
+    pub fn symbol_exists(&self, symbol: String) -> bool {
         self.symbols.contains(symbol)
     }
 
-    #[must_use] pub fn symbol_index(&self, symbol: String) -> usize {
+    #[must_use]
+    pub fn symbol_index(&self, symbol: String) -> usize {
         self.symbols.symbol(symbol)
     }
 
-    #[must_use] pub fn symbol_constant_value(&self, symbol: usize) -> &Value {
+    #[must_use]
+    pub fn symbol_constant_value(&self, symbol: usize) -> &Value {
         let constant = self.symbols.constant(symbol);
         &self.constants.lookup(constant).0
     }
 
-    #[must_use] pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
+    #[must_use]
+    pub fn symbol_constant_value_type(&self, symbol: usize) -> &Type {
         let constant = self.symbols.constant(symbol);
         self.types.lookup(self.constants.lookup(constant).1)
     }

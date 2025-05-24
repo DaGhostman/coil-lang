@@ -3,6 +3,8 @@ use std::{
     fmt::{Debug, Display},
 };
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Default, PartialEq, Debug, Copy, Clone)]
 #[repr(u8)]
 pub enum Operation {
@@ -75,6 +77,7 @@ pub enum Operation {
     GreaterEqual,
     // ---
     Print,
+    Length,
     Match,
     Check,
     Range,
@@ -188,7 +191,7 @@ impl IR {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Byte {
     /// Terminate the execution of the program (unrecoverable)
@@ -266,8 +269,12 @@ pub enum Byte {
     Duplicate,
     /// Prints the value from the top of the stack
     Print,
+    /// Gets the length of the value
+    Length,
     /// Call a native module function
     Native,
+    /// Invoke the entrypoint of the program
+    Init,
     /// Call a function
     Call,
     /// Load a variable
@@ -303,7 +310,7 @@ pub enum Byte {
     Array,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Code {
     byte: Byte,
     operands: [usize; 3],

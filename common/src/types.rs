@@ -3,11 +3,12 @@ use libffi::{
     low::types::{double, pointer, sint64, uint8, void},
     raw::ffi_type as FFIType,
 };
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
 use crate::{Value, memory::object::Objects, program::data::Data};
 
-#[derive(Copy, Clone, Debug, Default, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Kind {
     #[default]
@@ -61,7 +62,7 @@ impl PartialEq for Kind {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Type {
     own: Kind,
     // This should be handled in such a case that upon reaching the limit, the
@@ -98,13 +99,15 @@ impl Type {
         self.own
     }
 
-    pub fn add(&mut self, kind: usize) {
+    pub fn add(&mut self, kind: usize) -> &mut Self {
         if self.arity >= 32 {
-            return;
+            return self;
         }
 
         self.params[self.arity] = kind;
         self.arity += 1;
+
+        self
     }
 
     #[must_use]
@@ -112,12 +115,14 @@ impl Type {
         self.params[position]
     }
 
-    pub fn set(&mut self, position: usize, kind: usize) {
+    pub fn set(&mut self, position: usize, kind: usize) -> &mut Self {
         self.arity = self.arity.max(position.max(1));
 
         self.params[position] = kind;
 
         self.arity = self.arity.max(position);
+
+        self
     }
 
     pub fn add_argument(&mut self, r#type: usize) -> usize {
@@ -303,7 +308,7 @@ impl From<&Value> for Kind {
             Value::BOOLEAN(_) => Kind::Bool,
             Value::INTEGER(_) => Kind::Integer,
             Value::FLOAT(_) => Kind::Float,
-            Value::OBJECT(Objects::String(_)) | Value::STR(_) | Value::STRING(_) => Kind::String,
+            Value::OBJECT(Objects::String(_)) | Value::STR(_) => Kind::String,
             Value::FUNCTION(_, _) => Kind::Function,
             Value::FILE(_) | Value::RESOURCE(_) => Kind::Resource,
             Value::POINTER(_) => Kind::Pointer,

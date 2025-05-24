@@ -1,6 +1,6 @@
 use common::{
     Value, ValuePtr,
-    error::{Error, ErrorOrigin},
+    error::{Message, MessageOrigin},
     program::data::Data,
     types::Kind,
 };
@@ -27,7 +27,8 @@ pub struct FFIFunction {
 }
 
 impl FFIFunction {
-    #[must_use] pub fn new(name: String) -> Self {
+    #[must_use]
+    pub fn new(name: String) -> Self {
         Self {
             name,
             arguments: Vec::with_capacity(4),
@@ -52,10 +53,10 @@ impl FFIFunction {
         lib: &Library,
         arguments: &[Value],
         data: &mut Data,
-    ) -> Result<Value, Error> {
+    ) -> Result<Value, Message> {
         if arguments.len() != self.arguments.len() {
-            return Err(Error::new(
-                common::error::ErrorOrigin::FFI,
+            return Err(Message::error(
+                MessageOrigin::FFI,
                 format!(
                     "Function expected {} arguments, but called with {}",
                     self.arguments.len(),
@@ -68,8 +69,8 @@ impl FFIFunction {
             if Some(&(argument.to_owned()).into()) != self.arguments.get(idx)
                 && self.arguments.get(idx) != Some(&Kind::Pointer)
             {
-                return Err(Error::new(
-                    ErrorOrigin::FFI,
+                return Err(Message::error(
+                    MessageOrigin::FFI,
                     format!(
                         "Expected argument #{} to be of type '{}', but '{}' was received",
                         idx + 1,
@@ -100,7 +101,7 @@ impl FFIFunction {
         let function = format!("{}\0", self.name);
         let func: Symbol<*mut c_void> = unsafe {
             lib.get(function.as_bytes())
-                .map_err(|e| Error::new(ErrorOrigin::FFI, format!("{e}")))?
+                .map_err(|e| Message::error(MessageOrigin::FFI, format!("{e}")))?
         };
 
         unsafe {
@@ -129,17 +130,18 @@ impl FFIFunction {
         }
     }
 
-    #[must_use] pub fn arity(&self) -> usize {
+    #[must_use]
+    pub fn arity(&self) -> usize {
         self.arguments.len()
     }
 }
 
 impl DynamicLibrary {
-    pub fn load(name: &str) -> Result<Self, Error> {
+    pub fn load(name: &str) -> Result<Self, Message> {
         let lib = unsafe {
             Library::new(name).map_err(|e| {
-                Error::new(
-                    ErrorOrigin::FFI,
+                Message::error(
+                    MessageOrigin::FFI,
                     format!("Unable to load dynamic library '{name}': {e}"),
                 )
             })?
@@ -157,7 +159,8 @@ impl DynamicLibrary {
             .or_insert_with(|| FFIFunction::new(name))
     }
 
-    #[must_use] pub fn function(&self, symbol: usize) -> Option<&FFIFunction> {
+    #[must_use]
+    pub fn function(&self, symbol: usize) -> Option<&FFIFunction> {
         self.functions.get(&symbol)
     }
 
@@ -165,12 +168,12 @@ impl DynamicLibrary {
         self.functions.get_mut(&symbol)
     }
 
-    pub fn call(&self, name: usize, args: &[Value], data: &mut Data) -> Result<Value, Error> {
+    pub fn call(&self, name: usize, args: &[Value], data: &mut Data) -> Result<Value, Message> {
         if let Some(function) = self.functions.get(&name) {
             Ok(function.call(&self.lib, args, data)?)
         } else {
-            Err(Error::new(
-                ErrorOrigin::RUNTIME,
+            Err(Message::error(
+                MessageOrigin::RUNTIME,
                 "Requested function does not exist in the provided FFI module".to_owned(),
             ))
         }

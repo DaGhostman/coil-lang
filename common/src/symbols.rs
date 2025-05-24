@@ -1,8 +1,9 @@
 use rustc_hash::FxHashMap as HashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::interner::Interner;
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct SymbolTable {
     names: Interner<String>,
     mapping: HashMap<usize, usize>,
@@ -31,24 +32,29 @@ impl SymbolTable {
         idx
     }
 
-    #[must_use] pub fn constant(&self, symbol: usize) -> usize {
+    #[must_use]
+    pub fn constant(&self, symbol: usize) -> usize {
         self.mapping[&symbol]
     }
 
-    #[must_use] pub fn has_constant(&self, symbol: usize) -> bool {
+    #[must_use]
+    pub fn has_constant(&self, symbol: usize) -> bool {
         self.mapping.contains_key(&symbol)
     }
 
-    #[must_use] pub fn name(&self, symbol: usize) -> &String {
+    #[must_use]
+    pub fn name(&self, symbol: usize) -> &String {
         self.names.lookup(symbol)
     }
 
-    #[must_use] pub fn symbol(&self, symbol: String) -> usize {
+    #[must_use]
+    pub fn symbol(&self, symbol: String) -> usize {
         let mut interner = self.names.clone();
         interner.intern(symbol)
     }
 
-    #[must_use] pub fn contains(&self, symbol: String) -> bool {
+    #[must_use]
+    pub fn contains(&self, symbol: String) -> bool {
         let mut interner = self.names.clone();
         self.mapping.contains_key(&interner.intern(symbol))
     }

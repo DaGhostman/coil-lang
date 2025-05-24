@@ -2,6 +2,7 @@ pub mod constant_folding;
 pub mod jump_translation;
 // pub mod literal_variables;
 pub mod dead_code_elimination;
+pub mod function_inline;
 pub mod memoization;
 pub mod redundancy_removal;
 

@@ -597,7 +597,7 @@ mod tests {
                     $expected
                 );
             } else {
-                assert!(false, "Unable to build buffer for '{}'", $code);
+                unreachable!("Unable to build buffer for '{}'", $code);
             }
         };
     }

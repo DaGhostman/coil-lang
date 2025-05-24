@@ -1,4 +1,7 @@
 use memory::object::Objects;
+use native::Native;
+use serde::{Deserialize, Serialize};
+
 use std::{
     ffi::{CStr, CString, c_void},
     fmt::{Debug, Display},
@@ -14,16 +17,17 @@ pub mod interner;
 pub mod symbols;
 // pub mod memory;
 pub mod memory;
+pub mod native;
 pub mod opcodes;
 pub mod program;
 pub mod types;
 pub mod vec_array;
 
-#[inline]
+#[inline(always)]
 #[cold]
 fn cold() {}
 
-#[inline]
+#[inline(always)]
 #[must_use]
 pub fn likely(b: bool) -> bool {
     if !b {
@@ -33,6 +37,7 @@ pub fn likely(b: bool) -> bool {
     b
 }
 
+#[inline(always)]
 #[must_use]
 pub fn unlikely(b: bool) -> bool {
     if b {
@@ -40,6 +45,15 @@ pub fn unlikely(b: bool) -> bool {
     }
 
     b
+}
+
+#[macro_export]
+macro_rules! guarantee {
+    ($($cond:expr)*) => {
+        unsafe {
+            std::hint::assert_unchecked($($cond)*);
+        }
+    };
 }
 
 #[inline]
@@ -50,28 +64,45 @@ pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
     hash.finish()
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, Deserialize, Serialize)]
+#[repr(u8)]
 pub enum Value {
     #[default]
-    NONE,
+    NONE = 0,
     BOOLEAN(bool),
     INTEGER(i64),
     FLOAT(f64),
     STR(usize),
     FUNCTION(usize, usize),
-    EXTERNAL(usize),
+    NATIVE(usize),
     // ARRAY(Key),
     RANGE(i64, i64),
     FILE(usize),
     REFERENCE(usize),
     RESOURCE(usize),
+    #[serde(skip)]
     POINTER(*mut c_void),
     FFI(usize),
-    STRING(Objects),
+    #[serde(skip)]
     OBJECT(Objects),
     // ITERATOR(Objects, usize),
     TYPE(usize),
 }
+
+// impl Serialize for Value {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer,
+//     {
+//         match self {
+//             &Value::NONE => serializer.serialize_none(),
+//             &Value::BOOLEAN(state) => serializer.serialize_bool(state),
+//             &Value::INTEGER(value) => serializer.serialize_i64(value),
+//             &Value::FLOAT(value) => serializer.serialize_f64(value),
+//             &Value::FUNCTION(value) => {}
+//         }
+//     }
+// }
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
@@ -85,7 +116,7 @@ impl PartialEq for Value {
             (Self::RESOURCE(l), Self::RESOURCE(r)) => l == r,
             (Self::POINTER(l), Self::POINTER(r)) => l == r,
             (Self::FFI(l), Self::FFI(r)) => l == r,
-            (Self::STRING(Objects::String(l)), Self::STRING(Objects::String(r))) => {
+            (Self::OBJECT(Objects::String(l)), Self::OBJECT(Objects::String(r))) => {
                 l.as_ref().hash() == r.as_ref().hash()
             }
             (Self::OBJECT(Objects::Object(l)), Self::OBJECT(Objects::Object(r))) => {
@@ -339,7 +370,7 @@ impl Hash for Value {
                 "ty".hash(state);
                 n.hash(state);
             }
-            Value::EXTERNAL(func) => {
+            Value::NATIVE(func) => {
                 "ext".hash(state);
                 func.hash(state);
             }
@@ -363,6 +394,7 @@ impl Display for Value {
                 Value::NONE => String::new(),
                 Value::BOOLEAN(b) => format!("{b}"),
                 Value::STR(s) => format!("{s}"),
+                Value::OBJECT(Objects::String(s)) => format!("{}", s.as_ref().to_string()),
                 value => format!("{value:?}"),
             }
         )
@@ -380,7 +412,6 @@ impl Debug for Value {
                 Value::NONE | Value::OBJECT(Objects::None) => String::from("void"),
                 Value::BOOLEAN(b) => format!("bool({b})"),
                 Value::STR(s) => format!("string({s})"),
-                Value::STRING(s) => format!("string({s})"),
                 Value::FUNCTION(_, symbol) => format!("fn({symbol})"),
                 // ValueKind::ARRAY(a) => format!("arr({})", a),
                 Value::RANGE(start, end) => format!("range({start}, {end})"),
@@ -389,7 +420,7 @@ impl Debug for Value {
                 Value::POINTER(n) => format!("pointer({n:p})"),
                 Value::FFI(id) => format!("dynamic({id})"),
                 Value::REFERENCE(idx) => format!("ref({idx:?})"),
-                Value::EXTERNAL(_) => "ext_fn".to_string(),
+                Value::NATIVE(ext) => format!("ext(0x{:0x})", std::ptr::addr_of!(ext) as u64),
                 Value::OBJECT(Objects::Array(obj)) =>
                     format!("array(0x{:0x})", std::ptr::addr_of!(obj) as u64),
                 Value::OBJECT(Objects::Object(obj)) =>

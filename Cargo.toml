@@ -24,6 +24,7 @@ parser = { path = "parser" }
 compiler = { path = "compiler" }
 machine = { path = "machine" }
 clap = { version = "4.5", features = ["derive"] }
+rmp-serde = "1.3.0"
 
 [dev-dependencies]
 criterion = "0.5"

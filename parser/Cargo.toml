@@ -9,5 +9,5 @@ debug = []
 [dependencies]
 common = { path = "../common" }
 rand = "0.9.0"
-rustc-hash = { version = "2.1.1", features = ["rand"] }
+rustc-hash = { version = "2.1.1" }
 scanner = { path = "../scanner" }

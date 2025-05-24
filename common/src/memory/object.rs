@@ -107,7 +107,7 @@ impl Objects {
             }
             Self::Coroutine(i) => {
                 match i.as_mut().value {
-                    Value::OBJECT(mut v) | Value::STRING(mut v) => {
+                    Value::OBJECT(mut v) => {
                         v.mark(grey);
                     }
                     _ => (),
@@ -115,7 +115,7 @@ impl Objects {
 
                 for val in &mut i.as_mut().stack {
                     match val {
-                        Value::OBJECT(v) | Value::STRING(v) => {
+                        Value::OBJECT(v) => {
                             v.mark(grey);
                         }
                         _ => (),
@@ -158,34 +158,30 @@ impl Objects {
         match self {
             Self::None | Self::String(_) => (),
             Self::Object(o) => o.as_ref().state.iter().for_each(|(_, v)| match v {
-                Value::OBJECT(o) | Value::STRING(o) => o.mark_references(grey),
+                Value::OBJECT(o) => o.mark_references(grey),
                 _ => (),
             }),
             Self::Array(r) => {
                 for item in r.as_ref().items.as_slice() {
                     match item {
-                        Value::OBJECT(val) | Value::STRING(val) => val.mark_references(grey),
+                        Value::OBJECT(val) => val.mark_references(grey),
                         _ => (),
                     }
                 }
-                // r.as_ref().items.iter().for_each(|v| match v {
-                // Value::OBJECT(o) | Value::STRING(o) => o.mark_references(grey),
-                //     _ => (),
-                // })
             }
             Self::Iterator(i) => match i.as_ref().iterable {
-                Value::OBJECT(v) | Value::STRING(v) => v.mark_references(grey),
+                Value::OBJECT(v) => v.mark_references(grey),
                 _ => (),
             },
             Self::Coroutine(i) => {
                 match i.as_ref().value {
-                    Value::OBJECT(v) | Value::STRING(v) => v.mark_references(grey),
+                    Value::OBJECT(v) => v.mark_references(grey),
                     _ => (),
                 }
 
                 for val in &i.as_ref().stack {
                     match val {
-                        Value::OBJECT(v) | Value::STRING(v) => v.mark_references(grey),
+                        Value::OBJECT(v) => v.mark_references(grey),
                         _ => (),
                     }
                 }
@@ -268,7 +264,7 @@ impl From<Vec<Value>> for ObjArray {
     fn from(items: Vec<Value>) -> Self {
         Self {
             length: items.len(),
-            items,
+            items: items.clone(),
         }
     }
 }

@@ -1,86 +1,102 @@
 use common::{
     Value,
     memory::object::Objects,
+    native::{Action, Library, Native, NativeFunction},
     program::data::Data,
     types::{Kind, Type},
 };
-use machine::{NativeAction, NativeLibrary};
 
 #[derive(Default)]
 pub struct Coroutine {}
 
 impl Coroutine {
-    fn resume(name: &str, coroutine: &Value, arg: Option<Value>, data: &Data) -> NativeAction {
-        if let Value::OBJECT(Objects::Coroutine(coro)) = coroutine {
-            let (ip, stack) = coro.as_ref().resume();
+    fn resume(args: &[Value], data: &Data) -> Action {
+        if let &[coroutine] = args {
+            if let Value::OBJECT(Objects::Coroutine(coro)) = coroutine {
+                let (ip, stack) = coro.as_ref().resume();
 
-            NativeAction::Resume(ip, stack.clone(), arg.unwrap_or_default())
+                Action::Resume(ip, stack.clone(), args.get(1).copied().unwrap_or_default())
+            } else {
+                Action::Fail(format!(
+                    "Expected argument #1 of function 'std::coroutine::resume' to be a coroutine, but got '{}' instead",
+                    Type::new(coroutine.into()).output(data),
+                ))
+            }
         } else {
-            NativeAction::Fail(format!(
-                "Expected argument #1 of function '{name}' to be a coroutine, but got '{}' instead",
-                Type::new(coroutine.into()).output(data),
+            Action::Fail(
+                "Argument to function 'std::coroutine::resume' needs to be a coroutine".to_string(),
+            )
+        }
+    }
+
+    fn value<'func>(args: &[Value], data: &Data) -> Action {
+        if let &[coroutine] = args {
+            if let Value::OBJECT(Objects::Coroutine(coro)) = coroutine {
+                Action::Push(coro.as_ref().get())
+            } else {
+                Action::Fail(format!(
+                    "Expected argument #1 of function 'std::coroutine::value' to be a coroutine, but got '{}' instead",
+                    Type::new(coroutine.into()).output(data),
+                ))
+            }
+        } else {
+            Action::Fail(format!(
+                "Not enough arguments to function 'std::coroutine::value'"
             ))
         }
     }
 
-    fn value(name: &str, coroutine: &Value, data: &Data) -> NativeAction {
-        if let Value::OBJECT(Objects::Coroutine(coro)) = coroutine {
-            NativeAction::Push(coro.as_ref().get())
+    fn valid(args: &[Value], _: &Data) -> Action {
+        if let &[coroutine] = args {
+            Action::Push(Value::from(matches!(
+                coroutine,
+                Value::OBJECT(Objects::Coroutine(_))
+            )))
         } else {
-            NativeAction::Fail(format!(
-                "Expected argument #1 of function '{name}' to be a coroutine, but got '{}' instead",
-                Type::new(coroutine.into()).output(data),
+            Action::Fail(format!(
+                "Not enough arguments to functin 'std::coroutine::valid'"
             ))
         }
-    }
-
-    fn valid(coroutine: &Value) -> NativeAction {
-        NativeAction::Push(Value::from(matches!(
-            coroutine,
-            Value::OBJECT(Objects::Coroutine(_))
-        )))
     }
 }
 
-impl NativeLibrary for Coroutine {
-    fn get_functions(&self, data: &mut Data) -> Vec<(&str, Type)> {
+impl Library for Coroutine {
+    fn get_functions(&self, data: &mut Data) -> Vec<Native> {
         let t_type = data.add_symbol("T".to_string(), None);
         let any = data.add_type(Type::any());
         let t_arg = data.add_type(Type::new(Kind::Generic(t_type, any)));
         let coroutine = Type::new(Kind::Coroutine(t_arg));
 
-        let mut resume_type = Type::function();
-        resume_type.add(data.add_type(Type::integer()));
-        resume_type.add(data.add_type(coroutine));
-        resume_type.set_return(data.add_type(coroutine));
+        let mut resume = Native::new(
+            data.add_symbol("std::coroutine::resume".to_string(), None),
+            Self::resume,
+        );
+        resume
+            .get_type_mut()
+            .add(data.add_type(Type::integer()))
+            .add(data.add_type(coroutine))
+            .set_return(data.add_type(coroutine));
 
-        let mut value_type = Type::function();
-        value_type.add(data.add_type(coroutine));
-        value_type.set_return(t_arg);
+        let mut value = Native::new(
+            data.add_symbol("std::coroutine::value".to_string(), None),
+            Self::value,
+        );
+        value
+            .get_type_mut()
+            .add(data.add_type(coroutine))
+            .set_return(t_arg);
 
-        let mut complete_type = Type::function();
-        complete_type.set_return(data.add_type(Type::bool()));
-        complete_type.add(data.add_type(Type::any()));
+        let mut complete = Native::new(
+            data.add_symbol("std::coroutine::is_coroutine".to_string(), None),
+            Self::valid,
+        );
+        complete
+            .get_type_mut()
+            .add(data.add_type(Type::bool()))
+            .set_return(any);
 
         vec![
-            ("std::coroutine::resume", resume_type),
-            ("std::coroutine::value", value_type),
-            ("std::coroutine::is_coroutine", complete_type),
-            // ("std::coroutine::is_complete", complete_type),
-            // ...
+            resume, value, complete, // ...
         ]
-    }
-
-    fn call(&self, name: &str, data: &Data, args: &[Value]) -> NativeAction {
-        let coroutine = args[0];
-
-        match name {
-            "std::coroutine::resume" => Self::resume(name, &coroutine, args.get(1).copied(), data),
-            "std::coroutine::value" => Self::value(name, &coroutine, data),
-            "std::coroutine::is_coroutine" => Self::valid(&coroutine),
-            _ => NativeAction::Fail(format!(
-                "Unable to invoke function '{name}' as it is not defined, only declared",
-            )),
-        }
     }
 }

@@ -1,3 +1,4 @@
+use common::error::{Message, MessageComposer, MessageCreator, MessageKind, MessageOrigin};
 use common::opcodes::Metadata;
 use common::program::data::Data;
 use rand::{Rng, distr::Alphanumeric};
@@ -5,7 +6,7 @@ use scanner::buffer::Buffer;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
 pub mod precedence;
 
@@ -31,6 +32,8 @@ pub struct Context {
     previous: Option<Token>,
 
     owner: Option<usize>,
+
+    messages: Vec<Message>,
 }
 
 const INCLUDE_PATHS: [&str; 5] = ["src/", "lib/", "external/", "vendor/", "deps/"];
@@ -45,6 +48,7 @@ impl Context {
             current,
             previous: None,
             owner: None,
+            messages: vec![],
         }
     }
 
@@ -78,20 +82,37 @@ impl Context {
     }
 
     #[must_use]
+    pub fn has_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+
+    #[must_use]
     pub fn owner(&self) -> Option<usize> {
-        self.owner
+        self.owner.or(Some(0))
+    }
+
+    pub fn error(&mut self, message: &str) {
+        self.messages
+            .push(Message::error(MessageOrigin::PARSE, message.to_string()));
+    }
+
+    pub fn warn(&mut self, message: &str) {
+        self.messages
+            .push(Message::warning(MessageOrigin::PARSE, message.to_string()));
     }
 }
 
 pub struct Parser<'data> {
     data: &'data mut Data,
     file: String,
-    natives: HashMap<usize, usize>,
+    natives: HashMap<usize, Type>,
     typechecker: TypeChecker<64>,
 
     scanned: Vec<String>,
     aliases: HashMap<String, String>,
     namespace: String,
+
+    messages: FxHashSet<Message>,
 }
 
 macro_rules! op {
@@ -125,16 +146,19 @@ impl<'data> Parser<'data> {
             aliases: HashMap::default(),
             natives: HashMap::default(),
             namespace: String::new(),
+
+            messages: FxHashSet::default(),
         }
     }
 
-    pub fn register(&mut self, native: usize, type_: usize) {
+    pub fn register(&mut self, native: usize, type_: Type) {
         let name = self.data.symbol_name(native);
 
         self.scanned.push(name.to_owned());
         self.aliases.insert(name.to_owned(), name.to_owned());
 
         self.natives.insert(native, type_);
+        self.typechecker.register(native, type_);
     }
 
     fn name(&mut self, name: String, constant: Option<usize>) -> usize {
@@ -159,8 +183,6 @@ impl<'data> Parser<'data> {
             Kind::String
         } else if self.consume(ctx, TokenKind::Void) {
             Kind::None
-        } else if self.consume(ctx, TokenKind::Result) {
-            Kind::Result
         } else if self.consume(ctx, TokenKind::Dolar) {
             let symbol = self
                 .data
@@ -193,10 +215,12 @@ impl<'data> Parser<'data> {
             let n = self.data.add_symbol(name, None);
             Kind::Object(n)
         } else {
-            panic!(
+            ctx.error(&format!(
                 "Unknown token to be used as type: {:?}",
                 ctx.current().lexeme()
-            );
+            ));
+
+            Kind::default()
         });
 
         if self.consume(ctx, TokenKind::Less) {
@@ -251,7 +275,7 @@ impl<'data> Parser<'data> {
         let matched = self.consume(ctx, token);
 
         if !matched {
-            eprintln!(
+            ctx.error(&format!(
                 "ERROR: {}. Current: {:?}('{}') in {}:{}:{}",
                 message,
                 ctx.current.kind(),
@@ -259,8 +283,7 @@ impl<'data> Parser<'data> {
                 ctx.current.file(),
                 ctx.current.start_line(),
                 ctx.current.start_column(),
-            );
-            panic!("SADGE");
+            ));
         }
 
         matched
@@ -383,7 +406,7 @@ impl<'data> Parser<'data> {
             }
 
             if let Some(ty) = self.natives.get(&symbol) {
-                type_ = *self.data.get_type(*ty);
+                type_ = *ty;
             }
 
             symbol = self.data.add_symbol(name, None);
@@ -460,6 +483,7 @@ impl<'data> Parser<'data> {
         match operator.kind() {
             TokenKind::Minus => tokens.push(op!(this, ctx, Negate)),
             TokenKind::Bang => tokens.push(op!(this, ctx, Not)),
+            TokenKind::Len => tokens.push(op!(this, ctx, Length)),
             _ => unreachable!("Unexpected prefix operator"),
         }
 
@@ -717,7 +741,7 @@ impl<'data> Parser<'data> {
     }
 
     fn for_in(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let begin = op!(self, ctx, Begin);
+        let begin = op!(self, ctx, Begin, [ctx.owner().unwrap(), 0, 0]);
         let end = op!(self, ctx, End);
         let mut result = vec![begin];
         let name = ctx.current().to_owned();
@@ -797,7 +821,11 @@ impl<'data> Parser<'data> {
                     self,
                     ctx,
                     Invoke,
-                    [self.data.add_symbol(name, None), arity, 0]
+                    [
+                        self.data.add_symbol(name, None),
+                        arity,
+                        ctx.owner().unwrap()
+                    ]
                 );
 
                 while !self.consume(ctx, TokenKind::RightParenthesis) {
@@ -883,7 +911,7 @@ impl<'data> Parser<'data> {
 
                 result
             }
-            TokenKind::Bang | TokenKind::Minus => self.unary(ctx),
+            TokenKind::Bang | TokenKind::Minus | TokenKind::Len => self.unary(ctx),
 
             TokenKind::LeftParenthesis => self.grouping(ctx),
             TokenKind::True | TokenKind::False => self.boolean(ctx),
@@ -943,7 +971,7 @@ impl<'data> Parser<'data> {
     }
 
     fn block(&mut self, ctx: &mut Context) -> Vec<IR> {
-        let mut tokens = vec![op!(self, ctx, Begin)];
+        let mut tokens = vec![op!(self, ctx, Begin, [ctx.owner().unwrap(), 0, 0])];
 
         if self.expect(
             ctx,
@@ -1139,8 +1167,8 @@ impl<'data> Parser<'data> {
         }
 
         let symbol = self.name(name, None);
-        body.insert(0, op!(self, ctx, Begin, [symbol, 0, 0]));
-        body.push(op!(self, ctx, End, [symbol, 0, 0]));
+        body.insert(0, op!(self, ctx, Begin, [ctx.owner().unwrap(), 0, 0]));
+        body.push(op!(self, ctx, End));
 
         let mut func = op!(self, ctx, Function, [symbol, arity, body.len()]);
         let mut func_type = Type::function();
@@ -1221,7 +1249,7 @@ impl<'data> Parser<'data> {
 
         assert!(
             ctx.owner().is_none(),
-            "Classes can only be declared outisde any conditional blocks"
+            "Classes can only be declared at the top level of a file"
         );
 
         ctx.set_owner(owner);
@@ -1241,9 +1269,11 @@ impl<'data> Parser<'data> {
             }
         }
 
-        class.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
+        class.insert(0, op!(self, ctx, Begin, [ctx.owner().unwrap(), 0, 0]));
         class.insert(0, op!(self, ctx, Implement, [contract, owner, class.len()]));
         class.push(op!(self, ctx, End, [owner, 0, 0]));
+
+        ctx.clear_owner();
 
         class
     }
@@ -1258,7 +1288,7 @@ impl<'data> Parser<'data> {
         let owner = self.name(name, None);
         assert!(
             ctx.owner().is_none(),
-            "Classes can only be declared outisde any conditional blocks"
+            "Classes can only be declared at the top level of a file"
         );
         ctx.set_owner(owner);
 
@@ -1268,7 +1298,7 @@ impl<'data> Parser<'data> {
         while !self.consume(ctx, TokenKind::RightBracket) {
             let mut method = vec![];
             if self.consume(ctx, TokenKind::Pub) {
-                eprintln!("Interface methods are implicitly public, so 'pub' is not needed here");
+                ctx.error("Interface methods are implicitly public, so 'pub' is not needed here");
             }
             self.expect(
                 ctx,
@@ -1363,11 +1393,13 @@ impl<'data> Parser<'data> {
             interface.append(&mut method);
         }
 
-        interface.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
+        interface.insert(0, op!(self, ctx, Begin, [ctx.owner().unwrap(), 0, 0]));
         interface.push(op!(self, ctx, End, [owner, 0, 0]));
         iface.operands_mut()[1] = interface.len();
         iface.operands_mut()[2] = interface.len();
         interface.insert(0, iface);
+
+        ctx.clear_owner();
 
         interface
     }
@@ -1376,23 +1408,26 @@ impl<'data> Parser<'data> {
         let mut class = vec![];
         let ty = self.get_type(ctx);
 
+        assert!(
+            !ctx.has_owner(),
+            "Classes can only be declared at the top level of a file"
+        );
+
         let name = if let Kind::Object(name) = self.data.get_type(ty).kind() {
             self.data.symbol_name(name).to_string()
         } else {
             unreachable!("Invalid symbol name");
         };
 
-        let owner = self.name(name, None);
+        let owner = self.name(name.clone(), None);
+        self.aliases
+            .insert(name, self.data.symbol_name(owner).clone());
         let instance = Type::object(owner);
 
         self.expect(
             ctx,
             TokenKind::LeftBracket,
             "Expected '{' denoting class body",
-        );
-        assert!(
-            ctx.owner().is_none(),
-            "Classes can only be declared outisde any conditional blocks"
         );
         ctx.set_owner(owner);
         while !self.consume(ctx, TokenKind::RightBracket) {
@@ -1403,13 +1438,14 @@ impl<'data> Parser<'data> {
                 class.append(&mut self.method(ctx, owner, public));
             }
         }
-        ctx.clear_owner();
 
-        class.insert(0, op!(self, ctx, Begin, [owner, 0, 0]));
+        class.insert(0, op!(self, ctx, Begin, [ctx.owner().unwrap(), 0, 0]));
         class.push(op!(self, ctx, End, [owner, 0, 0]));
         let mut cls = op!(self, ctx, Class, [owner, class.len(), 0]);
         cls.set_type(self.data.add_type(instance));
         class.insert(1, cls);
+
+        ctx.clear_owner();
 
         class
     }
@@ -1417,11 +1453,17 @@ impl<'data> Parser<'data> {
     fn initialize(&mut self, ctx: &mut Context) -> Vec<IR> {
         ctx.advance();
         let mut result = vec![];
-        let mut name = ctx.current().lexeme().to_string();
-        if self.aliases.contains_key(&name) {
-            name = self.aliases[&name].to_string();
+        let mut symbol = self.name(ctx.current().lexeme().to_string(), None);
+        if self.aliases.contains_key(self.data.symbol_name(symbol)) {
+            symbol = self
+                .data
+                .add_symbol(self.aliases[self.data.symbol_name(symbol)].clone(), None);
         }
-        let symbol = self.data.add_symbol(name, None);
+
+        // if self.aliases.contains_key(&name) {
+        //     name = self.aliases[&name].to_string();
+        // }
+        // let symbol = self.data.add_symbol(name, None);
 
         if self.expect(ctx, TokenKind::Identifier, "Expecting class name") {
             let mut ty = Type::object(symbol);
@@ -1497,7 +1539,7 @@ impl<'data> Parser<'data> {
                 TokenKind::RightBracket,
                 "Expected '}' to close module group",
             );
-        } 
+        }
 
         if self.consume(ctx, TokenKind::As) {
             if self.expect(
@@ -1543,6 +1585,13 @@ impl<'data> Parser<'data> {
                 .trim_start_matches("::")
                 .to_string()
             });
+
+            self.typechecker.alias(
+                self.data.add_symbol(last.to_owned(), None),
+                self.data
+                    .add_symbol(self.aliases.get(last).cloned().unwrap(), None)
+                    .to_owned(),
+            );
         }
 
         if children.is_empty() {
@@ -1599,9 +1648,11 @@ impl<'data> Parser<'data> {
             }
 
             if paths.is_empty() {
-                panic!("Unable to resolve '{fqn}', because no suitable file has been found");
+                ctx.error(&format!(
+                    "Unable to resolve '{fqn}', because no suitable file has been found"
+                ));
             } else if paths.len() > 1 {
-                panic!(
+                ctx.error(&format!(
                     "Unable to resolve '{}', because of multiple possible locations:\n\t{}",
                     fqn,
                     paths
@@ -1609,11 +1660,14 @@ impl<'data> Parser<'data> {
                         .map(|path| path.to_str().unwrap_or(""))
                         .collect::<Vec<&str>>()
                         .join("\n\t")
-                );
+                ));
             }
 
             let ns = self.namespace.clone();
             let aliases = self.aliases.clone();
+            let tc_aliases = self.typechecker.aliases().clone();
+            let tc_functions = self.typechecker.functions().clone();
+
             self.aliases.clear();
             self.namespace = module.join("::");
 
@@ -1624,8 +1678,10 @@ impl<'data> Parser<'data> {
                     self.typechecker.set_file(self.file.to_string());
                 }
             }
+
             self.namespace = ns;
             self.aliases = aliases;
+            self.typechecker.restore(tc_functions, tc_aliases);
         }
 
         code
@@ -1734,24 +1790,73 @@ impl<'data> Parser<'data> {
         let buffer = if let Ok(buff) = Buffer::new(file.as_ref()) {
             buff
         } else {
-            return Err(format!("Unable to open file '{}'", &self.file));
+            return Err(format!("Unable to open file '{}'", &file));
         };
 
-        let mut ctx = Context::new(Scanner::new(buffer, Some(self.file.clone())));
+        let mut ctx = Context::new(Scanner::new(buffer, Some(file.clone())));
         let mut code = vec![];
-        self.typechecker.set_file(self.file.clone());
+        self.typechecker.set_file(file.clone());
 
         while ctx.current().kind() != TokenKind::EOF {
             let stmt = self.statement(&mut ctx);
 
             code.append(&mut self.typechecker.check(&stmt, self.data));
         }
-        if !self.typechecker.get_errors().is_empty() {
-            for err in self.typechecker.get_errors() {
-                eprintln!("{err}");
-            }
 
-            return Err("Encountered errors during parsing".to_string());
+        ctx.messages.iter().for_each(|m| {
+            self.messages.insert(m.clone());
+        });
+
+        self.typechecker.get_messages().iter().for_each(|m| {
+            self.messages.insert(m.clone());
+        });
+
+        if !self
+            .messages
+            .iter()
+            .filter(|m| m.kind() == MessageKind::ERROR)
+            .collect::<Vec<_>>()
+            .is_empty()
+        {
+            return Err(format!(
+                "Encountered {} errors, {} warnings and {} notices during parsing",
+                MessageComposer::default().push(
+                    &self
+                        .messages
+                        .iter()
+                        .filter(|v| v.kind() == MessageKind::ERROR)
+                        .collect::<Vec<_>>()
+                        .len()
+                        .to_string(),
+                    Some("red"),
+                    None,
+                    Some(&["bold"])
+                ),
+                MessageComposer::default().push(
+                    &self
+                        .messages
+                        .iter()
+                        .filter(|v| v.kind() == MessageKind::WARNING)
+                        .collect::<Vec<_>>()
+                        .len()
+                        .to_string(),
+                    Some("yellow"),
+                    None,
+                    Some(&["bold"]),
+                ),
+                MessageComposer::default().push(
+                    &self
+                        .messages
+                        .iter()
+                        .filter(|v| v.kind() == MessageKind::INFO)
+                        .collect::<Vec<_>>()
+                        .len()
+                        .to_string(),
+                    Some("cyan"),
+                    None,
+                    Some(&["bold"])
+                ),
+            ));
         }
 
         Ok(Program::new(code))
@@ -1759,6 +1864,10 @@ impl<'data> Parser<'data> {
 
     pub fn parse(&mut self) -> Result<Program<IR>, String> {
         self.parse_internal(self.file.clone())
+    }
+
+    pub fn get_messages(&self) -> Vec<&Message> {
+        Vec::from_iter(self.messages.iter())
     }
 }
 
@@ -1797,10 +1906,10 @@ mod tests {
 
                     assert_eq!(tokens.len(), program.len());
                 } else {
-                    assert!(false, "Unable to parse {}", $code);
+                    unreachable!("Unable to parse {}", $code);
                 }
             } else {
-                assert!(false, "Unable to build buffer for '{}'", $code);
+                unreachable!("Unable to build buffer for '{}'", $code);
             }
         };
     }

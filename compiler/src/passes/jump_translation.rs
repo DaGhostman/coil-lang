@@ -14,7 +14,7 @@ pub struct LabelUnrolling {
 
 impl LabelUnrolling {
     fn jump_at(&mut self, label: usize) -> usize {
-        *self.jumps.get(label)
+        self.jumps.get(label).checked_sub(1).or(Some(0)).unwrap()
     }
 
     fn reduce_jumps(&mut self, index: usize) {
@@ -36,7 +36,7 @@ impl CompilationPass for LabelUnrolling {
         &mut self,
         code: &[common::opcodes::Code],
         data: &mut Data,
-    ) -> Result<Vec<common::opcodes::Code>, common::error::Error> {
+    ) -> Result<Vec<common::opcodes::Code>, Vec<common::error::Message>> {
         let labels: Vec<(usize, usize)> = code
             .iter()
             .enumerate()
@@ -62,17 +62,9 @@ impl CompilationPass for LabelUnrolling {
         let mut bytecode = Vec::with_capacity(code.len());
         for code in code {
             bytecode.push(match code.byte() {
-                Byte::Jump => {
-                    Code::new_with_operands(Byte::Jump, [self.jump_at(code.operand(0)), 0, 0])
+                Byte::Jumpz | Byte::Jump => {
+                    Code::new_with_operands(*code.byte(), [(self.jump_at(code.operand(0))), 0, 0])
                 }
-                Byte::Jumpz => Code::new_with_operands(
-                    Byte::Jumpz,
-                    [
-                        (self.jump_at(code.operand(0))),
-                        (self.jump_at(code.operand(1))),
-                        0,
-                    ],
-                ),
                 Byte::Label => {
                     continue;
                 }

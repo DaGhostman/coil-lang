@@ -41,7 +41,7 @@ impl<K, V> Default for Table<K, V>
 where
     K: Hash,
     V: Default,
- {
+{
     fn default() -> Self {
         Self::new()
     }
@@ -52,7 +52,8 @@ where
     K: Hash,
     V: Default,
 {
-    #[must_use] pub fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         let mut entries = Vec::with_capacity(32);
         entries.resize_with(32, || Entry::new(0, V::default()));
 

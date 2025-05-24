@@ -12,4 +12,4 @@ common = { path = "../common" }
 libffi = "4.0.0"
 libloading = "0.8.6"
 parser = { path = "../parser" }
-rustc-hash = { version = "2.1.1", features = ["rand"] }
+rustc-hash = { version = "2.1.1" }

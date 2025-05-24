@@ -1,6 +1,5 @@
 use common::opcodes::{Byte, Code};
 
-
 use crate::CompilationPass;
 
 #[derive(Default)]
@@ -11,7 +10,7 @@ impl CompilationPass for RedundancyRemoval {
         &mut self,
         code: &[common::opcodes::Code],
         _: &mut common::program::data::Data,
-    ) -> Result<Vec<common::opcodes::Code>, common::error::Error> {
+    ) -> Result<Vec<common::opcodes::Code>, Vec<common::error::Message>> {
         let mut new_code = Vec::with_capacity(code.len());
         let mut ip = 0;
 

@@ -13,7 +13,7 @@ impl CompilationPass for ConstantFolding {
         &mut self,
         code: &[Code],
         data: &mut Data,
-    ) -> Result<Vec<Code>, common::error::Error> {
+    ) -> Result<Vec<Code>, Vec<common::error::Message>> {
         let mut code = code.to_vec();
         let mut length = code.len();
         let mut modified: Vec<Code> = Vec::with_capacity(length);

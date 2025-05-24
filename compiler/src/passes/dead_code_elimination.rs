@@ -1,6 +1,6 @@
 use common::{
     Value,
-    error::Error,
+    error::Message,
     opcodes::{Byte, Code},
     program::data::Data,
     types::Type,
@@ -13,7 +13,7 @@ use crate::CompilationPass;
 pub struct DCE {}
 
 impl CompilationPass for DCE {
-    fn compile(&mut self, code: &[Code], data: &mut Data) -> Result<Vec<Code>, Error> {
+    fn compile(&mut self, code: &[Code], data: &mut Data) -> Result<Vec<Code>, Vec<Message>> {
         let mut modified = Vec::with_capacity(code.len());
 
         let mut cursor = 0;
@@ -46,34 +46,38 @@ impl CompilationPass for DCE {
                         }
                     }
                 }
-                Byte::Jumpz => {
-                    let rhs = modified[modified.len() - 1];
+                Byte::Jump => {
+                    if op.operand(1) == 1 {
+                        let rhs = modified[modified.len() - 1];
 
-                    if *rhs.byte() == Byte::Push {
-                        let constant = data.constant(rhs.operand(0));
+                        if *rhs.byte() == Byte::Push {
+                            let constant = data.constant(rhs.operand(0));
 
-                        if let Value::BOOLEAN(state) = constant {
-                            // Remove the condition
-                            modified.pop();
+                            if let Value::BOOLEAN(state) = constant {
+                                // Remove the condition
+                                modified.pop();
 
-                            // TODO: Need to handle elimination of both branches and not just the
-                            // successful one
-                            //
-                            // if *constant == Value::BOOLEAN(true) {
-                            //     // This condition will always be true, so the else branch needs be
-                            //     // eliminated
-                            // } else
-                            if *state {
-                                modified.push(op);
+                                // TODO: Need to handle elimination of both branches and not just the
+                                // successful one
+                                //
+                                // if *constant == Value::BOOLEAN(true) {
+                                //     // This condition will always be true, so the else branch needs be
+                                //     // eliminated
+                                // } else
+                                if *state {
+                                    modified.push(op);
+                                } else {
+                                    // This condition will always be false, so the then branch needs be
+                                    // eliminated, i.e which is easy since it needs to just compile
+                                    // the else part. BUT the handling for `if true` is more
+                                    // complicated as it could be just an `else` or alternatively
+                                    // `else-if` which will have it's own condition and we
+                                    // shouldn't actually skip that, because it will be handled by
+                                    // the continuation of this handling.
+                                    cursor += labels[&op.operand(0)] - cursor;
+                                }
                             } else {
-                                // This condition will always be false, so the then branch needs be
-                                // eliminated, i.e which is easy since it needs to just compile
-                                // the else part. BUT the handling for `if true` is more
-                                // complicated as it could be just an `else` or alternatively
-                                // `else-if` which will have it's own condition and we
-                                // shouldn't actually skip that, because it will be handled by
-                                // the continuation of this handling.
-                                cursor += labels[&op.operand(0)] - cursor;
+                                modified.push(op);
                             }
                         } else {
                             modified.push(op);

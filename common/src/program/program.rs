@@ -1,6 +1,8 @@
 use core::fmt::Debug;
 
-#[derive(Clone, Default, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Program<T> {
     length: usize,
     code: Vec<T>,
@@ -43,17 +45,18 @@ where
         self.code.push(instruction);
     }
 
-    #[must_use] pub fn get(&self, index: usize) -> &T {
-        assert!(index < self.code.len());
-
+    #[must_use]
+    pub fn get(&self, index: usize) -> &T {
         &self.code[index]
     }
 
-    #[must_use] pub fn len(&self) -> usize {
+    #[must_use]
+    pub fn len(&self) -> usize {
         self.code.len()
     }
 
-    #[must_use] pub fn code(&self) -> &[T] {
+    #[must_use]
+    pub fn code(&self) -> &[T] {
         self.code.as_slice()
     }
 }

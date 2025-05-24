@@ -1,8 +1,8 @@
 use common::{
-    error::{Error, ErrorOrigin},
+    error::{Message, MessageOrigin},
     opcodes::{Metadata, Operation, IR},
     program::data::Data,
-    types::{Kind, Type},
+    types::{Kind, Type}
 };
 
 use rustc_hash::FxHashMap as HashMap;
@@ -12,14 +12,46 @@ pub struct TypeChecker<const N: usize> {
     stack: [usize; N],
     sp: usize,
     scope: usize,
-    errors: Vec<Error>,
+    messages: Vec<Message>,
     classes: HashMap<usize, HashMap<usize, (usize, usize, bool)>>,
     class_params: HashMap<usize, HashMap<usize, usize>>,
     state: HashMap<usize, HashMap<usize, usize>>,
-    functions: HashMap<usize, usize>,
+    functions: HashMap<usize, Type>,
+    aliases: HashMap<usize, usize>,
 
     type_arguments: HashMap<usize, HashMap<usize, usize>>,
     expects_return: Option<usize>,
+}
+
+impl <const N: usize> TypeChecker<N> {
+    pub fn register(&mut self, name: usize, ty_: Type) {
+        self.functions.insert(name, ty_);
+    }
+
+    pub fn alias(&mut self, name: usize, fqn: usize) {
+        self.aliases.insert(name, fqn);
+    }
+
+    pub fn resolve(&self, name: usize) -> usize {
+        if let Some(name) = self.aliases.get(&name) {
+            *name
+        } else {
+            name
+        }
+    }
+
+    pub(crate) fn aliases(&self) -> &HashMap<usize, usize> {
+        &self.aliases
+    }
+
+    pub(crate) fn functions(&self) -> &HashMap<usize, Type> {
+        &self.functions
+    }
+
+    pub(crate) fn restore(&mut self, functions: HashMap<usize, Type>, aliases: HashMap<usize, usize>) {
+        self.functions = functions;
+        self.aliases = aliases;
+    }
 }
 
 impl<const N: usize> Default for TypeChecker<N> {
@@ -29,16 +61,18 @@ impl<const N: usize> Default for TypeChecker<N> {
             sp: 0,
             scope: 0,
             stack: [0; N],
-            errors: Vec::with_capacity(8),
+            messages: Vec::with_capacity(8),
             classes: HashMap::default(),
             class_params: HashMap::default(),
             state: HashMap::default(),
             functions: HashMap::default(),
+            aliases: HashMap::default(),
             // ---
             type_arguments: HashMap::default(),
             expects_return: None,
         }
     }
+
 }
 
 impl<const N: usize> TypeChecker<N> {
@@ -62,20 +96,39 @@ impl<const N: usize> TypeChecker<N> {
     }
 
 
-    pub fn get_errors(&self) -> &Vec<Error> {
-        &self.errors
+    pub fn get_messages(&self) -> &Vec<Message> {
+        &self.messages
     }
 
     pub fn set_file(&mut self, file: String) {
         self.file = file;
     }
 
-    fn error(&mut self, message: String, metadata: &Metadata) {
+    // fn warning(&mut self, message: String, metadata: &Metadata) {
+    //     self.messages.push(Message::warning(
+    //         MessageOrigin::TYPE,
+    //         format!("'{message}' in {}@{metadata}", self.file),
+    //     ));
+    // }
 
-        self.errors.push(Error::new(
-            ErrorOrigin::TYPE,
-            format!("'{message}' in {}@{metadata}", self.file),
-        ));
+    fn error(&mut self, message: String, metadata: &Metadata) {
+        let mut msg = Message::error(
+            MessageOrigin::TYPE,
+            format!("{message}"),
+        );
+
+        msg.set_location(format!("{}@{metadata}", self.file));
+        self.messages.push(msg)
+    }
+    
+    fn warn(&mut self, message: String, metadata: &Metadata) {
+        let mut msg = Message::warning(
+            MessageOrigin::TYPE,
+            format!("{message}"),
+        );
+
+        msg.set_location(format!("{}@{metadata}", self.file));
+        self.messages.push(msg)
     }
 
     fn clear(&mut self) {
@@ -194,9 +247,12 @@ impl<const N: usize> TypeChecker<N> {
             let op = &code[ip];
 
             #[cfg(feature = "debug")]
-            println!("#{: >08}\t{: >12} [{}]", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
+            println!("#{: >08}\t{: >12} [{}] - {}:{}", ip, format!("{:?}", &code[ip].code()), self.stack[..self.sp].iter().map(|n| {
                 data.get_type(*n).output(data)
-            }).collect::<Vec<String>>().join(", "));
+            }).collect::<Vec<String>>().join(", "),
+                self.file,
+                op.metadata(),
+            );
 
             match op.code() {
                 Operation::Const => {
@@ -304,10 +360,10 @@ impl<const N: usize> TypeChecker<N> {
                     if !(self.match_type(data, lhs, int) && self.match_type(data, rhs, int)) 
                         && !(self.match_type(data, lhs, float) && self.match_type(data, rhs, float)) 
                     {
-                        self.errors.push(Error::new(
-                            ErrorOrigin::PARSE,
+                        self.error(
                             "Invalid comparison".to_string(),
-                        ));
+                            op.metadata()
+                        );
                     } 
 
                     self.push(data.find_type(Type::bool()));
@@ -397,10 +453,10 @@ impl<const N: usize> TypeChecker<N> {
                 }, 
                 Operation::This => self.push(op.kind()),
                 Operation::Load => {
-
                     if variables.contains_key(&op.operands()[0]) {
                         self.push(variables[&op.operands()[0]]);
                     } else {
+                        self.error(format!("Attempting to access undeclared variable '{}'", data.symbol_name(op.operands()[0])), op.metadata());
                         self.push(op.kind());
                     }
                 }
@@ -427,47 +483,50 @@ impl<const N: usize> TypeChecker<N> {
                     }
                 }
                 Operation::Call => {
-                    let [name, arity, _] = op.operands();
+                    let &[name, arity, _] = op.operands();
+
+
                     let kind;
 
-                    if let Some(func) = self.functions.get(name) {
-                        let fn_type = *data.get_type(*func);
+                    if let Some(&func) = self.functions.get(&self.resolve(name)) {
+                        let fn_type = func;
 
-                        for idx in 0..*arity {
+                        for idx in 0..arity {
                             let sub = self.substitute_type(data, fn_type.get(idx));
                             if !self.match_type(data, self.peek(idx), sub) {
-                                self.errors.push(Error::new(ErrorOrigin::PARSE, format!(
+                                self.error(format!(
                                     "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
                                     arity - idx ,
                                     data.symbol_name(op.operands()[0]),
-                                    data.get_type(data.get_type(*func).get(idx)).output(data), 
+                                    data.get_type(func.get(idx)).output(data), 
                                     data.get_type(self.peek(idx)).output(data)
-                                )));
+                                ), op.metadata());
                             }
                         }
 
-                        kind = self.resolve_type(data, data.get_type(*func).returns());
+
+                        kind = self.resolve_type(data, func.returns());
                     } else {
                         let fn_type = *data.get_type(op.kind());
                         let func = data.find_type(fn_type);
 
-                        for idx in 0..*arity {
+                        for idx in 0..arity {
                             let sub = self.substitute_type(data, fn_type.get(idx));
                             if !self.match_type(data, self.peek(idx), sub) {
-                                self.errors.push(Error::new(ErrorOrigin::PARSE, format!(
+                                self.error(format!(
                                     "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
                                     arity - idx ,
                                     data.symbol_name(op.operands()[0]),
                                     data.get_type(self.resolve_type(data, data.get_type(func).get(idx))).output(data), 
                                     data.get_type(self.resolve_type(data, self.peek(idx))).output(data)
-                                )));
+                                ), op.metadata());
                             }
                         }
 
                         kind = self.resolve_type(data, fn_type.returns());
                     }
 
-                    self.pop(*arity);
+                    self.pop(arity);
                     self.push(kind);
                 }
                 Operation::Prop => {
@@ -533,15 +592,15 @@ impl<const N: usize> TypeChecker<N> {
                     }
                 }
                 Operation::Invoke => {
-                    let [name, call_arity, ..] = op.operands();
+                    let [name, arity, ..] = op.operands();
                     let mut result = data.find_type(Type::void());
-                    let object = data.get_type(self.peek(*call_arity));
+                    let object = data.get_type(self.peek(*arity));
 
-                    let scope = self.scope;
-                    self.scope = self.peek(*call_arity);
+                    // let scope = self.scope;
+                    // self.scope = self.peek(*arity);
                     for param in object.arguments() {
                         if let Kind::Generic(n, t) = data.get_type(*param).kind() {
-                            self.type_arguments.entry(self.peek(*call_arity))
+                            self.type_arguments.entry(self.peek(*arity))
                                 .and_modify(|entry| {
                                     entry.insert(n, t);
                                 }).or_insert_with(|| {
@@ -560,18 +619,19 @@ impl<const N: usize> TypeChecker<N> {
 
                         let fqn = format!("{}::{}", data.symbol_name(n), data.symbol_name(*name));
 
-                        if *call_arity != declared_arity {
-                            self.error(format!("Called '{fqn}' with {call_arity} argument(s), but it was defined with {declared_arity}"), op.metadata());
+                        if *arity != declared_arity {
+                            self.error(format!("Called '{fqn}' with {arity} argument(s), but it was defined with {declared_arity}"), op.metadata());
                         }
 
-                        for idx in 0..*call_arity {
+                        for idx in 0..*arity {
                             if !self.match_type(data, self.peek(idx), existing_method.get(idx), ) {
-                                self.errors.push(Error::new(
-                                    ErrorOrigin::PARSE, format!(
+                                self.error(
+                                    format!(
                                         "Argument #{} of method '{fqn}' does not match expected type {:?}, got {:?}",
                                         idx + 1,
                                         data.get_type(self.resolve_type(data, existing_method.get(idx))).output(data),
-                                        data.get_type(self.resolve_type(data, self.peek(idx))).output(data))));
+                                        data.get_type(self.resolve_type(data, self.peek(idx))).output(data)),
+                                op.metadata());
                             }
                         }
 
@@ -585,29 +645,71 @@ impl<const N: usize> TypeChecker<N> {
                         }
 
                         result = self.resolve_type(data, data.get_type(method).returns());
-                        bytecode.push(IR::new(Operation::Invoke, [*name, *call_arity, n]));
-                    } else if let Kind::Coroutine(t) = object.kind() {
-                        if data.symbol_name(op.get(0)) == "get" {
-                            result = t;
-
-                        } else {
-                            self.error(format!("Coroutine does not have method named {}", data.symbol_name(op.get(0))), op.metadata());
-                        }
+                        bytecode.push(IR::new(Operation::Invoke, [*name, *arity, n]));
+                    } else if self.functions.contains_key(&self.resolve(*name)) {
+                    let name = if let Some(fqn) = self.aliases.get(&name) {
+                        *fqn
                     } else {
-                        todo!("Error out on call for non-object");
+                        *name
+                    };
+                        let kind;
+                    if let Some(&func) = self.functions.get(&name) {
+                        let fn_type = func;
+
+                        for idx in 0..*arity {
+                            let sub = self.substitute_type(data, fn_type.get(idx));
+                            if !self.match_type(data, self.peek(idx), sub) {
+                                self.error(format!(
+                                    "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
+                                    arity - idx ,
+                                    data.symbol_name(op.operands()[0]),
+                                    data.get_type(func.get(idx)).output(data), 
+                                    data.get_type(self.peek(idx)).output(data)
+                                ), op.metadata());
+                            }
+                        }
+
+                        kind = self.resolve_type(data, func.returns());
+                    } else {
+                        let fn_type = *data.get_type(op.kind());
+                        let func = data.find_type(fn_type);
+
+                        for idx in 0..*arity {
+                            let sub = self.substitute_type(data, fn_type.get(idx));
+                            if !self.match_type(data, self.peek(idx), sub) {
+                                self.error(format!(
+                                    "Argument #{} of function '{}' does not match expected type {:?}, got {:?}",
+                                    arity - idx ,
+                                    data.symbol_name(op.operands()[0]),
+                                    data.get_type(self.resolve_type(data, data.get_type(func).get(idx))).output(data), 
+                                    data.get_type(self.resolve_type(data, self.peek(idx))).output(data)
+                                ), op.metadata());
+                            }
+                        }
+
+                        kind = self.resolve_type(data, fn_type.returns());
                     }
 
-                    self.pop(1 + call_arity);
+                        result = kind;
+
+                        // let func_constant = data.add_constant(func_constant, op.kind());
+                        // bytecode.push(IR::new(Operation::Const, [func_constant, 0, 0]));
+                        bytecode.push(IR::new(Operation::Call, [name, arity + 1, 0]));
+
+                    } else {
+                        self.warn(format!("Unknown function '{}' used in method-like calling convention", data.symbol_name(*name)), op.metadata());
+                    }
+
+                    self.pop(1 + arity);
                     self.push(result);
 
-                    self.scope = scope;
                     ip += 1;
                     continue;
                 }
                 Operation::Closure => {
                     let [name, len, ..] = op.operands();
 
-                    self.functions.insert(*name, op.kind());
+                    self.functions.insert(*name, *data.get_type(op.kind()));
 
                     self.expects_return = Some(self.resolve_type(data, data.get_type(op.kind()).returns()));
                     let body = &mut self.check(&code[ip + 1..ip + 1+ len], data); 
@@ -622,7 +724,7 @@ impl<const N: usize> TypeChecker<N> {
                 Operation::Function => {
                     let [name, arity, len] = op.operands();
 
-                    self.functions.insert(*name, op.kind());
+                    self.functions.insert(*name, *data.get_type(op.kind()));
 
                     self.expects_return = Some(self.resolve_type(data, data.get_type(op.kind()).returns()));
                     let body =&mut self.check(&code[ip + 1..ip + 1+ len], data); 

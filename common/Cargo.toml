@@ -7,6 +7,7 @@ edition = "2024"
 debug = []
 
 [dependencies]
+colored = "3.0.0"
 libffi = "4.0.0"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-rustc-hash = { version = "2.1.1", features = ["rand"] }
+rustc-hash = { version = "2.1.1" }
+serde = { version = "1.0.219", features = ["derive"] }
