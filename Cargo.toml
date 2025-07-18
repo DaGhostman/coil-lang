@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [ "common","machine" ]
+
+[package]
+name = "zero-script"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "common" }
+machine = { path = "machine" }
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+
+[[bench]]
+name = "fib"
+harness = false
+
+[profile.release]
+opt-level=3
+lto = "fat"
+codegen-units = 1
+
+debug = 1
