@@ -24,8 +24,10 @@ pub enum Bytecode {
     POP,
     LOAD,
     STORE,
+    MOVE,
     CONST,
     SUSP = 251,
+    DATA = 253,
     #[default]
     HALT = 254,
 }

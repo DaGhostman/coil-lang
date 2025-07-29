@@ -20,10 +20,14 @@ impl <T: Copy + Default, const N: usize>Default for ArrayVec<T, N> {
 impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
 
     pub fn current(&self) -> &T {
+        promise!(self.current < N);
+
         &self.storage[self.current]
     }
 
     pub fn current_mut(&mut self) -> &mut T {
+        promise!(self.current < N);
+
         &mut self.storage[self.current]
     }
     
@@ -44,6 +48,7 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
 
     pub fn pop(&mut self) -> &T {
         promise!(self.current > 0);
+
         self.current -= 1;
         &self.storage[self.current + 1]
     }

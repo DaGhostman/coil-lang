@@ -1,5 +1,7 @@
 mod array_vec;
 
+pub use array_vec::*;
+
 #[macro_export]
 macro_rules! promise {
     ($cond: expr) => {
@@ -32,19 +34,31 @@ pub fn unlikely(b: bool) -> bool {
     b
 }
 
-pub use array_vec::*;
-
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// #[repr(u8)]
+// pub enum Types {
+//     NUMBER = 0,
+//     STRING = 1,
+// }
+//
+// impl Into<u8> for Types {
+//     fn into(self) -> u8 {
+//         self as u8
+//     }
+// }
+//
+// #[repr(u8)]
+// pub enum Registers {
+//     RET = 254,
+// }
+//
+// impl Into<u8> for Registers {
+//     fn into(self) -> u8 {
+//         self as u8
+//     }
+// }
+//
+// impl Into<usize> for Registers {
+//     fn into(self) -> usize {
+//         (self as u8) as usize
+//     }
+// }

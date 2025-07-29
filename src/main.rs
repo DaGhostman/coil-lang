@@ -1,3 +1,4 @@
+// use common::{Registers, Types};
 use machine::{Bytecode, Machine, Opcode};
 
 fn main() {
@@ -48,7 +49,6 @@ fn main() {
         Opcode::new(Bytecode::HALT, [0, 0, 0]),
         // -- FIB
         Opcode::new(Bytecode::STORE, [0, 0, 0]), // Argument `n`
-        // Opcode::new(Bytecode::PRINT, [0, 0, 0]),
         // --- if n < 2: return n
         Opcode::new(Bytecode::CONST, [0, 0, 2]),
         Opcode::new(Bytecode::STORE, [1, 0, 0]),
@@ -62,6 +62,7 @@ fn main() {
         Opcode::new(Bytecode::SUB, [0, 1, 1]),
         // Opcode::new(Bytecode::PRINT, [1, 0, 0]),
         Opcode::new(Bytecode::LOAD, [1, 0, 0]),
+
         Opcode::new(Bytecode::CALL, [5, 1, 0]),
         Opcode::new(Bytecode::STORE, [2, 0, 0]),
 
@@ -76,10 +77,7 @@ fn main() {
 
         // --- FIB(n - 1) + FIB(n - 2)
         Opcode::new(Bytecode::ADD, [2, 3, 0]),
-        // Opcode::new(Bytecode::PRINT, [2, 0, 0]),
-        // Opcode::new(Bytecode::PRINT, [3, 0, 0]),
-        // Opcode::new(Bytecode::PRINT, [0, 0, 0]),
-        
+        Opcode::new(Bytecode::LOAD, [0, 0, 0]),
         Opcode::new(Bytecode::RETURN, [0, 0, 0]),
     ];
 
@@ -123,5 +121,5 @@ fn main() {
     //     Opcode::new(Bytecode::HALT, [0, 0]),
     // ];
 
-    Machine::<u64>::default().run(fib.as_slice())
+    Machine::<u32>::default().run(fib.as_slice())
 }

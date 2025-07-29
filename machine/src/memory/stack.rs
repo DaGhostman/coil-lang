@@ -1,9 +1,9 @@
 use common::promise;
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Stack<T: Default + Copy + Clone, const N: usize> {
     top: usize,
-    storage: [T; N]
+    storage: [T; N],
 }
 
 impl <T: Default + Copy + Clone, const N: usize> Default for Stack<T, N> {
@@ -15,7 +15,7 @@ impl <T: Default + Copy + Clone, const N: usize> Default for Stack<T, N> {
     }
 }
 
-impl <T: Default + Copy + Clone, const N: usize> Stack<T, N> {
+impl <T: Default + Copy + Clone + PartialEq, const N: usize> Stack<T, N> {
     pub fn push(&mut self, value: T) -> () {
         promise!(self.top < N);
 
@@ -27,12 +27,12 @@ impl <T: Default + Copy + Clone, const N: usize> Stack<T, N> {
         promise!(self.top > 0);
 
         self.top -= 1;
-
         &self.storage[self.top]
     }
 
     pub fn peek(&self, idx: usize) -> &T {
-        promise!(self.top > idx);
+        promise!(self.top >= idx);
+        promise!(self.top < N);
 
         &self.storage[self.top - idx]
     }

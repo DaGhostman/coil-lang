@@ -1,6 +1,6 @@
-use std::{ops::{AddAssign, SubAssign}};
+use std::{fmt::Debug, ops::{AddAssign, SubAssign}};
 
-use common::{promise, ArrayVec};
+use common::promise;
 
 const REGISTRIES: usize = 32;
 
@@ -17,13 +17,13 @@ pub enum FrameState {
 }
 
 #[derive(Copy, Clone)]
-pub struct Frame<T: Default + Clone + Copy> {
+pub struct Frame<T: Default + Copy > {
     state: FrameState,
     // ---
     ip: usize,
     sp: usize,
     // ---
-    registries: ArrayVec<T, REGISTRIES>,
+    registries: [T; REGISTRIES],
 }
 
 impl <T: Default + Clone + Copy> Default for Frame<T> {
@@ -32,13 +32,13 @@ impl <T: Default + Clone + Copy> Default for Frame<T> {
             ip: 0,
             sp: 0,
             state: FrameState::default(),
-            registries: ArrayVec::default(),
+            registries: [T::default(); REGISTRIES],
         }
     }
 }
 
 
-impl <T: Default + Clone + Copy + AddAssign + SubAssign + From<u32> > Frame<T> {
+impl <T: Default + Copy + AddAssign + SubAssign + From<u32> > Frame<T> {
     pub fn tell(&self) -> usize {
         self.ip
     }
@@ -51,7 +51,8 @@ impl <T: Default + Clone + Copy + AddAssign + SubAssign + From<u32> > Frame<T> {
         self.ip = ip;
     }
 
-    pub fn with(&mut self, stack: usize) -> () {
+    pub fn seek_with_stack(&mut self, ip: usize, stack: usize) -> () {
+        self.ip = ip;
         self.sp = stack;
     }
 
