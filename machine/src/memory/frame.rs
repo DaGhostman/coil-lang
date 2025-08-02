@@ -2,7 +2,7 @@ use std::{fmt::Debug, ops::{AddAssign, SubAssign}};
 
 use common::promise;
 
-const REGISTRIES: usize = 32;
+const REGISTRIES: usize = 16;
 
 
 #[repr(u8)]

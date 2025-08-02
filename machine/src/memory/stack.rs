@@ -1,24 +1,21 @@
-use common::promise;
+use common::{promise, ArrayVec};
 
-#[derive(Debug, Copy, Clone)]
 pub struct Stack<T: Default + Copy + Clone, const N: usize> {
     top: usize,
-    storage: [T; N],
+    storage: ArrayVec<T, N>,
 }
 
 impl <T: Default + Copy + Clone, const N: usize> Default for Stack<T, N> {
     fn default() -> Self {
         Self {
             top: 0,
-            storage: [Default::default(); N],
+            storage: ArrayVec::default(),
         }
     }
 }
 
 impl <T: Default + Copy + Clone + PartialEq, const N: usize> Stack<T, N> {
     pub fn push(&mut self, value: T) -> () {
-        promise!(self.top < N);
-
         self.storage[self.top] = value;
         self.top += 1;
     }
@@ -32,14 +29,11 @@ impl <T: Default + Copy + Clone + PartialEq, const N: usize> Stack<T, N> {
 
     pub fn peek(&self, idx: usize) -> &T {
         promise!(self.top >= idx);
-        promise!(self.top < N);
 
         &self.storage[self.top - idx]
     }
 
     pub fn seek(&mut self, top: usize) -> () {
-        promise!(top < N);
-
         self.top = top;
     }
 

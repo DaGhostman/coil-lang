@@ -4,9 +4,8 @@ use common::{likely, unlikely, ArrayVec};
 use crate::{Bytecode, Frame, Opcode, Stack};
 
 pub struct Machine<T: Default + Copy + Clone + Debug> {
-    halt: bool,
     frames: ArrayVec<Frame<T>, 128>,
-    stack: Stack<T, 128>,
+    stack: Stack<T, 512>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -68,7 +67,6 @@ impl ExecutionResult {
 impl <T: Default + Copy + Clone + Debug> Default for Machine<T> {
     fn default() -> Self {
         Self {
-            halt: false,
             frames: ArrayVec::default(),
             stack: Stack::default(),
         }
@@ -79,13 +77,14 @@ impl <T: Default + Copy + Clone + Debug + AddAssign + SubAssign + From<u32> + Pa
     pub fn run(&mut self, code: &[Opcode]) -> () {
         self.frames.consume();
 
-        while !self.halt {
+        loop {
             let result = self.execute(code);
                 match result.outcome() {
                     ExecutionOutcome::CALL => {
                         likely(true);
 
-                        self.frames.current_mut().seek_with_stack(result.tell(), result.stack());
+                        self.frames.current_mut()
+                            .seek_with_stack(result.tell(), result.stack());
 
                         self.frames.consume();
                     },
@@ -110,13 +109,14 @@ impl <T: Default + Copy + Clone + Debug + AddAssign + SubAssign + From<u32> + Pa
 
     #[inline]
     fn execute(&mut self, code: &[Opcode]) -> ExecutionResult {
+        // let frame_no = self.frames.len();
         let frame = self.frames.get_mut();
         let mut ip = frame.tell();
 
-        while ip < code.len() {
+        while likely(ip < code.len()) {
             let opcode = code[ip];
 
-            // println!("#({:?}) - {} - {:?}", frame.status(), ip, opcode.bytecode());
+            // println!("#{}({:?}) - {} - {:?}", frame_no, frame.status(), ip, opcode.bytecode());
             ip += 1;
             frame.seek(ip);
 
