@@ -1,40 +1,35 @@
-use machine::{Bytecode, Machine, Opcode};
+use common::Value;
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
+use machine::{Byte, Instruction, Machine};
 use std::hint::black_box;
-use criterion::{criterion_group, criterion_main, Criterion, SamplingMode};
 
 fn fib(n: u16) -> () {
-    let bits = n.to_be_bytes();
     let fib = [
-        // -- MAIN
-        Opcode::new(Bytecode::CONST, [0, bits[0], bits[1]]),
-        Opcode::new(Bytecode::CALL, [4, 1, 0]),
-        Opcode::new(Bytecode::STORE, [0, 0, 0]),
-        // Opcode::new(Bytecode::PRINT, [0, 0, 0]),
-        Opcode::new(Bytecode::HALT, [0, 0, 0]),
-        Opcode::new(Bytecode::STORE, [0, 0, 0]), // Argument `n`
-        Opcode::new(Bytecode::CONST, [0, 0, 2]),
-        Opcode::new(Bytecode::STORE, [1, 0, 0]),
-        Opcode::new(Bytecode::LE, [0, 1, 2]),
-        Opcode::new(Bytecode::JMPF, [10, 2, 0]),
-        Opcode::new(Bytecode::RETURN, [0, 0, 0]),
-        Opcode::new(Bytecode::CONST, [0, 0, 1]),
-        Opcode::new(Bytecode::STORE, [1, 0, 0]),
-        Opcode::new(Bytecode::SUB, [0, 1, 1]),
-        Opcode::new(Bytecode::LOAD, [1, 0, 0]),
-        Opcode::new(Bytecode::CALL, [4, 1, 0]),
-        Opcode::new(Bytecode::STORE, [2, 0, 0]),
-        Opcode::new(Bytecode::CONST, [0, 0, 2]),
-        Opcode::new(Bytecode::STORE, [1, 0, 0]),
-        Opcode::new(Bytecode::SUB, [0, 1, 1]),
-        Opcode::new(Bytecode::LOAD, [1, 0, 0]),
-        Opcode::new(Bytecode::CALL, [4, 1, 0]),
-        Opcode::new(Bytecode::STORE, [3, 0, 0]),
-        Opcode::new(Bytecode::ADD, [2, 3, 0]),
-        Opcode::new(Bytecode::RETURN, [0, 0, 0]),
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(n.into())),
+        Byte::new(Instruction::CALL, [3, 1]),
+        Byte::new(Instruction::HALT, [0, 0]),
+        //
+        Byte::new(Instruction::LOAD, [0, 0]), // Load argument n
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)), // Load 2
+        Byte::new(Instruction::LE, [0, 0]),   // Compare n < 2
+        Byte::new(Instruction::JMPF, [9, 0]), // Jump if false
+        Byte::new(Instruction::LOAD, [0, 0]),
+        Byte::new(Instruction::RETURN, [0, 0]), // Return n
+        // -- FIB
+        Byte::new(Instruction::LOAD, [0, 0]), // Load n
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(1)), // Load 1
+        Byte::new(Instruction::SUB, [0, 0]),  // n - 1
+        Byte::new(Instruction::CALL, [3, 1]), // Call FIB(n - 1)
+        Byte::new(Instruction::LOAD, [0, 0]), // Store result
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)), // Load 2
+        Byte::new(Instruction::SUB, [0, 0]),  // n - 2
+        Byte::new(Instruction::CALL, [3, 1]), // Call FIB(n - 2)
+        // Opcode::new(Bytecode::STORE, [2, 0, 0]),  // Store result
+        Byte::new(Instruction::ADD, [0, 0]),    // Add results
+        Byte::new(Instruction::RETURN, [0, 0]), // Return result;
     ];
 
-
-    Machine::<u64>::default().run(fib.as_slice())
+    Machine::default().run(fib.as_slice())
 }
 
 fn fib_benchmark(c: &mut Criterion) {

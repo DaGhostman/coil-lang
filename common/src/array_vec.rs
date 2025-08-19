@@ -1,30 +1,32 @@
-use std::{ops::{Index, IndexMut}, slice::{Iter, IterMut}};
+use std::{
+    fmt::Debug,
+    ops::{Index, IndexMut},
+};
 
 use crate::{likely, promise, unlikely};
 
-pub struct ArrayVec<T: Copy + Default , const N: usize> {
+pub struct ArrayVec<T: Default, const N: usize> {
     current: usize,
     storage: [T; N],
     expansion: Vec<T>,
 }
 
-impl <T: Copy + Default, const N: usize>Default for ArrayVec<T, N> {
+impl<T: Default, const N: usize> Default for ArrayVec<T, N> {
     fn default() -> Self {
         Self {
             current: 0,
-            storage: [T::default(); N],
+            storage: std::array::from_fn(|_| T::default()),
             expansion: Vec::default(),
         }
     }
 }
 
-impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
+impl<T: Default, const N: usize> ArrayVec<T, N> {
     fn grow(&mut self, cursor: usize) {
-        promise!(cursor >= N);
         let boundary = self.expansion.len();
 
         if unlikely(cursor >= boundary) {
-            self.expansion.resize(boundary + N, T::default());
+            self.expansion.resize_with(boundary + N, T::default);
         }
     }
 
@@ -34,6 +36,7 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
 
             &self.storage[self.current]
         } else {
+            promise!((self.current - N) < self.expansion.len());
             &self.expansion[self.current - N]
         }
     }
@@ -47,13 +50,12 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
             let index = self.current - N;
             self.grow(index);
 
-            promise!(index >= N);
             promise!(index < self.expansion.len());
 
             &mut self.expansion[index]
         }
     }
-    
+
     pub fn consume(&mut self) -> () {
         self.current += 1;
     }
@@ -65,12 +67,13 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
     pub fn push(&mut self, value: T) -> () {
         if likely(self.current < N) {
             promise!(self.current < N);
+            promise!(self.current < self.storage.len());
 
             self.storage[self.current] = value;
         } else {
             self.grow(self.current - N);
 
-            promise!(self.current > N);
+            promise!(self.current >= N);
             promise!(self.current - N < self.expansion.len());
 
             self.expansion[self.current - N] = value;
@@ -98,6 +101,8 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
 
         if likely(current < N) {
             promise!(current < N);
+            promise!(current < self.storage.len());
+
             &self.storage[current]
         } else {
             promise!(self.expansion.len() > current - N);
@@ -120,7 +125,7 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
     }
 
     pub fn len(&self) -> usize {
-        self.current 
+        self.current
     }
 
     // pub fn iter(&self) -> Iter<T>{
@@ -147,8 +152,7 @@ impl <T: Copy + Default, const N: usize> ArrayVec<T, N> {
     }
 }
 
-
-impl <T: Copy + Default, const N: usize> Index<usize> for ArrayVec<T, N> {
+impl<T: Default, const N: usize> Index<usize> for ArrayVec<T, N> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
         if likely(index < N) {
@@ -161,7 +165,7 @@ impl <T: Copy + Default, const N: usize> Index<usize> for ArrayVec<T, N> {
     }
 }
 
-impl <T: Copy + Default, const N: usize> IndexMut<usize> for ArrayVec<T, N> {
+impl<T: Default, const N: usize> IndexMut<usize> for ArrayVec<T, N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         if likely(index < N) {
             promise!(index < N);
@@ -171,5 +175,27 @@ impl <T: Copy + Default, const N: usize> IndexMut<usize> for ArrayVec<T, N> {
             promise!(index - N > self.expansion.len());
             &mut self.expansion[index - N]
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<T: Default + Debug, const N: usize> Debug for ArrayVec<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?}",
+            self.storage
+                .iter()
+                .chain(self.expansion.iter())
+                .enumerate()
+                .filter_map(|(idx, val)| {
+                    if idx >= self.current {
+                        return None;
+                    }
+
+                    Some(val.to_owned())
+                })
+                .collect::<Vec<_>>()
+        )
     }
 }

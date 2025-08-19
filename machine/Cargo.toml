@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+rustc-hash = { version = "2.1.1", features = ["std", "rand"] }

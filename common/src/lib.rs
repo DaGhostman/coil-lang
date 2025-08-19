@@ -1,6 +1,10 @@
 mod array_vec;
+mod value;
+// mod interner;
 
 pub use array_vec::*;
+pub use value::*;
+// pub use interner::*;
 
 #[macro_export]
 macro_rules! promise {
@@ -10,10 +14,18 @@ macro_rules! promise {
             debug_assert!($cond);
         }
         #[cfg(not(debug_assertions))]
-        { 
-            unsafe {
-                std::hint::assert_unchecked($cond)
-            }
+        {
+            unsafe { std::hint::assert_unchecked($cond) }
+        }
+    };
+    ($cond: expr, $msg: literal) => {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!($cond, $msg);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            unsafe { std::hint::assert_unchecked($cond) }
         }
     };
 }
@@ -24,13 +36,17 @@ fn cold() {}
 
 #[inline]
 pub fn likely(b: bool) -> bool {
-    if !b { cold() }
+    if !b {
+        cold()
+    }
     b
 }
 
 #[inline]
 pub fn unlikely(b: bool) -> bool {
-    if b { cold() }
+    if b {
+        cold()
+    }
     b
 }
 

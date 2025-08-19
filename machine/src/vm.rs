@@ -1,11 +1,12 @@
-use std::{fmt::{Debug, Display}, ops::{Add, AddAssign, BitXor, Sub, SubAssign}};
-use common::{likely, unlikely, ArrayVec};
+use common::{ArrayVec, Type, Value, likely, unlikely};
+use std::string::String as RustString;
+const FRAME_COUNT: usize = 256;
 
-use crate::{Bytecode, Frame, Opcode, Stack};
+use crate::{Byte, Frame, Heap, Instruction, Object, String, garbage::Collectable};
 
-pub struct Machine<T: Default + Copy + Clone + Debug> {
-    frames: ArrayVec<Frame<T>, 128>,
-    stack: Stack<T, 512>,
+pub struct Machine {
+    frames: ArrayVec<Frame<Value>, FRAME_COUNT>,
+    heap: Heap<1024>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -22,23 +23,23 @@ enum ExecutionOutcome {
 struct ExecutionResult {
     outcome: ExecutionOutcome,
     ip: usize,
-    stack: usize,
+    arity: usize,
 }
 
 impl ExecutionResult {
-    pub fn returns(result: usize) -> Self {
+    pub fn returns() -> Self {
         Self {
             outcome: ExecutionOutcome::RETURN,
             ip: 0,
-            stack: result,
+            arity: 0,
         }
     }
 
-    pub fn call(ip: usize, sp: usize) -> Self {
+    pub fn call(ip: usize, arity: usize) -> Self {
         Self {
             outcome: ExecutionOutcome::CALL,
             ip,
-            stack: sp,
+            arity,
         }
     }
 
@@ -46,7 +47,15 @@ impl ExecutionResult {
         Self {
             outcome: ExecutionOutcome::TERMINATION,
             ip: 0,
-            stack: 0,
+            arity: 0,
+        }
+    }
+
+    pub fn invalid() -> Self {
+        Self {
+            outcome: ExecutionOutcome::INVALID,
+            ip: usize::MAX,
+            arity: usize::MAX,
         }
     }
 
@@ -54,8 +63,8 @@ impl ExecutionResult {
         self.outcome
     }
 
-    pub fn stack(&self) -> usize {
-        self.stack
+    pub fn arity(&self) -> usize {
+        self.arity
     }
 
     pub fn tell(&self) -> usize {
@@ -63,144 +72,230 @@ impl ExecutionResult {
     }
 }
 
-
-impl <T: Default + Copy + Clone + Debug> Default for Machine<T> {
+impl Default for Machine {
     fn default() -> Self {
+        let mut frames = ArrayVec::default();
+        frames.consume();
         Self {
-            frames: ArrayVec::default(),
-            stack: Stack::default(),
+            frames,
+            heap: Heap::default(),
         }
     }
 }
 
-impl <T: Default + Copy + Clone + Debug + AddAssign + SubAssign + From<u32> + PartialEq + Add<Output = T> + Sub<Output = T> + PartialOrd + Display + BitXor<Output = T>> Machine<T> {
-    pub fn run(&mut self, code: &[Opcode]) -> () {
-        self.frames.consume();
+impl Machine {
+    pub fn push(&mut self, value: Value) {
+        self.frames.get_mut().push(value);
+    }
 
-        loop {
-            let result = self.execute(code);
-                match result.outcome() {
-                    ExecutionOutcome::CALL => {
-                        likely(true);
+    fn mark(&mut self, fp: usize) -> () {
+        let mut grey: Vec<Object> = Vec::with_capacity(1024);
 
-                        self.frames.current_mut()
-                            .seek_with_stack(result.tell(), result.stack());
+        for n in 0..fp {
+            let stack = self.frames[n].stack_mut();
+            let max = stack.len();
 
-                        self.frames.consume();
-                    },
-                    ExecutionOutcome::RETURN => {
-                        likely(true);
-                        let v = *self.stack.pop();
+            for x in 0..max {
+                match stack[x].get_type() {
+                    Type::Object | Type::String => {
+                        let mut collectable: Collectable<Object> =
+                            Collectable::from(stack[x].as_ptr());
 
-                        self.frames.pop();
-                        self.frames.get_mut().resume();
-
-                        self.stack.seek(result.stack());
-                        self.stack.push(v);
-                    },
-                    ExecutionOutcome::TERMINATION => {
-                        unlikely(true);
-                        break;
+                        collectable.as_mut().mark(&mut grey);
                     }
                     _ => (),
                 }
+            }
+        }
+
+        while let Some(object) = grey.pop() {
+            object.mark_reference(&mut grey);
+        }
+    }
+
+    fn gc(&mut self, fp: usize) -> () {
+        self.mark(fp);
+
+        #[cfg(not(debug_assertions))]
+        if self.heap.usage() < 0.75 {
+            return;
+        }
+
+        self.heap.collect();
+    }
+
+    pub fn run(&mut self, code: &[Byte<Value>]) -> () {
+        loop {
+            let result = self.execute(code);
+
+            match result.outcome() {
+                ExecutionOutcome::CALL => {
+                    likely(true);
+                    self.frames.current_mut().enter(result.tell());
+
+                    for _ in 0..result.arity() {
+                        let value = *self.frames.get_mut().pop();
+                        self.frames.current_mut().push(value);
+                    }
+
+                    self.frames.consume();
+                }
+                ExecutionOutcome::RETURN => {
+                    likely(true);
+                    let v = *self.frames.get_mut().pop();
+
+                    self.frames.pop();
+                    self.frames.get_mut().resume(v);
+
+                    self.heap.collect();
+                }
+                ExecutionOutcome::TERMINATION => {
+                    unlikely(true);
+                    break;
+                }
+                _ => (),
+            }
         }
     }
 
     #[inline]
-    fn execute(&mut self, code: &[Opcode]) -> ExecutionResult {
-        // let frame_no = self.frames.len();
+    fn execute(&mut self, code: &[Byte<Value>]) -> ExecutionResult {
+        #[cfg(debug_assertions)]
+        let frame_no = self.frames.len();
         let frame = self.frames.get_mut();
         let mut ip = frame.tell();
 
         while likely(ip < code.len()) {
-            let opcode = code[ip];
+            let opcode = &code[ip];
 
-            // println!("#{}({:?}) - {} - {:?}", frame_no, frame.status(), ip, opcode.bytecode());
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "#{:<2} @ {:<3} - {:<10} - {:?}",
+                    frame_no,
+                    ip,
+                    format!("{}", opcode.bytecode()),
+                    frame
+                );
+            }
+
             ip += 1;
             frame.seek(ip);
 
             match opcode.bytecode() {
-                Bytecode::CONST => {
-                    let c = opcode.constant();
+                Instruction::DUP => {
+                    let value = *frame.peek();
 
-                    self.stack.push(c);
+                    frame.push(value);
                 }
-                Bytecode::STORE => {
+                Instruction::CONST => frame.push(opcode.constant()),
+                Instruction::STORE => {
                     likely(true);
-                    let val = *self.stack.pop();
+                    let val = *frame.pop();
                     frame.store(opcode.operand(0) as usize, val);
                 }
-                Bytecode::LOAD => {
+                Instruction::LOAD => {
                     likely(true);
 
-                    self.stack.push(
-                        *frame.load(opcode.operand(0) as usize)
-                    );
+                    frame.push(*frame.load(opcode.operand(0) as usize));
                 }
-                Bytecode::ADD => {
-                    frame.store(opcode.operand(2) as usize,
-                        *frame.load(opcode.operand(0) as usize) +
-                        *frame.load(opcode.operand(1) as usize)
-                    );
-                }
-                Bytecode::SUB => {
-                    frame.store(
-                        opcode.operand(2) as usize,
-                        *frame.load(opcode.operand(0) as usize) - *frame.load(opcode.operand(1) as usize)
-                    );
-                }
-                Bytecode::LE => {
-                    frame.store(
-                        opcode.operand(2) as usize,
-                        T::from((
-                            frame.get(opcode.operand(0) as usize) < frame.get(opcode.operand(1) as usize
-                        )) as u32),
-                    );
-                }
-                Bytecode::GT => {
-                    let rhs = *self.stack.pop();
-                    let lhs = *self.stack.pop();
+                Instruction::ADD => {
+                    let rhs = frame.pop().raw();
+                    let lhs = frame.top();
 
-                    self.stack.push(T::from((lhs > rhs) as u32));
+                    lhs.replace(lhs.raw() + rhs);
                 }
-                Bytecode::PRINT => println!("{}", frame.load(opcode.operand(0) as usize)),
-                Bytecode::JMP => {
+                Instruction::SUB => {
+                    let rhs = frame.pop().raw();
+                    let lhs = frame.top();
+
+                    lhs.replace(lhs.raw() - rhs);
+                }
+                Instruction::LE => {
+                    let rhs = frame.pop().raw();
+                    let lhs = frame.top();
+
+                    *lhs = Value::bool(lhs.raw() < rhs);
+                }
+                Instruction::GT => {
+                    let rhs = frame.pop().raw();
+                    let lhs = frame.top();
+
+                    *lhs = Value::bool(lhs.raw() > rhs);
+                }
+                Instruction::PRINT => {
+                    let value = frame.pop();
+                    println!(
+                        "{}",
+                        match value.get_type() {
+                            Type::Bool | Type::Integer => format!("{}", value.as_int()),
+                            Type::Float => format!("{:.?}", value.as_float()),
+                            Type::String => {
+                                let value: Collectable<String> = Collectable::from(value.as_ptr());
+
+                                format!("{}", (*value).as_ref())
+                            }
+                            _ => RustString::new(),
+                        }
+                    )
+                }
+                Instruction::JMP => {
                     ip = opcode.operand(0) as usize;
                 }
-                Bytecode::JMPF => {
-                    if likely(*frame.get(opcode.operand(1) as usize) == T::from(0 as u32)) {
-                        ip = opcode.operand(0) as usize;
-                    } 
-                }
-                Bytecode::JMPT => {
-                    if likely(*self.stack.pop() == T::from(1 as u32)) {
+                Instruction::JMPF => {
+                    if likely(frame.pop().as_int() == 0) {
                         ip = opcode.operand(0) as usize;
                     }
                 }
-                Bytecode::INC => frame.inc(opcode.operand(0) as usize),
-                Bytecode::DEC => frame.dec(opcode.operand(0) as usize),
-                Bytecode::CALL => {
+                Instruction::JMPT => {
+                    if likely(frame.pop().as_int() == 1) {
+                        ip = opcode.operand(0) as usize;
+                    }
+                }
+                Instruction::CALL => {
                     likely(true);
                     frame.suspend();
 
-                    return ExecutionResult::call(opcode.operand(0) as usize, self.stack.tell() - opcode.operand(1) as usize)
+                    return ExecutionResult::call(
+                        opcode.operand(0) as usize,
+                        opcode.operand(1) as usize,
+                    );
                 }
-                Bytecode::RETURN => {
+                Instruction::RETURN => {
                     likely(true);
                     frame.complete();
 
-                    self.stack.push(*frame.load(opcode.operand(0) as usize));
-                    return ExecutionResult::returns(frame.returns());
+                    return ExecutionResult::returns();
                 }
-                Bytecode::HALT => {
+                Instruction::HALT => {
                     unlikely(true);
                     frame.terminate();
+
                     return ExecutionResult::terminate();
                 }
-                _ => {
-                    unimplemented!("Code execution");
+                Instruction::STRING => {
+                    let mut value: Vec<u8> = Vec::with_capacity(opcode.operand(0) as usize);
+
+                    while let data = code[ip]
+                        && data.operand(0) != 0
+                    {
+                        ip += 1;
+
+                        value.push(data.operand(0));
+                    }
+
+                    if let Ok(value) = RustString::from_utf8(value) {
+                        let (_, collectable) = self.heap.alloc(value.into(), Object::String);
+
+                        frame.push(Value::string(collectable.ptr()));
+                    } else {
+                        eprintln!("Unable to recreate string from bytes");
+
+                        return ExecutionResult::invalid();
+                    }
                 }
+                Instruction::NOOP => continue,
+                _ => return ExecutionResult::invalid(),
             }
         }
 

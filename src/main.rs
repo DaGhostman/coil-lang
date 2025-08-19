@@ -1,125 +1,41 @@
+use common::Value;
 // use common::{Registers, Types};
-use machine::{Bytecode, Machine, Opcode};
+use machine::{Byte, Instruction, Machine};
 
 fn main() {
-    // let fib = [
-    //     // -- MAIN
-    //     Opcode::new(Bytecode::CONST, (13 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::CALL, [6, 1]),
-    //     Opcode::new(Bytecode::STORE, [0, 0]),
-    //     Opcode::new(Bytecode::LOAD, [0, 0]),
-    //     Opcode::new(Bytecode::PRINT, [0, 0]),
-    //     Opcode::new(Bytecode::HALT, [0, 0]),
-    //     // -- FIB
-    //     // --- if n < 2: return n
-    //     Opcode::new(Bytecode::STORE, [0, 0]),
-    //     Opcode::new(Bytecode::LOAD, [0, 0]),
-    //     Opcode::new(Bytecode::CONST, (2 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::LE, [0, 0]),
-    //     Opcode::new(Bytecode::JMPF, [13, 0]),
-    //     Opcode::new(Bytecode::LOAD, [0, 0]),
-    //     Opcode::new(Bytecode::RETURN, [0, 0]),
-    //
-    //     // --- FIB(n - 1)
-    //     Opcode::new(Bytecode::CONST, (1 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [1, 0]),
-    //     Opcode::new(Bytecode::SUB, [0, 1]),
-    //     Opcode::new(Bytecode::CALL, [6, 1]),
-    //     Opcode::new(Bytecode::STORE, [1, 0]),
-    //
-    //
-    //     // --- FIB(n - 2)
-    //     Opcode::new(Bytecode::CONST, (2 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [2, 0]),
-    //     Opcode::new(Bytecode::SUB, [0, 2]),
-    //     Opcode::new(Bytecode::CALL, [6, 1]),
-    //     Opcode::new(Bytecode::STORE, [2, 0]),
-    //
-    //     // --- FIB(n - 1) + FIB(n - 2)
-    //     Opcode::new(Bytecode::ADD, [1, 2]),
-    //     Opcode::new(Bytecode::RETURN, [0, 0]),
-    // ];
     let fib = [
-        // -- MAIN
-        Opcode::new(Bytecode::CONST, [0, 0, 32]),
-        Opcode::new(Bytecode::CALL, [5, 1, 0]),
-        Opcode::new(Bytecode::STORE, [0, 0, 0]),
-        // Opcode::new(Bytecode::LOAD, [0, 0]),
-        Opcode::new(Bytecode::PRINT, [0, 0, 0]),
-        Opcode::new(Bytecode::HALT, [0, 0, 0]),
+        // Byte::new_with(Instruction::CONST, [0, 0], Value::new(1, 32u64)),
+        // Byte::new(Instruction::STRING, [0, 1]),
+        // Byte::new(Instruction::DATA, [97, 0]),
+        // Byte::new(Instruction::DATA, [0, 0]),
+        // Byte::new(Instruction::PRINT, [0, 0]),
+        // Byte::new(Instruction::HALT, [0, 0]),
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(32)),
+        Byte::new(Instruction::CALL, [4, 1]),
+        Byte::new(Instruction::PRINT, [0, 0]),
+        Byte::new(Instruction::HALT, [0, 0]),
+        //
+        Byte::new(Instruction::LOAD, [0, 0]), // Load argument n
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)), // Load 2
+        Byte::new(Instruction::LE, [0, 0]),   // Compare n < 2
+        Byte::new(Instruction::JMPF, [10, 0]), // Jump if false
+        Byte::new(Instruction::LOAD, [0, 0]),
+        Byte::new(Instruction::RETURN, [0, 0]), // Return n
         // -- FIB
-        Opcode::new(Bytecode::STORE, [0, 0, 0]), // Argument `n`
-        // --- if n < 2: return n
-        Opcode::new(Bytecode::CONST, [0, 0, 2]),
-        Opcode::new(Bytecode::STORE, [1, 0, 0]),
-        Opcode::new(Bytecode::LE, [0, 1, 2]),
-        Opcode::new(Bytecode::JMPF, [11, 2, 0]),
-        Opcode::new(Bytecode::RETURN, [0, 0, 0]),
-
-        // --- FIB(n - 1)
-        Opcode::new(Bytecode::CONST, [0, 0, 1]),
-        Opcode::new(Bytecode::STORE, [1, 0, 0]),
-        Opcode::new(Bytecode::SUB, [0, 1, 1]),
-        // Opcode::new(Bytecode::PRINT, [1, 0, 0]),
-        Opcode::new(Bytecode::LOAD, [1, 0, 0]),
-
-        Opcode::new(Bytecode::CALL, [5, 1, 0]),
-        Opcode::new(Bytecode::STORE, [2, 0, 0]),
-
-
-        // --- FIB(n - 2)
-        Opcode::new(Bytecode::CONST, [0, 0, 2]),
-        Opcode::new(Bytecode::STORE, [1, 0, 0]),
-        Opcode::new(Bytecode::SUB, [0, 1, 1]),
-        Opcode::new(Bytecode::LOAD, [1, 0, 0]),
-        Opcode::new(Bytecode::CALL, [5, 1, 0]),
-        Opcode::new(Bytecode::STORE, [3, 0, 0]),
-
-        // --- FIB(n - 1) + FIB(n - 2)
-        Opcode::new(Bytecode::ADD, [2, 3, 0]),
-        Opcode::new(Bytecode::LOAD, [0, 0, 0]),
-        Opcode::new(Bytecode::RETURN, [0, 0, 0]),
+        Byte::new(Instruction::LOAD, [0, 0]), // Load n
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(1)), // Load 1
+        Byte::new(Instruction::SUB, [0, 0]),  // n - 1
+        Byte::new(Instruction::CALL, [4, 1]), // Call FIB(n - 1)
+        Byte::new(Instruction::LOAD, [0, 0]), // Store result
+        Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)), // Load 2
+        Byte::new(Instruction::SUB, [0, 0]),  // n - 2
+        Byte::new(Instruction::CALL, [4, 1]), // Call FIB(n - 2)
+        // Opcode::new(Bytecode::STORE, [2, 0, 0]),  // Store result
+        Byte::new(Instruction::ADD, [1, 0]), // Add results
+        Byte::new(Instruction::RETURN, [0, 0]), // Return result;
+                                             //
     ];
 
-
-    // let code = [
-    //     Opcode::new(Bytecode::CALL,  [26, 0]),
-    //     Opcode::new(Bytecode::STORE, [10, 0]),
-    //     // Opcode::new(Bytecode::PRINT, [10, 0]),
-    //     Opcode::new(Bytecode::CONST, (0 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [0, 0]),
-    //     Opcode::new(Bytecode::CONST, VALUE.to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [1, 0]),
-    //     Opcode::new(Bytecode::CONST, VALUE.to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [2, 0]),
-    //     Opcode::new(Bytecode::CONST, VALUE.to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [3, 0]),
-    //     Opcode::new(Bytecode::CONST, VALUE.to_be_bytes()),
-    //     Opcode::new(Bytecode::STORE, [4, 0]),
-    //     Opcode::new(Bytecode::ADD,   [1, 2]),
-    //     Opcode::new(Bytecode::STORE, [1, 0]),
-    //     Opcode::new(Bytecode::ADD,   [1, 3]),
-    //     Opcode::new(Bytecode::STORE, [1, 0]),
-    //     Opcode::new(Bytecode::ADD,   [1, 4]),
-    //     Opcode::new(Bytecode::STORE, [1, 0]),
-    //     Opcode::new(Bytecode::INC,   [0, 0]),
-    //     Opcode::new(Bytecode::CONST, (1000 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::LOAD,  [0, 0]),
-    //     Opcode::new(Bytecode::LE,    [0, 0]),
-    //     Opcode::new(Bytecode::JMPF,  [6, 0]),
-    //     Opcode::new(Bytecode::LOAD,  [1, 0]),
-    //     Opcode::new(Bytecode::PRINT, [1, 0]),
-    //     // --
-    //     Opcode::new(Bytecode::HALT, [0, 0]),
-    //     // --
-    //     Opcode::new(Bytecode::CONST, (42 as u16).to_be_bytes()),
-    //     // Opcode::new(Bytecode::STORE, [11, 0]),
-    //     // Opcode::new(Bytecode::PRINT, [11, 0]),
-    //     Opcode::new(Bytecode::CONST, (69 as u16).to_be_bytes()),
-    //     Opcode::new(Bytecode::RETURN, [0, 0]),
-    //     // --
-    //     Opcode::new(Bytecode::HALT, [0, 0]),
-    // ];
-
-    Machine::<u32>::default().run(fib.as_slice())
+    let mut vm = Machine::default();
+    vm.run(fib.as_slice());
 }

@@ -1,12 +1,14 @@
-use std::{fmt::Debug, ops::{AddAssign, SubAssign}};
+use std::{
+    fmt::Debug,
+    ops::{AddAssign, SubAssign},
+};
 
-use common::promise;
+use common::{ArrayVec, promise};
 
-const REGISTRIES: usize = 16;
-
+const STACK: usize = 128;
 
 #[repr(u8)]
-#[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[derive(Default, Copy, Clone, PartialEq)]
 pub enum FrameState {
     #[default]
     PENDING,
@@ -16,74 +18,61 @@ pub enum FrameState {
     TERMINATED,
 }
 
-#[derive(Copy, Clone)]
-pub struct Frame<T: Default + Copy > {
+pub struct Frame<T: Default> {
     state: FrameState,
     // ---
     ip: usize,
-    sp: usize,
     // ---
-    registries: [T; REGISTRIES],
+    stack: ArrayVec<T, STACK>,
 }
 
-impl <T: Default + Clone + Copy> Default for Frame<T> {
+impl<T: Default> Default for Frame<T> {
     fn default() -> Self {
         Self {
             ip: 0,
-            sp: 0,
             state: FrameState::default(),
-            registries: [T::default(); REGISTRIES],
+            stack: ArrayVec::default(),
         }
     }
 }
 
-
-impl <T: Default + Copy + AddAssign + SubAssign + From<u32> > Frame<T> {
+impl<T: Default> Frame<T> {
     pub fn tell(&self) -> usize {
         self.ip
-    }
-
-    pub fn returns(&self) -> usize {
-        self.sp
     }
 
     pub fn seek(&mut self, ip: usize) -> () {
         self.ip = ip;
     }
 
-    pub fn seek_with_stack(&mut self, ip: usize, stack: usize) -> () {
-        self.ip = ip;
-        self.sp = stack;
-    }
-
     pub fn load(&self, index: usize) -> &T {
-        promise!(index < REGISTRIES);
+        promise!(index < STACK);
 
-        &self.registries[index]
+        &self.stack[index]
     }
 
     pub fn store(&mut self, index: usize, value: T) -> () {
-        promise!(index < REGISTRIES);
-
-        self.registries[index] = value;
-    }
-
-    pub fn inc(&mut self, index: usize) -> () {
-        promise!(index < REGISTRIES);
-
-        self.registries[index] += 1.into();
-    }
-
-    pub fn dec(&mut self, index: usize) -> () {
-        promise!(index < REGISTRIES);
-
-        self.registries[index] -= 1.into();
+        self.stack[index] = value;
     }
 
     pub fn get(&self, index: usize) -> &T {
-        promise!(index < REGISTRIES);
+        &self.stack[index]
+    }
 
-        &self.registries[index]
+    pub fn push(&mut self, value: T) {
+        self.stack.push(value);
+    }
+
+    pub fn pop(&mut self) -> &T {
+        self.stack.pop()
+    }
+
+    pub fn peek(&self) -> &T {
+        self.stack.get()
+    }
+
+    pub fn top(&mut self) -> &mut T {
+        self.stack.get_mut()
     }
 
     pub fn status(&self) -> FrameState {
@@ -104,25 +93,39 @@ impl <T: Default + Copy + AddAssign + SubAssign + From<u32> > Frame<T> {
 
     pub fn terminate(&mut self) -> () {
         self.state = FrameState::TERMINATED;
-        self.recycle();
     }
 
     pub fn complete(&mut self) -> () {
         self.state = FrameState::COMPLETE;
-        self.recycle();
     }
 
-    pub fn resume(&mut self) -> () {
+    pub fn resume(&mut self, value: T) -> () {
         self.state = FrameState::PENDING;
+        self.stack.push(value);
     }
 
     pub fn is_pending(&self) -> bool {
         self.state == FrameState::PENDING
     }
 
-    pub fn recycle(&mut self) -> () {
+    pub fn enter(&mut self, ip: usize) {
         self.state = FrameState::default();
-        self.ip = 0;
-        self.sp = 0;
+        self.ip = ip;
+        self.stack.seek(0);
+    }
+
+    pub fn stack(&self) -> &ArrayVec<T, STACK> {
+        &self.stack
+    }
+
+    pub fn stack_mut(&mut self) -> &mut ArrayVec<T, STACK> {
+        &mut self.stack
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<T: Default + Debug> Debug for Frame<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.stack)
     }
 }

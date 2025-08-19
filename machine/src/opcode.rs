@@ -1,6 +1,8 @@
+use std::fmt::{Debug, Display};
+
 #[repr(u8)]
-#[derive(Debug, Default, Copy, Clone)]
-pub enum Bytecode {
+#[derive(Default, Copy, Clone)]
+pub enum Instruction {
     ADD = 0,
     SUB,
     MUL,
@@ -22,69 +24,83 @@ pub enum Bytecode {
     RETURN,
     PUSH = 200,
     POP,
+    DUP,
     LOAD,
     STORE,
     MOVE,
     CONST,
+    STRING,
     SUSP = 251,
+    NOOP = 252,
     DATA = 253,
     #[default]
     HALT = 254,
 }
 
-impl From<u8> for Bytecode {
+impl From<u8> for Instruction {
     fn from(value: u8) -> Self {
         match value {
-            0 => Bytecode::ADD,
-            1 => Bytecode::SUB,
-            2 => Bytecode::MUL,
-            3 => Bytecode::DIV,
-            4 => Bytecode::ADDF,
-            5 => Bytecode::SUBF,
-            6 => Bytecode::MULF,
-            7 => Bytecode::DIVF,
-            30 => Bytecode::EQ,
-            31 => Bytecode::LE,
-            32 => Bytecode::GT,
-            50 => Bytecode::JMP,
-            51 => Bytecode::JMPT,
-            52 => Bytecode::JMPF,
-            53 => Bytecode::CALL,
-            100 => Bytecode::PRINT,
-            101 => Bytecode::RETURN,
-            200 => Bytecode::PUSH,
-            201 => Bytecode::POP,
-            202 => Bytecode::LOAD,
-            203 => Bytecode::STORE,
-            204 => Bytecode::CONST,
-            251 => Bytecode::SUSP,
-            254 => Bytecode::HALT,
-            _ => Bytecode::HALT,
+            0 => Instruction::ADD,
+            1 => Instruction::SUB,
+            2 => Instruction::MUL,
+            3 => Instruction::DIV,
+            4 => Instruction::ADDF,
+            5 => Instruction::SUBF,
+            6 => Instruction::MULF,
+            7 => Instruction::DIVF,
+            30 => Instruction::EQ,
+            31 => Instruction::LE,
+            32 => Instruction::GT,
+            50 => Instruction::JMP,
+            51 => Instruction::JMPT,
+            52 => Instruction::JMPF,
+            53 => Instruction::CALL,
+            100 => Instruction::PRINT,
+            101 => Instruction::RETURN,
+            200 => Instruction::PUSH,
+            201 => Instruction::POP,
+            202 => Instruction::LOAD,
+            203 => Instruction::STORE,
+            204 => Instruction::CONST,
+            251 => Instruction::SUSP,
+            252 => Instruction::NOOP,
+            254 => Instruction::HALT,
+            _ => Instruction::HALT,
         }
     }
 }
 
-impl Into<u8> for Bytecode {
+impl Into<u8> for Instruction {
     fn into(self) -> u8 {
         self as u8
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Opcode {
-    bytecode: Bytecode,
-    operands: [u8; 3],
+#[derive(Default, Clone, Copy)]
+pub struct Byte<V> {
+    bytecode: Instruction,
+    operands: [u8; 2],
+    value: V,
 }
 
-impl Opcode {
-    pub fn new(bytecode: Bytecode, operands: [u8; 3]) -> Self {
+impl<V: Default + Copy> Byte<V> {
+    pub fn new(bytecode: Instruction, operands: [u8; 2]) -> Self {
         Self {
             bytecode,
             operands,
+            value: V::default(),
         }
     }
-    
-    pub fn bytecode(&self) -> Bytecode {
+
+    pub fn new_with(bytecode: Instruction, operands: [u8; 2], value: V) -> Self {
+        Self {
+            bytecode,
+            operands,
+            value,
+        }
+    }
+
+    pub fn bytecode(&self) -> Instruction {
         self.bytecode
     }
 
@@ -92,42 +108,21 @@ impl Opcode {
         self.operands[idx]
     }
 
-    pub fn constant<T: From<u32>>(&self) -> T {
-        u32::from_be_bytes([
-            0,
-            self.operands[0],
-            self.operands[1],
-            self.operands[2],
-        ]).into() 
+    pub fn constant(&self) -> V {
+        self.value
     }
 }
 
-impl Into<u32> for Opcode {
-    fn into(self) -> u32 {
-        let bytes = [
-            (self.bytecode as u8).to_be_bytes()[0],
-            self.operands[0],
-            self.operands[1],
-            self.operands[2],
-        ];
-
-        u32::from_be_bytes(bytes)
+#[cfg(debug_assertions)]
+impl<V: Display> Debug for Byte<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}({:?}) - {}", self.bytecode, self.operands, self.value)
     }
 }
 
-impl From<u32> for Opcode {
-    fn from(value: u32) -> Self {
-        let opcode = (value >> 24) & 254;
-
-        let operands = [
-            ((value & 0x00FF0000) >> 6) as u8,
-            ((value & 0x0000FF00) >> 4) as u8,
-            (value & 0x000000FF) as u8,
-        ];
-
-        Self {
-            bytecode: Bytecode::from(opcode as u8),
-            operands,
-        }
+#[cfg(debug_assertions)]
+impl Display for Instruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", *self as u8)
     }
 }
