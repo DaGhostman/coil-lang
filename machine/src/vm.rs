@@ -1,12 +1,16 @@
-use common::{ArrayVec, Type, Value, likely, unlikely};
-use std::string::String as RustString;
+use common::{ArrayVec, Type, Value, likely, promise, unlikely};
+use std::{ops::Deref, string::String as RustString};
 const FRAME_COUNT: usize = 256;
 
-use crate::{Byte, Frame, Heap, Instruction, Object, String, garbage::Collectable};
+use crate::{
+    Byte, Coroutine, Frame, Heap, Instruction, Object, String,
+    garbage::{Collectable, GcSized},
+};
 
 pub struct Machine {
     frames: ArrayVec<Frame<Value>, FRAME_COUNT>,
     heap: Heap<1024>,
+    pending: Vec<Object>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -15,6 +19,7 @@ enum ExecutionOutcome {
     #[default]
     INVALID,
     CALL,
+    RESUME,
     RETURN,
     TERMINATION,
 }
@@ -30,6 +35,14 @@ impl ExecutionResult {
     pub fn returns() -> Self {
         Self {
             outcome: ExecutionOutcome::RETURN,
+            ip: 0,
+            arity: 0,
+        }
+    }
+
+    pub fn resume() -> Self {
+        Self {
+            outcome: ExecutionOutcome::RESUME,
             ip: 0,
             arity: 0,
         }
@@ -79,6 +92,7 @@ impl Default for Machine {
         Self {
             frames,
             heap: Heap::default(),
+            pending: Vec::with_capacity(128),
         }
     }
 }
@@ -88,33 +102,33 @@ impl Machine {
         self.frames.get_mut().push(value);
     }
 
-    fn mark(&mut self, fp: usize) -> () {
-        let mut grey: Vec<Object> = Vec::with_capacity(1024);
-
-        for n in 0..fp {
-            let stack = self.frames[n].stack_mut();
-            let max = stack.len();
-
-            for x in 0..max {
-                match stack[x].get_type() {
+    fn mark(&mut self) -> () {
+        for frame in self.frames.iter() {
+            for element in frame.stack().iter() {
+                match element.get_type() {
                     Type::Object | Type::String => {
                         let mut collectable: Collectable<Object> =
-                            Collectable::from(stack[x].as_ptr());
+                            Collectable::from(element.as_ptr());
 
-                        collectable.as_mut().mark(&mut grey);
+                        collectable.as_mut().mark(&mut self.pending);
                     }
                     _ => (),
                 }
             }
         }
 
-        while let Some(object) = grey.pop() {
-            object.mark_reference(&mut grey);
+        while let Some(object) = self.pending.pop() {
+            object.mark_reference(&mut self.pending);
         }
     }
 
-    fn gc(&mut self, fp: usize) -> () {
-        self.mark(fp);
+    fn gc(&mut self) -> () {
+        #[cfg(not(debug_assertions))]
+        if likely(self.heap.usage() < 0.5) {
+            return;
+        }
+
+        self.mark();
 
         #[cfg(not(debug_assertions))]
         if self.heap.usage() < 0.75 {
@@ -122,6 +136,15 @@ impl Machine {
         }
 
         self.heap.collect();
+    }
+
+    fn alloc<T: GcSized, F>(&mut self, value: T, map: F) -> (Object, Collectable<T>)
+    where
+        F: Fn(Collectable<T>) -> Object,
+    {
+        self.gc();
+
+        self.heap.alloc(value, map)
     }
 
     pub fn run(&mut self, code: &[Byte<Value>]) -> () {
@@ -146,12 +169,16 @@ impl Machine {
 
                     self.frames.pop();
                     self.frames.get_mut().resume(v);
-
-                    self.heap.collect();
                 }
                 ExecutionOutcome::TERMINATION => {
                     unlikely(true);
                     break;
+                }
+                ExecutionOutcome::RESUME => {
+                    let frame: Collectable<Coroutine<Value>> =
+                        Collectable::from(self.frames.get_mut().pop().as_ptr());
+
+                    self.frames.push(frame.as_ref().frame().clone());
                 }
                 _ => (),
             }
@@ -266,6 +293,18 @@ impl Machine {
                     frame.complete();
 
                     return ExecutionResult::returns();
+                }
+                Instruction::SUSP => {
+                    frame.suspend();
+                    let suspended_frame = frame.clone();
+
+                    let (_, coro) = self.alloc(Coroutine::new(suspended_frame), Object::Coroutine);
+                    self.push(Value::object(coro.ptr()));
+
+                    return ExecutionResult::returns();
+                }
+                Instruction::RESUME => {
+                    return ExecutionResult::resume();
                 }
                 Instruction::HALT => {
                     unlikely(true);

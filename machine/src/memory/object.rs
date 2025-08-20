@@ -1,9 +1,10 @@
 use std::hash::{Hash, Hasher};
 
+use common::Value;
 use rustc_hash::FxHasher;
 
 use crate::{
-    String,
+    Coroutine, Reference, String,
     garbage::{Collectable, GcSized},
 };
 
@@ -14,18 +15,29 @@ pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
     hash.finish()
 }
 
+#[derive(Debug, Copy, Clone)]
+pub enum ReferenceType {
+    None,
+    String,
+    Coroutine,
+}
+
 #[derive(Default, Copy, Clone)]
 pub enum Object {
     #[default]
     None,
     String(Collectable<String>),
+    Reference(Collectable<Reference>),
+    Coroutine(Collectable<Coroutine<Value>>),
 }
 
 impl GcSized for Object {
     fn size(&self) -> usize {
         match self {
             Self::None => 0,
-            Self::String(s) => s.size(),
+            Self::String(value) => value.size(),
+            Self::Reference(value) => value.size(),
+            Self::Coroutine(value) => value.size(),
         }
     }
 }
@@ -35,6 +47,8 @@ impl Object {
         let marked = match self {
             Self::None => false,
             Self::String(value) => value.mark(),
+            Self::Reference(value) => value.mark(),
+            Self::Coroutine(value) => value.mark(),
         };
 
         if marked {
@@ -46,6 +60,8 @@ impl Object {
         match self {
             Self::None => (),
             Self::String(value) => value.unmark(),
+            Self::Reference(value) => value.unmark(),
+            Self::Coroutine(value) => value.unmark(),
         }
     }
 
@@ -53,12 +69,14 @@ impl Object {
         match self {
             Self::None => true,
             Self::String(value) => value.is_marked(),
+            Self::Reference(value) => value.is_marked(),
+            Self::Coroutine(value) => value.is_marked(),
         }
     }
 
     pub fn mark_reference(&self, _: &mut Vec<Self>) {
         match self {
-            Self::None | Self::String(_) => (),
+            Self::None | Self::Reference(..) | Self::String(_) | Self::Coroutine(..) => (),
         }
     }
 
@@ -66,12 +84,16 @@ impl Object {
         match self {
             Self::None => None,
             Self::String(value) => value.get_next(),
+            Self::Reference(value) => value.get_next(),
+            Self::Coroutine(value) => value.get_next(),
         }
     }
 
     pub fn set_next(&mut self, next: Option<Object>) {
         match self {
             Self::String(value) => value.set_next(next),
+            Self::Reference(value) => value.set_next(next),
+            Self::Coroutine(value) => value.set_next(next),
             _ => (),
         }
     }
@@ -83,6 +105,8 @@ impl std::fmt::Debug for Object {
         match self {
             Self::None => write!(f, "Object::None"),
             Self::String(value) => write!(f, "{:?}", value),
+            Self::Reference(value) => write!(f, "{:?}", value),
+            Self::Coroutine(value) => write!(f, "#{:?}", value.ptr().as_ptr() as usize),
         }
     }
 }

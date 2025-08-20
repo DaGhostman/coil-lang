@@ -18,6 +18,7 @@ pub enum FrameState {
     TERMINATED,
 }
 
+#[derive(Clone)]
 pub struct Frame<T: Default> {
     state: FrameState,
     // ---

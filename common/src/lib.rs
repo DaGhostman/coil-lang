@@ -39,6 +39,7 @@ pub fn likely(b: bool) -> bool {
     if !b {
         cold()
     }
+
     b
 }
 

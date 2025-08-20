@@ -30,6 +30,7 @@ pub enum Instruction {
     MOVE,
     CONST,
     STRING,
+    RESUME = 250,
     SUSP = 251,
     NOOP = 252,
     DATA = 253,

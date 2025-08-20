@@ -1,6 +1,4 @@
-use std::ops::Rem;
-
-use common::{ArrayVec, unlikely};
+use common::{likely, unlikely};
 
 use crate::{
     Object,
@@ -34,6 +32,7 @@ impl<const G: usize> Heap<G> {
 }
 
 impl<const G: usize> Heap<G> {
+    /// Allocate an object on the heap
     pub fn alloc<T: GcSized, F>(&mut self, value: T, map: F) -> (Object, Collectable<T>)
     where
         F: Fn(Collectable<T>) -> Object,
@@ -49,18 +48,22 @@ impl<const G: usize> Heap<G> {
         (object, content)
     }
 
+    /// Free the provided object
     pub fn free(&mut self, object: Object) -> usize {
         let size = object.size();
         self.size -= size;
 
         match object {
             Object::None => (),
-            Object::String(s) => s.release(),
+            Object::String(value) => value.release(),
+            Object::Reference(value) => value.release(),
+            Object::Coroutine(value) => value.release(),
         }
 
         size
     }
 
+    /// Collect all the marked objects
     pub fn collect(&mut self) {
         let mut previous: Option<Object> = None;
         let mut current = self.head;
@@ -68,7 +71,7 @@ impl<const G: usize> Heap<G> {
         while let Some(mut reference) = current {
             let next = reference.get_next();
 
-            if reference.is_marked() {
+            if unlikely(reference.is_marked()) {
                 reference.unmark();
                 previous = current;
                 current = next;

@@ -1,10 +1,14 @@
 use std::{
     fmt::Debug,
+    iter::Chain,
     ops::{Index, IndexMut},
+    slice::Iter,
+    vec::IntoIter as VecIntoIter,
 };
 
 use crate::{likely, promise, unlikely};
 
+#[derive(Clone)]
 pub struct ArrayVec<T: Default, const N: usize> {
     current: usize,
     storage: [T; N],
@@ -22,6 +26,10 @@ impl<T: Default, const N: usize> Default for ArrayVec<T, N> {
 }
 
 impl<T: Default, const N: usize> ArrayVec<T, N> {
+    pub fn iter<'iter>(&'iter self) -> ArrayVecIter<'iter, T, N> {
+        ArrayVecIter::new(&self)
+    }
+
     fn grow(&mut self, cursor: usize) {
         let boundary = self.expansion.len();
 
@@ -197,5 +205,32 @@ impl<T: Default + Debug, const N: usize> Debug for ArrayVec<T, N> {
                 })
                 .collect::<Vec<_>>()
         )
+    }
+}
+
+pub struct ArrayVecIter<'iter, T: Default, const N: usize> {
+    cursor: usize,
+    value: &'iter ArrayVec<T, N>,
+}
+
+impl<'iter, T: Default, const N: usize> ArrayVecIter<'iter, T, N> {
+    pub fn new(value: &'iter ArrayVec<T, N>) -> Self {
+        Self { cursor: 0, value }
+    }
+}
+
+impl<'iter, T: Default, const N: usize> Iterator for ArrayVecIter<'iter, T, N> {
+    type Item = &'iter T;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut value = None;
+
+        if likely(self.cursor < self.value.len()) {
+            promise!(self.cursor < self.value.len());
+            value = Some(&self.value[self.cursor]);
+        }
+
+        self.cursor += 1;
+
+        value
     }
 }
