@@ -9,4 +9,3 @@ pub use frame::*;
 pub use heap::*;
 pub use object::*;
 pub use objects::*;
-pub use stack::*;

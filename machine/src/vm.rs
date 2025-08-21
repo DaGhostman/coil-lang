@@ -1,4 +1,4 @@
-use common::{ArrayVec, Type, Value, likely, promise, unlikely};
+use common::{ArrayVec, Type, Value, likely, unlikely};
 use std::string::String as RustString;
 
 use crate::{

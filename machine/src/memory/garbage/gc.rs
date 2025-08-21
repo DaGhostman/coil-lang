@@ -1,6 +1,6 @@
-use std::{cell::Cell, ptr::NonNull};
+use std::cell::Cell;
 
-use common::{likely, unlikely};
+use common::unlikely;
 
 use crate::{Object, garbage::GcSized};
 
