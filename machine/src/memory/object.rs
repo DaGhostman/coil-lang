@@ -99,6 +99,21 @@ impl Object {
     }
 }
 
+impl std::fmt::Display for Object {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "0x{:016x}",
+            match self {
+                Object::None => 0,
+                Object::String(value) => value.ptr().as_ptr() as usize,
+                Object::Coroutine(value) => value.ptr().as_ptr() as usize,
+                Object::Reference(value) => value.ptr().as_ptr() as usize,
+            }
+        )
+    }
+}
+
 #[cfg(debug_assertions)]
 impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

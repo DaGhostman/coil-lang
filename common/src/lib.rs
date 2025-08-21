@@ -30,24 +30,27 @@ macro_rules! promise {
     };
 }
 
-#[inline]
+#[inline(always)]
 #[cold]
 fn cold() {}
 
-#[inline]
+#[inline(always)]
 pub fn likely(b: bool) -> bool {
-    if !b {
-        cold()
-    }
+    {
+        if !b {
+            cold()
+        }
 
-    b
+        b
+    }
 }
 
-#[inline]
+#[inline(always)]
 pub fn unlikely(b: bool) -> bool {
     if b {
         cold()
     }
+
     b
 }
 

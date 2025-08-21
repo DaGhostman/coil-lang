@@ -29,7 +29,7 @@ fn fib(n: u16) -> () {
         Byte::new(Instruction::RETURN, [0, 0]), // Return result;
     ];
 
-    Machine::default().run(fib.as_slice())
+    Machine::<512>::default().run(fib.as_slice())
 }
 
 fn fib_benchmark(c: &mut Criterion) {

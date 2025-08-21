@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 
 #[repr(u8)]
-#[derive(Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub enum Instruction {
     ADD = 0,
     SUB,
@@ -20,7 +20,10 @@ pub enum Instruction {
     JMPT,
     JMPF,
     CALL,
-    PRINT = 100,
+    PRINTI = 100,
+    PRINTF,
+    PRINTB,
+    PRINTS,
     RETURN,
     PUSH = 200,
     POP,
@@ -56,7 +59,7 @@ impl From<u8> for Instruction {
             51 => Instruction::JMPT,
             52 => Instruction::JMPF,
             53 => Instruction::CALL,
-            100 => Instruction::PRINT,
+            100 => Instruction::PRINTI,
             101 => Instruction::RETURN,
             200 => Instruction::PUSH,
             201 => Instruction::POP,

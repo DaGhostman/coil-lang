@@ -218,7 +218,7 @@ impl Debug for Value {
             match self.get_type() {
                 Type::Null => "null".to_string(),
                 Type::Integer => format!("int({})", self),
-                Type::Float => format!("float({:.?})", self),
+                Type::Float => format!("float({:.?})", self.as_float()),
                 Type::Bool => format!("bool({})", self),
                 Type::Object | Type::String => format!("0x{:016x}", self.raw()),
                 _ => unreachable!("Unknown value type"),

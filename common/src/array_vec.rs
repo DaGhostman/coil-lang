@@ -1,9 +1,6 @@
 use std::{
     fmt::Debug,
-    iter::Chain,
     ops::{Index, IndexMut},
-    slice::Iter,
-    vec::IntoIter as VecIntoIter,
 };
 
 use crate::{likely, promise, unlikely};

@@ -71,11 +71,20 @@ impl<const G: usize> Heap<G> {
         while let Some(mut reference) = current {
             let next = reference.get_next();
 
-            if unlikely(reference.is_marked()) {
+            if likely(reference.is_marked()) {
                 reference.unmark();
                 previous = current;
                 current = next;
             } else {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "COLLECTING: {} bytes {} (used {}/{} bytes)",
+                    reference.size(),
+                    reference,
+                    self.size() - reference.size(),
+                    self.threshold(),
+                );
+
                 self.free(reference);
 
                 current = next;

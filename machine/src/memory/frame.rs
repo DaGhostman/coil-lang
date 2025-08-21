@@ -5,7 +5,7 @@ use std::{
 
 use common::{ArrayVec, promise};
 
-const STACK: usize = 128;
+const STACK: usize = 32;
 
 #[repr(u8)]
 #[derive(Default, Copy, Clone, PartialEq)]

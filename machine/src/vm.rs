@@ -1,14 +1,13 @@
 use common::{ArrayVec, Type, Value, likely, promise, unlikely};
-use std::{ops::Deref, string::String as RustString};
-const FRAME_COUNT: usize = 256;
+use std::string::String as RustString;
 
 use crate::{
     Byte, Coroutine, Frame, Heap, Instruction, Object, String,
     garbage::{Collectable, GcSized},
 };
 
-pub struct Machine {
-    frames: ArrayVec<Frame<Value>, FRAME_COUNT>,
+pub struct Machine<const S: usize> {
+    frames: ArrayVec<Frame<Value>, S>,
     heap: Heap<1024>,
     pending: Vec<Object>,
 }
@@ -85,7 +84,7 @@ impl ExecutionResult {
     }
 }
 
-impl Default for Machine {
+impl<const S: usize> Default for Machine<S> {
     fn default() -> Self {
         let mut frames = ArrayVec::default();
         frames.consume();
@@ -97,25 +96,27 @@ impl Default for Machine {
     }
 }
 
-impl Machine {
+impl<const S: usize> Machine<S> {
     pub fn push(&mut self, value: Value) {
         self.frames.get_mut().push(value);
     }
 
     fn mark(&mut self) -> () {
-        for frame in self.frames.iter() {
-            for element in frame.stack().iter() {
-                match element.get_type() {
-                    Type::Object | Type::String => {
+        self.frames
+            .iter()
+            .filter(|frame| !frame.is_pending())
+            .for_each(|frame| {
+                frame
+                    .stack()
+                    .iter()
+                    .filter(|element| matches!(element.get_type(), Type::Object | Type::String))
+                    .for_each(|element| {
                         let mut collectable: Collectable<Object> =
                             Collectable::from(element.as_ptr());
 
                         collectable.as_mut().mark(&mut self.pending);
-                    }
-                    _ => (),
-                }
-            }
-        }
+                    });
+            });
 
         while let Some(object) = self.pending.pop() {
             object.mark_reference(&mut self.pending);
@@ -124,16 +125,11 @@ impl Machine {
 
     fn gc(&mut self) -> () {
         #[cfg(not(debug_assertions))]
-        if likely(self.heap.usage() < 0.5) {
+        if likely(self.heap.usage() < 0.75) {
             return;
         }
 
         self.mark();
-
-        #[cfg(not(debug_assertions))]
-        if self.heap.usage() < 0.75 {
-            return;
-        }
 
         self.heap.collect();
     }
@@ -175,6 +171,7 @@ impl Machine {
                     break;
                 }
                 ExecutionOutcome::RESUME => {
+                    unlikely(true);
                     let frame: Collectable<Coroutine<Value>> =
                         Collectable::from(self.frames.get_mut().pop().as_ptr());
 
@@ -183,6 +180,8 @@ impl Machine {
                 _ => (),
             }
         }
+
+        self.heap.collect();
     }
 
     #[inline]
@@ -201,7 +200,7 @@ impl Machine {
                     "#{:<2} @ {:<3} - {:<10} - {:?}",
                     frame_no,
                     ip,
-                    format!("{}", opcode.bytecode()),
+                    format!("{:?}", opcode.bytecode()),
                     frame
                 );
             }
@@ -218,6 +217,11 @@ impl Machine {
                 Instruction::CONST => frame.push(opcode.constant()),
                 Instruction::STORE => {
                     likely(true);
+
+                    if frame.stack().len() - 1 == opcode.operand(0) as usize {
+                        continue;
+                    }
+
                     let val = *frame.pop();
                     frame.store(opcode.operand(0) as usize, val);
                 }
@@ -228,54 +232,65 @@ impl Machine {
                 }
                 Instruction::ADD => {
                     let rhs = frame.pop().raw();
-                    let lhs = frame.top();
+                    let lhs = frame.peek().raw();
 
-                    lhs.replace(lhs.raw() + rhs);
+                    frame.top().replace(lhs + rhs)
                 }
                 Instruction::SUB => {
                     let rhs = frame.pop().raw();
-                    let lhs = frame.top();
+                    let lhs = frame.peek().raw();
 
-                    lhs.replace(lhs.raw() - rhs);
+                    frame.top().replace(lhs - rhs);
+                }
+                Instruction::MUL => {
+                    let rhs = frame.pop().raw();
+                    let lhs = frame.peek().raw();
+
+                    let modifier = rhs / 2;
+                    let reminder = rhs % 2;
+
+                    frame.top().replace((lhs << modifier) + (lhs * reminder))
+                }
+                Instruction::DIV => {
+                    let rhs = frame.pop().raw();
+                    let lhs = frame.peek().raw();
+
+                    let modifier = rhs / 2;
+                    let reminder = rhs % 2;
+
+                    frame.top().replace((lhs >> (modifier)) - reminder);
                 }
                 Instruction::LE => {
                     let rhs = frame.pop().raw();
-                    let lhs = frame.top();
+                    let lhs = frame.peek().raw();
 
-                    *lhs = Value::bool(lhs.raw() < rhs);
+                    *frame.top() = Value::bool(lhs < rhs);
                 }
                 Instruction::GT => {
                     let rhs = frame.pop().raw();
-                    let lhs = frame.top();
+                    let lhs = frame.peek().raw();
 
-                    *lhs = Value::bool(lhs.raw() > rhs);
+                    *frame.top() = Value::bool(lhs > rhs);
                 }
-                Instruction::PRINT => {
-                    let value = frame.pop();
+                Instruction::PRINTI => println!("{}", frame.pop().as_int()),
+                Instruction::PRINTF => println!("{}", frame.pop().as_float()),
+                Instruction::PRINTB => println!("{}", frame.pop().as_bool()),
+                Instruction::PRINTS => {
                     println!(
                         "{}",
-                        match value.get_type() {
-                            Type::Bool | Type::Integer => format!("{}", value.as_int()),
-                            Type::Float => format!("{:.?}", value.as_float()),
-                            Type::String => {
-                                let value: Collectable<String> = Collectable::from(value.as_ptr());
-
-                                format!("{}", (*value).as_ref())
-                            }
-                            _ => RustString::new(),
-                        }
+                        Collectable::<String>::from(frame.pop().as_ptr()).as_ref()
                     )
                 }
                 Instruction::JMP => {
                     ip = opcode.operand(0) as usize;
                 }
                 Instruction::JMPF => {
-                    if likely(frame.pop().as_int() == 0) {
+                    if likely(!frame.pop().as_bool()) {
                         ip = opcode.operand(0) as usize;
                     }
                 }
                 Instruction::JMPT => {
-                    if likely(frame.pop().as_int() == 1) {
+                    if likely(frame.pop().as_bool()) {
                         ip = opcode.operand(0) as usize;
                     }
                 }
