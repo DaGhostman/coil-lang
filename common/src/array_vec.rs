@@ -24,7 +24,7 @@ impl<T: Default, const N: usize> Default for ArrayVec<T, N> {
 
 impl<T: Default, const N: usize> ArrayVec<T, N> {
     pub fn iter<'iter>(&'iter self) -> ArrayVecIter<'iter, T, N> {
-        ArrayVecIter::new(&self)
+        ArrayVecIter::new(self)
     }
 
     fn grow(&mut self, cursor: usize) {
@@ -61,15 +61,15 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         }
     }
 
-    pub fn consume(&mut self) -> () {
+    pub fn consume(&mut self) {
         self.current += 1;
     }
 
-    pub fn seek(&mut self, value: usize) -> () {
+    pub fn seek(&mut self, value: usize) {
         self.current = value;
     }
 
-    pub fn push(&mut self, value: T) -> () {
+    pub fn push(&mut self, value: T) {
         if likely(self.current < N) {
             promise!(self.current < N);
             promise!(self.current < self.storage.len());

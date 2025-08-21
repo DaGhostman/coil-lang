@@ -101,7 +101,7 @@ impl<const S: usize> Machine<S> {
         self.frames.get_mut().push(value);
     }
 
-    fn mark(&mut self) -> () {
+    fn mark(&mut self) {
         self.frames
             .iter()
             .filter(|frame| !frame.is_pending())
@@ -123,7 +123,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    fn gc(&mut self) -> () {
+    fn gc(&mut self) {
         #[cfg(not(debug_assertions))]
         if likely(self.heap.usage() < 0.75) {
             return;
@@ -143,7 +143,7 @@ impl<const S: usize> Machine<S> {
         self.heap.alloc(value, map)
     }
 
-    pub fn run(&mut self, code: &[Byte<Value>]) -> () {
+    pub fn run(&mut self, code: &[Byte<Value>]) {
         loop {
             let result = self.execute(code);
 

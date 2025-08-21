@@ -29,9 +29,9 @@ impl GcSized for Reference {
     }
 }
 
-impl Into<Collectable<Object>> for Reference {
-    fn into(self) -> Collectable<Object> {
-        let ptr = NonNull::without_provenance(NonZero::new(self.1).expect("Pointer is 0"));
+impl From<Reference> for Collectable<Object> {
+    fn from(val: Reference) -> Self {
+        let ptr = NonNull::without_provenance(NonZero::new(val.1).expect("Pointer is 0"));
 
         Collectable::from(ptr)
     }

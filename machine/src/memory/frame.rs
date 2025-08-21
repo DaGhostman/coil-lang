@@ -39,7 +39,7 @@ impl<T: Default> Frame<T> {
         self.ip
     }
 
-    pub fn seek(&mut self, ip: usize) -> () {
+    pub fn seek(&mut self, ip: usize) {
         self.ip = ip;
     }
 
@@ -49,7 +49,7 @@ impl<T: Default> Frame<T> {
         &self.stack[index]
     }
 
-    pub fn store(&mut self, index: usize, value: T) -> () {
+    pub fn store(&mut self, index: usize, value: T) {
         self.stack[index] = value;
     }
 
@@ -81,23 +81,23 @@ impl<T: Default> Frame<T> {
         self.state == state
     }
 
-    pub fn suspend(&mut self) -> () {
+    pub fn suspend(&mut self) {
         self.state = FrameState::SUSPENDED;
     }
 
-    pub fn start(&mut self) -> () {
+    pub fn start(&mut self) {
         self.state = FrameState::STARTED;
     }
 
-    pub fn terminate(&mut self) -> () {
+    pub fn terminate(&mut self) {
         self.state = FrameState::TERMINATED;
     }
 
-    pub fn complete(&mut self) -> () {
+    pub fn complete(&mut self) {
         self.state = FrameState::COMPLETE;
     }
 
-    pub fn resume(&mut self, value: T) -> () {
+    pub fn resume(&mut self, value: T) {
         self.state = FrameState::PENDING;
         self.stack.push(value);
     }

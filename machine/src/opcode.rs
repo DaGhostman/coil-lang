@@ -74,9 +74,9 @@ impl From<u8> for Instruction {
     }
 }
 
-impl Into<u8> for Instruction {
-    fn into(self) -> u8 {
-        self as u8
+impl From<Instruction> for u8 {
+    fn from(val: Instruction) -> Self {
+        val as u8
     }
 }
 

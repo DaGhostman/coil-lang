@@ -77,7 +77,7 @@ impl<'a> Value {
     pub fn string<T>(value: NonNull<T>) -> Self {
         let ptr = value.as_ptr() as u64;
 
-        promise!(((ptr << 3) >> 3) == ptr as u64);
+        promise!(((ptr << 3) >> 3) == ptr);
 
         Self::with_type((ptr << 3) as _, Type::String)
     }
@@ -100,7 +100,7 @@ impl<'a> Value {
     pub fn object<T>(value: NonNull<T>) -> Self {
         let ptr = value.as_ptr() as u64;
 
-        promise!(((ptr << 3) >> 3) == ptr as u64);
+        promise!(((ptr << 3) >> 3) == ptr);
 
         Self::with_type((ptr << 3) as _, Type::Object)
     }
@@ -137,11 +137,7 @@ impl<'a> Value {
     ///
     /// You would need to verify the type externally
     pub fn as_bool(self) -> bool {
-        if (self.0 as i64 >> 3) == 0 {
-            false
-        } else {
-            true
-        }
+        (self.0 as i64 >> 3) != 0
     }
 
     /// Casts the internal pointer value to f64
@@ -154,7 +150,7 @@ impl<'a> Value {
     ///
     /// You would need to verify the type externally
     pub fn as_float(self) -> f64 {
-        f64::from_bits(((self.0 as u64 >> 3) << 3) as u64)
+        f64::from_bits((((self.0 as u64 >> 3) << 3)))
     }
 
     pub fn as_ptr<T>(self) -> NonNull<T> {
@@ -200,8 +196,8 @@ impl Display for Value {
             "{}",
             match self.get_type() {
                 Type::Null => String::new(),
-                Type::Integer | Type::Bool => format!("{}", self.as_int() as i64),
-                Type::Float => format!("{:.?}", self.as_float() as f64),
+                Type::Integer | Type::Bool => format!("{}", { self.as_int() }),
+                Type::Float => format!("{:.?}", { self.as_float() }),
                 Type::Object | Type::String => format!("obj(0x{})", self.raw()),
                 _ => unreachable!("Unknown value type"),
             }
