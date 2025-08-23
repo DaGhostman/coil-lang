@@ -1,6 +1,11 @@
+// mod language;
+
 use common::Value;
+
 // use common::{Registers, Types};
 use machine::{Byte, Instruction, Machine};
+
+// use crate::language::Language;
 
 fn main() {
     let sub = [
@@ -11,10 +16,10 @@ fn main() {
         Byte::new(Instruction::HALT, [0, 0]),
     ];
     let mul = [
-        Byte::new_with(Instruction::CONST, [0, 0], Value::int(6)),
-        Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)),
-        Byte::new(Instruction::DIV, [0, 0]),
-        Byte::new(Instruction::PRINTI, [0, 0]),
+        Byte::new_with(Instruction::CONST, [0, 0], Value::float(6.0)),
+        Byte::new_with(Instruction::CONST, [0, 0], Value::float(2.0)),
+        Byte::new(Instruction::MULF, [0, 0]),
+        Byte::new(Instruction::PRINTF, [0, 0]),
         Byte::new(Instruction::HALT, [0, 0]),
     ];
     let async_counters = [
@@ -91,6 +96,9 @@ fn main() {
         Byte::new(Instruction::ADD, [1, 0]),    // Add results
         Byte::new(Instruction::RETURN, [0, 0]), // Return result;
     ];
+
+    // let mut language = Language::default();
+    // language.run_bytecode(&fib);
 
     let mut vm = Machine::<256>::default();
     vm.run(fib.as_slice());

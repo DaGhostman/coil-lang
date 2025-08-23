@@ -14,9 +14,15 @@ pub enum Instruction {
     MULF,
     DIVF,
     EQ = 30,
+    EQF,
     LE,
+    LEF,
     GT,
+    GTF,
     JMP = 50,
+    JLE,
+    JGT,
+    JEQ,
     JMPT,
     JMPF,
     CALL,
@@ -83,12 +89,12 @@ impl From<Instruction> for u8 {
 #[derive(Default, Clone, Copy)]
 pub struct Byte<V> {
     bytecode: Instruction,
-    operands: [u8; 2],
+    operands: [usize; 2],
     value: V,
 }
 
 impl<V: Default + Copy> Byte<V> {
-    pub fn new(bytecode: Instruction, operands: [u8; 2]) -> Self {
+    pub fn new(bytecode: Instruction, operands: [usize; 2]) -> Self {
         Self {
             bytecode,
             operands,
@@ -96,7 +102,7 @@ impl<V: Default + Copy> Byte<V> {
         }
     }
 
-    pub fn new_with(bytecode: Instruction, operands: [u8; 2], value: V) -> Self {
+    pub fn new_with(bytecode: Instruction, operands: [usize; 2], value: V) -> Self {
         Self {
             bytecode,
             operands,
@@ -108,7 +114,7 @@ impl<V: Default + Copy> Byte<V> {
         self.bytecode
     }
 
-    pub fn operand(&self, idx: usize) -> u8 {
+    pub fn operand(&self, idx: usize) -> usize {
         self.operands[idx]
     }
 
