@@ -20,6 +20,10 @@ impl<T> Collectable<T> {
         Self(NonNull::from(Box::leak(boxed)))
     }
 
+    pub fn from_raw(ptr: &mut Gc<T>) -> Self {
+        Self(NonNull::from(ptr))
+    }
+
     pub fn release(self) {
         let _ = unsafe { Box::from_raw(self.0.as_ptr()) };
     }
