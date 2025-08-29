@@ -1,0 +1,8 @@
+[package]
+name = "parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariadne = { version = "0.5.1", features = ["auto-color"] }
+chumsky = { version = "0.10.1", features = ["lexical-numbers", "memoization"] }
