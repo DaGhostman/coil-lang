@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [ "common", "machine", "parser"]
+members = [ "common", "compiler", "machine", "parser"]
 
 [package]
 name = "zero-script"

@@ -1,8 +1,10 @@
 mod array_vec;
+mod opcode;
 mod value;
 // mod interner;
 
 pub use array_vec::*;
+pub use opcode::*;
 pub use value::*;
 // pub use interner::*;
 

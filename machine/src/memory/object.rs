@@ -16,10 +16,35 @@ pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub enum ReferenceType {
+pub enum ObjectType {
     None,
     String,
     Coroutine,
+    Reference,
+
+    __INVALID,
+}
+
+impl ObjectType {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::String => 1,
+            Self::Coroutine => 2,
+            Self::Reference => 3,
+            Self::__INVALID => 255,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => ObjectType::None,
+            1 => ObjectType::String,
+            2 => ObjectType::Coroutine,
+            3 => ObjectType::Reference,
+            _ => ObjectType::__INVALID,
+        }
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -43,17 +68,13 @@ impl GcSized for Object {
 }
 
 impl Object {
-    pub fn mark(&mut self, grey: &mut Vec<Self>) {
-        let marked = match self {
+    pub fn mark(&mut self) {
+        match self {
             Self::None => false,
             Self::String(value) => value.mark(),
             Self::Reference(value) => value.mark(),
             Self::Coroutine(value) => value.mark(),
         };
-
-        if marked {
-            grey.push(*self)
-        }
     }
 
     pub fn unmark(&mut self) {
@@ -74,9 +95,9 @@ impl Object {
         }
     }
 
-    pub fn mark_reference(&self, _: &mut Vec<Self>) {
+    pub fn mark_reference(&mut self) {
         match self {
-            Self::None | Self::Reference(..) | Self::String(_) | Self::Coroutine(..) => (),
+            Self::None | Self::Reference(..) | Self::String(..) | Self::Coroutine(..) => (),
         }
     }
 

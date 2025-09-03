@@ -1,119 +1,945 @@
-use chumsky::{prelude::any, text, Parser};
+use std::borrow::Borrow;
+use std::marker::PhantomData;
+use std::num::ParseFloatError;
 
-#[derive(Copy, Clone)]
-pub enum TokenKind {
-    FUNCTION,
-    INTEGER,
-    FLOAT,
-    STRING,
-}
+use ariadne::{Color, Config, IndexType, Label, Report, ReportBuilder, ReportKind, sources};
+use chumsky::prelude::*;
+use chumsky::{
+    IterParser, Parser,
+    prelude::{choice, just, recursive},
+};
 
-#[derive(Copy, Clone)]
-pub struct Token<'token>(TokenKind, &'token str, usize, usize);
+pub use chumsky::span::SimpleSpan;
 
-impl<'token> Token<'token> {
-    pub fn new(kind: TokenKind, lexeme: &'token str) -> Self {
-        Self(kind, lexeme, 0, 0)
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expression<'expr> {
+    Number(f64),
+    String(&'expr str),
+    Bool(bool),
 
-    pub fn with_info(&mut self, line: usize, column: usize) {
-        self.2 = line;
-        self.3 = column;
-    }
+    Identifier(&'expr str),
+    Type(&'expr str),
+    Comment(&'expr str),
+    Print(Output<'expr>),
+    Return(Output<'expr>),
+    ImplicitReturn(Output<'expr>),
+    Yield(Output<'expr>),
+    Negate(Output<'expr>),
+    Not(Output<'expr>),
+    Positive(Output<'expr>),
 
-    pub fn lexeme(&self) -> &'token str {
-        self.1
-    }
+    Add(Output<'expr>, Output<'expr>),
+    Sub(Output<'expr>, Output<'expr>),
+    Mul(Output<'expr>, Output<'expr>),
+    Div(Output<'expr>, Output<'expr>),
+    Mod(Output<'expr>, Output<'expr>),
+    Shl(Output<'expr>, Output<'expr>),
+    Shr(Output<'expr>, Output<'expr>),
+    Xor(Output<'expr>, Output<'expr>),
+    And(Output<'expr>, Output<'expr>),
+    Or(Output<'expr>, Output<'expr>),
+    Eq(Output<'expr>, Output<'expr>),
+    Neq(Output<'expr>, Output<'expr>),
+    Leq(Output<'expr>, Output<'expr>),
+    Geq(Output<'expr>, Output<'expr>),
+    Le(Output<'expr>, Output<'expr>),
+    Gt(Output<'expr>, Output<'expr>),
 
-    pub fn kind(&self) -> TokenKind {
-        self.0
-    }
+    List(Vec<Output<'expr>>),
+    Expr(Output<'expr>),
+    ExprStatement(Output<'expr>),
+    Statement(Output<'expr>),
+    Fragment(Vec<Output<'expr>>),
+    Block(Vec<Output<'expr>>),
+    Program(Vec<Output<'expr>>),
+    Defer(Vec<Output<'expr>>, Output<'expr>),
 
-    pub fn line(&self) -> usize {
-        self.2
-    }
+    Assignment(Output<'expr>, Output<'expr>),
 
-    pub fn column(&self) -> usize {
-        self.3
-    }
-}
-
-#[derive(Debug)]
-enum Expression<'expr> {
-    Int(i64),
-    Float(f64),
-
-    Variable(&'expr str),
-
-    Add(Box<Expression<'expr>>, Box<Expression<'expr>>),
-    Sub(Box<Expression<'expr>>, Box<Expression<'expr>>),
-    Mul(Box<Expression<'expr>>, Box<Expression<'expr>>),
-    Div(Box<Expression<'expr>>, Box<Expression<'expr>>),
-
-    Eq(Box<Expression<'expr>>, Box<Expression<'expr>>),
-    Le(Box<Expression<'expr>>, Box<Expression<'expr>>),
-    Gt(Box<Expression<'expr>>, Box<Expression<'expr>>),
-
-    Call(&'expr str, Vec<Expression<'expr>>),
-
-    Let {
-        name: &'expr str,
-        rhs: Box<Expression<'expr>>,
-        then: Box<Expression<'expr>>,
-    },
-    Fn {
-        name: &'expr str,
-        args: Vec<&'expr str>,
-        body: Box<Expression<'expr>>,
-        then: Box<Expression<'expr>>,
+    Use {
+        path: Vec<String>,
+        name: String,
+        alias: Option<String>,
     },
 
+    Function {
+        name: &'expr str,
+        args: Vec<(Output<'expr>, Output<'expr>)>,
+        returns: Option<Output<'expr>>,
+        body: Vec<Output<'expr>>,
+    },
+
+    If {
+        condition: Output<'expr>,
+        body: Output<'expr>,
+        alternative: Option<Output<'expr>>,
+    },
+
+    Call {
+        name: Output<'expr>,
+        args: Vec<Output<'expr>>,
+    },
+
+    Loop {
+        idntifier: Option<Output<'expr>>,
+        iterable: Output<'expr>,
+        body: Output<'expr>,
+    },
+
+    Match(Output<'expr>, Vec<(Output<'expr>, Output<'expr>)>),
+
+    Variable(Output<'expr>, Option<Output<'expr>>),
+    Constant(Output<'expr>, Option<Output<'expr>>),
+
+    Member(Vec<Output<'expr>>),
+
+    Instantiate(Output<'expr>),
 }
 
-
-fn parser<'parser>() -> impl Parser<'parser, &'parser str, Expression<'parser>> {
-    let int = text::int(10)
-        .map(|s: &str| Expression::Int(s.parse().unwrap())).padded();
-    // any()
-    //     .filter(|c: &char| c.is_ascii_digit())
-    //     .map(|c| Expression::Int(c.to_digit(10).expect("Valid integer") as i64))
-    //     .padded_by(any().filter(|c: &char| c.is_whitespace()).repeated())
-    int
-}
-
-fn eval<'eval>(expr: &'eval Expression<'eval>) -> Result<i64, String> {
-    match expr {
-        Expression::Int(x) => Ok(*x),
-        Expression::Add(a, b) => Ok(eval(a)? + eval(b)?),
-        Expression::Sub(a, b) => Ok(eval(a)? - eval(b)?),
-        Expression::Mul(a, b) => Ok(eval(a)? * eval(b)?),
-        Expression::Div(a, b) => Ok(eval(a)? / eval(b)?),
-        _ => todo!(),
+impl PartialOrd for Expression<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Expression::Number(lhs), Expression::Number(rhs)) => lhs.partial_cmp(rhs),
+            (Expression::String(lhs), Expression::String(rhs)) => lhs.partial_cmp(rhs),
+            _ => None,
+        }
     }
 }
 
+fn is_truthy<'expr>(value: &Output<'expr>) -> bool {
+    match value.1.borrow() {
+        Expression::Bool(v) => *v,
+        Expression::Number(v) => *v == 0.0,
+        Expression::String(v) => v.len() == 0,
+        Expression::Eq(lhs, rhs) => {
+            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
+                == <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
+        }
+        Expression::Le(lhs, rhs) => {
+            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
+                < <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
+        }
+        Expression::Gt(lhs, rhs) => {
+            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
+                > <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
+        }
+        Expression::Geq(lhs, rhs) => {
+            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
+                >= <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
+        }
+        Expression::Leq(lhs, rhs) => {
+            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
+                <= <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
+        }
+        Expression::Expr(value) => is_truthy(value),
+        a => {
+            dbg!(&a);
+            todo!("Add additional check for truthy expressions")
+        }
+    }
+}
+
+macro_rules! op {
+    ($operator: literal) => {
+        just($operator).padded()
+    };
+}
+
+macro_rules! output {
+    ($kind: tt) => {
+        |v, e| (e.span(), Box::new(Expression::$kind(v)))
+    };
+    ($kind: tt) => {
+        |(lhs, rhs), e| (e.span(), Box::new(Expression::$kind(lhs, rhs)))
+    };
+}
+
+pub struct ParserError {
+    message: String,
+    offender: Option<SimpleSpan>,
+}
+
+impl From<&str> for ParserError {
+    fn from(value: &str) -> Self {
+        Self {
+            message: value.to_string(),
+            offender: None,
+        }
+    }
+}
+
+impl From<Rich<'_, char>> for ParserError {
+    fn from(value: Rich<'_, char>) -> Self {
+        Self {
+            message: value.to_string(),
+            offender: Some(*value.span()),
+        }
+    }
+}
+
+impl ToString for ParserError {
+    fn to_string(&self) -> String {
+        self.message.clone()
+    }
+}
+
+pub struct ParserBuilder<'parser> {
+    _data: PhantomData<&'parser ()>,
+}
+
+impl<'parser> ParserBuilder<'parser> {
+    pub fn new() -> Self {
+        Self {
+            _data: PhantomData::default(),
+        }
+    }
+
+    fn ident(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + Copy
+    + 'parser {
+        text::ident().padded().map_with(output!(Identifier))
+    }
+
+    fn type_(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + Copy
+    + 'parser {
+        text::ident().padded().map_with(output!(Type))
+    }
+
+    fn comment<
+        T: Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+            + Clone
+            + 'parser,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        let comment = just("//")
+            .ignore_then(none_of('\n').repeated().to_slice().padded())
+            // .ignore_then(text::newline().not().to_slice())
+            .then(expr.clone().or_not())
+            .map_with(|(comment, value), e| {
+                if let Some(value) = value {
+                    (
+                        e.span(),
+                        Box::new(Expression::Fragment(vec![
+                            (e.span(), Box::new(Expression::Comment(comment))),
+                            value,
+                        ])),
+                    )
+                } else {
+                    (e.span(), Box::new(Expression::Comment(comment)))
+                }
+            });
+
+        let block_comment = op!("/*")
+            .ignore_then(none_of("*/").repeated().to_slice().then_ignore(op!("*/")))
+            .then(expr.clone().or_not())
+            .map_with(|(comment, value), e| {
+                if let Some(value) = value {
+                    (
+                        e.span(),
+                        Box::new(Expression::Fragment(vec![
+                            (e.span(), Box::new(Expression::Comment(comment))),
+                            value,
+                        ])),
+                    )
+                } else {
+                    (e.span(), Box::new(Expression::Comment(comment)))
+                }
+            });
+
+        comment.or(block_comment)
+    }
+
+    fn params<
+        T: Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+            + Clone
+            + 'parser,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<
+        'parser,
+        &'parser str,
+        Option<Vec<Output<'parser>>>,
+        extra::Err<Rich<'parser, char>>,
+    > + Clone
+    + 'parser {
+        expr.clone()
+            .separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .or_not()
+            .delimited_by(op!('('), op!(')'))
+    }
+
+    fn expression(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        recursive(|expr| {
+            let bool = choice([op!("true"), op!("false")])
+                .map_with(|v, e| (e.span(), Box::new(Expression::Bool(v == "true"))));
+
+            let int = text::int(10)
+                .then(just(".").then(text::int(10)).or_not())
+                .to_slice()
+                .from_str()
+                .validate(|v: Result<f64, ParseFloatError>, e, emitter| match v {
+                    Ok(value) => value,
+                    Err(msg) => {
+                        emitter.emit(Rich::custom(e.span(), msg.to_string()));
+
+                        0_f64
+                    }
+                })
+                .map_with(output!(Number))
+                .boxed();
+            // @TODO: Handle binary(0b010101011010) as numbers
+            // @TODO: Handle hex(0xa970987basd2) as numbers
+
+            let str = int
+                .clone()
+                .or(just('"')
+                    .ignore_then(any().repeated().to_slice().or(op!("\\\"").not().to_slice()))
+                    .then_ignore(just('"'))
+                    .map_with(output!(String))
+                    .or(just('\'')
+                        .ignore_then(any().repeated().to_slice().or(op!("\\'").not().to_slice()))
+                        .then_ignore(just('\''))
+                        .map_with(output!(String))))
+                .boxed();
+
+            let list = expr
+                .clone()
+                .separated_by(op!(','))
+                .allow_trailing()
+                .collect()
+                .map_with(output!(List))
+                .delimited_by(just('['), just(']'))
+                .boxed();
+
+            let atom = int
+                .clone()
+                .or(self.comment(expr.clone()))
+                .or(expr.clone().delimited_by(just('('), just(')')))
+                .or(self.ident())
+                .boxed();
+
+            let member = atom
+                .clone()
+                .separated_by(op!('.'))
+                .collect::<Vec<_>>()
+                .map_with(output!(Member));
+
+            let assignment = member
+                .clone()
+                .then_ignore(op!('='))
+                .then(expr.clone())
+                .map_with(|(name, value), e| {
+                    (e.span(), Box::new(Expression::Assignment(name, value)))
+                });
+
+            let block = expr
+                .clone()
+                .then(op!(';').or_not())
+                .map_with(|(stmt, t), e| {
+                    (
+                        e.span(),
+                        match t {
+                            Some(_) => Box::new(Expression::Statement(stmt)),
+                            None => Box::new(Expression::ImplicitReturn(stmt)),
+                        },
+                    )
+                })
+                .repeated()
+                .collect::<Vec<_>>()
+                .map_with(output!(Block));
+            // .map_with(output!(Scope));
+
+            let negate = op!('-')
+                .repeated()
+                .foldr_with(atom.clone(), |_op, rhs, e| {
+                    (e.span(), Box::new(Expression::Negate(rhs)))
+                })
+                .boxed();
+            let positive = op!('+')
+                .repeated()
+                .foldr_with(atom.clone(), |_, rhs, _| rhs)
+                .boxed();
+
+            let not = op!('!')
+                .repeated()
+                .foldr_with(atom.clone(), |_op, rhs, e| {
+                    (e.span(), Box::new(Expression::Not(rhs)))
+                })
+                .boxed();
+
+            let init = text::keyword("new")
+                .padded()
+                .ignore_then(self.ident().then_ignore(op!(';').or_not()))
+                .map_with(output!(Instantiate))
+                .boxed();
+
+            let call = atom
+                .clone()
+                .then(self.params(expr.clone()))
+                .map_with(|(f, args), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Call {
+                            name: f,
+                            args: args.unwrap_or_default(),
+                        }),
+                    )
+                });
+            let pattern = atom.clone().or(str.clone()).or(bool.clone()).clone();
+
+            let arm = pattern
+                .then_ignore(op!("=>"))
+                .then(
+                    block
+                        .clone()
+                        .delimited_by(op!('{'), op!('}'))
+                        .or(expr.clone().map_with(output!(ImplicitReturn))),
+                )
+                .separated_by(op!(','))
+                .allow_trailing()
+                .collect::<Vec<_>>();
+
+            let match_ = text::keyword("match")
+                .padded()
+                .ignored()
+                .then(expr.clone())
+                .then(op!('{').ignored())
+                .then(arm)
+                .then(op!('}').ignored())
+                .map_with(|(((((), pattern), _), arms), _), e| {
+                    (e.span(), Box::new(Expression::Match(pattern, arms)))
+                });
+
+            let unary = match_
+                .or(init)
+                .or(call)
+                .or(assignment)
+                .or(negate)
+                .or(not)
+                .or(positive)
+                .boxed();
+            let binary = unary
+                .clone()
+                .foldl_with(
+                    choice((
+                        op!("^").or(op!("xor")).to(Expression::Xor as fn(_, _) -> _),
+                        op!("&").or(op!("and")).to(Expression::And as fn(_, _) -> _),
+                        op!("|").or(op!("or")).to(Expression::Or as fn(_, _) -> _),
+                    ))
+                    .then(expr.clone())
+                    .repeated(),
+                    |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+                )
+                .boxed();
+
+            let comparison = binary
+                .clone()
+                .foldl_with(
+                    choice((
+                        op!("<").to(Expression::Le as fn(_, _) -> _),
+                        op!(">").to(Expression::Gt as fn(_, _) -> _),
+                        op!("==").to(Expression::Eq as fn(_, _) -> _),
+                        op!("!=").to(Expression::Neq as fn(_, _) -> _),
+                        op!(">=").to(Expression::Leq as fn(_, _) -> _),
+                        op!("<=.").to(Expression::Geq as fn(_, _) -> _),
+                    ))
+                    .then(expr.clone())
+                    .repeated(),
+                    |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+                )
+                .boxed();
+
+            let shift = comparison
+                .clone()
+                .foldl_with(
+                    choice((
+                        op!("<<").to(Expression::Shl as fn(_, _) -> _),
+                        op!(">>").to(Expression::Shr as fn(_, _) -> _),
+                    ))
+                    .then(expr.clone())
+                    .repeated(),
+                    |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+                )
+                .boxed();
+
+            //
+            let product = shift
+                .clone()
+                .foldl_with(
+                    choice((
+                        op!('*').to(Expression::Mul as fn(_, _) -> _),
+                        op!('/').to(Expression::Div as fn(_, _) -> _),
+                        op!('%').to(Expression::Mod as fn(_, _) -> _),
+                    ))
+                    .then(expr.clone())
+                    .repeated(),
+                    |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+                )
+                .boxed();
+
+            let sum = product
+                .clone()
+                .foldl_with(
+                    choice((
+                        op!('+').to(Expression::Add as fn(_, _) -> _),
+                        op!('-').to(Expression::Sub as fn(_, _) -> _),
+                    ))
+                    .then(expr.clone())
+                    .repeated(),
+                    |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+                )
+                .boxed();
+
+            // @TODO: Investigate complex pattern mattching, for now use it as glorified `if`
+            // assignment
+            // .or(member)
+            sum.or(str).or(bool).or(list).or(atom)
+        })
+        .map_with(|value, e| (e.span(), Box::new(Expression::Expr(value))))
+        .labelled("expression")
+        .boxed()
+        .memoized()
+    }
+
+    fn expression_stmt(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        self.expression()
+            .then_ignore(op!(';'))
+            .map_with(output!(ExprStatement))
+            .boxed()
+    }
+
+    fn statement(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        recursive(|stmt| {
+            let block = stmt
+                .clone()
+                .repeated()
+                .collect()
+                .map_with(output!(Block))
+                // .map_with(output!(Scope))
+                .delimited_by(op!('{'), op!('}'));
+
+            let else_ = |if_| {
+                op!("else")
+                    .ignore_then(choice((if_, stmt)))
+                    .boxed()
+                    .or_not()
+            };
+
+            let if_ = recursive(|if_| {
+                text::keyword("if")
+                    .padded()
+                    .then(self.expression())
+                    .then(block.clone())
+                    .then(else_(if_))
+                    .map_with(|(((_, condition), body), alternative), e| {
+                        (
+                            e.span(),
+                            Box::new(Expression::If {
+                                condition,
+                                body,
+                                alternative,
+                            }),
+                        )
+                    })
+            })
+            .boxed();
+
+            let for_ = text::keyword("for")
+                .padded()
+                .ignore_then(self.ident())
+                .then(text::keyword("in").padded().ignored())
+                .then(self.expression())
+                .then(block.clone())
+                .map_with(|(((item, _), iterable), body), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Loop {
+                            idntifier: Some(item),
+                            iterable,
+                            body,
+                        }),
+                    )
+                });
+
+            let while_ = text::keyword("while")
+                .ignore_then(self.expression())
+                .then(block.clone())
+                .map_with(|(iterable, body), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Loop {
+                            idntifier: None,
+                            iterable,
+                            body,
+                        }),
+                    )
+                });
+
+            let loop_ = for_.or(while_);
+
+            let declaration = text::keyword("let")
+                .padded()
+                .ignore_then(self.ident())
+                .then(op!(':').ignore_then(self.type_()).or_not())
+                .map_with(|(name, type_), e| {
+                    (e.span(), Box::new(Expression::Variable(name, type_)))
+                });
+
+            let constant = text::keyword("const")
+                .padded()
+                .ignore_then(self.ident())
+                .then(op!(':').ignore_then(self.type_()).or_not())
+                .map_with(|(name, type_), e| {
+                    (e.span(), Box::new(Expression::Constant(name, type_)))
+                });
+
+            let print = text::keyword("print")
+                .padded()
+                .ignore_then(self.expression().then_ignore(op!(';')))
+                .map_with(output!(Print))
+                .boxed();
+            let deferred = text::keyword("defer")
+                .padded()
+                .ignore_then(
+                    text::keyword("use")
+                        .ignore_then(self.params(self.expression()).clone())
+                        .or_not(),
+                )
+                .then(block.clone().or(self.expression().then_ignore(op!(';'))))
+                .map_with(|(imports, body), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Defer(
+                            imports.map(|v| v.unwrap_or_default()).unwrap_or_default(),
+                            body,
+                        )),
+                    )
+                })
+                .boxed();
+
+            let return_ = text::keyword("return")
+                .padded()
+                .ignore_then(self.expression().then_ignore(op!(';')))
+                .map_with(output!(Return))
+                .boxed();
+            let yield_ = text::keyword("yield")
+                .padded()
+                .ignore_then(self.expression().then_ignore(op!(';')))
+                .map_with(output!(Yield))
+                .boxed();
+
+            choice((
+                deferred,
+                print,
+                yield_,
+                return_,
+                if_,
+                loop_,
+                declaration,
+                constant,
+                self.expression_stmt(),
+                self.comment(self.expression()),
+                block,
+            ))
+            .map_with(|value, e| (e.span(), Box::new(Expression::Statement(value))))
+            .boxed()
+        })
+    }
+
+    fn block(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        self.statement()
+            .repeated()
+            .collect()
+            .map_with(output!(Block))
+            // .map_with(output!(Scope))
+            .delimited_by(op!('{'), op!('}'))
+            .boxed()
+    }
+
+    fn args(
+        &self,
+    ) -> impl Parser<
+        'parser,
+        &'parser str,
+        Option<Vec<(Output<'parser>, Output<'parser>)>>,
+        extra::Err<Rich<'parser, char>>,
+    > + Clone
+    + 'parser {
+        self.type_()
+            .then(self.ident())
+            .separated_by(op!(','))
+            .at_least(0)
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .or_not()
+            .delimited_by(op!('('), op!(')'))
+            .boxed()
+    }
+
+    fn func(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        text::keyword("fn")
+            .padded()
+            .ignore_then(text::ident().or_not())
+            .then(self.args())
+            .then(op!("->").ignore_then(self.ident()).or_not())
+            .then(self.block())
+            .map_with(|(((name, args), ret), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Function {
+                        name: name.unwrap_or("@"),
+                        args: args.unwrap_or_default(),
+                        returns: ret,
+                        body: match body.1.borrow() {
+                            Expression::Block(items) => items.clone(),
+                            _ => vec![],
+                        },
+                    }),
+                )
+            })
+            .boxed()
+    }
+
+    fn use_(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        let submodules = text::ident()
+            .padded()
+            .then(
+                text::keyword("as")
+                    .padded()
+                    .ignore_then(text::ident().padded())
+                    .padded()
+                    .or_not(),
+            )
+            .then_ignore(op!(",").or_not())
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(op!('{'), op!('}'));
+
+        text::keyword("use")
+            .padded()
+            .ignore_then(
+                text::ident()
+                    .then_ignore(just("::").or_not())
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .then(submodules.or_not())
+            .then_ignore(just(';'))
+            .map_with(|(mut path, children), e| {
+                let mut imports: Vec<Expression<'parser>> = vec![];
+
+                match children {
+                    Some(children) => children.iter().for_each(
+                        |(name, alias): &(&'parser str, Option<&'parser str>)| {
+                            imports.push(Expression::Use {
+                                path: path.iter().map(ToString::to_string).collect(),
+                                name: name.to_string(),
+                                alias: alias.map(ToString::to_string),
+                            });
+                        },
+                    ),
+                    None => {
+                        let name: Option<&'parser str> = path.pop();
+
+                        imports.push(Expression::Use {
+                            name: name.expect("Unable to get name").to_string(),
+                            path: path.iter().map(ToString::to_string).collect(),
+                            alias: None,
+                        })
+                    }
+                }
+
+                (
+                    e.span(),
+                    Box::new(Expression::Fragment(
+                        imports
+                            .iter()
+                            .map(|item| (e.span(), Box::new(item.clone())))
+                            .collect::<Vec<Output<'parser>>>(),
+                    )),
+                )
+            })
+    }
+
+    fn build(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>> + 'parser
+    {
+        self.func()
+            .or(self.use_())
+            .or(self.comment(self.expression()))
+            .repeated()
+            .collect()
+            .map_with(output!(Program))
+            .padded()
+            .memoized()
+    }
+
+    pub fn parse(
+        &self,
+        filename: String,
+        src: &'parser str,
+    ) -> Result<Output<'parser>, ParserError> {
+        match self.build().parse(&src).into_result() {
+            Ok(ast) => Ok(ast),
+            Err(errs) => {
+                errs.clone().into_iter().for_each(|e: Rich<'_, char>| {
+                    Report::build(ReportKind::Error, (filename.clone(), e.span().into_range()))
+                        .with_config(
+                            Config::new()
+                                .with_index_type(IndexType::Byte)
+                                .with_compact(false),
+                        )
+                        .with_message(e.to_string())
+                        .with_label(
+                            Label::new((filename.clone(), e.span().into_range()))
+                                .with_color(Color::Red),
+                        )
+                        .finish()
+                        .eprint(sources([(filename.clone(), src.clone())]))
+                        .unwrap()
+                });
+
+                Err("Parser errors".into())
+            }
+        }
+    }
+}
+
+type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
+
+fn main() {
+    let p = std::env::current_dir().unwrap().with_file_name("test.0s");
+    let src = std::fs::read_to_string(p.canonicalize().unwrap()).unwrap();
+    let file = p.to_str().expect("Unable to convert file path");
+
+    match ParserBuilder::new().parse(src, file) {
+        Ok(v) => {
+            dbg!(&v);
+        }
+        Err(e) => println!("Error while parsing: {}", e.to_string()),
+    };
+}
 
 #[cfg(test)]
-mod test {
+mod tests {
     use chumsky::Parser;
 
-    use crate::{eval, parser};
+    use crate::ParserBuilder;
+
+    macro_rules! parse {
+        ($case: literal) => {
+            ParserBuilder::new().build().parse($case).into_result()
+        };
+    }
 
     #[test]
-    fn test_simple_parsing() {
-        let p = std::env::current_dir().unwrap().with_file_name("test.0s");
+    fn test_operators() {
+        // @NOTE: Commented out cases, should be made to pass :)
+        assert!(parse!("42").is_err());
+        assert!(parse!("42;").is_err());
+        assert!(parse!("return 42;").is_err());
+        assert!(parse!("use foo;").is_ok());
+        assert!(parse!("use foo::bar::baz;").is_ok());
+        assert!(parse!("use foo::bar::{ baz };").is_ok());
+        // assert!(parse!("use foo::bar::{ baz::foobar };").is_ok());
+        assert!(parse!("use foo::bar::{ baz as foobar };").is_ok());
+        assert!(parse!("fn foo() { }").is_ok());
+        assert!(parse!("fn foo() { 10 }").is_err());
+        assert!(parse!("fn foo() { 10; }").is_ok());
+        assert!(parse!("fn foo() { (10); }").is_ok());
+        assert!(parse!("fn foo() { return 10 }").is_err());
+        assert!(parse!("fn foo() { return 10; }").is_ok());
+        assert!(parse!("fn foo() { return 0.0; }").is_ok());
+        assert!(parse!("fn foo() { return b01; }").is_ok());
+        assert!(parse!("fn foo() { return x01; }").is_ok());
+        assert!(parse!("fn foo() { 1 + 1; }").is_ok());
+        assert!(parse!("fn foo() { 1 - 1; }").is_ok());
+        assert!(parse!("fn foo() { 1 * 2; }").is_ok());
+        assert!(parse!("fn foo() { 2 / 2; }").is_ok());
+        assert!(parse!("fn foo() { 2 % 2; }").is_ok());
+        assert!(parse!("fn foo() { 10 < 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 <= 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 == 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 != 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 > 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 >= 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 << 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 >> 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 & 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 | 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 ^ 10; }").is_ok());
+        assert!(parse!("fn foo() { -10; }").is_ok());
+        assert!(parse!("fn foo() { -----10; }").is_ok());
+        assert!(parse!("fn foo() { !10; }").is_ok());
+        assert!(parse!("fn foo() { !true; }").is_ok());
+        assert!(parse!("fn foo() { !!false; }").is_ok());
+        assert!(parse!("fn foo() { +10; }").is_ok());
+    }
 
-        dbg!(&p);
+    #[test]
+    fn test_statements() {
+        assert!(parse!("fn foo() { var = 10; }").is_ok());
+        assert!(parse!("fn foo() { return 10; }").is_ok());
+        assert!(parse!("fn foo() { print 10; }").is_ok());
+        assert!(parse!("fn foo() { print foo; }").is_ok());
+        assert!(parse!("fn foo() { print false; }").is_ok());
+        assert!(parse!("fn foo() { print true; }").is_ok());
+        assert!(parse!("fn foo() { print 0.0; }").is_ok());
+        assert!(parse!("fn foo() { print b01; }").is_ok());
+        assert!(parse!("fn foo() { print x01; }").is_ok());
+        assert!(parse!("fn foo() { print bar(); }").is_ok());
+        assert!(parse!("fn foo() { this.foo = 11; }").is_ok());
+        assert!(parse!("fn foo() { bar(); }").is_ok());
+        assert!(parse!("fn foo() { bar(10); }").is_ok());
+        assert!(parse!("fn foo() { bar(10, 10,); }").is_ok());
+        assert!(parse!("fn x(int z) { }").is_ok());
+        assert!(parse!("fn (int z, string foo) -> int { }").is_ok());
 
-        let src = std::fs::read_to_string(p.canonicalize().unwrap()).unwrap();
-
-        match parser().parse(&src).into_result() {
-            Ok(ast) => match eval(&ast) {
-                Ok(output) => println!("Result: {}", output),
-                Err(err) => println!("Evaluation Error: {}", err),
-            }
-            Err(parse_err) => parse_err.into_iter().for_each(|e| eprintln!("Parse Error: {}", e)),
-        }
-
+        assert!(parse!("fn foo() { bar() + baz(); }").is_ok());
+        assert!(parse!("fn foo() { bar() - baz(); }").is_ok());
+        assert!(parse!("fn foo() { bar() * baz(); }").is_ok());
+        assert!(parse!("fn foo() { bar() / baz(); }").is_ok());
+        assert!(parse!("fn foo() { bar() % baz(); }").is_ok());
+        assert!(parse!("fn foo() { defer { baz(); } }").is_ok());
+        // assert!(parse!("fn foo() { bar() % baz() }").is_ok());
     }
 }

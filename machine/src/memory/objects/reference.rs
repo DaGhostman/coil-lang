@@ -1,19 +1,19 @@
 use std::{num::NonZero, ptr::NonNull};
 
 use crate::{
-    Object, ReferenceType,
+    Object, ObjectType,
     garbage::{Collectable, GcSized},
 };
 
-pub struct Reference(ReferenceType, usize);
+pub struct Reference(ObjectType, usize);
 
 impl From<Collectable<Object>> for Reference {
     fn from(value: Collectable<Object>) -> Self {
         Self(
             match value.as_ref() {
-                Object::None => ReferenceType::None,
-                Object::String(..) => ReferenceType::String,
-                Object::Coroutine(..) => ReferenceType::Coroutine,
+                Object::None => ObjectType::None,
+                Object::String(..) => ObjectType::String,
+                Object::Coroutine(..) => ObjectType::Coroutine,
                 Object::Reference(value) => return Self(value.as_ref().0, value.as_ref().1),
             },
             value.ptr().as_ptr() as usize,

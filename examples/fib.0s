@@ -1,0 +1,19 @@
+fn fib(int n) -> n {
+    if n < 2 {
+        return n;
+    }
+
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn foo() {
+    print 42;
+}
+
+fn main() {
+    defer foo(); 
+
+    print fib(13);
+    print 13;
+}
+
