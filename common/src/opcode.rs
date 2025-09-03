@@ -95,7 +95,15 @@ pub struct Byte<V> {
 }
 
 impl<V: Default + Copy> Byte<V> {
-    pub fn new(bytecode: Instruction, operands: [usize; 2]) -> Self {
+    pub fn new(bytecode: Instruction) -> Self {
+        Self {
+            bytecode,
+            operands: [0, 0],
+            value: V::default(),
+        }
+    }
+
+    pub fn new_with_operands(bytecode: Instruction, operands: [usize; 2]) -> Self {
         Self {
             bytecode,
             operands,
@@ -103,7 +111,19 @@ impl<V: Default + Copy> Byte<V> {
         }
     }
 
-    pub fn new_with(bytecode: Instruction, operands: [usize; 2], value: V) -> Self {
+    pub fn new_with_value(bytecode: Instruction, value: V) -> Self {
+        Self {
+            bytecode,
+            operands: [0, 0],
+            value,
+        }
+    }
+
+    pub fn new_with_operands_and_value(
+        bytecode: Instruction,
+        operands: [usize; 2],
+        value: V,
+    ) -> Self {
         Self {
             bytecode,
             operands,

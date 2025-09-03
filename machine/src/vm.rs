@@ -297,7 +297,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::STORE => {
                     likely(true);
 
-                    let val = *frame.pop();
+                    let val = *frame.peek();
                     frame.store(opcode.operand(0), val);
                 }
                 Instruction::LOAD => {
@@ -450,8 +450,8 @@ mod tests {
         let mut vm = Machine::<1>::default();
         let v = Value::from(42);
         vm.run(&[
-            Byte::new_with(Instruction::CONST, [0, 0], v),
-            Byte::new(Instruction::HALT, [0, 0]),
+            Byte::new_with_value(Instruction::CONST, v),
+            Byte::new(Instruction::HALT),
         ]);
 
         assert_eq!(v.raw(), vm.pop().raw());
@@ -466,7 +466,7 @@ mod tests {
             //     Instruction::ADDF,
             // ),
             (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(4),
                 Instruction::ADD,
             ),
@@ -474,12 +474,7 @@ mod tests {
 
         for (v, e, i) in cases {
             let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
+            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
 
             assert_eq!(e.raw(), vm.pop().raw());
         }
@@ -494,7 +489,7 @@ mod tests {
             //     Instruction::SUBF,
             // ),
             (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(0),
                 Instruction::SUB,
             ),
@@ -502,12 +497,7 @@ mod tests {
 
         for (v, e, i) in cases {
             let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
+            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
 
             assert_eq!(e.raw(), vm.pop().raw());
         }
@@ -522,7 +512,7 @@ mod tests {
             //     Instruction::MULF,
             // ),
             (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(4),
                 Instruction::MUL,
             ),
@@ -530,12 +520,7 @@ mod tests {
 
         for (v, e, i) in cases {
             let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
+            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
 
             assert_eq!(e.raw(), vm.pop().raw());
         }
@@ -550,7 +535,7 @@ mod tests {
             //     Instruction::DIVF,
             // ),
             (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(1),
                 Instruction::DIV,
             ),
@@ -558,12 +543,7 @@ mod tests {
 
         for (v, e, i) in cases {
             let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
+            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
 
             assert_eq!(e.raw(), vm.pop().raw());
         }
@@ -578,7 +558,7 @@ mod tests {
             //     Instruction::DIVF,
             // ),
             (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(1),
                 Instruction::DIV,
             ),
@@ -586,12 +566,7 @@ mod tests {
 
         for (v, e, i) in cases {
             let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
+            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
 
             assert_eq!(e.raw(), vm.pop().raw());
         }
