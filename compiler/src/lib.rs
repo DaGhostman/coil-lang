@@ -64,12 +64,12 @@ impl Compiler {
                     self.functions.insert(name.to_string(), self.bytecode.len());
 
                     for arg in args {
-                        let mut a = self.do_compile(&arg);
+                        let mut a = self.do_compile(arg);
                         self.bytecode.append(&mut a);
                     }
 
                     for child in body {
-                        let mut c = self.do_compile(&child);
+                        let mut c = self.do_compile(child);
                         self.bytecode.append(&mut c);
                     }
 
@@ -132,12 +132,10 @@ impl Compiler {
 
                     let total_length = self.bytecode.len();
                     let current_length = body.len() + bytecode.len();
-                    body.first_mut().map(|v| {
-                        *v = Byte::new_with_operands(
+                    if let Some(v) = body.first_mut() { *v = Byte::new_with_operands(
                             Instruction::JMP,
                             [total_length + current_length, 0],
-                        );
-                    });
+                        ); }
 
                     bytecode.append(&mut body);
                 }
@@ -170,7 +168,7 @@ impl Compiler {
 
                     let mut alternative = alternative
                         .as_ref()
-                        .map(|v| self.do_compile(&v))
+                        .map(|v| self.do_compile(v))
                         .unwrap_or_default();
 
                     let current_len = body.len() + condition.len();
@@ -268,9 +266,7 @@ impl Compiler {
         let mut program = self.do_compile(ast);
         self.bytecode.append(&mut program);
 
-        self.bytecode.first_mut().map(|v| {
-            *v = Byte::new_with_operands(Instruction::CALL, [self.functions["main"], 0]);
-        });
+        if let Some(v) = self.bytecode.first_mut() { *v = Byte::new_with_operands(Instruction::CALL, [self.functions["main"], 0]); }
 
         self.bytecode.clone()
     }

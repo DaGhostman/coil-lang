@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::num::ParseFloatError;
 
-use ariadne::{Color, Config, IndexType, Label, Report, ReportBuilder, ReportKind, sources};
+use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
 use chumsky::prelude::*;
 use chumsky::{
     IterParser, Parser,
@@ -110,7 +110,7 @@ fn is_truthy<'expr>(value: &Output<'expr>) -> bool {
     match value.1.borrow() {
         Expression::Bool(v) => *v,
         Expression::Number(v) => *v == 0.0,
-        Expression::String(v) => v.len() == 0,
+        Expression::String(v) => v.is_empty(),
         Expression::Eq(lhs, rhs) => {
             <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
                 == <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
@@ -187,17 +187,22 @@ pub struct ParserBuilder<'parser> {
     _data: PhantomData<&'parser ()>,
 }
 
+impl<'parser> Default for ParserBuilder<'parser> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'parser> ParserBuilder<'parser> {
     pub fn new() -> Self {
         Self {
-            _data: PhantomData::default(),
+            _data: PhantomData,
         }
     }
 
     fn ident(
         &self,
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
-    + Clone
     + Copy
     + 'parser {
         text::ident().padded().map_with(output!(Identifier))
@@ -206,7 +211,6 @@ impl<'parser> ParserBuilder<'parser> {
     fn type_(
         &self,
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
-    + Clone
     + Copy
     + 'parser {
         text::ident().padded().map_with(output!(Type))
@@ -411,7 +415,7 @@ impl<'parser> ParserBuilder<'parser> {
             let pattern = atom
                 .clone()
                 .or(str.clone())
-                .or(bool.clone())
+                .or(bool)
                 .clone()
                 .boxed();
 
@@ -872,7 +876,7 @@ impl<'parser> ParserBuilder<'parser> {
         filename: String,
         src: &'parser str,
     ) -> Result<Output<'parser>, ParserError> {
-        match self.build().parse(&src).into_result() {
+        match self.build().parse(src).into_result() {
             Ok(ast) => Ok(ast),
             Err(errs) => {
                 errs.clone().into_iter().for_each(|e: Rich<'_, char>| {
@@ -888,7 +892,7 @@ impl<'parser> ParserBuilder<'parser> {
                                 .with_color(Color::Red),
                         )
                         .finish()
-                        .eprint(sources([(filename.clone(), src.clone())]))
+                        .eprint(sources([(filename.clone(), src)]))
                         .unwrap()
                 });
 

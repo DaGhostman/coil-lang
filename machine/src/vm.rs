@@ -1,8 +1,7 @@
-use common::{ArrayVec, Value, likely, promise, unlikely};
-use std::string::String as RustString;
+use common::{ArrayVec, Value, likely, unlikely};
 
 use crate::{
-    Byte, Coroutine, Frame, Heap, Instruction, Object, ObjectType, Reference, String,
+    Byte, Coroutine, Frame, Heap, Instruction, Object,
     garbage::{Collectable, GcSized},
 };
 
