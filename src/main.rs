@@ -2,26 +2,41 @@
 
 use common::Value;
 
-use compiler::Compiler;
+use compiler::{Compiler, Typechecker};
 // use common::{Registers, Types};
+use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
 use machine::{Byte, Instruction, Machine};
-use parser::ParserBuilder;
+use parser::{Expression, ParserBuilder, SimpleSpan};
 
 // use crate::language::Language;
+
+fn render_error<'error>(span: SimpleSpan, e: String, filename: String, src: &'error str) {
+    Report::build(ReportKind::Error, (filename.clone(), span.into_range()))
+        .with_config(
+            Config::new()
+                .with_index_type(IndexType::Byte)
+                .with_compact(false),
+        )
+        .with_message(e.to_string())
+        .with_label(Label::new((filename.clone(), span.into_range())).with_color(Color::Red))
+        .finish()
+        .eprint(sources([(filename.clone(), src.clone())]))
+        .unwrap()
+}
 
 fn main() {
     let sub = [
         Byte::new_with_value(Instruction::CONST, Value::from(6)),
         Byte::new_with_value(Instruction::CONST, Value::from(2)),
         Byte::new(Instruction::SUB),
-        Byte::new(Instruction::PRINTI),
+        Byte::new(Instruction::PRINT),
         Byte::new(Instruction::HALT),
     ];
     let mul = [
         Byte::new_with_value(Instruction::CONST, Value::from(6.0)),
         Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
         Byte::new(Instruction::MULF),
-        Byte::new(Instruction::PRINTF),
+        Byte::new(Instruction::PRINT),
         Byte::new(Instruction::HALT),
     ];
     let async_counters = [
@@ -35,7 +50,7 @@ fn main() {
         Byte::new(Instruction::ADD),
         Byte::new_with_operands(Instruction::STORE, [1, 0]),
         Byte::new_with_operands(Instruction::LOAD, [1, 0]),
-        Byte::new(Instruction::PRINTI),
+        Byte::new(Instruction::PRINT),
         Byte::new(Instruction::SUSP),
         Byte::new_with_operands(Instruction::JMP, [1, 0]),
         Byte::new_with_operands(Instruction::LOAD, [1, 0]),
@@ -49,7 +64,7 @@ fn main() {
         Byte::new(Instruction::MUL),
         Byte::new_with_operands(Instruction::STORE, [1, 0]),
         Byte::new_with_operands(Instruction::LOAD, [1, 0]),
-        Byte::new(Instruction::PRINTI),
+        Byte::new(Instruction::PRINT),
         Byte::new(Instruction::SUSP),
         Byte::new_with_operands(Instruction::JMP, [15, 0]),
         Byte::new_with_operands(Instruction::LOAD, [1, 0]),
@@ -57,13 +72,13 @@ fn main() {
         Byte::new_with_value(Instruction::CONST, Value::from(0)),
         Byte::new_with_value(Instruction::CONST, Value::from(10)),
         Byte::new_with_operands(Instruction::CALL, [1, 2]), // Calls
-        Byte::new(Instruction::PRINTI),
+        Byte::new(Instruction::PRINT),
         Byte::new_with_value(Instruction::CONST, Value::from(1)),
         Byte::new_with_value(Instruction::CONST, Value::from(10)),
         Byte::new_with_operands(Instruction::CALL, [15, 2]), // Calls
         Byte::new(Instruction::RESUME),
         Byte::new(Instruction::RESUME),
-        Byte::new(Instruction::PRINTI),
+        Byte::new(Instruction::PRINT),
         Byte::new(Instruction::HALT),
     ];
 
@@ -76,7 +91,7 @@ fn main() {
         // Byte::new(Instruction::HALT, [0, 0]),
         Byte::new_with_value(Instruction::CONST, Value::from(32)),
         Byte::new_with_operands(Instruction::CALL, [4, 1]),
-        Byte::new(Instruction::PRINTI),
+        Byte::new(Instruction::PRINT),
         Byte::new(Instruction::HALT),
         //
         Byte::new(Instruction::LOAD), // Load argument n
@@ -103,16 +118,47 @@ fn main() {
     // language.run_bytecode(&fib);
 
     let argc = std::env::args().collect::<Vec<_>>();
-    let src = std::fs::read_to_string(argc[1].as_str()).unwrap();
+    let filename = argc[1].clone();
+    let src = std::fs::read_to_string(&filename).unwrap();
 
     let mut compiler = Compiler::default();
     match ParserBuilder::new().parse(argc[1].clone(), src.as_str()) {
         Ok(ast) => {
-            // dbg!(&ast, &compiler.compile(&ast));
-            Machine::<256>::default().run(&compiler.compile(&ast));
+            if let Err(messages) = Typechecker::default().check(&ast) {
+                messages
+                    .clone()
+                    .into_iter()
+                    .for_each(|(spane, e)| render_error(spane, e, filename.clone(), src.as_str()));
+            } else {
+                match compiler.compile(&ast) {
+                    Ok(bytecode) => {
+                        // dbg!(&ast, &compiler.compile(&ast));
+                        Machine::<256>::default().run(&bytecode);
+                    }
+                    Err(messages) => {
+                        messages.clone().into_iter().for_each(|(spane, e)| {
+                            render_error(spane, e, filename.clone(), src.as_str())
+                        });
+                        // messages.clone().into_iter().for_each(|(span, e)| {
+                        //     Report::build(ReportKind::Error, (filename.clone(), span.into_range()))
+                        //         .with_config(
+                        //             Config::new()
+                        //                 .with_index_type(IndexType::Byte)
+                        //                 .with_compact(false),
+                        //         )
+                        //         .with_message(e.to_string())
+                        //         .with_label(
+                        //             Label::new((filename.clone(), span.into_range()))
+                        //                 .with_color(Color::Red),
+                        //         )
+                        //         .finish()
+                        //         .eprint(sources([(filename.clone(), src.clone())]))
+                        //         .unwrap()
+                        // });
+                    }
+                }
+            }
         }
         Err(err) => (),
     };
-
-    // vm.run(fib.as_slice());
 }

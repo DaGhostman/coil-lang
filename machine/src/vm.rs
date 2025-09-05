@@ -5,6 +5,8 @@ use crate::{
     garbage::{Collectable, GcSized},
 };
 
+use std::string::String as RustString;
+
 pub struct Machine<const S: usize> {
     frames: ArrayVec<Frame<Value>, S>,
     heap: Heap<1024>,
@@ -304,21 +306,137 @@ impl<const S: usize> Machine<S> {
 
                     frame.push(*frame.load(opcode.operand(0)));
                 }
+                Instruction::NOT => {
+                    let lhs = frame.peek().raw();
+                    frame.top().replace(!lhs);
+                }
                 Instruction::ADD => ibinary_op!(frame, +),
                 Instruction::SUB => ibinary_op!(frame, -),
                 Instruction::MUL => ibinary_op!(frame, *),
                 Instruction::DIV => ibinary_op!(frame, /),
-                // Instruction::ADDF => fbinary_op!(frame, +),
-                // Instruction::SUBF => fbinary_op!(frame, -),
-                // Instruction::MULF => fbinary_op!(frame, *),
-                // Instruction::DIVF => fbinary_op!(frame, /),
+                Instruction::MOD => ibinary_op!(frame, %),
                 Instruction::LE => binary_op!(frame, <),
-                // Instruction::GT => binary_op!(frame, >),
-                // Instruction::EQ => binary_op!(frame, ==),
-                // Instruction::LEQ => binary_op!(frame, <=),
-                // Instruction::GEQ => binary_op!(frame, >=),
-                // Instruction::NEQ => binary_op!(frame, !=),
-                Instruction::PRINTI => println!("{}", frame.pop().as_int()),
+                Instruction::GT => binary_op!(frame, >),
+                Instruction::EQ => binary_op!(frame, ==),
+                Instruction::LEF => binary_op!(frame, <=),
+                Instruction::GTF => binary_op!(frame, >=),
+                Instruction::NEQ => binary_op!(frame, !=),
+                Instruction::ADDF => fbinary_op!(frame, +),
+                Instruction::SUBF => fbinary_op!(frame, -),
+                Instruction::MULF => fbinary_op!(frame, *),
+                Instruction::DIVF => fbinary_op!(frame, /),
+                Instruction::MODF => fbinary_op!(frame, %),
+                Instruction::PRINT => {
+                    let mut message = String::new();
+                    let num_params = opcode.operand(0);
+                    if num_params == 0 {
+                        message = Collectable::<String>::from(frame.pop().as_ptr())
+                            .as_ref()
+                            .to_string();
+                    } else {
+                        let mut params = vec![];
+                        for _ in 0..opcode.operand(0) {
+                            params.push(*frame.pop());
+                        }
+                        let format = Collectable::<String>::from(frame.pop().as_ptr())
+                            .as_ref()
+                            .to_string();
+
+                        let byte_format = format.chars().collect::<Vec<char>>();
+
+                        let mut n = 0;
+                        let mut param = 0;
+                        while n < byte_format.len() {
+                            if '%' == byte_format[n]
+                                && (n == 0 || '\\' != byte_format[n - 1].into())
+                            {
+                                if params.len() <= param {
+                                    todo!("Handle within typechecker");
+                                }
+                                n += 1;
+                                match byte_format[n] as char {
+                                    'i' => {
+                                        n += 1;
+
+                                        message.push_str(
+                                            format!("{}", params[param].as_int()).as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    'f' => {
+                                        n += 1;
+                                        message.push_str(
+                                            format!("{:.?}", params[param].as_float()).as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    'b' => {
+                                        n += 1;
+                                        message.push_str(
+                                            format!("{:0b}", params[param].raw()).as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    's' => {
+                                        n += 1;
+                                        message.push_str(
+                                            format!(
+                                                "{}",
+                                                Collectable::<String>::from(params[param].as_ptr())
+                                                    .as_ref()
+                                                    .to_string()
+                                            )
+                                            .as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    'x' => {
+                                        n += 1;
+                                        message.push_str(
+                                            format!("{:08x}", params[param].raw()).as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    'z' => {
+                                        n += 1;
+                                        message.push_str(if params[param].raw() > 0 {
+                                            "true"
+                                        } else {
+                                            "false"
+                                        });
+                                        param += 1;
+                                    }
+                                    'u' => {
+                                        n += 1;
+                                        message.push_str(
+                                            format!("{:08x}", params[param].raw()).as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    'p' => {
+                                        n += 1;
+                                        message.push_str(
+                                            format!(
+                                                "{:08x}",
+                                                params[param].as_ptr::<bool>().addr()
+                                            )
+                                            .as_str(),
+                                        );
+                                        param += 1;
+                                    }
+                                    _ => {
+                                        message.push(byte_format[n].into());
+                                    }
+                                }
+                                continue;
+                            }
+
+                            message.push(byte_format[n].into());
+                            n += 1;
+                        }
+                    }
+                    print!("{}", message)
+                }
                 // Instruction::PRINTF => println!("{:.?}", frame.pop().as_float()),
                 // Instruction::PRINTB => println!("{}", frame.pop().as_bool()),
                 // Instruction::PRINTS => {
@@ -404,32 +522,18 @@ impl<const S: usize> Machine<S> {
 
                     return ExecutionResult::terminate();
                 }
-                // Instruction::STRING => {
-                //     let mut value: Vec<u8> = Vec::with_capacity(opcode.operand(0));
-                //
-                //     while let data = code[ip]
-                //         && data.operand(0) != 0
-                //     {
-                //         ip += 1;
-                //
-                //         value.push(
-                //             data.operand(0)
-                //                 .try_into()
-                //                 .expect("Unable to reconstruct character"),
-                //         );
-                //     }
-                //
-                //     let (_, collectable) = self.heap.alloc(
-                //         if let Ok(value) = RustString::from_utf8(value) {
-                //             value.into()
-                //         } else {
-                //             unreachable!("Unable to recreate string from bytes");
-                //         },
-                //         Object::String,
-                //     );
-                //
-                //     frame.push(Value::from(collectable.ptr()));
-                // }
+                Instruction::STRING => {
+                    let mut value: String = String::with_capacity(opcode.operand(0));
+
+                    for _ in 0..opcode.operand(0) {
+                        value.push(char::from_u32(code[ip].operand(0) as u32).unwrap_or_default());
+                        ip += 1;
+                    }
+
+                    let (_, collectable) = self.heap.alloc(value.into(), Object::String);
+
+                    frame.push(Value::from(collectable.ptr()));
+                }
                 Instruction::NOOP => continue,
                 _ => return ExecutionResult::invalid(),
             }

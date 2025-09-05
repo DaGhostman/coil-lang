@@ -1,4 +1,4 @@
-fn fib(int n) -> n {
+fn fib(int n) -> int {
     if n < 2 {
         return n;
     }
@@ -7,6 +7,6 @@ fn fib(int n) -> n {
 }
 
 fn main() {
-    print fib(32);
+    print "%i", fib(32);
 }
 

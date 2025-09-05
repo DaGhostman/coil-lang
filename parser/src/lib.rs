@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::marker::PhantomData;
-use std::num::ParseFloatError;
+use std::num::{ParseFloatError, ParseIntError};
 
 use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
 use chumsky::prelude::*;
@@ -13,14 +13,15 @@ pub use chumsky::span::SimpleSpan;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression<'expr> {
-    Number(f64),
+    Integer(i64),
+    Float(f64),
     String(&'expr str),
     Bool(bool),
 
     Identifier(&'expr str),
     Type(&'expr str),
     Comment(&'expr str),
-    Print(Output<'expr>),
+    Print(Output<'expr>, Option<Vec<Output<'expr>>>),
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
     Yield(Output<'expr>),
@@ -99,7 +100,9 @@ pub enum Expression<'expr> {
 impl PartialOrd for Expression<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (Expression::Number(lhs), Expression::Number(rhs)) => lhs.partial_cmp(rhs),
+            (Expression::Integer(lhs), Expression::Integer(rhs)) => lhs.partial_cmp(rhs),
+            (Expression::Float(lhs), Expression::Float(rhs)) => lhs.partial_cmp(rhs),
+            (Expression::Bool(lhs), Expression::Bool(rhs)) => lhs.partial_cmp(rhs),
             (Expression::String(lhs), Expression::String(rhs)) => lhs.partial_cmp(rhs),
             _ => None,
         }
@@ -109,7 +112,7 @@ impl PartialOrd for Expression<'_> {
 fn is_truthy<'expr>(value: &Output<'expr>) -> bool {
     match value.1.borrow() {
         Expression::Bool(v) => *v,
-        Expression::Number(v) => *v == 0.0,
+        Expression::Integer(v) => *v == 0,
         Expression::String(v) => v.is_empty(),
         Expression::Eq(lhs, rhs) => {
             <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
@@ -195,9 +198,7 @@ impl<'parser> Default for ParserBuilder<'parser> {
 
 impl<'parser> ParserBuilder<'parser> {
     pub fn new() -> Self {
-        Self {
-            _data: PhantomData,
-        }
+        Self { _data: PhantomData }
     }
 
     fn ident(
@@ -294,11 +295,26 @@ impl<'parser> ParserBuilder<'parser> {
     + Clone
     + 'parser {
         recursive(|expr| {
-            let bool = choice([op!("true"), op!("false")])
+            let bool = op!("true")
+                .or(op!("false"))
                 .map_with(|v, e| (e.span(), Box::new(Expression::Bool(v == "true"))));
 
             let int = text::int(10)
-                .then(just(".").then(text::int(10)).or_not())
+                .to_slice()
+                .from_str()
+                .validate(|v: Result<i64, ParseIntError>, e, emitter| match v {
+                    Ok(value) => value,
+                    Err(msg) => {
+                        emitter.emit(Rich::custom(e.span(), msg.to_string()));
+
+                        0_i64
+                    }
+                })
+                .map_with(output!(Integer))
+                .boxed();
+
+            let float = text::int(10)
+                .then(just(".").then(text::int(10)))
                 .to_slice()
                 .from_str()
                 .validate(|v: Result<f64, ParseFloatError>, e, emitter| match v {
@@ -309,21 +325,19 @@ impl<'parser> ParserBuilder<'parser> {
                         0_f64
                     }
                 })
-                .map_with(output!(Number))
+                .map_with(output!(Float))
                 .boxed();
             // @TODO: Handle binary(0b010101011010) as numbers
             // @TODO: Handle hex(0xa970987basd2) as numbers
 
-            let str = int
-                .clone()
-                .or(just('"')
-                    .ignore_then(any().repeated().to_slice().or(op!("\\\"").not().to_slice()))
-                    .then_ignore(just('"'))
-                    .map_with(output!(String))
-                    .or(just('\'')
-                        .ignore_then(any().repeated().to_slice().or(op!("\\'").not().to_slice()))
-                        .then_ignore(just('\''))
-                        .map_with(output!(String))))
+            let str = just('"')
+                .ignore_then(none_of('"').repeated().to_slice())
+                .then_ignore(just('"'))
+                .map_with(output!(String))
+                // .or(just('\'')
+                //     .ignore_then(any().repeated().to_slice().or(op!("\\'").not().to_slice()))
+                //     .then_ignore(just('\''))
+                //     .map_with(output!(String)))
                 .boxed();
 
             let list = expr
@@ -335,8 +349,11 @@ impl<'parser> ParserBuilder<'parser> {
                 .delimited_by(just('['), just(']'))
                 .boxed();
 
-            let atom = int
+            let atom = float
                 .clone()
+                .or(int)
+                .or(bool)
+                .or(str.clone())
                 .or(self.comment(expr.clone()))
                 .or(expr.clone().delimited_by(just('('), just(')')))
                 .or(self.ident())
@@ -373,7 +390,6 @@ impl<'parser> ParserBuilder<'parser> {
                 .collect::<Vec<_>>()
                 .map_with(output!(Block))
                 .boxed();
-            // .map_with(output!(Scope));
 
             let negate = op!('-')
                 .repeated()
@@ -388,7 +404,7 @@ impl<'parser> ParserBuilder<'parser> {
 
             let not = op!('!')
                 .repeated()
-                .foldr_with(atom.clone(), |_op, rhs, e| {
+                .foldr_with(atom.clone().or(bool.clone()), |_op, rhs, e| {
                     (e.span(), Box::new(Expression::Not(rhs)))
                 })
                 .boxed();
@@ -412,12 +428,7 @@ impl<'parser> ParserBuilder<'parser> {
                     )
                 })
                 .boxed();
-            let pattern = atom
-                .clone()
-                .or(str.clone())
-                .or(bool)
-                .clone()
-                .boxed();
+            let pattern = atom.clone().or(str.clone()).or(bool).clone().boxed();
 
             let arm = pattern
                 .then_ignore(op!("=>"))
@@ -471,12 +482,12 @@ impl<'parser> ParserBuilder<'parser> {
                 .clone()
                 .foldl_with(
                     choice((
-                        op!("<").to(Expression::Le as fn(_, _) -> _),
-                        op!(">").to(Expression::Gt as fn(_, _) -> _),
-                        op!("==").to(Expression::Eq as fn(_, _) -> _),
-                        op!("!=").to(Expression::Neq as fn(_, _) -> _),
                         op!(">=").to(Expression::Leq as fn(_, _) -> _),
                         op!("<=.").to(Expression::Geq as fn(_, _) -> _),
+                        op!("<").to(Expression::Le as fn(_, _) -> _),
+                        op!(">").to(Expression::Gt as fn(_, _) -> _),
+                        op!("!=").to(Expression::Neq as fn(_, _) -> _),
+                        op!("==").to(Expression::Eq as fn(_, _) -> _),
                     ))
                     .then(expr.clone())
                     .repeated(),
@@ -528,7 +539,7 @@ impl<'parser> ParserBuilder<'parser> {
             // @TODO: Investigate complex pattern mattching, for now use it as glorified `if`
             // assignment
             // .or(member)
-            sum.or(str).or(bool).or(list).or(atom)
+            str.or(sum).or(list).or(atom)
         })
         .map_with(|value, e| (e.span(), Box::new(Expression::Expr(value))))
         .labelled("expression")
@@ -669,8 +680,20 @@ impl<'parser> ParserBuilder<'parser> {
 
             let print = text::keyword("print")
                 .padded()
-                .ignore_then(self.expression().then_ignore(op!(';')))
-                .map_with(output!(Print))
+                .ignore_then(
+                    self.expression()
+                        .then(
+                            op!(',')
+                                .ignore_then(self.expression())
+                                .repeated()
+                                .collect::<Vec<_>>()
+                                .or_not(),
+                        )
+                        .then_ignore(op!(';')),
+                )
+                .map_with(|(format, params), e| {
+                    (e.span(), Box::new(Expression::Print(format, params)))
+                })
                 .boxed();
             let deferred = text::keyword("defer")
                 .padded()
@@ -946,7 +969,7 @@ mod tests {
         assert!(parse!("fn foo() { 10 == 10; }").is_ok());
         assert!(parse!("fn foo() { 10 != 10; }").is_ok());
         assert!(parse!("fn foo() { 10 > 10; }").is_ok());
-        // assert!(parse!("fn foo() { 10 >= 10; }").is_ok());
+        assert!(parse!("fn foo() { 10 >= 10; }").is_ok());
         assert!(parse!("fn foo() { 10 << 10; }").is_ok());
         assert!(parse!("fn foo() { 10 >> 10; }").is_ok());
         assert!(parse!("fn foo() { 10 & 10; }").is_ok());
