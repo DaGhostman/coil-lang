@@ -1,8 +1,8 @@
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::num::{ParseFloatError, ParseIntError};
 
-use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
 use chumsky::prelude::*;
 use chumsky::{
     IterParser, Parser,
@@ -10,6 +10,7 @@ use chumsky::{
 };
 
 pub use chumsky::span::SimpleSpan;
+use common::Message;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression<'expr> {
@@ -22,6 +23,7 @@ pub enum Expression<'expr> {
     Type(&'expr str),
     Comment(&'expr str),
     Print(Output<'expr>, Option<Vec<Output<'expr>>>),
+    Format(Output<'expr>, Option<Vec<Output<'expr>>>),
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
     Yield(Output<'expr>),
@@ -109,39 +111,6 @@ impl PartialOrd for Expression<'_> {
     }
 }
 
-fn is_truthy<'expr>(value: &Output<'expr>) -> bool {
-    match value.1.borrow() {
-        Expression::Bool(v) => *v,
-        Expression::Integer(v) => *v == 0,
-        Expression::String(v) => v.is_empty(),
-        Expression::Eq(lhs, rhs) => {
-            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
-                == <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
-        }
-        Expression::Le(lhs, rhs) => {
-            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
-                < <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
-        }
-        Expression::Gt(lhs, rhs) => {
-            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
-                > <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
-        }
-        Expression::Geq(lhs, rhs) => {
-            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
-                >= <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
-        }
-        Expression::Leq(lhs, rhs) => {
-            <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&lhs.1)
-                <= <Box<Expression<'_>> as Borrow<Expression<'expr>>>::borrow(&rhs.1)
-        }
-        Expression::Expr(value) => is_truthy(value),
-        a => {
-            dbg!(&a);
-            todo!("Add additional check for truthy expressions")
-        }
-    }
-}
-
 macro_rules! op {
     ($operator: literal) => {
         just($operator).padded()
@@ -190,12 +159,6 @@ pub struct ParserBuilder<'parser> {
     _data: PhantomData<&'parser ()>,
 }
 
-impl<'parser> Default for ParserBuilder<'parser> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<'parser> ParserBuilder<'parser> {
     pub fn new() -> Self {
         Self { _data: PhantomData }
@@ -229,7 +192,6 @@ impl<'parser> ParserBuilder<'parser> {
     + 'parser {
         let comment = just("//")
             .ignore_then(none_of('\n').repeated().to_slice().padded())
-            // .ignore_then(text::newline().not().to_slice())
             .then(expr.clone().or_not())
             .map_with(|(comment, value), e| {
                 if let Some(value) = value {
@@ -244,7 +206,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Comment(comment)))
                 }
             })
-            .boxed();
+            ;
 
         let block_comment = op!("/*")
             .ignore_then(none_of("*/").repeated().to_slice().then_ignore(op!("*/")))
@@ -262,7 +224,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Comment(comment)))
                 }
             })
-            .boxed();
+            ;
 
         comment.or(block_comment)
     }
@@ -311,7 +273,7 @@ impl<'parser> ParserBuilder<'parser> {
                     }
                 })
                 .map_with(output!(Integer))
-                .boxed();
+                ;
 
             let float = text::int(10)
                 .then(just(".").then(text::int(10)))
@@ -326,7 +288,7 @@ impl<'parser> ParserBuilder<'parser> {
                     }
                 })
                 .map_with(output!(Float))
-                .boxed();
+                ;
             // @TODO: Handle binary(0b010101011010) as numbers
             // @TODO: Handle hex(0xa970987basd2) as numbers
 
@@ -338,7 +300,7 @@ impl<'parser> ParserBuilder<'parser> {
                 //     .ignore_then(any().repeated().to_slice().or(op!("\\'").not().to_slice()))
                 //     .then_ignore(just('\''))
                 //     .map_with(output!(String)))
-                .boxed();
+                ;
 
             let list = expr
                 .clone()
@@ -347,7 +309,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .collect()
                 .map_with(output!(List))
                 .delimited_by(just('['), just(']'))
-                .boxed();
+                ;
 
             let atom = float
                 .clone()
@@ -357,13 +319,13 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(self.comment(expr.clone()))
                 .or(expr.clone().delimited_by(just('('), just(')')))
                 .or(self.ident())
-                .boxed();
+                ;
 
             let member = op!('.')
                 .ignore_then(atom.clone())
                 .clone()
                 .map_with(output!(Member))
-                .boxed();
+                ;
 
             let assignment = self
                 .ident()
@@ -372,7 +334,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(name, value), e| {
                     (e.span(), Box::new(Expression::Assignment(name, value)))
                 })
-                .boxed();
+                ;
 
             let block = expr
                 .clone()
@@ -389,31 +351,31 @@ impl<'parser> ParserBuilder<'parser> {
                 .repeated()
                 .collect::<Vec<_>>()
                 .map_with(output!(Block))
-                .boxed();
+                ;
 
             let negate = op!('-')
                 .repeated()
                 .foldr_with(atom.clone(), |_op, rhs, e| {
                     (e.span(), Box::new(Expression::Negate(rhs)))
                 })
-                .boxed();
+                ;
             let positive = op!('+')
                 .repeated()
                 .foldr_with(atom.clone(), |_, rhs, _| rhs)
-                .boxed();
+                ;
 
             let not = op!('!')
                 .repeated()
-                .foldr_with(atom.clone().or(bool.clone()), |_op, rhs, e| {
+                .foldr_with(atom.clone().or(bool), |_op, rhs, e| {
                     (e.span(), Box::new(Expression::Not(rhs)))
                 })
-                .boxed();
+                ;
 
             let init = text::keyword("new")
                 .padded()
                 .ignore_then(self.ident().then_ignore(op!(';').or_not()))
                 .map_with(output!(Instantiate))
-                .boxed();
+                ;
 
             let call = atom
                 .clone()
@@ -427,8 +389,8 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 })
-                .boxed();
-            let pattern = atom.clone().or(str.clone()).or(bool).clone().boxed();
+                ;
+            let pattern = atom.clone().or(str.clone()).or(bool).clone();
 
             let arm = pattern
                 .then_ignore(op!("=>"))
@@ -441,7 +403,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .separated_by(op!(','))
                 .allow_trailing()
                 .collect::<Vec<_>>()
-                .boxed();
+                ;
 
             let match_ = text::keyword("match")
                 .padded()
@@ -453,7 +415,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(((((), pattern), _), arms), _), e| {
                     (e.span(), Box::new(Expression::Match(pattern, arms)))
                 })
-                .boxed();
+                ;
 
             let unary = match_
                 .or(init)
@@ -463,7 +425,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(negate)
                 .or(not)
                 .or(positive)
-                .boxed();
+                ;
             let binary = unary
                 .clone()
                 .foldl_with(
@@ -476,7 +438,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                .boxed();
+                ;
 
             let comparison = binary
                 .clone()
@@ -493,7 +455,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                .boxed();
+                ;
 
             let shift = comparison
                 .clone()
@@ -506,7 +468,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                .boxed();
+                ;
 
             //
             let product = shift
@@ -521,7 +483,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                .boxed();
+                ;
 
             let sum = product
                 .clone()
@@ -534,7 +496,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                .boxed();
+                ;
 
             // @TODO: Investigate complex pattern mattching, for now use it as glorified `if`
             // assignment
@@ -543,7 +505,7 @@ impl<'parser> ParserBuilder<'parser> {
         })
         .map_with(|value, e| (e.span(), Box::new(Expression::Expr(value))))
         .labelled("expression")
-        .boxed()
+        
         .memoized()
     }
 
@@ -555,7 +517,7 @@ impl<'parser> ParserBuilder<'parser> {
         self.expression()
             .then_ignore(op!(';'))
             .map_with(output!(ExprStatement))
-            .boxed()
+            
     }
 
     fn statement(
@@ -571,16 +533,16 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(output!(Block))
                 // .map_with(output!(Scope))
                 .delimited_by(op!('{'), op!('}'))
-                .boxed();
+                ;
 
             let else_ = |if_| {
                 {
                     op!("else")
                         .ignore_then(choice((if_, stmt)))
-                        .boxed()
+                        
                         .or_not()
                 }
-                .boxed()
+                
             };
 
             let if_ = recursive(|if_| {
@@ -600,7 +562,7 @@ impl<'parser> ParserBuilder<'parser> {
                         )
                     })
             })
-            .boxed();
+            ;
 
             let for_ = text::keyword("for")
                 .padded()
@@ -618,7 +580,7 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 })
-                .boxed();
+                ;
 
             let while_ = text::keyword("while")
                 .ignore_then(self.expression())
@@ -633,9 +595,9 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 })
-                .boxed();
+                ;
 
-            let loop_ = for_.or(while_).boxed();
+            let loop_ = for_.or(while_);
 
             let declaration = text::keyword("let")
                 .padded()
@@ -655,7 +617,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Fragment(vals)))
                 })
                 .then_ignore(op!(';'))
-                .boxed();
+                ;
 
             let constant = text::keyword("const")
                 .padded()
@@ -676,7 +638,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Fragment(vals)))
                 })
                 .then_ignore(op!(';'))
-                .boxed();
+                ;
 
             let print = text::keyword("print")
                 .padded()
@@ -694,7 +656,24 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(format, params), e| {
                     (e.span(), Box::new(Expression::Print(format, params)))
                 })
-                .boxed();
+                ;
+            let format = text::keyword("fmt")
+                .padded()
+                .ignore_then(
+                    self.expression()
+                        .then(
+                            op!(',')
+                                .ignore_then(self.expression())
+                                .repeated()
+                                .collect::<Vec<_>>()
+                                .or_not(),
+                        )
+                        .then_ignore(op!(';')),
+                )
+                .map_with(|(format, params), e| {
+                    (e.span(), Box::new(Expression::Format(format, params)))
+                })
+                ;
             let deferred = text::keyword("defer")
                 .padded()
                 .ignore_then(
@@ -712,22 +691,23 @@ impl<'parser> ParserBuilder<'parser> {
                         )),
                     )
                 })
-                .boxed();
+                ;
 
             let return_ = text::keyword("return")
                 .padded()
                 .ignore_then(self.expression().then_ignore(op!(';')))
                 .map_with(output!(Return))
-                .boxed();
+                ;
             let yield_ = text::keyword("yield")
                 .padded()
                 .ignore_then(self.expression().then_ignore(op!(';')))
                 .map_with(output!(Yield))
-                .boxed();
+                ;
 
             choice((
                 deferred,
                 print,
+                format,
                 yield_,
                 return_,
                 if_,
@@ -739,7 +719,7 @@ impl<'parser> ParserBuilder<'parser> {
                 block,
             ))
             .map_with(|value, e| (e.span(), Box::new(Expression::Statement(value))))
-            .boxed()
+            
         })
     }
 
@@ -752,9 +732,8 @@ impl<'parser> ParserBuilder<'parser> {
             .repeated()
             .collect()
             .map_with(output!(Block))
-            // .map_with(output!(Scope))
             .delimited_by(op!('{'), op!('}'))
-            .boxed()
+            
     }
 
     fn args(
@@ -774,7 +753,7 @@ impl<'parser> ParserBuilder<'parser> {
             .collect::<Vec<_>>()
             .or_not()
             .delimited_by(op!('('), op!(')'))
-            .boxed()
+            
     }
 
     fn func(
@@ -811,7 +790,7 @@ impl<'parser> ParserBuilder<'parser> {
                     }),
                 )
             })
-            .boxed()
+            
     }
 
     fn use_(
@@ -832,7 +811,7 @@ impl<'parser> ParserBuilder<'parser> {
             .repeated()
             .collect::<Vec<_>>()
             .delimited_by(op!('{'), op!('}'))
-            .boxed();
+            ;
 
         text::keyword("use")
             .padded()
@@ -896,30 +875,19 @@ impl<'parser> ParserBuilder<'parser> {
 
     pub fn parse(
         &self,
-        filename: String,
         src: &'parser str,
-    ) -> Result<Output<'parser>, ParserError> {
+    ) -> Result<Output<'parser>, HashSet<common::Message>> {
         match self.build().parse(src).into_result() {
             Ok(ast) => Ok(ast),
             Err(errs) => {
-                errs.clone().into_iter().for_each(|e: Rich<'_, char>| {
-                    Report::build(ReportKind::Error, (filename.clone(), e.span().into_range()))
-                        .with_config(
-                            Config::new()
-                                .with_index_type(IndexType::Byte)
-                                .with_compact(false),
-                        )
-                        .with_message(e.to_string())
-                        .with_label(
-                            Label::new((filename.clone(), e.span().into_range()))
-                                .with_color(Color::Red),
-                        )
-                        .finish()
-                        .eprint(sources([(filename.clone(), src)]))
-                        .unwrap()
+                let mut messages = HashSet::with_capacity(errs.len());
+                errs.into_iter().for_each(|err| {
+                    let message = Message::error(err.to_string(), err.span().into_range());
+
+                    messages.insert(message);
                 });
 
-                Err("Parser errors".into())
+                Err(messages)
             }
         }
     }

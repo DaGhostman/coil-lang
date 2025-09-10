@@ -17,7 +17,7 @@ pub enum FrameState {
 
 #[derive(Clone)]
 pub struct Frame<T: Default> {
-    state: FrameState,
+    // state: FrameState,
     // ---
     ip: usize,
     // ---
@@ -28,7 +28,7 @@ impl<T: Default> Default for Frame<T> {
     fn default() -> Self {
         Self {
             ip: 0,
-            state: FrameState::default(),
+            // state: FrameState::default(),
             stack: ArrayVec::default(),
         }
     }
@@ -73,41 +73,41 @@ impl<T: Default> Frame<T> {
         self.stack.get_mut()
     }
 
-    pub fn status(&self) -> FrameState {
-        self.state
-    }
-
-    pub fn is(&self, state: FrameState) -> bool {
-        self.state == state
-    }
-
-    pub fn suspend(&mut self) {
-        self.state = FrameState::SUSPENDED;
-    }
-
-    pub fn start(&mut self) {
-        self.state = FrameState::STARTED;
-    }
-
-    pub fn terminate(&mut self) {
-        self.state = FrameState::TERMINATED;
-    }
-
-    pub fn complete(&mut self) {
-        self.state = FrameState::COMPLETE;
-    }
-
+    // pub fn status(&self) -> FrameState {
+    //     self.state
+    // }
+    //
+    // pub fn is(&self, state: FrameState) -> bool {
+    //     self.state == state
+    // }
+    //
+    // pub fn suspend(&mut self) {
+    //     self.state = FrameState::SUSPENDED;
+    // }
+    //
+    // pub fn start(&mut self) {
+    //     self.state = FrameState::STARTED;
+    // }
+    //
+    // pub fn terminate(&mut self) {
+    //     self.state = FrameState::TERMINATED;
+    // }
+    //
+    // pub fn complete(&mut self) {
+    //     self.state = FrameState::COMPLETE;
+    // }
+    //
     pub fn resume(&mut self, value: T) {
-        self.state = FrameState::PENDING;
+        // self.state = FrameState::PENDING;
         self.stack.push(value);
     }
-
-    pub fn is_pending(&self) -> bool {
-        self.state == FrameState::PENDING
-    }
+    //
+    // pub fn is_pending(&self) -> bool {
+    //     self.state == FrameState::PENDING
+    // }
 
     pub fn enter(&mut self, ip: usize) {
-        self.state = FrameState::default();
+        // self.state = FrameState::default();
         self.ip = ip;
         self.stack.seek(0);
     }

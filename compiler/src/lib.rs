@@ -1,18 +1,20 @@
 mod typechecker;
+mod pipeline;
 
-use std::{borrow::Borrow, collections::HashMap};
+use std::{borrow::Borrow, collections::{HashMap, HashSet}};
 
-use common::{Byte, Instruction, Interner, Value, likely, unlikely};
+use common::{likely, unlikely, Byte, Instruction, Interner, Message, Value};
 use parser::{Expression, SimpleSpan};
 
 use regex::Regex;
 pub use typechecker::*;
+pub use pipeline::*;
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
         $result.append(&mut $self.do_compile($rhs));
 
-        bytecode.push($instruction);
+        $result.push($instruction);
     };
 }
 macro_rules! binary {
@@ -34,20 +36,40 @@ struct Context {
     prev: Option<Box<Self>>,
 }
 
-#[derive(Default)]
 pub struct Compiler {
     bytecode: Vec<Byte<Value>>,
-    _aliases: HashMap<String, String>,
+    aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
-    _methods: HashMap<String, usize>,
-    // defers: Vec<(usize, usize, Vec<Byte<Value>>)>,
-    // variables: Interner<String>,
-    // constants: HashMap<usize, bool>,
+    native: HashMap<String, usize>,
     // --
-    messages: Vec<(SimpleSpan, String)>,
+    messages: HashSet<Message>,
     context: Context,
-
+    // --
     typechecker: Typechecker,
+}
+
+impl Default for Compiler {
+
+    fn default() -> Self {
+        let mut bytecode = Vec::with_capacity(1024);
+        bytecode.append(&mut vec![
+            Byte::new_with_operands(Instruction::CALL, [usize::MAX, 0]),
+            Byte::new(Instruction::HALT),
+        ]);
+
+
+        Self {
+            bytecode,
+            aliases: HashMap::default(),
+            functions: HashMap::with_capacity(32),
+            native: HashMap::default(),
+            // ---
+            messages: HashSet::default(),
+            context: Context::default(),
+            // ---
+            typechecker: Typechecker::default(),
+        }
+    }
 }
 
 impl<'ctx> Context {
@@ -68,7 +90,20 @@ impl<'ctx> Context {
     }
 }
 
+
 impl Compiler {
+    pub fn get_function(&self, name: &str) -> usize {
+        self.functions[name]
+    }
+
+    pub fn register(&mut self, name: &str, params: &[Type], returns: Type) -> &mut Self {
+        let idx = self.native.len();
+        self.native.insert(name.to_string(), idx);
+        self.typechecker.register_native_function(name, params, returns);
+
+        self
+    }
+
     fn resolve_variable<'compiler>(
         &self,
         variable: &(SimpleSpan, Box<Expression<'compiler>>),
@@ -82,16 +117,27 @@ impl Compiler {
         }
     }
 
+    fn typecheck<'check>(&mut self, ast: &(SimpleSpan, Box<Expression<'check>>)) -> Type {
+        self.typechecker.check(ast).map_err(|messages| {
+            messages.iter().for_each(|e| {
+                self.messages.insert(e.clone());
+            });
+        }).unwrap_or_default()
+    }
+
     pub fn do_compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte<Value>> {
         let mut bytecode = vec![];
-        let type_ = self.typechecker.check(ast).unwrap_or_default();
+        let _ = self.typecheck(ast);
         let (span, child) = ast;
 
         match child.borrow() {
             Expression::Comment(_) => (),
+            Expression::Use { path: _, name, alias } => {
+                self.aliases.insert(alias.clone().unwrap_or(name.to_string()), name.to_string());
+            }
             Expression::Program(children) | Expression::Fragment(children) => {
                 for child in children {
                     bytecode.append(&mut self.do_compile(child));
@@ -112,11 +158,6 @@ impl Compiler {
                 returns: _returns,
                 body,
             } => {
-                // let variables = self.variables.clone();
-                // let constants = self.constants.clone();
-                // self.variables = Interner::default();
-                // self.constants.clear();
-
                 self.functions.insert(name.to_string(), self.bytecode.len());
 
                 for arg in args {
@@ -140,9 +181,6 @@ impl Compiler {
                 self.bytecode
                     .push(Byte::new_with_value(Instruction::CONST, Value::default()));
                 self.bytecode.push(Byte::new(Instruction::RETURN));
-
-                // self.variables = variables;
-                // self.constants = constants;
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -160,7 +198,19 @@ impl Compiler {
                         bytecode.append(&mut self.do_compile(param));
                     });
                 }
-                bytecode.push(Byte::new_with_operands(Instruction::PRINT, [params_len, 0]));
+                bytecode.push(Byte::new_with_operands(Instruction::FORMAT, [params_len, 0]));
+                bytecode.push(Byte::new(Instruction::PRINT));
+            }
+            Expression::Format(format, params) => {
+                bytecode.append(&mut self.do_compile(format));
+                let mut params_len = 0;
+                if let Some(params) = params {
+                    params_len = params.len();
+                    params.iter().for_each(|param| {
+                        bytecode.append(&mut self.do_compile(param));
+                    });
+                }
+                bytecode.push(Byte::new_with_operands(Instruction::FORMAT, [params_len, 0]));
             }
             Expression::Return(child) | Expression::ImplicitReturn(child) => {
                 for (offset, arity, x) in self.context.defers.iter() {
@@ -206,23 +256,33 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
-                let n = self.resolve_variable(name);
+                let identifier = self.resolve_variable(name);
+                let n = self.aliases.get(&identifier).unwrap_or(&identifier);
 
-                let offset = self.functions[&n];
-                for arg in args {
-                    bytecode.append(&mut self.do_compile(arg));
+                if let Some(offset) = self.functions.get(n).copied() {
+                    for arg in args {
+                        bytecode.append(&mut self.do_compile(arg));
+                    }
+
+                    bytecode.push(Byte::new_with_operands(
+                        Instruction::CALL,
+                        [offset, args.len()],
+                    ))
+                } else if let Some(offset) = self.native.get(n) {
+                    bytecode.push(Byte::new_with_operands(
+                        Instruction::NATIVE,
+                        [*offset, args.len()],
+                    ))
+                } else {
+                    self.messages.insert(Message::error(format!("Unable to call unknown function '{}'", n), span.into_range()));
                 }
-                bytecode.push(Byte::new_with_operands(
-                    Instruction::CALL,
-                    [offset, args.len()],
-                ))
             }
             Expression::Identifier(n) => {
                 if let Some(symbol) = self.context.variables.key(&n.to_string()) {
                     bytecode.push(Byte::new_with_operands(Instruction::LOAD, [symbol, 0]));
                 } else {
                     self.messages
-                        .push((*span, format!("Unknown variable '{}'", n)));
+                        .insert(Message::error(format!("Unknown variable '{}'", n), span.into_range()));
                 }
             }
             Expression::If {
@@ -255,7 +315,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if self.typecheck(lhs) == Type::FLOAT {
                             Instruction::LEF
                         } else {
                             Instruction::LE
@@ -270,7 +330,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if self.typecheck(lhs) == Type::FLOAT {
                             Instruction::GTF
                         } else {
                             Instruction::GT
@@ -285,7 +345,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if self.typecheck(lhs) == Type::FLOAT {
                             Instruction::GTF
                         } else {
                             Instruction::GT
@@ -302,7 +362,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if self.typecheck(lhs) == Type::FLOAT {
                             Instruction::LEF
                         } else {
                             Instruction::LE
@@ -317,6 +377,12 @@ impl Compiler {
 
                 bytecode.push(Byte::new(Instruction::NOT))
             }
+            Expression::Not(lhs) => {
+                unary!(bytecode, self, lhs, Byte::new(Instruction::NOT));
+            }
+            Expression::Negate(lhs) => {
+                unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
+            }
             Expression::Add(lhs, rhs) => {
                 binary!(
                     bytecode,
@@ -324,7 +390,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if likely(self.typecheck(lhs) == Type::FLOAT) {
                             Instruction::ADDF
                         } else {
                             Instruction::ADD
@@ -339,7 +405,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if likely(self.typecheck(lhs) == Type::FLOAT) {
                             Instruction::SUBF
                         } else {
                             Instruction::SUB
@@ -354,7 +420,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if likely(self.typecheck(lhs) == Type::FLOAT) {
                             Instruction::MULF
                         } else {
                             Instruction::MUL
@@ -369,7 +435,7 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(
-                        if self.typechecker.check(lhs).unwrap_or_default() == Type::FLOAT {
+                        if likely(self.typecheck(lhs) == Type::FLOAT) {
                             Instruction::DIVF
                         } else {
                             Instruction::DIV
@@ -379,7 +445,7 @@ impl Compiler {
             }
             Expression::Integer(num) => bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
-                Value::from(*num as i64),
+                Value::from(*num),
             )),
             Expression::Bool(state) => bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
@@ -434,7 +500,7 @@ impl Compiler {
 
                 if unlikely(self.context.variables.contains(&name)) {
                     self.messages
-                        .push((*span, format!("Variable '{}' already declared", name)));
+                        .insert(Message::error(format!("Variable '{}' already declared", name), span.into_range()));
                 }
 
                 self.context.variables.intern(name);
@@ -443,7 +509,7 @@ impl Compiler {
                 let name = self.resolve_variable(name);
                 if self.context.variables.contains(&name) {
                     self.messages
-                        .push((*span, format!("Constant '{}' already declared", name)));
+                        .insert(Message::error(format!("Constant '{}' already declared", name), span.into_range()));
                 }
 
                 let symbol = self.context.variables.intern(name.clone());
@@ -462,12 +528,12 @@ impl Compiler {
                                 *state = true;
                             });
                         } else {
-                            self.messages.push((
-                                *span,
+                            self.messages.insert(Message::error(
                                 format!(
                                     "Unable to assign to an already assigned constant '{}'",
                                     name
                                 ),
+                                span.into_range(),
                             ));
                         }
                     }
@@ -477,18 +543,18 @@ impl Compiler {
                     bytecode.append(&mut expr);
                     bytecode.push(Byte::new_with_operands(Instruction::STORE, [symbol, 0]));
                 } else {
-                    self.messages.push((
-                        *span,
+                    self.messages.insert(Message::error(
                         format!(
                             "Unable to assign to a non-existing variable/constant '{}'",
                             name
                         ),
-                    ))
+                        span.into_range(),
+                    ));
                 }
             }
             _expr => {
                 self.messages
-                    .push((*span, format!("Unable to compile expression")));
+                    .insert(Message::error("Unable to compile expression".to_string(), span.into_range()));
                 #[cfg(debug_assertions)]
                 dbg!(_expr);
             }
@@ -500,22 +566,15 @@ impl Compiler {
     pub fn compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
-    ) -> Result<Vec<Byte<Value>>, Vec<(SimpleSpan, String)>> {
-        self.bytecode = vec![
-            Byte::new_with_operands(Instruction::CALL, [usize::MAX, 0]),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut program = self.do_compile(ast);
-        self.bytecode.append(&mut program);
+    ) -> Result<Vec<Byte<Value>>, HashSet<Message>> {
+            let mut program = self.do_compile(ast);
+            self.bytecode.append(&mut program);
 
-        if let Some(v) = self.bytecode.first_mut() {
-            *v = Byte::new_with_operands(Instruction::CALL, [self.functions["main"], 0]);
-        }
 
-        if self.messages.len() > 0 {
+        if !self.messages.is_empty() {
             Err(self.messages.clone())
         } else {
-            Ok(self.bytecode.clone())
+            Ok(self.bytecode.drain(0..).collect())
         }
     }
 }

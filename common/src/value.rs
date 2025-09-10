@@ -23,6 +23,12 @@ impl From<bool> for Value {
     }
 }
 
+impl From<u64> for Value {
+    fn from(value: u64) -> Self {
+        Self::new(value as _)
+    }
+}
+
 impl<T> From<NonNull<T>> for Value {
     fn from(value: NonNull<T>) -> Self {
         Self::new(value.as_ptr() as _)

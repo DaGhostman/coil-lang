@@ -1,38 +1,11 @@
-use common::{ArrayVec, Value, likely, unlikely};
+use std::collections::HashMap;
+
+use common::{ArrayVec, Value, likely, promise, unlikely};
 
 use crate::{
     Byte, Coroutine, Frame, Heap, Instruction, Object,
     garbage::{Collectable, GcSized},
 };
-
-use std::string::String as RustString;
-
-pub struct Machine<const S: usize> {
-    frames: ArrayVec<Frame<Value>, S>,
-    heap: Heap<1024>,
-    // handler: ArrayVec<
-    //     Option<&'vm dyn Fn(&mut Frame<Value>, &Byte<Value>) -> Option<ExecutionResult>>,
-    //     255,
-    // >,
-}
-
-#[derive(Default, Copy, Clone)]
-#[repr(u8)]
-enum ExecutionOutcome {
-    #[default]
-    INVALID,
-    CALL,
-    RESUME,
-    RETURN,
-    TERMINATION,
-}
-
-#[derive(Default)]
-struct ExecutionResult {
-    outcome: ExecutionOutcome,
-    ip: usize,
-    arity: usize,
-}
 
 macro_rules! ibinary_op {
     ($frame: expr, $op:tt) => {
@@ -45,7 +18,6 @@ macro_rules! ibinary_op {
     }
 
 }
-
 macro_rules! fbinary_op {
     ($frame: expr, $op:tt) => {
         {
@@ -70,6 +42,68 @@ macro_rules! binary_op {
 
 }
 
+macro_rules! unary_op {
+    ($frame: expr, $op: tt) => {
+        let rhs = $frame.peek().as_int();
+
+        *$frame.top() = Value::from($op rhs);
+    }
+}
+
+macro_rules! ibinary_handler {
+    ($op: tt) => {
+        #[inline]
+        |frame, _, _, _, _,| { ibinary_op!(frame, $op); None}
+    }
+}
+
+macro_rules! fbinary_handler {
+    ($op: tt) => {
+        #[inline]
+        |frame, _, _, _, _,| { fbinary_op!(frame, $op); None}
+    }
+}
+
+macro_rules! binary_handler {
+    ($op: tt) => {
+        #[inline]
+        |frame, _, _, _, _,| { binary_op!(frame, $op); None}
+    }
+}
+
+macro_rules! unary_handler {
+    ($op: tt) => {
+        #[inline]
+        |frame, _, _, _, _,| { unary_op!(frame, $op); None}
+    }
+}
+
+type External = fn(&[Value], &mut Heap<1024>) -> Value;
+
+pub struct Machine<const S: usize> {
+    frames: ArrayVec<Frame<Value>, S>,
+    heap: Heap<1024>,
+
+    native: HashMap<usize, External>,
+}
+
+#[derive(Default, Copy, Clone)]
+#[repr(u8)]
+enum ExecutionOutcome {
+    #[default]
+    INVALID,
+    CALL,
+    RESUME,
+    RETURN,
+    TERMINATION,
+}
+
+#[derive(Default)]
+struct ExecutionResult {
+    outcome: ExecutionOutcome,
+    ip: usize,
+    arity: usize,
+}
 impl ExecutionResult {
     pub fn returns() -> Self {
         Self {
@@ -132,7 +166,14 @@ impl<const S: usize> Default for Machine<S> {
             frames,
             heap: Heap::default(),
             // handler: ArrayVec::default(),
+            native: HashMap::with_capacity(32),
         }
+    }
+}
+
+impl<const S: usize> Machine<S> {
+    pub fn register(&mut self, name: usize, func: External) {
+        self.native.insert(name, func);
     }
 }
 
@@ -205,12 +246,15 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn run(&mut self, code: &[Byte<Value>]) {
+        if code.len() == 0 {
+            return;
+        }
+
         loop {
             let result = self.execute(code);
 
             match result.outcome() {
                 ExecutionOutcome::CALL => {
-                    likely(true);
                     self.frames.current_mut().enter(result.tell());
 
                     for _ in 0..result.arity() {
@@ -221,7 +265,6 @@ impl<const S: usize> Machine<S> {
                     self.frames.consume();
                 }
                 ExecutionOutcome::RETURN => {
-                    likely(true);
                     let v = *self.frames.get_mut().pop();
 
                     self.frames.pop();
@@ -253,11 +296,17 @@ impl<const S: usize> Machine<S> {
         let frame = self.frames.get_mut();
         let mut ip = frame.tell();
 
-        while likely(ip < code.len()) {
+        while ip < code.len() {
+            promise!(code.len() > ip);
             let opcode = &code[ip];
+            ip += 1;
+            frame.seek(ip);
 
             #[cfg(debug_assertions)]
             {
+                if frame_no > 35 {
+                    panic!("ENOUGH");
+                }
                 eprintln!(
                     "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
                     frame_no,
@@ -269,46 +318,36 @@ impl<const S: usize> Machine<S> {
                 );
             }
 
-            ip += 1;
-            frame.seek(ip);
-
-            // if let Some(handler) = self.handler[(*opcode.bytecode() as u8) as usize] {
-            //     let result = handler(frame, opcode);
-            //     ip = frame.tell();
-            //
-            //     if let Some(result) = result {
-            //         return result;
-            //     } else {
-            //         unlikely(true);
-            //     }
-            // } else {
-            //     unlikely(true);
-            // }
+            // promise!(HANDLERS.len() > opcode.bytecode() as u8 as usize);
+            // if let Some(outcome) = HANDLERS[opcode.bytecode() as u8 as usize](
+            //     frame,
+            //     &opcode,
+            //     &mut ip,
+            //     code,
+            //     &mut self.heap,
+            // ) {
+            //     return outcome;
+            // } 
 
             match opcode.bytecode() {
-                // Instruction::DUP => {
-                //     let value = *frame.peek();
-                //
-                //     frame.push(value);
-                // }
                 Instruction::POP => {
                     frame.pop();
                 }
                 Instruction::CONST => frame.push(opcode.constant()),
                 Instruction::STORE => {
-                    likely(true);
-
                     let val = *frame.peek();
                     frame.store(opcode.operand(0), val);
                 }
                 Instruction::LOAD => {
-                    likely(true);
-
                     frame.push(*frame.load(opcode.operand(0)));
                 }
                 Instruction::NOT => {
                     let lhs = frame.peek().raw();
                     frame.top().replace(!lhs);
+                }
+                Instruction::NEG => {
+                    let lhs = frame.peek().raw();
+                    frame.top().replace(-(lhs as i64) as u64);
                 }
                 Instruction::ADD => ibinary_op!(frame, +),
                 Instruction::SUB => ibinary_op!(frame, -),
@@ -326,7 +365,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::MULF => fbinary_op!(frame, *),
                 Instruction::DIVF => fbinary_op!(frame, /),
                 Instruction::MODF => fbinary_op!(frame, %),
-                Instruction::PRINT => {
+                Instruction::FORMAT => {
                     let mut message = String::new();
                     let num_params = opcode.operand(0);
                     if num_params == 0 {
@@ -347,14 +386,12 @@ impl<const S: usize> Machine<S> {
                         let mut n = 0;
                         let mut param = 0;
                         while n < byte_format.len() {
-                            if '%' == byte_format[n]
-                                && (n == 0 || '\\' != byte_format[n - 1].into())
-                            {
+                            if '%' == byte_format[n] && (n == 0 || '\\' != byte_format[n - 1]) {
                                 if params.len() <= param {
                                     todo!("Handle within typechecker");
                                 }
                                 n += 1;
-                                match byte_format[n] as char {
+                                match byte_format[n] {
                                     'i' => {
                                         n += 1;
 
@@ -380,13 +417,10 @@ impl<const S: usize> Machine<S> {
                                     's' => {
                                         n += 1;
                                         message.push_str(
-                                            format!(
-                                                "{}",
-                                                Collectable::<String>::from(params[param].as_ptr())
-                                                    .as_ref()
-                                                    .to_string()
-                                            )
-                                            .as_str(),
+                                            Collectable::<String>::from(params[param].as_ptr())
+                                                .as_ref()
+                                                .to_string()
+                                                .as_str(),
                                         );
                                         param += 1;
                                     }
@@ -408,9 +442,8 @@ impl<const S: usize> Machine<S> {
                                     }
                                     'u' => {
                                         n += 1;
-                                        message.push_str(
-                                            format!("{:08x}", params[param].raw()).as_str(),
-                                        );
+                                        message
+                                            .push_str(format!("{}", params[param].raw()).as_str());
                                         param += 1;
                                     }
                                     'p' => {
@@ -425,72 +458,56 @@ impl<const S: usize> Machine<S> {
                                         param += 1;
                                     }
                                     _ => {
-                                        message.push(byte_format[n].into());
+                                        message.push(byte_format[n]);
                                     }
                                 }
                                 continue;
                             }
 
-                            message.push(byte_format[n].into());
+                            message.push(byte_format[n]);
                             n += 1;
                         }
                     }
-                    print!("{}", message)
+
+                    let (_, collectable) = self.heap.alloc(message.into(), Object::String);
+
+                    frame.push(Value::from(collectable.ptr()));
                 }
-                // Instruction::PRINTF => println!("{:.?}", frame.pop().as_float()),
-                // Instruction::PRINTB => println!("{}", frame.pop().as_bool()),
-                // Instruction::PRINTS => {
-                //     println!(
-                //         "{}",
-                //         Collectable::<String>::from(frame.pop().as_ptr()).as_ref()
-                //     )
-                // }
+                Instruction::PRINT => {
+                    print!(
+                        "{}",
+                        Collectable::<String>::from(frame.pop().as_ptr())
+                            .as_ref()
+                            .to_string()
+                    );
+                }
                 Instruction::JMP => {
                     ip = opcode.operand(0);
                 }
-                // Instruction::JLE => {
-                //     let rhs = frame.pop().raw();
-                //     let lhs = frame.pop().raw();
-                //
-                //     if lhs < rhs {
-                //         ip = opcode.operand(0) ;
-                //     }
-                // }
-                // Instruction::JGT => {
-                //     let rhs = frame.pop().raw();
-                //     let lhs = frame.pop().raw();
-                //
-                //     if lhs > rhs {
-                //         ip = opcode.operand(0) ;
-                //     }
-                // }
-                // Instruction::JEQ => {
-                //     let rhs = frame.pop().raw();
-                //     let lhs = frame.pop().raw();
-                //
-                //     if lhs == rhs {
-                //         ip = opcode.operand(0) ;
-                //     }
-                // }
                 Instruction::JMPF => {
-                    if likely(!frame.pop().as_bool()) {
+                    if !frame.pop().as_bool() {
                         ip = opcode.operand(0);
                     }
                 }
-                // Instruction::JMPT => {
-                //     if likely(frame.pop().as_bool()) {
-                //         ip = opcode.operand(0);
-                //     }
-                // }
+                Instruction::JMPT => {
+                    if frame.pop().as_bool() {
+                        ip = opcode.operand(0);
+                    }
+                }
                 Instruction::CALL => {
-                    likely(true);
-                    frame.suspend();
+                    // frame.suspend();
 
                     return ExecutionResult::call(opcode.operand(0), opcode.operand(1));
                 }
+                Instruction::NATIVE => {
+                    let arity = opcode.operand(1);
+                    let args = (0..arity).map(|_| *frame.pop()).collect::<Vec<_>>();
+                    let result = self.native[&opcode.operand(0)](&args, &mut self.heap);
+
+                    frame.push(result);
+                }
                 Instruction::RETURN => {
-                    likely(true);
-                    frame.complete();
+                    // frame.complete();
 
                     return ExecutionResult::returns();
                 }
@@ -517,8 +534,7 @@ impl<const S: usize> Machine<S> {
                 //     }
                 // }
                 Instruction::HALT => {
-                    unlikely(true);
-                    frame.terminate();
+                    // frame.terminate();
 
                     return ExecutionResult::terminate();
                 }
@@ -563,11 +579,11 @@ mod tests {
     #[test]
     fn test_addition() {
         let cases = [
-            // (
-            //     Byte::new_with(Instruction::CONST, [0, 0], Value::from(2.0)),
-            //     Value::from(4.0),
-            //     Instruction::ADDF,
-            // ),
+            (
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Value::from(4.0),
+                Instruction::ADDF,
+            ),
             (
                 Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(4),
@@ -586,11 +602,11 @@ mod tests {
     #[test]
     fn test_subtraction() {
         let cases = [
-            // (
-            //     Byte::new_with(Instruction::CONST, [0, 0], Value::from(2.0)),
-            //     Value::from(0.0),
-            //     Instruction::SUBF,
-            // ),
+            (
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Value::from(0.0),
+                Instruction::SUBF,
+            ),
             (
                 Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(0),
@@ -609,11 +625,11 @@ mod tests {
     #[test]
     fn test_multiplication() {
         let cases = [
-            // (
-            //     Byte::new_with(Instruction::CONST, [0, 0], Value::from(2.0)),
-            //     Value::from(4.0),
-            //     Instruction::MULF,
-            // ),
+            (
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Value::from(4.0),
+                Instruction::MULF,
+            ),
             (
                 Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(4),
@@ -632,11 +648,11 @@ mod tests {
     #[test]
     fn test_division() {
         let cases = [
-            // (
-            //     Byte::new_with(Instruction::CONST, [0, 0], Value::from(2.0)),
-            //     Value::from(1.0),
-            //     Instruction::DIVF,
-            // ),
+            (
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Value::from(1.0),
+                Instruction::DIVF,
+            ),
             (
                 Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(1),
@@ -655,11 +671,11 @@ mod tests {
     #[test]
     fn test_jumps() {
         let cases = [
-            // (
-            //     Byte::new_with(Instruction::CONST, [0, 0], Value::from(2.0)),
-            //     Value::from(1.0),
-            //     Instruction::DIVF,
-            // ),
+            (
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Value::from(1.0),
+                Instruction::DIVF,
+            ),
             (
                 Byte::new_with_value(Instruction::CONST, Value::from(2)),
                 Value::from(1),

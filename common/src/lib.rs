@@ -2,11 +2,13 @@ mod array_vec;
 mod interner;
 mod opcode;
 mod value;
+mod message;
 
 pub use array_vec::*;
 pub use interner::*;
 pub use opcode::*;
 pub use value::*;
+pub use message::*;
 
 #[macro_export]
 macro_rules! promise {

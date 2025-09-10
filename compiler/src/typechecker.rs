@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
+use common::Message;
 use parser::{Expression, SimpleSpan};
 
 #[derive(Default)]
@@ -11,7 +12,7 @@ pub struct Typechecker {
     variables: HashMap<String, Type>,
 
     // --
-    messages: HashSet<(SimpleSpan, String)>,
+    messages: HashSet<Message>,
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -71,42 +72,15 @@ impl Typechecker {
         }
     }
 
-    // fn resolve_expr<'compiler>(&self, expr: &(SimpleSpan, Box<Expression<'compiler>>)) -> Type {
-    //     match expr.1.borrow() {
-    //         Expression::Integer(_) => Type::INTEGER,
-    //         Expression::Bool(_) => Type::BOOLEAN,
-    //         Expression::String(_) => Type::STRING,
-    //         Expression::Float(_) => Type::FLOAT,
-    //         Expression::Expr(stmt) => self.resolve_expr(stmt),
-    //         Expression::Type(v) => v.to_string().into(),
-    //         Expression::Call { name, .. } => {
-    //             let name = self.resolve_variable(name);
-    //
-    //             if let Some(func) = self.functions.get(&name) {
-    //                 func.1.clone()
-    //             } else {
-    //                 Type::default()
-    //             }
-    //         }
-    //         Expression::Identifier(n) => {
-    //             if let Some(var) = self.variables.get(&n.to_string()) {
-    //                 var.clone()
-    //             } else {
-    //                 Type::default()
-    //             }
-    //         }
-    //         Expression::Constant(_, ty) | Expression::Variable(_, ty) => ty
-    //             .as_ref()
-    //             .map(|v| self.resolve_expr(&v))
-    //             .unwrap_or_default(),
-    //         x => panic!("Unable to resolve {:?}", x),
-    //     }
-    // }
+    pub fn register_native_function(&mut self, name: &str, params: &[Type], returns: Type) {
+        self.functions
+            .insert(name.to_string(), (params.to_vec(), returns));
+    }
 
-    pub fn check<'tc>(
+    pub fn check<'check>(
         &mut self,
-        ast: &(SimpleSpan, Box<Expression<'tc>>),
-    ) -> Result<Type, Vec<(SimpleSpan, String)>> {
+        ast: &(SimpleSpan, Box<Expression<'check>>),
+    ) -> Result<Type, HashSet<Message>> {
         let (span, child) = ast;
 
         let result = match child.borrow() {
@@ -125,7 +99,7 @@ impl Typechecker {
             Expression::Constant(name, ty) | Expression::Variable(name, ty) => {
                 let t = if ty.is_some() {
                     ty.as_ref()
-                        .map(|v| self.check(&v).unwrap_or_default())
+                        .map(|v| self.check(v).unwrap_or_default())
                         .unwrap_or_default()
                 } else {
                     Type::default()
@@ -147,7 +121,7 @@ impl Typechecker {
 
                 let args = args
                     .iter()
-                    .map(|arg| self.check(&arg).unwrap_or_default())
+                    .map(|arg| self.check(arg).unwrap_or_default())
                     .collect::<Vec<_>>();
 
                 self.functions.insert(
@@ -162,7 +136,7 @@ impl Typechecker {
                 );
 
                 body.iter().for_each(|stmt| {
-                    let _ = self.check(&stmt);
+                    let _ = self.check(stmt);
                 });
 
                 self.variables = variables;
@@ -172,17 +146,6 @@ impl Typechecker {
                     .map(|return_| self.check(&return_).unwrap_or_default())
                     .unwrap_or_default()
             }
-            // Expression::Constant(name, t) | Expression::Variable(name, t) => {
-            //     self.variables.insert(
-            //         self.resolve_variable(name),
-            //         t.clone()
-            //             .map(|v| self.check(&v).unwrap_or_default())
-            //             .unwrap_or_default(),
-            //     );
-            //
-            //     t.map(|t| self.check(&t).unwrap_or_default())
-            //         .unwrap_or_default()
-            // }
             Expression::Assignment(name, value) => {
                 let name = self.resolve_variable(name);
                 let ty = self.check(value).unwrap_or_default();
@@ -196,7 +159,12 @@ impl Typechecker {
 
                             ty
                         } else if t != &ty {
-                            self.messages.insert((*span, format!("Unable to assign value of type '{}' to variable '{}' that is of type '{}'", ty.to_string(), name, t.to_string())));
+                            self.messages.insert(
+                                Message::error(
+                                    format!("Unable to assign value of type '{}' to variable '{}' that is of type '{}'", ty.to_string(), name, t.to_string()),
+                                    span.into_range()
+                                )
+                            );
                             Type::default()
                         } else {
                             Type::default()
@@ -217,63 +185,67 @@ impl Typechecker {
             }
             Expression::Statement(expr)
             | Expression::ExprStatement(expr)
-            | Expression::Expr(expr) => self.check(&expr)?,
-            Expression::Return(expr) => self.check(expr)?,
-            Expression::Print(fmt, _) => {
+            | Expression::Expr(expr)
+            | Expression::Return(expr) => self.check(expr)?,
+            Expression::Format(fmt, _) | Expression::Print(fmt, _) => {
                 let type_ = self.check(fmt).unwrap_or_default();
                 if type_ != Type::STRING {
-                    self.messages.insert((
-                        *span,
+                    self.messages.insert(Message::error(
                         format!(
                             "Print format must evaluate to string, '{}' given",
                             type_.to_string(),
                         ),
+                        span.into_range(),
                     ));
                 }
 
                 Type::NONE
             }
-            Expression::Comment(..) => Type::NONE,
+            Expression::Comment(..) | Expression::Use { .. } => Type::NONE,
             Expression::Call { name, args } => {
                 let name = self.resolve_variable(name);
                 let call_arity = args.len();
                 if let Some(func) = self.functions.get(&name).cloned() {
                     if call_arity != func.0.len() {
-                        self.messages.insert((
-                            *span,
+                        self.messages.insert(Message::error(
                             format!(
                                 "Function '{}' expects {} arguments, but called with {}",
                                 name,
                                 func.0.len(),
                                 call_arity
                             ),
+                            span.into_range(),
                         ));
                     } else {
                         for (idx, arg) in args.iter().enumerate() {
-                            let ty = self.check(arg).unwrap_or_default();
-                            if func.0[idx] != ty {
-                                self.messages.insert((
-                                    *span,
+                            match self.check(arg) {
+                                Ok(ty) => {
+                                    if func.0[idx] != ty {
+                                        self.messages.insert(Message::error(
                                     format!(
-                                        "Argument #{} of function '{}' is incorrect, expected '{}' but found '{}'",
+                                        "Argument #{} of function '{}' is incorrect, expected '{}' but got '{}'",
                                         idx + 1,
                                         name,
                                         func.0[idx].to_string(),
                                         ty.to_string(),
                                     ),
+                                    arg.0.into_range(),
                                 ));
-                            }
+                                    }
+                                }
+                                Err(_) => (),
+                            };
                         }
                     }
 
                     func.1.clone()
                 } else {
-                    self.messages.insert((
-                        *span,
+                    self.messages.insert(Message::error(
                         format!(
                             "Unable to check signature, becuase function '{}' does not exist",
                             name
                         ),
+                        span.into_range(),
                     ));
 
                     Type::default()
@@ -305,9 +277,9 @@ impl Typechecker {
                 let rhs = self.check(rhs).unwrap_or_default();
 
                 if lhs != rhs || (lhs != Type::INTEGER && lhs != Type::FLOAT) {
-                    self.messages.insert((
-                        *span,
-                        format!("Unable to perform arithmetic operation on non-numeric types."),
+                    self.messages.insert(Message::error(
+                        "Unable to perform arithmetic operation on non-numeric types.".to_string(),
+                        span.into_range(),
                     ));
 
                     Type::default()
@@ -325,9 +297,9 @@ impl Typechecker {
 
                 // @TODO: Handle `UNKNOWN` that is unable to resolve the function params
                 if lhs != rhs || lhs != Type::INTEGER {
-                    self.messages.insert((
-                        *span,
-                        format!("Unable to perform bitwise for non-numeric types."),
+                    self.messages.insert(Message::error(
+                        "Unable to perform bitwise for non-numeric types.".to_string(),
+                        span.into_range(),
                     ));
 
                     Type::default()
@@ -346,9 +318,9 @@ impl Typechecker {
 
                 // @TODO: Handle `UNKNOWN` that is unable to resolve the function params
                 if lhs != rhs {
-                    self.messages.insert((
-                        *span,
-                        format!("Unable to perform comparison of non-identical types."),
+                    self.messages.insert(Message::error(
+                        "Unable to perform comparison of non-identical types.".to_string(),
+                        span.into_range(),
                     ));
 
                     Type::default()
@@ -361,15 +333,17 @@ impl Typechecker {
             e => {
                 #[cfg(debug_assertions)]
                 dbg!(e);
-                self.messages
-                    .insert((*span, format!("Unknown expression '{:?}'", e)));
+                self.messages.insert(Message::error(
+                    format!("Unknown expression '{:?}'", e),
+                    span.into_range(),
+                ));
 
                 Type::default()
             }
         };
 
-        if self.messages.len() > 0 {
-            Err(self.messages.iter().cloned().collect::<Vec<_>>())
+        if !self.messages.is_empty() {
+            Err(self.messages.clone())
         } else {
             Ok(result)
         }
