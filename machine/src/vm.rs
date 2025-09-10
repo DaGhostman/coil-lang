@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use common::{ArrayVec, Value, likely, promise, unlikely};
+#[cfg(not(debug_assertions))]
+use common::likely;
+
+use common::{ArrayVec, SeekableIterator, Value, 
+    unlikely};
 
 use crate::{
     Byte, Coroutine, Frame, Heap, Instruction, Object,
@@ -44,37 +48,11 @@ macro_rules! binary_op {
 
 macro_rules! unary_op {
     ($frame: expr, $op: tt) => {
-        let rhs = $frame.peek().as_int();
+        {
+            let rhs = $frame.peek().as_int();
 
-        *$frame.top() = Value::from($op rhs);
-    }
-}
-
-macro_rules! ibinary_handler {
-    ($op: tt) => {
-        #[inline]
-        |frame, _, _, _, _,| { ibinary_op!(frame, $op); None}
-    }
-}
-
-macro_rules! fbinary_handler {
-    ($op: tt) => {
-        #[inline]
-        |frame, _, _, _, _,| { fbinary_op!(frame, $op); None}
-    }
-}
-
-macro_rules! binary_handler {
-    ($op: tt) => {
-        #[inline]
-        |frame, _, _, _, _,| { binary_op!(frame, $op); None}
-    }
-}
-
-macro_rules! unary_handler {
-    ($op: tt) => {
-        #[inline]
-        |frame, _, _, _, _,| { unary_op!(frame, $op); None}
+            *$frame.top() = Value::from($op rhs);
+        }
     }
 }
 
@@ -178,6 +156,7 @@ impl<const S: usize> Machine<S> {
 }
 
 impl<const S: usize> Machine<S> {
+    #[cfg(test)]
     pub fn push(&mut self, value: Value) {
         self.frames.get_mut().push(value);
     }
@@ -250,12 +229,16 @@ impl<const S: usize> Machine<S> {
             return;
         }
 
+        let mut code_iter = code.into();
+
         loop {
-            let result = self.execute(code);
+            let result = self.execute(&mut code_iter);
 
             match result.outcome() {
                 ExecutionOutcome::CALL => {
+                    self.frames.get_mut().seek(code_iter.tell());
                     self.frames.current_mut().enter(result.tell());
+                    code_iter.seek(result.tell());
 
                     for _ in 0..result.arity() {
                         let value = *self.frames.get_mut().pop();
@@ -269,6 +252,7 @@ impl<const S: usize> Machine<S> {
 
                     self.frames.pop();
                     self.frames.get_mut().resume(v);
+                    code_iter.seek(self.frames.get().tell());
                 }
                 ExecutionOutcome::TERMINATION => {
                     unlikely(true);
@@ -289,45 +273,25 @@ impl<const S: usize> Machine<S> {
     }
 
     #[inline]
-    fn execute(&mut self, code: &[Byte<Value>]) -> ExecutionResult {
+    fn execute<'iter>(&mut self, code: &mut SeekableIterator<'iter, Byte<Value>>) -> ExecutionResult {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
         let frame = self.frames.get_mut();
-        let mut ip = frame.tell();
 
-        while ip < code.len() {
-            promise!(code.len() > ip);
-            let opcode = &code[ip];
-            ip += 1;
-            frame.seek(ip);
-
+        while let Some(opcode) = code.next() {
             #[cfg(debug_assertions)]
             {
-                if frame_no > 35 {
-                    panic!("ENOUGH");
-                }
                 eprintln!(
                     "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
                     frame_no,
-                    ip,
+                    code.tell(),
                     format!("{:?}", opcode.bytecode()),
                     opcode.operand(0),
                     opcode.operand(1),
                     frame
                 );
             }
-
-            // promise!(HANDLERS.len() > opcode.bytecode() as u8 as usize);
-            // if let Some(outcome) = HANDLERS[opcode.bytecode() as u8 as usize](
-            //     frame,
-            //     &opcode,
-            //     &mut ip,
-            //     code,
-            //     &mut self.heap,
-            // ) {
-            //     return outcome;
-            // } 
 
             match opcode.bytecode() {
                 Instruction::POP => {
@@ -341,14 +305,8 @@ impl<const S: usize> Machine<S> {
                 Instruction::LOAD => {
                     frame.push(*frame.load(opcode.operand(0)));
                 }
-                Instruction::NOT => {
-                    let lhs = frame.peek().raw();
-                    frame.top().replace(!lhs);
-                }
-                Instruction::NEG => {
-                    let lhs = frame.peek().raw();
-                    frame.top().replace(-(lhs as i64) as u64);
-                }
+                Instruction::NOT => unary_op!(frame, !),
+                Instruction::NEG => unary_op!(frame, !),
                 Instruction::ADD => ibinary_op!(frame, +),
                 Instruction::SUB => ibinary_op!(frame, -),
                 Instruction::MUL => ibinary_op!(frame, *),
@@ -482,21 +440,19 @@ impl<const S: usize> Machine<S> {
                     );
                 }
                 Instruction::JMP => {
-                    ip = opcode.operand(0);
+                    code.seek(opcode.operand(0));
                 }
                 Instruction::JMPF => {
                     if !frame.pop().as_bool() {
-                        ip = opcode.operand(0);
+                        code.seek(opcode.operand(0));
                     }
                 }
                 Instruction::JMPT => {
                     if frame.pop().as_bool() {
-                        ip = opcode.operand(0);
+                        code.seek(opcode.operand(0));
                     }
                 }
                 Instruction::CALL => {
-                    // frame.suspend();
-
                     return ExecutionResult::call(opcode.operand(0), opcode.operand(1));
                 }
                 Instruction::NATIVE => {
@@ -507,8 +463,6 @@ impl<const S: usize> Machine<S> {
                     frame.push(result);
                 }
                 Instruction::RETURN => {
-                    // frame.complete();
-
                     return ExecutionResult::returns();
                 }
                 // Instruction::SUSP => {
@@ -534,16 +488,15 @@ impl<const S: usize> Machine<S> {
                 //     }
                 // }
                 Instruction::HALT => {
-                    // frame.terminate();
-
                     return ExecutionResult::terminate();
                 }
                 Instruction::STRING => {
                     let mut value: String = String::with_capacity(opcode.operand(0));
 
                     for _ in 0..opcode.operand(0) {
-                        value.push(char::from_u32(code[ip].operand(0) as u32).unwrap_or_default());
-                        ip += 1;
+                        if let Some(data) = code.next() {
+                            value.push(char::from_u32(data.operand(0) as u32).unwrap_or_default());
+                        }
                     }
 
                     let (_, collectable) = self.heap.alloc(value.into(), Object::String);
@@ -555,7 +508,7 @@ impl<const S: usize> Machine<S> {
             }
         }
 
-        ExecutionResult::default()
+        ExecutionResult::terminate()
     }
 }
 #[cfg(test)]

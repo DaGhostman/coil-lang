@@ -11,6 +11,12 @@ impl From<i64> for Value {
     }
 }
 
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Self::new(value as _)
+    }
+}
+
 impl From<f64> for Value {
     fn from(value: f64) -> Self {
         Self::new(value.to_bits() as _)

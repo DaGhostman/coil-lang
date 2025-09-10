@@ -206,7 +206,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Comment(comment)))
                 }
             })
-            ;
+            .boxed();
 
         let block_comment = op!("/*")
             .ignore_then(none_of("*/").repeated().to_slice().then_ignore(op!("*/")))
@@ -224,7 +224,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Comment(comment)))
                 }
             })
-            ;
+            .boxed();
 
         comment.or(block_comment)
     }
@@ -273,7 +273,7 @@ impl<'parser> ParserBuilder<'parser> {
                     }
                 })
                 .map_with(output!(Integer))
-                ;
+                .boxed();
 
             let float = text::int(10)
                 .then(just(".").then(text::int(10)))
@@ -288,7 +288,7 @@ impl<'parser> ParserBuilder<'parser> {
                     }
                 })
                 .map_with(output!(Float))
-                ;
+                .boxed();
             // @TODO: Handle binary(0b010101011010) as numbers
             // @TODO: Handle hex(0xa970987basd2) as numbers
 
@@ -300,7 +300,7 @@ impl<'parser> ParserBuilder<'parser> {
                 //     .ignore_then(any().repeated().to_slice().or(op!("\\'").not().to_slice()))
                 //     .then_ignore(just('\''))
                 //     .map_with(output!(String)))
-                ;
+                .boxed();
 
             let list = expr
                 .clone()
@@ -309,7 +309,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .collect()
                 .map_with(output!(List))
                 .delimited_by(just('['), just(']'))
-                ;
+                .boxed();
 
             let atom = float
                 .clone()
@@ -319,13 +319,13 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(self.comment(expr.clone()))
                 .or(expr.clone().delimited_by(just('('), just(')')))
                 .or(self.ident())
-                ;
+                .boxed();
 
             let member = op!('.')
                 .ignore_then(atom.clone())
                 .clone()
                 .map_with(output!(Member))
-                ;
+                .boxed();
 
             let assignment = self
                 .ident()
@@ -334,7 +334,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(name, value), e| {
                     (e.span(), Box::new(Expression::Assignment(name, value)))
                 })
-                ;
+                .boxed();
 
             let block = expr
                 .clone()
@@ -351,31 +351,31 @@ impl<'parser> ParserBuilder<'parser> {
                 .repeated()
                 .collect::<Vec<_>>()
                 .map_with(output!(Block))
-                ;
+                .boxed();
 
             let negate = op!('-')
                 .repeated()
                 .foldr_with(atom.clone(), |_op, rhs, e| {
                     (e.span(), Box::new(Expression::Negate(rhs)))
                 })
-                ;
+                .boxed();
             let positive = op!('+')
                 .repeated()
                 .foldr_with(atom.clone(), |_, rhs, _| rhs)
-                ;
+                .boxed();
 
             let not = op!('!')
                 .repeated()
                 .foldr_with(atom.clone().or(bool), |_op, rhs, e| {
                     (e.span(), Box::new(Expression::Not(rhs)))
                 })
-                ;
+                .boxed();
 
             let init = text::keyword("new")
                 .padded()
                 .ignore_then(self.ident().then_ignore(op!(';').or_not()))
                 .map_with(output!(Instantiate))
-                ;
+                .boxed();
 
             let call = atom
                 .clone()
@@ -389,8 +389,8 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 })
-                ;
-            let pattern = atom.clone().or(str.clone()).or(bool).clone();
+                .boxed();
+            let pattern = atom.clone().or(str.clone()).or(bool).clone().boxed();
 
             let arm = pattern
                 .then_ignore(op!("=>"))
@@ -403,7 +403,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .separated_by(op!(','))
                 .allow_trailing()
                 .collect::<Vec<_>>()
-                ;
+                .boxed();
 
             let match_ = text::keyword("match")
                 .padded()
@@ -415,7 +415,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(((((), pattern), _), arms), _), e| {
                     (e.span(), Box::new(Expression::Match(pattern, arms)))
                 })
-                ;
+                .boxed();
 
             let unary = match_
                 .or(init)
@@ -425,7 +425,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(negate)
                 .or(not)
                 .or(positive)
-                ;
+                .boxed();
             let binary = unary
                 .clone()
                 .foldl_with(
@@ -438,7 +438,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                ;
+                .boxed();
 
             let comparison = binary
                 .clone()
@@ -455,7 +455,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                ;
+                .boxed();
 
             let shift = comparison
                 .clone()
@@ -468,7 +468,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                ;
+                .boxed();
 
             //
             let product = shift
@@ -483,7 +483,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                ;
+                .boxed();
 
             let sum = product
                 .clone()
@@ -496,7 +496,7 @@ impl<'parser> ParserBuilder<'parser> {
                     .repeated(),
                     |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
                 )
-                ;
+                .boxed();
 
             // @TODO: Investigate complex pattern mattching, for now use it as glorified `if`
             // assignment
@@ -505,7 +505,7 @@ impl<'parser> ParserBuilder<'parser> {
         })
         .map_with(|value, e| (e.span(), Box::new(Expression::Expr(value))))
         .labelled("expression")
-        
+        .boxed()
         .memoized()
     }
 
@@ -517,7 +517,7 @@ impl<'parser> ParserBuilder<'parser> {
         self.expression()
             .then_ignore(op!(';'))
             .map_with(output!(ExprStatement))
-            
+            .boxed()
     }
 
     fn statement(
@@ -533,16 +533,16 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(output!(Block))
                 // .map_with(output!(Scope))
                 .delimited_by(op!('{'), op!('}'))
-                ;
+                .boxed();
 
             let else_ = |if_| {
                 {
                     op!("else")
                         .ignore_then(choice((if_, stmt)))
-                        
+                        .boxed()
                         .or_not()
                 }
-                
+                .boxed()
             };
 
             let if_ = recursive(|if_| {
@@ -562,7 +562,7 @@ impl<'parser> ParserBuilder<'parser> {
                         )
                     })
             })
-            ;
+            .boxed();
 
             let for_ = text::keyword("for")
                 .padded()
@@ -580,7 +580,7 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 })
-                ;
+                .boxed();
 
             let while_ = text::keyword("while")
                 .ignore_then(self.expression())
@@ -595,9 +595,9 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 })
-                ;
+                .boxed();
 
-            let loop_ = for_.or(while_);
+            let loop_ = for_.or(while_).boxed();
 
             let declaration = text::keyword("let")
                 .padded()
@@ -617,7 +617,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Fragment(vals)))
                 })
                 .then_ignore(op!(';'))
-                ;
+                .boxed();
 
             let constant = text::keyword("const")
                 .padded()
@@ -638,7 +638,7 @@ impl<'parser> ParserBuilder<'parser> {
                     (e.span(), Box::new(Expression::Fragment(vals)))
                 })
                 .then_ignore(op!(';'))
-                ;
+                .boxed();
 
             let print = text::keyword("print")
                 .padded()
@@ -656,7 +656,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(format, params), e| {
                     (e.span(), Box::new(Expression::Print(format, params)))
                 })
-                ;
+                .boxed();
             let format = text::keyword("fmt")
                 .padded()
                 .ignore_then(
@@ -673,7 +673,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .map_with(|(format, params), e| {
                     (e.span(), Box::new(Expression::Format(format, params)))
                 })
-                ;
+                .boxed();
             let deferred = text::keyword("defer")
                 .padded()
                 .ignore_then(
@@ -691,18 +691,18 @@ impl<'parser> ParserBuilder<'parser> {
                         )),
                     )
                 })
-                ;
+                .boxed();
 
             let return_ = text::keyword("return")
                 .padded()
                 .ignore_then(self.expression().then_ignore(op!(';')))
                 .map_with(output!(Return))
-                ;
+                .boxed();
             let yield_ = text::keyword("yield")
                 .padded()
                 .ignore_then(self.expression().then_ignore(op!(';')))
                 .map_with(output!(Yield))
-                ;
+                .boxed();
 
             choice((
                 deferred,
@@ -719,7 +719,7 @@ impl<'parser> ParserBuilder<'parser> {
                 block,
             ))
             .map_with(|value, e| (e.span(), Box::new(Expression::Statement(value))))
-            
+            .boxed()
         })
     }
 
@@ -733,7 +733,7 @@ impl<'parser> ParserBuilder<'parser> {
             .collect()
             .map_with(output!(Block))
             .delimited_by(op!('{'), op!('}'))
-            
+            .boxed()
     }
 
     fn args(
@@ -753,7 +753,7 @@ impl<'parser> ParserBuilder<'parser> {
             .collect::<Vec<_>>()
             .or_not()
             .delimited_by(op!('('), op!(')'))
-            
+            .boxed()
     }
 
     fn func(
@@ -790,7 +790,7 @@ impl<'parser> ParserBuilder<'parser> {
                     }),
                 )
             })
-            
+            .boxed()
     }
 
     fn use_(
@@ -811,7 +811,7 @@ impl<'parser> ParserBuilder<'parser> {
             .repeated()
             .collect::<Vec<_>>()
             .delimited_by(op!('{'), op!('}'))
-            ;
+            .boxed();
 
         text::keyword("use")
             .padded()

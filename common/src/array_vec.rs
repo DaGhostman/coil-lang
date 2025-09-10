@@ -89,6 +89,7 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
 
     pub fn pop(&mut self) -> &T {
         promise!(self.current > 0);
+        promise!(!self.storage.is_empty() || !self.expansion.is_empty());
 
         self.current -= 1;
         if likely(self.current < N) {
@@ -208,6 +209,12 @@ impl<T: Default + Debug, const N: usize> Debug for ArrayVec<T, N> {
 pub struct ArrayVecIter<'iter, T: Default, const N: usize> {
     cursor: usize,
     value: &'iter ArrayVec<T, N>,
+}
+
+impl <'iter, T: Default, const N: usize> ArrayVecIter<'iter, T, N> {
+    pub fn seek(&mut self, cursor: usize) {
+        self.cursor = cursor;
+    }
 }
 
 impl<'iter, T: Default, const N: usize> ArrayVecIter<'iter, T, N> {
