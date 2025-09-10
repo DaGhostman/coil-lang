@@ -225,7 +225,7 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn run(&mut self, code: &[Byte<Value>]) {
-        if code.len() == 0 {
+        if code.is_empty() {
             return;
         }
 
@@ -436,7 +436,6 @@ impl<const S: usize> Machine<S> {
                         "{}",
                         Collectable::<String>::from(frame.pop().as_ptr())
                             .as_ref()
-                            .to_string()
                     );
                 }
                 Instruction::JMP => {

@@ -159,6 +159,12 @@ pub struct ParserBuilder<'parser> {
     _data: PhantomData<&'parser ()>,
 }
 
+impl<'parser> Default for ParserBuilder<'parser> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'parser> ParserBuilder<'parser> {
     pub fn new() -> Self {
         Self { _data: PhantomData }

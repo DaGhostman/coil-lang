@@ -16,6 +16,12 @@ pub struct Pipeline<'pipeline> {
     interner: Interner<String>,
 }
 
+impl<'pipeline> Default for Pipeline<'pipeline> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'pipeline> Pipeline<'pipeline> {
     pub fn register_native_function(&mut self, name: String) {
         self.interner.intern(name);
@@ -72,7 +78,7 @@ impl<'pipeline> Pipeline<'pipeline> {
             Expression::Use { path, .. } => {
                 let mut p = self.cwd.clone();
                 p.push("src");
-                path.into_iter().for_each(|segment| p.push(segment));
+                path.iter().for_each(|segment| p.push(segment));
                 p.set_extension("0s");
 
                 if let Some(path) = p.to_str() {

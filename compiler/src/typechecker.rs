@@ -218,22 +218,19 @@ impl Typechecker {
                         ));
                     } else {
                         for (idx, arg) in args.iter().enumerate() {
-                            match self.check(arg) {
-                                Ok(ty) => {
-                                    if func.0[idx] != ty {
-                                        self.messages.insert(Message::error(
-                                    format!(
-                                        "Argument #{} of function '{}' is incorrect, expected '{}' but got '{}'",
-                                        idx + 1,
-                                        name,
-                                        func.0[idx].to_string(),
-                                        ty.to_string(),
-                                    ),
-                                    arg.0.into_range(),
-                                ));
-                                    }
+                            if let Ok(ty) = self.check(arg) {
+                                if func.0[idx] != ty {
+                                    self.messages.insert(Message::error(
+                                format!(
+                                    "Argument #{} of function '{}' is incorrect, expected '{}' but got '{}'",
+                                    idx + 1,
+                                    name,
+                                    func.0[idx].to_string(),
+                                    ty.to_string(),
+                                ),
+                                arg.0.into_range(),
+                            ));
                                 }
-                                Err(_) => (),
                             };
                         }
                     }

@@ -1,4 +1,3 @@
-use std::slice;
 
 pub struct SeekableIterator<'iter, T> {
     cursor: usize,
