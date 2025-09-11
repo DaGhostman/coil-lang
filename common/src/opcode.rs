@@ -109,8 +109,8 @@ impl<V: Default + Copy> Byte<V> {
         }
     }
 
-    pub fn bytecode(&self) -> Instruction {
-        self.bytecode
+    pub fn bytecode(&self) -> &Instruction {
+        &self.bytecode
     }
 
     pub fn operand(&self, idx: usize) -> usize {
