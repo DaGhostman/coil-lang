@@ -3,11 +3,10 @@ use std::collections::HashMap;
 #[cfg(not(debug_assertions))]
 use common::likely;
 
-use common::{ArrayVec, SeekableIterator, Value, 
-    unlikely};
+use common::{ArrayVec, SeekableIterator, Value, unlikely};
 
 use crate::{
-    Byte, Coroutine, Frame, Heap, Instruction, Object,
+    Byte, Coroutine, Frame, Heap, Instruction, Object, ObjectType, Reference,
     garbage::{Collectable, GcSized},
 };
 
@@ -56,11 +55,13 @@ macro_rules! unary_op {
     }
 }
 
-type External = fn(&[Value], &mut Heap<1024>) -> Value;
+
+const HEAP: usize = 8192;
+type External = fn(&[Value], &mut Heap<HEAP>) -> Value;
 
 pub struct Machine<const S: usize> {
     frames: ArrayVec<Frame<Value>, S>,
-    heap: Heap<1024>,
+    heap: Heap<HEAP>,
 
     native: HashMap<usize, External>,
 }
@@ -171,58 +172,6 @@ impl<const S: usize> Machine<S> {
         self.frames.get().tell()
     }
 
-    // pub fn seek(&mut self, ip: usize) {
-    //     self.frames.seek(ip);
-    // }
-
-    // pub fn register<F>(&mut self, instruction: Instruction, handler: &'vm F)
-    // where
-    //     F: Fn(&mut Frame<Value>, &Byte<Value>) -> Option<ExecutionResult>,
-    // {
-    //     self.handler[instruction as usize] = Some(handler);
-    // }
-
-    // fn mark(&mut self) {
-    //     // @TODO: Figure out GC in a way that the types are not necessary
-    //     // self.frames
-    //     //     .iter()
-    //     //     .filter(|frame| !frame.is_pending())
-    //     //     .for_each(|frame| {
-    //     //         frame
-    //     //             .stack()
-    //     //             .iter()
-    //     //             // .filter(|element| matches!(element.get_type(), Type::Object | Type::String))
-    //     //             .for_each(|element| {
-    //     //                 let mut collectable: Collectable<Object> =
-    //     //                     Collectable::from(element.as_ptr());
-    //     //
-    //     //                 collectable.as_mut().mark(&mut self.pending);
-    //     //             });
-    //     //     });
-    //
-    //     // for object in self.pending.iter() {
-    //         // object.mark();
-    //         // object.mark_reference();
-    //     // }
-    // }
-
-    fn gc(&mut self) {
-        #[cfg(not(debug_assertions))]
-        if likely(self.heap.usage() < 0.75) {
-            return;
-        }
-
-        self.heap.collect();
-    }
-
-    fn alloc<T: GcSized, F>(&mut self, value: T, map: F) -> (Object, Collectable<T>)
-    where
-        F: Fn(Collectable<T>) -> Object,
-    {
-        self.gc();
-
-        self.heap.alloc(value, map)
-    }
 
     pub fn run(&mut self, code: &[Byte<Value>]) {
         if code.is_empty() {
@@ -249,8 +198,34 @@ impl<const S: usize> Machine<S> {
                 }
                 ExecutionOutcome::RETURN => {
                     let v = *self.frames.get_mut().pop();
+                    let allocations = self
+                        .frames
+                        .pop()
+                        .allocations()
+                        .map(|v| *v)
+                        .collect::<Vec<_>>();
+                    let current = self.frames.get_mut();
 
-                    self.frames.pop();
+                    for addr in allocations {
+                        if v.raw() == addr {
+                            current.alloc(addr);
+                        } else {
+                            Collectable::<&dyn std::any::Any>::from(
+                                std::ptr::NonNull::without_provenance(
+                                    core::num::NonZero::new(addr as usize).expect("Invalid porinter address")
+                                )
+                            )
+                                .dec();
+                        }
+                    }
+
+                    #[cfg(not(debug_assertions))]
+                    if likely(self.heap.usage() > 0.75) {
+                        self.heap.collect();
+                    }
+                    #[cfg(debug_assertions)]
+                    self.heap.collect();
+
                     self.frames.get_mut().resume(v);
                     code_iter.seek(self.frames.get().tell());
                 }
@@ -268,16 +243,28 @@ impl<const S: usize> Machine<S> {
                 _ => (),
             }
         }
-
-        self.heap.collect();
     }
 
     #[inline]
-    fn execute<'iter>(&mut self, code: &mut SeekableIterator<'iter, Byte<Value>>) -> ExecutionResult {
+    fn execute<'iter>(
+        &mut self,
+        code: &mut SeekableIterator<'iter, Byte<Value>>,
+    ) -> ExecutionResult {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
         let frame = self.frames.get_mut();
+
+        macro_rules! alloc {
+            ($value: expr, $map: expr) => {
+                {
+                let (object, collectable) = self.heap.alloc($value, $map);
+                frame.alloc(Value::from(collectable.ptr()).raw());
+
+                (object, collectable)
+                }
+            };
+        }
 
         while let Some(opcode) = code.next() {
             #[cfg(debug_assertions)]
@@ -427,15 +414,14 @@ impl<const S: usize> Machine<S> {
                         }
                     }
 
-                    let (_, collectable) = self.heap.alloc(message.into(), Object::String);
+                    let (_, collectable) = alloc!(message.into(), Object::String);
 
                     frame.push(Value::from(collectable.ptr()));
                 }
                 Instruction::PRINT => {
                     print!(
                         "{}",
-                        Collectable::<String>::from(frame.pop().as_ptr())
-                            .as_ref()
+                        Collectable::<String>::from(frame.pop().as_ptr()).as_ref()
                     );
                 }
                 Instruction::JMP => {
@@ -464,28 +450,27 @@ impl<const S: usize> Machine<S> {
                 Instruction::RETURN => {
                     return ExecutionResult::returns();
                 }
-                // Instruction::SUSP => {
-                //     frame.suspend();
-                //     let suspended_frame = frame.clone();
-                //
-                //     let (_, coro) = self.alloc(Coroutine::new(suspended_frame), Object::Coroutine);
-                //     self.push(Value::from(coro.ptr()));
-                //
-                //     return ExecutionResult::returns();
-                // }
-                // Instruction::RESUME => {
-                //     return ExecutionResult::resume();
-                // }
-                // Instruction::FREE => {
-                //     unlikely(true);
-                //
-                //     match ObjectType::from_u8(opcode.operand(0) as u8) {
-                //         ObjectType::String => Collectable::<String>::from(frame.pop().as_ptr()).release(),
-                //         ObjectType::Coroutine => Collectable::<Coroutine<Value>>::from(frame.pop().as_ptr()).release(),
-                //         ObjectType::Reference => Collectable::<Reference>::from(frame.pop().as_ptr()).release(),
-                //         _ => unreachable!("Should not attempt to free null-object"),
-                //     }
-                // }
+                Instruction::SUSP => {
+                    let suspended_frame = frame.clone();
+
+                    let (_, coro) = self
+                        .heap
+                        .alloc(Coroutine::new(suspended_frame), Object::Coroutine);
+                    frame.push(Value::from(coro.ptr()));
+
+                    return ExecutionResult::returns();
+                }
+                Instruction::RESUME => {
+                    return ExecutionResult::resume();
+                }
+                Instruction::ACQUIRE => {
+                    Collectable::<&dyn std::any::Any>::from(frame.load(opcode.operand(0)).as_ptr())
+                        .inc();
+                }
+                Instruction::RELEASE => {
+                    Collectable::<&dyn std::any::Any>::from(frame.load(opcode.operand(0)).as_ptr())
+                        .dec();
+                }
                 Instruction::HALT => {
                     return ExecutionResult::terminate();
                 }
@@ -498,7 +483,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
 
-                    let (_, collectable) = self.heap.alloc(value.into(), Object::String);
+                    let (_, collectable) = alloc!(value.into(), Object::String);
 
                     frame.push(Value::from(collectable.ptr()));
                 }

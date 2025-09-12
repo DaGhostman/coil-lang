@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use common::{ArrayVec, promise};
+use common::{promise, ArrayVec, ArrayVecIter};
 
 const STACK: usize = 32;
 
@@ -22,6 +22,7 @@ pub struct Frame<T: Default> {
     ip: usize,
     // ---
     stack: ArrayVec<T, STACK>,
+    allocations: ArrayVec<u64, STACK>,
 }
 
 impl<T: Default> Default for Frame<T> {
@@ -30,6 +31,7 @@ impl<T: Default> Default for Frame<T> {
             ip: 0,
             // state: FrameState::default(),
             stack: ArrayVec::default(),
+            allocations: ArrayVec::default(),
         }
     }
 }
@@ -71,6 +73,14 @@ impl<T: Default> Frame<T> {
 
     pub fn top(&mut self) -> &mut T {
         self.stack.get_mut()
+    }
+
+    pub fn alloc(&mut self, addr: u64) {
+        self.allocations.push(addr);
+    }
+
+    pub fn allocations<'iter>(&self) -> ArrayVecIter<'_, u64, STACK> {
+        self.allocations.iter()
     }
 
     // pub fn status(&self) -> FrameState {

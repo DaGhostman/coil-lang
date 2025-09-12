@@ -21,29 +21,17 @@ pub enum ObjectType {
     String,
     Coroutine,
     Reference,
-
-    __INVALID,
 }
 
-impl ObjectType {
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::None => 0,
-            Self::String => 1,
-            Self::Coroutine => 2,
-            Self::Reference => 3,
-            Self::__INVALID => 255,
-        }
+impl From<u8> for ObjectType {
+    fn from(value: u8) -> Self {
+        unsafe { std::mem::transmute(value) }
     }
+}
 
-    pub const fn from_u8(value: u8) -> Self {
-        match value {
-            0 => ObjectType::None,
-            1 => ObjectType::String,
-            2 => ObjectType::Coroutine,
-            3 => ObjectType::Reference,
-            _ => ObjectType::__INVALID,
-        }
+impl From<ObjectType> for u8 {
+    fn from(value: ObjectType) -> Self {
+        value as u8
     }
 }
 
@@ -68,30 +56,30 @@ impl GcSized for Object {
 }
 
 impl Object {
-    pub fn mark(&mut self) {
+    pub fn inc(&mut self) -> usize {
         match self {
-            Self::None => false,
-            Self::String(value) => value.mark(),
-            Self::Reference(value) => value.mark(),
-            Self::Coroutine(value) => value.mark(),
-        };
-    }
-
-    pub fn unmark(&mut self) {
-        match self {
-            Self::None => (),
-            Self::String(value) => value.unmark(),
-            Self::Reference(value) => value.unmark(),
-            Self::Coroutine(value) => value.unmark(),
+            Self::None => 0,
+            Self::String(value) => value.inc(),
+            Self::Reference(value) => value.inc(),
+            Self::Coroutine(value) => value.inc(),
         }
     }
 
-    pub fn is_marked(&self) -> bool {
+    pub fn dec(&mut self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::String(value) => value.dec(),
+            Self::Reference(value) => value.dec(),
+            Self::Coroutine(value) => value.dec(),
+        }
+    }
+
+    pub fn is_collectable(&self) -> bool {
         match self {
             Self::None => true,
-            Self::String(value) => value.is_marked(),
-            Self::Reference(value) => value.is_marked(),
-            Self::Coroutine(value) => value.is_marked(),
+            Self::String(value) => value.is_collectable(),
+            Self::Reference(value) => value.is_collectable(),
+            Self::Coroutine(value) => value.is_collectable(),
         }
     }
 

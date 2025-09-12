@@ -2,7 +2,7 @@ use common::{likely, unlikely};
 
 use crate::{
     Object,
-    garbage::{Collectable, Gc, GcSized},
+    garbage::{Collectable, GcSized, Rc},
 };
 
 pub struct Heap<const G: usize> {
@@ -37,13 +37,30 @@ impl<const G: usize> Heap<G> {
     where
         F: Fn(Collectable<T>) -> Object,
     {
-        let boxed = Box::new(Gc::new(self.head, value));
+        let boxed = Box::new(Rc::new(self.head, value));
         let content = Collectable::new(boxed);
 
         let object = map(content);
 
         self.size += object.size();
         self.head = Some(object);
+
+
+
+
+        if unlikely(self.size >= self.threshold) {
+            self.threshold = (self.size.max(G)).max(self.threshold * 2);
+        }
+
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "ALLOCATED: {} bytes {} (used {}/{} bytes)",
+            object.size(),
+            object,
+            self.size(),
+            self.threshold(),
+        );
 
         (object, content)
     }
@@ -52,6 +69,15 @@ impl<const G: usize> Heap<G> {
     pub fn free(&mut self, object: Object) -> usize {
         let size = object.size();
         self.size -= size;
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "COLLECTING: {} bytes {} (used {}/{} bytes)",
+            size,
+            object,
+            self.size(),
+            self.threshold(),
+        );
 
         match object {
             Object::None => (),
@@ -68,23 +94,13 @@ impl<const G: usize> Heap<G> {
         let mut previous: Option<Object> = None;
         let mut current = self.head;
 
-        while let Some(mut reference) = current {
+        while let Some(reference) = current {
             let next = reference.get_next();
 
-            if likely(reference.is_marked()) {
-                reference.unmark();
+            if likely(!reference.is_collectable()) {
                 previous = current;
                 current = next;
             } else {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "COLLECTING: {} bytes {} (used {}/{} bytes)",
-                    reference.size(),
-                    reference,
-                    self.size() - reference.size(),
-                    self.threshold(),
-                );
-
                 self.free(reference);
 
                 current = next;
@@ -96,12 +112,24 @@ impl<const G: usize> Heap<G> {
             }
         }
 
+
         if unlikely(self.size <= (self.threshold - G)) {
-            self.threshold = (self.size.max(1) * G).max(self.threshold);
+            self.threshold = (self.threshold.max(1) / 2).max(G);
         }
+
     }
 
     pub fn usage(&self) -> f32 {
         self.size as f32 / self.threshold as f32
+    }
+}
+
+impl<const G: usize> Drop for Heap<G> {
+    fn drop(&mut self) {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            current = reference.get_next();
+            self.free(reference);
+        }
     }
 }
