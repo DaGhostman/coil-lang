@@ -18,6 +18,8 @@ pub enum Instruction {
     JMPF,
     STRING,
     DATA,
+    ACQUIRE,
+    RELEASE,
 
     // Arithmetic
     ADD,

@@ -538,10 +538,15 @@ impl Compiler {
                         }
                     }
 
+                    let ty = self.typecheck(value);
                     let mut expr = self.do_compile(value);
 
                     bytecode.append(&mut expr);
                     bytecode.push(Byte::new_with_operands(Instruction::STORE, [symbol, 0]));
+
+                    if matches!(ty, Type::OBJECT(_) | Type::STRING) {
+                        bytecode.push(Byte::new_with_operands(Instruction::ACQUIRE, [symbol, 0]));
+                    }
                 } else {
                     self.messages.insert(Message::error(
                         format!(
