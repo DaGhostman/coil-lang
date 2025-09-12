@@ -165,7 +165,7 @@ impl<T: Default, const N: usize> Index<usize> for ArrayVec<T, N> {
             promise!(index < N);
             &self.storage[index]
         } else {
-            promise!(index - N > self.expansion.len());
+            promise!(index - N < self.expansion.len());
             &self.expansion[index - N]
         }
     }
@@ -178,7 +178,7 @@ impl<T: Default, const N: usize> IndexMut<usize> for ArrayVec<T, N> {
             &mut self.storage[index]
         } else {
             self.grow(index - N);
-            promise!(index - N > self.expansion.len());
+            promise!(index - N < self.expansion.len());
             &mut self.expansion[index - N]
         }
     }
