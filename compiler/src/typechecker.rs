@@ -150,29 +150,32 @@ impl Typechecker {
                 let name = self.resolve_variable(name);
                 let ty = self.check(value).unwrap_or_default();
 
-                if self.variables.contains_key(&name) {
-                    if let Some(t) = self.variables.get(&name) {
-                        if t == &Type::UNKNOWN {
-                            self.variables.entry(name).and_modify(|entry| {
-                                *entry = ty.clone();
-                            });
+                if let Some(t) = self.variables.get(&name) {
+                    if t == &Type::UNKNOWN {
+                        self.variables.entry(name).and_modify(|entry| {
+                            *entry = ty.clone();
+                        });
 
-                            ty
-                        } else if t != &ty {
-                            self.messages.insert(
+                        ty
+                    } else if t != &ty {
+                        self.messages.insert(
                                 Message::error(
                                     format!("Unable to assign value of type '{}' to variable '{}' that is of type '{}'", ty.to_string(), name, t.to_string()),
                                     span.into_range()
                                 )
                             );
-                            Type::default()
-                        } else {
-                            Type::default()
-                        }
-                    } else {
                         Type::default()
+                    } else {
+                        t.clone()
                     }
                 } else {
+                    self.messages.insert(Message::error(
+                        format!(
+                            "Attempting to assign value to undeclared variable '{}'",
+                            name
+                        ),
+                        span.into_range(),
+                    ));
                     Type::default()
                 }
             }
