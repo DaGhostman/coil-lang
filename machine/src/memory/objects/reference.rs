@@ -1,8 +1,7 @@
 use std::{num::NonZero, ptr::NonNull};
 
 use crate::{
-    Object, ObjectType,
-    garbage::{Collectable, GcSized},
+    garbage::{Collectable, GcSized}, Object, ObjectType, 
 };
 
 pub struct Reference(ObjectType, usize);

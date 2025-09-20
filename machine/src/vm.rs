@@ -1,13 +1,10 @@
-use std::collections::HashMap;
+use std::{borrow::Borrow, collections::HashMap, io::Write, ops::Deref};
 
-#[cfg(not(debug_assertions))]
-use common::likely;
-
-use common::{ArrayVec, SeekableIterator, Value, unlikely};
+use common::{ArrayVec, SeekableIterator, Value, promise, unlikely};
 
 use crate::{
-    Byte, Coroutine, Frame, Heap, Instruction, Object, ObjectType, Reference,
-    garbage::{Collectable, GcSized},
+    Byte, Coroutine, Frame, Heap, Instruction, Object, ObjectType, String as ObjString,
+    garbage::Collectable,
 };
 
 macro_rules! ibinary_op {
@@ -16,7 +13,7 @@ macro_rules! ibinary_op {
             let rhs = $frame.pop().as_int();
             let lhs = $frame.peek().as_int();
 
-            *$frame.top() = Value::from(lhs $op rhs);
+            $frame.top().replace((lhs $op rhs) as u64)
         }
     }
 
@@ -27,7 +24,7 @@ macro_rules! fbinary_op {
             let rhs = $frame.pop().as_float();
             let lhs = $frame.peek().as_float();
 
-            *$frame.top() = Value::from(lhs $op rhs);
+            $frame.top().replace((lhs $op rhs).to_bits())
         }
     }
 
@@ -39,7 +36,7 @@ macro_rules! binary_op {
             let rhs = $frame.pop().raw();
             let lhs = $frame.peek().raw();
 
-            *$frame.top() = Value::from(lhs $op rhs);
+            $frame.top().replace((lhs $op rhs) as bool as _);
         }
     }
 
@@ -48,21 +45,17 @@ macro_rules! binary_op {
 macro_rules! unary_op {
     ($frame: expr, $op: tt) => {
         {
-            let rhs = $frame.peek().as_int();
+            let rhs = $frame.peek().as_bool();
 
-            *$frame.top() = Value::from($op rhs);
+            $frame.top().replace(($op rhs).into());
         }
     }
 }
 
-
-const HEAP: usize = 8192;
-type External = fn(&[Value], &mut Heap<HEAP>) -> Value;
+type External = fn(&[Value]) -> Value;
 
 pub struct Machine<const S: usize> {
     frames: ArrayVec<Frame<Value>, S>,
-    heap: Heap<HEAP>,
-
     native: HashMap<usize, External>,
 }
 
@@ -143,8 +136,6 @@ impl<const S: usize> Default for Machine<S> {
         frames.consume();
         Self {
             frames,
-            heap: Heap::default(),
-            // handler: ArrayVec::default(),
             native: HashMap::with_capacity(32),
         }
     }
@@ -172,7 +163,6 @@ impl<const S: usize> Machine<S> {
         self.frames.get().tell()
     }
 
-
     pub fn run(&mut self, code: &[Byte<Value>]) {
         if code.is_empty() {
             return;
@@ -186,8 +176,8 @@ impl<const S: usize> Machine<S> {
             match result.outcome() {
                 ExecutionOutcome::CALL => {
                     self.frames.get_mut().seek(code_iter.tell());
-                    self.frames.current_mut().enter(result.tell());
                     code_iter.seek(result.tell());
+                    self.frames.current_mut().enter();
 
                     for _ in 0..result.arity() {
                         let value = *self.frames.get_mut().pop();
@@ -197,37 +187,13 @@ impl<const S: usize> Machine<S> {
                     self.frames.consume();
                 }
                 ExecutionOutcome::RETURN => {
-                    let v = *self.frames.get_mut().pop();
-                    let allocations = self
-                        .frames
-                        .pop()
-                        .allocations()
-                        .map(|v| *v)
-                        .collect::<Vec<_>>();
-                    let current = self.frames.get_mut();
+                    let current = self.frames.pop();
+                    let v = *current.peek();
 
-                    for addr in allocations {
-                        if v.raw() == addr {
-                            current.alloc(addr);
-                        } else {
-                            Collectable::<&dyn std::any::Any>::from(
-                                std::ptr::NonNull::without_provenance(
-                                    core::num::NonZero::new(addr as usize).expect("Invalid porinter address")
-                                )
-                            )
-                                .dec();
-                        }
-                    }
+                    let prev = self.frames.get_mut();
 
-                    #[cfg(not(debug_assertions))]
-                    if likely(self.heap.usage() > 0.75) {
-                        self.heap.collect();
-                    }
-                    #[cfg(debug_assertions)]
-                    self.heap.collect();
-
-                    self.frames.get_mut().resume(v);
-                    code_iter.seek(self.frames.get().tell());
+                    prev.resume(v);
+                    code_iter.seek(prev.tell());
                 }
                 ExecutionOutcome::TERMINATION => {
                     unlikely(true);
@@ -255,17 +221,6 @@ impl<const S: usize> Machine<S> {
 
         let frame = self.frames.get_mut();
 
-        macro_rules! alloc {
-            ($value: expr, $map: expr) => {
-                {
-                let (object, collectable) = self.heap.alloc($value, $map);
-                frame.alloc(Value::from(collectable.ptr()).raw());
-
-                (object, collectable)
-                }
-            };
-        }
-
         while let Some(opcode) = code.next() {
             #[cfg(debug_assertions)]
             {
@@ -278,6 +233,9 @@ impl<const S: usize> Machine<S> {
                     opcode.operand(1),
                     frame
                 );
+                if frame_no == 16 {
+                    panic!("Enough!");
+                }
             }
 
             match opcode.bytecode() {
@@ -311,129 +269,172 @@ impl<const S: usize> Machine<S> {
                 Instruction::DIVF => fbinary_op!(frame, /),
                 Instruction::MODF => fbinary_op!(frame, %),
                 Instruction::FORMAT => {
-                    let mut message = String::new();
-                    let num_params = opcode.operand(0);
-                    if num_params == 0 {
-                        message = Collectable::<String>::from(frame.pop().as_ptr())
-                            .as_ref()
-                            .to_string();
-                    } else {
-                        let mut params = vec![];
-                        for _ in 0..opcode.operand(0) {
-                            params.push(*frame.pop());
+                    if opcode.operand(0) != 0 {
+                        let mut params = ArrayVec::<Value, 8>::default();
+
+                        for idx in (0..opcode.operand(0)).rev() {
+                            params[idx]= *frame.pop();
                         }
-                        let format = Collectable::<String>::from(frame.pop().as_ptr())
-                            .as_ref()
-                            .to_string();
 
-                        let byte_format = format.chars().collect::<Vec<char>>();
+                        let format_string = Collectable::<ObjString>::from(frame.peek().as_ptr());
+                        let format_str = format_string.as_ref().as_str();
 
-                        let mut n = 0;
-                        let mut param = 0;
-                        while n < byte_format.len() {
-                            if '%' == byte_format[n] && (n == 0 || '\\' != byte_format[n - 1]) {
-                                if params.len() <= param {
-                                    todo!("Handle within typechecker");
-                                }
-                                n += 1;
-                                match byte_format[n] {
-                                    'i' => {
-                                        n += 1;
+                        // Pre-allocate string with estimated capacity
+                        let mut message = String::with_capacity(format_str.len() * 2);
 
-                                        message.push_str(
-                                            format!("{}", params[param].as_int()).as_str(),
-                                        );
-                                        param += 1;
+                        let mut chars = format_str.chars().peekable();
+                        while let Some(ch) = chars.next() {
+                            if ch == '%' {
+                                match chars.peek() {
+                                    Some('i') => {
+                                        chars.next();
+                                        message.push_str(&params.pop().as_int().to_string());
                                     }
-                                    'f' => {
-                                        n += 1;
-                                        message.push_str(
-                                            format!("{:.?}", params[param].as_float()).as_str(),
-                                        );
-                                        param += 1;
+                                    Some('f') => {
+                                        chars.next();
+                                        message
+                                            .push_str(&format!("{:.?}", params.pop().as_float()));
                                     }
-                                    'b' => {
-                                        n += 1;
-                                        message.push_str(
-                                            format!("{:0b}", params[param].raw()).as_str(),
-                                        );
-                                        param += 1;
+                                    Some('b') => {
+                                        chars.next();
+                                        message.push_str(&format!("{:0b}", params.pop().raw()));
                                     }
-                                    's' => {
-                                        n += 1;
-                                        message.push_str(
-                                            Collectable::<String>::from(params[param].as_ptr())
-                                                .as_ref()
-                                                .to_string()
-                                                .as_str(),
-                                        );
-                                        param += 1;
+                                    Some('s') => {
+                                        chars.next();
+                                        let string_val =
+                                            Collectable::<String>::from(params.pop().as_ptr());
+                                        message.push_str(&string_val.as_ref().as_str());
                                     }
-                                    'x' => {
-                                        n += 1;
-                                        message.push_str(
-                                            format!("{:08x}", params[param].raw()).as_str(),
-                                        );
-                                        param += 1;
+                                    Some('x') => {
+                                        chars.next();
+                                        message.push_str(&format!("{:08x}", params.pop().raw()));
                                     }
-                                    'z' => {
-                                        n += 1;
-                                        message.push_str(if params[param].raw() > 0 {
+                                    Some('z') => {
+                                        chars.next();
+                                        message.push_str(if params.pop().raw() > 0 {
                                             "true"
                                         } else {
                                             "false"
                                         });
-                                        param += 1;
                                     }
-                                    'u' => {
-                                        n += 1;
-                                        message
-                                            .push_str(format!("{}", params[param].raw()).as_str());
-                                        param += 1;
+                                    Some('u') => {
+                                        chars.next();
+                                        message.push_str(&params.pop().raw().to_string());
                                     }
-                                    'p' => {
-                                        n += 1;
-                                        message.push_str(
-                                            format!(
-                                                "{:08x}",
-                                                params[param].as_ptr::<bool>().addr()
-                                            )
-                                            .as_str(),
-                                        );
-                                        param += 1;
+                                    Some('p') => {
+                                        chars.next();
+                                        message.push_str(&format!(
+                                            "{:08x}",
+                                            params.pop().as_ptr::<bool>().addr()
+                                        ));
                                     }
                                     _ => {
-                                        message.push(byte_format[n]);
+                                        message.push('%');
                                     }
                                 }
-                                continue;
+                            } else {
+                                message.push(ch);
                             }
-
-                            message.push(byte_format[n]);
-                            n += 1;
                         }
+                        Heap::free(format_string);
+                        let (_, collectable) = Heap::alloc(message.into(), Object::String);
+                        *frame.top() = Value::from(collectable.ptr());
                     }
-
-                    let (_, collectable) = alloc!(message.into(), Object::String);
-
-                    frame.push(Value::from(collectable.ptr()));
+                    // let mut message = String::new();
+                    // let mut params = Vec::with_capacity(opcode.operand(1));
+                    //
+                    // for idx in (0..opcode.operand(0)).rev() {
+                    //     params.insert(idx, *frame.pop());
+                    // }
+                    //
+                    // let mut format = Collectable::<ObjString>::from(frame.pop().as_ptr());
+                    // let mut byte_format = format.as_ref().as_str().char_indices();
+                    //
+                    //     while let Some((_, v)) = byte_format.next() {
+                    //         match v {
+                    //             '%' => match byte_format.next() {
+                    //                 Some((_, 'i')) => unsafe {
+                    //                     message.push_str(
+                    //                         format!("{}", params.pop().unwrap_unchecked().as_int()).as_str(),
+                    //                     );
+                    //                 }
+                    //                 Some((_, 'f')) => unsafe {
+                    //                     message.push_str(
+                    //                         format!("{:.?}", params.pop().unwrap_unchecked().as_float()).as_str(),
+                    //                     );
+                    //                 }
+                    //                 Some((_, 'b')) => unsafe {
+                    //                     message.push_str(
+                    //                         format!("{:0b}", params.pop().unwrap_unchecked().raw()).as_str(),
+                    //                     );
+                    //                 }
+                    //                 Some((_, 's')) => unsafe {
+                    //                     message.push_str(
+                    //                         Collectable::<String>::from(params.pop().unwrap_unchecked().as_ptr())
+                    //                             .as_ref()
+                    //                             .to_string()
+                    //                             .as_str(),
+                    //                     );
+                    //                 }
+                    //                 Some((_, 'x')) => unsafe {
+                    //                     message.push_str(
+                    //                         format!("{:08x}", params.pop().unwrap_unchecked().raw()).as_str(),
+                    //                     );
+                    //                 }
+                    //                 Some((_, 'z')) => unsafe {
+                    //                     message.push_str(if params.pop().unwrap_unchecked().raw() > 0 {
+                    //                         "true"
+                    //                     } else {
+                    //                         "false"
+                    //                     });
+                    //                 }
+                    //                 Some((_, 'u')) => unsafe {
+                    //                     message
+                    //                         .push_str(format!("{}", params.pop().unwrap_unchecked().raw()).as_str());
+                    //                 }
+                    //                 Some((_, 'p')) => unsafe {
+                    //                     message.push_str(
+                    //                         format!(
+                    //                             "{:08x}",
+                    //                             params.pop().unwrap_unchecked().as_ptr::<bool>().addr()
+                    //                         )
+                    //                         .as_str(),
+                    //                     );
+                    //                 }
+                    //                 _ => {
+                    //                     message.push('%');
+                    //                 }
+                    //             },
+                    //             ch => {
+                    //                 message.push(ch);
+                    //             }
+                    //         }
+                    //     }
+                    //
+                    // Heap::free(&mut format);
+                    // let (_, collectable) = Heap::alloc(message.into(), Object::String);
+                    //
+                    // frame.push(Value::from(collectable.ptr()));
                 }
                 Instruction::PRINT => {
-                    print!(
-                        "{}",
-                        Collectable::<String>::from(frame.pop().as_ptr()).as_ref()
-                    );
+                    let value = Collectable::<ObjString>::from(frame.pop().as_ptr());
+                    print!("{}", value.as_ref().as_str());
+
+                    Heap::free(value);
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand(0));
                 }
+                Instruction::JMPR => {
+                    code.add(opcode.operand(0));
+                }
                 Instruction::JMPF => {
-                    if !frame.pop().as_bool() {
+                    if frame.pop().raw() != 1 {
                         code.seek(opcode.operand(0));
                     }
                 }
                 Instruction::JMPT => {
-                    if frame.pop().as_bool() {
+                    if frame.pop().raw() == 1 {
                         code.seek(opcode.operand(0));
                     }
                 }
@@ -443,7 +444,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::NATIVE => {
                     let arity = opcode.operand(1);
                     let args = (0..arity).map(|_| *frame.pop()).collect::<Vec<_>>();
-                    let result = self.native[&opcode.operand(0)](&args, &mut self.heap);
+                    let result = self.native[&opcode.operand(0)](&args);
 
                     frame.push(result);
                 }
@@ -453,9 +454,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::SUSP => {
                     let suspended_frame = frame.clone();
 
-                    let (_, coro) = self
-                        .heap
-                        .alloc(Coroutine::new(suspended_frame), Object::Coroutine);
+                    let (_, coro) = Heap::alloc(Coroutine::new(suspended_frame), Object::Coroutine);
                     frame.push(Value::from(coro.ptr()));
 
                     return ExecutionResult::returns();
@@ -464,14 +463,39 @@ impl<const S: usize> Machine<S> {
                     return ExecutionResult::resume();
                 }
                 Instruction::ACQUIRE => {
-                    Collectable::<&dyn std::any::Any>::from(frame.load(opcode.operand(0)).as_ptr())
-                        .inc();
+                    match (opcode.operand(0) as u8).into() {
+                        ObjectType::String => {
+                            Collectable::<ObjString>::from(frame.peek().as_ptr()).inc()
+                        }
+                        ObjectType::Reference => {
+                            Collectable::<crate::memory::Reference>::from(frame.peek().as_ptr())
+                                .inc()
+                        }
+                        ObjectType::Coroutine => {
+                            Collectable::<crate::memory::Coroutine<Value>>::from(
+                                frame.peek().as_ptr(),
+                            )
+                            .inc()
+                        }
+                        _ => 0,
+                    };
                 }
-                Instruction::RELEASE => {
-                    Collectable::<&dyn std::any::Any>::from(frame.load(opcode.operand(0)).as_ptr())
-                        .dec();
-                }
+                Instruction::RELEASE => match (opcode.operand(0) as u8).into() {
+                    ObjectType::String => {
+                        Heap::free(Collectable::<ObjString>::from(frame.peek().as_ptr()))
+                    }
+                    ObjectType::Reference => Heap::free(
+                        Collectable::<crate::memory::Reference>::from(frame.peek().as_ptr()),
+                    ),
+                    ObjectType::Coroutine => {
+                        Heap::free(Collectable::<crate::memory::Coroutine<Value>>::from(
+                            frame.peek().as_ptr(),
+                        ))
+                    }
+                    _ => (),
+                },
                 Instruction::HALT => {
+                    let _ = std::io::stdout().flush();
                     return ExecutionResult::terminate();
                 }
                 Instruction::STRING => {
@@ -483,7 +507,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
 
-                    let (_, collectable) = alloc!(value.into(), Object::String);
+                    let (_, collectable) = Heap::alloc(value.into(), Object::String);
 
                     frame.push(Value::from(collectable.ptr()));
                 }
@@ -495,6 +519,7 @@ impl<const S: usize> Machine<S> {
         ExecutionResult::terminate()
     }
 }
+
 #[cfg(test)]
 mod tests {
     use common::Value;

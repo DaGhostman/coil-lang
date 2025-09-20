@@ -16,13 +16,17 @@ impl String {
     pub fn hash(&self) -> u64 {
         self.1
     }
+
+    pub fn as_str(&self) -> &str {
+        self.2.as_str()
+    }
 }
 
 impl GcSized for String {
     fn size(&self) -> usize {
-        use std::mem::size_of_val;
+        use std::mem::{size_of_val, size_of};
 
-        size_of_val(&self.0) + size_of_val(&self.1) + size_of_val(&self.2)
+        size_of_val(&self.0) + size_of_val(&self.1) + size_of_val(&self.2) + (size_of::<char>() * self.2.len())
     }
 }
 

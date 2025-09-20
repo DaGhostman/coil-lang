@@ -1,9 +1,9 @@
 use std::{
     fmt::Debug,
-    ops::{Index, IndexMut},
+    ops::{Index, IndexMut, Range},
 };
 
-use crate::{likely, promise, unlikely};
+use crate::{likely, unlikely, promise };
 
 #[derive(Clone)]
 pub struct ArrayVec<T: Default, const N: usize> {
@@ -105,7 +105,7 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         promise!(self.current > 0);
         let current = self.current - 1;
 
-        if likely(current < N) {
+        if (current < N) {
             promise!(current < N);
             promise!(current < self.storage.len());
 
@@ -119,6 +119,7 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
     pub fn get_mut(&mut self) -> &mut T {
         promise!(self.current > 0);
         let current = self.current - 1;
+
         if likely(current < N) {
             promise!(current < N);
             &mut self.storage[current]
@@ -129,6 +130,19 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
             &mut self.expansion[current - N]
         }
     }
+
+    // pub fn insert(&mut self, index: usize, value: T) {
+    //     self.current = self.current.max(index + 1);
+    //
+    //     if likely(index < N) {
+    //         promise!(index < N);
+    //         self.storage[index] = value;
+    //     } else {
+    //         self.grow(index - N);
+    //         promise!(index - N < self.expansion.len());
+    //         self.expansion[index - N] = value;
+    //     }
+    // }
 
     pub fn len(&self) -> usize {
         self.current
@@ -153,8 +167,10 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
     //     &self.storage[0..cursor]
     // }
 
+    #[inline]
     pub fn clear(&mut self) {
         self.current = 0;
+        // self.expansion.clear();
     }
 }
 
@@ -171,8 +187,30 @@ impl<T: Default, const N: usize> Index<usize> for ArrayVec<T, N> {
     }
 }
 
+// impl<T: Default + Copy, const N: usize> Index<Range<usize>>for ArrayVec<T, N> {
+//     type Output = ArrayVec<T, 16>;
+//     fn index(&self, index: Range<usize>) -> Self::Output {
+//         let mut v = ArrayVec::<T, 16>::default();
+//
+//         for n in index.start..index.end {
+//             v.push(self[n]);
+//         }
+//
+//         v
+//
+//         // if (index < N) {
+//         //     promise!(index < N);
+//         //     &self.storage[index]
+//         // } else {
+//         //     promise!(index - N < self.expansion.len());
+//         //     &self.expansion[index - N]
+//         // }
+//     }
+// }
+//
 impl<T: Default, const N: usize> IndexMut<usize> for ArrayVec<T, N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.current = self.current.max(index + 1);
         if likely(index < N) {
             promise!(index < N);
             &mut self.storage[index]

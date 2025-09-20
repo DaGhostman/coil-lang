@@ -1,5 +1,4 @@
 use std::borrow::Borrow;
-use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::num::{ParseFloatError, ParseIntError};
 
@@ -10,7 +9,7 @@ use chumsky::{
 };
 
 pub use chumsky::span::SimpleSpan;
-use common::Message;
+use common::{Label, Message};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression<'expr> {
@@ -72,11 +71,7 @@ pub enum Expression<'expr> {
         body: Vec<Output<'expr>>,
     },
 
-    If {
-        condition: Output<'expr>,
-        body: Output<'expr>,
-        alternative: Option<Output<'expr>>,
-    },
+    If { condition: Output<'expr>, body: Output<'expr>, alternative: Option<Output<'expr>>},
 
     Call {
         name: Output<'expr>,
@@ -128,14 +123,12 @@ macro_rules! output {
 
 pub struct ParserError {
     message: String,
-    offender: Option<SimpleSpan>,
 }
 
 impl From<&str> for ParserError {
     fn from(value: &str) -> Self {
         Self {
             message: value.to_string(),
-            offender: None,
         }
     }
 }
@@ -144,7 +137,6 @@ impl From<Rich<'_, char>> for ParserError {
     fn from(value: Rich<'_, char>) -> Self {
         Self {
             message: value.to_string(),
-            offender: Some(*value.span()),
         }
     }
 }
@@ -432,6 +424,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(not)
                 .or(positive)
                 .boxed();
+
             let binary = unary
                 .clone()
                 .foldl_with(
@@ -450,8 +443,8 @@ impl<'parser> ParserBuilder<'parser> {
                 .clone()
                 .foldl_with(
                     choice((
-                        op!(">=").to(Expression::Leq as fn(_, _) -> _),
-                        op!("<=.").to(Expression::Geq as fn(_, _) -> _),
+                        op!(">=").to(Expression::Geq as fn(_, _) -> _),
+                        op!("<=").to(Expression::Leq as fn(_, _) -> _),
                         op!("<").to(Expression::Le as fn(_, _) -> _),
                         op!(">").to(Expression::Gt as fn(_, _) -> _),
                         op!("!=").to(Expression::Neq as fn(_, _) -> _),
@@ -537,26 +530,18 @@ impl<'parser> ParserBuilder<'parser> {
                 .repeated()
                 .collect()
                 .map_with(output!(Block))
-                // .map_with(output!(Scope))
                 .delimited_by(op!('{'), op!('}'))
                 .boxed();
 
-            let else_ = |if_| {
-                {
-                    op!("else")
-                        .ignore_then(choice((if_, stmt)))
-                        .boxed()
-                        .or_not()
-                }
-                .boxed()
-            };
-
-            let if_ = recursive(|if_| {
-                text::keyword("if")
+            let if_ = text::keyword("if")
                     .padded()
                     .then(self.expression())
                     .then(block.clone())
-                    .then(else_(if_))
+                    .then(
+                        op!("else")
+                            .ignore_then(block.clone())
+                            .or_not()
+                    )
                     .map_with(|(((_, condition), body), alternative), e| {
                         (
                             e.span(),
@@ -566,9 +551,7 @@ impl<'parser> ParserBuilder<'parser> {
                                 alternative,
                             }),
                         )
-                    })
-            })
-            .boxed();
+                    });
 
             let for_ = text::keyword("for")
                 .padded()
@@ -879,21 +862,17 @@ impl<'parser> ParserBuilder<'parser> {
             .memoized()
     }
 
-    pub fn parse(
-        &self,
-        src: &'parser str,
-    ) -> Result<Output<'parser>, HashSet<common::Message>> {
+    pub fn parse(&self, src: &'parser str) -> Result<Output<'parser>, common::Message> {
         match self.build().parse(src).into_result() {
             Ok(ast) => Ok(ast),
             Err(errs) => {
-                let mut messages = HashSet::with_capacity(errs.len());
-                errs.into_iter().for_each(|err| {
-                    let message = Message::error(err.to_string(), err.span().into_range());
-
-                    messages.insert(message);
+                let mut message =
+                    Message::error("Parse error".to_string(), std::ops::Range::default());
+                errs.iter().for_each(|err| {
+                    message.push(Label::new(err.to_string(), err.span().into_range()));
                 });
 
-                Err(messages)
+                Err(message)
             }
         }
     }

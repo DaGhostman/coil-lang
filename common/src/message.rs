@@ -1,28 +1,58 @@
-use std::ops::Range;
+use std::ops::{Deref, Range};
 
-#[derive(PartialEq, Hash, Eq, Clone, Debug)]
+use crate::{likely, unlikely};
+
+#[derive(PartialEq, Hash, Eq, Copy, Clone, Debug)]
 pub enum MessageKind {
     WARNING,
     ERROR,
     INFO,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, Clone)]
+pub struct Label {
+    message: String,
+    range: Range<usize>,
+}
+
+impl Label {
+    pub fn new(message: String, range: Range<usize>) -> Self {
+        Self {
+            message,
+            range,
+        }
+    }
+
+    pub fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+}
+
+impl ToString for Label {
+    fn to_string(&self) -> String {
+        self.message.to_string()
+    }
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
 pub struct Message {
     kind: MessageKind,
     message: String,
+    help: Option<String>,
+    labels: Vec<Label>,
     range: Range<usize>,
 
-    related: Option<Box<Self>>,
 }
+
 
 impl Message {
     pub fn new(kind: MessageKind, message: String, range: Range<usize>) -> Self {
         Self {
             kind,
-            message,
             range,
-            related: None,
+            help: None,
+            message,
+            labels: Vec::with_capacity(16)
         }
     }
 
@@ -34,21 +64,18 @@ impl Message {
         Self::new(MessageKind::ERROR, message, range)
     }
 
-
     pub fn info(message: String, range: Range<usize>) -> Self {
         Self::new(MessageKind::INFO, message, range)
     }
 }
 
 impl Message {
-    pub fn relates(&mut self, other: Self) -> &mut Self {
-        self.related = Some(Box::new(other));
-
-        self
+    pub fn with_help(&mut self, msg: String) {
+        self.help = Some(msg);
     }
 
-    pub fn related(&self) -> &Option<Box<Self>> {
-        &self.related
+    pub fn help(&self) -> &Option<String> {
+        &self.help
     }
 
     pub fn message(&self) -> &str {
@@ -59,7 +86,15 @@ impl Message {
         &self.kind
     }
 
+    pub fn labels(&self) -> &Vec<Label> {
+        &self.labels
+    }
+
     pub fn range(&self) -> &Range<usize> {
         &self.range
+    }
+
+    pub fn push(&mut self, label: Label) {
+        self.labels.push(label);
     }
 }

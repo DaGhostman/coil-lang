@@ -74,14 +74,6 @@ impl Object {
         }
     }
 
-    pub fn is_collectable(&self) -> bool {
-        match self {
-            Self::None => true,
-            Self::String(value) => value.is_collectable(),
-            Self::Reference(value) => value.is_collectable(),
-            Self::Coroutine(value) => value.is_collectable(),
-        }
-    }
 
     pub fn mark_reference(&mut self) {
         match self {
@@ -89,23 +81,6 @@ impl Object {
         }
     }
 
-    pub fn get_next(&self) -> Option<Self> {
-        match self {
-            Self::None => None,
-            Self::String(value) => value.get_next(),
-            Self::Reference(value) => value.get_next(),
-            Self::Coroutine(value) => value.get_next(),
-        }
-    }
-
-    pub fn set_next(&mut self, next: Option<Object>) {
-        match self {
-            Self::String(value) => value.set_next(next),
-            Self::Reference(value) => value.set_next(next),
-            Self::Coroutine(value) => value.set_next(next),
-            _ => (),
-        }
-    }
 }
 
 impl std::fmt::Display for Object {

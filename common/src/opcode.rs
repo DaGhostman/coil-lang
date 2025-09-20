@@ -16,6 +16,7 @@ pub enum Instruction {
     JMP,
     JMPT,
     JMPF,
+    JMPR,
     STRING,
     DATA,
     ACQUIRE,
@@ -50,6 +51,7 @@ pub enum Instruction {
     // -- Keyword
     PRINT,
     FORMAT,
+    STRINGIFY,
     NATIVE,
     RESUME,
     SUSP,

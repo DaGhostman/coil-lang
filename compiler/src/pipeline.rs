@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, collections::HashSet, path::PathBuf};
 
-use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
+use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
 use common::{Byte, Instruction, Interner, Message, MessageKind, Value};
 use parser::{Expression, ParserBuilder, SimpleSpan};
 
@@ -43,34 +43,40 @@ impl<'pipeline> Pipeline<'pipeline> {
         }
     }
 
-    fn render_errors(&mut self, filename: String, source: &str, messages: HashSet<Message>) {
+    fn render_errors(filename: String, source: &str, message: &Message) {
         let mut sources = sources([(filename.clone(), source)]);
 
-        for message in messages.iter() {
-            Report::build(
-                match message.kind() {
-                    MessageKind::ERROR => {
-                        self.failed = true;
-                        ReportKind::Error
-                    }
-                    MessageKind::WARNING => ReportKind::Warning,
-                    MessageKind::INFO => ReportKind::Advice,
-                },
-                (filename.clone(), message.range().clone()),
-            )
-            .with_config(
-                Config::new()
-                    .with_index_type(IndexType::Byte)
-                    .with_compact(false),
-            )
-            .with_message(message.message())
-            .with_label(
-                Label::new((filename.to_string(), message.range().clone())).with_color(Color::Red),
-            )
-            .finish()
-            .eprint(&mut sources)
-            .unwrap()
+        let mut report = Report::build(
+            match message.kind() {
+                MessageKind::ERROR => ReportKind::Error,
+                MessageKind::WARNING => ReportKind::Warning,
+                MessageKind::INFO => ReportKind::Custom("Info", Color::BrightBlue),
+            },
+            (filename.clone(), message.range().clone()),
+        )
+        .with_message(message.message())
+        .with_config(
+            Config::new()
+                .with_index_type(IndexType::Byte)
+                .with_underlines(true)
+                .with_label_attach(LabelAttach::End)
+                .with_multiline_arrows(true)
+                .with_compact(false),
+        );
+
+        for label in message.labels() {
+            report = report.with_label(
+                Label::new((filename.to_string(), label.range().clone()))
+                    .with_message(label.to_string())
+                    .with_color(Color::Primary),
+            );
         }
+
+        if let Some(tip) = message.help() {
+            report = report.with_help(tip);
+        }
+
+        report.finish().eprint(&mut sources).unwrap()
     }
 
     fn visit(&mut self, node: &(SimpleSpan, Box<Expression<'_>>)) {
@@ -102,21 +108,20 @@ impl<'pipeline> Pipeline<'pipeline> {
         if self.processed.contains(&file) {
             return;
         }
-        self.processed.insert(file.clone());
 
-        let src = std::fs::read_to_string(file.clone()).expect("Failed to open file");
+        let src = std::fs::read_to_string(file.as_str()).expect("Failed to open file");
+        self.processed.insert(file.clone());
 
         match self.parser.parse(src.as_str()) {
             Ok(ast) => {
                 self.visit(&ast);
-                match self.compiler.compile(&ast) {
-                    Ok(mut bytecode) => {
-                        self.bytecode.append(&mut bytecode);
-                    }
-                    Err(e) => self.render_errors(file, src.as_str(), e),
-                }
+                self.bytecode.append(&mut self.compiler.compile(&ast));
+
+                // for message in self.compiler.get_messages() {
+                //     Self::render_errors(file.clone(), src.as_str(), &message);
+                // }
             }
-            Err(e) => self.render_errors(file, src.as_str(), e),
+            Err(e) => Self::render_errors(file, src.as_str(), &e),
         }
     }
 

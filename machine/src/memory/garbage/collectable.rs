@@ -4,7 +4,9 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::garbage::{Rc, GcSized};
+
+use crate::{garbage::{GcSized, Rc}, };
+
 
 #[derive(Debug)]
 pub struct Collectable<T>(NonNull<Rc<T>>);

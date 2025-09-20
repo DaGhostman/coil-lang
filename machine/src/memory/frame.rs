@@ -1,11 +1,11 @@
 use std::fmt::Debug;
 
-use common::{promise, ArrayVec, ArrayVecIter};
+use common::{promise, ArrayVec};
 
 const STACK: usize = 32;
 
 #[repr(u8)]
-#[derive(Default, Copy, Clone, PartialEq)]
+#[derive(Default, Copy, Clone)]
 pub enum FrameState {
     #[default]
     PENDING,
@@ -22,7 +22,7 @@ pub struct Frame<T: Default> {
     ip: usize,
     // ---
     stack: ArrayVec<T, STACK>,
-    allocations: ArrayVec<u64, STACK>,
+    // allocations: ArrayVec<u64, STACK>,
 }
 
 impl<T: Default> Default for Frame<T> {
@@ -31,7 +31,7 @@ impl<T: Default> Default for Frame<T> {
             ip: 0,
             // state: FrameState::default(),
             stack: ArrayVec::default(),
-            allocations: ArrayVec::default(),
+            // allocations: ArrayVec::default(),
         }
     }
 }
@@ -75,13 +75,18 @@ impl<T: Default> Frame<T> {
         self.stack.get_mut()
     }
 
-    pub fn alloc(&mut self, addr: u64) {
-        self.allocations.push(addr);
-    }
+    // #[inline]
+    // pub fn len(&self) -> usize {
+    //     self.stack.len()
+    // }
 
-    pub fn allocations<'iter>(&self) -> ArrayVecIter<'_, u64, STACK> {
-        self.allocations.iter()
-    }
+    // pub fn alloc(&mut self, addr: u64) {
+    //     self.allocations.push(addr);
+    // }
+    //
+    // pub fn allocations<'iter>(&self) -> ArrayVecIter<'_, u64, STACK> {
+    //     self.allocations.iter()
+    // }
 
     // pub fn status(&self) -> FrameState {
     //     self.state
@@ -107,6 +112,7 @@ impl<T: Default> Frame<T> {
     //     self.state = FrameState::COMPLETE;
     // }
     //
+    #[inline]
     pub fn resume(&mut self, value: T) {
         // self.state = FrameState::PENDING;
         self.stack.push(value);
@@ -116,10 +122,11 @@ impl<T: Default> Frame<T> {
     //     self.state == FrameState::PENDING
     // }
 
-    pub fn enter(&mut self, ip: usize) {
+    #[inline]
+    pub fn enter(&mut self) {
         // self.state = FrameState::default();
-        self.ip = ip;
-        self.stack.seek(0);
+        self.seek(0);
+        self.stack.clear();
     }
 
     pub fn stack(&self) -> &ArrayVec<T, STACK> {

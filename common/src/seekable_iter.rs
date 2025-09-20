@@ -1,4 +1,4 @@
-use crate::likely;
+use crate::{likely, promise};
 
 
 pub struct SeekableIterator<'iter, T> {
@@ -36,13 +36,15 @@ impl <'iter, T> SeekableIterator<'iter, T> {
 impl <'iter, T>Iterator for SeekableIterator<'iter, T> {
     type Item = &'iter T;
     fn next(&mut self) -> Option<Self::Item> {
-        let mut value = None;
-        if likely(self.cursor < self.len) {
-            value = Some(&self.items[self.cursor]);
+        promise!(self.cursor < self.len);
+        if self.cursor < self.len {
+            let value = Some(&self.items[self.cursor]);
             self.cursor += 1;
-        }
 
-        value
+            return value;
+        } else {
+            None
+        }
     }
 }
 

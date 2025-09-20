@@ -1,4 +1,4 @@
-use crate::{Frame, garbage::GcSized};
+use crate::{garbage::GcSized, Frame, };
 
 pub struct Coroutine<T: Default>(Frame<T>);
 
@@ -18,9 +18,9 @@ impl<T: Default> Coroutine<T> {
 
 impl<T: Default> GcSized for Coroutine<T> {
     fn size(&self) -> usize {
-        use std::mem::size_of_val;
+        use std::mem::{size_of_val, size_of};
 
-        size_of_val(&self.0)
+        size_of_val(&self.0) //+ (size_of::<T>() * self.0.tell())
     }
 }
 

@@ -64,7 +64,7 @@ impl<'a> Value {
     ///
     /// You would need to verify the type externally
     pub fn as_int(&self) -> i64 {
-        self.raw() as _
+        self.0 as _
     }
 
     /// Casts the internal pointer value to bool
@@ -78,7 +78,7 @@ impl<'a> Value {
     ///
     /// You would need to verify the type externally
     pub fn as_bool(&self) -> bool {
-        self.raw() == 1
+        self.0 as u8 == 1
     }
 
     /// Casts the internal pointer value to float
@@ -91,7 +91,7 @@ impl<'a> Value {
     ///
     /// You would need to verify the type externally
     pub fn as_float(&self) -> f64 {
-        f64::from_bits(self.raw() as _)
+        f64::from_bits(self.0 as _)
     }
 
     pub fn as_ptr<T>(&self) -> NonNull<T> {
