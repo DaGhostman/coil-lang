@@ -1,11 +1,10 @@
-use std::hash::{Hash, Hasher};
+use std::{hash::{Hash, Hasher}};
 
 use common::Value;
 use rustc_hash::FxHasher;
 
 use crate::{
-    Coroutine, Reference, String,
-    garbage::{Collectable, GcSized},
+    garbage::{GcSized}, Coroutine, String
 };
 
 pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
@@ -20,7 +19,6 @@ pub enum ObjectType {
     None,
     String,
     Coroutine,
-    Reference,
 }
 
 impl From<u8> for ObjectType {
@@ -35,13 +33,12 @@ impl From<ObjectType> for u8 {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Clone)]
 pub enum Object {
     #[default]
     None,
-    String(Collectable<String>),
-    Reference(Collectable<Reference>),
-    Coroutine(Collectable<Coroutine<Value>>),
+    String(String),
+    Coroutine(Coroutine<Value>),
 }
 
 impl GcSized for Object {
@@ -49,50 +46,46 @@ impl GcSized for Object {
         match self {
             Self::None => 0,
             Self::String(value) => value.size(),
-            Self::Reference(value) => value.size(),
             Self::Coroutine(value) => value.size(),
         }
     }
 }
 
-impl Object {
-    pub fn inc(&mut self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::String(value) => value.inc(),
-            Self::Reference(value) => value.inc(),
-            Self::Coroutine(value) => value.inc(),
-        }
-    }
 
-    pub fn dec(&mut self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::String(value) => value.dec(),
-            Self::Reference(value) => value.dec(),
-            Self::Coroutine(value) => value.dec(),
-        }
-    }
-
-
-    pub fn mark_reference(&mut self) {
-        match self {
-            Self::None | Self::Reference(..) | Self::String(..) | Self::Coroutine(..) => (),
-        }
-    }
-
-}
+// impl Object {
+//     pub fn inc(&mut self) -> usize {
+//         match self {
+//             Self::None => 0,
+//             Self::String(value) => value.inc(),
+//             Self::Coroutine(value) => value.inc(),
+//         }
+//     }
+//
+//     pub fn dec(&mut self) -> usize {
+//         match self {
+//             Self::None => 0,
+//             Self::String(value) => value.dec(),
+//             Self::Coroutine(value) => value.dec(),
+//         }
+//     }
+//
+//
+//     pub fn mark_reference(&mut self) {
+//         match self {
+//             Self::None | Self::String(..) | Self::Coroutine(..) => (),
+//         }
+//     }
+//
+// }
 
 impl std::fmt::Display for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "0x{:016x}",
+            "{}",
             match self {
-                Object::None => 0,
-                Object::String(value) => value.ptr().as_ptr() as usize,
-                Object::Coroutine(value) => value.ptr().as_ptr() as usize,
-                Object::Reference(value) => value.ptr().as_ptr() as usize,
+                Object::String(value) => value.to_string(),
+                _ => std::string::String::default(),
             }
         )
     }
@@ -102,10 +95,8 @@ impl std::fmt::Display for Object {
 impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::None => write!(f, "Object::None"),
-            Self::String(value) => write!(f, "{:?}", value),
-            Self::Reference(value) => write!(f, "{:?}", value),
-            Self::Coroutine(value) => write!(f, "#{:?}", value.ptr().as_ptr() as usize),
+            Self::String(value) => write!(f, "{:?}", value.to_string()),
+            _ => write!(f, "Object"),
         }
     }
 }

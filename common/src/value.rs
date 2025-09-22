@@ -1,5 +1,3 @@
-use std::{num::NonZero, ptr::NonNull};
-
 type Storage = u64;
 
 #[derive(Default, Copy, Clone)]
@@ -35,9 +33,9 @@ impl From<u64> for Value {
     }
 }
 
-impl<T> From<NonNull<T>> for Value {
-    fn from(value: NonNull<T>) -> Self {
-        Self::new(value.as_ptr() as _)
+impl<T> From<*mut T> for Value {
+    fn from(value: *mut T) -> Self {
+        Self::new(value as _)
     }
 }
 
@@ -94,10 +92,11 @@ impl<'a> Value {
         f64::from_bits(self.0 as _)
     }
 
-    pub fn as_ptr<T>(&self) -> NonNull<T> {
-        NonNull::without_provenance(
-            NonZero::new(self.raw() as usize).expect("Invalid pointer address"),
-        )
+    pub fn as_ptr<T>(&self) -> *mut T {
+        self.raw() as _
+        // NonNull::without_provenance(
+        //     NonZero::new(self.raw() as _).expect("Invalid pointer address"),
+        // )
     }
 
     /// Casts the internal pointer value to float
@@ -111,8 +110,8 @@ impl<'a> Value {
     /// ```
     ///
     /// You would need to verify the type externally
-    pub fn raw(&self) -> Storage {
-        self.0 as _
+    pub fn raw(&self) -> usize {
+        self.0.addr() as usize
         // (self.0 as usize >> 3) as _
     }
 }

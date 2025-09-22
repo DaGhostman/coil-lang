@@ -3,8 +3,7 @@ use std::{borrow::Borrow, collections::HashMap, io::Write, ops::Deref};
 use common::{ArrayVec, SeekableIterator, Value, promise, unlikely};
 
 use crate::{
-    Byte, Coroutine, Frame, Heap, Instruction, Object, ObjectType, String as ObjString,
-    garbage::Collectable,
+    ArenaAllocated, Byte, Coroutine, Frame, Instruction, Object, 
 };
 
 macro_rules! ibinary_op {
@@ -199,13 +198,13 @@ impl<const S: usize> Machine<S> {
                     unlikely(true);
                     break;
                 }
-                ExecutionOutcome::RESUME => {
-                    unlikely(true);
-                    let frame: Collectable<Coroutine<Value>> =
-                        Collectable::from(self.frames.get_mut().pop().as_ptr());
-
-                    self.frames.push(frame.as_ref().frame().clone());
-                }
+                // ExecutionOutcome::RESUME => {
+                //     unlikely(true);
+                //     let frame: Collectable<Coroutine<Value>> =
+                //         Collectable::from(self.frames.get_mut().pop().as_ptr());
+                //
+                //     self.frames.push(frame.as_ref().frame().clone());
+                // }
                 _ => (),
             }
         }
@@ -233,9 +232,6 @@ impl<const S: usize> Machine<S> {
                     opcode.operand(1),
                     frame
                 );
-                if frame_no == 16 {
-                    panic!("Enough!");
-                }
             }
 
             match opcode.bytecode() {
@@ -276,11 +272,11 @@ impl<const S: usize> Machine<S> {
                             params[idx]= *frame.pop();
                         }
 
-                        let format_string = Collectable::<ObjString>::from(frame.peek().as_ptr());
-                        let format_str = format_string.as_ref().as_str();
+                        let format_string = ArenaAllocated::<Object>::new(frame.peek().as_ptr());
+                        let format_str = format_string.to_string();
 
                         // Pre-allocate string with estimated capacity
-                        let mut message = String::with_capacity(format_str.len() * 2);
+                        let mut message = String::default();
 
                         let mut chars = format_str.chars().peekable();
                         while let Some(ch) = chars.next() {
@@ -302,8 +298,8 @@ impl<const S: usize> Machine<S> {
                                     Some('s') => {
                                         chars.next();
                                         let string_val =
-                                            Collectable::<String>::from(params.pop().as_ptr());
-                                        message.push_str(&string_val.as_ref().as_str());
+                                            ArenaAllocated::<String>::new(params.pop().as_ptr());
+                                        message.push_str(&string_val.as_str());
                                     }
                                     Some('x') => {
                                         chars.next();
@@ -336,8 +332,7 @@ impl<const S: usize> Machine<S> {
                                 message.push(ch);
                             }
                         }
-                        Heap::free(format_string);
-                        let (_, collectable) = Heap::alloc(message.into(), Object::String);
+                        let collectable = frame.alloc(Object::String(message.into()));
                         *frame.top() = Value::from(collectable.ptr());
                     }
                     // let mut message = String::new();
@@ -417,10 +412,13 @@ impl<const S: usize> Machine<S> {
                     // frame.push(Value::from(collectable.ptr()));
                 }
                 Instruction::PRINT => {
-                    let value = Collectable::<ObjString>::from(frame.pop().as_ptr());
-                    print!("{}", value.as_ref().as_str());
+                    let value = ArenaAllocated::<Object>::new(frame.pop().as_ptr());
 
-                    Heap::free(value);
+                    match value.borrow() {
+                        Object::String(inner) => print!("{}", inner.as_str()),
+                        Object::Coroutine(_) => print!("0x{:016}", value.ptr().addr()),
+                        Object::None => print!(""),
+                    };
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand(0));
@@ -454,62 +452,55 @@ impl<const S: usize> Machine<S> {
                 Instruction::SUSP => {
                     let suspended_frame = frame.clone();
 
-                    let (_, coro) = Heap::alloc(Coroutine::new(suspended_frame), Object::Coroutine);
-                    frame.push(Value::from(coro.ptr()));
+                    let object = frame.alloc(Object::Coroutine(Coroutine::new(suspended_frame)));
+
+                    frame.push(Value::from(object.ptr()));
 
                     return ExecutionResult::returns();
                 }
                 Instruction::RESUME => {
                     return ExecutionResult::resume();
                 }
-                Instruction::ACQUIRE => {
-                    match (opcode.operand(0) as u8).into() {
-                        ObjectType::String => {
-                            Collectable::<ObjString>::from(frame.peek().as_ptr()).inc()
-                        }
-                        ObjectType::Reference => {
-                            Collectable::<crate::memory::Reference>::from(frame.peek().as_ptr())
-                                .inc()
-                        }
-                        ObjectType::Coroutine => {
-                            Collectable::<crate::memory::Coroutine<Value>>::from(
-                                frame.peek().as_ptr(),
-                            )
-                            .inc()
-                        }
-                        _ => 0,
-                    };
-                }
-                Instruction::RELEASE => match (opcode.operand(0) as u8).into() {
-                    ObjectType::String => {
-                        Heap::free(Collectable::<ObjString>::from(frame.peek().as_ptr()))
-                    }
-                    ObjectType::Reference => Heap::free(
-                        Collectable::<crate::memory::Reference>::from(frame.peek().as_ptr()),
-                    ),
-                    ObjectType::Coroutine => {
-                        Heap::free(Collectable::<crate::memory::Coroutine<Value>>::from(
-                            frame.peek().as_ptr(),
-                        ))
-                    }
-                    _ => (),
-                },
+                // Instruction::ACQUIRE => {
+                //     match (opcode.operand(0) as u8).into() {
+                //         ObjectType::String => {
+                //             Collectable::<ObjString>::from(frame.peek().as_ptr()).inc()
+                //         }
+                //         ObjectType::Coroutine => {
+                //             Collectable::<crate::memory::Coroutine<Value>>::from(
+                //                 frame.peek().as_ptr(),
+                //             )
+                //             .inc()
+                //         }
+                //         _ => 0,
+                //     };
+                // }
+                // Instruction::RELEASE => match (opcode.operand(0) as u8).into() {
+                //     ObjectType::String => {
+                //         // Heap::free(Collectable::<ObjString>::from(frame.peek().as_ptr()))
+                //     }
+                //     ObjectType::Coroutine => {
+                //         // Heap::free(Collectable::<crate::memory::Coroutine<Value>>::from(
+                //         //     frame.peek().as_ptr(),
+                //         // ))
+                //     }
+                //     _ => (),
+                // },
                 Instruction::HALT => {
                     let _ = std::io::stdout().flush();
                     return ExecutionResult::terminate();
                 }
                 Instruction::STRING => {
-                    let mut value: String = String::with_capacity(opcode.operand(0));
+                    let length = opcode.operand(0);
+                    let mut value: String = String::with_capacity(length);
 
-                    for _ in 0..opcode.operand(0) {
-                        if let Some(data) = code.next() {
-                            value.push(char::from_u32(data.operand(0) as u32).unwrap_or_default());
-                        }
+                    while length != value.len() && let Some(data) = code.next() {
+                        value.push(char::from_u32(data.operand(0) as u32).unwrap_or_default());
                     }
 
-                    let (_, collectable) = Heap::alloc(value.into(), Object::String);
+                    let object = frame.alloc(Object::String(value.into()));
 
-                    frame.push(Value::from(collectable.ptr()));
+                    frame.push(Value::from(object.ptr()));
                 }
                 Instruction::NOOP => continue,
                 _ => return ExecutionResult::invalid(),

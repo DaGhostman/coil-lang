@@ -35,6 +35,6 @@ fn main() {
     // Machine::<64>::default().run(&fib);
 
     if let Ok(bytecode) = pipeline.run(filename) {
-        Machine::<256>::default().run(&bytecode);
+        Machine::<128>::default().run(&bytecode);
     }
 }

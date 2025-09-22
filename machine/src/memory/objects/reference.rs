@@ -4,16 +4,17 @@ use crate::{
     garbage::{Collectable, GcSized}, Object, ObjectType, 
 };
 
+#[derive(Clone)]
 pub struct Reference(ObjectType, usize);
 
-impl From<Collectable<Object>> for Reference {
-    fn from(value: Collectable<Object>) -> Self {
+impl From<Object> for Reference {
+    fn from(value: Object) -> Self {
         Self(
-            match value.as_ref() {
+            match value {
                 Object::None => ObjectType::None,
                 Object::String(..) => ObjectType::String,
                 Object::Coroutine(..) => ObjectType::Coroutine,
-                Object::Reference(value) => return Self(value.as_ref().0, value.as_ref().1),
+                Object::Reference(value) => return Self(value.0, value.1),
             },
             value.ptr().as_ptr() as usize,
         )

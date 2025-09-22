@@ -1,8 +1,11 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, mem::MaybeUninit};
 
-use common::{promise, ArrayVec};
+use common::{promise, unlikely, ArrayVec};
 
-const STACK: usize = 32;
+use crate::{Allocator, ArenaAllocated, Object};
+
+const STACK: usize = 16;
+const HEAP: usize= 1024;
 
 #[repr(u8)]
 #[derive(Default, Copy, Clone)]
@@ -22,6 +25,7 @@ pub struct Frame<T: Default> {
     ip: usize,
     // ---
     stack: ArrayVec<T, STACK>,
+    allocator: Allocator<Object, HEAP>,
     // allocations: ArrayVec<u64, STACK>,
 }
 
@@ -31,6 +35,7 @@ impl<T: Default> Default for Frame<T> {
             ip: 0,
             // state: FrameState::default(),
             stack: ArrayVec::default(),
+            allocator: Allocator::default(),
             // allocations: ArrayVec::default(),
         }
     }
@@ -46,8 +51,6 @@ impl<T: Default> Frame<T> {
     }
 
     pub fn load(&self, index: usize) -> &T {
-        promise!(index < STACK);
-
         &self.stack[index]
     }
 
@@ -73,6 +76,10 @@ impl<T: Default> Frame<T> {
 
     pub fn top(&mut self) -> &mut T {
         self.stack.get_mut()
+    }
+
+    pub fn alloc(&mut self, value: Object) -> ArenaAllocated<Object> {
+        self.allocator.alloc(value)
     }
 
     // #[inline]
@@ -127,6 +134,9 @@ impl<T: Default> Frame<T> {
         // self.state = FrameState::default();
         self.seek(0);
         self.stack.clear();
+        // if !self.allocator.is_empty() {
+        //     self.allocator.clear();
+        // }
     }
 
     pub fn stack(&self) -> &ArrayVec<T, STACK> {
@@ -137,6 +147,12 @@ impl<T: Default> Frame<T> {
         &mut self.stack
     }
 }
+
+// impl <T: Default> Drop for Frame<T> {
+//     fn drop(&mut self) {
+//         self.allocator.clear();
+//     }
+// }
 
 #[cfg(debug_assertions)]
 impl<T: Default + Debug> Debug for Frame<T> {

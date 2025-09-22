@@ -1,5 +1,6 @@
 use crate::{garbage::GcSized, Frame, };
 
+#[derive(Clone)]
 pub struct Coroutine<T: Default>(Frame<T>);
 
 impl<T: Default> Coroutine<T> {

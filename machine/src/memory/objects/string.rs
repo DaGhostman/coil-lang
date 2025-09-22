@@ -1,12 +1,12 @@
 use std::{
     fmt::{Debug, Display},
     hash::Hash,
-    string::String as RustString,
 };
 
 use crate::{calculate_hash, garbage::GcSized};
 
-pub struct String(usize, u64, RustString);
+#[derive(Clone)]
+pub struct String(usize, u64, std::string::String);
 
 impl String {
     pub fn length(&self) -> usize {
@@ -30,15 +30,15 @@ impl GcSized for String {
     }
 }
 
-impl From<RustString> for String {
-    fn from(value: RustString) -> Self {
+impl From<std::string::String> for String {
+    fn from(value: std::string::String) -> Self {
         Self(value.len(), calculate_hash(&value), value)
     }
 }
 
 impl From<&str> for String {
     fn from(value: &str) -> Self {
-        Self::from(value.to_string())
+        Self::from(value.to_string().clone())
     }
 }
 
