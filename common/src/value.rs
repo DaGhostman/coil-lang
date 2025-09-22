@@ -106,12 +106,12 @@ impl<'a> Value {
     ///
     /// assert_eq!(Value::from(42).raw(), 42);
     /// assert_eq!(Value::from(true).raw(), 1);
-    /// assert_eq!(1.2_f64.to_bits() , Value::from(1.2).raw());
+    /// assert_eq!(1.2_f64.to_bits() as usize , Value::from(1.2).raw());
     /// ```
     ///
     /// You would need to verify the type externally
     pub fn raw(&self) -> usize {
-        self.0.addr() as usize
+        self.0.addr() 
         // (self.0 as usize >> 3) as _
     }
 }
@@ -163,6 +163,6 @@ mod tests {
 
         assert_eq!(Value::default().raw(), 0);
         assert_eq!(Value::from(13).raw(), 13);
-        assert_eq!(Value::from(1.2).raw(), (1.2_f64).to_bits());
+        assert_eq!(Value::from(1.2).raw(), (1.2_f64).to_bits() as usize);
     }
 }

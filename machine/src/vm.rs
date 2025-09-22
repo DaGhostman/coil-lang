@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, collections::HashMap, io::Write, ops::Deref};
+use std::{collections::HashMap, io::Write, };
 
 use common::{ArrayVec, SeekableIterator, Value, promise, unlikely};
 
@@ -273,7 +273,9 @@ impl<const S: usize> Machine<S> {
                         }
 
                         let format_string = ArenaAllocated::<Object>::new(frame.peek().as_ptr());
-                        let format_str = format_string.to_string();
+                        let format_str = format_string.as_ref().to_string();
+
+                        frame.free(format_string);
 
                         // Pre-allocate string with estimated capacity
                         let mut message = String::default();
@@ -299,7 +301,7 @@ impl<const S: usize> Machine<S> {
                                         chars.next();
                                         let string_val =
                                             ArenaAllocated::<String>::new(params.pop().as_ptr());
-                                        message.push_str(&string_val.as_str());
+                                        message.push_str(&string_val.as_ref().as_str());
                                     }
                                     Some('x') => {
                                         chars.next();
@@ -335,90 +337,17 @@ impl<const S: usize> Machine<S> {
                         let collectable = frame.alloc(Object::String(message.into()));
                         *frame.top() = Value::from(collectable.ptr());
                     }
-                    // let mut message = String::new();
-                    // let mut params = Vec::with_capacity(opcode.operand(1));
-                    //
-                    // for idx in (0..opcode.operand(0)).rev() {
-                    //     params.insert(idx, *frame.pop());
-                    // }
-                    //
-                    // let mut format = Collectable::<ObjString>::from(frame.pop().as_ptr());
-                    // let mut byte_format = format.as_ref().as_str().char_indices();
-                    //
-                    //     while let Some((_, v)) = byte_format.next() {
-                    //         match v {
-                    //             '%' => match byte_format.next() {
-                    //                 Some((_, 'i')) => unsafe {
-                    //                     message.push_str(
-                    //                         format!("{}", params.pop().unwrap_unchecked().as_int()).as_str(),
-                    //                     );
-                    //                 }
-                    //                 Some((_, 'f')) => unsafe {
-                    //                     message.push_str(
-                    //                         format!("{:.?}", params.pop().unwrap_unchecked().as_float()).as_str(),
-                    //                     );
-                    //                 }
-                    //                 Some((_, 'b')) => unsafe {
-                    //                     message.push_str(
-                    //                         format!("{:0b}", params.pop().unwrap_unchecked().raw()).as_str(),
-                    //                     );
-                    //                 }
-                    //                 Some((_, 's')) => unsafe {
-                    //                     message.push_str(
-                    //                         Collectable::<String>::from(params.pop().unwrap_unchecked().as_ptr())
-                    //                             .as_ref()
-                    //                             .to_string()
-                    //                             .as_str(),
-                    //                     );
-                    //                 }
-                    //                 Some((_, 'x')) => unsafe {
-                    //                     message.push_str(
-                    //                         format!("{:08x}", params.pop().unwrap_unchecked().raw()).as_str(),
-                    //                     );
-                    //                 }
-                    //                 Some((_, 'z')) => unsafe {
-                    //                     message.push_str(if params.pop().unwrap_unchecked().raw() > 0 {
-                    //                         "true"
-                    //                     } else {
-                    //                         "false"
-                    //                     });
-                    //                 }
-                    //                 Some((_, 'u')) => unsafe {
-                    //                     message
-                    //                         .push_str(format!("{}", params.pop().unwrap_unchecked().raw()).as_str());
-                    //                 }
-                    //                 Some((_, 'p')) => unsafe {
-                    //                     message.push_str(
-                    //                         format!(
-                    //                             "{:08x}",
-                    //                             params.pop().unwrap_unchecked().as_ptr::<bool>().addr()
-                    //                         )
-                    //                         .as_str(),
-                    //                     );
-                    //                 }
-                    //                 _ => {
-                    //                     message.push('%');
-                    //                 }
-                    //             },
-                    //             ch => {
-                    //                 message.push(ch);
-                    //             }
-                    //         }
-                    //     }
-                    //
-                    // Heap::free(&mut format);
-                    // let (_, collectable) = Heap::alloc(message.into(), Object::String);
-                    //
-                    // frame.push(Value::from(collectable.ptr()));
                 }
                 Instruction::PRINT => {
                     let value = ArenaAllocated::<Object>::new(frame.pop().as_ptr());
 
-                    match value.borrow() {
+                    match value.as_ref() {
                         Object::String(inner) => print!("{}", inner.as_str()),
                         Object::Coroutine(_) => print!("0x{:016}", value.ptr().addr()),
                         Object::None => print!(""),
                     };
+
+                    frame.free(value);
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand(0));
@@ -461,31 +390,12 @@ impl<const S: usize> Machine<S> {
                 Instruction::RESUME => {
                     return ExecutionResult::resume();
                 }
-                // Instruction::ACQUIRE => {
-                //     match (opcode.operand(0) as u8).into() {
-                //         ObjectType::String => {
-                //             Collectable::<ObjString>::from(frame.peek().as_ptr()).inc()
-                //         }
-                //         ObjectType::Coroutine => {
-                //             Collectable::<crate::memory::Coroutine<Value>>::from(
-                //                 frame.peek().as_ptr(),
-                //             )
-                //             .inc()
-                //         }
-                //         _ => 0,
-                //     };
-                // }
-                // Instruction::RELEASE => match (opcode.operand(0) as u8).into() {
-                //     ObjectType::String => {
-                //         // Heap::free(Collectable::<ObjString>::from(frame.peek().as_ptr()))
-                //     }
-                //     ObjectType::Coroutine => {
-                //         // Heap::free(Collectable::<crate::memory::Coroutine<Value>>::from(
-                //         //     frame.peek().as_ptr(),
-                //         // ))
-                //     }
-                //     _ => (),
-                // },
+                Instruction::RELEASE => {
+                    frame.free(ArenaAllocated::<Object>::new(frame.load(opcode.operand(0)).as_ptr()));
+                },
+                Instruction::ACQUIRE => {
+                    ArenaAllocated::<Object>::new(frame.load(opcode.operand(0)).as_ptr()).inc();
+                },
                 Instruction::HALT => {
                     let _ = std::io::stdout().flush();
                     return ExecutionResult::terminate();

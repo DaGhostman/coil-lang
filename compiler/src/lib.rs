@@ -163,7 +163,7 @@ impl Compiler {
             } => {
                 self.functions.insert(name.to_string(), self.bytecode.len());
 
-                for arg in args {
+                for (idx, arg) in args.iter().enumerate() {
                     let ty = self.typecheck(arg);
                     let mut a = self.do_compile(arg);
 
@@ -171,10 +171,7 @@ impl Compiler {
                         self.bytecode.push(Byte::new_with_operands(
                             Instruction::ACQUIRE,
                             [
-                                match ty {
-                                    Type::STRING => 1,
-                                    _ => 0,
-                                },
+                                idx,
                                 0,
                             ],
                         ));
@@ -185,6 +182,13 @@ impl Compiler {
                 for child in body {
                     let mut c = self.do_compile(child);
                     self.bytecode.append(&mut c);
+                }
+
+                for (idx, var) in self.context.variables.iter().enumerate() {
+                    if let Some(Type::OBJECT(_)) = self.typechecker.get_variable_type(var) {
+                        self.bytecode
+                            .push(Byte::new_with_operands(Instruction::RELEASE, [idx, 0]));
+                    }
                 }
 
                 for (offset, arity, x) in self.context.defers.iter() {
@@ -265,17 +269,28 @@ impl Compiler {
                     ));
                 }
 
+                if let Expression::Identifier(name) = *expr.1.borrow() {
+                    let ty = self.typechecker.get_variable_type(&name.into());
+                    let symbol = self.context.variables.key(&name.into());
+                        if matches!(ty, Some(Type::OBJECT(_))) || matches!(ty, Some(Type::STRING)) {
+                            bytecode
+                                .push(Byte::new_with_operands(Instruction::ACQUIRE, [symbol.expect("Unable to resolve unknown variable"), 0]));
+                        }
+                }
+
                 for variable in self.context.variables.iter() {
                     if let (Some(symbol), Some(ty)) = (
                         self.context.variables.key(variable),
                         self.typechecker.get_variable_type(variable),
                     ) {
                         if matches!(ty, Type::OBJECT(_)) || matches!(ty, Type::STRING) {
-                            bytecode.push(Byte::new_with_operands(Instruction::LOAD, [symbol, 0]));
-                            bytecode.push(Byte::new(Instruction::RELEASE));
+                            bytecode
+                                .push(Byte::new_with_operands(Instruction::RELEASE, [symbol, 0]));
                         }
                     }
                 }
+
+
                 bytecode.append(&mut self.do_compile(expr));
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
                     bytecode.push(Byte::new(Instruction::RETURN));
@@ -372,9 +387,9 @@ impl Compiler {
                         Instruction::JMPR,
                         [
                             // self.bytecode.len()
-                                // + condition.len()
-                                // + body.len()
-                                2 // This instruction + the JMPF bellow
+                            // + condition.len()
+                            // + body.len()
+                            2 // This instruction + the JMPF bellow
                                 + alternative.len(),
                             0,
                         ],
@@ -640,16 +655,7 @@ impl Compiler {
                     bytecode.push(Byte::new_with_operands(Instruction::STORE, [symbol, 0]));
 
                     if matches!(ty, Type::OBJECT(_) | Type::STRING) {
-                        bytecode.push(Byte::new_with_operands(
-                            Instruction::ACQUIRE,
-                            [
-                                match ty {
-                                    Type::STRING => 1,
-                                    _ => 0,
-                                },
-                                0,
-                            ],
-                        ));
+                        bytecode.push(Byte::new_with_operands(Instruction::ACQUIRE, [symbol, 0]));
                     }
                 } else {
                     let mut message =

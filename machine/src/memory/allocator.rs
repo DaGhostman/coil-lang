@@ -1,13 +1,18 @@
 use std::{
-    alloc::Layout, borrow::{Borrow, BorrowMut}, marker::PhantomData, ops::{Deref, DerefMut}
+    alloc::Layout,
+    borrow::{Borrow, BorrowMut},
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
 };
 
-use crate::garbage::GcSized;
+use common::ArrayVec;
 
-pub struct ArenaAllocated<T>(*mut T);
+use crate::garbage::{GcSized, Rc};
+
+pub struct ArenaAllocated<T>(*mut Rc<T>);
 
 impl<T> ArenaAllocated<T> {
-    pub fn new(ptr: *mut T) -> Self {
+    pub fn new(ptr: *mut Rc<T>) -> Self {
         Self(ptr)
     }
 
@@ -15,7 +20,7 @@ impl<T> ArenaAllocated<T> {
         lhs.0.eq(&rhs.0)
     }
 
-    pub fn ptr(&self) -> *mut T {
+    pub fn ptr(&self) -> *mut Rc<T> {
         self.0
     }
 }
@@ -27,16 +32,16 @@ impl<T: GcSized> GcSized for ArenaAllocated<T> {
 }
 
 impl<T> Deref for ArenaAllocated<T> {
-    type Target = T;
+    type Target = Rc<T>;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref().expect("Inable to deref allocation") }
+        unsafe { &*self.0 }
     }
 }
 
 impl<T> DerefMut for ArenaAllocated<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.0.as_mut().expect("Unable to mut deref allocation") }
+        unsafe { &mut *self.0 }
     }
 }
 
@@ -47,15 +52,15 @@ impl<T> Clone for ArenaAllocated<T> {
     }
 }
 
-impl<T> Borrow<T> for ArenaAllocated<T> {
-    fn borrow(&self) -> &T {
+impl<T> Borrow<Rc<T>> for ArenaAllocated<T> {
+    fn borrow(&self) -> &Rc<T> {
         self.deref()
     }
 }
 
-impl<T> BorrowMut<T> for ArenaAllocated<T> {
-    fn borrow_mut(&mut self) -> &mut T {
-        unsafe { self.0.as_mut().unwrap() }
+impl<T> BorrowMut<Rc<T>> for ArenaAllocated<T> {
+    fn borrow_mut(&mut self) -> &mut Rc<T> {
+        unsafe { self.0.as_mut().expect("Unable to obtain mutable reference") }
     }
 }
 
@@ -65,6 +70,7 @@ pub struct Chunk<T: GcSized, const B: usize> {
     size: usize,
     count: usize,
     layout: Layout,
+    freed: ArrayVec<usize, B>,
     // prev: Option<Box<Chunk<T, B>>>,
     _phantom: PhantomData<[T; B]>,
 }
@@ -93,13 +99,16 @@ impl<T: GcSized, const B: usize> Chunk<T, B> {
 
         match std::alloc::Layout::from_size_align(size * B, align) {
             Ok(layout) => unsafe {
-                let data =std::alloc::alloc(layout); 
+                let data = std::alloc::alloc(layout);
+
+                dbg!(size);
 
                 Chunk {
                     data,
                     size,
                     layout,
                     count: 0,
+                    freed: ArrayVec::default(),
                     _phantom: PhantomData::default(),
                 }
             },
@@ -110,23 +119,32 @@ impl<T: GcSized, const B: usize> Chunk<T, B> {
     }
 
     pub fn alloc(&mut self, value: T) -> ArenaAllocated<T> {
-        let aligned_offset = (self.count + self.size + self.layout.align() - 1) & !(self.layout.align() - 1);
-        if aligned_offset + self.count > B * self.size {
-            panic!("Unable to overallocate");
-        }
+        let offset = if self.freed.len() == 0 {
+            let aligned_offset =
+                (self.count + self.size + self.layout.align() - 1) & !(self.layout.align() - 1);
+            if aligned_offset + self.count > B * self.size {
+                panic!("Unable to overallocate");
+            }
 
-
+            aligned_offset
+        } else {
+            *self.freed.pop()
+        };
 
         unsafe {
             let ptr = self.data.offset(self.count as isize);
-            self.count = aligned_offset;
-            std::ptr::write(ptr as *mut T, value);
+            self.count = offset;
+            std::ptr::write(ptr as *mut Rc<T>, Rc::new(value));
 
             // panic!("OFFSET: {}", ptr.offset_from(self.data));
-        // panic!("{} - {} - {:?} {} {} {} {}", self.count, self.top.addr(), self.layout, self.layout.size(), self.layout.align(), aligned_offset, self.layout.size() * B);
+            // panic!("{} - {} - {:?} {} {} {} {}", self.count, self.top.addr(), self.layout, self.layout.size(), self.layout.align(), aligned_offset, self.layout.size() * B);
 
             ArenaAllocated(ptr as _)
         }
+    }
+
+    pub fn free(&mut self, value: ArenaAllocated<T>) {
+        self.freed.push(value.ptr() as _);
     }
 
     // pub fn free(self) {
@@ -155,7 +173,9 @@ impl<T: GcSized, const B: usize> Chunk<T, B> {
 
 impl<T: GcSized, const B: usize> Drop for Chunk<T, B> {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.data, self.layout); }
+        unsafe {
+            std::alloc::dealloc(self.data, self.layout);
+        }
     }
 }
 
@@ -173,6 +193,7 @@ impl<T: GcSized, const B: usize> Allocator<T, B> {
         if self.head.is_none() {
             self.head = Some(Chunk::new());
         }
+
         // if (self.head.len() + self.size >= B) {
         //     let mut chunk = Chunk::new();
         //     chunk.set_prev(self.head.clone());
@@ -180,10 +201,22 @@ impl<T: GcSized, const B: usize> Allocator<T, B> {
         // }
 
         if let Some(chunk) = &mut self.head {
-            self.size += std::mem::size_of::<T>();
             chunk.alloc(value)
         } else {
             unreachable!("Unable to get here");
+        }
+    }
+
+    pub fn free(&mut self, value: ArenaAllocated<T>) {
+
+        if value.dec() == 0 {
+            if let Some(chunk) = &mut self.head {
+                #[cfg(debug_assertions)]
+                eprintln!("Cleaning: {}", value.ptr().addr());
+                chunk.free(value);
+            } else {
+                unreachable!("Attempting to free, before create");
+            }
         }
     }
 
@@ -236,15 +269,15 @@ mod tests {
         let x: ArenaAllocated<String> = allocator.alloc(str.clone().into());
         // let y: ArenaAllocated<String> = allocator.alloc("Hello, Boss!".into());
 
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
-        assert_eq!(str, x.to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
+        assert_eq!(str, x.as_ref().to_string());
 
-        assert_eq!(88, x.size());
+        assert_eq!(96, x.size());
     }
 }

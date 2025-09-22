@@ -81,6 +81,9 @@ impl<T: Default> Frame<T> {
     pub fn alloc(&mut self, value: Object) -> ArenaAllocated<Object> {
         self.allocator.alloc(value)
     }
+    pub fn free(&mut self, value: ArenaAllocated<Object>) {
+        self.allocator.free(value)
+    }
 
     // #[inline]
     // pub fn len(&self) -> usize {

@@ -10,18 +10,18 @@ pub struct Rc<T> {
 impl <T> Rc<T> {
     pub const fn new(data: T) -> Self {
         Self {
-            count: Cell::new(0),
+            count: Cell::new(1),
             data,
         }
     }
 
-    pub fn inc(&mut self) -> usize {
+    pub fn inc(&self) -> usize {
         self.count.update(|ref_count| ref_count + 1);
         
         self.count.get()
     }
 
-    pub fn dec(&mut self) -> usize {
+    pub fn dec(&self) -> usize {
         self.count.update(|ref_count| ref_count.max(1) - 1);
 
         self.count.get()
