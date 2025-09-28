@@ -1,4 +1,4 @@
-use crate::{likely, promise};
+use crate::promise;
 
 
 pub struct SeekableIterator<'iter, T> {
@@ -38,10 +38,11 @@ impl <'iter, T>Iterator for SeekableIterator<'iter, T> {
     fn next(&mut self) -> Option<Self::Item> {
         promise!(self.cursor < self.len);
         if self.cursor < self.len {
+            promise!(self.cursor < self.len);
             let value = Some(&self.items[self.cursor]);
             self.cursor += 1;
 
-            return value;
+            value
         } else {
             None
         }

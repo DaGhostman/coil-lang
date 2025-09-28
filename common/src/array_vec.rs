@@ -1,6 +1,5 @@
 use std::{
-    fmt::Debug,
-    ops::{Index, IndexMut, Range},
+    ops::{Index, IndexMut},
 };
 
 use crate::{likely, unlikely, promise };
@@ -10,6 +9,15 @@ pub struct ArrayVec<T: Default, const N: usize> {
     current: usize,
     storage: [T; N],
     expansion: Vec<T>,
+}
+
+impl<T: Default, const N: usize> FromIterator<T> for ArrayVec<T, N> {
+    fn from_iter<X: IntoIterator<Item = T>>(iter: X) -> Self {
+        let mut result = ArrayVec::default();
+        iter.into_iter().for_each(|v| result.push(v));
+
+        result
+    }
 }
 
 impl<T: Default, const N: usize> Default for ArrayVec<T, N> {
@@ -35,6 +43,7 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         }
     }
 
+    #[inline]
     pub fn current(&self) -> &T {
         if likely(self.current < N) {
             promise!(self.current < N);
@@ -46,6 +55,7 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         }
     }
 
+    #[inline]
     pub fn current_mut(&mut self) -> &mut T {
         if likely(self.current < N) {
             promise!(self.current < N);
@@ -61,32 +71,38 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         }
     }
 
+    #[inline]
     pub fn consume(&mut self) {
         self.current += 1;
     }
 
+    #[inline]
     pub fn seek(&mut self, value: usize) {
         self.current = value;
     }
 
+    #[inline]
     pub fn push(&mut self, value: T) {
-        if likely(self.current < N) {
-            promise!(self.current < N);
-            promise!(self.current < self.storage.len());
-
-            self.storage[self.current] = value;
-        } else {
-            self.grow(self.current - N);
-
-            promise!(self.current >= N);
-            promise!(self.current - N < self.expansion.len());
-
-            self.expansion[self.current - N] = value;
-        }
-
+        let current = self.current;
         self.current += 1;
+
+        if likely(current < N) {
+            promise!(current < N);
+            promise!(current < self.storage.len());
+
+            self.storage[current] = value;
+        } else {
+            let offset = current - N;
+            self.grow(offset);
+
+            promise!(offset >= N);
+            promise!(offset < self.expansion.len());
+
+            self.expansion[offset] = value;
+        }
     }
 
+    #[inline]
     pub fn pop(&mut self) -> &T {
         promise!(self.current > 0);
         promise!(!self.storage.is_empty() || !self.expansion.is_empty());
@@ -105,7 +121,7 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         promise!(self.current > 0);
         let current = self.current - 1;
 
-        if (current < N) {
+        if likely(current < N) {
             promise!(current < N);
             promise!(current < self.storage.len());
 
@@ -144,8 +160,14 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
     //     }
     // }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.current
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.current == 0
     }
 
     // pub fn iter(&self) -> Iter<T>{
@@ -223,7 +245,7 @@ impl<T: Default, const N: usize> IndexMut<usize> for ArrayVec<T, N> {
 }
 
 #[cfg(debug_assertions)]
-impl<T: Default + Debug, const N: usize> Debug for ArrayVec<T, N> {
+impl<T: Default + std::fmt::Debug, const N: usize> std::fmt::Debug for ArrayVec<T, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

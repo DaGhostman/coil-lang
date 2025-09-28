@@ -83,12 +83,16 @@ impl<'pipeline> Pipeline<'pipeline> {
         match node.1.borrow() {
             Expression::Use { path, .. } => {
                 let mut p = self.cwd.clone();
+                let mut ns = String::new();
                 p.push("src");
-                path.iter().for_each(|segment| p.push(segment));
+                path.iter().for_each(|segment| {
+                    p.push(segment);
+                    ns.push_str(format!("{}::", segment).as_str());
+                });
                 p.set_extension("0s");
 
                 if let Some(path) = p.to_str() {
-                    self.process(path.to_string());
+                    self.process(path.to_string(), ns);
                 } else {
                     panic!("Unable to handle '{}'", p.display());
                 }
@@ -104,7 +108,7 @@ impl<'pipeline> Pipeline<'pipeline> {
         }
     }
 
-    fn process(&mut self, file: String) {
+    fn process(&mut self, file: String, ns: String) {
         if self.processed.contains(&file) {
             return;
         }
@@ -115,7 +119,10 @@ impl<'pipeline> Pipeline<'pipeline> {
         match self.parser.parse(src.as_str()) {
             Ok(ast) => {
                 self.visit(&ast);
-                self.bytecode.append(&mut self.compiler.compile(&ast));
+                let bytecode = self.compiler.compile(ns.as_str(),&ast);
+
+
+                self.bytecode = bytecode;
 
                 // for message in self.compiler.get_messages() {
                 //     Self::render_errors(file.clone(), src.as_str(), &message);
@@ -126,7 +133,7 @@ impl<'pipeline> Pipeline<'pipeline> {
     }
 
     pub fn run(mut self, filename: String) -> Result<Vec<Byte<Value>>, ()> {
-        self.process(filename);
+        self.process(filename, String::default());
 
         if let Some(byte) = self.bytecode.first_mut() {
             *byte =

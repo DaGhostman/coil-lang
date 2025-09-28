@@ -1,5 +1,5 @@
 use std::{
-    fmt::{Debug, Display},
+    fmt::{Display},
     hash::Hash,
 };
 
@@ -55,7 +55,7 @@ impl Display for String {
 }
 
 #[cfg(debug_assertions)]
-impl Debug for String {
+impl std::fmt::Debug for String {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "'{}' (0x{:0x})", self.2, self.1)
     }

@@ -1,11 +1,17 @@
 type Storage = u64;
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, Eq, Hash)]
 pub struct Value(*mut u8);
 
 impl From<i64> for Value {
     fn from(value: i64) -> Self {
         Self::new(value as _)
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
     }
 }
 
@@ -61,6 +67,7 @@ impl<'a> Value {
     /// ```
     ///
     /// You would need to verify the type externally
+    #[inline]
     pub fn as_int(&self) -> i64 {
         self.0 as _
     }
@@ -75,6 +82,7 @@ impl<'a> Value {
     /// ```
     ///
     /// You would need to verify the type externally
+    #[inline]
     pub fn as_bool(&self) -> bool {
         self.0 as u8 == 1
     }
@@ -88,10 +96,12 @@ impl<'a> Value {
     /// ```
     ///
     /// You would need to verify the type externally
+    #[inline]
     pub fn as_float(&self) -> f64 {
         f64::from_bits(self.0 as _)
     }
 
+    #[inline]
     pub fn as_ptr<T>(&self) -> *mut T {
         self.raw() as _
         // NonNull::without_provenance(
@@ -104,14 +114,15 @@ impl<'a> Value {
     /// ```
     /// use common::Value;
     ///
-    /// assert_eq!(Value::from(42).raw(), 42);
-    /// assert_eq!(Value::from(true).raw(), 1);
-    /// assert_eq!(1.2_f64.to_bits() as usize , Value::from(1.2).raw());
+    /// assert_eq!(Value::from(42).raw(), 42 as _);
+    /// assert_eq!(Value::from(true).raw(), 1 as _);
+    /// assert_eq!(Value::from(1.2).raw(), 1.2_f64.to_bits() as _ );
     /// ```
     ///
     /// You would need to verify the type externally
-    pub fn raw(&self) -> usize {
-        self.0.addr() 
+    #[inline]
+    pub fn raw(&self) -> *mut u8 {
+        self.0 
         // (self.0 as usize >> 3) as _
     }
 }
@@ -161,8 +172,8 @@ mod tests {
         assert_eq!(Value::default().as_int(), 0);
         assert_eq!(Value::from(1.2).as_float(), 1.2);
 
-        assert_eq!(Value::default().raw(), 0);
-        assert_eq!(Value::from(13).raw(), 13);
-        assert_eq!(Value::from(1.2).raw(), (1.2_f64).to_bits() as usize);
+        assert_eq!(Value::default().raw(), std::ptr::null_mut());
+        assert_eq!(Value::from(13).raw(), 13 as _);
+        assert_eq!(Value::from(1.2).raw(), (1.2_f64).to_bits() as _);
     }
 }

@@ -37,6 +37,7 @@ struct Context {
 }
 
 pub struct Compiler {
+    namespace: String,
     bytecode: Vec<Byte<Value>>,
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
@@ -57,6 +58,7 @@ impl Default for Compiler {
         ]);
 
         Self {
+            namespace: String::default(),
             bytecode,
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
@@ -123,6 +125,8 @@ impl Compiler {
         self.typechecker.check(ast)
     }
 
+    // fn compile_if
+
     fn do_compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
@@ -134,12 +138,17 @@ impl Compiler {
         match child.borrow() {
             Expression::Comment(_) => (),
             Expression::Use {
-                path: _,
+                path: p,
                 name,
                 alias,
             } => {
+                let mut prefix = p.clone();
+                if prefix.len() == 1 {
+                    prefix.push("".to_string());
+                }
                 self.aliases
-                    .insert(alias.clone().unwrap_or(name.to_string()), name.to_string());
+                    .insert(alias.clone().unwrap_or(name.to_string()), format!("{}{}", prefix.join("::"), name.to_string()));
+
             }
             Expression::Program(children) | Expression::Fragment(children) => {
                 for child in children {
@@ -161,21 +170,12 @@ impl Compiler {
                 returns: _returns,
                 body,
             } => {
-                self.functions.insert(name.to_string(), self.bytecode.len());
+                self.functions.insert(format!("{}{}", self.namespace, name.to_string()), self.bytecode.len());
 
-                for (idx, arg) in args.iter().enumerate() {
-                    let ty = self.typecheck(arg);
+
+                for arg in args.iter().rev() {
                     let mut a = self.do_compile(arg);
 
-                    if matches!(ty, Type::OBJECT(_) | Type::STRING) {
-                        self.bytecode.push(Byte::new_with_operands(
-                            Instruction::ACQUIRE,
-                            [
-                                idx,
-                                0,
-                            ],
-                        ));
-                    }
                     self.bytecode.append(&mut a);
                 }
 
@@ -184,12 +184,12 @@ impl Compiler {
                     self.bytecode.append(&mut c);
                 }
 
-                for (idx, var) in self.context.variables.iter().enumerate() {
-                    if let Some(Type::OBJECT(_)) = self.typechecker.get_variable_type(var) {
-                        self.bytecode
-                            .push(Byte::new_with_operands(Instruction::RELEASE, [idx, 0]));
-                    }
-                }
+                // for (idx, var) in self.context.variables.iter().enumerate() {
+                //     if let Some(Type::OBJECT(_)) = self.typechecker.get_variable_type(var) {
+                //         self.bytecode
+                //             .push(Byte::new_with_operands(Instruction::RELEASE, [idx, 0]));
+                //     }
+                // }
 
                 for (offset, arity, x) in self.context.defers.iter() {
                     self.bytecode.append(&mut x.clone());
@@ -203,26 +203,30 @@ impl Compiler {
                     if let (Some(symbol), Some(ty)) = (
                         self.context.variables.key(variable),
                         self.typechecker.get_variable_type(variable),
-                    ) {
-                        if matches!(ty, Type::OBJECT(_) | Type::STRING) {
-                            self.bytecode
-                                .push(Byte::new_with_operands(Instruction::LOAD, [symbol, 0]));
-                            self.bytecode.push(Byte::new_with_operands(
-                                Instruction::RELEASE,
-                                [
-                                    match ty {
-                                        Type::STRING => 1,
-                                        _ => 0,
-                                    },
-                                    0,
-                                ],
-                            ));
-                        }
+                    ) && matches!(ty, Type::OBJECT(_) | Type::STRING)
+                    {
+                        self.bytecode
+                            .push(Byte::new_with_operands(Instruction::LOAD, [symbol, 0]));
+                        // self.bytecode.push(Byte::new_with_operands(
+                        //     Instruction::RELEASE,
+                        //     [
+                        //         match ty {
+                        //             Type::STRING => 1,
+                        //             _ => 0,
+                        //         },
+                        //         0,
+                        //     ],
+                        // ));
                     }
                 }
-                self.bytecode
-                    .push(Byte::new_with_value(Instruction::CONST, Value::default()));
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                if !matches!(
+                    self.bytecode.last().map(|b| b.bytecode()),
+                    Some(Instruction::RETURN)
+                ) {
+                    self.bytecode
+                        .push(Byte::new_with_value(Instruction::CONST, Value::default()));
+                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                }
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -269,27 +273,26 @@ impl Compiler {
                     ));
                 }
 
-                if let Expression::Identifier(name) = *expr.1.borrow() {
-                    let ty = self.typechecker.get_variable_type(&name.into());
-                    let symbol = self.context.variables.key(&name.into());
-                        if matches!(ty, Some(Type::OBJECT(_))) || matches!(ty, Some(Type::STRING)) {
-                            bytecode
-                                .push(Byte::new_with_operands(Instruction::ACQUIRE, [symbol.expect("Unable to resolve unknown variable"), 0]));
-                        }
-                }
+                // if let Expression::Identifier(name) = *expr.1.borrow() {
+                //     let ty = self.typechecker.get_variable_type(&name.into());
+                //     let symbol = self.context.variables.key(&name.into());
+                //     // if matches!(ty, Some(Type::OBJECT(_))) || matches!(ty, Some(Type::STRING)) {
+                //     //     bytecode.push(Byte::new_with_operands(
+                //     //         Instruction::ACQUIRE,
+                //     //         [symbol.expect("Unable to resolve unknown variable"), 0],
+                //     //     ));
+                //     // }
+                // }
 
-                for variable in self.context.variables.iter() {
-                    if let (Some(symbol), Some(ty)) = (
-                        self.context.variables.key(variable),
-                        self.typechecker.get_variable_type(variable),
-                    ) {
-                        if matches!(ty, Type::OBJECT(_)) || matches!(ty, Type::STRING) {
-                            bytecode
-                                .push(Byte::new_with_operands(Instruction::RELEASE, [symbol, 0]));
-                        }
-                    }
-                }
-
+                // for variable in self.context.variables.iter() {
+                //     if let (Some(symbol), Some(ty)) = (
+                //         self.context.variables.key(variable),
+                //         self.typechecker.get_variable_type(variable),
+                //     ) && (matches!(ty, Type::OBJECT(_)) || matches!(ty, Type::STRING))
+                //     {
+                //         bytecode.push(Byte::new_with_operands(Instruction::RELEASE, [symbol, 0]));
+                //     }
+                // }
 
                 bytecode.append(&mut self.do_compile(expr));
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
@@ -299,6 +302,13 @@ impl Compiler {
             Expression::Yield(child) => {
                 bytecode.append(&mut self.do_compile(child));
                 bytecode.push(Byte::new(Instruction::SUSP));
+            }
+            Expression::Resume(expr, arg) => {
+                if arg.is_some() {
+                    arg.as_ref().map(|a| self.do_compile(&a)).map(|mut a| self.bytecode.append(&mut a)).unwrap();
+                } 
+                bytecode.append(&mut self.do_compile(expr));
+                bytecode.push(Byte::new_with_operands(Instruction::RESUME, [arg.is_some() as usize, 0]));
             }
             Expression::Defer(deps, child) => {
                 let mut body = vec![Byte::new_with_operands(Instruction::JMP, [usize::MAX, 0])];
@@ -369,42 +379,53 @@ impl Compiler {
                     self.messages.push(message);
                 }
             }
-            Expression::If {
-                condition,
-                body,
-                alternative,
-            } => {
-                let mut condition = self.do_compile(condition);
-                let mut body = self.do_compile(body);
+            Expression::If(branches) => {
+                let mut compiled = branches
+                    .iter()
+                    .map(|(_, branch)| {
+                        if let Expression::Branch(condition, body) = branch.borrow() {
+                            (
+                                condition.as_ref().map(|c| self.do_compile(&c)),
+                                self.do_compile(body),
+                            )
+                        } else {
+                            unreachable!("Unable to handle");
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
-                let mut alternative = alternative
-                    .as_ref()
-                    .map(|v| self.do_compile(v))
-                    .unwrap_or_default();
+                let compiled_lenght = compiled
+                    .iter()
+                    .map(|(condition, body)| {
+                        if !condition.is_none() {
+                            condition.as_ref().map(|c| c.len()).unwrap_or(0) + body.len() + 2
+                        } else {
+                            0
+                        }
+                    })
+                    .sum::<usize>()
+                    + self.bytecode.len()
+                    + bytecode.len();
 
-                if !alternative.is_empty() {
-                    body.push(Byte::new_with_operands(
-                        Instruction::JMPR,
-                        [
-                            // self.bytecode.len()
-                            // + condition.len()
-                            // + body.len()
-                            2 // This instruction + the JMPF bellow
-                                + alternative.len(),
-                            0,
-                        ],
-                    ));
-                }
 
-                let current_len = body.len() + condition.len();
-                bytecode.append(&mut condition);
+                let branchless = branches.len() == 1;
+                compiled.iter_mut().for_each(|(condition, body)| {
+                    if let Some(condition) = condition {
+                        bytecode.append(condition);
+                        bytecode.push(Byte::new_with_operands(
+                            Instruction::JMPF,
+                            [bytecode.len() + self.bytecode.len() + body.len() + 1 + ((!branchless) as usize), 0],
+                        ));
+                    }
 
-                bytecode.push(Byte::new_with_operands(
-                    Instruction::JMPF,
-                    [self.bytecode.len() + current_len + 1, 0],
-                ));
-                bytecode.append(&mut body);
-                bytecode.append(&mut alternative);
+                    if !branchless {
+                        body.push(Byte::new_with_operands(
+                            Instruction::JMP,
+                            [compiled_lenght, 0],
+                        ));
+                    }
+                    bytecode.append(body);
+                });
             }
             Expression::Le(lhs, rhs) => {
                 binary!(
@@ -648,15 +669,15 @@ impl Compiler {
                         }
                     }
 
-                    let ty = self.typecheck(value);
+                    // let ty = self.typecheck(value);
                     let mut expr = self.do_compile(value);
 
                     bytecode.append(&mut expr);
                     bytecode.push(Byte::new_with_operands(Instruction::STORE, [symbol, 0]));
 
-                    if matches!(ty, Type::OBJECT(_) | Type::STRING) {
-                        bytecode.push(Byte::new_with_operands(Instruction::ACQUIRE, [symbol, 0]));
-                    }
+                    // if matches!(ty, Type::OBJECT(_) | Type::STRING) {
+                    //     bytecode.push(Byte::new_with_operands(Instruction::ACQUIRE, [symbol, 0]));
+                    // }
                 } else {
                     let mut message =
                         Message::error("Undefined variable".to_string(), span.into_range());
@@ -699,7 +720,7 @@ impl Compiler {
                         );
                     }
                 }
-            }
+            },
             _expr => {
                 let mut message =
                     Message::error("Unknown expression".to_string(), span.into_range());
@@ -718,9 +739,13 @@ impl Compiler {
 
     pub fn compile<'compiler>(
         &mut self,
+        module: &str,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte<Value>> {
+        let ns = self.namespace.clone();
+        self.namespace = module.to_string();
         let mut program = self.do_compile(ast);
+        self.namespace = ns.to_string();
 
         self.messages
             .append(&mut self.typechecker.get_messages().collect());

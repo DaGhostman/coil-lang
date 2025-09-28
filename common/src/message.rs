@@ -1,6 +1,5 @@
-use std::ops::{Deref, Range};
+use std::ops::Range;
 
-use crate::{likely, unlikely};
 
 #[derive(PartialEq, Hash, Eq, Copy, Clone, Debug)]
 pub enum MessageKind {

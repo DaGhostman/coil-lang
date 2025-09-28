@@ -17,6 +17,7 @@ pub enum Expression<'expr> {
     Float(f64),
     String(&'expr str),
     Bool(bool),
+    Module(String, Output<'expr>),
 
     Identifier(&'expr str),
     Type(&'expr str),
@@ -26,6 +27,7 @@ pub enum Expression<'expr> {
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
     Yield(Output<'expr>),
+    Resume(Output<'expr>, Option<Output<'expr>>),
     Negate(Output<'expr>),
     Not(Output<'expr>),
     Positive(Output<'expr>),
@@ -71,7 +73,16 @@ pub enum Expression<'expr> {
         body: Vec<Output<'expr>>,
     },
 
-    If { condition: Output<'expr>, body: Output<'expr>, alternative: Option<Output<'expr>>},
+    Branch(Option<Output<'expr>>, Output<'expr>),
+
+    // I am writing a parser using the `chumsky` crate in rust, that can be found in #{buffer:parser/src/lib.rs} and #{buffer:compiler/src/lib.rs} and I have encountered the following error:
+    // > found Repeated combinator making no progress at parser/src/lib.rs:538:18
+    //
+    // Can you help me fix it? What I am trying to do is handle inling `if .. else if ... else` chains as a single expression instead of nested ones, i.e the whole tree to be flattened so that in the compiler I have the context of where "outside" the tree is. Currently the `Expression::If` is the one I am trying to replace, while the `Expression::If2` is the new one I am trying to create. Can you suggest the fixes without changing the full parser?
+    //
+    // I would ask you to be concise and follow my instructions above closely. Do not focus too much on the other aspects of the parser as much as on the `If2` implementation. Also if you have any suggestion on how I could achieve the same with `If` it is also welcomed, but do keep in mind that it is not a priority necessarily.
+    //
+    If(Vec<Output<'expr>>),
 
     Call {
         name: Output<'expr>,
@@ -148,6 +159,7 @@ impl ToString for ParserError {
 }
 
 pub struct ParserBuilder<'parser> {
+    prefix: String,
     _data: PhantomData<&'parser ()>,
 }
 
@@ -159,7 +171,7 @@ impl<'parser> Default for ParserBuilder<'parser> {
 
 impl<'parser> ParserBuilder<'parser> {
     pub fn new() -> Self {
-        Self { _data: PhantomData }
+        Self { prefix: String::default(), _data: PhantomData }
     }
 
     fn ident(
@@ -415,7 +427,20 @@ impl<'parser> ParserBuilder<'parser> {
                 })
                 .boxed();
 
+            let yield_ = text::keyword("yield")
+                .ignore_then(expr.clone())
+                .map_with(output!(Yield));
+
+            let resume = text::keyword("resume")
+                .ignore_then(expr.clone())
+                .then(expr.clone().delimited_by(op!('('), op!(')')).or_not())
+                .map_with(|(expr, arg), e| {
+                    (e.span(), Box::new(Expression::Resume(expr, arg)))
+                });
+
             let unary = match_
+                .or(yield_)
+                .or(resume)
                 .or(init)
                 .or(call)
                 .or(member)
@@ -445,10 +470,10 @@ impl<'parser> ParserBuilder<'parser> {
                     choice((
                         op!(">=").to(Expression::Geq as fn(_, _) -> _),
                         op!("<=").to(Expression::Leq as fn(_, _) -> _),
-                        op!("<").to(Expression::Le as fn(_, _) -> _),
-                        op!(">").to(Expression::Gt as fn(_, _) -> _),
                         op!("!=").to(Expression::Neq as fn(_, _) -> _),
                         op!("==").to(Expression::Eq as fn(_, _) -> _),
+                        op!("<").to(Expression::Le as fn(_, _) -> _),
+                        op!(">").to(Expression::Gt as fn(_, _) -> _),
                     ))
                     .then(expr.clone())
                     .repeated(),
@@ -533,25 +558,45 @@ impl<'parser> ParserBuilder<'parser> {
                 .delimited_by(op!('{'), op!('}'))
                 .boxed();
 
-            let if_ = text::keyword("if")
+            let if_ = recursive(|if_| {
+                text::keyword("if")
                     .padded()
                     .then(self.expression())
-                    .then(block.clone())
+                    .then(block.clone().or(stmt.clone()))
                     .then(
                         op!("else")
-                            .ignore_then(block.clone())
-                            .or_not()
+                            .ignore_then(if_)
+                            .separated_by(op!("else"))
+                            .collect::<Vec<_>>()
+                            .map_with(output!(Block))
+                            .or_not(),
                     )
-                    .map_with(|(((_, condition), body), alternative), e| {
-                        (
+                    .then(op!("else").ignore_then(stmt.clone()).or_not())
+                    .map_with(|((((_, condition), body), branches), alternative), e| {
+                        let mut result = vec![(
                             e.span(),
-                            Box::new(Expression::If {
-                                condition,
-                                body,
-                                alternative,
-                            }),
-                        )
-                    });
+                            Box::new(Expression::Branch(Some(condition), body)),
+                        )];
+
+                        if let Some((_, list)) = branches {
+                            if let Expression::Block(body) = *list {
+                                body.iter().for_each(|(_, branch)| {
+                                    if let Expression::If(branches) = branch.borrow() {
+                                        result.append(&mut branches.clone());
+                                    }
+                                })
+                            }
+                        };
+
+                        if let Some((span, alt)) = alternative {
+                            result.push((span, Box::new(Expression::Branch(None, (span, alt)))));
+                        }
+
+                        (e.span(), Box::new(Expression::If(result)))
+                    })
+                    .boxed()
+            })
+            .boxed();
 
             let for_ = text::keyword("for")
                 .padded()

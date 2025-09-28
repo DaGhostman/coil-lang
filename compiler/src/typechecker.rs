@@ -3,7 +3,7 @@ use std::{
     collections::HashMap, vec::Drain, 
 };
 
-use common::{Label, Message, MessageKind};
+use common::{Label, Message};
 use parser::{Expression, SimpleSpan};
 
 pub struct Typechecker {
@@ -247,9 +247,9 @@ impl Typechecker {
             | Expression::Expr(expr)
             | Expression::Return(expr) => self.check(expr),
             Expression::ImplicitReturn(expr) => {
-                let e = self.check(expr);
+                
 
-                e
+                self.check(expr)
             }
             Expression::Format(fmt, _) | Expression::Print(fmt, _) => {
                 let type_ = self.check(fmt);
@@ -409,19 +409,40 @@ impl Typechecker {
                 }
             }
 
-            Expression::If { condition, .. } => {
-                let expr = self.check(condition);
-                if !matches!(expr, Type::BOOLEAN) {
-                        let mut message = Message::error("Invalid condition".to_string(), span.into_range());
-                        message.push(Label::new(
-                                "Conditional expression does not evaluate to true".to_string(),
-                                condition.0.into_range(),
-                            ));
-                    self.messages.push(message);
-                }
+            Expression::Branch(condition, body) => {
+                if let Some(condition) = condition {
+                    let expr = self.check(condition);
+                    if !matches!(expr, Type::BOOLEAN) {
+                            let mut message = Message::error("Invalid condition".to_string(), span.into_range());
+                            message.push(Label::new(
+                                    "Conditional expression does not evaluate to true".to_string(),
+                                    condition.0.into_range(),
+                                ));
+                        self.messages.push(message);
+                    }
 
-                expr
+                } 
+
+                self.check(body)
             }
+            Expression::If(branches) => {
+                branches.iter().for_each(|b| { self.check(b); });
+
+                Type::NONE
+            }
+            // Expression::If { condition, .. } => {
+            //     let expr = self.check(condition);
+            //     if !matches!(expr, Type::BOOLEAN) {
+            //             let mut message = Message::error("Invalid condition".to_string(), span.into_range());
+            //             message.push(Label::new(
+            //                     "Conditional expression does not evaluate to true".to_string(),
+            //                     condition.0.into_range(),
+            //                 ));
+            //         self.messages.push(message);
+            //     }
+            //
+            //     expr
+            // }
             Expression::Match(lhs, children) => {
                 let lhs_ = self.check(lhs);
                 let mut expected = None;
@@ -453,26 +474,24 @@ impl Typechecker {
                     if expected.is_none() {
                         expected = Some(body_.clone());
                         expected_location = body.0.into_range();
-                    } else {
-                        if expected != Some(body_.clone()) {
-                            let mut message = 
-                            Message::error("Unexpected return value".to_string(), span.into_range());
-                            message.push(
-                                Label::new(
-                                    format!("Result of this block is '{}'", body_.to_string()),
-                                    expected_location.clone(),
-                                )
-                            );
-                            message.push(Label::new(
-                                format!(
-                                    "Expected this block to result in '{}' but found '{}' instead.",
-                                    expected.clone().unwrap().to_string(),
-                                    body_.to_string()
-                                ),
-                                body.0.into_range(),
-                            ));
-                        self.messages.push(message);
-                        }
+                    } else if expected != Some(body_.clone()) {
+                        let mut message = 
+                        Message::error("Unexpected return value".to_string(), span.into_range());
+                        message.push(
+                            Label::new(
+                                format!("Result of this block is '{}'", body_.to_string()),
+                                expected_location.clone(),
+                            )
+                        );
+                        message.push(Label::new(
+                            format!(
+                                "Expected this block to result in '{}' but found '{}' instead.",
+                                expected.clone().unwrap().to_string(),
+                                body_.to_string()
+                            ),
+                            body.0.into_range(),
+                        ));
+                    self.messages.push(message);
                     }
                 }
 

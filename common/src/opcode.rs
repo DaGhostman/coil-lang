@@ -1,4 +1,6 @@
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug};
+
+use crate::promise;
 
 #[repr(u8)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -16,7 +18,6 @@ pub enum Instruction {
     JMP,
     JMPT,
     JMPF,
-    JMPR,
     STRING,
     DATA,
     ACQUIRE,
@@ -69,10 +70,12 @@ impl From<Instruction> for u8 {
     }
 }
 
+type OPERAND = usize;
+const OPERAND_COUNT: usize = 2;
 #[derive(Default, Clone, Copy)]
 pub struct Byte<V> {
     bytecode: Instruction,
-    operands: [usize; 2],
+    operands: [OPERAND; OPERAND_COUNT],
     value: V,
 }
 
@@ -80,12 +83,12 @@ impl<V: Default + Copy> Byte<V> {
     pub fn new(bytecode: Instruction) -> Self {
         Self {
             bytecode,
-            operands: [0, 0],
+            operands: Default::default(),
             value: V::default(),
         }
     }
 
-    pub fn new_with_operands(bytecode: Instruction, operands: [usize; 2]) -> Self {
+    pub fn new_with_operands(bytecode: Instruction, operands: [OPERAND; OPERAND_COUNT]) -> Self {
         Self {
             bytecode,
             operands,
@@ -117,7 +120,9 @@ impl<V: Default + Copy> Byte<V> {
         &self.bytecode
     }
 
-    pub fn operand(&self, idx: usize) -> usize {
+    pub fn operand(&self, idx: usize) -> OPERAND {
+        promise!(idx < OPERAND_COUNT);
+
         self.operands[idx]
     }
 
@@ -127,7 +132,7 @@ impl<V: Default + Copy> Byte<V> {
 }
 
 #[cfg(debug_assertions)]
-impl<V: Display> Debug for Byte<V> {
+impl<V: std::fmt::Display> Debug for Byte<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -138,7 +143,7 @@ impl<V: Display> Debug for Byte<V> {
 }
 
 #[cfg(debug_assertions)]
-impl Display for Instruction {
+impl std::fmt::Display for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", *self as u8)
     }

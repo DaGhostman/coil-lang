@@ -1,52 +1,40 @@
-use std::{collections::HashMap, io::Write, };
+use std::{collections::HashMap, io::Write};
 
-use common::{ArrayVec, SeekableIterator, Value, promise, unlikely};
+use common::{ArrayVec, SeekableIterator, Value, unlikely};
 
-use crate::{
-    ArenaAllocated, Byte, Coroutine, Frame, Instruction, Object, 
-};
+use crate::{Allocated, Byte, Coroutine, Frame, Heap, Instruction, Stack};
 
-macro_rules! ibinary_op {
-    ($frame: expr, $op:tt) => {
+macro_rules! binary {
+    ($stack: expr, $op:tt, $from: ident, $to: ident) => {
         {
-            let rhs = $frame.pop().as_int();
-            let lhs = $frame.peek().as_int();
+            let rhs = $stack.pop().$from();
+            let lhs = $stack.peek().$from();
 
-            $frame.top().replace((lhs $op rhs) as u64)
+            $stack.top().replace((lhs $op rhs).$to());
         }
-    }
-
-}
-macro_rules! fbinary_op {
-    ($frame: expr, $op:tt) => {
+    };
+    ($stack: expr, $op:tt, $from: ident) => {
         {
-            let rhs = $frame.pop().as_float();
-            let lhs = $frame.peek().as_float();
+            let rhs = $stack.pop().$from();
+            let lhs = $stack.peek().$from();
 
-            $frame.top().replace((lhs $op rhs).to_bits())
+            $stack.top().replace((lhs $op rhs) as _)
         }
-    }
-
+    };
 }
 
-macro_rules! binary_op {
-    ($frame: expr, $op:tt) => {
+macro_rules! unary {
+    ($stack: expr, $op: tt, $from: ident, $to: ident) => {
         {
-            let rhs = $frame.pop().raw();
-            let lhs = $frame.peek().raw();
+        let rhs = $stack.peek().$from();
 
-            $frame.top().replace((lhs $op rhs) as bool as _);
+        $stack.top().replace(($op rhs).$to());
         }
-    }
+    };
+    ($stack: expr, $op: tt, $from: ident) => { {
+            let rhs = $stack.peek().$from();
 
-}
-
-macro_rules! unary_op {
-    ($frame: expr, $op: tt) => {
-        {
-            let rhs = $frame.peek().as_bool();
-
-            $frame.top().replace(($op rhs).into());
+            $stack.top().replace(($op rhs) as _);
         }
     }
 }
@@ -54,7 +42,9 @@ macro_rules! unary_op {
 type External = fn(&[Value]) -> Value;
 
 pub struct Machine<const S: usize> {
-    frames: ArrayVec<Frame<Value>, S>,
+    heap: Heap,
+    stack: Stack<Value, 2048>,
+    frames: ArrayVec<Frame, S>,
     native: HashMap<usize, External>,
 }
 
@@ -135,6 +125,8 @@ impl<const S: usize> Default for Machine<S> {
         frames.consume();
         Self {
             frames,
+            heap: Heap::new(),
+            stack: Stack::new(),
             native: HashMap::with_capacity(32),
         }
     }
@@ -149,17 +141,17 @@ impl<const S: usize> Machine<S> {
 impl<const S: usize> Machine<S> {
     #[cfg(test)]
     pub fn push(&mut self, value: Value) {
-        self.frames.get_mut().push(value);
+        self.stack.push(value);
     }
 
     #[cfg(test)]
     pub fn pop(&mut self) -> Value {
-        *self.frames.get_mut().pop()
+        self.stack.pop()
     }
 
     #[cfg(test)]
     pub fn tell(&self) -> usize {
-        self.frames.get().tell()
+        self.stack.tell()
     }
 
     pub fn run(&mut self, code: &[Byte<Value>]) {
@@ -177,40 +169,42 @@ impl<const S: usize> Machine<S> {
                     self.frames.get_mut().seek(code_iter.tell());
                     code_iter.seek(result.tell());
                     self.frames.current_mut().enter();
-
-                    for _ in 0..result.arity() {
-                        let value = *self.frames.get_mut().pop();
-                        self.frames.current_mut().push(value);
-                    }
+                    self.frames
+                        .current_mut()
+                        .set(self.stack.tell() - result.arity());
 
                     self.frames.consume();
                 }
                 ExecutionOutcome::RETURN => {
                     let current = self.frames.pop();
-                    let v = *current.peek();
+                    let v = self.stack.pop();
+                    self.stack.seek(current.get());
+                    self.stack.push(v);
 
                     let prev = self.frames.get_mut();
 
-                    prev.resume(v);
                     code_iter.seek(prev.tell());
                 }
                 ExecutionOutcome::TERMINATION => {
                     unlikely(true);
                     break;
                 }
-                // ExecutionOutcome::RESUME => {
-                //     unlikely(true);
-                //     let frame: Collectable<Coroutine<Value>> =
-                //         Collectable::from(self.frames.get_mut().pop().as_ptr());
-                //
-                //     self.frames.push(frame.as_ref().frame().clone());
-                // }
+                ExecutionOutcome::RESUME => {
+                    unlikely(true);
+                    self.frames.get_mut().seek(code_iter.tell());
+                    let coro = Allocated::<Coroutine<Value>>::new(self.stack.pop().as_ptr());
+
+                    self.frames
+                        .push((coro.as_ref().ip(), self.stack.tell()).into());
+                    code_iter.seek(coro.as_ref().ip());
+                    self.stack.append(coro.as_ref().stack());
+                }
                 _ => (),
             }
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn execute<'iter>(
         &mut self,
         code: &mut SeekableIterator<'iter, Byte<Value>>,
@@ -230,54 +224,51 @@ impl<const S: usize> Machine<S> {
                     format!("{:?}", opcode.bytecode()),
                     opcode.operand(0),
                     opcode.operand(1),
-                    frame
+                    self.stack.slice(frame.get(), self.stack.tell())
                 );
             }
 
             match opcode.bytecode() {
                 Instruction::POP => {
-                    frame.pop();
+                    self.stack.pop();
                 }
-                Instruction::CONST => frame.push(opcode.constant()),
+                Instruction::CONST => self.stack.push(opcode.constant()),
                 Instruction::STORE => {
-                    let val = *frame.peek();
-                    frame.store(opcode.operand(0), val);
+                    let val = self.stack.peek();
+                    self.stack[frame.get() + opcode.operand(0)] = *val;
                 }
                 Instruction::LOAD => {
-                    frame.push(*frame.load(opcode.operand(0)));
+                    self.stack.push(self.stack[frame.get() + opcode.operand(0)]);
                 }
-                Instruction::NOT => unary_op!(frame, !),
-                Instruction::NEG => unary_op!(frame, !),
-                Instruction::ADD => ibinary_op!(frame, +),
-                Instruction::SUB => ibinary_op!(frame, -),
-                Instruction::MUL => ibinary_op!(frame, *),
-                Instruction::DIV => ibinary_op!(frame, /),
-                Instruction::MOD => ibinary_op!(frame, %),
-                Instruction::LE => binary_op!(frame, <),
-                Instruction::GT => binary_op!(frame, >),
-                Instruction::EQ => binary_op!(frame, ==),
-                Instruction::LEF => binary_op!(frame, <=),
-                Instruction::GTF => binary_op!(frame, >=),
-                Instruction::NEQ => binary_op!(frame, !=),
-                Instruction::ADDF => fbinary_op!(frame, +),
-                Instruction::SUBF => fbinary_op!(frame, -),
-                Instruction::MULF => fbinary_op!(frame, *),
-                Instruction::DIVF => fbinary_op!(frame, /),
-                Instruction::MODF => fbinary_op!(frame, %),
+                Instruction::NOT => unary!(self.stack, !, as_bool),
+                Instruction::NEG => unary!(self.stack, -, as_int),
+                Instruction::ADD => binary!(self.stack, +, as_int),
+                Instruction::SUB => binary!(self.stack, -, as_int),
+                Instruction::MUL => binary!(self.stack, *, as_int),
+                Instruction::DIV => binary!(self.stack, /, as_int),
+                Instruction::MOD => binary!(self.stack, %, as_int),
+                Instruction::LE => binary!(self.stack, <, raw),
+                Instruction::GT => binary!(self.stack, >, raw),
+                Instruction::EQ => binary!(self.stack, ==, raw),
+                Instruction::LEF => binary!(self.stack, <=, raw),
+                Instruction::GTF => binary!(self.stack, >=, raw),
+                Instruction::NEQ => binary!(self.stack, !=, raw),
+                Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
+                Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
+                Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
+                Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
+                Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
                 Instruction::FORMAT => {
                     if opcode.operand(0) != 0 {
                         let mut params = ArrayVec::<Value, 8>::default();
 
                         for idx in (0..opcode.operand(0)).rev() {
-                            params[idx]= *frame.pop();
+                            params[idx] = self.stack.pop();
                         }
 
-                        let format_string = ArenaAllocated::<Object>::new(frame.peek().as_ptr());
-                        let format_str = format_string.as_ref().to_string();
+                        let format_string = Allocated::<String>::new(self.stack.peek().as_ptr());
+                        let format_str = format_string.as_ref().as_str();
 
-                        frame.free(format_string);
-
-                        // Pre-allocate string with estimated capacity
                         let mut message = String::default();
 
                         let mut chars = format_str.chars().peekable();
@@ -295,21 +286,23 @@ impl<const S: usize> Machine<S> {
                                     }
                                     Some('b') => {
                                         chars.next();
-                                        message.push_str(&format!("{:0b}", params.pop().raw()));
+                                        message
+                                            .push_str(&format!("{:0b}", params.pop().raw().addr()));
                                     }
                                     Some('s') => {
                                         chars.next();
                                         let string_val =
-                                            ArenaAllocated::<String>::new(params.pop().as_ptr());
-                                        message.push_str(&string_val.as_ref().as_str());
+                                            Allocated::<String>::new(params.pop().as_ptr());
+                                        message.push_str(string_val.as_ref().as_str());
                                     }
                                     Some('x') => {
                                         chars.next();
-                                        message.push_str(&format!("{:08x}", params.pop().raw()));
+                                        message
+                                            .push_str(&format!("{:0x}", params.pop().raw().addr()));
                                     }
                                     Some('z') => {
                                         chars.next();
-                                        message.push_str(if params.pop().raw() > 0 {
+                                        message.push_str(if params.pop().raw() > 0 as _ {
                                             "true"
                                         } else {
                                             "false"
@@ -317,7 +310,7 @@ impl<const S: usize> Machine<S> {
                                     }
                                     Some('u') => {
                                         chars.next();
-                                        message.push_str(&params.pop().raw().to_string());
+                                        message.push_str(&params.pop().raw().addr().to_string());
                                     }
                                     Some('p') => {
                                         chars.next();
@@ -334,68 +327,59 @@ impl<const S: usize> Machine<S> {
                                 message.push(ch);
                             }
                         }
-                        let collectable = frame.alloc(Object::String(message.into()));
-                        *frame.top() = Value::from(collectable.ptr());
+                        let collectable = self.heap.alloc::<crate::String>(message.into());
+                        *self.stack.top() = Value::from(collectable.ptr() as u64);
                     }
                 }
                 Instruction::PRINT => {
-                    let value = ArenaAllocated::<Object>::new(frame.pop().as_ptr());
-
-                    match value.as_ref() {
-                        Object::String(inner) => print!("{}", inner.as_str()),
-                        Object::Coroutine(_) => print!("0x{:016}", value.ptr().addr()),
-                        Object::None => print!(""),
-                    };
-
-                    frame.free(value);
+                    print!(
+                        "{}",
+                        Allocated::<String>::new(self.stack.peek().as_ptr())
+                            .as_ref()
+                            .as_str()
+                    );
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand(0));
                 }
-                Instruction::JMPR => {
-                    code.add(opcode.operand(0));
-                }
                 Instruction::JMPF => {
-                    if frame.pop().raw() != 1 {
+                    if !self.stack.pop().as_bool() {
                         code.seek(opcode.operand(0));
                     }
                 }
                 Instruction::JMPT => {
-                    if frame.pop().raw() == 1 {
+                    if self.stack.pop().as_bool() {
                         code.seek(opcode.operand(0));
                     }
                 }
                 Instruction::CALL => {
                     return ExecutionResult::call(opcode.operand(0), opcode.operand(1));
                 }
-                Instruction::NATIVE => {
-                    let arity = opcode.operand(1);
-                    let args = (0..arity).map(|_| *frame.pop()).collect::<Vec<_>>();
-                    let result = self.native[&opcode.operand(0)](&args);
-
-                    frame.push(result);
-                }
+                // Instruction::NATIVE => {
+                //     let arity = opcode.operand(1);
+                //     let args = (0..arity).map(|_| *frame.pop()).collect::<Vec<_>>();
+                //     let result = self.native[&opcode.operand(0)](&args);
+                //
+                //     frame.push(result);
+                // }
                 Instruction::RETURN => {
                     return ExecutionResult::returns();
                 }
                 Instruction::SUSP => {
-                    let suspended_frame = frame.clone();
+                    let suspended_frame = (code.tell(), frame.get());
 
-                    let object = frame.alloc(Object::Coroutine(Coroutine::new(suspended_frame)));
+                    let collectable = self.heap.alloc(Coroutine::new(
+                        suspended_frame,
+                        self.stack.slice(frame.tell(), self.stack.tell() - 1),
+                    ));
 
-                    frame.push(Value::from(object.ptr()));
+                    self.stack.push(Value::from(collectable.ptr() as u64));
 
                     return ExecutionResult::returns();
                 }
                 Instruction::RESUME => {
                     return ExecutionResult::resume();
                 }
-                Instruction::RELEASE => {
-                    frame.free(ArenaAllocated::<Object>::new(frame.load(opcode.operand(0)).as_ptr()));
-                },
-                Instruction::ACQUIRE => {
-                    ArenaAllocated::<Object>::new(frame.load(opcode.operand(0)).as_ptr()).inc();
-                },
                 Instruction::HALT => {
                     let _ = std::io::stdout().flush();
                     return ExecutionResult::terminate();
@@ -404,13 +388,15 @@ impl<const S: usize> Machine<S> {
                     let length = opcode.operand(0);
                     let mut value: String = String::with_capacity(length);
 
-                    while length != value.len() && let Some(data) = code.next() {
+                    while length != value.len()
+                        && let Some(data) = code.next()
+                    {
                         value.push(char::from_u32(data.operand(0) as u32).unwrap_or_default());
                     }
 
-                    let object = frame.alloc(Object::String(value.into()));
+                    let collectable = self.heap.alloc::<crate::String>(value.into());
 
-                    frame.push(Value::from(object.ptr()));
+                    self.stack.push(Value::from(collectable.ptr() as u64));
                 }
                 Instruction::NOOP => continue,
                 _ => return ExecutionResult::invalid(),

@@ -1,34 +1,367 @@
-use crate::{
-    Object,
-    garbage::{Collectable, GcSized, Rc},
+use std::{
+    alloc::{Layout, LayoutError},
+    borrow::{Borrow, BorrowMut},
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
 };
 
-pub struct Heap();
+use crate::{Object, garbage::GcSized};
 
-impl Heap {
-    /// Allocate an object on the heap returning an object & a collectable
-    pub fn alloc<T: GcSized, F>(value: T, map: F) -> (Object, Collectable<T>)
-    where
-        F: Fn(Collectable<T>) -> Object,
-    {
-        let boxed = Box::new(Rc::new(value));
-        let content = Collectable::new(boxed);
+pub struct Header(usize, bool);
 
-        let object = map(content);
+pub struct Reference<T> {
+    header: Header,
+    data: T,
+}
 
-        #[cfg(debug_assertions)]
-        eprintln!("ALLOCATED: {} bytes @ {}", object.size(), object);
-
-        (object, content)
+impl<T> Reference<T> {
+    #[inline]
+    pub fn new(value: T) -> Self {
+        Self {
+            header: Header(0, false),
+            data: value,
+        }
     }
 
-    /// Free the provided collectable
-    pub fn free<T: GcSized>(mut object: Collectable<T>) {
-        if object.dec() == 0 {
-            #[cfg(debug_assertions)]
-            eprintln!("COLLECTING: {} bytes @ 0x{:016x}", object.size(), object.ptr().addr());
-            object.release();
+    #[inline]
+    pub fn inc(&mut self) {
+        self.header.0 += 1;
+    }
+
+    #[inline]
+    pub fn dec(&mut self) {
+        if !self.header.1 && self.header.0 > 0 {
+            self.header.0 -= 1;
+
+            if self.header.0 == 0 {
+                self.header.1 = true;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn data(&self) -> &T {
+        &self.data
+    }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+}
+
+impl<T> AsRef<T> for Reference<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        self.data()
+    }
+}
+
+impl<T> AsMut<T> for Reference<T> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut T {
+        self.data_mut()
+    }
+}
+
+impl<T: GcSized> GcSized for Reference<T> {
+    #[inline]
+    fn size(&self) -> usize {
+        self.data.size()
+    }
+}
+
+impl<T> From<T> for Reference<T> {
+    #[inline]
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+pub struct Allocated<T>(NonNull<Reference<T>>);
+
+impl<T: GcSized> GcSized for Allocated<T> {
+    #[inline]
+    fn size(&self) -> usize {
+        self.deref().size()
+    }
+}
+
+impl<T> Deref for Allocated<T> {
+    type Target = Reference<T>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<T> DerefMut for Allocated<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.0.as_mut() }
+    }
+}
+
+impl<T> Borrow<T> for Allocated<T> {
+    #[inline]
+    fn borrow(&self) -> &T {
+        self.data()
+    }
+}
+
+impl<T> BorrowMut<T> for Allocated<T> {
+    #[inline]
+    fn borrow_mut(&mut self) -> &mut T {
+        self.data_mut()
+    }
+}
+
+impl<T> Allocated<T> {
+    #[inline]
+    pub fn new(value: *mut Reference<T>) -> Self {
+        unsafe { (*value).inc() }
+
+        Allocated(NonNull::new(value).expect("Invalid pointer"))
+    }
+
+    #[inline]
+    pub fn ptr(&self) -> usize {
+        self.0.addr().into()
+    }
+}
+
+impl<T> Drop for Allocated<T> {
+    fn drop(&mut self) {
+        unsafe {
+            self.0.as_mut().dec();
         }
     }
 }
 
+// impl<T> Copy for Allocated<T> {}
+// impl<T> Clone for Allocated<T> {
+//     fn clone(&self) -> Self {
+//         *self
+//     }
+// }
+
+const CHUNK_SIZE: usize = 32768; // 32k memory blocks
+const BLOCK_SIZE: usize = 128; // 128 bytes per block
+const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_SIZE;
+
+struct Chunk {
+    top: *mut u8,
+    end: *mut u8,
+    start: *mut u8,
+    free_list: Vec<bool>,
+}
+
+impl Chunk {
+    pub fn new<const N: usize>() -> Result<Self, LayoutError> {
+        match Layout::from_size_align(N, align_of::<u8>()) {
+            Ok(layout) => {
+                let ptr = unsafe { std::alloc::alloc(layout) };
+                if ptr.is_null() {
+                    panic!("OOM");
+                    // return Err(LayoutError::UnsupportedLayout);
+                }
+                let free_list = vec![true; N / BLOCK_SIZE];
+                Ok(Self {
+                    top: ptr,
+                    start: ptr,
+                    end: (ptr as usize + N) as _,
+                    free_list,
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+    // pub fn new<const N: usize>() -> Result<Self, LayoutError> {
+    //     match Layout::from_size_align(N, align_of::<u8>()) {
+    //         Ok(layout) => {
+    //             let ptr = unsafe { std::alloc::alloc(layout) };
+    //
+    //             Ok(Self {
+    //                 top: ptr,
+    //                 start: ptr,
+    //                 end: (ptr as usize + N) as _,
+    //             })
+    //         }
+    //         Err(e) => Err(e),
+    //     }
+    // }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        unsafe {
+            std::alloc::dealloc(
+                self.start,
+                Layout::from_size_align(self.end as usize - self.start as usize, align_of::<u8>())
+                    .unwrap(),
+            )
+        };
+    }
+}
+
+#[derive(Default)]
+pub struct Allocator {
+    cursor: usize,
+    // growth: usize,
+    chunks: Vec<Chunk>,
+}
+
+impl Allocator {
+    pub fn inner_allocate<T>(&mut self, size: usize) -> *mut Reference<T> {
+        // Verify allocation fits block size
+        let blocks_needed = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        if blocks_needed > BLOCKS_PER_CHUNK {
+            panic!(
+                "Allocation needs more size than a single chunk, {} but only {} is available",
+                blocks_needed, BLOCKS_PER_CHUNK
+            );
+        }
+
+        if size > BLOCK_SIZE {}
+
+        // Check current chunk for free block
+        if let Some(chunk) = self.chunks.get_mut(self.cursor) {
+            for i in 0..(chunk.free_list.len() - blocks_needed + 1) {
+                if chunk.free_list[i..i + blocks_needed].iter().all(|&f| f) {
+                    let block_offset = i * BLOCK_SIZE;
+                    for j in i..i + blocks_needed {
+                        chunk.free_list[j] = false;
+                    }
+
+                    return unsafe {
+                        chunk.start.offset(block_offset as isize) as *mut Reference<T>
+                    };
+                }
+            }
+        }
+
+        // Create new chunk if current is full
+        let new_chunk = Chunk::new::<CHUNK_SIZE>().expect("Failed to allocate new chunk");
+        self.chunks.push(new_chunk);
+        self.cursor = self.chunks.len() - 1;
+
+        // Allocate from first block of new chunk
+        let chunk = self.chunks.last_mut().unwrap();
+        for i in 0..blocks_needed {
+            chunk.free_list[i] = false;
+        }
+
+        chunk.start as *mut Reference<T>
+    }
+
+    // Free a block and mark as available
+    pub fn free(&mut self, ptr: *mut u8) {
+        let chunk_index = self
+            .chunks
+            .iter()
+            .position(|chunk| {
+                let start = chunk.start as usize;
+                let end = chunk.end as usize;
+                (ptr as usize) >= start && (ptr as usize) < end
+            })
+            .expect("Pointer not in any chunk");
+
+        let chunk = &mut self.chunks[chunk_index];
+        let block_index = ((ptr as usize) - chunk.start as usize) / BLOCK_SIZE;
+        chunk.free_list[block_index] = true;
+    }
+}
+
+// impl Allocator {
+//     pub fn inner_allocate<T>(&mut self, size: usize) -> *mut Reference<T> {
+//         if let Some(chunk) = self.chunks.get_mut(self.cursor) {
+//             let available = chunk.end as usize - chunk.top as usize;
+//
+//             if available >= size {
+//                 let ptr = chunk.top as *mut u8 as *mut Reference<T>;
+//
+//                 unsafe {
+//                     chunk.top = chunk.top.offset(size as isize);
+//                 }
+//
+//                 ptr
+//             } else {
+//                 dbg!(available, size);
+//                 unreachable!("OOM");
+//             }
+//         } else {
+//             unreachable!("Unable to access chunk");
+//         }
+//     }
+// }
+
+impl Drop for Allocator {
+    fn drop(&mut self) {
+        let _ = self.chunks.drain(..);
+    }
+}
+
+pub struct Heap {
+    allocator: Allocator,
+}
+
+impl Heap {
+    pub fn new() -> Self {
+        if let Ok(chunk) = Chunk::new::<CHUNK_SIZE>() {
+            let mut chunks = Vec::with_capacity(32);
+            chunks.push(chunk);
+
+            Self {
+                allocator: Allocator {
+                    chunks,
+                    cursor: 0,
+                    // growth: CHUNK_SIZE,
+                },
+            }
+        } else {
+            panic!("Unable to allocate heap")
+        }
+    }
+}
+
+impl Heap {
+    pub fn alloc<T>(&mut self, value: T) -> Allocated<T> {
+        let size = std::mem::size_of::<Reference<T>>();
+        let ptr = self.allocator.inner_allocate::<T>(size);
+
+        // Construct the Reference<T> in allocated memory
+        unsafe {
+            std::ptr::write(ptr, Reference::new(value));
+        }
+
+        Allocated(NonNull::new(ptr).unwrap())
+    }
+}
+
+impl Heap {
+    // Reclaim memory when reference count drops to zero
+    pub fn reclaim(&mut self) {
+        self.allocator
+            .chunks
+            .iter_mut()
+            .filter_map(|chunk| {
+                for block_idx in 0..BLOCKS_PER_CHUNK {
+                    if !chunk.free_list[block_idx] {
+                        let block_ptr =
+                            unsafe { chunk.start.offset(block_idx as isize * BLOCK_SIZE as isize) };
+                        let header = unsafe { &mut *(block_ptr as *mut Header) };
+                        if header.1 {
+                            return Some(block_ptr);
+                        }
+                    }
+                }
+
+                None
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .for_each(|ptr| self.allocator.free(*ptr));
+    }
+}

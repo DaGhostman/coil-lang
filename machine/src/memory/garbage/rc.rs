@@ -15,26 +15,31 @@ impl <T> Rc<T> {
         }
     }
 
+    #[inline]
     pub fn inc(&self) -> usize {
         self.count.update(|ref_count| ref_count + 1);
         
         self.count.get()
     }
 
+    #[inline]
     pub fn dec(&self) -> usize {
         self.count.update(|ref_count| ref_count.max(1) - 1);
 
         self.count.get()
     }
 
+    #[inline]
     pub fn count(&self) -> usize {
         self.count.get()
     }
 
+    #[inline]
     pub fn data(&self) -> &T {
         &self.data
     }
 
+    #[inline]
     pub fn data_mut(&mut self) -> &mut T {
         &mut self.data
     }

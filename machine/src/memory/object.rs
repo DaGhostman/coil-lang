@@ -38,7 +38,7 @@ pub enum Object {
     #[default]
     None,
     String(String),
-    Coroutine(Coroutine<Value>),
+    // Coroutine(Coroutine<Value>),
 }
 
 impl GcSized for Object {
@@ -46,7 +46,7 @@ impl GcSized for Object {
         match self {
             Self::None => 0,
             Self::String(value) => value.size(),
-            Self::Coroutine(value) => value.size(),
+            // Self::Coroutine(value) => value.size(),
         }
     }
 }
