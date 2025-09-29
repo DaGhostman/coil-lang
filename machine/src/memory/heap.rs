@@ -5,9 +5,9 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{Object, garbage::GcSized};
+use crate::{garbage::GcSized};
 
-pub struct Header(usize, bool);
+pub struct Header(usize, bool, usize);
 
 pub struct Reference<T> {
     header: Header,
@@ -18,7 +18,7 @@ impl<T> Reference<T> {
     #[inline]
     pub fn new(value: T) -> Self {
         Self {
-            header: Header(0, false),
+            header: Header(0, false, size_of::<T>() + size_of::<Header>()),
             data: value,
         }
     }
@@ -151,7 +151,7 @@ const BLOCK_SIZE: usize = 128; // 128 bytes per block
 const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_SIZE;
 
 struct Chunk {
-    top: *mut u8,
+    // top: *mut u8,
     end: *mut u8,
     start: *mut u8,
     free_list: Vec<bool>,
@@ -168,7 +168,7 @@ impl Chunk {
                 }
                 let free_list = vec![true; N / BLOCK_SIZE];
                 Ok(Self {
-                    top: ptr,
+                    // top: ptr,
                     start: ptr,
                     end: (ptr as usize + N) as _,
                     free_list,
@@ -257,7 +257,7 @@ impl Allocator {
     }
 
     // Free a block and mark as available
-    pub fn free(&mut self, ptr: *mut u8) {
+    pub fn free(&mut self, ptr: *mut u8, blocks: usize) {
         let chunk_index = self
             .chunks
             .iter()
@@ -270,7 +270,9 @@ impl Allocator {
 
         let chunk = &mut self.chunks[chunk_index];
         let block_index = ((ptr as usize) - chunk.start as usize) / BLOCK_SIZE;
-        chunk.free_list[block_index] = true;
+        for n in block_index..block_index + blocks {
+            chunk.free_list[n] = true;
+        }
     }
 }
 
@@ -353,7 +355,7 @@ impl Heap {
                             unsafe { chunk.start.offset(block_idx as isize * BLOCK_SIZE as isize) };
                         let header = unsafe { &mut *(block_ptr as *mut Header) };
                         if header.1 {
-                            return Some(block_ptr);
+                            return Some((block_ptr, header.2));
                         }
                     }
                 }
@@ -362,6 +364,6 @@ impl Heap {
             })
             .collect::<Vec<_>>()
             .iter()
-            .for_each(|ptr| self.allocator.free(*ptr));
+            .for_each(|(ptr, size)| self.allocator.free(*ptr, (size + BLOCK_SIZE - 1) / BLOCK_SIZE));
     }
 }
