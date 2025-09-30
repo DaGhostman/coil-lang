@@ -578,14 +578,13 @@ impl<'parser> ParserBuilder<'parser> {
                             Box::new(Expression::Branch(Some(condition), body)),
                         )];
 
-                        if let Some((_, list)) = branches {
-                            if let Expression::Block(body) = *list {
+                        if let Some((_, list)) = branches &&
+                            let Expression::Block(body) = *list {
                                 body.iter().for_each(|(_, branch)| {
                                     if let Expression::If(branches) = branch.borrow() {
                                         result.append(&mut branches.clone());
                                     }
                                 })
-                            }
                         };
 
                         if let Some((span, alt)) = alternative {
