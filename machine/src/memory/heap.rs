@@ -1,8 +1,5 @@
 use std::{
-    alloc::{Layout, LayoutError},
-    borrow::{Borrow, BorrowMut},
-    ops::{Deref, DerefMut},
-    ptr::NonNull,
+    alloc::{Layout, LayoutError}, borrow::{Borrow, BorrowMut}, collections::{HashMap, HashSet}, ops::{Deref, DerefMut}, ptr::NonNull
 };
 
 use crate::{garbage::GcSized};
@@ -158,13 +155,13 @@ struct Chunk {
 }
 
 impl Chunk {
+    #[inline]
     pub fn new<const N: usize>() -> Result<Self, LayoutError> {
         match Layout::from_size_align(N, align_of::<u8>()) {
             Ok(layout) => {
-                let ptr = unsafe { std::alloc::alloc(layout) };
+                let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
                 if ptr.is_null() {
                     panic!("OOM");
-                    // return Err(LayoutError::UnsupportedLayout);
                 }
                 let free_list = vec![true; N / BLOCK_SIZE];
                 Ok(Self {
@@ -177,20 +174,6 @@ impl Chunk {
             Err(e) => Err(e),
         }
     }
-    // pub fn new<const N: usize>() -> Result<Self, LayoutError> {
-    //     match Layout::from_size_align(N, align_of::<u8>()) {
-    //         Ok(layout) => {
-    //             let ptr = unsafe { std::alloc::alloc(layout) };
-    //
-    //             Ok(Self {
-    //                 top: ptr,
-    //                 start: ptr,
-    //                 end: (ptr as usize + N) as _,
-    //             })
-    //         }
-    //         Err(e) => Err(e),
-    //     }
-    // }
 }
 
 impl Drop for Chunk {
@@ -213,15 +196,13 @@ pub struct Allocator {
 }
 
 impl Allocator {
+    #[inline]
     pub fn inner_allocate<T>(&mut self, size: usize) -> *mut Reference<T> {
         // Verify allocation fits block size
         let blocks_needed = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
         if blocks_needed > BLOCKS_PER_CHUNK {
-            panic!(
-                "Allocation needs more size than a single chunk, {} but only {} is available",
-                blocks_needed, BLOCKS_PER_CHUNK
-            );
+            return unsafe { std::alloc::alloc_zeroed(Layout::from_size_align_unchecked(size, align_of::<Reference<T>>())) as *mut _ }
         }
 
         if size > BLOCK_SIZE {}
@@ -243,9 +224,9 @@ impl Allocator {
         }
 
         // Create new chunk if current is full
+        self.cursor = self.chunks.len();
         let new_chunk = Chunk::new::<CHUNK_SIZE>().expect("Failed to allocate new chunk");
         self.chunks.push(new_chunk);
-        self.cursor = self.chunks.len() - 1;
 
         // Allocate from first block of new chunk
         let chunk = self.chunks.last_mut().unwrap();
@@ -257,6 +238,7 @@ impl Allocator {
     }
 
     // Free a block and mark as available
+    #[inline]
     pub fn free(&mut self, ptr: *mut u8, blocks: usize) {
         let chunk_index = self
             .chunks
@@ -274,30 +256,31 @@ impl Allocator {
             chunk.free_list[n] = true;
         }
     }
-}
 
-// impl Allocator {
-//     pub fn inner_allocate<T>(&mut self, size: usize) -> *mut Reference<T> {
-//         if let Some(chunk) = self.chunks.get_mut(self.cursor) {
-//             let available = chunk.end as usize - chunk.top as usize;
-//
-//             if available >= size {
-//                 let ptr = chunk.top as *mut u8 as *mut Reference<T>;
-//
-//                 unsafe {
-//                     chunk.top = chunk.top.offset(size as isize);
-//                 }
-//
-//                 ptr
-//             } else {
-//                 dbg!(available, size);
-//                 unreachable!("OOM");
-//             }
-//         } else {
-//             unreachable!("Unable to access chunk");
-//         }
-//     }
-// }
+    #[inline]
+    fn reclaim(&mut self) {
+        self
+            .chunks
+            .iter_mut()
+            .filter_map(|chunk| {
+                for block_idx in 0..BLOCKS_PER_CHUNK {
+                    if !chunk.free_list[block_idx] {
+                        let block_ptr =
+                            unsafe { chunk.start.offset(block_idx as isize * BLOCK_SIZE as isize) };
+                        let header = unsafe { &mut *(block_ptr as *mut Header) };
+                        if header.1 {
+                            return Some((block_ptr, header.2));
+                        }
+                    }
+                }
+
+                None
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .for_each(|(ptr, size)| self.free(*ptr, *size));
+    }
+}
 
 impl Drop for Allocator {
     fn drop(&mut self) {
@@ -338,32 +321,14 @@ impl Heap {
             std::ptr::write(ptr, Reference::new(value));
         }
 
-        Allocated(NonNull::new(ptr).unwrap())
+        Allocated::<T>::new(ptr)
+        // Allocated(NonNull::new(ptr).unwrap())
     }
 }
 
 impl Heap {
     // Reclaim memory when reference count drops to zero
     pub fn reclaim(&mut self) {
-        self.allocator
-            .chunks
-            .iter_mut()
-            .filter_map(|chunk| {
-                for block_idx in 0..BLOCKS_PER_CHUNK {
-                    if !chunk.free_list[block_idx] {
-                        let block_ptr =
-                            unsafe { chunk.start.offset(block_idx as isize * BLOCK_SIZE as isize) };
-                        let header = unsafe { &mut *(block_ptr as *mut Header) };
-                        if header.1 {
-                            return Some((block_ptr, header.2));
-                        }
-                    }
-                }
-
-                None
-            })
-            .collect::<Vec<_>>()
-            .iter()
-            .for_each(|(ptr, size)| self.allocator.free(*ptr, (size + BLOCK_SIZE - 1) / BLOCK_SIZE));
+        self.allocator.reclaim();
     }
 }
