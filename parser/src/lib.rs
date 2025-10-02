@@ -75,13 +75,6 @@ pub enum Expression<'expr> {
 
     Branch(Option<Output<'expr>>, Output<'expr>),
 
-    // I am writing a parser using the `chumsky` crate in rust, that can be found in #{buffer:parser/src/lib.rs} and #{buffer:compiler/src/lib.rs} and I have encountered the following error:
-    // > found Repeated combinator making no progress at parser/src/lib.rs:538:18
-    //
-    // Can you help me fix it? What I am trying to do is handle inling `if .. else if ... else` chains as a single expression instead of nested ones, i.e the whole tree to be flattened so that in the compiler I have the context of where "outside" the tree is. Currently the `Expression::If` is the one I am trying to replace, while the `Expression::If2` is the new one I am trying to create. Can you suggest the fixes without changing the full parser?
-    //
-    // I would ask you to be concise and follow my instructions above closely. Do not focus too much on the other aspects of the parser as much as on the `If2` implementation. Also if you have any suggestion on how I could achieve the same with `If` it is also welcomed, but do keep in mind that it is not a priority necessarily.
-    //
     If(Vec<Output<'expr>>),
 
     Call {
