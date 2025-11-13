@@ -56,6 +56,7 @@ pub enum Instruction {
     NATIVE,
     RESUME,
     SUSP,
+    FREE,
 }
 
 impl From<u8> for Instruction {

@@ -13,6 +13,7 @@ use common::{Label, Message};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression<'expr> {
+    Noop(&'expr Expression<'expr>),
     Integer(i64),
     Float(f64),
     String(&'expr str),
@@ -31,6 +32,7 @@ pub enum Expression<'expr> {
     Negate(Output<'expr>),
     Not(Output<'expr>),
     Positive(Output<'expr>),
+    Default(&'expr str),
 
     Add(Output<'expr>, Output<'expr>),
     Sub(Output<'expr>, Output<'expr>),
@@ -125,6 +127,133 @@ macro_rules! output {
     };
 }
 
+macro_rules! binary_op {
+    ($lhs: expr, $rhs: expr, $op: tt, $output: ident) => {
+        match ($lhs, $rhs) {
+            (Expression::Integer(a), Expression::Integer(b)) => Some(Expression::$output(a $op b)),
+            (Expression::Float(a), Expression::Float(b)) => Some(Expression::$output(a $op b)),
+            (Expression::Bool(a), Expression::Bool(b)) => Some(Expression::$output(a $op b)),
+            _ => None,
+        }
+    };
+    ($lhs: expr, $rhs: expr, $op: tt) => {
+        match ($lhs, $rhs) {
+            (Expression::Integer(a), Expression::Integer(b)) => Some(Expression::Integer(a $op b)),
+            (Expression::Float(a), Expression::Float(b)) => Some(Expression::Float(a $op b)),
+            _ => None
+        }
+    };
+}
+
+macro_rules! foldable {
+    ($variant: ident, $op: tt) => {
+        |lhs: Output<'_>, rhs: Output<'_>| -> Expression<'_> {
+            if let Some(output) = binary_op!(
+                constant_fold(lhs.1.borrow()),
+                constant_fold(rhs.1.borrow()),
+                $op
+            ) {
+                output
+            } else {
+                Expression::$variant(lhs, rhs)
+            }
+        } as fn(_, _) -> _
+    };
+    ($variant: ident, $op: tt, $output: ident) => {
+        |lhs: Output<'_>, rhs: Output<'_>| -> Expression<'_> {
+            if let Some(output) = binary_op!(
+                constant_fold(lhs.1.borrow()),
+                constant_fold(rhs.1.borrow()),
+                $op,
+                $output
+            ) {
+                output
+            } else {
+                Expression::$variant(lhs, rhs)
+            }
+        } as fn(_, _) -> _
+    };
+}
+
+#[inline]
+fn constant_fold<'expr>(expr: &'expr Expression<'expr>) -> Expression<'expr> {
+    match expr {
+        Expression::Integer(i) => Some(Expression::Integer(*i)),
+        Expression::Float(f) => Some(Expression::Float(*f)),
+        Expression::Bool(b) => Some(Expression::Bool(*b)),
+
+        Expression::Add(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), +)
+        }
+        Expression::Sub(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), -)
+        }
+        Expression::Mul(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), *)
+        }
+        Expression::Div(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), /)
+        }
+        Expression::Mod(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), %)
+        }
+        Expression::Eq(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), ==, Bool)
+        }
+        Expression::Neq(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), !=, Bool)
+        }
+        Expression::Le(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), <, Bool)
+        }
+        Expression::Gt(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), >, Bool)
+        }
+        Expression::Leq(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), <=, Bool)
+        }
+        Expression::Geq(left, right) => {
+            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), >=, Bool)
+        }
+
+        Expression::Negate(expr) => Some(unary_op(expr.1.borrow(), |a| match a {
+            Expression::Integer(i) => Expression::Integer(-i),
+            Expression::Float(f) => Expression::Float(-f),
+            _ => *expr.1.clone(),
+        })),
+
+        Expression::Not(expr) => Some(unary_op(expr.1.borrow(), |a| match a {
+            Expression::Bool(b) => Expression::Bool(!b),
+            _ => Expression::from(*expr.1.clone()), //*expr.1.clone()
+        })),
+
+        // @TODO: Handle remaining cases.
+        // It will be interesting if a functional version of function-folding will be possible, as
+        // that will bring a lot of benefits (along with challenges). If a function is pure and has
+        // only constant (or constant-resolvable) arguments it can in turn be folded. This will be
+        // interesting with nested functions. maybe a limited bytecode could be output so that when
+        // passed to the VM will evaluate it, more or less like the `comptime` in zig?
+        //
+        // Expression::Function { args, body, .. } => Expression::Function {
+        //     name: expr.name,
+        //     args: args.iter().map(constant_fold).collect(),
+        //     body: body.iter().map(constant_fold).collect(),
+        //     returns: expr.returns.map(constant_fold),
+        // },
+        //
+        // Expression::Match(expr, cases) => Expression::Match(constant_fold(expr), cases.iter().map(|&(pat, body)| (constant_fold(pat), constant_fold(body))).collect()),
+        _ => None,
+    }
+    .unwrap_or(Expression::Noop(expr))
+}
+
+fn unary_op<'expr>(
+    expr: &Expression<'expr>,
+    operation: impl FnOnce(&Expression<'expr>) -> Expression<'expr> + 'expr,
+) -> Expression<'expr> {
+    operation(expr)
+}
+
 pub struct ParserError {
     message: String,
 }
@@ -164,7 +293,10 @@ impl<'parser> Default for ParserBuilder<'parser> {
 
 impl<'parser> ParserBuilder<'parser> {
     pub fn new() -> Self {
-        Self { prefix: String::default(), _data: PhantomData }
+        Self {
+            prefix: String::default(),
+            _data: PhantomData,
+        }
     }
 
     fn ident(
@@ -324,6 +456,8 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(self.ident())
                 .boxed();
 
+            let fallback = text::keyword("default").padded().map_with(output!(Default));
+
             let member = op!('.')
                 .ignore_then(atom.clone())
                 .clone()
@@ -393,7 +527,12 @@ impl<'parser> ParserBuilder<'parser> {
                     )
                 })
                 .boxed();
-            let pattern = atom.clone().or(str.clone()).or(bool).clone().boxed();
+            let pattern = fallback
+                .or(atom.clone())
+                .or(str.clone())
+                .or(bool)
+                .clone()
+                .boxed();
 
             let arm = pattern
                 .then_ignore(op!("=>"))
@@ -427,9 +566,7 @@ impl<'parser> ParserBuilder<'parser> {
             let resume = text::keyword("resume")
                 .ignore_then(expr.clone())
                 .then(expr.clone().delimited_by(op!('('), op!(')')).or_not())
-                .map_with(|(expr, arg), e| {
-                    (e.span(), Box::new(Expression::Resume(expr, arg)))
-                });
+                .map_with(|(expr, arg), e| (e.span(), Box::new(Expression::Resume(expr, arg))));
 
             let unary = match_
                 .or(yield_)
@@ -461,12 +598,12 @@ impl<'parser> ParserBuilder<'parser> {
                 .clone()
                 .foldl_with(
                     choice((
-                        op!(">=").to(Expression::Geq as fn(_, _) -> _),
-                        op!("<=").to(Expression::Leq as fn(_, _) -> _),
-                        op!("!=").to(Expression::Neq as fn(_, _) -> _),
-                        op!("==").to(Expression::Eq as fn(_, _) -> _),
-                        op!("<").to(Expression::Le as fn(_, _) -> _),
-                        op!(">").to(Expression::Gt as fn(_, _) -> _),
+                        op!(">=").to(foldable!(Geq, >=, Bool)),
+                        op!("<=").to(foldable!(Leq, <=, Bool)),
+                        op!("!=").to(foldable!(Neq, !=, Bool)),
+                        op!("==").to(foldable!(Eq, ==, Bool)),
+                        op!("<").to(foldable!(Le, <, Bool)),
+                        op!(">").to(foldable!(Gt, >, Bool)),
                     ))
                     .then(expr.clone())
                     .repeated(),
@@ -492,9 +629,9 @@ impl<'parser> ParserBuilder<'parser> {
                 .clone()
                 .foldl_with(
                     choice((
-                        op!('*').to(Expression::Mul as fn(_, _) -> _),
-                        op!('/').to(Expression::Div as fn(_, _) -> _),
-                        op!('%').to(Expression::Mod as fn(_, _) -> _),
+                        op!('*').to(foldable!(Mul, *)),
+                        op!('/').to(foldable!(Div, /)),
+                        op!('%').to(foldable!(Mod, %)),
                     ))
                     .then(expr.clone())
                     .repeated(),
@@ -506,8 +643,8 @@ impl<'parser> ParserBuilder<'parser> {
                 .clone()
                 .foldl_with(
                     choice((
-                        op!('+').to(Expression::Add as fn(_, _) -> _),
-                        op!('-').to(Expression::Sub as fn(_, _) -> _),
+                        op!('+').to(foldable!(Add, +)),
+                        op!('-').to(foldable!(Sub, -)),
                     ))
                     .then(expr.clone())
                     .repeated(),
@@ -571,13 +708,14 @@ impl<'parser> ParserBuilder<'parser> {
                             Box::new(Expression::Branch(Some(condition), body)),
                         )];
 
-                        if let Some((_, list)) = branches &&
-                            let Expression::Block(body) = *list {
-                                body.iter().for_each(|(_, branch)| {
-                                    if let Expression::If(branches) = branch.borrow() {
-                                        result.append(&mut branches.clone());
-                                    }
-                                })
+                        if let Some((_, list)) = branches
+                            && let Expression::Block(body) = *list
+                        {
+                            body.iter().for_each(|(_, branch)| {
+                                if let Expression::If(branches) = branch.borrow() {
+                                    result.append(&mut branches.clone());
+                                }
+                            })
                         };
 
                         if let Some((span, alt)) = alternative {

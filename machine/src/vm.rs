@@ -266,7 +266,7 @@ impl<const S: usize> Machine<S> {
                             params[idx] = self.stack.pop();
                         }
 
-                        let format_string = Allocated::<String>::new(self.stack.peek().as_ptr());
+                        let format_string = Allocated::<crate::String>::new(self.stack.peek().as_ptr());
                         let format_str = format_string.as_ref().as_str();
 
                         let mut message = String::default();
@@ -292,7 +292,7 @@ impl<const S: usize> Machine<S> {
                                     Some('s') => {
                                         chars.next();
                                         let string_val =
-                                            Allocated::<String>::new(params.pop().as_ptr());
+                                            Allocated::<crate::String>::new(params.pop().as_ptr());
                                         message.push_str(string_val.as_ref().as_str());
                                     }
                                     Some('x') => {
@@ -334,10 +334,14 @@ impl<const S: usize> Machine<S> {
                 Instruction::PRINT => {
                     print!(
                         "{}",
-                        Allocated::<String>::new(self.stack.peek().as_ptr())
+                        Allocated::<crate::String>::new(self.stack.peek().as_ptr())
                             .as_ref()
                             .as_str()
                     );
+                }
+                Instruction::FREE => {
+                    let val = Allocated::<crate::String>::new(self.stack.pop().as_ptr());
+                    self.heap.free(val);
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand(0));

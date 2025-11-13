@@ -26,96 +26,15 @@ macro_rules! binary {
     };
 }
 
-macro_rules! binary_op {
-    ($lhs: expr, $rhs: expr, $op: tt, $output: ident) => {
-        match ($lhs, $rhs) {
-            (Expression::Integer(a), Expression::Integer(b)) => Some(Expression::$output(a $op b)),
-            (Expression::Float(a), Expression::Float(b)) => Some(Expression::$output(a $op b)),
-            (Expression::Bool(a), Expression::Bool(b)) => Some(Expression::$output(a $op b)),
-            _ => None,
-        }
-    };
-    ($lhs: expr, $rhs: expr, $op: tt) => {
-        match ($lhs, $rhs) {
-            (Expression::Integer(a), Expression::Integer(b)) => Some(Expression::Integer(a $op b)),
-            (Expression::Float(a), Expression::Float(b)) => Some(Expression::Float(a $op b)),
-            _ => None
-        }
-    };
-}
-
 #[derive(Default, Clone)]
 struct Context {
     current: Option<String>,
     variables: Interner<String>,
+    ref_counts: HashMap<usize, usize>,
     constants: HashMap<usize, bool>,
     defers: Vec<(usize, usize, Vec<Byte<Value>>)>,
 
     prev: Option<Box<Self>>,
-}
-
-fn constant_fold<'expr>(expr: &'expr Expression<'expr>) -> Expression<'expr> {
-    match expr {
-        Expression::Integer(i) => Expression::Integer(*i),
-        Expression::Float(f) => Expression::Float(*f),
-        Expression::Bool(b) => Expression::Bool(*b),
-
-        Expression::Add(left, right) => {
-            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), +)
-                .unwrap_or(expr.clone())
-        }
-        Expression::Sub(left, right) => {
-            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), -)
-                .unwrap_or(expr.clone())
-        }
-        Expression::Mul(left, right) => {
-            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), *)
-                .unwrap_or(expr.clone())
-        }
-        Expression::Div(left, right) => {
-            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), /)
-                .unwrap_or(expr.clone())
-        }
-        Expression::Mod(left, right) => {
-            binary_op!(constant_fold(left.1.borrow()), constant_fold(right.1.borrow()), %)
-                .unwrap_or(expr.clone())
-        }
-
-        Expression::Negate(expr) => unary_op(expr.1.borrow(), |a| match a {
-            Expression::Integer(i) => Expression::Integer(-i),
-            Expression::Float(f) => Expression::Float(-f),
-            _ => *expr.1.clone(),
-        }),
-
-        Expression::Not(expr) => unary_op(expr.1.borrow(), |a| match a {
-            Expression::Bool(b) => Expression::Bool(!b),
-            _ => Expression::from(*expr.1.clone()), //*expr.1.clone()
-        }),
-
-        // @TODO: Handle remaining cases. 
-        // It will be interesting if a functional version of function-folding will be possible, as
-        // that will bring a lot of benefits (along with challenges). If a function is pure and has
-        // only constant (or constant-resolvable) arguments it can in turn be folded. This will be
-        // interesting with nested functions. maybe a limited bytecode could be output so that when
-        // passed to the VM will evaluate it, more or less like the `comptime` in zig?
-        //
-        // Expression::Function { args, body, .. } => Expression::Function {
-        //     name: expr.name,
-        //     args: args.iter().map(constant_fold).collect(),
-        //     body: body.iter().map(constant_fold).collect(),
-        //     returns: expr.returns.map(constant_fold),
-        // },
-        //
-        // Expression::Match(expr, cases) => Expression::Match(constant_fold(expr), cases.iter().map(|&(pat, body)| (constant_fold(pat), constant_fold(body))).collect()),
-        _ => expr.clone(),
-    }
-}
-
-fn unary_op<'expr>(
-    expr: &Expression<'expr>,
-    operation: impl FnOnce(&Expression<'expr>) -> Expression<'expr> + 'expr,
-) -> Expression<'expr> {
-    operation(expr)
 }
 
 pub struct Compiler {
@@ -159,6 +78,7 @@ impl<'ctx> Context {
         Self {
             current: self.current.clone(),
             defers: Vec::default(),
+            ref_counts: self.ref_counts.clone(),
             constants: self.constants.clone(),
             variables: self.variables.clone(),
             prev: Some(Box::new(self.to_owned())),
@@ -177,8 +97,8 @@ impl Compiler {
         self.functions[name]
     }
 
-    pub fn get_messages(self) -> Vec<Message> {
-        self.messages
+    pub fn get_messages(&self) -> &Vec<Message> {
+        &self.messages
     }
 
     pub fn register(&mut self, name: &str, params: &[Type], returns: Type) -> &mut Self {
@@ -230,6 +150,9 @@ impl Compiler {
                     alias.clone().unwrap_or(name.to_string()),
                     format!("{}{}", prefix.join("::"), name.to_string()),
                 );
+            }
+            Expression::Noop(child) => {
+                dbg!(&child);
             }
             Expression::Program(children) | Expression::Fragment(children) => {
                 for child in children {
@@ -302,6 +225,7 @@ impl Compiler {
                         // ));
                     }
                 }
+
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
                     Some(Instruction::RETURN)
@@ -332,6 +256,7 @@ impl Compiler {
                     [params_len, 0],
                 ));
                 bytecode.push(Byte::new(Instruction::PRINT));
+                bytecode.push(Byte::new(Instruction::FREE));
             }
             Expression::Format(format, params) => {
                 bytecode.append(&mut self.do_compile(format));
@@ -376,6 +301,15 @@ impl Compiler {
                 //         bytecode.push(Byte::new_with_operands(Instruction::RELEASE, [symbol, 0]));
                 //     }
                 // }
+
+                if matches!(expr.1.borrow(), Expression::Identifier(_)) {
+                    let symbol = self.context.variables.intern(self.resolve_variable(expr));
+                    if matches!(self.typecheck(expr), Type::OBJECT(_) | Type::STRING) {
+                        self.context.ref_counts.entry(symbol).and_modify(|v| {
+                            *v += 1;
+                        });
+                    }
+                }
 
                 bytecode.append(&mut self.do_compile(expr));
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
@@ -580,8 +514,6 @@ impl Compiler {
             }
             Expression::Eq(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
-
-                // bytecode.push(Byte::new(Instruction::NOT))
             }
             Expression::Not(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NOT));
@@ -590,114 +522,69 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                let a = constant_fold(lhs.1.borrow());
-                let b = constant_fold(rhs.1.borrow());
-
-                if let Some(constant) = binary_op!(a, b, +) {
-                    let mut span = lhs.0;
-                    span.end = rhs.0.end;
-                    bytecode.append(&mut self.do_compile(&(span, Box::new(constant))));
-                } else {
-                    binary!(
-                        bytecode,
-                        self,
-                        lhs,
-                        rhs,
-                        Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                            Instruction::ADD
-                        } else {
-                            Instruction::ADDF
-                        },)
-                    );
-                }
+                binary!(
+                    bytecode,
+                    self,
+                    lhs,
+                    rhs,
+                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                        Instruction::ADD
+                    } else {
+                        Instruction::ADDF
+                    },)
+                );
             }
             Expression::Sub(lhs, rhs) => {
-                let a = constant_fold(lhs.1.borrow());
-                let b = constant_fold(rhs.1.borrow());
-
-                if let Some(constant) = binary_op!(a, b, -) {
-                    let mut span = lhs.0;
-                    span.end = rhs.0.end;
-                    bytecode.append(&mut self.do_compile(&(span, Box::new(constant))));
-                } else {
-                    binary!(
-                        bytecode,
-                        self,
-                        lhs,
-                        rhs,
-                        Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                            Instruction::SUBF
-                        } else {
-                            Instruction::SUB
-                        },)
-                    );
-                }
-            },
+                binary!(
+                    bytecode,
+                    self,
+                    lhs,
+                    rhs,
+                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                        Instruction::SUBF
+                    } else {
+                        Instruction::SUB
+                    },)
+                );
+            }
             Expression::Mul(lhs, rhs) => {
-                let a = constant_fold(lhs.1.borrow());
-                let b = constant_fold(rhs.1.borrow());
-
-                if let Some(constant) = binary_op!(a, b, *) {
-                    let mut span = lhs.0;
-                    span.end = rhs.0.end;
-                    bytecode.append(&mut self.do_compile(&(span, Box::new(constant))));
-                } else {
-                    binary!(
-                        bytecode,
-                        self,
-                        lhs,
-                        rhs,
-                        Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                            Instruction::SUBF
-                        } else {
-                            Instruction::SUB
-                        },)
-                    );
-                }
+                binary!(
+                    bytecode,
+                    self,
+                    lhs,
+                    rhs,
+                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                        Instruction::MULF
+                    } else {
+                        Instruction::MUL
+                    },)
+                );
             }
             Expression::Mod(lhs, rhs) => {
-                let a = constant_fold(lhs.1.borrow());
-                let b = constant_fold(rhs.1.borrow());
-
-                if let Some(constant) = binary_op!(a, b, %) {
-                    let mut span = lhs.0;
-                    span.end = rhs.0.end;
-                    bytecode.append(&mut self.do_compile(&(span, Box::new(constant))));
-                } else {
-                    binary!(
-                        bytecode,
-                        self,
-                        lhs,
-                        rhs,
-                        Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                            Instruction::MODF
-                        } else {
-                            Instruction::MOD
-                        },)
-                    );
-                }
+                binary!(
+                    bytecode,
+                    self,
+                    lhs,
+                    rhs,
+                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                        Instruction::MODF
+                    } else {
+                        Instruction::MOD
+                    },)
+                );
             }
             Expression::Div(lhs, rhs) => {
-                let a = constant_fold(lhs.1.borrow());
-                let b = constant_fold(rhs.1.borrow());
-
-                if let Some(constant) = binary_op!(a, b, /) {
-                    let mut span = lhs.0;
-                    span.end = rhs.0.end;
-                    bytecode.append(&mut self.do_compile(&(span, Box::new(constant))));
-                } else {
-                    binary!(
-                        bytecode,
-                        self,
-                        lhs,
-                        rhs,
-                        Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                            Instruction::MODF
-                        } else {
-                            Instruction::MOD
-                        },)
-                    );
-                }
+                binary!(
+                    bytecode,
+                    self,
+                    lhs,
+                    rhs,
+                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                        Instruction::DIVF
+                    } else {
+                        Instruction::DIV
+                    },)
+                );
             }
             Expression::And(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::AND));
@@ -812,6 +699,14 @@ impl Compiler {
                     // let ty = self.typecheck(value);
                     let mut expr = self.do_compile(value);
 
+                    if matches!(value.1.borrow(), Expression::Identifier(_)) {
+                        let symbol = self.context.variables.intern(self.resolve_variable(value));
+                        if matches!(self.typecheck(value), Type::OBJECT(_) | Type::STRING) {
+                            self.context.ref_counts.entry(symbol).and_modify(|v| {
+                                *v += 1;
+                            });
+                        }
+                    }
                     bytecode.append(&mut expr);
                     bytecode.push(Byte::new_with_operands(Instruction::STORE, [symbol, 0]));
 
@@ -835,17 +730,40 @@ impl Compiler {
                 let lhs = self.do_compile(lhs);
 
                 let mut jumps: Vec<usize> = Vec::with_capacity(children.len());
+                let last_idx = children.len() - 1;
 
-                for (rhs, body) in children {
-                    bytecode.append(&mut lhs.clone());
-                    bytecode.append(&mut self.do_compile(rhs));
-                    bytecode.push(Byte::new(Instruction::EQ));
+                for (idx, (rhs, body)) in children.iter().enumerate() {
+                    let is_condition = !matches!(*rhs.1, Expression::Default(_));
+
+                    if !is_condition && idx != last_idx {
+                        let mut message = Message::warn(
+                            "`default` branch should be at the end of expression".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(Label::new(
+                            format!("Code after this block is not reachable"),
+                            rhs.0.into_range(),
+                        ));
+                        message.with_help(
+                            "Maybe you need to move this to the bottom of the list?".to_string(),
+                        );
+
+                        self.messages.push(message);
+                    }
+
+                    if is_condition {
+                        bytecode.append(&mut lhs.clone());
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::EQ));
+                    }
 
                     let mut body = self.do_compile(body);
-                    bytecode.push(Byte::new_with_operands(
-                        Instruction::JMPF,
-                        [self.bytecode.len() + bytecode.len() + body.len() + 1, 0],
-                    ));
+                    if is_condition {
+                        bytecode.push(Byte::new_with_operands(
+                            Instruction::JMPF,
+                            [self.bytecode.len() + bytecode.len() + body.len() + 2, 0],
+                        ));
+                    }
                     bytecode.append(&mut body);
                     jumps.push(bytecode.len());
                     bytecode.push(Byte::new_with_operands(Instruction::JMP, [usize::MAX, 0]));

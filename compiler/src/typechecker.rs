@@ -1,7 +1,4 @@
-use std::{
-    borrow::Borrow,
-    collections::HashMap, vec::Drain, 
-};
+use std::{borrow::Borrow, collections::HashMap, vec::Drain};
 
 use common::{Label, Message};
 use parser::{Expression, SimpleSpan};
@@ -9,6 +6,8 @@ use parser::{Expression, SimpleSpan};
 pub struct Typechecker {
     functions: HashMap<String, (Vec<Type>, Type)>,
     variables: HashMap<String, (Type, std::ops::Range<usize>)>,
+
+    stack: Vec<Type>,
 
     // --
     messages: Vec<Message>,
@@ -19,6 +18,7 @@ impl Default for Typechecker {
         Self {
             functions: HashMap::with_capacity(16),
             variables: HashMap::with_capacity(16),
+            stack: Vec::with_capacity(16),
             messages: Vec::with_capacity(16),
         }
     }
@@ -35,6 +35,7 @@ pub enum Type {
     BOOLEAN,
     LIST,
     OBJECT(String),
+    ALLOCATION(Box<Type>),
 }
 
 impl From<String> for Type {
@@ -61,7 +62,7 @@ impl ToString for Type {
             Type::LIST => "array",
             Type::NONE => "void",
             Type::OBJECT(s) => s,
-            Type::UNKNOWN => "%",
+            _ => "%",
         }
         .to_string()
     }
@@ -99,8 +100,16 @@ impl Typechecker {
 
         match child.borrow() {
             Expression::Type(t) => t.to_string().into(),
-            Expression::Integer(_) => Type::INTEGER,
-            Expression::Bool(_) => Type::BOOLEAN,
+            Expression::Integer(_) => {
+                self.stack.push(Type::INTEGER);
+
+                Type::INTEGER
+            }
+            Expression::Bool(_) => {
+                self.stack.push(Type::BOOLEAN);
+
+                Type::BOOLEAN
+            }
             Expression::String(_) => Type::STRING,
             Expression::Float(_) => Type::FLOAT,
             Expression::Identifier(n) => {
@@ -151,18 +160,19 @@ impl Typechecker {
                     .drain()
                     .filter(|(_, (t, _))| *t == Type::UNKNOWN)
                     .for_each(|(name, (_, s))| {
-                            let mut message = Message::info(
-                                format!("Variable '{}' has undetermined type", name),
-                                span.into_range(),
-                            );
-                            message.push(Label::new(
-                                format!("Variable '{}' has undetermined type", name),
-                                     s.clone()));
-                            message.with_help("Possibly unused?".to_string());
+                        let mut message = Message::info(
+                            format!("Variable '{}' has undetermined type", name),
+                            span.into_range(),
+                        );
+                        message.push(Label::new(
+                            format!("Variable '{}' has undetermined type", name),
+                            s.clone(),
+                        ));
+                        message.with_help("Possibly unused?".to_string());
 
                         self.messages.push(message);
                     });
-                self.variables.extend(variables); 
+                self.variables.extend(variables);
 
                 returns
                     .clone()
@@ -175,14 +185,17 @@ impl Typechecker {
 
                 if let Some((t, entry_span)) = self.variables.get(&name).cloned() {
                     if t == Type::UNKNOWN {
-                        self.variables.entry(name).and_modify(|entry| {
-                            *entry = (ty.clone(), entry_span.clone())
-                        });
+                        self.variables
+                            .entry(name)
+                            .and_modify(|entry| *entry = (ty.clone(), entry_span.clone()));
 
                         ty
                     } else if t != ty {
-                            let mut message = Message::error("Assignment type mismatch".to_string(), span.into_range());
-                                message.push(Label::new(
+                        let mut message = Message::error(
+                            "Assignment type mismatch".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(Label::new(
                                     format!("Unable to assign value of type '{}' to variable '{}' that is of type '{}'", ty.to_string(), name, t.to_string()),
                                     span.into_range()
                                 ));
@@ -194,14 +207,15 @@ impl Typechecker {
                         t.clone()
                     }
                 } else {
-                        let mut message = Message::error("Missing variable".to_string(), span.into_range());
-                            message.push(Label::new(
-                                format!(
-                                    "Attempting to assign value to undeclared variable '{}'",
-                                    name
-                                ),
-                                span.into_range(),
-                            ));
+                    let mut message =
+                        Message::error("Missing variable".to_string(), span.into_range());
+                    message.push(Label::new(
+                        format!(
+                            "Attempting to assign value to undeclared variable '{}'",
+                            name
+                        ),
+                        span.into_range(),
+                    ));
                     self.messages.push(message);
 
                     Type::default()
@@ -218,12 +232,17 @@ impl Typechecker {
                                 expected = Some(actual);
                                 expected_location = stmt.0.into_range();
                             } else if expected != Some(actual.clone()) {
-                                        let mut message = Message::error("Return type mismatch".to_string(), span.into_range());
-                                            message.push(Label::new(format!(
-                                                    "Here return type is '{}'",
-                                                    expected.clone().unwrap().to_string()
-                                                ), expected_location.clone())
-                                            );
+                                let mut message = Message::error(
+                                    "Return type mismatch".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(Label::new(
+                                    format!(
+                                        "Here return type is '{}'",
+                                        expected.clone().unwrap().to_string()
+                                    ),
+                                    expected_location.clone(),
+                                ));
                                 message.push(
                                                 Label::new(format!(
                                                     "Expected to return value of type '{}', instead returns '{}'",
@@ -231,7 +250,7 @@ impl Typechecker {
                                                     actual.to_string()), expr.0.into_range()
                                                 )
                                             );
-                                    self.messages.push(message);
+                                self.messages.push(message);
                             }
                         }
                         _ => {
@@ -246,22 +265,19 @@ impl Typechecker {
             | Expression::ExprStatement(expr)
             | Expression::Expr(expr)
             | Expression::Return(expr) => self.check(expr),
-            Expression::ImplicitReturn(expr) => {
-                
-
-                self.check(expr)
-            }
+            Expression::ImplicitReturn(expr) => self.check(expr),
             Expression::Format(fmt, _) | Expression::Print(fmt, _) => {
                 let type_ = self.check(fmt);
                 if type_ != Type::STRING {
-                        let mut message = Message::error("Invalid format string".to_string(), span.into_range());
-                            message.push(Label::new(
-                                format!(
-                                    "Print format must evaluate to string, '{}' given",
-                                    type_.to_string(),
-                                ),
-                                span.into_range(),
-                            ));
+                    let mut message =
+                        Message::error("Invalid format string".to_string(), span.into_range());
+                    message.push(Label::new(
+                        format!(
+                            "Print format must evaluate to string, '{}' given",
+                            type_.to_string(),
+                        ),
+                        span.into_range(),
+                    ));
                     self.messages.push(message);
                 }
 
@@ -273,23 +289,27 @@ impl Typechecker {
                 let call_arity = args.len();
                 if let Some(func) = self.functions.get(&name).cloned() {
                     if call_arity != func.0.len() {
-                            let mut message = Message::error("Invalid function call".to_string(), span.into_range());
-                                message.push(Label::new(
-                                    format!(
-                                        "Function '{}' expects {} arguments, but called with {}",
-                                        name,
-                                        func.0.len(),
-                                        call_arity
-                                    ),
-                                    span.into_range(),
-                                ));
+                        let mut message =
+                            Message::error("Invalid function call".to_string(), span.into_range());
+                        message.push(Label::new(
+                            format!(
+                                "Function '{}' expects {} arguments, but called with {}",
+                                name,
+                                func.0.len(),
+                                call_arity
+                            ),
+                            span.into_range(),
+                        ));
                         self.messages.push(message);
                     } else {
                         for (idx, arg) in args.iter().enumerate() {
                             let ty = self.check(arg);
                             if func.0[idx] != ty {
-                                let mut message = Message::error("Invalid function argument".to_string(), span.into_range());
-                                    message.push(
+                                let mut message = Message::error(
+                                    "Invalid function argument".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(
                                     Label::new(
                                     format!(
                                         "Argument #{} of function '{}' is incorrect, expected '{}' but got '{}'",
@@ -308,16 +328,15 @@ impl Typechecker {
 
                     func.1.clone()
                 } else {
-                        let mut message = Message::error("Unknown function".to_string(), span.into_range());
-                        message.push(
-                        Label::new(
-                            format!(
-                                "Unable to check signature, becuase function '{}' does not exist",
-                                name
-                            ),
-                            span.into_range(),
+                    let mut message =
+                        Message::error("Unknown function".to_string(), span.into_range());
+                    message.push(Label::new(
+                        format!(
+                            "Unable to check signature, becuase function '{}' does not exist",
+                            name
                         ),
-                    );
+                        span.into_range(),
+                    ));
 
                     self.messages.push(message);
 
@@ -350,12 +369,12 @@ impl Typechecker {
                 let rhs = self.check(rhs);
 
                 if lhs != rhs || (lhs != Type::INTEGER && lhs != Type::FLOAT) {
-                        let mut message = Message::error("Invalid expression".to_string(), span.into_range());
-                        message.push(Label::new(
-                                "Unable to perform arithmetic operation on non-numeric types."
-                                    .to_string(),
-                                span.into_range(),
-                            ));
+                    let mut message =
+                        Message::error("Invalid expression".to_string(), span.into_range());
+                    message.push(Label::new(
+                        "Unable to perform arithmetic operation on non-numeric types.".to_string(),
+                        span.into_range(),
+                    ));
                     self.messages.push(message);
 
                     Type::default()
@@ -373,11 +392,12 @@ impl Typechecker {
 
                 // @TODO: Handle `UNKNOWN` that is unable to resolve the function params
                 if lhs != rhs || lhs != Type::INTEGER {
-                        let mut message =Message::error("Invalid expression".to_string(), span.into_range());
-                        message.push(Label::new(
-                                "Unable to perform bitwise for non-numeric types.".to_string(),
-                                span.into_range(),
-                            ));
+                    let mut message =
+                        Message::error("Invalid expression".to_string(), span.into_range());
+                    message.push(Label::new(
+                        "Unable to perform bitwise for non-numeric types.".to_string(),
+                        span.into_range(),
+                    ));
                     self.messages.push(message);
 
                     Type::default()
@@ -396,11 +416,12 @@ impl Typechecker {
 
                 // @TODO: Handle `UNKNOWN` that is unable to resolve the function params
                 if lhs != rhs {
-                    let mut message = Message::error("Invalid expression".to_string(), span.into_range());
-                        message.push(Label::new(
-                                "Unable to perform comparison of non-identical types.".to_string(),
-                                span.into_range(),
-                            ));
+                    let mut message =
+                        Message::error("Invalid expression".to_string(), span.into_range());
+                    message.push(Label::new(
+                        "Unable to perform comparison of non-identical types.".to_string(),
+                        span.into_range(),
+                    ));
                     self.messages.push(message);
 
                     Type::default()
@@ -413,20 +434,22 @@ impl Typechecker {
                 if let Some(condition) = condition {
                     let expr = self.check(condition);
                     if !matches!(expr, Type::BOOLEAN) {
-                            let mut message = Message::error("Invalid condition".to_string(), span.into_range());
-                            message.push(Label::new(
-                                    "Conditional expression does not evaluate to true".to_string(),
-                                    condition.0.into_range(),
-                                ));
+                        let mut message =
+                            Message::error("Invalid condition".to_string(), span.into_range());
+                        message.push(Label::new(
+                            "Conditional expression does not evaluate to true".to_string(),
+                            condition.0.into_range(),
+                        ));
                         self.messages.push(message);
                     }
-
-                } 
+                }
 
                 self.check(body)
             }
             Expression::If(branches) => {
-                branches.iter().for_each(|b| { self.check(b); });
+                branches.iter().for_each(|b| {
+                    self.check(b);
+                });
 
                 Type::NONE
             }
@@ -449,25 +472,26 @@ impl Typechecker {
                 let mut expected_location = std::ops::Range::default();
 
                 for (rhs, body) in children {
-                    let current = self.check(rhs);
+                    if !matches!(*rhs.1, Expression::Default(_)) {
+                        let current = self.check(rhs);
 
-                    if lhs_ != current {
-                            let mut message = Message::error("Invalid comparison".to_string(), span.into_range());
-                                message.push(
-                                    Label::new(
-                                        format!("Expression is of type '{}'", lhs_.to_string()),
-                                        lhs.0.into_range(),
-                                    )
-                                );
-                                message.push(Label::new(
-                                    format!(
-                                        "Found expression to be of type '{}', while expecting '{}'",
-                                        current.to_string(),
-                                        lhs_.to_string()
-                                    ),
-                                    rhs.0.into_range(),
-                                ));
-                        self.messages.push(message);
+                        if lhs_ != current {
+                            let mut message =
+                                Message::error("Invalid comparison".to_string(), span.into_range());
+                            message.push(Label::new(
+                                format!("Expression is of type '{}'", lhs_.to_string()),
+                                lhs.0.into_range(),
+                            ));
+                            message.push(Label::new(
+                                format!(
+                                    "Found expression to be of type '{}', while expecting '{}'",
+                                    current.to_string(),
+                                    lhs_.to_string()
+                                ),
+                                rhs.0.into_range(),
+                            ));
+                            self.messages.push(message);
+                        }
                     }
 
                     let body_ = self.check(body);
@@ -475,14 +499,14 @@ impl Typechecker {
                         expected = Some(body_.clone());
                         expected_location = body.0.into_range();
                     } else if expected != Some(body_.clone()) {
-                        let mut message = 
-                        Message::error("Unexpected return value".to_string(), span.into_range());
-                        message.push(
-                            Label::new(
-                                format!("Result of this block is '{}'", body_.to_string()),
-                                expected_location.clone(),
-                            )
+                        let mut message = Message::error(
+                            "Unexpected return value".to_string(),
+                            span.into_range(),
                         );
+                        message.push(Label::new(
+                            format!("Result of this block is '{}'", body_.to_string()),
+                            expected_location.clone(),
+                        ));
                         message.push(Label::new(
                             format!(
                                 "Expected this block to result in '{}' but found '{}' instead.",
@@ -491,7 +515,7 @@ impl Typechecker {
                             ),
                             body.0.into_range(),
                         ));
-                    self.messages.push(message);
+                        self.messages.push(message);
                     }
                 }
 
@@ -500,16 +524,16 @@ impl Typechecker {
             e => {
                 #[cfg(debug_assertions)]
                 dbg!(e);
-                let mut message = Message::error("Unknown expression".to_string(), span.into_range());
+                let mut message =
+                    Message::error("Unknown expression".to_string(), span.into_range());
                 message.push(Label::new(
-                            format!("Unknown expression '{:?}'", e),
-                            span.into_range(),
-                        ));
+                    format!("Unknown expression '{:?}'", e),
+                    span.into_range(),
+                ));
                 self.messages.push(message);
 
                 Type::default()
             }
         }
     }
-
 }

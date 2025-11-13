@@ -119,14 +119,13 @@ impl<'pipeline> Pipeline<'pipeline> {
         match self.parser.parse(src.as_str()) {
             Ok(ast) => {
                 self.visit(&ast);
-                let bytecode = self.compiler.compile(ns.as_str(),&ast);
-
+                let bytecode = self.compiler.compile(ns.as_str(), &ast);
 
                 self.bytecode = bytecode;
 
-                // for message in self.compiler.get_messages() {
-                //     Self::render_errors(file.clone(), src.as_str(), &message);
-                // }
+                for message in self.compiler.get_messages() {
+                    Self::render_errors(file.clone(), src.as_str(), &message);
+                }
             }
             Err(e) => Self::render_errors(file, src.as_str(), &e),
         }
