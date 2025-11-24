@@ -1,8 +1,6 @@
-use std::{
-    ops::{Index, IndexMut},
-};
+use std::ops::{Index, IndexMut};
 
-use crate::{likely, unlikely, promise };
+use crate::{likely, promise, unlikely};
 
 #[derive(Clone)]
 pub struct ArrayVec<T: Default, const N: usize> {
@@ -271,7 +269,7 @@ pub struct ArrayVecIter<'iter, T: Default, const N: usize> {
     value: &'iter ArrayVec<T, N>,
 }
 
-impl <'iter, T: Default, const N: usize> ArrayVecIter<'iter, T, N> {
+impl<'iter, T: Default, const N: usize> ArrayVecIter<'iter, T, N> {
     pub fn seek(&mut self, cursor: usize) {
         self.cursor = cursor;
     }

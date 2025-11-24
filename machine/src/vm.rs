@@ -1,8 +1,13 @@
 use std::{collections::HashMap, io::Write};
 
-use common::{ArrayVec, SeekableIterator, Value, unlikely};
+use common::{
+    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec,
+    Instruction as _Instruction, SeekableIterator, Value, unlikely,
+};
 
-use crate::{Allocated, Byte, Coroutine, Frame, Heap, Instruction, Stack};
+use crate::{
+    Allocated, Byte as _Byte, Coroutine, Frame, Heap, Stack, garbage::collector::Collector,
+};
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -43,7 +48,7 @@ type External = fn(&[Value]) -> Value;
 
 pub struct Machine<const S: usize> {
     heap: Heap,
-    stack: Stack<Value, 2048>,
+    stack: Stack<Value, 8192>,
     frames: ArrayVec<Frame, S>,
     native: HashMap<usize, External>,
 }
@@ -62,14 +67,12 @@ enum ExecutionOutcome {
 #[derive(Default)]
 struct ExecutionResult {
     outcome: ExecutionOutcome,
-    ip: usize,
     arity: usize,
 }
 impl ExecutionResult {
     pub fn returns() -> Self {
         Self {
             outcome: ExecutionOutcome::RETURN,
-            ip: 0,
             arity: 0,
         }
     }
@@ -77,15 +80,13 @@ impl ExecutionResult {
     pub fn resume() -> Self {
         Self {
             outcome: ExecutionOutcome::RESUME,
-            ip: 0,
             arity: 0,
         }
     }
 
-    pub fn call(ip: usize, arity: usize) -> Self {
+    pub fn call(arity: usize) -> Self {
         Self {
             outcome: ExecutionOutcome::CALL,
-            ip,
             arity,
         }
     }
@@ -93,7 +94,6 @@ impl ExecutionResult {
     pub fn terminate() -> Self {
         Self {
             outcome: ExecutionOutcome::TERMINATION,
-            ip: 0,
             arity: 0,
         }
     }
@@ -101,7 +101,6 @@ impl ExecutionResult {
     pub fn invalid() -> Self {
         Self {
             outcome: ExecutionOutcome::INVALID,
-            ip: usize::MAX,
             arity: usize::MAX,
         }
     }
@@ -112,10 +111,6 @@ impl ExecutionResult {
 
     pub fn arity(&self) -> usize {
         self.arity
-    }
-
-    pub fn tell(&self) -> usize {
-        self.ip
     }
 }
 
@@ -154,20 +149,20 @@ impl<const S: usize> Machine<S> {
         self.stack.tell()
     }
 
-    pub fn run(&mut self, code: &[Byte<Value>]) {
+    pub fn run(&mut self, code: &[Byte]) {
         if code.is_empty() {
             return;
         }
 
-        let mut code_iter = code.into();
+        let mut code_iter = SeekableIterator::new(code);
 
         loop {
             let result = self.execute(&mut code_iter);
 
             match result.outcome() {
                 ExecutionOutcome::CALL => {
-                    self.frames.get_mut().seek(code_iter.tell());
-                    code_iter.seek(result.tell());
+                    self.frames.get_mut().seek(code_iter.tell() + 1);
+                    // code_iter.seek(result.tell());
                     self.frames.current_mut().enter();
                     self.frames
                         .current_mut()
@@ -205,10 +200,7 @@ impl<const S: usize> Machine<S> {
     }
 
     #[inline(always)]
-    fn execute<'iter>(
-        &mut self,
-        code: &mut SeekableIterator<'iter, Byte<Value>>,
-    ) -> ExecutionResult {
+    fn execute<'iter>(&mut self, code: &mut SeekableIterator<'iter, Byte>) -> ExecutionResult {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
@@ -222,8 +214,8 @@ impl<const S: usize> Machine<S> {
                     frame_no,
                     code.tell(),
                     format!("{:?}", opcode.bytecode()),
-                    opcode.operand(0),
-                    opcode.operand(1),
+                    opcode.operand_u16(0),
+                    opcode.operand_u16(1),
                     self.stack.slice(frame.get(), self.stack.tell())
                 );
             }
@@ -232,13 +224,25 @@ impl<const S: usize> Machine<S> {
                 Instruction::POP => {
                     self.stack.pop();
                 }
-                Instruction::CONST => self.stack.push(opcode.constant()),
+                Instruction::DUPLICATE => {
+                    self.stack.push(*self.stack.peek());
+                }
+                Instruction::CONST => self.stack.push(Value::from(opcode.constant())),
                 Instruction::STORE => {
                     let val = self.stack.peek();
-                    self.stack[frame.get() + opcode.operand(0)] = *val;
+                    self.stack[frame.get() + opcode.operand_u32() as usize] = *val;
                 }
                 Instruction::LOAD => {
-                    self.stack.push(self.stack[frame.get() + opcode.operand(0)]);
+                    self.stack
+                        .push(self.stack[frame.get() + opcode.operand_u32() as usize]);
+                }
+                Instruction::INC => {
+                    let lhs = *self.stack[frame.get() + opcode.operand_u32() as usize].inc();
+                    self.stack.push(lhs);
+                }
+                Instruction::DEC => {
+                    let lhs = *self.stack[frame.get() + opcode.operand_u32() as usize].dec();
+                    self.stack.push(lhs);
                 }
                 Instruction::NOT => unary!(self.stack, !, as_bool),
                 Instruction::NEG => unary!(self.stack, -, as_int),
@@ -259,14 +263,16 @@ impl<const S: usize> Machine<S> {
                 Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
                 Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
                 Instruction::FORMAT => {
-                    if opcode.operand(0) != 0 {
+                    let params_count = opcode.operand_u32();
+                    if params_count != 0 {
                         let mut params = ArrayVec::<Value, 8>::default();
 
-                        for idx in (0..opcode.operand(0)).rev() {
+                        for idx in (0..params_count as usize).rev() {
                             params[idx] = self.stack.pop();
                         }
 
-                        let format_string = Allocated::<crate::String>::new(self.stack.peek().as_ptr());
+                        let format_string =
+                            Allocated::<crate::String>::new(self.stack.peek().as_ptr());
                         let format_str = format_string.as_ref().as_str();
 
                         let mut message = String::default();
@@ -327,6 +333,7 @@ impl<const S: usize> Machine<S> {
                                 message.push(ch);
                             }
                         }
+
                         let collectable = self.heap.alloc::<crate::String>(message.into());
                         *self.stack.top() = Value::from(collectable.ptr() as u64);
                     }
@@ -344,20 +351,20 @@ impl<const S: usize> Machine<S> {
                     self.heap.free(val);
                 }
                 Instruction::JMP => {
-                    code.seek(opcode.operand(0));
+                    code.seek(opcode.operand_u32() as usize);
                 }
                 Instruction::JMPF => {
                     if !self.stack.pop().as_bool() {
-                        code.seek(opcode.operand(0));
+                        code.seek(opcode.operand_u32() as usize);
                     }
                 }
                 Instruction::JMPT => {
                     if self.stack.pop().as_bool() {
-                        code.seek(opcode.operand(0));
+                        code.seek(opcode.operand_u32() as usize);
                     }
                 }
                 Instruction::CALL => {
-                    return ExecutionResult::call(opcode.operand(0), opcode.operand(1));
+                    return ExecutionResult::call(opcode.operand_u32() as usize);
                 }
                 // Instruction::NATIVE => {
                 //     let arity = opcode.operand(1);
@@ -389,13 +396,13 @@ impl<const S: usize> Machine<S> {
                     return ExecutionResult::terminate();
                 }
                 Instruction::STRING => {
-                    let length = opcode.operand(0);
+                    let length = opcode.operand_u32() as usize;
                     let mut value: String = String::with_capacity(length);
 
                     while length != value.len()
                         && let Some(data) = code.next()
                     {
-                        value.push(char::from_u32(data.operand(0) as u32).unwrap_or_default());
+                        value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
                     let collectable = self.heap.alloc::<crate::String>(value.into());
@@ -422,7 +429,7 @@ mod tests {
         let mut vm = Machine::<1>::default();
         let v = Value::from(42);
         vm.run(&[
-            Byte::new_with_value(Instruction::CONST, v),
+            Byte::new_with_value(Instruction::CONST, v.raw() as _),
             Byte::new(Instruction::HALT),
         ]);
 
@@ -433,12 +440,12 @@ mod tests {
     fn test_addition() {
         let cases = [
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
                 Value::from(4.0),
                 Instruction::ADDF,
             ),
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
                 Value::from(4),
                 Instruction::ADD,
             ),
@@ -456,12 +463,12 @@ mod tests {
     fn test_subtraction() {
         let cases = [
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
                 Value::from(0.0),
                 Instruction::SUBF,
             ),
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
                 Value::from(0),
                 Instruction::SUB,
             ),
@@ -479,12 +486,12 @@ mod tests {
     fn test_multiplication() {
         let cases = [
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
                 Value::from(4.0),
                 Instruction::MULF,
             ),
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
                 Value::from(4),
                 Instruction::MUL,
             ),
@@ -502,12 +509,12 @@ mod tests {
     fn test_division() {
         let cases = [
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
                 Value::from(1.0),
                 Instruction::DIVF,
             ),
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
                 Value::from(1),
                 Instruction::DIV,
             ),
@@ -525,12 +532,12 @@ mod tests {
     fn test_jumps() {
         let cases = [
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
                 Value::from(1.0),
                 Instruction::DIVF,
             ),
             (
-                Byte::new_with_value(Instruction::CONST, Value::from(2)),
+                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
                 Value::from(1),
                 Instruction::DIV,
             ),

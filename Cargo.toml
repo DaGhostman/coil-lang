@@ -12,7 +12,8 @@ common = { path = "common" }
 machine = { path = "machine" }
 parser = { path = "parser" }
 compiler = { path = "compiler" }
-ariadne = { version = "0.5.1", features = ["auto-color"] }
+ariadne = { version = "0.6.0", features = ["auto-color"] }
+rkyv = "0.8.12"
 
 [dev-dependencies]
 criterion = { version = "^0.7", features = ["html_reports"] }
@@ -31,5 +32,4 @@ debug = 1
 
 [profile.branch_misses]
 inherits="release"
-
 debug = 2

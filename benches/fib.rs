@@ -5,25 +5,28 @@ use std::hint::black_box;
 
 fn fib(n: u16) -> () {
     let fib = [
-        Byte::new_with_value(Instruction::CONST, Value::from(n as i64)),
-        Byte::new_with_operands(Instruction::CALL, [3, 1]),
+        Byte::new_with_value(Instruction::CONST, Value::from(n as i64).raw() as _),
+        Byte::new(Instruction::CALL).with_operand_u32(1),
+        Byte::new(Instruction::JMP).with_operand_u32(4),
         Byte::new(Instruction::HALT),
         //
-        Byte::new_with_operands(Instruction::LOAD, [0, 0]), // Load argument n
-        Byte::new_with_value(Instruction::CONST, Value::from(2)), // Load 2
-        Byte::new(Instruction::LE),                         // Compare n < 2
-        Byte::new_with_operands(Instruction::JMPF, [9, 0]), // Jump if false
-        Byte::new_with_operands(Instruction::LOAD, [0, 0]),
+        Byte::new(Instruction::LOAD).with_operand_u32(0), // Load argument n
+        Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _), // Load 2
+        Byte::new(Instruction::LE),                       // Compare n < 2
+        Byte::new(Instruction::JMPF).with_operand_u32(10), // Jump if false
+        Byte::new(Instruction::LOAD).with_operand_u32(0),
         Byte::new(Instruction::RETURN), // Return n
         // -- FIB
-        Byte::new_with_operands(Instruction::LOAD, [0, 0]), // Load n
-        Byte::new_with_value(Instruction::CONST, Value::from(1)), // Load 1
-        Byte::new(Instruction::SUB),                        // n - 1
-        Byte::new_with_operands(Instruction::CALL, [3, 1]), // Call FIB(n - 1)
-        Byte::new_with_operands(Instruction::LOAD, [0, 0]), // Store result
-        Byte::new_with_value(Instruction::CONST, Value::from(2)), // Load 2
-        Byte::new(Instruction::SUB),                        // n - 2
-        Byte::new_with_operands(Instruction::CALL, [3, 1]), // Call FIB(n - 2)
+        Byte::new(Instruction::LOAD).with_operand_u32(0), // Load n
+        Byte::new_with_value(Instruction::CONST, Value::from(1).raw() as _), // Load 1
+        Byte::new(Instruction::SUB),                      // n - 1
+        Byte::new(Instruction::CALL).with_operand_u32(1), // Call FIB(n - 1)
+        Byte::new(Instruction::JMP).with_operand_u32(4),
+        Byte::new(Instruction::LOAD).with_operand_u32(0), // Store result
+        Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _), // Load 2
+        Byte::new(Instruction::SUB),                      // n - 2
+        Byte::new(Instruction::CALL).with_operand_u32(1), // Call FIB(n - 2)
+        Byte::new(Instruction::JMP).with_operand_u32(4),
         // Opcode::new(Bytecode::STORE, [2, 0, 0]),  // Store result
         Byte::new(Instruction::ADD),    // Add results
         Byte::new(Instruction::RETURN), // Return result;

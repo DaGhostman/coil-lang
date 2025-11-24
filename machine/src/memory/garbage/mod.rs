@@ -1,5 +1,6 @@
 // mod collectable;
 // mod gc;
+pub mod collector;
 mod rc;
 
 use std::cell::Cell;

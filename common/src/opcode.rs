@@ -1,14 +1,16 @@
-use std::fmt::{Debug};
+use std::fmt::Debug;
 
-use crate::promise;
+use rkyv::{Archive, Deserialize, Serialize};
 
 #[repr(u8)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, Archive, Serialize, Deserialize)]
+#[rkyv(compare(PartialEq), derive(Debug), derive(Clone), derive(Copy))]
 pub enum Instruction {
     // -- Special
     #[default]
     HALT,
     NOOP,
+    DUPLICATE,
     POP,
     CONST,
     STORE,
@@ -22,6 +24,8 @@ pub enum Instruction {
     DATA,
     ACQUIRE,
     RELEASE,
+    INC,
+    DEC,
 
     // Arithmetic
     ADD,
@@ -71,48 +75,44 @@ impl From<Instruction> for u8 {
     }
 }
 
-type OPERAND = usize;
-const OPERAND_COUNT: usize = 2;
-#[derive(Default, Clone, Copy)]
-pub struct Byte<V> {
+#[derive(Default, Clone, Copy, Archive, Serialize, Deserialize)]
+#[rkyv(compare(PartialEq))]
+pub struct Byte {
     bytecode: Instruction,
-    operands: [OPERAND; OPERAND_COUNT],
-    value: V,
+    operands: u32,
+    value: u64,
 }
 
-impl<V: Default + Copy> Byte<V> {
+impl Byte {
     pub fn new(bytecode: Instruction) -> Self {
         Self {
             bytecode,
             operands: Default::default(),
-            value: V::default(),
+            value: 0,
         }
     }
 
-    pub fn new_with_operands(bytecode: Instruction, operands: [OPERAND; OPERAND_COUNT]) -> Self {
-        Self {
-            bytecode,
-            operands,
-            value: V::default(),
-        }
+    pub fn with_operand_u32(mut self, operand: u32) -> Self {
+        self.operands = operand;
+
+        self
     }
 
-    pub fn new_with_value(bytecode: Instruction, value: V) -> Self {
-        Self {
-            bytecode,
-            operands: [0, 0],
-            value,
-        }
+    pub fn with_operands_u16(mut self, operands: [u16; 2]) -> Self {
+        let mut operand: u32 = 0;
+        operand ^= operands[0] as u32;
+        operand <<= 16;
+        operand ^= operands[1] as u32;
+
+        self.operands = operand;
+
+        self
     }
 
-    pub fn new_with_operands_and_value(
-        bytecode: Instruction,
-        operands: [usize; 2],
-        value: V,
-    ) -> Self {
+    pub fn new_with_value(bytecode: Instruction, value: u64) -> Self {
         Self {
             bytecode,
-            operands,
+            operands: 0,
             value,
         }
     }
@@ -121,19 +121,67 @@ impl<V: Default + Copy> Byte<V> {
         &self.bytecode
     }
 
-    pub fn operand(&self, idx: usize) -> OPERAND {
-        promise!(idx < OPERAND_COUNT);
-
-        self.operands[idx]
+    pub fn operand_u32(&self) -> u32 {
+        self.operands
     }
 
-    pub fn constant(&self) -> V {
+    ///
+    ///```
+    /// use common::{Instruction, Byte};
+    ///
+    /// let mut value: Byte = Byte::new(Instruction::default());
+    /// value = value.with_operands_u16([1, 2,]);
+    /// assert_eq!(1, value.operand_u16(0));
+    /// assert_eq!(2, value.operand_u16(1));
+    /// ```
+    ///
+    pub fn operand_u16(&self, index: usize) -> u16 {
+        match index {
+            0 => (self.operands >> 16) as u16,
+            1 => ((self.operands << 16) >> 16) as u16,
+            _ => unreachable!("Unable to use larger index when using u32 operands"),
+        }
+    }
+
+    pub fn constant(&self) -> u64 {
         self.value
     }
 }
 
+impl ArchivedByte {
+    pub fn bytecode(&self) -> &ArchivedInstruction {
+        &self.bytecode
+    }
+
+    pub fn operand_u32(&self) -> u32 {
+        self.operands.into()
+    }
+
+    ///
+    ///```
+    /// use common::{Instruction, Byte};
+    ///
+    /// let mut value: Byte = Byte::new(Instruction::default());
+    /// value = value.with_operands_u16([1, 2,]);
+    /// assert_eq!(1, value.operand_u16(0));
+    /// assert_eq!(2, value.operand_u16(1));
+    /// ```
+    ///
+    pub fn operand_u16(&self, index: usize) -> u16 {
+        match index {
+            0 => (self.operands >> 16) as u16,
+            1 => ((self.operands << 16) >> 16) as u16,
+            _ => unreachable!("Unable to use larger index when using u32 operands"),
+        }
+    }
+
+    pub fn constant(&self) -> u64 {
+        self.value.into()
+    }
+}
+
 #[cfg(debug_assertions)]
-impl<V: std::fmt::Display> Debug for Byte<V> {
+impl Debug for Byte {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -145,6 +193,23 @@ impl<V: std::fmt::Display> Debug for Byte<V> {
 
 #[cfg(debug_assertions)]
 impl std::fmt::Display for Instruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", *self as u8)
+    }
+}
+#[cfg(debug_assertions)]
+impl Debug for ArchivedByte {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?}({:?}) - {}",
+            self.bytecode, self.operands, self.value
+        )
+    }
+}
+
+#[cfg(debug_assertions)]
+impl std::fmt::Display for ArchivedInstruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", *self as u8)
     }

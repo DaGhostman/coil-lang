@@ -1,11 +1,9 @@
-use std::{hash::{Hash, Hasher}};
+use std::hash::{Hash, Hasher};
 
 use common::Value;
 use rustc_hash::FxHasher;
 
-use crate::{
-    garbage::{GcSized}, Coroutine, String
-};
+use crate::{Coroutine, String, garbage::GcSized};
 
 pub fn calculate_hash<V: Hash>(value: &V) -> u64 {
     let mut hash = FxHasher::default();
@@ -50,7 +48,6 @@ impl GcSized for Object {
         }
     }
 }
-
 
 // impl Object {
 //     pub fn inc(&mut self) -> usize {

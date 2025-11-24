@@ -1,6 +1,6 @@
 use std::{collections::HashMap, hash::Hash};
 
-use crate::{likely, promise, ArrayVec, ArrayVecIter};
+use crate::{ArrayVec, ArrayVecIter, likely, promise};
 
 #[derive(Default, Clone)]
 pub struct Interner<T: Default + Eq> {
@@ -38,8 +38,11 @@ impl<T: Default + Hash + Eq + Clone> Interner<T> {
     pub fn iter(&self) -> ArrayVecIter<'_, T, 64> {
         self.storage.iter()
     }
-}
 
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+}
 
 #[cfg(debug_assertions)]
 impl<T: std::fmt::Debug + Default + Eq> std::fmt::Debug for Interner<T> {

@@ -1,15 +1,22 @@
-use std::{borrow::Borrow, collections::HashSet, path::PathBuf};
+use std::{
+    borrow::Borrow,
+    collections::HashSet,
+    fs::File,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
-use common::{Byte, Instruction, Interner, Message, MessageKind, Value};
+use common::{ArchivedByte, Byte, Instruction, Interner, Message, MessageKind, Value};
 use parser::{Expression, ParserBuilder, SimpleSpan};
+use rkyv::{rancor::Error, vec::ArchivedVec};
 
 use crate::Compiler;
 
 pub struct Pipeline<'pipeline> {
     failed: bool,
     cwd: PathBuf,
-    bytecode: Vec<Byte<Value>>,
+    bytecode: Vec<Byte>,
     processed: HashSet<String>,
     compiler: Compiler,
     parser: ParserBuilder<'pipeline>,
@@ -131,13 +138,30 @@ impl<'pipeline> Pipeline<'pipeline> {
         }
     }
 
-    pub fn run(mut self, filename: String) -> Result<Vec<Byte<Value>>, ()> {
+    pub fn compile(mut self, filename: String, output: String) {
         self.process(filename, String::default());
 
-        if let Some(byte) = self.bytecode.first_mut() {
-            *byte =
-                Byte::new_with_operands(Instruction::CALL, [self.compiler.get_function("main"), 0]);
+        if let Some(byte) = self.bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.get_function("main") as u32);
         }
+
+        let mut out = File::create(output).expect("Unable to open output file");
+        out.write(
+            rkyv::to_bytes::<rkyv::rancor::Error>(&self.bytecode)
+                .unwrap()
+                .as_slice(),
+        )
+        .expect("Unable to write compiled output to file");
+    }
+
+    pub fn run(mut self, filename: String) -> Result<Vec<Byte>, ()> {
+        let mut f = File::open(filename).expect("Unable to find file");
+        let mut buffer = Vec::with_capacity(8192);
+        f.read_to_end(&mut buffer).expect("Unable to read file");
+
+        let bytecode = rkyv::access::<ArchivedVec<ArchivedByte>, Error>(&buffer)
+            .expect("Unable to decode rkyv binary");
 
         if self.failed {
             return Err(());

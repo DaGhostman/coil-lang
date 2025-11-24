@@ -122,8 +122,20 @@ impl<'a> Value {
     /// You would need to verify the type externally
     #[inline]
     pub fn raw(&self) -> *mut u8 {
-        self.0 
+        self.0
         // (self.0 as usize >> 3) as _
+    }
+
+    pub fn inc(&mut self) -> &Self {
+        unsafe { self.0 = self.0.add(1) };
+
+        self
+    }
+
+    pub fn dec(&mut self) -> &Self {
+        unsafe { self.0 = self.0.add(1) };
+
+        self
     }
 }
 

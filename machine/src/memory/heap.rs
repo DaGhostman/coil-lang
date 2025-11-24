@@ -5,7 +5,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::garbage::GcSized;
+use crate::garbage::{GcSized, collector::Collector};
 
 pub struct Header(());
 
@@ -239,7 +239,7 @@ impl Allocator {
         }) {
             let chunk = &mut self.chunks[chunk_index];
             let block_index = ((ptr as usize) - chunk.start as usize) / BLOCK_SIZE;
-            for n in block_index..block_index + blocks {
+            for n in block_index..(block_index + blocks) {
                 chunk.free_list[n] = true;
             }
         }
@@ -294,6 +294,29 @@ impl Heap {
             panic!("Unable to allocate heap")
         }
     }
+
+    #[cfg(debug_assertions)]
+    pub fn stats(&self) -> String {
+        let allocator = &self.allocator;
+
+        let mut result = format!("Chunks in use {}", allocator.chunks.len());
+        result = format!(
+            "{}\n Sectors {} and each {}",
+            result, BLOCKS_PER_CHUNK, BLOCK_SIZE
+        );
+        for (idx, chunk) in allocator.chunks.iter().enumerate() {
+            let used = chunk
+                .free_list
+                .iter()
+                .filter(|v| **v == false)
+                .collect::<Vec<&bool>>()
+                .len();
+
+            result = format!("{}\n\t #{} {}/{}", result, idx, used, BLOCKS_PER_CHUNK);
+        }
+
+        result
+    }
 }
 
 impl Heap {
@@ -315,5 +338,34 @@ impl Heap {
         }
 
         Allocated::<T>::new(ptr)
+    }
+
+    pub fn gc(&mut self, stack: &[*mut u8]) {
+        let mut collector = Collector::default();
+
+        let boundaries = &self
+            .allocator
+            .chunks
+            .iter()
+            .map(|c| (c.start, c.end))
+            .collect::<Vec<_>>();
+
+        let mut dead_chunks = vec![];
+
+        for (idx, chunk) in boundaries.iter().enumerate() {
+            let to_free = collector.mark::<BLOCK_SIZE>(&stack, (chunk.0, chunk.1));
+            if to_free.len() == BLOCKS_PER_CHUNK {
+                dead_chunks.push(idx);
+            } else {
+                for block in to_free {
+                    self.allocator.free(block, 1);
+                }
+            }
+        }
+
+        for ch in dead_chunks.iter().rev() {
+            self.allocator.chunks.remove(*ch);
+            self.allocator.cursor = self.allocator.cursor.max(1) - 1;
+        }
     }
 }

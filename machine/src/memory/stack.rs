@@ -66,7 +66,11 @@
 //     }
 // }
 
-use std::ops::{Index, IndexMut};
+use std::{
+    array::IntoIter,
+    ops::{Index, IndexMut},
+    slice::Iter,
+};
 
 use common::promise;
 
@@ -134,23 +138,35 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
         self.stack[self.cursor..self.cursor + slice.len()].copy_from_slice(slice);
         self.cursor += slice.len();
     }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.stack[..self.cursor]
+    }
 }
 
-impl <T: Default + Copy, const N: usize> Index<usize> for Stack<T, N> {
+// impl<T: Default + Copy, const N: usize> IntoIterator for Stack<T, N> {
+//     type Item = T;
+//     type IntoIter = IntoIter<T, N>;
+//
+//     fn into_iter(self) -> Self::IntoIter {
+//         self.stack.into_iter()
+//     }
+// }
+//
+impl<T: Default + Copy, const N: usize> Index<usize> for Stack<T, N> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
         &self.stack[index]
     }
 }
 
-impl <T: Default + Copy, const N: usize> IndexMut<usize> for Stack<T, N> {
+impl<T: Default + Copy, const N: usize> IndexMut<usize> for Stack<T, N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         promise!(index < self.stack.len());
         promise!(index < N);
         &mut self.stack[index]
     }
 }
-
 
 #[cfg(debug_assertions)]
 impl<T: Default + std::fmt::Debug, const N: usize> std::fmt::Debug for Stack<T, N> {

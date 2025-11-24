@@ -521,6 +521,8 @@ impl Typechecker {
 
                 expected.unwrap_or_default()
             }
+            Expression::Inc(_) | Expression::Dec(_) => Type::INTEGER,
+            Expression::Loop { .. } => Type::NONE,
             e => {
                 #[cfg(debug_assertions)]
                 dbg!(e);
