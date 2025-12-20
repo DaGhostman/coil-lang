@@ -6,6 +6,7 @@ use parser::{Expression, SimpleSpan};
 pub struct Typechecker {
     functions: HashMap<String, (Vec<Type>, Type)>,
     variables: HashMap<String, (Type, std::ops::Range<usize>)>,
+    classes: HashMap<String, Vec<(String, Type)>>,
 
     stack: Vec<Type>,
 
@@ -18,6 +19,7 @@ impl Default for Typechecker {
         Self {
             functions: HashMap::with_capacity(16),
             variables: HashMap::with_capacity(16),
+            classes: HashMap::with_capacity(16),
             stack: Vec::with_capacity(16),
             messages: Vec::with_capacity(16),
         }
@@ -261,6 +263,23 @@ impl Typechecker {
 
                 expected.unwrap_or_default()
             }
+            Expression::Class(name, state) => {
+                self.classes.insert(
+                    name.to_string(),
+                    state
+                        .iter()
+                        .map(|v| match v.1.borrow() {
+                            Expression::Field(n, t) => (
+                                self.resolve_variable(&n),
+                                Type::from(self.resolve_variable(&t)),
+                            ),
+                            _ => unreachable!("Class definition does not contain only fields"),
+                        })
+                        .collect::<Vec<_>>(),
+                );
+
+                Type::default()
+            }
             Expression::Statement(expr)
             | Expression::ExprStatement(expr)
             | Expression::Expr(expr)
@@ -343,7 +362,7 @@ impl Typechecker {
                     Type::default()
                 }
             }
-            Expression::Instantiate(class) => self.check(class),
+            Expression::Instantiate(class, _args) => self.check(class),
             Expression::Negate(lhs) | Expression::Positive(lhs) => {
                 let ty = self.check(lhs);
 
@@ -429,7 +448,6 @@ impl Typechecker {
                     Type::BOOLEAN
                 }
             }
-
             Expression::Branch(condition, body) => {
                 if let Some(condition) = condition {
                     let expr = self.check(condition);

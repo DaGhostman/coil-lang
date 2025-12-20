@@ -125,6 +125,7 @@ impl<'pipeline> Pipeline<'pipeline> {
 
         match self.parser.parse(src.as_str()) {
             Ok(ast) => {
+                dbg!(&ast);
                 self.visit(&ast);
                 let bytecode = self.compiler.compile(ns.as_str(), &ast);
 
@@ -157,10 +158,10 @@ impl<'pipeline> Pipeline<'pipeline> {
 
     pub fn run(mut self, filename: String) -> Result<Vec<Byte>, ()> {
         let mut f = File::open(filename).expect("Unable to find file");
-        let mut buffer = Vec::with_capacity(8192);
+        let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");
 
-        let bytecode = rkyv::access::<ArchivedVec<ArchivedByte>, Error>(&buffer)
+        let _ = rkyv::access::<ArchivedVec<ArchivedByte>, Error>(&buffer)
             .expect("Unable to decode rkyv binary");
 
         if self.failed {

@@ -2,6 +2,8 @@ use std::fmt::Debug;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+use crate::Value;
+
 #[repr(u8)]
 #[derive(Debug, Default, Copy, Clone, Archive, Serialize, Deserialize)]
 #[rkyv(compare(PartialEq), derive(Debug), derive(Clone), derive(Copy))]
@@ -33,8 +35,6 @@ pub enum Instruction {
     MUL,
     DIV,
     MOD,
-    // INC,
-    // DEC,
     ADDF,
     SUBF,
     MULF,
@@ -58,9 +58,8 @@ pub enum Instruction {
     FORMAT,
     STRINGIFY,
     NATIVE,
-    RESUME,
-    SUSP,
-    FREE,
+    INIT,
+    SET,
 }
 
 impl From<u8> for Instruction {
@@ -149,6 +148,37 @@ impl Byte {
 }
 
 impl ArchivedByte {
+    pub fn new(bytecode: ArchivedInstruction) -> Self {
+        Self {
+            bytecode,
+            operands: Default::default(),
+            value: 0.into(),
+        }
+    }
+
+    pub fn with_operand_u32(mut self, operand: u32) -> Self {
+        self.operands = operand.into();
+
+        self
+    }
+
+    pub fn with_value(mut self, value: Value) -> Self {
+        self.value = (value.raw() as u64).into();
+
+        self
+    }
+
+    pub fn with_operands_u16(mut self, operands: [u16; 2]) -> Self {
+        let mut operand: u32 = 0;
+        operand ^= operands[0] as u32;
+        operand <<= 16;
+        operand ^= operands[1] as u32;
+
+        self.operands = operand.into();
+
+        self
+    }
+
     pub fn bytecode(&self) -> &ArchivedInstruction {
         &self.bytecode
     }

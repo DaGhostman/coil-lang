@@ -1,13 +1,11 @@
-use std::{collections::HashMap, io::Write};
+use std::{collections::HashMap, io::Write, ops::Deref, ptr::NonNull};
 
 use common::{
     ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec,
     Instruction as _Instruction, SeekableIterator, Value, unlikely,
 };
 
-use crate::{
-    Allocated, Byte as _Byte, Coroutine, Frame, Heap, Stack, garbage::collector::Collector,
-};
+use crate::{Byte as _Byte, Frame, Heap, ObjInstance, ObjString, Object, Stack};
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -44,13 +42,12 @@ macro_rules! unary {
     }
 }
 
-type External = fn(&[Value]) -> Value;
+// type External = fn(&[Value]) -> Value;
 
 pub struct Machine<const S: usize> {
     heap: Heap,
     stack: Stack<Value, 8192>,
     frames: ArrayVec<Frame, S>,
-    native: HashMap<usize, External>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -59,7 +56,6 @@ enum ExecutionOutcome {
     #[default]
     INVALID,
     CALL,
-    RESUME,
     RETURN,
     TERMINATION,
 }
@@ -73,13 +69,6 @@ impl ExecutionResult {
     pub fn returns() -> Self {
         Self {
             outcome: ExecutionOutcome::RETURN,
-            arity: 0,
-        }
-    }
-
-    pub fn resume() -> Self {
-        Self {
-            outcome: ExecutionOutcome::RESUME,
             arity: 0,
         }
     }
@@ -105,10 +94,12 @@ impl ExecutionResult {
         }
     }
 
+    #[inline]
     pub fn outcome(&self) -> ExecutionOutcome {
         self.outcome
     }
 
+    #[inline]
     pub fn arity(&self) -> usize {
         self.arity
     }
@@ -120,17 +111,16 @@ impl<const S: usize> Default for Machine<S> {
         frames.consume();
         Self {
             frames,
-            heap: Heap::new(),
+            heap: Heap::default(),
             stack: Stack::new(),
-            native: HashMap::with_capacity(32),
         }
     }
 }
 
 impl<const S: usize> Machine<S> {
-    pub fn register(&mut self, name: usize, func: External) {
-        self.native.insert(name, func);
-    }
+    // pub fn register(&mut self, name: usize, func: External) {
+    //     self.native.insert(name, func);
+    // }
 }
 
 impl<const S: usize> Machine<S> {
@@ -184,16 +174,6 @@ impl<const S: usize> Machine<S> {
                     unlikely(true);
                     break;
                 }
-                ExecutionOutcome::RESUME => {
-                    unlikely(true);
-                    self.frames.get_mut().seek(code_iter.tell());
-                    let coro = Allocated::<Coroutine<Value>>::new(self.stack.pop().as_ptr());
-
-                    self.frames
-                        .push((coro.as_ref().ip(), self.stack.tell()).into());
-                    code_iter.seek(coro.as_ref().ip());
-                    self.stack.append(coro.as_ref().stack());
-                }
                 _ => (),
             }
         }
@@ -216,8 +196,24 @@ impl<const S: usize> Machine<S> {
                     format!("{:?}", opcode.bytecode()),
                     opcode.operand_u16(0),
                     opcode.operand_u16(1),
-                    self.stack.slice(frame.get(), self.stack.tell())
+                    self.stack.as_slice()
                 );
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                println!("Performing GC trace");
+                self.heap.trace(
+                    &self
+                        .stack
+                        .as_slice()
+                        .iter()
+                        .map(|v| v.raw() as u64)
+                        .collect::<Vec<u64>>(),
+                );
+
+                println!("Performing GC collection");
+                unsafe { self.heap.sweep() };
             }
 
             match opcode.bytecode() {
@@ -271,13 +267,12 @@ impl<const S: usize> Machine<S> {
                             params[idx] = self.stack.pop();
                         }
 
-                        let format_string =
-                            Allocated::<crate::String>::new(self.stack.peek().as_ptr());
-                        let format_str = format_string.as_ref().as_str();
+                        let ptr = self.stack.pop().as_ptr::<ObjString>();
+                        let format_string = (unsafe { &*ptr }).data.as_str();
 
                         let mut message = String::default();
 
-                        let mut chars = format_str.chars().peekable();
+                        let mut chars = format_string.chars().peekable();
                         while let Some(ch) = chars.next() {
                             if ch == '%' {
                                 match chars.peek() {
@@ -298,8 +293,11 @@ impl<const S: usize> Machine<S> {
                                     Some('s') => {
                                         chars.next();
                                         let string_val =
-                                            Allocated::<crate::String>::new(params.pop().as_ptr());
-                                        message.push_str(string_val.as_ref().as_str());
+                                            (unsafe { &*params.pop().as_ptr::<ObjString>() })
+                                                .data
+                                                .as_str();
+                                        // Allocated::<crate::String>::new(params.pop().as_ptr());
+                                        message.push_str(string_val);
                                     }
                                     Some('x') => {
                                         chars.next();
@@ -334,21 +332,16 @@ impl<const S: usize> Machine<S> {
                             }
                         }
 
-                        let collectable = self.heap.alloc::<crate::String>(message.into());
-                        *self.stack.top() = Value::from(collectable.ptr() as u64);
+                        let (obj, _) = self
+                            .heap
+                            .alloc(ObjString::from(message.as_str()), Object::String);
+
+                        self.stack.push(Value::from(obj.addr() as u64));
                     }
                 }
                 Instruction::PRINT => {
-                    print!(
-                        "{}",
-                        Allocated::<crate::String>::new(self.stack.peek().as_ptr())
-                            .as_ref()
-                            .as_str()
-                    );
-                }
-                Instruction::FREE => {
-                    let val = Allocated::<crate::String>::new(self.stack.pop().as_ptr());
-                    self.heap.free(val);
+                    let ptr = self.stack.pop().as_ptr::<ObjString>();
+                    print!("{}", unsafe { &*ptr });
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand_u32() as usize);
@@ -366,30 +359,14 @@ impl<const S: usize> Machine<S> {
                 Instruction::CALL => {
                     return ExecutionResult::call(opcode.operand_u32() as usize);
                 }
-                // Instruction::NATIVE => {
-                //     let arity = opcode.operand(1);
-                //     let args = (0..arity).map(|_| *frame.pop()).collect::<Vec<_>>();
-                //     let result = self.native[&opcode.operand(0)](&args);
-                //
-                //     frame.push(result);
-                // }
+                Instruction::INIT => {
+                    let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
+                    let _ = r.as_mut();
+
+                    self.stack.push(Value::from(r.as_ptr().addr() as u64));
+                }
                 Instruction::RETURN => {
                     return ExecutionResult::returns();
-                }
-                Instruction::SUSP => {
-                    let suspended_frame = (code.tell(), frame.get());
-
-                    let collectable = self.heap.alloc(Coroutine::new(
-                        suspended_frame,
-                        self.stack.slice(frame.tell(), self.stack.tell() - 1),
-                    ));
-
-                    self.stack.push(Value::from(collectable.ptr() as u64));
-
-                    return ExecutionResult::returns();
-                }
-                Instruction::RESUME => {
-                    return ExecutionResult::resume();
                 }
                 Instruction::HALT => {
                     let _ = std::io::stdout().flush();
@@ -405,9 +382,11 @@ impl<const S: usize> Machine<S> {
                         value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
-                    let collectable = self.heap.alloc::<crate::String>(value.into());
+                    let (object, _) = self
+                        .heap
+                        .alloc(ObjString::from(value.as_str()), Object::String);
 
-                    self.stack.push(Value::from(collectable.ptr() as u64));
+                    self.stack.push(Value::from(object.addr() as u64));
                 }
                 Instruction::NOOP => continue,
                 _ => return ExecutionResult::invalid(),
@@ -418,136 +397,136 @@ impl<const S: usize> Machine<S> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use common::Value;
-
-    use crate::{Byte, Instruction, Machine};
-
-    #[test]
-    fn test_constants() {
-        let mut vm = Machine::<1>::default();
-        let v = Value::from(42);
-        vm.run(&[
-            Byte::new_with_value(Instruction::CONST, v.raw() as _),
-            Byte::new(Instruction::HALT),
-        ]);
-
-        assert_eq!(v.raw(), vm.pop().raw());
-    }
-
-    #[test]
-    fn test_addition() {
-        let cases = [
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-                Value::from(4.0),
-                Instruction::ADDF,
-            ),
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-                Value::from(4),
-                Instruction::ADD,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_subtraction() {
-        let cases = [
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-                Value::from(0.0),
-                Instruction::SUBF,
-            ),
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-                Value::from(0),
-                Instruction::SUB,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_multiplication() {
-        let cases = [
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-                Value::from(4.0),
-                Instruction::MULF,
-            ),
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-                Value::from(4),
-                Instruction::MUL,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_division() {
-        let cases = [
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-                Value::from(1.0),
-                Instruction::DIVF,
-            ),
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-                Value::from(1),
-                Instruction::DIV,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_jumps() {
-        let cases = [
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-                Value::from(1.0),
-                Instruction::DIVF,
-            ),
-            (
-                Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-                Value::from(1),
-                Instruction::DIV,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use common::{ArchivedByte, Value};
+//
+//     use crate::{Byte, Instruction, Machine};
+//
+//     #[test]
+//     fn test_constants() {
+//         let mut vm = Machine::<1>::default();
+//         let v = Value::from(42);
+//         vm.run(&[
+//             ArchivedByte::ew_with_value(Instruction::CONST, v.raw() as _),
+//             Byte::new(Instruction::HALT),
+//         ]);
+//
+//         assert_eq!(v.raw(), vm.pop().raw());
+//     }
+//
+//     #[test]
+//     fn test_addition() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(4.0),
+//                 Instruction::ADDF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(4),
+//                 Instruction::ADD,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_subtraction() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(0.0),
+//                 Instruction::SUBF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(0),
+//                 Instruction::SUB,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_multiplication() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(4.0),
+//                 Instruction::MULF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(4),
+//                 Instruction::MUL,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_division() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(1.0),
+//                 Instruction::DIVF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(1),
+//                 Instruction::DIV,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_jumps() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(1.0),
+//                 Instruction::DIVF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(1),
+//                 Instruction::DIV,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+// }

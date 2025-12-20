@@ -1,0 +1,7 @@
+use foo::sadge;
+
+fn main() {
+    sadge();
+
+    print "%x\n", 69;
+}

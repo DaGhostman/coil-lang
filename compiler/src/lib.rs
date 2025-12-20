@@ -29,10 +29,14 @@ macro_rules! binary {
 struct Context {
     current: Option<String>,
     variables: Interner<String>,
+    symbols: Interner<String>,
     assignments: HashMap<String, bool>,
     ref_counts: HashMap<usize, usize>,
     constants: HashMap<usize, bool>,
     defers: Vec<(usize, usize, Vec<Byte>)>,
+    classes: HashMap<String, Vec<(String, usize)>>,
+    impementations: HashMap<String, String>,
+    methods: HashMap<String, HashMap<String, String>>,
 
     prev: Option<Box<Self>>,
 }
@@ -79,11 +83,15 @@ impl<'ctx> Context {
     fn child(&self) -> Self {
         Self {
             current: self.current.clone(),
+            impementations: self.impementations.clone(),
+            methods: self.methods.clone(),
             defers: Vec::default(),
             ref_counts: self.ref_counts.clone(),
             constants: self.constants.clone(),
             assignments: self.assignments.clone(),
             variables: self.variables.clone(),
+            symbols: self.symbols.clone(),
+            classes: self.classes.clone(),
             prev: Some(Box::new(self.to_owned())),
         }
     }
@@ -154,9 +162,7 @@ impl Compiler {
                     format!("{}{}", prefix.join("::"), name.to_string()),
                 );
             }
-            Expression::Noop(child) => {
-                dbg!(&child);
-            }
+            Expression::Noop(_) => (),
             Expression::Program(children) | Expression::Fragment(children) => {
                 for child in children {
                     bytecode.append(&mut self.do_compile(child));
@@ -193,13 +199,6 @@ impl Compiler {
                     self.bytecode.append(&mut c);
                 }
 
-                // for (idx, var) in self.context.variables.iter().enumerate() {
-                //     if let Some(Type::OBJECT(_)) = self.typechecker.get_variable_type(var) {
-                //         self.bytecode
-                //             .push(Byte::new_with_operands(Instruction::RELEASE, [idx, 0]));
-                //     }
-                // }
-
                 for (offset, arity, x) in self.context.defers.iter() {
                     self.bytecode.append(&mut x.clone());
                     self.bytecode
@@ -207,18 +206,6 @@ impl Compiler {
                     self.bytecode
                         .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
                 }
-
-                // for variable in self.context.variables.iter() {
-                //     if let (Some(symbol), Some(ty)) = (
-                //         self.context.variables.key(variable),
-                //         self.typechecker.get_variable_type(variable),
-                //     ) && matches!(ty, Type::OBJECT(_) | Type::STRING)
-                //     {
-                //         self.bytecode
-                //             .push(Byte::new_with_operands(Instruction::LOAD, [symbol, 0]));
-                //         self.bytecode.push(Byte::new(Instruction::FREE));
-                //     }
-                // }
 
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
@@ -260,7 +247,6 @@ impl Compiler {
                 }
                 bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
                 bytecode.push(Byte::new(Instruction::PRINT));
-                bytecode.push(Byte::new(Instruction::FREE));
             }
             Expression::Format(format, params) => {
                 bytecode.append(&mut self.do_compile(format));
@@ -317,9 +303,65 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::RETURN));
                 }
             }
-            Expression::Yield(child) => {
-                bytecode.append(&mut self.do_compile(child));
-                bytecode.push(Byte::new(Instruction::SUSP));
+            Expression::Class(name, state) => {
+                self.context.classes.insert(
+                    name.to_string(),
+                    state
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, v)| match v.1.borrow() {
+                            Expression::Field(n, _) => (self.resolve_variable(&n), idx),
+                            _ => unreachable!(
+                                "The should be only fields inside of a class definition"
+                            ),
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                self.context.symbols.intern(name.to_string());
+            }
+            Expression::Implementation(what, owner, methods) => {
+                let namespace = self.namespace.clone();
+                let functions = self.functions.clone();
+
+                self.namespace.push_str(what);
+
+                for func in methods {
+                    self.functions.drain();
+                    self.do_compile(func);
+
+                    for (method, _) in self.functions.iter() {
+                        self.context
+                            .methods
+                            .entry(owner.to_string())
+                            .and_modify(|e| {
+                                e.insert(what.to_string(), method.clone());
+                            })
+                            .or_insert_with(|| {
+                                let mut h = HashMap::default();
+                                h.insert(what.to_string(), method.clone());
+                                h
+                            });
+                    }
+                }
+
+                self.context
+                    .impementations
+                    .insert(what.to_string(), owner.to_string());
+
+                self.namespace = namespace;
+                self.functions = functions;
+            }
+            Expression::Instantiate(class, args) => {
+                let name = self.resolve_variable(&class);
+                bytecode.push(
+                    Byte::new(Instruction::INIT)
+                        .with_operand_u32(self.context.classes[&name].len() as u32),
+                );
+                // bytecode.push(Byte::new(Instruction::SET).with_operand_u32(operand);
+                // let s = self;
+                // self.functions.get(k);
+
+                // bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(0));
             }
             Expression::Inc(var) => {
                 let name = self.resolve_variable(var);
@@ -346,17 +388,6 @@ impl Compiler {
                     .with_operand_u32((self.bytecode.len() + len) as u32);
 
                 self.bytecode.append(&mut loop_);
-            }
-            Expression::Resume(expr, arg) => {
-                if arg.is_some() {
-                    arg.as_ref()
-                        .map(|a| self.do_compile(&a))
-                        .map(|mut a| self.bytecode.append(&mut a))
-                        .unwrap();
-                }
-                bytecode.append(&mut self.do_compile(expr));
-                bytecode
-                    .push(Byte::new(Instruction::RESUME).with_operand_u32(arg.is_some() as u32));
             }
             Expression::Defer(deps, child) => {
                 let mut body = vec![Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)];
@@ -523,7 +554,7 @@ impl Compiler {
                         Instruction::LEF
                     } else {
                         Instruction::LE
-                    },)
+                    })
                 );
 
                 bytecode.push(Byte::new(Instruction::NOT))
@@ -544,9 +575,9 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                        Instruction::ADD
-                    } else {
                         Instruction::ADDF
+                    } else {
+                        Instruction::ADD
                     },)
                 );
             }
@@ -691,15 +722,6 @@ impl Compiler {
             }
             Expression::Assignment(name, value) => {
                 let name = self.resolve_variable(name);
-
-                if self.context.assignments.contains_key(&name) {
-                    if !matches!(
-                        _type,
-                        Type::BOOLEAN | Type::INTEGER | Type::FLOAT | Type::NONE
-                    ) {
-                        bytecode.push(Byte::new(Instruction::FREE));
-                    }
-                }
 
                 self.context.assignments.insert(name.clone(), true);
 

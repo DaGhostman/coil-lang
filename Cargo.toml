@@ -28,7 +28,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 # strip = true
-debug = 1
+# debug = 1
 
 [profile.branch_misses]
 inherits="release"

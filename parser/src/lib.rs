@@ -2,6 +2,10 @@ use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::num::{ParseFloatError, ParseIntError};
 
+mod pratt;
+
+pub use pratt::*;
+
 use chumsky::prelude::*;
 use chumsky::{
     IterParser, Parser,
@@ -96,9 +100,15 @@ pub enum Expression<'expr> {
     Variable(Output<'expr>, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
 
+    Implementation(&'expr str, &'expr str, Vec<Output<'expr>>),
+    Class(&'expr str, Vec<Output<'expr>>),
+    Field(Output<'expr>, Output<'expr>),
+    Method(bool, Output<'expr>),
     Member(Output<'expr>),
+    Access(&'expr str),
+    Update(&'expr str, Output<'expr>),
 
-    Instantiate(Output<'expr>),
+    Instantiate(Output<'expr>, Option<Vec<Output<'expr>>>),
 }
 
 impl PartialOrd for Expression<'_> {
@@ -149,29 +159,29 @@ macro_rules! binary_op {
 macro_rules! foldable {
     ($variant: ident, $op: tt) => {
         |lhs: Output<'_>, rhs: Output<'_>| -> Expression<'_> {
-            if let Some(output) = binary_op!(
-                constant_fold(lhs.1.borrow()),
-                constant_fold(rhs.1.borrow()),
-                $op
-            ) {
-                output
-            } else {
-                Expression::$variant(lhs, rhs)
-            }
+            // if let Some(output) = binary_op!(
+            //     lhs.1.borrow(),
+            //     rhs.1.borrow()),
+            //     $op
+            // ) {
+            //     output
+            // } else {
+            Expression::$variant(lhs, rhs)
+            // }
         } as fn(_, _) -> _
     };
     ($variant: ident, $op: tt, $output: ident) => {
         |lhs: Output<'_>, rhs: Output<'_>| -> Expression<'_> {
-            if let Some(output) = binary_op!(
-                constant_fold(lhs.1.borrow()),
-                constant_fold(rhs.1.borrow()),
-                $op,
-                $output
-            ) {
-                output
-            } else {
-                Expression::$variant(lhs, rhs)
-            }
+            // if let Some(output) = binary_op!(
+            //     lhs.1.borrow(),
+            //     rhs.1.borrow(),
+            //     $op,
+            //     $output
+            // ) {
+            //     output
+            // } else {
+            Expression::$variant(lhs, rhs)
+            // }
         } as fn(_, _) -> _
     };
 }
@@ -380,6 +390,14 @@ impl<'parser> ParserBuilder<'parser> {
         self.ident().then_ignore(just("++")).map_with(output!(Inc))
     }
 
+    fn dec(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Copy
+    + 'parser {
+        self.ident().then_ignore(just("--")).map_with(output!(Dec))
+    }
+
     fn expression(
         &self,
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
@@ -491,8 +509,10 @@ impl<'parser> ParserBuilder<'parser> {
 
             let init = text::keyword("new")
                 .padded()
-                .ignore_then(self.ident().then_ignore(op!(';').or_not()))
-                .map_with(output!(Instantiate));
+                .ignore_then(self.ident().then(self.params(expr.clone())))
+                .map_with(|(name, args), e| {
+                    (e.span(), Box::new(Expression::Instantiate(name, args)))
+                });
 
             let call = atom
                 .clone()
@@ -540,29 +560,46 @@ impl<'parser> ParserBuilder<'parser> {
                 .then(expr.clone().delimited_by(op!('('), op!(')')).or_not())
                 .map_with(|(expr, arg), e| (e.span(), Box::new(Expression::Resume(expr, arg))));
 
-            let unary = match_
-                .or(yield_)
-                .or(resume)
-                .or(init)
-                .or(call)
-                .or(member)
-                .or(assignment)
-                .or(negate)
-                .or(not)
-                .or(positive);
+            let unary = negate.or(not).or(positive);
+            // match_
+            // .or(negate)
+            // .or(not)
+            // .or(positive)
+            // More expr
+            // ;
 
-            let binary = unary.clone().foldl_with(
+            let sum = unary.clone().foldl_with(
                 choice((
-                    op!("^").or(op!("xor")).to(Expression::Xor as fn(_, _) -> _),
-                    op!("&").or(op!("and")).to(Expression::And as fn(_, _) -> _),
-                    op!("|").or(op!("or")).to(Expression::Or as fn(_, _) -> _),
+                    op!('+').to(foldable!(Add, +)),
+                    op!('-').to(foldable!(Sub, -)),
                 ))
                 .then(expr.clone())
                 .repeated(),
                 |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
             );
 
-            let comparison = binary.clone().foldl_with(
+            let product = sum.clone().foldl_with(
+                choice((
+                    op!('*').to(foldable!(Mul, *)),
+                    op!('/').to(foldable!(Div, /)),
+                    op!('%').to(foldable!(Mod, %)),
+                ))
+                .then(expr.clone())
+                .repeated(),
+                |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+            );
+
+            let shift = product.clone().foldl_with(
+                choice((
+                    op!("<<").to(Expression::Shl as fn(_, _) -> _),
+                    op!(">>").to(Expression::Shr as fn(_, _) -> _),
+                ))
+                .then(expr.clone())
+                .repeated(),
+                |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
+            );
+
+            let comparison = shift.clone().foldl_with(
                 choice((
                     op!(">=").to(foldable!(Geq, >=, Bool)),
                     op!("<=").to(foldable!(Leq, <=, Bool)),
@@ -576,10 +613,11 @@ impl<'parser> ParserBuilder<'parser> {
                 |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
             );
 
-            let shift = comparison.clone().foldl_with(
+            let binary = comparison.clone().foldl_with(
                 choice((
-                    op!("<<").to(Expression::Shl as fn(_, _) -> _),
-                    op!(">>").to(Expression::Shr as fn(_, _) -> _),
+                    op!("^").or(op!("xor")).to(Expression::Xor as fn(_, _) -> _),
+                    op!("&").or(op!("and")).to(Expression::And as fn(_, _) -> _),
+                    op!("|").or(op!("or")).to(Expression::Or as fn(_, _) -> _),
                 ))
                 .then(expr.clone())
                 .repeated(),
@@ -587,31 +625,21 @@ impl<'parser> ParserBuilder<'parser> {
             );
 
             //
-            let product = shift.clone().foldl_with(
-                choice((
-                    op!('*').to(foldable!(Mul, *)),
-                    op!('/').to(foldable!(Div, /)),
-                    op!('%').to(foldable!(Mod, %)),
-                ))
-                .then(expr.clone())
-                .repeated(),
-                |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
-            );
-
-            let sum = product.clone().foldl_with(
-                choice((
-                    op!('+').to(foldable!(Add, +)),
-                    op!('-').to(foldable!(Sub, -)),
-                ))
-                .then(expr.clone())
-                .repeated(),
-                |lhs, (op, rhs), e| (e.span(), Box::new(op(lhs, rhs))),
-            );
-
+            //
             // @TODO: Investigate complex pattern mattching, for now use it as glorified `if`
             // assignment
             // .or(member)
-            str.or(self.inc()).or(sum).or(list).or(atom)
+            str.or(init)
+                .or(call)
+                .or(member)
+                // .or(assignment)
+                .or(binary)
+                .or(self.inc())
+                .or(self.dec())
+                // .or(binary)
+                .or(self.dot(expr.clone()))
+                .or(list)
+                .or(atom)
         })
         .map_with(|value, e| (e.span(), Box::new(Expression::Expr(value))))
         .labelled("expression")
@@ -865,6 +893,114 @@ impl<'parser> ParserBuilder<'parser> {
             .delimited_by(op!('('), op!(')'))
     }
 
+    fn dot<
+        T: Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+            + Clone
+            + 'parser,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        let access = self
+            .ident()
+            .then_ignore(op!("."))
+            .then(text::ident().padded().map_with(output!(Access)))
+            .map_with(|(member, a), e| (e.span(), Box::new(Expression::Fragment(vec![member, a]))));
+
+        let update = op!(".")
+            .ignore_then(text::ident().padded())
+            .then_ignore(op!('='))
+            .then(expr)
+            .map_with(|(member, value), e| {
+                dbg!(member, &value);
+                (
+                    e.span(),
+                    Box::new(Expression::Fragment(vec![
+                        (e.span(), Box::new(Expression::Identifier(member))),
+                        value,
+                    ])),
+                )
+            });
+
+        choice((access, update))
+
+        // access.or(update)
+    }
+
+    fn class(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        let field = self.ident().then_ignore(op!(":")).then(self.type_());
+
+        text::keyword("class")
+            .padded()
+            .ignore_then(text::ident())
+            .then(
+                field
+                    .map_with(|(name, type_), e| {
+                        (e.span(), Box::new(Expression::Field(name, type_)))
+                    })
+                    .separated_by(op!(',').or_not())
+                    .at_least(0)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('{'), op!('}'))
+                    .or_not(),
+            )
+            .map_with(|(name, state), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Class(name, state.unwrap_or(vec![]))),
+                )
+            })
+    }
+
+    fn impl_(
+        &self,
+    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    + Clone
+    + 'parser {
+        text::keyword("impl")
+            .padded()
+            .ignore_then(text::ident().padded())
+            .then(
+                text::keyword("for")
+                    .padded()
+                    .ignored()
+                    .then(text::ident().padded())
+                    .or_not(),
+            )
+            .then(
+                text::keyword("pub")
+                    .padded()
+                    .or_not()
+                    .then(self.func())
+                    .map_with(|(visibility, func), e| {
+                        (
+                            e.span(),
+                            Box::new(Expression::Method(visibility.is_some(), func)),
+                        )
+                    })
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|((interface, owner), functions), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Implementation(
+                        interface,
+                        owner.map(|(_, owner)| owner).unwrap_or(interface),
+                        functions,
+                    )),
+                )
+            })
+    }
+
     fn func(
         &self,
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
@@ -971,6 +1107,8 @@ impl<'parser> ParserBuilder<'parser> {
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>> + 'parser
     {
         self.func()
+            .or(self.impl_())
+            .or(self.class())
             .or(self.use_())
             .or(self.comment(self.expression()))
             .repeated()

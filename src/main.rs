@@ -1,7 +1,6 @@
 use std::io::Read;
 
 use common::ArchivedByte;
-use common::{Byte, Instruction, Value};
 use compiler::Pipeline;
 use machine::Machine;
 use rkyv::{rancor::Error, vec::ArchivedVec};
@@ -17,11 +16,11 @@ fn main() {
     }
 
     let mut f = std::fs::File::open("out.c0s").expect("Unable to find file");
-    let mut buffer = Vec::with_capacity(8192);
+    let mut buffer = Vec::with_capacity(1024);
     f.read_to_end(&mut buffer).expect("Unable to read file");
 
     let bytecode = rkyv::access::<ArchivedVec<ArchivedByte>, Error>(&buffer)
         .expect("Unable to decode rkyv binary");
 
-    Machine::<128>::default().run(bytecode.as_slice());
+    Machine::<64>::default().run(bytecode.as_slice());
 }

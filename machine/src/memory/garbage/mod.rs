@@ -1,13 +1,10 @@
-// mod collectable;
-// mod gc;
-pub mod collector;
-mod rc;
+// pub mod collectable;
+// pub mod gc;
+// mod rc;
 
 use std::cell::Cell;
 
 // pub use collectable::*;
-// pub use gc::*;
-pub use rc::*;
 
 pub trait GcSized {
     fn size(&self) -> usize;

@@ -4,21 +4,19 @@ use std::{
     ptr::NonNull,
 };
 
-
-use crate::{garbage::{GcSized, Rc}, };
-
+use crate::garbage::{GcSized, gc::Gc};
 
 #[derive(Debug)]
-pub struct Collectable<T>(NonNull<Rc<T>>);
+pub struct Collectable<T>(NonNull<Gc<T>>);
 
-impl<T> From<NonNull<Rc<T>>> for Collectable<T> {
-    fn from(value: NonNull<Rc<T>>) -> Self {
+impl<T> From<NonNull<Gc<T>>> for Collectable<T> {
+    fn from(value: NonNull<Gc<T>>) -> Self {
         Self(value)
     }
 }
 
 impl<T> Collectable<T> {
-    pub fn new(boxed: Box<Rc<T>>) -> Self {
+    pub fn new(boxed: Box<Gc<T>>) -> Self {
         Self(NonNull::from(Box::leak(boxed)))
     }
 
@@ -30,7 +28,7 @@ impl<T> Collectable<T> {
         lhs.0.eq(&rhs.0)
     }
 
-    pub fn ptr(&self) -> NonNull<Rc<T>> {
+    pub fn ptr(&self) -> NonNull<Gc<T>> {
         self.0
     }
 }
@@ -42,7 +40,7 @@ impl<T: GcSized> GcSized for Collectable<T> {
 }
 
 impl<T> Deref for Collectable<T> {
-    type Target = Rc<T>;
+    type Target = Gc<T>;
 
     fn deref(&self) -> &Self::Target {
         unsafe { self.0.as_ref() }

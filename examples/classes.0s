@@ -1,0 +1,17 @@
+class Foo {
+    name: String,
+}
+
+impl Foo {
+    fn sadge() -> int {
+        return 42;
+    }
+}
+
+fn main() {
+    print "%i", (2 * 2 + 3);
+    let x = new Foo();
+    // x.name = "foo";
+
+    // print "%u - %u\n", x, x.name;
+}

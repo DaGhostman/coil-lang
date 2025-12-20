@@ -1,0 +1,15 @@
+async fn coro() {
+    print "Suspended\n";
+    yield 1;
+    print "Resumed\n";
+}
+
+fn main() {
+    let x = coro();
+
+    x = resume x;
+
+    print "%u", x;
+
+    x;
+}
