@@ -9,7 +9,7 @@ use chumsky::{
     error::Rich,
     extra,
     pratt::{infix, left, postfix, prefix, right},
-    prelude::{choice, just, recursive},
+    prelude::{choice, empty, just, none_of, recursive},
     select_ref, text,
 };
 
@@ -39,6 +39,12 @@ macro_rules! op {
     };
 }
 
+macro_rules! keyword {
+    ($word: literal) => {
+        text::keyword($word).padded()
+    };
+}
+
 macro_rules! output {
     ($kind: tt) => {
         |v, e| (e.span(), Box::new(Expression::$kind(v)))
@@ -50,13 +56,14 @@ macro_rules! output {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression<'expr> {
-    Noop(&'expr Expression<'expr>),
+    Noop,
     Integer(i64),
     Float(f64),
     String(&'expr str),
     Bool(bool),
     Module(String, Output<'expr>),
 
+    Argument(&'expr str, &'expr str),
     Identifier(&'expr str),
     Type(&'expr str),
     Comment(&'expr str),
@@ -100,7 +107,7 @@ pub enum Expression<'expr> {
     Fragment(Vec<Output<'expr>>),
     Block(Vec<Output<'expr>>),
     Program(Vec<Output<'expr>>),
-    Defer(Vec<Output<'expr>>, Output<'expr>),
+    Defer(Output<'expr>),
 
     Assignment(Output<'expr>, Output<'expr>),
 
@@ -112,9 +119,9 @@ pub enum Expression<'expr> {
 
     Function {
         name: &'expr str,
-        args: Vec<Output<'expr>>,
-        returns: Option<Output<'expr>>,
-        body: Vec<Output<'expr>>,
+        args: Output<'expr>,
+        returns: Option<&'expr str>,
+        body: Output<'expr>,
     },
 
     Branch(Option<Output<'expr>>, Output<'expr>),
@@ -123,7 +130,7 @@ pub enum Expression<'expr> {
 
     Call {
         name: Output<'expr>,
-        args: Vec<Output<'expr>>,
+        args: Option<Vec<Output<'expr>>>,
     },
 
     Loop {
@@ -192,6 +199,16 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(output!(Float))
     }
 
+    fn string(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        just('"')
+            .ignore_then(none_of('"').repeated().to_slice())
+            .then_ignore(just('"'))
+            .map_with(output!(String))
+            .labelled("string")
+    }
     fn ident(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -205,12 +222,16 @@ impl<'pratt> Pratt<'pratt> {
     {
         recursive(|expr| {
             let atom = choice((
+                self.call(expr.clone()),
                 self.int(),
                 self.float(),
                 self.ident(),
-                op!("true")
+                self.string(),
+                keyword!("true")
+                    .labelled("boolean")
                     .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true")))),
-                op!("false")
+                keyword!("false")
+                    .labelled("boolean")
                     .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true")))),
             ));
 
@@ -316,16 +337,27 @@ impl<'pratt> Pratt<'pratt> {
                 infix(left(Precedence::Term as u16), op!('+'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Add(lhs, rhs)))
                 }),
-                postfix(Precedence::None as u16, self.inc(), |_, rhs, e| {
-                    // @TODO handle precedence of
-                    // inc/dec
-                    (e.span(), Box::new(Expression::Inc(rhs)))
-                }),
-                postfix(Precedence::None as u16, self.dec(), |_, rhs, e| {
-                    // @TODO handle precedence of
-                    // inc/dec
-                    (e.span(), Box::new(Expression::Dec(rhs)))
-                }),
+                infix(
+                    right(Precedence::None as u16),
+                    op!('='),
+                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
+                ), // postfix(Precedence::None as u16, op!("++"), |_, rhs, e| {
+                   // // postfix(Precedence::None as u16, self.inc(), |_, rhs, e| {
+                   //     (e.span(), Box::new(Expression::Inc(rhs)))
+                   // }),
+                   // postfix(Precedence::None as u16, text::keyword("--"), |_, rhs, e| {
+                   // // postfix(Precedence::None as u16, self.dec(), |_, rhs, e| {
+                   //     (e.span(), Box::new(Expression::Dec(rhs)))
+                   // }),
+                   // infix(
+                   //     left(Precedence::None as u16),
+                   //     self.call(expr.clone()),
+                   //     |_b, _a, rhs, e| {
+                   //         dbg!(&_b, &_a, &rhs);
+                   //
+                   //         (e.span(), Box::new(Expression::Noop))
+                   //     },
+                   // ),
             ))
         })
         .map_with(output!(Expr))
@@ -362,7 +394,7 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(output!(Group))
     }
 
-    fn expr_statement<
+    fn call<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
             + 'pratt,
@@ -371,7 +403,168 @@ impl<'pratt> Pratt<'pratt> {
         expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        expr.then_ignore(op!(';')).map_with(output!(ExprStatement))
+        self.ident()
+            .then(
+                expr.clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .or_not()
+                    .delimited_by(op!('('), op!(')')),
+            )
+            .map_with(|(name, args), e| (e.span(), Box::new(Expression::Call { name, args })))
+    }
+
+    fn block<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        stmt.repeated()
+            .at_least(0)
+            .collect()
+            .map_with(output!(Block))
+            .delimited_by(op!('{'), op!('}'))
+    }
+
+    fn arg_list(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let arg = text::ident()
+            .padded()
+            .then(text::ident().padded())
+            .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
+
+        arg.separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .map_with(output!(Fragment))
+            .delimited_by(op!("("), op!(")"))
+    }
+
+    fn func<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("fn")
+            .then(text::ident().padded())
+            .then(self.arg_list())
+            .then(op!("->").ignore_then(text::ident().padded()).or_not())
+            .then(self.block(stmt))
+            .map_with(|((((_, name), args), returns), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Function {
+                        name,
+                        args,
+                        returns,
+                        body,
+                    }),
+                )
+            })
+    }
+
+    fn defer<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("defer")
+            .ignore_then(self.block(stmt))
+            .map_with(output!(Defer))
+    }
+
+    fn while_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("while")
+            .ignore_then(self.expr())
+            .then(self.block(stmt))
+            .map_with(|(iterable, body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Loop {
+                        identifier: None,
+                        iterable,
+                        body,
+                    }),
+                )
+            })
+    }
+
+    fn print(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("print")
+            .labelled("print statement")
+            .ignore_then(self.string())
+            .then(
+                self.expr()
+                    .separated_by(op!(','))
+                    .allow_leading()
+                    .collect::<Vec<_>>()
+                    .or_not(),
+            )
+            .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Print(fmt, params))))
+            .then_ignore(op!(';'))
+    }
+
+    fn expr_statement(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.expr()
+            .then_ignore(op!(';'))
+            .map_with(output!(ExprStatement))
+    }
+
+    fn statement(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        recursive(|stmt| {
+            choice((
+                self.while_(stmt.clone()),
+                self.block(stmt.clone()),
+                self.expr_statement(),
+                self.print(),
+            ))
+        })
+        .map_with(output!(Statement))
+    }
+
+    fn declaration(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let stmt = self.statement();
+
+        choice((
+            stmt.clone(),
+            self.func(stmt.clone()),
+            self.defer(stmt.clone()),
+        ))
     }
 }
 
@@ -411,7 +604,8 @@ mod tests {
                 Self::Negate(n) => write!(f, "-{}", n.borrow().1),
                 Self::Positive(n) => write!(f, "+{}", n.borrow().1),
                 Self::Expr(e) => write!(f, "{}", e.1),
-                Self::Fragment(list) => write!(
+                Self::ExprStatement(e) => write!(f, "{};", e.1),
+                Self::Fragment(list) | Self::Block(list) => write!(
                     f,
                     "{}",
                     list.iter()
@@ -420,12 +614,73 @@ mod tests {
                         .join(" ")
                 ),
                 Self::Group(g) => write!(f, "({})", g.1),
+                Self::Statement(s) => write!(f, "{};\n", s.1),
+                Self::String(s) => write!(f, "\"{}\"", s),
+                Self::Print(fmt, params) => write!(
+                    f,
+                    "print {}{}",
+                    fmt.borrow().1,
+                    params.clone().map_or(String::default(), |p| format!(
+                        ", {}",
+                        p.iter()
+                            .map(|p| p.1.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    ))
+                ),
+                Self::Function {
+                    name,
+                    args,
+                    returns,
+                    body,
+                } => {
+                    write!(
+                        f,
+                        "fn {}({}){} {{\n{}}}",
+                        name,
+                        args.1,
+                        returns.map_or(String::default(), |ret| format!(" -> {}", ret)),
+                        body.1
+                    )
+                }
+                Self::Defer(b) => write!(f, "defer {}", b.1),
+                Self::Call { name, args } => {
+                    write!(
+                        f,
+                        "{}({})",
+                        name.1,
+                        args.clone().map_or(String::default(), |p| p
+                            .iter()
+                            .map(|p| p.1.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", "))
+                    )
+                }
+                Self::Loop {
+                    identifier,
+                    iterable,
+                    body,
+                } => {
+                    write!(
+                        f,
+                        "{} {{\n{}}}",
+                        match identifier {
+                            Some(_) => String::new(),
+                            None => format!("while {}", iterable.1),
+                        },
+                        body.1
+                    )
+                }
+                Self::Assignment(n, e) => {
+                    write!(f, "{} = {}", n.1, e.1)
+                }
+                Self::Noop => write!(f, "@"),
                 e => todo!("Missing rest of nodes: {:?}", e),
             }
         }
     }
 
-    macro_rules! parse {
+    macro_rules! expr {
         ($case: literal) => {
             Pratt::default()
                 .expr()
@@ -437,9 +692,21 @@ mod tests {
         };
     }
 
+    macro_rules! stmt {
+        ($case: literal) => {
+            Pratt::default()
+                .declaration()
+                .parse($case)
+                .into_result()
+                .unwrap()
+                .1
+                .to_string()
+        };
+    }
+
     macro_rules! same {
         ($case: literal) => {
-            assert_eq!($case.to_string(), parse!($case));
+            assert_eq!($case.to_string(), expr!($case));
         };
     }
 
@@ -464,5 +731,24 @@ mod tests {
         same!("2 << 2 + 2");
         same!("((2 + 2) * 2) + -3");
         same!("2 * 2 + 3 + -3");
+        same!("2 * ((2 * 2) + 2)");
+        same!("2 + 2 - 1 / 5 % 3");
+        same!("foo()");
+    }
+
+    #[test]
+    fn pratt_test_statements() {
+        stmt!("print \"%i\", 42;");
+        stmt!("print \"Hello, World!\";");
+        stmt!("defer { print \"%i\", 42; }");
+        stmt!("while x < 10 { x = x + 1; }");
+    }
+
+    #[test]
+    fn pratt_test_fn_declaration() {
+        assert_eq!(
+            "fn main() -> void {\nprint \"Hello, %s\", 42;\n}",
+            stmt!("fn main() -> void {\n  print \"Hello, %s\", 42;\n  }")
+        )
     }
 }
