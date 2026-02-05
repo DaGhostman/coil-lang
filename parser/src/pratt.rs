@@ -131,7 +131,7 @@ pub enum Expression<'expr> {
 
     Call {
         name: Output<'expr>,
-        args: Option<Vec<Output<'expr>>>,
+        args: Option<Vec<Output<'expr>>>, 
     },
 
     Loop {
@@ -286,7 +286,7 @@ impl<'pratt> Pratt<'pratt> {
                                 "/" => Expression::Div(lhs, rhs),
                                 "%" => Expression::Mod(lhs, rhs),
                                 _ => unreachable!("No other operators"),
-                            }),
+                            }), 
                         )
                     },
                 ),
@@ -311,35 +311,10 @@ impl<'pratt> Pratt<'pratt> {
                                 "<=" => Expression::Leq(lhs, rhs),
                                 "<" => Expression::Le(lhs, rhs),
                                 _ => unreachable!("No more comparison operators"),
-                            }),
+                            }), 
                         )
                     },
                 ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!("!="),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Neq(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!('>'),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Gt(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!(">="),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Geq(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!('<'),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Le(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!("<="),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Leq(lhs, rhs))),
-                // ),
                 prefix(
                     Precedence::Negate as u16,
                     choice((op!('-'), op!('~'), op!('+'))),
@@ -351,7 +326,7 @@ impl<'pratt> Pratt<'pratt> {
                                 '+' => Expression::Positive(rhs),
                                 '~' => Expression::Not(rhs),
                                 _ => unreachable!("No other prefix operators"),
-                            }),
+                            }), 
                         )
                     },
                 ),
@@ -366,11 +341,6 @@ impl<'pratt> Pratt<'pratt> {
                 infix(left(Precedence::Term as u16), op!('+'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Add(lhs, rhs)))
                 }),
-                // infix(
-                //     right(Precedence::None as u16),
-                //     op!('='),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
-                // ),
                 postfix(
                     Precedence::Primary as u16,
                     choice((op!("++"), op!("--"))),
@@ -381,7 +351,7 @@ impl<'pratt> Pratt<'pratt> {
                                 "++" => Expression::Inc(lhs),
                                 "--" => Expression::Dec(lhs),
                                 _ => unreachable!("no other inc/dec operators"),
-                            }),
+                            }), 
                         )
                     },
                 ),
@@ -405,8 +375,8 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn group<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -422,8 +392,8 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn block<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -454,8 +424,8 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn func<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -475,14 +445,14 @@ impl<'pratt> Pratt<'pratt> {
                         args,
                         returns,
                         body,
-                    }),
+                    }), 
                 )
             })
     }
 
     fn defer<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -495,8 +465,8 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn while_<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -513,14 +483,14 @@ impl<'pratt> Pratt<'pratt> {
                         identifier: None,
                         iterable,
                         body,
-                    }),
+                    }), 
                 )
             })
     }
 
     fn if_<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -537,7 +507,7 @@ impl<'pratt> Pratt<'pratt> {
                         identifier: None,
                         iterable,
                         body,
-                    }),
+                    }), 
                 )
             })
     }
@@ -636,8 +606,8 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn params<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
@@ -645,9 +615,9 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<
         'pratt,
         &'pratt str,
-        Option<Vec<Output<'pratt>>>,
+        Option<Vec<Output<'pratt>>>, 
         extra::Err<Rich<'pratt, char>>,
-    > + Clone
+    > + Clone 
     + 'pratt {
         expr.clone()
             .separated_by(op!(','))
@@ -658,8 +628,8 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     fn call<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> 
+            + Clone 
             + 'pratt,
     >(
         &self,
