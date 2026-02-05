@@ -1,0 +1,8 @@
+fn sadge(string n) {
+    print "0x%x - %s", n, n;
+}
+
+
+fn main() {
+    sadge("Hello");
+}

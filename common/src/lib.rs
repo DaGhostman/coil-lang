@@ -1,10 +1,16 @@
 mod array_vec;
+mod interner;
+mod opcode;
 mod value;
-// mod interner;
+mod message;
+mod seekable_iter;
 
 pub use array_vec::*;
+pub use interner::*;
+pub use opcode::*;
 pub use value::*;
-// pub use interner::*;
+pub use message::*;
+pub use seekable_iter::*;
 
 #[macro_export]
 macro_rules! promise {

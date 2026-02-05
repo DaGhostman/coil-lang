@@ -1,11 +1,14 @@
+// mod allocator;
 mod frame;
-pub mod garbage;
+// pub mod garbage;
 mod heap;
-mod object;
-mod objects;
+// mod object;
+// mod objects;
 mod stack;
 
+// pub use allocator::*;
 pub use frame::*;
 pub use heap::*;
-pub use object::*;
-pub use objects::*;
+// pub use object::*;
+// pub use objects::*;
+pub use stack::*;

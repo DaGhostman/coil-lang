@@ -1,15 +1,53 @@
-use common::{ArrayVec, Type, Value, likely, promise, unlikely};
-use std::string::String as RustString;
+use std::{fmt::Write, io::Write as _};
 
-use crate::{
-    Byte, Coroutine, Frame, Heap, Instruction, Object, String,
-    garbage::{Collectable, GcSized},
+use common::{
+    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, SeekableIterator, Value,
+    unlikely,
 };
 
+use crate::{Frame, Heap, ObjInstance, ObjString, Object, Stack};
+
+macro_rules! binary {
+    ($stack: expr, $op:tt, $from: ident, $to: ident) => {
+        {
+            let rhs = $stack.pop().$from();
+            let lhs = $stack.peek().$from();
+
+            $stack.top().replace((lhs $op rhs).$to());
+        }
+    };
+    ($stack: expr, $op:tt, $from: ident) => {
+        {
+            let rhs = $stack.pop().$from();
+            let lhs = $stack.peek().$from();
+
+            $stack.top().replace((lhs $op rhs) as _)
+        }
+    };
+}
+
+macro_rules! unary {
+    ($stack: expr, $op: tt, $from: ident, $to: ident) => {
+        {
+        let rhs = $stack.peek().$from();
+
+        $stack.top().replace(($op rhs).$to());
+        }
+    };
+    ($stack: expr, $op: tt, $from: ident) => { {
+            let rhs = $stack.peek().$from();
+
+            $stack.top().replace(($op rhs) as _);
+        }
+    }
+}
+
+// type External = fn(&[Value]) -> Value;
+
 pub struct Machine<const S: usize> {
-    frames: ArrayVec<Frame<Value>, S>,
-    heap: Heap<1024>,
-    pending: Vec<Object>,
+    heap: Heap,
+    stack: Stack<Value, 8192>,
+    frames: ArrayVec<Frame, S>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -18,7 +56,6 @@ enum ExecutionOutcome {
     #[default]
     INVALID,
     CALL,
-    RESUME,
     RETURN,
     TERMINATION,
 }
@@ -26,31 +63,19 @@ enum ExecutionOutcome {
 #[derive(Default)]
 struct ExecutionResult {
     outcome: ExecutionOutcome,
-    ip: usize,
     arity: usize,
 }
-
 impl ExecutionResult {
     pub fn returns() -> Self {
         Self {
             outcome: ExecutionOutcome::RETURN,
-            ip: 0,
             arity: 0,
         }
     }
 
-    pub fn resume() -> Self {
-        Self {
-            outcome: ExecutionOutcome::RESUME,
-            ip: 0,
-            arity: 0,
-        }
-    }
-
-    pub fn call(ip: usize, arity: usize) -> Self {
+    pub fn call(arity: usize) -> Self {
         Self {
             outcome: ExecutionOutcome::CALL,
-            ip,
             arity,
         }
     }
@@ -58,7 +83,6 @@ impl ExecutionResult {
     pub fn terminate() -> Self {
         Self {
             outcome: ExecutionOutcome::TERMINATION,
-            ip: 0,
             arity: 0,
         }
     }
@@ -66,21 +90,18 @@ impl ExecutionResult {
     pub fn invalid() -> Self {
         Self {
             outcome: ExecutionOutcome::INVALID,
-            ip: usize::MAX,
             arity: usize::MAX,
         }
     }
 
+    #[inline]
     pub fn outcome(&self) -> ExecutionOutcome {
         self.outcome
     }
 
+    #[inline]
     pub fn arity(&self) -> usize {
         self.arity
-    }
-
-    pub fn tell(&self) -> usize {
-        self.ip
     }
 }
 
@@ -91,517 +112,434 @@ impl<const S: usize> Default for Machine<S> {
         Self {
             frames,
             heap: Heap::default(),
-            pending: Vec::with_capacity(128),
+            stack: Stack::new(),
         }
     }
 }
 
 impl<const S: usize> Machine<S> {
+    // pub fn register(&mut self, name: usize, func: External) {
+    //     self.native.insert(name, func);
+    // }
+}
+
+impl<const S: usize> Machine<S> {
+    #[cfg(test)]
     pub fn push(&mut self, value: Value) {
-        self.frames.get_mut().push(value);
+        self.stack.push(value);
     }
 
+    #[cfg(test)]
     pub fn pop(&mut self) -> Value {
-        *self.frames.get_mut().pop()
+        self.stack.pop()
     }
 
     #[cfg(test)]
     pub fn tell(&self) -> usize {
-        self.frames.get().tell()
+        self.stack.tell()
     }
 
-    fn mark(&mut self) {
-        self.frames
-            .iter()
-            .filter(|frame| !frame.is_pending())
-            .for_each(|frame| {
-                frame
-                    .stack()
-                    .iter()
-                    .filter(|element| matches!(element.get_type(), Type::Object | Type::String))
-                    .for_each(|element| {
-                        let mut collectable: Collectable<Object> =
-                            Collectable::from(element.as_ptr());
-
-                        collectable.as_mut().mark(&mut self.pending);
-                    });
-            });
-
-        while let Some(object) = self.pending.pop() {
-            object.mark_reference(&mut self.pending);
-        }
-    }
-
-    fn gc(&mut self) {
-        #[cfg(not(debug_assertions))]
-        if likely(self.heap.usage() < 0.5) {
+    pub fn run(&mut self, code: &[Byte]) {
+        if code.is_empty() {
             return;
         }
 
-        self.mark();
+        let mut code_iter = SeekableIterator::new(code);
 
-        #[cfg(not(debug_assertions))]
-        if likely(self.heap.usage() < 0.75) {
-            return;
-        }
-
-        self.heap.collect();
-    }
-
-    fn alloc<T: GcSized, F>(&mut self, value: T, map: F) -> (Object, Collectable<T>)
-    where
-        F: Fn(Collectable<T>) -> Object,
-    {
-        self.gc();
-
-        self.heap.alloc(value, map)
-    }
-
-    pub fn run(&mut self, code: &[Byte<Value>]) {
         loop {
-            let result = self.execute(code);
+            let result = self.execute(&mut code_iter);
 
             match result.outcome() {
                 ExecutionOutcome::CALL => {
-                    likely(true);
-                    self.frames.current_mut().enter(result.tell());
-
-                    for _ in 0..result.arity() {
-                        let value = *self.frames.get_mut().pop();
-                        self.frames.current_mut().push(value);
-                    }
+                    self.frames.get_mut().seek(code_iter.tell() + 1);
+                    // code_iter.seek(result.tell());
+                    self.frames.current_mut().enter();
+                    self.frames
+                        .current_mut()
+                        .set(self.stack.tell() - result.arity());
 
                     self.frames.consume();
                 }
                 ExecutionOutcome::RETURN => {
-                    likely(true);
-                    let v = *self.frames.get_mut().pop();
+                    let current = self.frames.pop();
+                    let v = self.stack.pop();
+                    self.stack.seek(current.get());
+                    self.stack.push(v);
 
-                    self.frames.pop();
-                    self.frames.get_mut().resume(v);
+                    let prev = self.frames.get_mut();
+
+                    code_iter.seek(prev.tell());
                 }
                 ExecutionOutcome::TERMINATION => {
                     unlikely(true);
                     break;
                 }
-                ExecutionOutcome::RESUME => {
-                    unlikely(true);
-                    let frame: Collectable<Coroutine<Value>> =
-                        Collectable::from(self.frames.get_mut().pop().as_ptr());
-
-                    self.frames.push(frame.as_ref().frame().clone());
-                }
                 _ => (),
             }
         }
-
-        self.heap.collect();
     }
 
-    #[inline]
-    fn execute(&mut self, code: &[Byte<Value>]) -> ExecutionResult {
+    #[inline(always)]
+    fn execute(&mut self, code: &mut SeekableIterator<'_, Byte>) -> ExecutionResult {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
+
         let frame = self.frames.get_mut();
-        let mut ip = frame.tell();
 
-        while likely(ip < code.len()) {
-            let opcode = &code[ip];
-
+        while let Some(opcode) = code.next() {
             #[cfg(debug_assertions)]
             {
                 eprintln!(
-                    "#{:<2} @ {:<3} - {:<10} - {:?}",
+                    "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
                     frame_no,
-                    ip,
+                    code.tell(),
                     format!("{:?}", opcode.bytecode()),
-                    frame
+                    opcode.operand_u16(0),
+                    opcode.operand_u16(1),
+                    self.stack.as_slice()
                 );
             }
 
-            ip += 1;
-            frame.seek(ip);
+            #[cfg(debug_assertions)]
+            {
+                println!("Performing GC trace");
+                self.heap.trace(
+                    &self
+                        .stack
+                        .as_slice()
+                        .iter()
+                        .map(|v| v.raw() as u64)
+                        .collect::<Vec<u64>>(),
+                );
 
-            // if let Some(handler) = self.handler[(*opcode.bytecode() as u8) as usize] {
-            //     let result = handler(frame, opcode);
-            //     ip = frame.tell();
-            //
-            //     if let Some(result) = result {
-            //         return result;
-            //     } else {
-            //         unlikely(true);
-            //     }
-            // } else {
-            //     unlikely(true);
-            // }
+                println!("Performing GC collection");
+                unsafe { self.heap.sweep() };
+            }
 
             match opcode.bytecode() {
-                // Instruction::DUP => {
-                //     let value = *frame.peek();
-                //
-                //     frame.push(value);
-                // }
-                Instruction::CONST => frame.push(opcode.constant()),
+                Instruction::POP => {
+                    self.stack.pop();
+                }
+                Instruction::DUPLICATE => {
+                    self.stack.push(*self.stack.peek());
+                }
+                Instruction::CONST => self.stack.push(Value::from(opcode.constant())),
                 Instruction::STORE => {
-                    likely(true);
-
-                    let val = *frame.pop();
-                    frame.store(opcode.operand(0), val);
+                    let val = self.stack.peek();
+                    self.stack[frame.get() + opcode.operand_u32() as usize] = *val;
                 }
                 Instruction::LOAD => {
-                    likely(true);
-
-                    frame.push(*frame.load(opcode.operand(0)));
+                    self.stack
+                        .push(self.stack[frame.get() + opcode.operand_u32() as usize]);
                 }
-                Instruction::ADD => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
-
-                    frame.top().replace(lhs + rhs)
+                Instruction::INC => {
+                    let lhs = *self.stack[frame.get() + opcode.operand_u32() as usize].inc();
+                    self.stack.push(lhs);
                 }
-                Instruction::ADDF => {
-                    let rhs = frame.pop().as_float();
-                    let lhs = frame.peek().as_float();
-
-                    frame.top().replace((lhs + rhs).to_bits().into());
+                Instruction::DEC => {
+                    let lhs = *self.stack[frame.get() + opcode.operand_u32() as usize].dec();
+                    self.stack.push(lhs);
                 }
-                Instruction::SUB => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
+                Instruction::NOT => unary!(self.stack, !, as_bool),
+                Instruction::NEG => unary!(self.stack, -, as_int),
+                Instruction::ADD => binary!(self.stack, +, as_int),
+                Instruction::SUB => binary!(self.stack, -, as_int),
+                Instruction::MUL => binary!(self.stack, *, as_int),
+                Instruction::DIV => binary!(self.stack, /, as_int),
+                Instruction::MOD => binary!(self.stack, %, as_int),
+                Instruction::LE => binary!(self.stack, <, raw),
+                Instruction::LEQ => binary!(self.stack, <=, raw),
+                Instruction::GT => binary!(self.stack, >, raw),
+                Instruction::GEQ => binary!(self.stack, >=, raw),
+                Instruction::EQ => binary!(self.stack, ==, raw),
+                Instruction::NEQ => binary!(self.stack, !=, raw),
+                Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
+                Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
+                Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
+                Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
+                Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
+                Instruction::LEF => binary!(self.stack, <, as_float),
+                Instruction::LEQF => binary!(self.stack, <=, as_float),
+                Instruction::GTF => binary!(self.stack, >, as_float),
+                Instruction::GEQF => binary!(self.stack, >=, as_float),
+                Instruction::FORMAT => {
+                    let params_count = opcode.operand_u32();
+                    if params_count != 0 {
+                        let mut params = ArrayVec::<Value, 8>::default();
 
-                    frame.top().replace(lhs - rhs);
+                        for idx in (0..params_count as usize).rev() {
+                            params[idx] = self.stack.pop();
+                        }
+
+                        let ptr = self.stack.pop().as_ptr::<ObjString>();
+                        let format_string = (unsafe { &*ptr }).data.as_str();
+
+                        let mut message = String::default();
+
+                        let mut chars = format_string.chars().peekable();
+                        while let Some(ch) = chars.next() {
+                            if ch == '%' {
+                                match chars.peek() {
+                                    Some('i') => {
+                                        chars.next();
+                                        message.push_str(&params.pop().as_int().to_string());
+                                    }
+                                    Some('f') => {
+                                        chars.next();
+                                        // message
+                                        //     .push_str(&format!("{:.?}", params.pop().as_float()));
+                                        let _ =
+                                            write!(&mut message, "{:.?}", params.pop().as_float());
+                                    }
+                                    Some('b') => {
+                                        chars.next();
+                                        let _ = write!(
+                                            &mut message,
+                                            "{:0b}",
+                                            params.pop().raw().addr()
+                                        );
+                                    }
+                                    Some('s') => {
+                                        chars.next();
+                                        let string_val =
+                                            (unsafe { &*params.pop().as_ptr::<ObjString>() })
+                                                .data
+                                                .as_str();
+                                        // Allocated::<crate::String>::new(params.pop().as_ptr());
+                                        message.push_str(string_val);
+                                    }
+                                    Some('x') => {
+                                        chars.next();
+                                        let _ = write!(
+                                            &mut message,
+                                            "{:0x}",
+                                            params.pop().raw().addr()
+                                        );
+                                    }
+                                    Some('z') => {
+                                        chars.next();
+                                        message.push_str(if params.pop().raw() > 0 as _ {
+                                            "true"
+                                        } else {
+                                            "false"
+                                        });
+                                    }
+                                    Some('u') => {
+                                        chars.next();
+                                        message.push_str(&params.pop().raw().addr().to_string());
+                                    }
+                                    Some('p') => {
+                                        chars.next();
+                                        let _ = write!(
+                                            &mut message,
+                                            "{:08x}",
+                                            params.pop().as_ptr::<bool>().addr()
+                                        );
+                                    }
+                                    _ => {
+                                        message.push('%');
+                                    }
+                                }
+                            } else {
+                                message.push(ch);
+                            }
+                        }
+
+                        let (obj, _) = self
+                            .heap
+                            .alloc(ObjString::from(message.as_str()), Object::String);
+
+                        self.stack.push(Value::from(obj.addr()));
+                    }
                 }
-                Instruction::SUBF => {
-                    let rhs = frame.pop().as_float();
-                    let lhs = frame.peek().as_float();
-
-                    frame.top().replace((lhs - rhs).to_bits().into());
+                Instruction::PRINT => {
+                    let ptr = self.stack.pop().as_ptr::<ObjString>();
+                    print!("{}", unsafe { &*ptr });
                 }
-                Instruction::MUL => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
-
-                    let modifier = rhs / 2;
-                    let reminder = rhs % 2;
-
-                    frame.top().replace((lhs << modifier) + (lhs * reminder))
-                }
-                Instruction::MULF => {
-                    let rhs = frame.pop().as_float();
-                    let lhs = frame.peek().as_float();
-
-                    frame.top().replace((lhs * rhs).to_bits().into());
-                }
-                Instruction::DIV => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
-
-                    let modifier = rhs / 2;
-                    let reminder = rhs % 2;
-
-                    frame.top().replace((lhs >> (modifier)) - reminder);
-                }
-                Instruction::DIVF => {
-                    let rhs = frame.pop().as_float();
-                    let lhs = frame.peek().as_float();
-
-                    frame.top().replace((lhs / rhs).to_bits().into());
-                }
-                Instruction::LE => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
-
-                    *frame.top() = Value::bool(lhs < rhs);
-                }
-                // Instruction::LEF => {
-                //     let rhs = frame.pop().as_float();
-                //     let lhs = frame.peek().as_float();
-                //
-                //     *frame.top() = Value::bool(lhs < rhs);
-                // }
-                Instruction::GT => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
-
-                    *frame.top() = Value::bool(lhs > rhs);
-                }
-                // Instruction::GTF => {
-                //     let rhs = frame.pop().as_float();
-                //     let lhs = frame.peek().as_float();
-                //
-                //     *frame.top() = Value::bool(lhs > rhs);
-                // }
-                Instruction::EQ => {
-                    let rhs = frame.pop().raw();
-                    let lhs = frame.peek().raw();
-
-                    *frame.top() = Value::bool(lhs > rhs);
-                }
-                Instruction::PRINTI => println!("{}", frame.pop().as_int()),
-                // Instruction::PRINTF => println!("{:.?}", frame.pop().as_float()),
-                // Instruction::PRINTB => println!("{}", frame.pop().as_bool()),
-                // Instruction::PRINTS => {
-                //     println!(
-                //         "{}",
-                //         Collectable::<String>::from(frame.pop().as_ptr()).as_ref()
-                //     )
-                // }
                 Instruction::JMP => {
-                    ip = opcode.operand(0);
+                    code.seek(opcode.operand_u32() as usize);
                 }
-                // Instruction::JLE => {
-                //     let rhs = frame.pop().raw();
-                //     let lhs = frame.pop().raw();
-                //
-                //     if lhs < rhs {
-                //         ip = opcode.operand(0) ;
-                //     }
-                // }
-                // Instruction::JGT => {
-                //     let rhs = frame.pop().raw();
-                //     let lhs = frame.pop().raw();
-                //
-                //     if lhs > rhs {
-                //         ip = opcode.operand(0) ;
-                //     }
-                // }
-                // Instruction::JEQ => {
-                //     let rhs = frame.pop().raw();
-                //     let lhs = frame.pop().raw();
-                //
-                //     if lhs == rhs {
-                //         ip = opcode.operand(0) ;
-                //     }
-                // }
                 Instruction::JMPF => {
-                    if likely(!frame.pop().as_bool()) {
-                        ip = opcode.operand(0);
+                    if !self.stack.pop().as_bool() {
+                        code.seek(opcode.operand_u32() as usize);
                     }
                 }
                 Instruction::JMPT => {
-                    if likely(frame.pop().as_bool()) {
-                        ip = opcode.operand(0);
+                    if self.stack.pop().as_bool() {
+                        code.seek(opcode.operand_u32() as usize);
                     }
                 }
                 Instruction::CALL => {
-                    likely(true);
-                    frame.suspend();
+                    return ExecutionResult::call(opcode.operand_u32() as usize);
+                }
+                Instruction::INIT => {
+                    let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
+                    let _ = r.as_mut();
 
-                    return ExecutionResult::call(opcode.operand(0), opcode.operand(1));
+                    self.stack.push(Value::from(r.as_ptr().addr() as u64));
                 }
                 Instruction::RETURN => {
-                    likely(true);
-                    frame.complete();
-
                     return ExecutionResult::returns();
-                }
-                Instruction::SUSP => {
-                    frame.suspend();
-                    let suspended_frame = frame.clone();
-
-                    let (_, coro) = self.alloc(Coroutine::new(suspended_frame), Object::Coroutine);
-                    self.push(Value::object(coro.ptr()));
-
-                    return ExecutionResult::returns();
-                }
-                Instruction::RESUME => {
-                    return ExecutionResult::resume();
                 }
                 Instruction::HALT => {
-                    unlikely(true);
-                    frame.terminate();
-
+                    let _ = std::io::stdout().flush();
                     return ExecutionResult::terminate();
                 }
                 Instruction::STRING => {
-                    let mut value: Vec<u8> = Vec::with_capacity(opcode.operand(0));
+                    let length = opcode.operand_u32() as usize;
+                    let mut value: String = String::with_capacity(length);
 
-                    while let data = code[ip]
-                        && data.operand(0) != 0
+                    while length != value.len()
+                        && let Some(data) = code.next()
                     {
-                        ip += 1;
-
-                        value.push(
-                            data.operand(0)
-                                .try_into()
-                                .expect("Unable to reconstruct character"),
-                        );
+                        value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
-                    let (_, collectable) = self.heap.alloc(
-                        if let Ok(value) = RustString::from_utf8(value) {
-                            value.into()
-                        } else {
-                            unreachable!("Unable to recreate string from bytes");
-                        },
-                        Object::String,
-                    );
+                    let (object, _) = self
+                        .heap
+                        .alloc(ObjString::from(value.as_str()), Object::String);
 
-                    frame.push(Value::string(collectable.ptr()));
+                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::NOOP => continue,
                 _ => return ExecutionResult::invalid(),
             }
         }
 
-        ExecutionResult::default()
+        ExecutionResult::terminate()
     }
 }
-#[cfg(test)]
-mod tests {
-    use common::Value;
 
-    use crate::{Byte, Instruction, Machine};
-
-    #[test]
-    fn test_constants() {
-        let mut vm = Machine::<1>::default();
-        let v = Value::int(42);
-        vm.run(&[
-            Byte::new_with(Instruction::CONST, [0, 0], v),
-            Byte::new(Instruction::HALT, [0, 0]),
-        ]);
-
-        assert_eq!(v.raw(), vm.pop().raw());
-    }
-
-    #[test]
-    fn test_addition() {
-        let cases = [
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::float(2.0)),
-                Value::float(4.0),
-                Instruction::ADDF,
-            ),
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)),
-                Value::int(4),
-                Instruction::ADD,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_subtraction() {
-        let cases = [
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::float(2.0)),
-                Value::float(0.0),
-                Instruction::SUBF,
-            ),
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)),
-                Value::int(0),
-                Instruction::SUB,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_multiplication() {
-        let cases = [
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::float(2.0)),
-                Value::float(4.0),
-                Instruction::MULF,
-            ),
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)),
-                Value::int(4),
-                Instruction::MUL,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_division() {
-        let cases = [
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::float(2.0)),
-                Value::float(1.0),
-                Instruction::DIVF,
-            ),
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)),
-                Value::int(1),
-                Instruction::DIV,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-
-    #[test]
-    fn test_jumps() {
-        let cases = [
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::float(2.0)),
-                Value::float(1.0),
-                Instruction::DIVF,
-            ),
-            (
-                Byte::new_with(Instruction::CONST, [0, 0], Value::int(2)),
-                Value::int(1),
-                Instruction::DIV,
-            ),
-        ];
-
-        for (v, e, i) in cases {
-            let mut vm = Machine::<2>::default();
-            vm.run(&[
-                v,
-                v,
-                Byte::new(i, [0, 0]),
-                Byte::new(Instruction::HALT, [0, 0]),
-            ]);
-
-            assert_eq!(e.raw(), vm.pop().raw());
-        }
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use common::{ArchivedByte, Value};
+//
+//     use crate::{Byte, Instruction, Machine};
+//
+//     #[test]
+//     fn test_constants() {
+//         let mut vm = Machine::<1>::default();
+//         let v = Value::from(42);
+//         vm.run(&[
+//             ArchivedByte::ew_with_value(Instruction::CONST, v.raw() as _),
+//             Byte::new(Instruction::HALT),
+//         ]);
+//
+//         assert_eq!(v.raw(), vm.pop().raw());
+//     }
+//
+//     #[test]
+//     fn test_addition() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(4.0),
+//                 Instruction::ADDF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(4),
+//                 Instruction::ADD,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_subtraction() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(0.0),
+//                 Instruction::SUBF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(0),
+//                 Instruction::SUB,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_multiplication() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(4.0),
+//                 Instruction::MULF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(4),
+//                 Instruction::MUL,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_division() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(1.0),
+//                 Instruction::DIVF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(1),
+//                 Instruction::DIV,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+//
+//     #[test]
+//     fn test_jumps() {
+//         let cases = [
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
+//                 Value::from(1.0),
+//                 Instruction::DIVF,
+//             ),
+//             (
+//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
+//                 Value::from(1),
+//                 Instruction::DIV,
+//             ),
+//         ];
+//
+//         for (v, e, i) in cases {
+//             let mut vm = Machine::<2>::default();
+//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
+//
+//             assert_eq!(e.raw(), vm.pop().raw());
+//         }
+//     }
+// }

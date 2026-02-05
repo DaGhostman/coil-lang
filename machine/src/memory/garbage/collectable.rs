@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::garbage::{Gc, GcSized};
+use crate::garbage::{GcSized, gc::Gc};
 
 #[derive(Debug)]
 pub struct Collectable<T>(NonNull<Gc<T>>);
@@ -18,10 +18,6 @@ impl<T> From<NonNull<Gc<T>>> for Collectable<T> {
 impl<T> Collectable<T> {
     pub fn new(boxed: Box<Gc<T>>) -> Self {
         Self(NonNull::from(Box::leak(boxed)))
-    }
-
-    pub fn from_raw(ptr: &mut Gc<T>) -> Self {
-        Self(NonNull::from(ptr))
     }
 
     pub fn release(self) {
