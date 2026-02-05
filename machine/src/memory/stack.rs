@@ -7,7 +7,14 @@ pub struct Stack<T: Default, const N: usize> {
     cursor: usize,
 }
 
+impl<T: Default + Copy, const N: usize> Default for Stack<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Default + Copy, const N: usize> Stack<T, N> {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             stack: std::array::from_fn(|_| T::default()),

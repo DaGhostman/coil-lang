@@ -9,9 +9,10 @@ use chumsky::{
     error::Rich,
     extra,
     pratt::{infix, left, postfix, prefix, right},
-    prelude::{choice, empty, just, none_of, recursive},
-    select_ref, text,
+    prelude::{choice, just, none_of, recursive},
+    text,
 };
+use common::{Label, Message};
 
 #[repr(u16)]
 enum Precedence {
@@ -56,7 +57,7 @@ macro_rules! output {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression<'expr> {
-    Noop,
+    Noop(Output<'expr>),
     Integer(i64),
     Float(f64),
     String(&'expr str),
@@ -141,7 +142,7 @@ pub enum Expression<'expr> {
 
     Match(Output<'expr>, Vec<(Output<'expr>, Output<'expr>)>),
 
-    Variable(Output<'expr>, Option<Output<'expr>>),
+    Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
 
     Implementation(&'expr str, &'expr str, Vec<Output<'expr>>),
@@ -177,6 +178,7 @@ impl<'pratt> Pratt<'pratt> {
                     0_i64
                 }
             })
+            .labelled("integer")
             .map_with(output!(Integer))
     }
 
@@ -196,6 +198,7 @@ impl<'pratt> Pratt<'pratt> {
                     0_f64
                 }
             })
+            .labelled("float")
             .map_with(output!(Float))
     }
 
@@ -226,138 +229,162 @@ impl<'pratt> Pratt<'pratt> {
                 self.int(),
                 self.float(),
                 self.ident(),
-                self.string(),
-                keyword!("true")
-                    .labelled("boolean")
-                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true")))),
-                keyword!("false")
-                    .labelled("boolean")
-                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true")))),
+                op!("true")
+                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
+                    .labelled("boolean"),
+                op!("false")
+                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
+                    .labelled("boolean"),
             ));
 
             choice((atom, self.group(expr.clone()))).pratt((
                 postfix(Precedence::Unary as u16, op!('!'), |lhs, _, e| {
                     (e.span(), Box::new(Expression::Not(lhs)))
                 }),
-                (infix(
+                infix(
                     right(Precedence::Binary as u16),
                     op!("<<"),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Shl(lhs, rhs))),
-                )),
-                (infix(
+                ),
+                infix(
                     right(Precedence::Binary as u16),
                     op!(">>"),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Shr(lhs, rhs))),
-                )),
-                (infix(
+                ),
+                infix(
                     right(Precedence::Binary as u16),
                     op!('&'),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::BitAnd(lhs, rhs))),
-                )),
-                (infix(
+                ),
+                infix(
                     right(Precedence::And as u16),
                     op!("&&"),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::And(lhs, rhs))),
-                )),
-                (infix(
+                ),
+                infix(
                     right(Precedence::Binary as u16),
                     op!('|'),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::BitOr(lhs, rhs))),
-                )),
-                (infix(right(Precedence::Or as u16), op!("||"), |lhs, _, rhs, e| {
+                ),
+                infix(right(Precedence::Or as u16), op!("||"), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Or(lhs, rhs)))
-                })),
-                (infix(
+                }),
+                infix(
                     right(Precedence::Binary as u16),
                     op!('^'),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Xor(lhs, rhs))),
-                )),
-                (infix(
+                ),
+                infix(
                     right(Precedence::Factor as u16),
-                    op!("**"),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Pow(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Factor as u16),
-                    op!('*'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Mul(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Factor as u16),
-                    op!('/'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Div(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Factor as u16),
-                    op!('%'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Mod(lhs, rhs))),
-                )),
-                (infix(
+                    choice((op!("**"), op!("*"), op!("/"), op!("%"))),
+                    |lhs, op, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(match op {
+                                "**" => Expression::Pow(lhs, rhs),
+                                "*" => Expression::Mul(lhs, rhs),
+                                "/" => Expression::Div(lhs, rhs),
+                                "%" => Expression::Mod(lhs, rhs),
+                                _ => unreachable!("No other operators"),
+                            }),
+                        )
+                    },
+                ),
+                infix(
                     right(Precedence::Compare as u16),
-                    op!("=="),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Eq(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Compare as u16),
-                    op!("!="),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Neq(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Compare as u16),
-                    op!('>'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Gt(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Compare as u16),
-                    op!(">="),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Geq(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Compare as u16),
-                    op!('<'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Le(lhs, rhs))),
-                )),
-                (infix(
-                    right(Precedence::Compare as u16),
-                    op!("<="),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Leq(lhs, rhs))),
-                )),
-                (prefix(Precedence::Negate as u16, op!('-'), |_, rhs, e| {
-                    (e.span(), Box::new(Expression::Negate(rhs)))
-                })),
-                (prefix(Precedence::Negate as u16, op!('~'), |_, rhs, e| {
-                    (e.span(), Box::new(Expression::Not(rhs)))
-                })),
-                (prefix(Precedence::Negate as u16, op!('+'), |_, rhs, e| {
-                    (e.span(), Box::new(Expression::Positive(rhs)))
-                })),
+                    choice((
+                        op!("=="),
+                        op!("!="),
+                        op!(">"),
+                        op!(">="),
+                        op!("<="),
+                        op!("<"),
+                    )),
+                    |lhs, op, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(match op {
+                                "==" => Expression::Eq(lhs, rhs),
+                                "!=" => Expression::Neq(lhs, rhs),
+                                ">" => Expression::Gt(lhs, rhs),
+                                ">=" => Expression::Geq(lhs, rhs),
+                                "<=" => Expression::Leq(lhs, rhs),
+                                "<" => Expression::Le(lhs, rhs),
+                                _ => unreachable!("No more comparison operators"),
+                            }),
+                        )
+                    },
+                ),
+                // infix(
+                //     right(Precedence::Compare as u16),
+                //     op!("!="),
+                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Neq(lhs, rhs))),
+                // ),
+                // infix(
+                //     right(Precedence::Compare as u16),
+                //     op!('>'),
+                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Gt(lhs, rhs))),
+                // ),
+                // infix(
+                //     right(Precedence::Compare as u16),
+                //     op!(">="),
+                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Geq(lhs, rhs))),
+                // ),
+                // infix(
+                //     right(Precedence::Compare as u16),
+                //     op!('<'),
+                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Le(lhs, rhs))),
+                // ),
+                // infix(
+                //     right(Precedence::Compare as u16),
+                //     op!("<="),
+                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Leq(lhs, rhs))),
+                // ),
+                prefix(
+                    Precedence::Negate as u16,
+                    choice((op!('-'), op!('~'), op!('+'))),
+                    |c, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(match c {
+                                '-' => Expression::Negate(rhs),
+                                '+' => Expression::Positive(rhs),
+                                '~' => Expression::Not(rhs),
+                                _ => unreachable!("No other prefix operators"),
+                            }),
+                        )
+                    },
+                ),
+                infix(
+                    right(Precedence::Assign as u16),
+                    op!("="),
+                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
+                ),
                 infix(left(Precedence::Term as u16), op!('-'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Sub(lhs, rhs)))
                 }),
                 infix(left(Precedence::Term as u16), op!('+'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Add(lhs, rhs)))
                 }),
-                infix(
-                    right(Precedence::None as u16),
-                    op!('='),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
-                ), // postfix(Precedence::None as u16, op!("++"), |_, rhs, e| {
-                   // // postfix(Precedence::None as u16, self.inc(), |_, rhs, e| {
-                   //     (e.span(), Box::new(Expression::Inc(rhs)))
-                   // }),
-                   // postfix(Precedence::None as u16, text::keyword("--"), |_, rhs, e| {
-                   // // postfix(Precedence::None as u16, self.dec(), |_, rhs, e| {
-                   //     (e.span(), Box::new(Expression::Dec(rhs)))
-                   // }),
-                   // infix(
-                   //     left(Precedence::None as u16),
-                   //     self.call(expr.clone()),
-                   //     |_b, _a, rhs, e| {
-                   //         dbg!(&_b, &_a, &rhs);
-                   //
-                   //         (e.span(), Box::new(Expression::Noop))
-                   //     },
-                   // ),
+                // infix(
+                //     right(Precedence::None as u16),
+                //     op!('='),
+                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
+                // ),
+                postfix(
+                    Precedence::Primary as u16,
+                    choice((op!("++"), op!("--"))),
+                    |lhs, op, e| {
+                        (
+                            e.span(),
+                            Box::new(match op {
+                                "++" => Expression::Inc(lhs),
+                                "--" => Expression::Dec(lhs),
+                                _ => unreachable!("no other inc/dec operators"),
+                            }),
+                        )
+                    },
+                ),
             ))
         })
         .map_with(output!(Expr))
@@ -392,27 +419,6 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(output!(Fragment))
             .delimited_by(op!('('), op!(')'))
             .map_with(output!(Group))
-    }
-
-    fn call<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
-        &self,
-        expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        self.ident()
-            .then(
-                expr.clone()
-                    .separated_by(op!(','))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .or_not()
-                    .delimited_by(op!('('), op!(')')),
-            )
-            .map_with(|(name, args), e| (e.span(), Box::new(Expression::Call { name, args })))
     }
 
     fn block<
@@ -512,6 +518,30 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
+    fn if_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("if")
+            .ignore_then(self.expr())
+            .then(self.block(stmt))
+            .map_with(|(iterable, body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Loop {
+                        identifier: None,
+                        iterable,
+                        body,
+                    }),
+                )
+            })
+    }
+
     fn print(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -527,7 +557,24 @@ impl<'pratt> Pratt<'pratt> {
                     .or_not(),
             )
             .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Print(fmt, params))))
-            .then_ignore(op!(';'))
+    }
+    fn return_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("return")
+            .labelled("return")
+            .ignore_then(self.expr())
+            .map_with(|result, e| (e.span(), Box::new(Expression::Return(result))))
+    }
+
+    fn comment(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        op!("//")
+            .ignore_then(none_of('\n').repeated().to_slice().padded())
+            .map_with(output!(Comment))
     }
 
     fn expr_statement(
@@ -546,9 +593,13 @@ impl<'pratt> Pratt<'pratt> {
         recursive(|stmt| {
             choice((
                 self.while_(stmt.clone()),
+                self.if_(stmt.clone()),
                 self.block(stmt.clone()),
+                self.variable().then_ignore(op!(';')),
                 self.expr_statement(),
-                self.print(),
+                self.print().then_ignore(op!(';')),
+                self.return_().then_ignore(op!(';')),
+                self.comment(),
             ))
         })
         .map_with(output!(Statement))
@@ -561,10 +612,87 @@ impl<'pratt> Pratt<'pratt> {
         let stmt = self.statement();
 
         choice((
-            stmt.clone(),
             self.func(stmt.clone()),
             self.defer(stmt.clone()),
+            stmt.clone(),
         ))
+    }
+
+    fn variable(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("let")
+            .ignore_then(text::ident())
+            .then(op!(":").ignore_then(self.ident()).or_not())
+            .then(op!("=").ignore_then(self.expr()).or_not())
+            .map_with(|((name, ty), val), e| {
+                let mut result = vec![(e.span(), Box::new(Expression::Variable(name, ty)))];
+                if let Some(v) = val {
+                    result.push(v);
+                }
+                (e.span(), Box::new(Expression::Fragment(result)))
+            })
+    }
+
+    fn params<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        Option<Vec<Output<'pratt>>>,
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+    + 'pratt {
+        expr.clone()
+            .separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .or_not()
+            .delimited_by(op!('('), op!(')'))
+    }
+
+    fn call<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.ident()
+            .then(self.params(expr))
+            .map_with(|(name, args), e| (e.span(), Box::new(Expression::Call { name, args })))
+    }
+
+    pub fn parse(&self, input: &'pratt str) -> Result<Output<'pratt>, common::Message> {
+        match self
+            .declaration()
+            .repeated()
+            .collect()
+            .map_with(output!(Program))
+            .or(self.comment())
+            .parse(input)
+            .into_result()
+        {
+            Err(errs) => {
+                let mut message =
+                    Message::error("Parse error".to_string(), std::ops::Range::default());
+
+                errs.iter().for_each(|err| {
+                    message.push(Label::new(err.to_string(), err.span().into_range()));
+                });
+
+                Err(message)
+            }
+            Ok(ast) => Ok(ast),
+        }
     }
 }
 
@@ -674,7 +802,7 @@ mod tests {
                 Self::Assignment(n, e) => {
                     write!(f, "{} = {}", n.1, e.1)
                 }
-                Self::Noop => write!(f, "@"),
+                Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
                 e => todo!("Missing rest of nodes: {:?}", e),
             }
         }
@@ -749,6 +877,7 @@ mod tests {
         assert_eq!(
             "fn main() -> void {\nprint \"Hello, %s\", 42;\n}",
             stmt!("fn main() -> void {\n  print \"Hello, %s\", 42;\n  }")
-        )
+        );
+        same!("foo(1, 3, 4) * foo(2)");
     }
 }

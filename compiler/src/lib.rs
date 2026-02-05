@@ -4,7 +4,7 @@ mod typechecker;
 use std::{borrow::Borrow, collections::HashMap};
 
 use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
-use parser::{Expression, SimpleSpan};
+use parser::{SimpleSpan, pratt::Expression};
 
 pub use pipeline::*;
 pub use typechecker::*;
@@ -31,9 +31,8 @@ struct Context {
     variables: Interner<String>,
     symbols: Interner<String>,
     assignments: HashMap<String, bool>,
-    ref_counts: HashMap<usize, usize>,
     constants: HashMap<usize, bool>,
-    defers: Vec<(usize, usize, Vec<Byte>)>,
+    defers: Vec<usize>,
     classes: HashMap<String, Vec<(String, usize)>>,
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
@@ -86,7 +85,6 @@ impl<'ctx> Context {
             impementations: self.impementations.clone(),
             methods: self.methods.clone(),
             defers: Vec::default(),
-            ref_counts: self.ref_counts.clone(),
             constants: self.constants.clone(),
             assignments: self.assignments.clone(),
             variables: self.variables.clone(),
@@ -159,21 +157,22 @@ impl Compiler {
                 }
                 self.aliases.insert(
                     alias.clone().unwrap_or(name.to_string()),
-                    format!("{}{}", prefix.join("::"), name.to_string()),
+                    format!("{}{}", prefix.join("::"), name),
                 );
             }
             Expression::Noop(_) => (),
+            Expression::Group(e) => bytecode.append(&mut self.do_compile(e)),
             Expression::Program(children) | Expression::Fragment(children) => {
-                for child in children {
+                children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
-                }
+                });
             }
             Expression::Block(children) => {
                 let ctx = self.context.child();
                 self.context = ctx;
-                for child in children {
+                children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
-                }
+                });
 
                 self.context = *self.context.get_prev().clone().unwrap();
             }
@@ -184,28 +183,21 @@ impl Compiler {
                 body,
             } => {
                 self.functions.insert(
-                    format!("{}{}", self.namespace, name.to_string()),
+                    format!("{}{}", self.namespace, name),
                     self.bytecode.len(),
                 );
 
-                for arg in args.iter().rev() {
-                    let mut a = self.do_compile(arg);
+                let mut a = self.do_compile(args);
 
-                    self.bytecode.append(&mut a);
-                }
+                self.bytecode.append(&mut a);
 
-                for child in body {
-                    let mut c = self.do_compile(child);
-                    self.bytecode.append(&mut c);
-                }
+                let mut c = self.do_compile(body);
+                self.bytecode.append(&mut c);
 
-                for (offset, arity, x) in self.context.defers.iter() {
-                    self.bytecode.append(&mut x.clone());
-                    self.bytecode
-                        .push(Byte::new(Instruction::CALL).with_operand_u32(*arity as u32));
+                self.context.defers.iter().for_each(|offset| {
                     self.bytecode
                         .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                }
+                });
 
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
@@ -260,13 +252,12 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
             }
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
-                for (offset, arity, x) in self.context.defers.iter() {
-                    self.bytecode.append(&mut x.clone());
+                self.context.defers.iter().for_each(|offset| {
                     self.bytecode
-                        .push(Byte::new(Instruction::CALL).with_operand_u32(*arity as u32));
+                        .push(Byte::new(Instruction::CALL).with_operand_u32(0));
                     self.bytecode
                         .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                }
+                });
 
                 // if let Expression::Identifier(name) = *expr.1.borrow() {
                 //     let ty = self.typechecker.get_variable_type(&name.into());
@@ -289,14 +280,9 @@ impl Compiler {
                 //     }
                 // }
 
-                if matches!(expr.1.borrow(), Expression::Identifier(_)) {
-                    let symbol = self.context.variables.intern(self.resolve_variable(expr));
-                    if matches!(self.typecheck(expr), Type::OBJECT(_) | Type::STRING) {
-                        self.context.ref_counts.entry(symbol).and_modify(|v| {
-                            *v += 1;
-                        });
-                    }
-                }
+                // if matches!(expr.1.borrow(), Expression::Identifier(_)) {
+                //     let symbol = self.context.variables.intern(self.resolve_variable(expr));
+                // }
 
                 bytecode.append(&mut self.do_compile(expr));
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
@@ -310,7 +296,7 @@ impl Compiler {
                         .iter()
                         .enumerate()
                         .map(|(idx, v)| match v.1.borrow() {
-                            Expression::Field(n, _) => (self.resolve_variable(&n), idx),
+                            Expression::Field(n, _) => (self.resolve_variable(n), idx),
                             _ => unreachable!(
                                 "The should be only fields inside of a class definition"
                             ),
@@ -351,8 +337,8 @@ impl Compiler {
                 self.namespace = namespace;
                 self.functions = functions;
             }
-            Expression::Instantiate(class, args) => {
-                let name = self.resolve_variable(&class);
+            Expression::Instantiate(class, _args) => {
+                let name = self.resolve_variable(class);
                 bytecode.push(
                     Byte::new(Instruction::INIT)
                         .with_operand_u32(self.context.classes[&name].len() as u32),
@@ -389,18 +375,10 @@ impl Compiler {
 
                 self.bytecode.append(&mut loop_);
             }
-            Expression::Defer(deps, child) => {
+            Expression::Defer(child) => {
                 let mut body = vec![Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)];
-                let mut args = vec![];
-                let mut arity = 0;
-                for arg in deps.iter() {
-                    args.append(&mut self.do_compile(arg));
-                    arity += 1;
-                }
 
-                self.context
-                    .defers
-                    .push((self.bytecode.len() + body.len(), arity, args));
+                self.context.defers.push(self.bytecode.len() + body.len());
 
                 body.append(&mut self.do_compile(child));
                 body.push(Byte::new_with_value(
@@ -423,13 +401,16 @@ impl Compiler {
                 let n = self.aliases.get(&identifier).unwrap_or(&identifier);
 
                 if let Some(offset) = self.functions.get(n).copied() {
-                    for arg in args {
-                        bytecode.append(&mut self.do_compile(arg));
+                    if let Some(args) = args {
+                        args.iter()
+                            .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                     }
 
-                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(args.len() as u32));
+                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(
+                        args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                    ));
                     bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
-                } else if let Some(_) = self.native.get(n) {
+                } else if self.native.get(n).is_some() {
                     todo!("Not implemented");
                 } else {
                     let mut message =
@@ -440,6 +421,10 @@ impl Compiler {
                     ));
                     self.messages.push(message);
                 }
+            }
+            Expression::Argument(_, n) => {
+                let _ = self.context.variables.intern(n.to_string());
+                // bytecode.push(Byte::new(Instruction::LOAD)
             }
             Expression::Identifier(n) => {
                 if let Some(symbol) = self.context.variables.key(&n.to_string()) {
@@ -460,7 +445,7 @@ impl Compiler {
                     .map(|(_, branch)| {
                         if let Expression::Branch(condition, body) = branch.borrow() {
                             (
-                                condition.as_ref().map(|c| self.do_compile(&c)),
+                                condition.as_ref().map(|c| self.do_compile(c)),
                                 self.do_compile(body),
                             )
                         } else {
@@ -536,13 +521,11 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(if self.typecheck(lhs) == Type::FLOAT {
-                        Instruction::GTF
+                        Instruction::LEQF
                     } else {
-                        Instruction::GT
-                    },)
+                        Instruction::LEQ
+                    })
                 );
-
-                bytecode.push(Byte::new(Instruction::NOT))
             }
             Expression::Geq(lhs, rhs) => {
                 binary!(
@@ -551,13 +534,11 @@ impl Compiler {
                     lhs,
                     rhs,
                     Byte::new(if self.typecheck(lhs) == Type::FLOAT {
-                        Instruction::LEF
+                        Instruction::GEQF
                     } else {
-                        Instruction::LE
+                        Instruction::GEQ
                     })
                 );
-
-                bytecode.push(Byte::new(Instruction::NOT))
             }
             Expression::Eq(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
@@ -649,7 +630,7 @@ impl Compiler {
                 Value::from(*num).raw() as _,
             )),
             Expression::String(str) => {
-                let mut escaped = str
+                let escaped = str
                     .replace("\\n", "\n")
                     .replace("\\r", "\r")
                     .replace("\\t", "\t")
@@ -679,10 +660,12 @@ impl Compiler {
 
                 let mut count = 0;
 
-                for ch in escaped.chars() {
-                    count += 1;
-                    bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                }
+                escaped
+                    .chars()
+                    .inspect(|_| count += 1)
+                    .for_each(|ch| {
+                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                    });
 
                 bytecode.insert(
                     idx,
@@ -690,9 +673,7 @@ impl Compiler {
                 );
             }
             Expression::Variable(name, _ty) => {
-                let name = self.resolve_variable(name);
-
-                if unlikely(self.context.variables.contains(&name)) {
+                if unlikely(self.context.variables.contains(&name.to_string())) {
                     let mut message =
                         Message::error("Variable redeclaration".to_string(), span.into_range());
                     message.push(Label::new(
@@ -702,7 +683,7 @@ impl Compiler {
                     self.messages.push(message);
                 }
 
-                self.context.variables.intern(name);
+                self.context.variables.intern(name.to_string());
             }
             Expression::Constant(name, _ty) => {
                 let name = self.resolve_variable(name);
@@ -750,14 +731,6 @@ impl Compiler {
                     // let ty = self.typecheck(value);
                     let mut expr = self.do_compile(value);
 
-                    if matches!(value.1.borrow(), Expression::Identifier(_)) {
-                        let symbol = self.context.variables.intern(self.resolve_variable(value));
-                        if matches!(self.typecheck(value), Type::OBJECT(_) | Type::STRING) {
-                            self.context.ref_counts.entry(symbol).and_modify(|v| {
-                                *v += 1;
-                            });
-                        }
-                    }
                     bytecode.append(&mut expr);
                     bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
 
@@ -784,7 +757,7 @@ impl Compiler {
                 let mut jumps: Vec<usize> = Vec::with_capacity(children.len());
                 let last_idx = children.len() - 1;
 
-                for (idx, (rhs, body)) in children.iter().enumerate() {
+                children.iter().enumerate().for_each(|(idx, (rhs, body))| {
                     let is_condition = !matches!(*rhs.1, Expression::Default(_));
 
                     if !is_condition && idx != last_idx {
@@ -793,7 +766,7 @@ impl Compiler {
                             span.into_range(),
                         );
                         message.push(Label::new(
-                            format!("Code after this block is not reachable"),
+                            "Code after this block is not reachable".to_string(),
                             rhs.0.into_range(),
                         ));
                         message.with_help(
@@ -818,15 +791,15 @@ impl Compiler {
                     bytecode.append(&mut body);
                     jumps.push(bytecode.len());
                     bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
-                }
+                });
 
                 let len = bytecode.len();
-                for jump in jumps {
-                    if let Some(instruction) = bytecode.get_mut(jump) {
+                jumps.iter().for_each(|jump| {
+                    if let Some(instruction) = bytecode.get_mut(*jump) {
                         *instruction = Byte::new(Instruction::JMP)
                             .with_operand_u32((self.bytecode.len() + len) as u32);
                     }
-                }
+                });
             }
             _expr => {
                 let mut message =

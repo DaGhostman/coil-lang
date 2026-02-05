@@ -1,4 +1,4 @@
-use std::ops::{Index, IndexMut, Range};
+use std::ops::{Index, IndexMut};
 
 use crate::{likely, promise, unlikely};
 

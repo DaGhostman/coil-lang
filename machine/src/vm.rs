@@ -1,11 +1,11 @@
-use std::{collections::HashMap, io::Write, ops::Deref, ptr::NonNull};
+use std::{fmt::Write, io::Write as _};
 
 use common::{
-    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec,
-    Instruction as _Instruction, SeekableIterator, Value, unlikely,
+    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, SeekableIterator, Value,
+    unlikely,
 };
 
-use crate::{Byte as _Byte, Frame, Heap, ObjInstance, ObjString, Object, Stack};
+use crate::{Frame, Heap, ObjInstance, ObjString, Object, Stack};
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -180,7 +180,7 @@ impl<const S: usize> Machine<S> {
     }
 
     #[inline(always)]
-    fn execute<'iter>(&mut self, code: &mut SeekableIterator<'iter, Byte>) -> ExecutionResult {
+    fn execute(&mut self, code: &mut SeekableIterator<'_, Byte>) -> ExecutionResult {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
@@ -248,16 +248,20 @@ impl<const S: usize> Machine<S> {
                 Instruction::DIV => binary!(self.stack, /, as_int),
                 Instruction::MOD => binary!(self.stack, %, as_int),
                 Instruction::LE => binary!(self.stack, <, raw),
+                Instruction::LEQ => binary!(self.stack, <=, raw),
                 Instruction::GT => binary!(self.stack, >, raw),
+                Instruction::GEQ => binary!(self.stack, >=, raw),
                 Instruction::EQ => binary!(self.stack, ==, raw),
-                Instruction::LEF => binary!(self.stack, <=, raw),
-                Instruction::GTF => binary!(self.stack, >=, raw),
                 Instruction::NEQ => binary!(self.stack, !=, raw),
                 Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
                 Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
                 Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
                 Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
                 Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
+                Instruction::LEF => binary!(self.stack, <, as_float),
+                Instruction::LEQF => binary!(self.stack, <=, as_float),
+                Instruction::GTF => binary!(self.stack, >, as_float),
+                Instruction::GEQF => binary!(self.stack, >=, as_float),
                 Instruction::FORMAT => {
                     let params_count = opcode.operand_u32();
                     if params_count != 0 {
@@ -282,13 +286,18 @@ impl<const S: usize> Machine<S> {
                                     }
                                     Some('f') => {
                                         chars.next();
-                                        message
-                                            .push_str(&format!("{:.?}", params.pop().as_float()));
+                                        // message
+                                        //     .push_str(&format!("{:.?}", params.pop().as_float()));
+                                        let _ =
+                                            write!(&mut message, "{:.?}", params.pop().as_float());
                                     }
                                     Some('b') => {
                                         chars.next();
-                                        message
-                                            .push_str(&format!("{:0b}", params.pop().raw().addr()));
+                                        let _ = write!(
+                                            &mut message,
+                                            "{:0b}",
+                                            params.pop().raw().addr()
+                                        );
                                     }
                                     Some('s') => {
                                         chars.next();
@@ -301,8 +310,11 @@ impl<const S: usize> Machine<S> {
                                     }
                                     Some('x') => {
                                         chars.next();
-                                        message
-                                            .push_str(&format!("{:0x}", params.pop().raw().addr()));
+                                        let _ = write!(
+                                            &mut message,
+                                            "{:0x}",
+                                            params.pop().raw().addr()
+                                        );
                                     }
                                     Some('z') => {
                                         chars.next();
@@ -318,10 +330,11 @@ impl<const S: usize> Machine<S> {
                                     }
                                     Some('p') => {
                                         chars.next();
-                                        message.push_str(&format!(
+                                        let _ = write!(
+                                            &mut message,
                                             "{:08x}",
                                             params.pop().as_ptr::<bool>().addr()
-                                        ));
+                                        );
                                     }
                                     _ => {
                                         message.push('%');
@@ -336,7 +349,7 @@ impl<const S: usize> Machine<S> {
                             .heap
                             .alloc(ObjString::from(message.as_str()), Object::String);
 
-                        self.stack.push(Value::from(obj.addr() as u64));
+                        self.stack.push(Value::from(obj.addr()));
                     }
                 }
                 Instruction::PRINT => {
@@ -386,7 +399,7 @@ impl<const S: usize> Machine<S> {
                         .heap
                         .alloc(ObjString::from(value.as_str()), Object::String);
 
-                    self.stack.push(Value::from(object.addr() as u64));
+                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::NOOP => continue,
                 _ => return ExecutionResult::invalid(),

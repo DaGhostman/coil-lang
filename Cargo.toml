@@ -16,7 +16,7 @@ ariadne = { version = "0.6.0", features = ["auto-color"] }
 rkyv = "0.8.12"
 
 [dev-dependencies]
-criterion = { version = "^0.7", features = ["html_reports"] }
+criterion = { version = "^0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "fib"

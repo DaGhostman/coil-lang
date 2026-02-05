@@ -15,28 +15,22 @@ impl From<(usize, usize)> for Frame {
     }
 }
 
-impl Into<(usize, usize)> for Frame {
-    fn into(self) -> (usize, usize) {
-        (self.ip, self.sp)
+impl From<Frame> for (usize, usize) {
+    fn from(val: Frame) -> Self {
+        (val.ip, val.sp)
     }
 }
 
+#[derive(Default)]
 pub struct Frame {
     ip: usize,
     sp: usize,
 }
 
-impl Default for Frame {
-    fn default() -> Self {
-        Self {
-            ip: 0,
-            sp: 0,
-        }
-    }
-}
 
 impl Frame {
     #[inline]
+    #[must_use] 
     pub fn tell(&self) -> usize {
         self.ip
     }
@@ -52,6 +46,7 @@ impl Frame {
     }
 
     #[inline]
+    #[must_use] 
     pub fn get(&self) -> usize {
         self.sp
     }

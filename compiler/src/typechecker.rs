@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, collections::HashMap, vec::Drain};
 
 use common::{Label, Message};
-use parser::{Expression, SimpleSpan};
+use parser::{SimpleSpan, pratt::Expression};
 
 pub struct Typechecker {
     functions: HashMap<String, (Vec<Type>, Type)>,
@@ -121,7 +121,19 @@ impl Typechecker {
                     n.to_string().into()
                 }
             }
-            Expression::Constant(name, ty) | Expression::Variable(name, ty) => {
+            Expression::Variable(name, ty) => {
+                let t = if ty.is_some() {
+                    ty.as_ref().map(|v| self.check(v)).unwrap_or_default()
+                } else {
+                    Type::default()
+                };
+
+                self.variables
+                    .insert(name.to_string(), (t.clone(), span.into_range()));
+
+                t
+            }
+            Expression::Constant(name, ty) => {
                 let t = if ty.is_some() {
                     ty.as_ref().map(|v| self.check(v)).unwrap_or_default()
                 } else {
@@ -133,6 +145,13 @@ impl Typechecker {
 
                 t
             }
+            Expression::Argument(t, n) => {
+                let t: Type = t.to_string().into();
+                self.variables
+                    .insert(n.to_string(), (t.clone(), span.into_range()));
+
+                t
+            }
             Expression::Function {
                 name,
                 args,
@@ -141,22 +160,29 @@ impl Typechecker {
             } => {
                 let variables = self.variables.drain().collect::<Vec<_>>();
 
-                let args = args.iter().map(|arg| self.check(arg)).collect::<Vec<_>>();
+                let args = if let Expression::Fragment(args) = args.1.as_ref() {
+                    args.iter().map(|arg| self.check(arg)).collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                // dbg!(&args);
+                // let args = self.check(args);
 
                 self.functions.insert(
                     name.to_string(),
                     (
-                        args.clone(),
-                        returns
-                            .clone()
-                            .map(|v| self.resolve_variable(&v).into())
+                        args,
+                        (*returns)
+                            .map(|v| v.to_string().into())
                             .unwrap_or_default(),
                     ),
                 );
 
-                body.iter().for_each(|stmt| {
-                    let _ = self.check(stmt);
-                });
+                let _ = self.check(body);
+
+                // body.iter().for_each(|stmt| {
+                //     let _ = self.check(stmt);
+                // });
 
                 self.variables
                     .drain()
@@ -176,9 +202,8 @@ impl Typechecker {
                     });
                 self.variables.extend(variables);
 
-                returns
-                    .clone()
-                    .map(|return_| self.check(&return_))
+                (*returns)
+                    .map(|return_| return_.to_string().into())
                     .unwrap_or_default()
             }
             Expression::Assignment(name, value) => {
@@ -223,6 +248,7 @@ impl Typechecker {
                     Type::default()
                 }
             }
+            Expression::Group(e) => self.check(e),
             Expression::Block(stmts) | Expression::Program(stmts) | Expression::Fragment(stmts) => {
                 let mut expected = None;
                 let mut expected_location = std::ops::Range::default();
@@ -270,8 +296,8 @@ impl Typechecker {
                         .iter()
                         .map(|v| match v.1.borrow() {
                             Expression::Field(n, t) => (
-                                self.resolve_variable(&n),
-                                Type::from(self.resolve_variable(&t)),
+                                self.resolve_variable(n),
+                                Type::from(self.resolve_variable(t)),
                             ),
                             _ => unreachable!("Class definition does not contain only fields"),
                         })
@@ -305,7 +331,7 @@ impl Typechecker {
             Expression::Comment(..) | Expression::Use { .. } => Type::NONE,
             Expression::Call { name, args } => {
                 let name = self.resolve_variable(name);
-                let call_arity = args.len();
+                let call_arity = args.to_owned().unwrap_or_default().len();
                 if let Some(func) = self.functions.get(&name).cloned() {
                     if call_arity != func.0.len() {
                         let mut message =
@@ -321,7 +347,7 @@ impl Typechecker {
                         ));
                         self.messages.push(message);
                     } else {
-                        for (idx, arg) in args.iter().enumerate() {
+                        for (idx, arg) in args.to_owned().unwrap_or_default().iter().enumerate() {
                             let ty = self.check(arg);
                             if func.0[idx] != ty {
                                 let mut message = Message::error(

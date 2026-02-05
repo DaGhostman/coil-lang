@@ -7,8 +7,9 @@ use std::{
 };
 
 use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
-use common::{ArchivedByte, Byte, Instruction, Interner, Message, MessageKind, Value};
-use parser::{Expression, ParserBuilder, SimpleSpan};
+use common::{ArchivedByte, Byte, Instruction, Interner, Message, MessageKind};
+use parser::ParserBuilder;
+use parser::pratt::{Expression, Pratt, SimpleSpan};
 use rkyv::{rancor::Error, vec::ArchivedVec};
 
 use crate::Compiler;
@@ -123,16 +124,18 @@ impl<'pipeline> Pipeline<'pipeline> {
         let src = std::fs::read_to_string(file.as_str()).expect("Failed to open file");
         self.processed.insert(file.clone());
 
-        match self.parser.parse(src.as_str()) {
+        let parser = Pratt::default();
+
+        // match self.parser.parse(src.as_str()) {
+        match parser.parse(src.as_str()) {
             Ok(ast) => {
-                dbg!(&ast);
                 self.visit(&ast);
                 let bytecode = self.compiler.compile(ns.as_str(), &ast);
 
                 self.bytecode = bytecode;
 
                 for message in self.compiler.get_messages() {
-                    Self::render_errors(file.clone(), src.as_str(), &message);
+                    Self::render_errors(file.clone(), src.as_str(), message);
                 }
             }
             Err(e) => Self::render_errors(file, src.as_str(), &e),
@@ -156,7 +159,7 @@ impl<'pipeline> Pipeline<'pipeline> {
         .expect("Unable to write compiled output to file");
     }
 
-    pub fn run(mut self, filename: String) -> Result<Vec<Byte>, ()> {
+    pub fn run(self, filename: String) -> Result<Vec<Byte>, ()> {
         let mut f = File::open(filename).expect("Unable to find file");
         let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");

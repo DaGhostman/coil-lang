@@ -1,8 +1,9 @@
 use std::borrow::Borrow;
+use std::fmt::Display;
 use std::marker::PhantomData;
 use std::num::{ParseFloatError, ParseIntError};
 
-mod pratt;
+pub mod pratt;
 
 pub use pratt::*;
 
@@ -138,6 +139,7 @@ macro_rules! output {
     };
 }
 
+#[allow(clippy::float_cmp)]
 macro_rules! binary_op {
     ($lhs: expr, $rhs: expr, $op: tt, $output: ident) => {
         match ($lhs, $rhs) {
@@ -235,7 +237,7 @@ fn constant_fold<'expr>(expr: &'expr Expression<'expr>) -> Expression<'expr> {
 
         Expression::Not(expr) => Some(unary_op(expr.1.borrow(), |a| match a {
             Expression::Bool(b) => Expression::Bool(!b),
-            _ => Expression::from(*expr.1.clone()), //*expr.1.clone()
+            _ => *expr.1.clone(), //*expr.1.clone()
         })),
 
         // @TODO: Handle remaining cases.
@@ -285,9 +287,9 @@ impl From<Rich<'_, char>> for ParserError {
     }
 }
 
-impl ToString for ParserError {
-    fn to_string(&self) -> String {
-        self.message.clone()
+impl Display for ParserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
     }
 }
 
@@ -296,13 +298,14 @@ pub struct ParserBuilder<'parser> {
     _data: PhantomData<&'parser ()>,
 }
 
-impl<'parser> Default for ParserBuilder<'parser> {
+impl Default for ParserBuilder<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<'parser> ParserBuilder<'parser> {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             prefix: String::default(),
@@ -310,17 +313,15 @@ impl<'parser> ParserBuilder<'parser> {
         }
     }
 
-    fn ident(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn ident()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Copy
     + 'parser {
         text::ident().padded().map_with(output!(Identifier))
     }
 
-    fn type_(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn type_()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Copy
     + 'parser {
         text::ident().padded().map_with(output!(Type))
@@ -331,7 +332,6 @@ impl<'parser> ParserBuilder<'parser> {
             + Clone
             + 'parser,
     >(
-        &self,
         expr: T,
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
@@ -365,7 +365,6 @@ impl<'parser> ParserBuilder<'parser> {
             + Clone
             + 'parser,
     >(
-        &self,
         expr: T,
     ) -> impl Parser<
         'parser,
@@ -382,25 +381,20 @@ impl<'parser> ParserBuilder<'parser> {
             .delimited_by(op!('('), op!(')'))
     }
 
-    fn inc(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn inc() -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Copy
     + 'parser {
-        self.ident().then_ignore(just("++")).map_with(output!(Inc))
+        Self::ident().then_ignore(just("++")).map_with(output!(Inc))
     }
 
-    fn dec(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn dec() -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Copy
     + 'parser {
-        self.ident().then_ignore(just("--")).map_with(output!(Dec))
+        Self::ident().then_ignore(just("--")).map_with(output!(Dec))
     }
 
-    fn expression(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn expression()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
         recursive(|expr| {
@@ -455,13 +449,12 @@ impl<'parser> ParserBuilder<'parser> {
                 .delimited_by(just('['), just(']'));
 
             let atom = float
-                .clone()
                 .or(int)
                 .or(bool)
-                .or(str.clone())
-                .or(self.comment(expr.clone()))
+                .or(str)
+                .or(Self::comment(expr.clone()))
                 .or(expr.clone().delimited_by(just('('), just(')')))
-                .or(self.ident());
+                .or(Self::ident());
 
             let fallback = text::keyword("default").padded().map_with(output!(Default));
 
@@ -470,8 +463,7 @@ impl<'parser> ParserBuilder<'parser> {
                 .clone()
                 .map_with(output!(Member));
 
-            let assignment = self
-                .ident()
+            let _assignment = Self::ident()
                 .then_ignore(op!('='))
                 .then(expr.clone())
                 .map_with(|(name, value), e| {
@@ -509,14 +501,14 @@ impl<'parser> ParserBuilder<'parser> {
 
             let init = text::keyword("new")
                 .padded()
-                .ignore_then(self.ident().then(self.params(expr.clone())))
+                .ignore_then(Self::ident().then(Self::params(expr.clone())))
                 .map_with(|(name, args), e| {
                     (e.span(), Box::new(Expression::Instantiate(name, args)))
                 });
 
             let call = atom
                 .clone()
-                .then(self.params(expr.clone()))
+                .then(Self::params(expr.clone()))
                 .map_with(|(f, args), e| {
                     (
                         e.span(),
@@ -526,7 +518,7 @@ impl<'parser> ParserBuilder<'parser> {
                         }),
                     )
                 });
-            let pattern = fallback.or(atom.clone()).or(str.clone()).or(bool).clone();
+            let pattern = fallback.or(atom.clone()).or(str).or(bool).clone();
 
             let arm = pattern
                 .then_ignore(op!("=>"))
@@ -540,22 +532,22 @@ impl<'parser> ParserBuilder<'parser> {
                 .allow_trailing()
                 .collect::<Vec<_>>();
 
-            let match_ = text::keyword("match")
+            let _match_ = text::keyword("match")
                 .padded()
                 .ignored()
                 .then(expr.clone())
                 .then(op!('{').ignored())
                 .then(arm)
                 .then(op!('}').ignored())
-                .map_with(|(((((), pattern), _), arms), _), e| {
+                .map_with(|(((((), pattern), ()), arms), ()), e| {
                     (e.span(), Box::new(Expression::Match(pattern, arms)))
                 });
 
-            let yield_ = text::keyword("yield")
+            let _yield_ = text::keyword("yield")
                 .ignore_then(expr.clone())
                 .map_with(output!(Yield));
 
-            let resume = text::keyword("resume")
+            let _resume = text::keyword("resume")
                 .ignore_then(expr.clone())
                 .then(expr.clone().delimited_by(op!('('), op!(')')).or_not())
                 .map_with(|(expr, arg), e| (e.span(), Box::new(Expression::Resume(expr, arg))));
@@ -634,10 +626,10 @@ impl<'parser> ParserBuilder<'parser> {
                 .or(member)
                 // .or(assignment)
                 .or(binary)
-                .or(self.inc())
-                .or(self.dec())
+                .or(Self::inc())
+                .or(Self::dec())
                 // .or(binary)
-                .or(self.dot(expr.clone()))
+                .or(Self::dot(expr.clone()))
                 .or(list)
                 .or(atom)
         })
@@ -646,19 +638,17 @@ impl<'parser> ParserBuilder<'parser> {
         .memoized()
     }
 
-    fn expression_stmt(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn expression_stmt()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
-        self.expression()
+        Self::expression()
             .then_ignore(op!(';'))
             .map_with(output!(ExprStatement))
     }
 
-    fn statement(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn statement()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
         recursive(|stmt| {
@@ -672,7 +662,7 @@ impl<'parser> ParserBuilder<'parser> {
             let if_ = recursive(|if_| {
                 text::keyword("if")
                     .padded()
-                    .then(self.expression())
+                    .then(Self::expression())
                     .then(block.clone().or(stmt.clone()))
                     .then(
                         op!("else")
@@ -692,12 +682,12 @@ impl<'parser> ParserBuilder<'parser> {
                         if let Some((_, list)) = branches
                             && let Expression::Block(body) = *list
                         {
-                            body.iter().for_each(|(_, branch)| {
+                            for (_, branch) in &body {
                                 if let Expression::If(branches) = branch.borrow() {
                                     result.append(&mut branches.clone());
                                 }
-                            })
-                        };
+                            }
+                        }
 
                         if let Some((span, alt)) = alternative {
                             result.push((span, Box::new(Expression::Branch(None, (span, alt)))));
@@ -709,11 +699,11 @@ impl<'parser> ParserBuilder<'parser> {
 
             let for_ = text::keyword("for")
                 .padded()
-                .ignore_then(self.ident())
+                .ignore_then(Self::ident())
                 .then(text::keyword("in").padded().ignored())
-                .then(self.expression())
+                .then(Self::expression())
                 .then(block.clone())
-                .map_with(|(((item, _), iterable), body), e| {
+                .map_with(|(((item, ()), iterable), body), e| {
                     (
                         e.span(),
                         Box::new(Expression::Loop {
@@ -725,7 +715,7 @@ impl<'parser> ParserBuilder<'parser> {
                 });
 
             let while_ = text::keyword("while")
-                .ignore_then(self.expression())
+                .ignore_then(Self::expression())
                 .then(block.clone())
                 .map_with(|(iterable, body), e| {
                     (
@@ -742,9 +732,9 @@ impl<'parser> ParserBuilder<'parser> {
 
             let declaration = text::keyword("let")
                 .padded()
-                .ignore_then(self.ident())
-                .then(op!(':').ignore_then(self.type_()).or_not())
-                .then(op!('=').ignore_then(self.expression().clone()).or_not())
+                .ignore_then(Self::ident())
+                .then(op!(':').ignore_then(Self::type_()).or_not())
+                .then(op!('=').ignore_then(Self::expression().clone()).or_not())
                 .map_with(|((name, type_), assignment), e| {
                     let mut vals = vec![];
                     vals.push((
@@ -752,7 +742,7 @@ impl<'parser> ParserBuilder<'parser> {
                         Box::new(Expression::Variable(name.clone(), type_)),
                     ));
                     if let Some(assignment) = assignment {
-                        vals.push((e.span(), Box::new(Expression::Assignment(name, assignment))))
+                        vals.push((e.span(), Box::new(Expression::Assignment(name, assignment))));
                     }
 
                     (
@@ -767,9 +757,9 @@ impl<'parser> ParserBuilder<'parser> {
 
             let constant = text::keyword("const")
                 .padded()
-                .ignore_then(self.ident())
-                .then(op!(':').ignore_then(self.type_()).or_not())
-                .then(op!('=').ignore_then(self.expression().clone()).or_not())
+                .ignore_then(Self::ident())
+                .then(op!(':').ignore_then(Self::type_()).or_not())
+                .then(op!('=').ignore_then(Self::expression().clone()).or_not())
                 .map_with(|((name, type_), assignment), e| {
                     let mut vals = vec![];
                     vals.push((
@@ -778,7 +768,7 @@ impl<'parser> ParserBuilder<'parser> {
                     ));
 
                     if let Some(assignment) = assignment {
-                        vals.push((e.span(), Box::new(Expression::Assignment(name, assignment))))
+                        vals.push((e.span(), Box::new(Expression::Assignment(name, assignment))));
                     }
 
                     (e.span(), Box::new(Expression::Fragment(vals)))
@@ -788,10 +778,10 @@ impl<'parser> ParserBuilder<'parser> {
             let print = text::keyword("print")
                 .padded()
                 .ignore_then(
-                    self.expression()
+                    Self::expression()
                         .then(
                             op!(',')
-                                .ignore_then(self.expression())
+                                .ignore_then(Self::expression())
                                 .repeated()
                                 .collect::<Vec<_>>()
                                 .or_not(),
@@ -804,10 +794,10 @@ impl<'parser> ParserBuilder<'parser> {
             let format = text::keyword("fmt")
                 .padded()
                 .ignore_then(
-                    self.expression()
+                    Self::expression()
                         .then(
                             op!(',')
-                                .ignore_then(self.expression())
+                                .ignore_then(Self::expression())
                                 .repeated()
                                 .collect::<Vec<_>>()
                                 .or_not(),
@@ -821,15 +811,17 @@ impl<'parser> ParserBuilder<'parser> {
                 .padded()
                 .ignore_then(
                     text::keyword("use")
-                        .ignore_then(self.params(self.expression()).clone())
+                        .ignore_then(Self::params(Self::expression()).clone())
                         .or_not(),
                 )
-                .then(block.clone().or(self.expression().then_ignore(op!(';'))))
+                .then(block.clone().or(Self::expression().then_ignore(op!(';'))))
                 .map_with(|(imports, body), e| {
                     (
                         e.span(),
                         Box::new(Expression::Defer(
-                            imports.map(|v| v.unwrap_or_default()).unwrap_or_default(),
+                            imports
+                                .map(std::option::Option::unwrap_or_default)
+                                .unwrap_or_default(),
                             body,
                         )),
                     )
@@ -837,11 +829,11 @@ impl<'parser> ParserBuilder<'parser> {
 
             let return_ = text::keyword("return")
                 .padded()
-                .ignore_then(self.expression().then_ignore(op!(';')))
+                .ignore_then(Self::expression().then_ignore(op!(';')))
                 .map_with(output!(Return));
             let yield_ = text::keyword("yield")
                 .padded()
-                .ignore_then(self.expression().then_ignore(op!(';')))
+                .ignore_then(Self::expression().then_ignore(op!(';')))
                 .map_with(output!(Yield));
 
             choice((
@@ -854,37 +846,34 @@ impl<'parser> ParserBuilder<'parser> {
                 loop_,
                 declaration,
                 constant,
-                self.expression_stmt(),
-                self.comment(self.expression()),
+                Self::expression_stmt(),
+                Self::comment(Self::expression()),
                 block,
             ))
             .map_with(|value, e| (e.span(), Box::new(Expression::Statement(value))))
         })
     }
 
-    fn block(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn block()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
-        self.statement()
+        Self::statement()
             .repeated()
             .collect()
             .map_with(output!(Block))
             .delimited_by(op!('{'), op!('}'))
     }
 
-    fn args(
-        &self,
-    ) -> impl Parser<
+    fn args() -> impl Parser<
         'parser,
         &'parser str,
         Option<Vec<(Output<'parser>, Output<'parser>)>>,
         extra::Err<Rich<'parser, char>>,
     > + Clone
     + 'parser {
-        self.type_()
-            .then(self.ident())
+        Self::type_()
+            .then(Self::ident())
             .separated_by(op!(','))
             .at_least(0)
             .allow_trailing()
@@ -898,13 +887,11 @@ impl<'parser> ParserBuilder<'parser> {
             + Clone
             + 'parser,
     >(
-        &self,
         expr: T,
     ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
-        let access = self
-            .ident()
+        let access = Self::ident()
             .then_ignore(op!("."))
             .then(text::ident().padded().map_with(output!(Access)))
             .map_with(|(member, a), e| (e.span(), Box::new(Expression::Fragment(vec![member, a]))));
@@ -929,12 +916,11 @@ impl<'parser> ParserBuilder<'parser> {
         // access.or(update)
     }
 
-    fn class(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn class()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
-        let field = self.ident().then_ignore(op!(":")).then(self.type_());
+        let field = Self::ident().then_ignore(op!(":")).then(Self::type_());
 
         text::keyword("class")
             .padded()
@@ -959,9 +945,8 @@ impl<'parser> ParserBuilder<'parser> {
             })
     }
 
-    fn impl_(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn impl_()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
         text::keyword("impl")
@@ -978,7 +963,7 @@ impl<'parser> ParserBuilder<'parser> {
                 text::keyword("pub")
                     .padded()
                     .or_not()
-                    .then(self.func())
+                    .then(Self::func())
                     .map_with(|(visibility, func), e| {
                         (
                             e.span(),
@@ -994,24 +979,22 @@ impl<'parser> ParserBuilder<'parser> {
                     e.span(),
                     Box::new(Expression::Implementation(
                         interface,
-                        owner.map(|(_, owner)| owner).unwrap_or(interface),
+                        owner.map_or(interface, |((), owner)| owner),
                         functions,
                     )),
                 )
             })
     }
 
-    fn func(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn func() -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
         text::keyword("fn")
             .padded()
             .ignore_then(text::ident().or_not())
-            .then(self.args())
-            .then(op!("->").ignore_then(self.ident()).or_not())
-            .then(self.block())
+            .then(Self::args())
+            .then(op!("->").ignore_then(Self::ident()).or_not())
+            .then(Self::block())
             .map_with(|(((name, args), ret), body), e| {
                 (
                     e.span(),
@@ -1037,9 +1020,7 @@ impl<'parser> ParserBuilder<'parser> {
             })
     }
 
-    fn use_(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
+    fn use_() -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>>
     + Clone
     + 'parser {
         let submodules = text::ident()
@@ -1053,7 +1034,7 @@ impl<'parser> ParserBuilder<'parser> {
             )
             .then_ignore(op!(",").or_not())
             .repeated()
-            .collect::<Vec<_>>()
+            .collect::<Vec<(&'parser str, Option<&'parser str>)>>()
             .delimited_by(op!('{'), op!('}'));
 
         text::keyword("use")
@@ -1069,25 +1050,22 @@ impl<'parser> ParserBuilder<'parser> {
             .map_with(|(mut path, children), e| {
                 let mut imports: Vec<Expression<'parser>> = vec![];
 
-                match children {
-                    Some(children) => children.iter().for_each(
-                        |(name, alias): &(&'parser str, Option<&'parser str>)| {
-                            imports.push(Expression::Use {
-                                path: path.iter().map(ToString::to_string).collect(),
-                                name: name.to_string(),
-                                alias: alias.map(ToString::to_string),
-                            });
-                        },
-                    ),
-                    None => {
-                        let name: Option<&'parser str> = path.pop();
-
+                if let Some(children) = children {
+                    for (name, alias) in &children {
                         imports.push(Expression::Use {
-                            name: name.expect("Unable to get name").to_string(),
                             path: path.iter().map(ToString::to_string).collect(),
-                            alias: None,
-                        })
+                            name: name.to_string(),
+                            alias: alias.map(ToString::to_string),
+                        });
                     }
+                } else {
+                    let name: Option<&'parser str> = path.pop();
+
+                    imports.push(Expression::Use {
+                        name: name.expect("Unable to get name").to_string(),
+                        path: path.iter().map(ToString::to_string).collect(),
+                        alias: None,
+                    });
                 }
 
                 (
@@ -1102,15 +1080,14 @@ impl<'parser> ParserBuilder<'parser> {
             })
     }
 
-    fn build(
-        &self,
-    ) -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>> + 'parser
+    fn build()
+    -> impl Parser<'parser, &'parser str, Output<'parser>, extra::Err<Rich<'parser, char>>> + 'parser
     {
-        self.func()
-            .or(self.impl_())
-            .or(self.class())
-            .or(self.use_())
-            .or(self.comment(self.expression()))
+        Self::func()
+            .or(Self::impl_())
+            .or(Self::class())
+            .or(Self::use_())
+            .or(Self::comment(Self::expression()))
             .repeated()
             .collect()
             .map_with(output!(Program))
@@ -1119,14 +1096,14 @@ impl<'parser> ParserBuilder<'parser> {
     }
 
     pub fn parse(&self, src: &'parser str) -> Result<Output<'parser>, common::Message> {
-        match self.build().parse(src).into_result() {
+        match Self::build().parse(src).into_result() {
             Ok(ast) => Ok(ast),
             Err(errs) => {
                 let mut message =
                     Message::error("Parse error".to_string(), std::ops::Range::default());
-                errs.iter().for_each(|err| {
+                for err in errs {
                     message.push(Label::new(err.to_string(), err.span().into_range()));
-                });
+                }
 
                 Err(message)
             }

@@ -173,7 +173,7 @@ impl Heap {
 
         let mut gray = Vec::with_capacity(values.len());
         while let Some(reference) = current {
-            if !reference.is_marked() && values.contains(&(reference.addr() as u64)) {
+            if !reference.is_marked() && values.contains(&{ reference.addr() }) {
                 reference.mark(&mut gray);
             }
 
@@ -282,6 +282,7 @@ impl Object {
     }
 
     /// Return whether the object is marked.
+    #[must_use] 
     pub fn is_marked(&self) -> bool {
         match self {
             Self::String(s) => s.is_marked(),
@@ -297,17 +298,15 @@ impl Object {
             Self::Instance(i) => i.as_ref().fields.iter().for_each(|(k, v)| {
                 k.mark();
 
-                match v {
-                    Member::Object(i) => {
-                        i.mark(grey_objects);
-                    }
-                    _ => (),
-                };
+                if let Member::Object(i) = v {
+                    i.mark(grey_objects);
+                }
             }),
         }
     }
 
     /// Get the next object reference in the linked list.
+    #[must_use] 
     pub fn get_next(&self) -> Option<Self> {
         match self {
             Self::String(s) => s.get_next(),
@@ -323,6 +322,7 @@ impl Object {
         }
     }
 
+    #[must_use] 
     pub fn addr(&self) -> u64 {
         match self {
             Self::String(s) => s.as_ptr() as u64,
@@ -360,6 +360,7 @@ pub struct ObjInstance {
 }
 
 impl ObjInstance {
+    #[must_use] 
     pub fn default() -> Self {
         Self {
             fields: Table::default(),
@@ -388,6 +389,7 @@ pub struct ObjString {
 }
 
 impl ObjString {
+    #[must_use] 
     pub fn hash(s: &str) -> u32 {
         let mut hash = 2_166_136_261;
         for b in s.bytes() {
@@ -491,6 +493,7 @@ pub struct Gc<T> {
 }
 
 impl<T> Gc<T> {
+    #[must_use] 
     pub fn new(boxed: Box<GcData<T>>) -> Self {
         Self {
             ptr: NonNull::from(Box::leak(boxed)),
@@ -501,10 +504,12 @@ impl<T> Gc<T> {
         _ = unsafe { Box::from_raw(self.ptr.as_ptr()) };
     }
 
+    #[must_use] 
     pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
         lhs.ptr.eq(&rhs.ptr)
     }
 
+    #[must_use] 
     pub const fn as_ptr(&self) -> *const GcData<T> {
         self.ptr.as_ptr()
     }
@@ -553,6 +558,7 @@ impl<V> Default for Table<V> {
 
 impl<V> Table<V> {
     #[inline]
+    #[must_use] 
     pub const fn new() -> Self {
         Self(UnsafeCell::new(Store::new()))
     }

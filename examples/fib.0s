@@ -1,24 +1,9 @@
-// fn fib(int n) -> int {
-//     if n < 2 {
-//         return n;
-//     }
-// 
-//     return fib(n - 1) + fib(n - 2);
-// }
-
 fn fib(int n) -> int {
-    let i = 0;
-    let a = 0;
-    let b = 1;
-    let c = 0;
-
-    while i < (n - 1) {
-        c = b;
-        b = a + b;
-        a = c;
-        i++;
+    if n <= 2 {
+        return 1;
     }
-    return b;
+
+    return fib(n - 1) + fib(n - 2);
 }
 
 fn main() {

@@ -24,8 +24,6 @@ pub enum Instruction {
     JMPF,
     STRING,
     DATA,
-    ACQUIRE,
-    RELEASE,
     INC,
     DEC,
 
@@ -50,9 +48,13 @@ pub enum Instruction {
     EQ,
     NEQ,
     LE,
+    LEQ,
     LEF,
+    LEQF,
     GT,
+    GEQ,
     GTF,
+    GEQF,
     // -- Keyword
     PRINT,
     FORMAT,
