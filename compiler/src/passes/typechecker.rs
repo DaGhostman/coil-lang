@@ -146,7 +146,20 @@ impl<const N: usize> TypeChecker<N> {
                             "Unable to invoke a method on non-object".to_string(),
                         ));
                     }
-                    // TODO: Add method existence and argument type checking
+                    // Check method existence and argument types
+                    let obj_type = self.peek(op.operand(1));
+                    if let Kind::Object(methods) = obj_type.kind() {
+                        let method_name = op.operand(0);
+                        if !methods.contains_key(&method_name) {
+                            self.errors.push(Error::new(
+                                ErrorOrigin::COMPILE,
+                                format!("Method '{}' does not exist on object", method_name),
+                            ));
+                        } else {
+                            let method_type = methods.get(&method_name).unwrap();
+                            // TODO: Check argument types against method signature
+                        }
+                    }
                 }
                 _ => (),
             }
