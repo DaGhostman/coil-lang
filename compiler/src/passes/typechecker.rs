@@ -29,6 +29,13 @@ impl<const N: usize> Default for TypeChecker<N> {
 
 impl<const N: usize> TypeChecker<N> {
     fn push(&mut self, type_: Type) {
+        if self.sp >= N {
+            self.errors.push(Error::new(
+                ErrorOrigin::COMPILE,
+                "Type stack overflow".to_string(),
+            ));
+            return;
+        }
         self.stack[self.sp] = type_;
         self.sp += 1;
     }
@@ -36,7 +43,7 @@ impl<const N: usize> TypeChecker<N> {
     fn pop(&mut self, n: usize) -> Type {
         let sp = self.sp;
         self.sp -= n;
-        self.stack[sp]
+        self.stack[sp - n]
     }
 
     fn peek(&self, offset: usize) -> Type {
@@ -64,7 +71,9 @@ impl<const N: usize> TypeChecker<N> {
                     self.pop(op.operand(0));
                 }
                 Byte::Add | Byte::Sub | Byte::Mul | Byte::Div => {
-                    let type_ = match (self.pop(1).kind(), self.pop(1).kind()) {
+                    let right = self.pop(1);
+                    let left = self.pop(1);
+                    let type_ = match (left.kind(), right.kind()) {
                         (Kind::Integer, Kind::Integer) => Kind::Integer,
                         (Kind::Float, Kind::Float) => Kind::Float,
                         (Kind::Integer, Kind::Float) => Kind::Float,
@@ -74,9 +83,7 @@ impl<const N: usize> TypeChecker<N> {
                                 ErrorOrigin::COMPILE,
                                 format!(
                                     "{:?} {:?} {:?} has invalid types and is therefore not allowed",
-                                    l,
-                                    op.byte(),
-                                    r
+                                    l, op.byte(), r
                                 ),
                             ));
                             Kind::None
@@ -86,21 +93,20 @@ impl<const N: usize> TypeChecker<N> {
                     self.push(Type::new(type_));
                 }
                 Byte::Less | Byte::LessEqual | Byte::Equal | Byte::Greater | Byte::GreaterEqual => {
-                    let r = self.pop(1);
-                    let l = self.pop(1);
+                    let right = self.pop(1);
+                    let left = self.pop(1);
 
-                    match (l.kind(), r.kind()) {
+                    // Only allow comparisons between compatible types
+                    match (left.kind(), right.kind()) {
                         (Kind::Integer, Kind::Integer) => (),
                         (Kind::Float, Kind::Float) => (),
-                        (Kind::Integer, Kind::Float) => (),
-                        (Kind::Float, Kind::Integer) => (),
                         (Kind::String, Kind::String) => (),
                         (Kind::Object(_), Kind::Object(_)) => (),
                         (Kind::List(_), Kind::List(_)) => (),
                         _ => {
                             self.errors.push(Error::new(
                                 ErrorOrigin::COMPILE,
-                                format!("Unable to do a comparison between {:?} and {:?}", l, r),
+                                format!("Unable to compare incompatible types: {:?} and {:?}", left, right),
                             ));
                         }
                     }
@@ -117,29 +123,22 @@ impl<const N: usize> TypeChecker<N> {
                     self.push(op.get_type());
                 }
                 Byte::Load => {
+                    if !variables.contains_key(&op.operand(0)) {
+                        self.errors.push(Error::new(
+                            ErrorOrigin::COMPILE,
+                            format!("Undefined variable: {}", op.operand(0)),
+                        ));
+                    }
                     self.push(
                         variables
                             .get(&op.operand(0))
                             .copied()
-                            .unwrap_or(op.get_type()),
+                            .unwrap_or_else(|| op.get_type()),
                     );
-                    // self.push(variables[&op.operand(0)]);
-                    // self.push(if let Some(kind) = op.kind() {
-                    //     kind
-                    // } else {
-                    //     Type::None
-                    // });
                 }
                 Byte::Instantiate => {
                     self.push(op.get_type());
                 }
-                // Byte::This => {
-                //     self.push(if let Some(kind) = op.kind() {
-                //         kind
-                //     } else {
-                //         Type::None
-                //     });
-                // }
                 Byte::Invoke => {
                     if !matches!(self.peek(op.operand(1)).kind(), Kind::Object(_)) {
                         self.errors.push(Error::new(
@@ -147,9 +146,10 @@ impl<const N: usize> TypeChecker<N> {
                             "Unable to invoke a method on non-object".to_string(),
                         ));
                     }
+                    // TODO: Add method existence and argument type checking
                 }
                 _ => (),
-            };
+            }
 
             bytecode.push(op);
             ip += 1;
@@ -181,94 +181,5 @@ impl<const N: usize> CompilationPass for TypeChecker<N> {
         }
 
         Ok(code)
-        // let mut variables: HashMap<usize, Type> = HashMap::new();
-        //
-        // for op in program.code() {
-        //     match op.code() {
-        //         Operation::Const => {
-        //             match program
-        //                 .constant(op.get(0).copied().unwrap_or_default())
-        //                 .map(|v| v.kind())
-        //             {
-        //                 Some(ValueType::BOOLEAN(_)) => self.types.push(Type::Bool),
-        //                 Some(ValueType::INTEGER(_)) => self.types.push(Type::Integer),
-        //                 Some(ValueType::FLOAT(_)) => self.types.push(Type::Float),
-        //                 Some(ValueType::STRING(_)) => self.types.push(Type::String),
-        //                 Some(ValueType::NONE) => self.types.push(Type::None),
-        //                 Some(ValueType::FUNCTION(_, _)) => self.types.push(Type::Function),
-        //                 a => {
-        //                     return Err(Error::new(
-        //                         common::error::ErrorOrigin::RUNTIME,
-        //                         "Unknown type".to_string(),
-        //                     ));
-        //                 }
-        //             }
-        //         }
-        //
-        //         Operation::Add | Operation::Subtract | Operation::Multiply | Operation::Divide => {
-        //             match (self.types.pop(), self.types.pop()) {
-        //                 (Some(Type::Integer), Some(Type::Integer)) => {
-        //                     self.types.push(Type::Integer);
-        //                 }
-        //                 (Some(Type::Float), Some(Type::Float)) => {
-        //                     self.types.push(Type::Float);
-        //                 }
-        //                 (Some(Type::Integer), Some(Type::Float)) => {
-        //                     self.types.push(Type::Float);
-        //                 }
-        //                 (Some(Type::Float), Some(Type::Integer)) => {
-        //                     self.types.push(Type::Float);
-        //                 }
-        //                 (Some(Type::String), Some(Type::String)) => {
-        //                     self.types.push(Type::String);
-        //                 }
-        //                 _ => todo!("Not implemented operation check"),
-        //             }
-        //         }
-        //         Operation::Modulo
-        //         | Operation::BitAnd
-        //         | Operation::BitOr
-        //         | Operation::BitXor
-        //         | Operation::LeftShift
-        //         | Operation::RightShift => {
-        //             if let (Some(Type::Integer), Some(Type::Integer)) =
-        //                 (self.types.pop(), self.types.pop())
-        //             {
-        //                 self.types.push(Type::Integer);
-        //             } else {
-        //                 todo!("Operation not supported for types other than integers")
-        //             }
-        //         }
-        //         Operation::Equal
-        //         | Operation::Less
-        //         | Operation::LessEqual
-        //         | Operation::Greater
-        //         | Operation::GreaterEqual => {
-        //             if let (Some(rhs), Some(lhs)) = (self.types.pop(), self.types.pop()) {
-        //                 if lhs != rhs {
-        //                     todo!("Unable to handle comparison between incompatible types")
-        //                 } else {
-        //                     self.types.push(Type::Bool)
-        //                 }
-        //             }
-        //         }
-        //         Operation::Argument => {
-        //             // name, type, offset
-        //             variables.insert(
-        //                 op.get(0).cloned().unwrap_or(0),
-        //                 (op.get(1).cloned().unwrap_or(0)).into(),
-        //             );
-        //         }
-        //         Operation::Load => {
-        //             self.types.push(
-        //                 variables
-        //                     .get(&op.operands()[0])
-        //                     .cloned()
-        //                     .unwrap_or_default(),
-        //             );
-        //         }
-        //         _ => (),
-        //     }
-        // }
     }
 }
