@@ -8,29 +8,27 @@ use std::{
 
 use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
 use common::{ArchivedByte, Byte, Instruction, Interner, Message, MessageKind};
-use parser::ParserBuilder;
-use parser::pratt::{Expression, Pratt, SimpleSpan};
+use parser::{Pratt, SimpleSpan, ast::Expression};
 use rkyv::{rancor::Error, vec::ArchivedVec};
 
 use crate::Compiler;
 
-pub struct Pipeline<'pipeline> {
+pub struct Pipeline {
     failed: bool,
     cwd: PathBuf,
     bytecode: Vec<Byte>,
     processed: HashSet<String>,
     compiler: Compiler,
-    parser: ParserBuilder<'pipeline>,
     interner: Interner<String>,
 }
 
-impl<'pipeline> Default for Pipeline<'pipeline> {
+impl Default for Pipeline {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'pipeline> Pipeline<'pipeline> {
+impl Pipeline {
     pub fn register_native_function(&mut self, name: String) {
         self.interner.intern(name);
 
@@ -47,7 +45,6 @@ impl<'pipeline> Pipeline<'pipeline> {
             processed: HashSet::default(),
             interner: Interner::default(),
             compiler: Compiler::default(),
-            parser: ParserBuilder::new(),
         }
     }
 
@@ -126,7 +123,6 @@ impl<'pipeline> Pipeline<'pipeline> {
 
         let parser = Pratt::default();
 
-        // match self.parser.parse(src.as_str()) {
         match parser.parse(src.as_str()) {
             Ok(ast) => {
                 self.visit(&ast);

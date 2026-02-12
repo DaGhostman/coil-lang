@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, collections::HashMap, vec::Drain};
 
 use common::{Label, Message};
-use parser::{SimpleSpan, pratt::Expression};
+use parser::{SimpleSpan, ast::Expression};
 
 pub struct Typechecker {
     functions: HashMap<String, (Vec<Type>, Type)>,
@@ -78,7 +78,7 @@ impl Typechecker {
         match variable.1.borrow() {
             Expression::Identifier(n) | Expression::Type(n) => n.to_string(),
             f => {
-                dbg!(&f);
+                eprintln!("{}", f);
                 todo!("Function name as expression")
             }
         }
@@ -172,9 +172,7 @@ impl Typechecker {
                     name.to_string(),
                     (
                         args,
-                        (*returns)
-                            .map(|v| v.to_string().into())
-                            .unwrap_or_default(),
+                        (*returns).map(|v| v.to_string().into()).unwrap_or_default(),
                     ),
                 );
 
@@ -569,11 +567,11 @@ impl Typechecker {
             Expression::Loop { .. } => Type::NONE,
             e => {
                 #[cfg(debug_assertions)]
-                dbg!(e);
+                eprintln!("{}", e);
                 let mut message =
                     Message::error("Unknown expression".to_string(), span.into_range());
                 message.push(Label::new(
-                    format!("Unknown expression '{:?}'", e),
+                    format!("Unknown expression '{}'", e),
                     span.into_range(),
                 ));
                 self.messages.push(message);

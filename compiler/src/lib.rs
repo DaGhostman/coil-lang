@@ -1,10 +1,11 @@
 mod pipeline;
 mod typechecker;
+mod typechecking;
 
 use std::{borrow::Borrow, collections::HashMap};
 
 use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
-use parser::{SimpleSpan, pratt::Expression};
+use parser::{SimpleSpan, ast::Expression};
 
 pub use pipeline::*;
 pub use typechecker::*;
@@ -126,7 +127,7 @@ impl Compiler {
         match variable.1.borrow() {
             Expression::Identifier(n) => n.to_string(),
             f => {
-                dbg!(&f);
+                eprintln!("{}", f);
                 todo!("Function name as expression")
             }
         }
@@ -182,10 +183,8 @@ impl Compiler {
                 returns: _returns,
                 body,
             } => {
-                self.functions.insert(
-                    format!("{}{}", self.namespace, name),
-                    self.bytecode.len(),
-                );
+                self.functions
+                    .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
 
                 let mut a = self.do_compile(args);
 
@@ -660,12 +659,9 @@ impl Compiler {
 
                 let mut count = 0;
 
-                escaped
-                    .chars()
-                    .inspect(|_| count += 1)
-                    .for_each(|ch| {
-                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                    });
+                escaped.chars().inspect(|_| count += 1).for_each(|ch| {
+                    bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                });
 
                 bytecode.insert(
                     idx,
