@@ -806,7 +806,7 @@ impl Compiler {
                 ));
                 self.messages.push(message);
                 #[cfg(debug_assertions)]
-                dbg!(_expr);
+                eprintln!("{}", _expr);
             }
         }
 
