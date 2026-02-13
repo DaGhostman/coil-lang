@@ -744,7 +744,7 @@ impl Compiler {
                         ),
                         span.into_range(),
                     ));
-                self.messages.push(message);
+                    self.messages.push(message);
                 }
             }
             Expression::Match(lhs, children) => {
@@ -758,11 +758,13 @@ impl Compiler {
                     let expr = child.1.as_ref();
                     match expr {
                         Expression::MatchArm(pattern, body) => {
-                            let is_condition = !matches!(pattern.1.as_ref(), Expression::Default(_));
+                            let is_condition =
+                                !matches!(pattern.1.as_ref(), Expression::Default(_));
 
                             if !is_condition && jumps.len() != last_idx {
                                 let mut message = Message::warn(
-                                    "`default` branch should be at the end of expression".to_string(),
+                                    "`default` branch should be at the end of expression"
+                                        .to_string(),
                                     child.0.clone().into_range(),
                                 );
                                 message.push(Label::new(
@@ -770,7 +772,8 @@ impl Compiler {
                                     child.0.clone().into_range(),
                                 ));
                                 message.with_help(
-                                    "Maybe you need to move this to the bottom of the list?".to_string(),
+                                    "Maybe you need to move this to the bottom of the list?"
+                                        .to_string(),
                                 );
                                 self.messages.push(message);
                             }
@@ -784,7 +787,8 @@ impl Compiler {
                             let mut body_code = self.do_compile(&body);
                             if is_condition {
                                 bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
-                                    (self.bytecode.len() + bytecode.len() + body_code.len() + 2) as u32,
+                                    (self.bytecode.len() + bytecode.len() + body_code.len() + 2)
+                                        as u32,
                                 ));
                             }
                             bytecode.append(&mut body_code);
@@ -841,11 +845,11 @@ impl Compiler {
 
         self.messages
             .append(&mut self.typechecker.get_messages().collect());
-        // let messages = self.typechecker.get_messages();
-        // self.messages.reserve(messages.len());
-        // for message in messages {
-        //     self.messages.push(message.clone());
-        // }
+        let messages = self.typechecker.get_messages();
+        self.messages.reserve(messages.len());
+        for message in messages {
+            self.messages.push(message.clone());
+        }
 
         self.bytecode.append(&mut program);
 
