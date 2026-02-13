@@ -88,7 +88,22 @@ pub enum Expression<'expr> {
         body: Output<'expr>,
     },
 
-    Match(Output<'expr>, Vec<(Output<'expr>, Output<'expr>)>),
+    Match(Output<'expr>, Vec<Output<'expr>>),
+
+    // HM Type System Features
+    TypeVar(&'expr str, usize),      // Type variable for inference
+    SumType(Vec<Expression<'expr>>), // Sum type (enum)
+    Variant(&'expr str, Vec<Expression<'expr>>), // Variant for sum type
+    GenericDecl(Vec<&'expr str>, Output<'expr>), // Generic type declaration
+    GenericCall(&'expr str, Vec<Output<'expr>>), // Generic type call
+    InterfaceDecl(&'expr str, Vec<Expression<'expr>>), // Interface definition
+    StructDecl(&'expr str, Vec<Expression<'expr>>), // Struct definition
+    ImplTrait(&'expr str, &'expr str), // Trait implementation
+    MatchArm(Output<'expr>, Output<'expr>), // Match arm with pattern
+    TypePattern(Vec<Expression<'expr>>), // Pattern matching type
+    FieldPattern(&'expr str, Option<Output<'expr>>), // Field pattern
+    TypeAlias(&'expr str, Output<'expr>), // Type alias
+    NewType(&'expr str, Output<'expr>), // New type declaration
 
     Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
@@ -206,6 +221,52 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{} = {}", n.1, e.1)
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
+            Self::TypeVar(name, id) => write!(f, "T<{}:{}>", id, name),
+            Self::SumType(variants) => {
+                let names = variants
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                write!(f, "enum<{}>", names)
+            }
+            Self::Variant(name, _) => write!(f, "{}", name),
+            Self::GenericDecl(params, body) => {
+                let p = params
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "gen<{}> {{ {} }}", p, body.1)
+            }
+            Self::GenericCall(name, args) => {
+                let a = args
+                    .iter()
+                    .map(|a| a.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "{}<{}>", name, a)
+            }
+            Self::InterfaceDecl(name, _methods) => {
+                write!(f, "interface {} {{ ... }}", name)
+            }
+            Self::StructDecl(name, _fields) => {
+                write!(f, "struct {} {{ ... }}", name)
+            }
+            Self::ImplTrait(r#trait, r#type) => {
+                write!(f, "impl {} for {}", r#trait, r#type)
+            }
+            Self::MatchArm(_pattern, body) => {
+                write!(f, "match arm {{ ... }}: {}", body.1)
+            }
+            Self::TypePattern(_) => write!(f, "type pattern {{ ... }}"),
+            Self::FieldPattern(name, _) => write!(f, "{}", name),
+            Self::TypeAlias(name, target) => {
+                write!(f, "type {} = {}", name, target.1)
+            }
+            Self::NewType(name, target) => {
+                write!(f, "newtype {} = {}", name, target.1)
+            }
             e => todo!("Missing rest of nodes: {}", e),
         }
     }

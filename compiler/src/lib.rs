@@ -744,50 +744,66 @@ impl Compiler {
                         ),
                         span.into_range(),
                     ));
-                    self.messages.push(message);
+                self.messages.push(message);
                 }
             }
             Expression::Match(lhs, children) => {
-                let lhs = self.do_compile(lhs);
+                let mut lhs_code = self.do_compile(lhs);
+                bytecode.append(&mut lhs_code);
 
                 let mut jumps: Vec<usize> = Vec::with_capacity(children.len());
                 let last_idx = children.len() - 1;
 
-                children.iter().enumerate().for_each(|(idx, (rhs, body))| {
-                    let is_condition = !matches!(*rhs.1, Expression::Default(_));
+                for child in children.iter() {
+                    let expr = child.1.as_ref();
+                    match expr {
+                        Expression::MatchArm(pattern, body) => {
+                            let is_condition = !matches!(pattern.1.as_ref(), Expression::Default(_));
 
-                    if !is_condition && idx != last_idx {
-                        let mut message = Message::warn(
-                            "`default` branch should be at the end of expression".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(Label::new(
-                            "Code after this block is not reachable".to_string(),
-                            rhs.0.into_range(),
-                        ));
-                        message.with_help(
-                            "Maybe you need to move this to the bottom of the list?".to_string(),
-                        );
+                            if !is_condition && jumps.len() != last_idx {
+                                let mut message = Message::warn(
+                                    "`default` branch should be at the end of expression".to_string(),
+                                    child.0.clone().into_range(),
+                                );
+                                message.push(Label::new(
+                                    "Code after this block is not reachable".to_string(),
+                                    child.0.clone().into_range(),
+                                ));
+                                message.with_help(
+                                    "Maybe you need to move this to the bottom of the list?".to_string(),
+                                );
+                                self.messages.push(message);
+                            }
 
-                        self.messages.push(message);
+                            if is_condition {
+                                let mut pattern_code = self.do_compile(&pattern);
+                                bytecode.append(&mut pattern_code);
+                                bytecode.push(Byte::new(Instruction::EQ));
+                            }
+
+                            let mut body_code = self.do_compile(&body);
+                            if is_condition {
+                                bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
+                                    (self.bytecode.len() + bytecode.len() + body_code.len() + 2) as u32,
+                                ));
+                            }
+                            bytecode.append(&mut body_code);
+                            jumps.push(bytecode.len());
+                            bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
+                        }
+                        _ => {
+                            let mut message = Message::error(
+                                "Invalid match arm".to_string(),
+                                child.0.clone().into_range(),
+                            );
+                            message.push(Label::new(
+                                "Match arm must be a case expression".to_string(),
+                                child.0.clone().into_range(),
+                            ));
+                            self.messages.push(message);
+                        }
                     }
-
-                    if is_condition {
-                        bytecode.append(&mut lhs.clone());
-                        bytecode.append(&mut self.do_compile(rhs));
-                        bytecode.push(Byte::new(Instruction::EQ));
-                    }
-
-                    let mut body = self.do_compile(body);
-                    if is_condition {
-                        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
-                            (self.bytecode.len() + bytecode.len() + body.len() + 2) as u32,
-                        ));
-                    }
-                    bytecode.append(&mut body);
-                    jumps.push(bytecode.len());
-                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
-                });
+                }
 
                 let len = bytecode.len();
                 jumps.iter().for_each(|jump| {

@@ -123,8 +123,9 @@ This file tracks implementation progress across all phases and tasks.
 - [x] Implement `infer()` method for expression inference - ✅
 - [x] Implement `solve_constraints()` to run HM algorithm - ✅
 - [x] Return type errors with proper spans - ✅
+- [x] Add match expression handling in compiler - ✅
 
-**Notes:** Task 2.1 completed. Created HmTypeChecker with full expression inference support
+**Notes:** Task 2.1 completed. Created HmTypeChecker with full expression inference support and Match expression handling
 
 ---
 

@@ -494,11 +494,12 @@ impl<'pratt> Pratt<'pratt> {
             choice((
                 self.while_(stmt.clone()),
                 self.if_(stmt.clone()),
+                self.match_(stmt.clone()),
                 self.block(stmt.clone()),
-                self.variable().then_ignore(op!(';')),
+                self.variable().then_ignore(op!(";")),
                 self.expr_statement(),
-                self.print().then_ignore(op!(';')),
-                self.return_().then_ignore(op!(';')),
+                self.print().then_ignore(op!(";")),
+                self.return_().then_ignore(op!(";")),
                 self.comment(),
             ))
         })
@@ -532,6 +533,51 @@ impl<'pratt> Pratt<'pratt> {
                     result.push(v);
                 }
                 (e.span(), Box::new(Expression::Fragment(result)))
+            })
+    }
+
+    fn match_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("match")
+            .ignore_then(self.expr())
+            .then(
+                op!("{")
+                    .ignore_then(
+                        self.match_arm(stmt.clone())
+                            .repeated()
+                            .collect::<Vec<_>>()
+                            .then_ignore(op!(",").or_not())
+                    )
+                    .or_not()
+                    .delimited_by(op!("{"), op!("}"))
+            )
+            .map_with(|(lhs, arms), e| {
+                let arms = arms.unwrap_or_default();
+                (e.span(), Box::new(Expression::Match(lhs, arms)))
+            })
+    }
+
+    fn match_arm<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("case")
+            .ignore_then(self.expr())
+            .then(op!("=>").ignore_then(self.block(stmt)))
+            .map_with(|(pattern, body), e| {
+                (e.span(), Box::new(Expression::MatchArm(pattern, body)))
             })
     }
 

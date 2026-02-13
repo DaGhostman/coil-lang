@@ -508,61 +508,61 @@ impl Typechecker {
             //
             //     expr
             // }
-            Expression::Match(lhs, children) => {
-                let lhs_ = self.check(lhs);
-                let mut expected = None;
-                let mut expected_location = std::ops::Range::default();
-
-                for (rhs, body) in children {
-                    if !matches!(*rhs.1, Expression::Default(_)) {
-                        let current = self.check(rhs);
-
-                        if lhs_ != current {
-                            let mut message =
-                                Message::error("Invalid comparison".to_string(), span.into_range());
-                            message.push(Label::new(
-                                format!("Expression is of type '{}'", lhs_.to_string()),
-                                lhs.0.into_range(),
-                            ));
-                            message.push(Label::new(
-                                format!(
-                                    "Found expression to be of type '{}', while expecting '{}'",
-                                    current.to_string(),
-                                    lhs_.to_string()
-                                ),
-                                rhs.0.into_range(),
-                            ));
-                            self.messages.push(message);
-                        }
-                    }
-
-                    let body_ = self.check(body);
-                    if expected.is_none() {
-                        expected = Some(body_.clone());
-                        expected_location = body.0.into_range();
-                    } else if expected != Some(body_.clone()) {
-                        let mut message = Message::error(
-                            "Unexpected return value".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(Label::new(
-                            format!("Result of this block is '{}'", body_.to_string()),
-                            expected_location.clone(),
-                        ));
-                        message.push(Label::new(
-                            format!(
-                                "Expected this block to result in '{}' but found '{}' instead.",
-                                expected.clone().unwrap().to_string(),
-                                body_.to_string()
-                            ),
-                            body.0.into_range(),
-                        ));
-                        self.messages.push(message);
-                    }
-                }
-
-                expected.unwrap_or_default()
-            }
+            // Expression::Match(lhs, children) => {
+            //     let lhs_ = self.check(lhs);
+            //     let mut expected = None;
+            //     let mut expected_location = std::ops::Range::default();
+            //
+            //     for (rhs, body) in children {
+            //         if !matches!(*rhs.1, Expression::Default(_)) {
+            //             let current = self.check(rhs);
+            //
+            //             if lhs_ != current {
+            //                 let mut message =
+            //                     Message::error("Invalid comparison".to_string(), span.into_range());
+            //                 message.push(Label::new(
+            //                     format!("Expression is of type '{}'", lhs_.to_string()),
+            //                     lhs.0.into_range(),
+            //                 ));
+            //                 message.push(Label::new(
+            //                     format!(
+            //                         "Found expression to be of type '{}', while expecting '{}'",
+            //                         current.to_string(),
+            //                         lhs_.to_string()
+            //                     ),
+            //                     rhs.0.into_range(),
+            //                 ));
+            //                 self.messages.push(message);
+            //             }
+            //         }
+            //
+            //         let body_ = self.check(body);
+            //         if expected.is_none() {
+            //             expected = Some(body_.clone());
+            //             expected_location = body.0.into_range();
+            //         } else if expected != Some(body_.clone()) {
+            //             let mut message = Message::error(
+            //                 "Unexpected return value".to_string(),
+            //                 span.into_range(),
+            //             );
+            //             message.push(Label::new(
+            //                 format!("Result of this block is '{}'", body_.to_string()),
+            //                 expected_location.clone(),
+            //             ));
+            //             message.push(Label::new(
+            //                 format!(
+            //                     "Expected this block to result in '{}' but found '{}' instead.",
+            //                     expected.clone().unwrap().to_string(),
+            //                     body_.to_string()
+            //                 ),
+            //                 body.0.into_range(),
+            //             ));
+            //             self.messages.push(message);
+            //         }
+            //     }
+            //
+            //     expected.unwrap_or_default()
+            // }
             Expression::Inc(_) | Expression::Dec(_) => Type::INTEGER,
             Expression::Loop { .. } => Type::NONE,
             e => {
