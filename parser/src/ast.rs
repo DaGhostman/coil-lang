@@ -257,7 +257,7 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "impl {} for {}", r#trait, r#type)
             }
             Self::MatchArm((_, pattern), (_, body)) => {
-                write!(f, "{} => {}", pattern, body)
+                write!(f, "case {} => {}", pattern, body)
             }
             Self::TypePattern(_) => write!(f, "type pattern {{ ... }}"),
             Self::FieldPattern(name, _) => write!(f, "{}", name),
@@ -268,11 +268,10 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "newtype {} = {}", name, target.1)
             }
             Self::Match(expr, arms) => {
-                write!(f, "match {} {{\n", expr.1,)?;
+                write!(f, "match {} {{", expr.1)?;
                 for arm in arms {
-                    write!(f, "{}", arm.1)?;
+                    write!(f, "\n  {}", arm.1)?;
                 }
-
                 write!(f, "\n}}")
             }
             Self::Argument(ty, name) => {
