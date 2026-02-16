@@ -1,6 +1,8 @@
+mod hm_typechecker;
 mod pipeline;
 mod typechecker;
 mod typechecking;
+mod types;
 
 use std::{borrow::Borrow, collections::HashMap};
 
@@ -9,6 +11,8 @@ use parser::{SimpleSpan, ast::Expression};
 
 pub use pipeline::*;
 pub use typechecker::*;
+
+use crate::hm_typechecker::HmTypeChecker;
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -53,6 +57,8 @@ pub struct Compiler {
     context: Context,
     // --
     typechecker: Typechecker,
+    // HM Type Checker (new)
+    hm_typechecker: HmTypeChecker,
 }
 
 impl Default for Compiler {
@@ -75,6 +81,8 @@ impl Default for Compiler {
             context: Context::default(),
             // ---
             typechecker: Typechecker::default(),
+            // ---
+            hm_typechecker: HmTypeChecker::new(),
         }
     }
 }
@@ -778,11 +786,9 @@ impl Compiler {
                                 self.messages.push(message);
                             }
 
-                            if is_condition {
-                                let mut pattern_code = self.do_compile(&pattern);
-                                bytecode.append(&mut pattern_code);
-                                bytecode.push(Byte::new(Instruction::EQ));
-                            }
+                            let mut pattern_code = self.do_compile(&pattern);
+                            bytecode.append(&mut pattern_code);
+                            bytecode.push(Byte::new(Instruction::EQ));
 
                             let mut body_code = self.do_compile(&body);
                             if is_condition {

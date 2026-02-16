@@ -256,8 +256,8 @@ impl<'a> Display for Expression<'a> {
             Self::ImplTrait(r#trait, r#type) => {
                 write!(f, "impl {} for {}", r#trait, r#type)
             }
-            Self::MatchArm(_pattern, body) => {
-                write!(f, "match arm {{ ... }}: {}", body.1)
+            Self::MatchArm((_, pattern), (_, body)) => {
+                write!(f, "{} => {}", pattern, body)
             }
             Self::TypePattern(_) => write!(f, "type pattern {{ ... }}"),
             Self::FieldPattern(name, _) => write!(f, "{}", name),
@@ -266,6 +266,14 @@ impl<'a> Display for Expression<'a> {
             }
             Self::NewType(name, target) => {
                 write!(f, "newtype {} = {}", name, target.1)
+            }
+            Self::Match(expr, arms) => {
+                write!(f, "match {} {{\n", expr.1,)?;
+                for arm in arms {
+                    write!(f, "{}", arm.1)?;
+                }
+
+                write!(f, "\n}}")
             }
             e => todo!("Missing rest of nodes: {}", e),
         }

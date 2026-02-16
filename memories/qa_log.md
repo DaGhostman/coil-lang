@@ -184,9 +184,87 @@
 - Type inference: as much as possible, explicit types for ambiguity
 - Error recovery: collect all errors, support warnings, better UX
 
+### D9: Recursive Type Handling
+**Date:** 2026-02-13  
+**Decision:** Use Box<Type> for recursive type fields
+
+**Rationale:**
+- Rust cannot have infinitely sized recursive types without indirection
+- `Box<Type>` provides heap allocation and fixed-size pointer
+- Allows type inference to work with nested/recursive type structures
+
+### D10: Type Module Naming
+**Date:** 2026-02-13  
+**Decision:** Rename type.rs to ty.rs
+
+**Rationale:**
+- `type` is Rust reserved keyword, cannot be used as module name
+- `ty` is short, descriptive, and avoids conflicts
+- Minimal changes to existing code structure
+
+### D11: Substitution Implementation
+**Date:** 2026-02-13  
+**Decision:** Convert Substitution from type alias to struct
+
+**Rationale:**
+- Type aliases in Rust don't support impl blocks
+- Struct wrapper provides proper encapsulation and method implementation
+- More idiomatic Rust pattern for custom collection types
+
 ## Notes
 
 - All decisions should be preserved in this file
 - Add timestamps for traceability
 - Include user input when available
 - Document rationale for each decision
+
+## Implementation Notes - 2026-02-13
+
+### Q9: Recursive Type Handling
+**Date:** 2026-02-13  
+**Question:** How should recursive types be handled in Rust without causing infinite size errors?
+
+**User Input:** 
+- **Preference:** Use `Box<Type>` for recursive type fields
+
+**Decision:** 
+- Use `Box<Type>` for recursive type fields in `Array`, `Function.return_ty`, `Field.ty`, `GenericType.params`, `InterfaceDef.methods`, `TypeAlias.target`
+- Convert `Substitution` from type alias to struct for proper method implementation
+
+**Rationale:**
+- Rust cannot have infinitely sized recursive types without indirection
+- `Box<Type>` provides heap allocation and fixed-size pointer
+- Allows type inference to work with nested/recursive type structures
+
+### Q10: Type Module Name Conflict
+**Date:** 2026-02-13  
+**Question:** `type` is a reserved keyword in Rust, how to handle the type.rs module?
+
+**User Input:** 
+- **Preference:** Rename module to `ty.rs`
+
+**Decision:** 
+- Rename `compiler/src/types/type.rs` to `compiler/src/types/ty.rs`
+- Update all references from `crate::types::type` to `crate::types::ty`
+- Update `mod.rs` to use `pub mod ty`
+
+**Rationale:**
+- `type` is Rust reserved keyword, cannot be used as module name
+- `ty` is short, descriptive, and avoids conflicts
+- Minimal changes to existing code structure
+
+### Q11: Substitution Type Alias Issue
+**Date:** 2026-02-13  
+**Question:** Rust type aliases don't support impl blocks, how to add methods to HashMap?
+
+**User Input:** 
+- **Preference:** Use struct wrapper around HashMap
+
+**Decision:** 
+- Convert `pub type Substitution = HashMap<TypeVar, Type>` to `pub struct Substitution { inner: HashMap<TypeVar, Type> }`
+- Implement all methods on the struct
+
+**Rationale:**
+- Type aliases in Rust don't inherit impl blocks from underlying type
+- Struct wrapper provides proper encapsulation and method implementation
+- More idiomatic Rust pattern for custom collection types

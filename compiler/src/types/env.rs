@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use parser::SimpleSpan;
 
-use crate::types::type::{Type, TypeVar, StructDef, InterfaceDef, Field, Method, GenericType, TypeAlias, Variant};
+use crate::types::ty::{
+    Field, GenericType, InterfaceDef, Method, StructDef, Type, TypeAlias, TypeVar, Variant,
+};
 
 /// Type environment for Hindley-Milner type checking
 #[derive(Debug)]
@@ -180,8 +182,8 @@ impl StructBuilder {
         }
     }
 
-    pub fn field(&mut self, name: &str, ty: Type, span: SimpleSpan) -> &mut Self {
-        self.fields.push(Field::new(name, ty, span));
+    pub fn field(&mut self, name: &str, ty: Type) -> &mut Self {
+        self.fields.push(Field::new(name, ty));
         self
     }
 
@@ -191,7 +193,7 @@ impl StructBuilder {
     }
 
     pub fn build(&self) -> StructDef {
-        let mut def = StructDef::new(&self.name, self.fields.clone(), self.span.clone());
+        let mut def = StructDef::new(&self.name, self.fields.clone());
         def.with_generics(self.generics.clone());
         def
     }
@@ -217,8 +219,8 @@ impl InterfaceBuilder {
         }
     }
 
-    pub fn method(&mut self, name: &str, params: Vec<Type>, return_ty: Type, span: SimpleSpan) -> &mut Self {
-        self.methods.push(Method::new(name, params, return_ty, span));
+    pub fn method(&mut self, name: &str, params: Vec<Type>, return_ty: Type) -> &mut Self {
+        self.methods.push(Method::new(name, params, return_ty));
         self
     }
 
@@ -233,7 +235,7 @@ impl InterfaceBuilder {
     }
 
     pub fn build(&self) -> InterfaceDef {
-        let mut def = InterfaceDef::new(&self.name, self.methods.clone(), self.span.clone());
+        let mut def = InterfaceDef::new(&self.name, self.methods.clone());
         def.with_generics(self.generics.clone());
         def.extends(self.extends.iter().map(|s| s.as_str()).collect());
         def
@@ -256,14 +258,15 @@ impl VariantBuilder {
         }
     }
 
-    pub fn field(&mut self, name: &str, ty: Type, span: SimpleSpan) -> &mut Self {
-        self.fields.push(Field::new(name, ty, span));
+    pub fn field(&mut self, name: &str, ty: Type) -> &mut Self {
+        self.fields.push(Field::new(name, ty));
         self
     }
 
     pub fn build(&self) -> Variant {
-        let mut variant = Variant::new(&self.name, self.span.clone());
+        let mut variant = Variant::new(&self.name);
         variant.with_fields(self.fields.clone());
         variant
     }
 }
+

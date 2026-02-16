@@ -1,9 +1,10 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 
 use parser::SimpleSpan;
 
-use crate::types::type::{Type, TypeVar};
 use crate::types::substitution::Substitution;
+use crate::types::ty::{Type, TypeVar};
 
 /// Result of unification
 #[derive(Debug, Clone)]
@@ -50,7 +51,7 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
 
         // Type variable with concrete type
         (Type::TypeVar(tv), ty) => {
-            if occurs_check(tv, &ty, substitution) {
+            if occurs_check(&tv, &ty, substitution) {
                 UnifyResult::failure("Recursive type binding detected")
             } else {
                 substitution.extend(tv.clone(), ty);
@@ -59,7 +60,7 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
         }
 
         (ty, Type::TypeVar(tv)) => {
-            if occurs_check(tv, &ty, substitution) {
+            if occurs_check(&tv, &ty, substitution) {
                 UnifyResult::failure("Recursive type binding detected")
             } else {
                 substitution.extend(tv.clone(), ty);
@@ -68,7 +69,7 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
         }
 
         // Compound types
-        (Type::Array(t1), Type::Array(t2)) => unify_types(t1, t2, substitution),
+        (Type::Array(t1), Type::Array(t2)) => unify_types(t1.borrow(), t2.borrow(), substitution),
 
         (Type::Function(p1, r1), Type::Function(p2, r2)) => {
             if p1.len() != p2.len() {
@@ -85,7 +86,7 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
             }
 
             // Unify return types
-            match unify_types(r1, r2, &mut subst) {
+            match unify_types(r1.borrow(), r2.borrow(), &mut subst) {
                 UnifyResult::Success(s) => UnifyResult::success(s),
                 UnifyResult::Failure(msg) => UnifyResult::failure(&msg),
             }
@@ -123,16 +124,16 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
         }
 
         // Generic types
-        (Type::Generic(g1), Type::Generic(g2)) => {
-            if g1.name != g2.name {
+        (Type::Generic(r#g1), Type::Generic(r#g2)) => {
+            if r#g1.name != r#g2.name {
                 return UnifyResult::failure("Generic name mismatch");
             }
-            if g1.params.len() != g2.params.len() {
+            if r#g1.params.len() != r#g2.params.len() {
                 return UnifyResult::failure("Generic parameter count mismatch");
             }
 
             let mut subst = substitution.clone();
-            for (p1, p2) in g1.params.iter().zip(g2.params.iter()) {
+            for (p1, p2) in r#g1.params.iter().zip(r#g2.params.iter()) {
                 match unify_types(p1, p2, &mut subst) {
                     UnifyResult::Success(s) => subst = s,
                     UnifyResult::Failure(msg) => return UnifyResult::failure(&msg),
@@ -176,14 +177,14 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
 fn apply_substitution(ty: &Type, substitution: &Substitution) -> Type {
     match ty {
         Type::TypeVar(tv) => substitution.get(tv).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Array(t) => Type::Array(apply_substitution(t, substitution)),
+        Type::Array(t) => Type::Array(Box::new(apply_substitution(t, substitution))),
         Type::Function(params, ret) => {
             let new_params = params
                 .iter()
                 .map(|p| apply_substitution(p, substitution))
                 .collect();
             let new_ret = apply_substitution(ret, substitution);
-            Type::Function(new_params, new_ret)
+            Type::Function(new_params, Box::new(new_ret))
         }
         Type::Tuple(tys) => {
             let new_tys = tys
@@ -196,15 +197,9 @@ fn apply_substitution(ty: &Type, substitution: &Substitution) -> Type {
             let new_fields = def
                 .fields
                 .iter()
-                .map(|f| {
-                    super::type::Field::new(
-                        &f.name,
-                        apply_substitution(&f.ty, substitution),
-                        f.span.clone(),
-                    )
-                })
+                .map(|f| super::ty::Field::new(&f.name, apply_substitution(&f.ty, substitution)))
                 .collect();
-            let mut new_def = super::type::StructDef::new(&def.name, new_fields, def.span.clone());
+            let mut new_def = super::ty::StructDef::new(&def.name, new_fields);
             new_def.with_generics(def.generics.clone());
             Type::Struct(new_def)
         }
@@ -218,56 +213,40 @@ fn apply_substitution(ty: &Type, substitution: &Substitution) -> Type {
                         .iter()
                         .map(|p| apply_substitution(p, substitution))
                         .collect();
-                    super::type::Method::new(
+                    super::ty::Method::new(
                         &m.name,
                         new_params,
                         apply_substitution(&m.return_ty, substitution),
-                        m.span.clone(),
                     )
                 })
                 .collect();
-            let mut new_def = super::type::InterfaceDef::new(
-                &def.name,
-                new_methods,
-                def.span.clone(),
-            );
+            let mut new_def = super::ty::InterfaceDef::new(&def.name, new_methods);
             new_def.with_generics(def.generics.clone());
             new_def.extends(def.extends.iter().map(|s| s.as_str()).collect());
             Type::Interface(new_def)
         }
-        Type::Generic(gen) => {
-            let new_params = gen
+        Type::Generic(r#gen) => {
+            let new_params = r#gen
                 .params
                 .iter()
                 .map(|p| apply_substitution(p, substitution))
                 .collect();
-            Type::Generic(super::type::GenericType::new(
-                &gen.name,
-                new_params,
-                gen.span.clone(),
-            ))
+            Type::Generic(super::ty::GenericType::new(&r#gen.name, new_params))
         }
-        Type::Alias(alias) => {
-            Type::Alias(super::type::TypeAlias::new(
-                &alias.name,
-                apply_substitution(&alias.target, substitution),
-                alias.span.clone(),
-            ))
-        }
+        Type::Alias(alias) => Type::Alias(super::ty::TypeAlias::new(
+            &alias.name,
+            apply_substitution(&alias.target, substitution),
+        )),
         Type::SumType(variants) => {
             let new_variants = variants
                 .iter()
                 .map(|v| {
-                    let mut variant = super::type::Variant::new(&v.name, v.span.clone());
+                    let mut variant = super::ty::Variant::new(&v.name);
                     let new_fields = v
                         .fields
                         .iter()
                         .map(|f| {
-                            super::type::Field::new(
-                                &f.name,
-                                apply_substitution(&f.ty, substitution),
-                                f.span.clone(),
-                            )
+                            super::ty::Field::new(&f.name, apply_substitution(&f.ty, substitution))
                         })
                         .collect();
                     variant.with_fields(new_fields);
@@ -302,15 +281,21 @@ fn occurs_check(tv: &TypeVar, ty: &Type, substitution: &Substitution) -> bool {
             .fields
             .iter()
             .any(|f| occurs_check(tv, &f.ty, substitution)),
-        Type::Interface(def) => def
-            .methods
+        Type::Interface(def) => def.methods.iter().any(|m| {
+            m.params.iter().any(|p| occurs_check(tv, p, substitution))
+                || occurs_check(tv, &m.return_ty, substitution)
+        }),
+        Type::Generic(r#gen) => r#gen
+            .params
             .iter()
-            .any(|m| m.params.iter().any(|p| occurs_check(tv, p, substitution)) || occurs_check(tv, &m.return_ty, substitution)),
-        Type::Generic(gen) => gen.params.iter().any(|p| occurs_check(tv, p, substitution)),
+            .any(|p| occurs_check(tv, p, substitution)),
         Type::Alias(alias) => occurs_check(tv, &alias.target, substitution),
-        Type::SumType(variants) => variants
-            .iter()
-            .any(|v| v.fields.iter().any(|f| occurs_check(tv, &f.ty, substitution))),
+        Type::SumType(variants) => variants.iter().any(|v| {
+            v.fields
+                .iter()
+                .any(|f| occurs_check(tv, &f.ty, substitution))
+        }),
         _ => false,
     }
 }
+

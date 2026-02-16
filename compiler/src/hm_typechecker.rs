@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::fmt::Debug;
+use std::{borrow::Borrow, collections::HashMap};
 
 use parser::{SimpleSpan, ast::Expression};
 
 use crate::types::{
-    Type, TypeVar, TypeEnv, ConstraintSet, Substitution, unify::unify_types,
+    ConstraintSet, Substitution, Type, TypeEnv, TypeVar, constraint::Constraint, unify::unify_types,
 };
 
 /// Hindley-Milner Type Checker for Zero-Script
@@ -36,7 +37,7 @@ impl HmTypeChecker {
         let ty = self.infer_expr(expr.borrow())?;
 
         // Add type constraint for the expression
-        self.constraints.add(ty, ty.clone(), span.clone());
+        self.constraints.add(ty.clone(), ty.clone(), span.clone());
 
         Ok(ty)
     }
@@ -65,7 +66,8 @@ impl HmTypeChecker {
 
                 // For addition, both operands should be the same numeric type
                 // Generate constraint: left_ty == right_ty
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 match (left_ty, right_ty) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
@@ -79,7 +81,8 @@ impl HmTypeChecker {
                 let left_ty = self.infer_expr(lhs.1.borrow())?;
                 let right_ty = self.infer_expr(rhs.1.borrow())?;
 
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 match (left_ty, right_ty) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
@@ -93,7 +96,8 @@ impl HmTypeChecker {
                 let left_ty = self.infer_expr(lhs.1.borrow())?;
                 let right_ty = self.infer_expr(rhs.1.borrow())?;
 
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 match (left_ty, right_ty) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
@@ -107,7 +111,8 @@ impl HmTypeChecker {
                 let left_ty = self.infer_expr(lhs.1.borrow())?;
                 let right_ty = self.infer_expr(rhs.1.borrow())?;
 
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 match (left_ty, right_ty) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
@@ -121,7 +126,8 @@ impl HmTypeChecker {
                 let left_ty = self.infer_expr(lhs.1.borrow())?;
                 let right_ty = self.infer_expr(rhs.1.borrow())?;
 
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 Ok(Type::Bool)
             }
@@ -133,7 +139,8 @@ impl HmTypeChecker {
                 let left_ty = self.infer_expr(lhs.1.borrow())?;
                 let right_ty = self.infer_expr(rhs.1.borrow())?;
 
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 Ok(Type::Bool)
             }
@@ -142,7 +149,8 @@ impl HmTypeChecker {
                 let left_ty = self.infer_expr(lhs.1.borrow())?;
                 let right_ty = self.infer_expr(rhs.1.borrow())?;
 
-                self.constraints.add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
+                self.constraints
+                    .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
                 Ok(Type::Bool)
             }
@@ -195,7 +203,7 @@ impl HmTypeChecker {
                 self.env.pop_scope();
 
                 // Create function type
-                Ok(Type::Function(Vec::new(), return_ty))
+                Ok(Type::Function(Vec::new(), Box::new(return_ty)))
             }
 
             Expression::Call { name, args } => {
@@ -248,12 +256,16 @@ impl HmTypeChecker {
                 let lhs_ty = self.infer_expr(lhs.1.borrow())?;
 
                 // For each arm, check the pattern type matches lhs type
-                for (pattern, body) in arms {
-                    let pattern_ty = self.infer_expr(pattern.1.borrow())?;
-                    self.constraints.add(lhs_ty.clone(), pattern_ty, pattern.0.clone());
+                // for (pattern, body) in arms {
+                for (span, arm) in arms {
+                    if let Expression::MatchArm((_, pattern), (_, body)) = arm.borrow() {
+                        let pattern_ty = self.infer_expr(pattern)?;
+                        self.constraints
+                            .add(lhs_ty.clone(), pattern_ty, span.clone());
 
-                    // Infer body type
-                    let _ = self.infer_expr(body.1.borrow())?;
+                        // Infer body type
+                        let _ = self.infer_expr(body)?;
+                    }
                 }
 
                 Ok(lhs_ty) // Return the type of the match expression
@@ -267,11 +279,11 @@ impl HmTypeChecker {
                             Expression::Identifier(name) => name.to_string(),
                             _ => "unknown".to_string(),
                         };
-                        let field_ty = Type::from(t.1.borrow().to_string());
+                        let field_ty = Type::from(t.1.to_string());
                         self.env.define_variable(&field_name, field_ty);
                     }
                 }
-                Ok(Type::Struct(super::types::StructDef::new(name, Vec::new(), name.into())))
+                Ok(Type::Struct(super::types::StructDef::new(name, Vec::new())))
             }
 
             Expression::If(branches) => {
@@ -283,7 +295,7 @@ impl HmTypeChecker {
                 Ok(Type::Void)
             }
 
-            Expression::Loop { iterable, body } => {
+            Expression::Loop { iterable, body, .. } => {
                 let _ = self.infer_expr(iterable.1.borrow())?;
                 let _ = self.infer_expr(body.1.borrow())?;
                 Ok(Type::Void)
@@ -306,16 +318,20 @@ impl HmTypeChecker {
 
             Expression::Constant(name, ty_expr) => {
                 // Similar to Variable but marks as constant
-                self.infer_expr(&(name.0.clone(), Box::new(Expression::Variable(name.1.borrow().to_string(), ty_expr.clone()))))
+                self.infer_expr(&Expression::Variable(
+                    &<Box<Expression<'_>> as std::borrow::Borrow<Expression>>::borrow(&name.1)
+                        .to_string(),
+                    // name.1.borrow().to_string(),
+                    ty_expr.clone(),
+                ))
             }
 
-            Expression::Type(ty_name) => {
-                Ok(Type::from(ty_name.to_string()))
-            }
+            Expression::Type(ty_name) => Ok(Type::from(ty_name.to_string())),
 
-            Expression::Comment(_) | Expression::Use { .. } | Expression::Noop(_) | Expression::Expr(_) => {
-                Ok(Type::Void)
-            }
+            Expression::Comment(_)
+            | Expression::Use { .. }
+            | Expression::Noop(_)
+            | Expression::Expr(_) => Ok(Type::Void),
 
             // Unhandled expressions - return a type variable for now
             _ => {
@@ -327,9 +343,111 @@ impl HmTypeChecker {
 
     /// Solve constraints and return substitution
     pub fn solve_constraints(&mut self) -> Result<Substitution, Vec<String>> {
-        // For now, return empty substitution
-        // This will be implemented with full HM constraint solving
-        Ok(Substitution::new())
+        self.constraints.solve()
+    }
+
+    /// Check a return statement and generate constraints
+    pub fn check_return(
+        &mut self,
+        expr_ty: Type,
+        expected_ty: Type,
+        span: SimpleSpan,
+    ) -> Result<(), Vec<String>> {
+        self.constraints
+            .add(expr_ty.clone(), expected_ty.clone(), span);
+        Ok(())
+    }
+
+    /// Check a function call and infer the return type
+    pub fn check_call(
+        &mut self,
+        func_name: &str,
+        arg_types: Vec<Type>,
+        span: SimpleSpan,
+    ) -> Result<Type, Vec<String>> {
+        // Look up function signature
+        if let Some(func_ty) = self.env.lookup(func_name) {
+            match func_ty {
+                Type::Function(params, return_ty) => {
+                    // Generate constraints for argument types
+                    if params.len() == arg_types.len() {
+                        for (param_ty, arg_ty) in params.iter().zip(arg_types.iter()) {
+                            self.constraints
+                                .add(param_ty.clone(), arg_ty.clone(), span.clone());
+                        }
+                    } else {
+                        return Err(vec![format!(
+                            "Function '{}' expects {} arguments, but {} provided",
+                            func_name,
+                            params.len(),
+                            arg_types.len()
+                        )]);
+                    }
+                    Ok(return_ty.as_ref().clone())
+                }
+                _ => Err(vec![format!("'{}' is not a function", func_name)]),
+            }
+        } else {
+            // Create a type variable for undetermined function return type
+            let tv = self.new_type_var(&format!("{}_ret", func_name));
+            Ok(Type::TypeVar(tv))
+        }
+    }
+
+    /// Infer the type of a block and check all statements
+    pub fn check_block(&mut self, statements: Vec<&Expression<'_>>) -> Result<Type, Vec<String>> {
+        let mut last_type = Type::Void;
+
+        for stmt in statements {
+            let ty = self.infer_expr(stmt)?;
+            last_type = ty;
+        }
+
+        Ok(last_type)
+    }
+
+    /// Check an assignment and generate constraints
+    pub fn check_assignment(
+        &mut self,
+        var_name: &str,
+        value_ty: Type,
+        span: SimpleSpan,
+    ) -> Result<(), Vec<String>> {
+        if let Some(expected_ty) = self.env.lookup(var_name) {
+            self.constraints
+                .add(value_ty.clone(), expected_ty.clone(), span);
+            Ok(())
+        } else {
+            // Variable not found in environment, define it
+            self.env.define_variable(var_name, value_ty.clone());
+            Ok(())
+        }
+    }
+
+    /// Get the current type environment
+    pub fn get_env(&self) -> &TypeEnv {
+        &self.env
+    }
+
+    /// Get mutable access to the type environment
+    pub fn get_env_mut(&mut self) -> &mut TypeEnv {
+        &mut self.env
+    }
+
+    /// Get all constraints for debugging
+    pub fn get_constraints(&self) -> &[Constraint] {
+        self.constraints.get_constraints()
+    }
+
+    /// Solve constraints and apply substitution to a type
+    pub fn apply_substitution(&mut self, ty: Type) -> Result<Type, Vec<String>> {
+        let substitution = self.solve_constraints()?;
+        Ok(substitution.apply(ty))
+    }
+
+    /// Get all type errors from constraint checking
+    pub fn check_constraints(&self) -> Vec<String> {
+        self.constraints.check()
     }
 }
 
@@ -340,21 +458,23 @@ impl Default for HmTypeChecker {
 }
 
 // Type conversion from parser Type to our new Type system
-impl From<String> for Type {
-    fn from(value: String) -> Self {
-        match value.to_lowercase().as_str() {
-            "int" => Type::Int,
-            "float" => Type::Float,
-            "string" => Type::String,
-            "bool" => Type::Bool,
-            "array" => Type::Void, // TODO: Handle typed arrays
-            "void" => Type::Void,
-            "none" => Type::None,
-            _ => {
-                // For unknown types, create a type variable
-                let tv = TypeVar::new(0, &value);
-                Type::TypeVar(tv)
-            }
-        }
-    }
-}
+// impl From<String> for Type {
+//     fn from(value: String) -> Self {
+//         match value.to_lowercase().as_str() {
+//             "int" => Type::Int,
+//             "float" => Type::Float,
+//             "string" => Type::String,
+//             "bool" => Type::Bool,
+//             "array" => Type::Void, // TODO: Handle typed arrays
+//             "void" => Type::Void,
+//             "none" => Type::None,
+//             _ => {
+//                 // For unknown types, create a type variable
+//                 let tv = TypeVar::new(0, &value);
+//                 Type::TypeVar(tv)
+//             }
+//         }
+//     }
+// }
+//
+

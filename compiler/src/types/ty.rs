@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
-use parser::SimpleSpan;
 use common::Byte;
+use parser::SimpleSpan;
 
 /// Type variable for Hindley-Milner type inference
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -29,16 +29,14 @@ impl Display for TypeVar {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
-    pub ty: Type,
-    pub span: SimpleSpan,
+    pub ty: Box<Type>,
 }
 
 impl Field {
-    pub fn new(name: &str, ty: Type, span: SimpleSpan) -> Self {
+    pub fn new(name: &str, ty: Type) -> Self {
         Self {
             name: name.to_string(),
-            ty,
-            span,
+            ty: Box::new(ty),
         }
     }
 }
@@ -47,25 +45,18 @@ impl Field {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Method {
     pub name: String,
-    pub params: Vec<Type>,
-    pub return_ty: Type,
+    pub params: Vec<Box<Type>>,
+    pub return_ty: Box<Type>,
     pub default_impl: Option<Vec<Byte>>,
-    pub span: SimpleSpan,
 }
 
 impl Method {
-    pub fn new(
-        name: &str,
-        params: Vec<Type>,
-        return_ty: Type,
-        span: SimpleSpan,
-    ) -> Self {
+    pub fn new(name: &str, params: Vec<Type>, return_ty: Type) -> Self {
         Self {
             name: name.to_string(),
-            params,
-            return_ty,
+            params: params.into_iter().map(|p| Box::new(p)).collect(),
+            return_ty: Box::new(return_ty),
             default_impl: None,
-            span,
         }
     }
 
@@ -80,16 +71,14 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<Field>,
     pub generics: Vec<TypeVar>,
-    pub span: SimpleSpan,
 }
 
 impl StructDef {
-    pub fn new(name: &str, fields: Vec<Field>, span: SimpleSpan) -> Self {
+    pub fn new(name: &str, fields: Vec<Field>) -> Self {
         Self {
             name: name.to_string(),
             fields,
             generics: Vec::new(),
-            span,
         }
     }
 
@@ -105,17 +94,15 @@ pub struct InterfaceDef {
     pub methods: Vec<Method>,
     pub generics: Vec<TypeVar>,
     pub extends: Vec<String>,
-    pub span: SimpleSpan,
 }
 
 impl InterfaceDef {
-    pub fn new(name: &str, methods: Vec<Method>, span: SimpleSpan) -> Self {
+    pub fn new(name: &str, methods: Vec<Method>) -> Self {
         Self {
             name: name.to_string(),
             methods,
             generics: Vec::new(),
             extends: Vec::new(),
-            span,
         }
     }
 
@@ -132,18 +119,16 @@ impl InterfaceDef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeAlias {
     pub name: String,
-    pub target: Type,
+    pub target: Box<Type>,
     pub generics: Vec<TypeVar>,
-    pub span: SimpleSpan,
 }
 
 impl TypeAlias {
-    pub fn new(name: &str, target: Type, span: SimpleSpan) -> Self {
+    pub fn new(name: &str, target: Type) -> Self {
         Self {
             name: name.to_string(),
-            target,
+            target: Box::new(target),
             generics: Vec::new(),
-            span,
         }
     }
 
@@ -156,22 +141,20 @@ impl TypeAlias {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenericType {
     pub name: String,
-    pub params: Vec<Type>,
-    pub span: SimpleSpan,
+    pub params: Vec<Box<Type>>,
 }
 
 impl GenericType {
-    pub fn new(name: &str, params: Vec<Type>, span: SimpleSpan) -> Self {
+    pub fn new(name: &str, params: Vec<Type>) -> Self {
         Self {
             name: name.to_string(),
-            params,
-            span,
+            params: params.into_iter().map(|p| Box::new(p)).collect(),
         }
     }
 }
 
 /// Core type representation for Hindley-Milner type system
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     // Base types
     Int,
@@ -184,9 +167,9 @@ pub enum Type {
     // Type variables for HM inference
     TypeVar(TypeVar),
 
-    // Compound types
-    Array(Type),
-    Function(Vec<Type>, Type), // (params, return)
+    // Compound types (using Box to handle recursion)
+    Array(Box<Type>),
+    Function(Vec<Type>, Box<Type>), // (params, return)
     Tuple(Vec<Type>),
 
     // User-defined types
@@ -208,15 +191,13 @@ pub enum Type {
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Field>,
-    pub span: SimpleSpan,
 }
 
 impl Variant {
-    pub fn new(name: &str, span: SimpleSpan) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
             fields: Vec::new(),
-            span,
         }
     }
 
@@ -233,12 +214,12 @@ impl Type {
 
     /// Create a new array type
     pub fn array(ty: Type) -> Self {
-        Type::Array(ty)
+        Type::Array(Box::new(ty))
     }
 
     /// Create a new function type
     pub fn function(params: Vec<Type>, return_ty: Type) -> Self {
-        Type::Function(params, return_ty)
+        Type::Function(params, Box::new(return_ty))
     }
 
     /// Create a new tuple type
@@ -247,30 +228,30 @@ impl Type {
     }
 
     /// Create a new struct type
-    pub fn struct_def(name: &str, fields: Vec<Field>, span: SimpleSpan) -> Self {
-        let mut struct_def = StructDef::new(name, fields, span);
+    pub fn struct_def(name: &str, fields: Vec<Field>) -> Self {
+        let mut struct_def = StructDef::new(name, fields);
         Type::Struct(struct_def)
     }
 
     /// Create a new interface type
-    pub fn interface_def(name: &str, methods: Vec<Method>, span: SimpleSpan) -> Self {
-        let mut interface_def = InterfaceDef::new(name, methods, span);
+    pub fn interface_def(name: &str, methods: Vec<Method>) -> Self {
+        let mut interface_def = InterfaceDef::new(name, methods);
         Type::Interface(interface_def)
     }
 
     /// Create a new generic type
-    pub fn generic(name: &str, params: Vec<Type>, span: SimpleSpan) -> Self {
-        Type::Generic(GenericType::new(name, params, span))
+    pub fn generic(name: &str, params: Vec<Type>) -> Self {
+        Type::Generic(GenericType::new(name, params))
     }
 
     /// Create a new type alias
-    pub fn alias(name: &str, target: Type, span: SimpleSpan) -> Self {
-        let mut alias = TypeAlias::new(name, target, span);
+    pub fn alias(name: &str, target: Type) -> Self {
+        let mut alias = TypeAlias::new(name, target);
         Type::Alias(alias)
     }
 
     /// Create a new sum type (enum)
-    pub fn sum_type(name: &str, variants: Vec<Variant>, span: SimpleSpan) -> Self {
+    pub fn sum_type(name: &str, variants: Vec<Variant>) -> Self {
         // For now, we'll wrap variants in a struct-like type
         // This will be refined as we add more enum-specific features
         Type::SumType(variants)
@@ -289,12 +270,18 @@ impl Type {
         )
     }
 
+    /// Unify this type with another type using the HM algorithm
+    pub fn unify(
+        &self,
+        other: &Type,
+        substitution: &mut crate::types::substitution::Substitution,
+    ) -> crate::types::unify::UnifyResult {
+        crate::types::unify::unify_types(self, other, substitution)
+    }
+
     /// Check if this type is a compound type
     pub fn is_compound_type(&self) -> bool {
-        matches!(
-            self,
-            Type::Array(_) | Type::Function(_, _) | Type::Tuple(_)
-        )
+        matches!(self, Type::Array(_) | Type::Function(_, _) | Type::Tuple(_))
     }
 
     /// Get type name for display purposes
@@ -326,14 +313,14 @@ impl Type {
             }
             Type::Struct(def) => def.name.clone(),
             Type::Interface(def) => def.name.clone(),
-            Type::Generic(gen) => {
-                let param_names = gen
+            Type::Generic(r#gen) => {
+                let param_names = r#gen
                     .params
                     .iter()
                     .map(|p| p.type_name())
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{}<{}>", gen.name, param_names)
+                format!("{}<{}>", r#gen.name, param_names)
             }
             Type::Alias(alias) => {
                 format!("{} = {}", alias.name, alias.target.type_name())
@@ -353,5 +340,25 @@ impl Type {
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.type_name())
+    }
+}
+
+/// Conversion from String to Type for type name parsing
+impl From<String> for Type {
+    fn from(value: String) -> Self {
+        match value.to_lowercase().as_str() {
+            "int" => Type::Int,
+            "float" => Type::Float,
+            "string" => Type::String,
+            "bool" => Type::Bool,
+            "array" => Type::Void, // TODO: Handle typed arrays
+            "void" => Type::Void,
+            "none" => Type::None,
+            _ => {
+                // For unknown types, create a type variable
+                let tv = TypeVar::new(0, &value);
+                Type::TypeVar(tv)
+            }
+        }
     }
 }

@@ -1,20 +1,27 @@
 # Hindley-Milner Type System - Implementation Complete
 
 ## Current Status
-- **Phase 1 (Foundation):** 4/4 tasks completed
-- **Phase 2 (Type Checker):** 2/3 tasks completed  
-- **Phase 4 (Integration):** 1/4 tasks completed
-- **Overall Progress:** 14% (7/50 tasks)
+- **Phase 1 (Foundation):** 4/4 tasks completed (Task 1.1, 1.2, 1.3, 1.4 done)
+- **Phase 2 (Type Checker):** 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 done)
+- **Phase 4 (Integration):** 0/4 tasks completed (Task 4.1 partial)
+- **Overall Progress:** 12% (7/50 tasks)
 
 ## Completed Features
 
 ### Type System Core ✅
-- `compiler/src/types/type.rs` - Complete Type enum with all variants
-- `compiler/src/types/substitution.rs` - Type substitution with occur-check
-- `compiler/src/types/constraint.rs` - Constraint generation
-- `compiler/src/types/unify.rs` - Hindley-Milner unification algorithm
+- `compiler/src/types/ty.rs` - Complete Type enum with all variants (renamed from type.rs)
+- `compiler/src/types/substitution.rs` - Substitution struct with occur-check and apply methods (converted from type alias)
+- `compiler/src/types/constraint.rs` - Constraint generation with solve() using HM unification
+- `compiler/src/types/unify.rs` - Hindley-Milner unification algorithm with occur-check
 - `compiler/src/types/env.rs` - Type environment with scope management
 - `compiler/src/types/mod.rs` - Module exports
+
+**Key Changes:**
+- Renamed `type.rs` to `ty.rs` (avoid Rust reserved keyword)
+- Added `Box<Type>` for recursive type fields
+- Converted `Substitution` from type alias to struct
+- Added `From<String> for Type` implementation
+- Added `unify()` method to Type enum
 
 ### Type Checker ✅
 - `compiler/src/hm_typechecker.rs` - Full HmTypeChecker with expression inference
@@ -23,6 +30,14 @@
 - Match expression inference
 - Class field processing
 - Type variable generation
+
+**Constraint Methods Added:**
+- `check_return()` - Return type constraints
+- `check_call()` - Function call constraints
+- `check_assignment()` - Assignment constraints
+- `check_block()` - Block statement type checking
+- `solve_constraints()` - Full HM constraint solving
+- `check_constraints()` - Constraint validation
 
 ### AST Enhancements ✅
 - `parser/src/ast.rs` - Added HM variants:

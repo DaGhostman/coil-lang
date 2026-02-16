@@ -5,7 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::Value;
 
 #[repr(u8)]
-#[derive(Debug, Default, Copy, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Default, Copy, Clone, Archive, Serialize, Deserialize, PartialEq, Eq)]
 #[rkyv(compare(PartialEq), derive(Debug), derive(Clone), derive(Copy))]
 pub enum Instruction {
     // -- Special
@@ -76,7 +76,7 @@ impl From<Instruction> for u8 {
     }
 }
 
-#[derive(Default, Clone, Copy, Archive, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
 #[rkyv(compare(PartialEq))]
 pub struct Byte {
     bytecode: Instruction,

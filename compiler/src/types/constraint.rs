@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use parser::SimpleSpan;
 
-use super::type::Type;
+use super::ty::Type;
 
 /// Type constraint for Hindley-Milner unification
 #[derive(Clone, Debug)]
@@ -14,11 +14,7 @@ pub struct Constraint {
 
 impl Constraint {
     pub fn new(left: Type, right: Type, span: SimpleSpan) -> Self {
-        Self {
-            left,
-            right,
-            span,
-        }
+        Self { left, right, span }
     }
 }
 
@@ -47,17 +43,49 @@ impl ConstraintSet {
     }
 
     /// Solve the constraint set using Hindley-Milner unification
-    pub fn solve(&self) -> Result<HashMap<String, Type>, Vec<String>> {
-        // For now, return empty solution
-        // This will be implemented with full HM unification
-        Ok(HashMap::new())
+    pub fn solve(&self) -> Result<crate::types::substitution::Substitution, Vec<String>> {
+        use crate::types::substitution::Substitution;
+        use crate::types::unify::unify_types;
+
+        let mut substitution: Substitution = Substitution::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for constraint in self.constraints.iter() {
+            match unify_types(&constraint.left, &constraint.right, &mut substitution) {
+                crate::types::unify::UnifyResult::Success(_) => {
+                    // Continue with accumulated substitution
+                }
+                crate::types::unify::UnifyResult::Failure(msg) => {
+                    errors.push(format!(
+                        "Constraint violation at {:?}: {}",
+                        constraint.span, msg
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(substitution)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Check all constraints and return any errors
     pub fn check(&self) -> Vec<String> {
-        // For now, return empty vector
-        // This will be implemented with full constraint checking
-        Vec::new()
+        let mut errors: Vec<String> = Vec::new();
+
+        for constraint in self.constraints.iter() {
+            // Basic check: are the types structurally equal?
+            if constraint.left != constraint.right {
+                errors.push(format!(
+                    "Type mismatch at {:?}: expected {:?}, found {:?}",
+                    constraint.span, constraint.left, constraint.right
+                ));
+            }
+        }
+
+        errors
     }
 
     /// Get all constraints
@@ -75,3 +103,4 @@ impl ConstraintSet {
         self.constraints.is_empty()
     }
 }
+

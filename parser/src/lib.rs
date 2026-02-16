@@ -1,5 +1,6 @@
 use ast::{Expression, Output};
 use std::{
+    borrow::Borrow,
     marker::PhantomData,
     num::{ParseFloatError, ParseIntError},
 };
@@ -548,18 +549,18 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("match")
             .ignore_then(self.expr())
             .then(
-                op!("{")
-                    .ignore_then(
-                        self.match_arm(stmt.clone())
-                            .repeated()
-                            .collect::<Vec<_>>()
-                            .then_ignore(op!(",").or_not())
-                    )
+                self.match_arm(stmt.clone())
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .then_ignore(op!(",").or_not())
                     .or_not()
-                    .delimited_by(op!("{"), op!("}"))
+                    .delimited_by(op!("{"), op!("}")),
             )
             .map_with(|(lhs, arms), e| {
                 let arms = arms.unwrap_or_default();
+                arms.iter().for_each(|a| {
+                    eprintln!("{}", a.1);
+                });
                 (e.span(), Box::new(Expression::Match(lhs, arms)))
             })
     }

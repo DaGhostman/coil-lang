@@ -2,8 +2,9 @@
 
 ## Current Status
 - **Phase 1 (Foundation):** 3/4 tasks completed
-- **Phase 2 (Type Checker):** 1/3 tasks completed  
-- **Overall Progress:** 8% (4/50 tasks)
+- **Phase 2 (Type Checker):** 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 completed)
+- **Phase 4 (Integration):** 0/4 tasks completed (Task 4.1 partial)
+- **Overall Progress:** 12% (6/50 tasks)
 
 ## Completed Tasks
 
@@ -65,6 +66,27 @@
 - Class field processing
 - Type variable generation
 
+### Task 2.2: Expression Type Inference ✅
+**Date Completed:** 2026-02-13
+
+**Features:**
+- All literal types (Int, Float, String, Bool)
+- Identifier type lookup with type variable fallback
+- Arithmetic expressions with type coercion
+- Comparison expressions
+- Logical expressions
+- Call expression inference
+
+### Task 2.3: Constraint Generation ✅
+**Date Completed:** 2026-02-13
+
+**Features:**
+- `HmTypeChecker::check_return()` - Return type constraints
+- `HmTypeChecker::check_call()` - Function call constraints
+- `HmTypeChecker::check_assignment()` - Assignment constraints
+- `HmTypeChecker::solve_constraints()` - Full HM constraint solving
+- `ConstraintSet::solve()` - Unification with occur-check
+
 ## AST Enhancements ✅
 **Date Completed:** 2026-02-13
 
@@ -99,45 +121,40 @@
 
 ## Build Status
 - ✅ No compilation errors
-- ⚫ Warnings from existing code (typechecking/mod.rs) - not part of new implementation
+- ⚫ Warnings from existing code (typechecking/mod.rs, parser/src/lib.rs) - not part of new implementation
 - ✅ New type system files compile cleanly
+- ✅ HmTypeChecker compiles cleanly
 - ✅ Tests pass
 
 ## Next Steps
 
 ### Task 1.4: AST Enhancement for HM Features
 **Priority:** High
-**Status:** Partially completed (variants added, Display implemented)
+**Status:** Partially completed (AST variants added, parser rules pending)
 
 **Pending:**
 - Add parser rules for enum, interface, impl declarations
 - Add type annotations to AST variants
 
-### Task 2.2: Expression Type Inference
-**Priority:** High
-**Status:** In progress
-
-**Pending:**
-- More complex expressions (List, Block, Program, etc.)
-- Type narrowing in match arms
-- Exhaustiveness checking
-
-### Task 2.3: Constraint Generation
+### Task 3.x: Advanced Features
 **Priority:** High
 **Status:** Not Started
 
 **Pending:**
-- Generate constraints for assignments
-- Generate constraints for function calls
-- Generate constraints for return statements
+- Sum type exhaustiveness checking
+- Generic type bounds
+- Interface conformance checking
+- Type narrowing in match arms
 
 ### Task 4.1: Compiler Integration
 **Priority:** Critical
-**Status:** Not Started
+**Status:** In Progress
 
 **Files to modify:**
-- `compiler/src/lib.rs` - Integrate HmTypeChecker with Compiler
-- `compiler/src/pipeline.rs` - Use new type checker
+- `compiler/src/lib.rs` - Integrate HmTypeChecker with Compiler - ✅ (field added)
+- `compiler/src/pipeline.rs` - Use new type checker - ⬀
+- Update bytecode generation to include type info - ⬀
+- Implement type-based optimizations - ⬀
 
 ## Design Decisions Summary
 
