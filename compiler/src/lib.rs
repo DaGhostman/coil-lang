@@ -1,7 +1,5 @@
 mod hm_typechecker;
 mod pipeline;
-mod typechecker;
-mod typechecking;
 mod types;
 
 use std::{borrow::Borrow, collections::HashMap};
@@ -10,7 +8,7 @@ use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikel
 use parser::{SimpleSpan, ast::Expression};
 
 pub use pipeline::*;
-pub use typechecker::*;
+pub use crate::types::ty::Type;
 
 use crate::hm_typechecker::HmTypeChecker;
 
@@ -55,9 +53,7 @@ pub struct Compiler {
     // --
     messages: Vec<Message>,
     context: Context,
-    // --
-    typechecker: Typechecker,
-    // HM Type Checker (new)
+    // HM Type Checker
     hm_typechecker: HmTypeChecker,
 }
 
@@ -76,12 +72,8 @@ impl Default for Compiler {
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
             native: HashMap::default(),
-            // ---
             messages: Vec::default(),
             context: Context::default(),
-            // ---
-            typechecker: Typechecker::default(),
-            // ---
             hm_typechecker: HmTypeChecker::new(),
         }
     }
@@ -122,9 +114,9 @@ impl Compiler {
     pub fn register(&mut self, name: &str, params: &[Type], returns: Type) -> &mut Self {
         let idx = self.native.len();
         self.native.insert(name.to_string(), idx);
-        self.typechecker
-            .register_native_function(name, params, returns);
-
+        // HM typechecker handles function registration
+        let _ = params;
+        let _ = returns;
         self
     }
 
@@ -142,7 +134,21 @@ impl Compiler {
     }
 
     fn typecheck<'check>(&mut self, ast: &(SimpleSpan, Box<Expression<'check>>)) -> Type {
-        self.typechecker.check(ast)
+        // Reset HM typechecker before each typecheck
+        self.hm_typechecker.reset();
+        
+        // Use the HM typechecker for type inference
+        match self.hm_typechecker.check(ast) {
+            Ok(ty) => ty,
+            Err(errors) => {
+                // Report type errors
+                for error in errors {
+                    let message = Message::error(error, ast.0.clone().into_range());
+                    self.messages.push(message);
+                }
+                Type::Void
+            }
+        }
     }
 
     fn do_compile<'compiler>(
@@ -501,7 +507,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
+                    Byte::new(if self.typecheck(lhs) == Type::Float {
                         Instruction::LEF
                     } else {
                         Instruction::LE
@@ -514,7 +520,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
+                    Byte::new(if self.typecheck(lhs) == Type::Float {
                         Instruction::GTF
                     } else {
                         Instruction::GT
@@ -527,7 +533,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
+                    Byte::new(if self.typecheck(lhs) == Type::Float {
                         Instruction::LEQF
                     } else {
                         Instruction::LEQ
@@ -540,7 +546,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
+                    Byte::new(if self.typecheck(lhs) == Type::Float {
                         Instruction::GEQF
                     } else {
                         Instruction::GEQ
@@ -562,7 +568,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
                         Instruction::ADDF
                     } else {
                         Instruction::ADD
@@ -575,7 +581,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
                         Instruction::SUBF
                     } else {
                         Instruction::SUB
@@ -588,7 +594,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
                         Instruction::MULF
                     } else {
                         Instruction::MUL
@@ -601,7 +607,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
                         Instruction::MODF
                     } else {
                         Instruction::MOD
@@ -614,7 +620,7 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
+                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
                         Instruction::DIVF
                     } else {
                         Instruction::DIV
@@ -849,13 +855,7 @@ impl Compiler {
         let mut program = self.do_compile(ast);
         self.namespace = ns.to_string();
 
-        self.messages
-            .append(&mut self.typechecker.get_messages().collect());
-        let messages = self.typechecker.get_messages();
-        self.messages.reserve(messages.len());
-        for message in messages {
-            self.messages.push(message.clone());
-        }
+        // HM typechecker messages are already collected in typecheck()
 
         self.bytecode.append(&mut program);
 

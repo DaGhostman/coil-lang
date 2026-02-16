@@ -1,10 +1,9 @@
 use std::fmt::Display;
 
 use common::Byte;
-use parser::SimpleSpan;
 
 /// Type variable for Hindley-Milner type inference
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct TypeVar {
     pub id: usize,
     pub name: String,
@@ -26,7 +25,7 @@ impl Display for TypeVar {
 }
 
 /// Field definition for structs
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
     pub ty: Box<Type>,
@@ -42,7 +41,7 @@ impl Field {
 }
 
 /// Method definition for interfaces
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Method {
     pub name: String,
     pub params: Vec<Box<Type>>,
@@ -66,7 +65,7 @@ impl Method {
 }
 
 /// Structure definition for custom types
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<Field>,
@@ -88,7 +87,7 @@ impl StructDef {
 }
 
 /// Interface definition for contracts
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InterfaceDef {
     pub name: String,
     pub methods: Vec<Method>,
@@ -116,7 +115,7 @@ impl InterfaceDef {
 }
 
 /// Type alias definition
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TypeAlias {
     pub name: String,
     pub target: Box<Type>,
@@ -138,7 +137,7 @@ impl TypeAlias {
 }
 
 /// Generic type for parameterized types
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GenericType {
     pub name: String,
     pub params: Vec<Box<Type>>,
@@ -154,7 +153,7 @@ impl GenericType {
 }
 
 /// Core type representation for Hindley-Milner type system
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Type {
     // Base types
     Int,
@@ -187,7 +186,7 @@ pub enum Type {
 }
 
 /// Variant for sum types
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Field>,
@@ -229,13 +228,13 @@ impl Type {
 
     /// Create a new struct type
     pub fn struct_def(name: &str, fields: Vec<Field>) -> Self {
-        let mut struct_def = StructDef::new(name, fields);
+        let struct_def = StructDef::new(name, fields);
         Type::Struct(struct_def)
     }
 
     /// Create a new interface type
     pub fn interface_def(name: &str, methods: Vec<Method>) -> Self {
-        let mut interface_def = InterfaceDef::new(name, methods);
+        let interface_def = InterfaceDef::new(name, methods);
         Type::Interface(interface_def)
     }
 
@@ -246,7 +245,7 @@ impl Type {
 
     /// Create a new type alias
     pub fn alias(name: &str, target: Type) -> Self {
-        let mut alias = TypeAlias::new(name, target);
+        let alias = TypeAlias::new(name, target);
         Type::Alias(alias)
     }
 
@@ -254,6 +253,7 @@ impl Type {
     pub fn sum_type(name: &str, variants: Vec<Variant>) -> Self {
         // For now, we'll wrap variants in a struct-like type
         // This will be refined as we add more enum-specific features
+        let _ = name;
         Type::SumType(variants)
     }
 

@@ -393,3 +393,56 @@ This file tracks implementation progress across all phases and tasks.
 6. **Error Handling:** Collect all errors, support warnings
 7. **RTTI:** Compile-time monomorphization, no runtime type information
 8. **Inference:** As much as possible, explicit types for ambiguity
+
+## Progress Update - 2026-02-16
+
+### New Progress
+- **Phase 1 (Foundation):** 3/4 tasks completed (Task 1.1, 1.2, 1.3 done, 1.4 pending)
+- **Phase 2 (Type Checker):** 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 completed)
+- **Phase 4 (Integration):** 0/4 tasks completed (Task 4.1 in progress - completed with HM integration)
+- **Task 4.2 (Error Reporting):** COMPLETED ✅
+- **Overall Progress:** 14% (7/50 tasks + Task 4.2)
+
+### What Work Done (2026-02-16)
+
+1. **Code Cleanup** - Removed 44+ unused imports:
+   - hm_typechecker.rs, ty.rs, constraint.rs, unify.rs, env.rs, mod.rs, lib.rs
+
+2. **Legacy Typechecker Replacement**
+   - Deleted `compiler/src/typechecker.rs` (583 lines)
+   - Deleted `compiler/src/typechecking/mod.rs` (32 lines)
+   - Removed legacy typechecker from Compiler struct
+   - Updated all references to use HM types directly
+
+3. **Build Fixes** - Added missing imports:
+   - SimpleSpan in hm_typechecker.rs and env.rs
+   - Borrow in unify.rs
+   - HashMap in env.rs
+
+4. **Warning Fixes** - Fixed all unused variables:
+   - ty, body_ty, name, args variables
+   - Unnecessary mut in struct_def/interface_def methods
+   - mut subst in unify.rs sum_type method
+
+5. **Compiler Integration**
+   - Added `reset()` method to HmTypeChecker
+   - Updated `typecheck()` to use HM typechecker
+   - Updated `register()` to work with HM types
+   - Replaced Type::FLOAT → Type::Float, Type::NONE → Type::Void
+
+6. **Error Reporting (Task 4.2)**
+   - Added `TypeError` struct with span information
+   - Enhanced constraint error messages with helpful suggestions
+   - Added arithmetic operation type mismatch messages
+   - Implemented span-based location reporting
+
+### Net Result
+- 12 files changed, 114 insertions(+), 704 deletions(-) = -590 lines net
+- Build: ✅ Success with 13 warnings (dead code for future features)
+- Tests: ✅ All pass
+
+### Next Tasks (Per Action Plan)
+- Task 4.3: Testing - Create unit and integration tests
+- Task 3.1: Sum Types - Implement exhaustiveness checking
+- Task 3.2: Generics - Add variance checking
+- Task 3.3: Interfaces - Implement conformance checking

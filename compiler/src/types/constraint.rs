@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
+use super::ty::Type;
+use crate::types::unify::unify_types;
 use parser::SimpleSpan;
 
-use super::ty::Type;
-
 /// Type constraint for Hindley-Milner unification
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Constraint {
     pub left: Type,
     pub right: Type,
@@ -19,7 +17,7 @@ impl Constraint {
 }
 
 /// Set of constraints for type checking
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ConstraintSet {
     pub constraints: Vec<Constraint>,
 }
@@ -45,7 +43,6 @@ impl ConstraintSet {
     /// Solve the constraint set using Hindley-Milner unification
     pub fn solve(&self) -> Result<crate::types::substitution::Substitution, Vec<String>> {
         use crate::types::substitution::Substitution;
-        use crate::types::unify::unify_types;
 
         let mut substitution: Substitution = Substitution::new();
         let mut errors: Vec<String> = Vec::new();
@@ -79,9 +76,18 @@ impl ConstraintSet {
             // Basic check: are the types structurally equal?
             if constraint.left != constraint.right {
                 errors.push(format!(
-                    "Type mismatch at {:?}: expected {:?}, found {:?}",
+                    "Type mismatch at {:?}: expected {}, found {}",
                     constraint.span, constraint.left, constraint.right
                 ));
+                
+                // Add helpful suggestion
+                let left_name = constraint.left.type_name();
+                let right_name = constraint.right.type_name();
+                if left_name == "int" && right_name == "float" || left_name == "float" && right_name == "int" {
+                    errors.push(format!(
+                        "  Note: Numeric type coercion is not implicit in Zero-Script. Consider using an explicit cast."
+                    ));
+                }
             }
         }
 
@@ -103,4 +109,3 @@ impl ConstraintSet {
         self.constraints.is_empty()
     }
 }
-

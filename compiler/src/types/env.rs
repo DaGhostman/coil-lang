@@ -2,12 +2,9 @@ use std::collections::HashMap;
 
 use parser::SimpleSpan;
 
-use crate::types::ty::{
-    Field, GenericType, InterfaceDef, Method, StructDef, Type, TypeAlias, TypeVar, Variant,
-};
+use crate::types::ty::{Field, InterfaceDef, Method, StructDef, Type, TypeVar, Variant};
 
 /// Type environment for Hindley-Milner type checking
-#[derive(Debug)]
 pub struct TypeEnv {
     /// Variable bindings: name -> type
     variables: HashMap<String, Type>,
@@ -269,4 +266,3 @@ impl VariantBuilder {
         variant
     }
 }
-

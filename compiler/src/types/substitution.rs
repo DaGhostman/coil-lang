@@ -5,7 +5,7 @@ use crate::types::ty::{
 };
 
 /// Type substitution mapping for Hindley-Milner unification
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Substitution {
     inner: HashMap<TypeVar, Type>,
 }

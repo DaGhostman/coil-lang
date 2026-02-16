@@ -1,11 +1,23 @@
-use std::fmt::Debug;
-use std::{borrow::Borrow, collections::HashMap};
-
 use parser::{SimpleSpan, ast::Expression};
+use std::borrow::Borrow;
 
-use crate::types::{
-    ConstraintSet, Substitution, Type, TypeEnv, TypeVar, constraint::Constraint, unify::unify_types,
-};
+use crate::types::{ConstraintSet, Substitution, Type, TypeEnv, TypeVar, constraint::Constraint};
+
+/// A type checking error with span information
+#[derive(Clone, Debug)]
+pub struct TypeError {
+    pub message: String,
+    pub span: parser::SimpleSpan,
+}
+
+impl TypeError {
+    pub fn new(message: &str, span: parser::SimpleSpan) -> Self {
+        Self {
+            message: message.to_string(),
+            span,
+        }
+    }
+}
 
 /// Hindley-Milner Type Checker for Zero-Script
 pub struct HmTypeChecker {
@@ -22,6 +34,13 @@ impl HmTypeChecker {
             constraints: ConstraintSet::new(),
             type_var_counter: 0,
         }
+    }
+
+    /// Reset the type checker for a new compilation
+    pub fn reset(&mut self) {
+        self.env = TypeEnv::new();
+        self.constraints = ConstraintSet::new();
+        self.type_var_counter = 0;
     }
 
     /// Generate a new type variable ID
@@ -69,11 +88,21 @@ impl HmTypeChecker {
                 self.constraints
                     .add(left_ty.clone(), right_ty.clone(), rhs.0.clone());
 
+                let left_ty_name = left_ty.type_name();
+                let right_ty_name = right_ty.type_name();
                 match (left_ty, right_ty) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
                     (Type::Float, Type::Float) => Ok(Type::Float),
                     (Type::Int, Type::Float) | (Type::Float, Type::Int) => Ok(Type::Float),
-                    _ => Ok(Type::Int), // Fallback for now
+                    _ => {
+                        // Provide helpful error message for type mismatch
+                        let err = format!(
+                            "Invalid operands for arithmetic operation: left type '{}', right type '{}'. \
+                            Note: Arithmetic operations require compatible numeric types.",
+                            left_ty_name, right_ty_name
+                        );
+                        Err(vec![err])
+                    }
                 }
             }
 
@@ -156,7 +185,7 @@ impl HmTypeChecker {
             }
 
             Expression::Not(expr) => {
-                let ty = self.infer_expr(expr.1.borrow())?;
+                let _ = self.infer_expr(expr.1.borrow())?;
                 Ok(Type::Bool)
             }
 
@@ -171,7 +200,7 @@ impl HmTypeChecker {
             }
 
             Expression::Function {
-                name,
+                name: _,
                 args,
                 returns,
                 body,
@@ -197,7 +226,7 @@ impl HmTypeChecker {
                 };
 
                 // Check body
-                let body_ty = self.infer_expr(body.1.borrow())?;
+                let _ = self.infer_expr(body.1.borrow())?;
 
                 // Pop scope
                 self.env.pop_scope();
@@ -206,7 +235,7 @@ impl HmTypeChecker {
                 Ok(Type::Function(Vec::new(), Box::new(return_ty)))
             }
 
-            Expression::Call { name, args } => {
+            Expression::Call { name: _, args: _ } => {
                 // For now, create a type variable for the call result
                 let tv = self.new_type_var("call_result");
                 Ok(Type::TypeVar(tv))
@@ -477,4 +506,3 @@ impl Default for HmTypeChecker {
 //     }
 // }
 //
-

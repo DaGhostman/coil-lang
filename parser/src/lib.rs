@@ -1,6 +1,5 @@
 use ast::{Expression, Output};
 use std::{
-    borrow::Borrow,
     marker::PhantomData,
     num::{ParseFloatError, ParseIntError},
 };

@@ -1,13 +1,10 @@
 use std::borrow::Borrow;
-use std::collections::HashMap;
-
-use parser::SimpleSpan;
 
 use crate::types::substitution::Substitution;
 use crate::types::ty::{Type, TypeVar};
 
 /// Result of unification
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum UnifyResult {
     Success(Substitution),
     Failure(String),
@@ -149,12 +146,13 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
                 return UnifyResult::failure("Sum type variant count mismatch");
             }
 
-            let mut subst = substitution.clone();
+            let subst = substitution.clone();
             for (variant1, variant2) in v1.iter().zip(v2.iter()) {
                 if variant1.name != variant2.name {
                     return UnifyResult::failure("Sum type variant name mismatch");
                 }
                 // TODO: unify variant fields
+                let _ = subst;
             }
 
             UnifyResult::success(subst)
@@ -298,4 +296,3 @@ fn occurs_check(tv: &TypeVar, ty: &Type, substitution: &Substitution) -> bool {
         _ => false,
     }
 }
-
