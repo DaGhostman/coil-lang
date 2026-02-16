@@ -268,3 +268,65 @@
 - Type aliases in Rust don't inherit impl blocks from underlying type
 - Struct wrapper provides proper encapsulation and method implementation
 - More idiomatic Rust pattern for custom collection types
+### Q12-Q13: Function Call Type Resolution Strategy
+**Date:** 2026-02-16  
+**Issue:** The HM typechecker creates type variables for function calls but cannot resolve them to concrete types.
+
+**User Input:**
+- **Q12 Preference:** Option 1 - Store function return types in TypeEnv during compilation, look them up during call inference (for now, future improvements possible)
+- **Q13 Preference:** HM typechecker maintains its own separate function registry (parallel to Compiler's registry) to track return types for type inference, avoiding confusion with bytecode jump targets
+
+**Rationale:**
+- TypeEnv is already has scope management and variable/function storage
+- Separate registry keeps type checking concerns isolated from bytecode generation
+- Simplest implementation for now, can evolve later if needed
+
+### Q14: Function Body Variable Scope Management
+**Date:** 2026-02-16  
+**Issue:** Variables defined in function body go into function scope, then get lost when scope is popped.
+
+**User Input:**
+- Keep the scope mechanism (good for nested scopes, closures, etc.)
+- Don't move variables to parent level (risk of overlaps)
+- Store parameter types and return type in Function type in TypeEnv for later validation
+- The Function type should contain: (params: Vec<Type>, return_ty: Type)
+- Don't need to preserve local variables from function body after type checking
+
+**Rationale:**
+- Scope mechanism is correct for nested structures
+- Function signatures only need parameter types and return type
+- Local variables are transient and don't need to persist after type checking
+- Store function signatures in TypeEnv for call resolution
+
+**Solution:**
+- Function handler in HM typechecker keeps scope for body processing
+- After body is processed, extract parameter types and return type
+- Store function signature in TypeEnv.functions with full type info
+- Don't copy local variables to parent level
+- Scope is popped after processing
+
+### Q15: Function Return Type Inference
+**Date:** 2026-02-16  
+**Question:** Should functions without explicit return type default to void or infer the type?
+
+**Considerations:**
+1. Default to void: Simpler implementation, explicit contract, catches missing return type annotations
+2. Auto-inference: More convenient, less boilerplate, consistent with local variable inference
+
+**User Input:**
+- Check function signature to ensure return types match
+- Inference should be implemented but with signature verification
+- Function signature should be primary source of truth
+- If no return type, auto-inference can be done
+
+**Decision:**
+- Function return type from declaration is primary source
+- Infer from return statements and validate against declared type
+- If no declaration, infer from return statements
+- For `fn fib(int n) { ... }`, infer return type from `return` statements
+
+**Implementation Approach:**
+1. First pass: process function body, collect return types from return statements
+2. If explicit return type exists, validate against inferred type
+3. If no explicit return type, use inferred type
+4. Handle multiple return statements with type unification

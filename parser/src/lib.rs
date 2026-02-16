@@ -126,8 +126,8 @@ impl<'pratt> Pratt<'pratt> {
         recursive(|expr| {
             let atom = choice((
                 self.call(expr.clone()),
-                self.int(),
                 self.float(),
+                self.int(),
                 self.ident(),
                 op!("true")
                     .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
@@ -528,11 +528,19 @@ impl<'pratt> Pratt<'pratt> {
             .then(op!(":").ignore_then(self.ident()).or_not())
             .then(op!("=").ignore_then(self.expr()).or_not())
             .map_with(|((name, ty), val), e| {
-                let mut result = vec![(e.span(), Box::new(Expression::Variable(name, ty)))];
                 if let Some(v) = val {
-                    result.push(v);
+                    // Create Assignment for let x: int = 5
+                    (
+                        e.span(),
+                        Box::new(Expression::Assignment(
+                            (e.span(), Box::new(Expression::Identifier(name))),
+                            v,
+                        )),
+                    )
+                } else {
+                    // Just declare variable without value: let x: int
+                    (e.span(), Box::new(Expression::Variable(name, ty)))
                 }
-                (e.span(), Box::new(Expression::Fragment(result)))
             })
     }
 

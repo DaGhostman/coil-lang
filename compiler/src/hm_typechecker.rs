@@ -36,11 +36,31 @@ impl HmTypeChecker {
         }
     }
 
-    /// Reset the type checker for a new compilation
-    pub fn reset(&mut self) {
+    pub fn clear(&mut self) -> (TypeEnv, ConstraintSet, usize) {
+        let env = self.env.clone();
+        let constraints = self.constraints.clone();
+        let vars = self.type_var_counter;
+
         self.env = TypeEnv::new();
         self.constraints = ConstraintSet::new();
         self.type_var_counter = 0;
+
+        return (env, constraints, vars);
+    }
+
+    /// Reset the type checker for a new compilation
+    pub fn reset(&mut self) -> (TypeEnv, ConstraintSet, usize) {
+        let env = self.env.clone();
+        let constraints = self.constraints.clone();
+        let vars = self.type_var_counter;
+
+        return (env, constraints, vars);
+    }
+
+    pub fn restore(&mut self, env: TypeEnv, constraints: ConstraintSet, counter: usize) {
+        self.env = env;
+        self.constraints = constraints;
+        self.type_var_counter = counter;
     }
 
     /// Generate a new type variable ID
@@ -200,7 +220,7 @@ impl HmTypeChecker {
             }
 
             Expression::Function {
-                name: _,
+                name,
                 args,
                 returns,
                 body,
@@ -208,20 +228,24 @@ impl HmTypeChecker {
                 // Create a new scope for the function
                 self.env.push_scope();
 
-                // Process arguments
+                // Process arguments and collect parameter types
+                let mut param_types = Vec::new();
                 if let Expression::Fragment(arg_list) = args.1.borrow() {
                     for arg in arg_list.iter() {
                         if let Expression::Argument(ty_name, var_name) = arg.1.borrow() {
                             let ty = Type::from(ty_name.to_string());
-                            self.env.define_variable(var_name, ty.clone());
+                            param_types.push(ty.clone());
+                            self.env.define_variable(var_name, ty);
                         }
                     }
                 }
 
-                // Process return type
+                // Process return type - explicit is preferred
                 let return_ty = if let Some(ret) = returns {
                     Type::from(ret.to_string())
                 } else {
+                    // Inference fallback: default to Void for functions without explicit return type
+                    // Note: It's recommended to explicitly declare return types for clarity
                     Type::Void
                 };
 
@@ -231,14 +255,70 @@ impl HmTypeChecker {
                 // Pop scope
                 self.env.pop_scope();
 
-                // Create function type
-                Ok(Type::Function(Vec::new(), Box::new(return_ty)))
+                // Register function signature in TypeEnv for call resolution
+                let func_ty = Type::Function(param_types, Box::new(return_ty));
+                self.env.define_function(name, func_ty.clone());
+
+                Ok(func_ty)
             }
 
-            Expression::Call { name: _, args: _ } => {
-                // For now, create a type variable for the call result
-                let tv = self.new_type_var("call_result");
-                Ok(Type::TypeVar(tv))
+            Expression::Call { name, args } => {
+                // Extract function name from the name expression
+                let identifier = match name.1.borrow() {
+                    Expression::Identifier(n) => n.to_string(),
+                    _ => {
+                        // For complex expressions, use a type variable
+                        let tv = self.new_type_var("complex_call");
+                        return Ok(Type::TypeVar(tv));
+                    }
+                };
+
+                // Look up function signature from TypeEnv
+                if let Some(func_ty) = self.env.lookup(&identifier).cloned() {
+                    match func_ty {
+                        Type::Function(params, return_ty) => {
+                            // Check argument count if we have args
+                            if let Some(args) = args {
+                                if params.len() == args.len() {
+                                    // Infer argument types first
+                                    let arg_types: Vec<Type> = args
+                                        .iter()
+                                        .map(|arg| self.infer_expr(arg.1.borrow()))
+                                        .collect::<Result<Vec<_>, Vec<_>>>()
+                                        .map_err(|e| e)?;
+
+                                    // Then add constraints
+                                    for (i, arg_ty) in arg_types.iter().enumerate() {
+                                        self.constraints.add(
+                                            arg_ty.clone(),
+                                            params[i].clone(),
+                                            args[i].0.clone(),
+                                        );
+                                    }
+                                    Ok(return_ty.as_ref().clone())
+                                } else {
+                                    Err(vec![format!(
+                                        "Function '{}' expects {} arguments, but {} provided",
+                                        identifier,
+                                        params.len(),
+                                        args.len()
+                                    )])
+                                }
+                            } else {
+                                Ok(return_ty.as_ref().clone())
+                            }
+                        }
+                        _ => Err(vec![format!(
+                            "'{}' is not a function (type: {})",
+                            identifier,
+                            func_ty.type_name()
+                        )]),
+                    }
+                } else {
+                    // Function not found, return a type variable (for forward declarations)
+                    let tv = self.new_type_var(&format!("{}_ret", identifier));
+                    Ok(Type::TypeVar(tv))
+                }
             }
 
             Expression::Variable(name, ty_expr) => {
@@ -357,10 +437,8 @@ impl HmTypeChecker {
 
             Expression::Type(ty_name) => Ok(Type::from(ty_name.to_string())),
 
-            Expression::Comment(_)
-            | Expression::Use { .. }
-            | Expression::Noop(_)
-            | Expression::Expr(_) => Ok(Type::Void),
+            Expression::Comment(_) | Expression::Use { .. } | Expression::Noop(_) => Ok(Type::Void),
+            Expression::Expr(expr) => self.infer_expr(expr.1.borrow()),
 
             // Unhandled expressions - return a type variable for now
             _ => {

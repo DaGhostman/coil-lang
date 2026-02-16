@@ -2,13 +2,13 @@ mod hm_typechecker;
 mod pipeline;
 mod types;
 
-use std::{borrow::Borrow, collections::HashMap};
+use std::{any::Any, borrow::Borrow, collections::HashMap};
 
 use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
 use parser::{SimpleSpan, ast::Expression};
 
-pub use pipeline::*;
 pub use crate::types::ty::Type;
+pub use pipeline::*;
 
 use crate::hm_typechecker::HmTypeChecker;
 
@@ -114,9 +114,11 @@ impl Compiler {
     pub fn register(&mut self, name: &str, params: &[Type], returns: Type) -> &mut Self {
         let idx = self.native.len();
         self.native.insert(name.to_string(), idx);
-        // HM typechecker handles function registration
-        let _ = params;
-        let _ = returns;
+        // Register function signature with HM typechecker for type inference
+        let func_ty = Type::Function(params.to_vec(), Box::new(returns));
+        self.hm_typechecker
+            .get_env_mut()
+            .define_function(name, func_ty);
         self
     }
 
@@ -135,8 +137,7 @@ impl Compiler {
 
     fn typecheck<'check>(&mut self, ast: &(SimpleSpan, Box<Expression<'check>>)) -> Type {
         // Reset HM typechecker before each typecheck
-        self.hm_typechecker.reset();
-        
+
         // Use the HM typechecker for type inference
         match self.hm_typechecker.check(ast) {
             Ok(ty) => ty,
@@ -197,6 +198,10 @@ impl Compiler {
                 returns: _returns,
                 body,
             } => {
+                let (env, constraints, counter) = self.hm_typechecker.reset();
+                // Register function signature with HM typechecker for type inference
+                // self.hm_typechecker.check(ast).ok();
+
                 self.functions
                     .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
 
@@ -222,6 +227,10 @@ impl Compiler {
                     ));
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
+                self.hm_typechecker.restore(env, constraints, counter);
+                self.hm_typechecker
+                    .get_env_mut()
+                    .define_function(name, _type);
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -435,8 +444,11 @@ impl Compiler {
                     self.messages.push(message);
                 }
             }
-            Expression::Argument(_, n) => {
+            Expression::Argument(ty, n) => {
                 let _ = self.context.variables.intern(n.to_string());
+                self.hm_typechecker
+                    .get_env_mut()
+                    .define_variable(n, Type::from(ty.to_string()));
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
             Expression::Identifier(n) => {
@@ -568,11 +580,12 @@ impl Compiler {
                     self,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
-                        Instruction::ADDF
-                    } else {
-                        Instruction::ADD
-                    },)
+                    Byte::new(
+                        //if likely(self.typecheck(lhs) == Type::Float) {
+                        // Instruction::ADDF
+                        // } else {
+                        Instruction::ADD // },
+                    )
                 );
             }
             Expression::Sub(lhs, rhs) => {
@@ -682,7 +695,13 @@ impl Compiler {
                     Byte::new(Instruction::STRING).with_operand_u32(count as u32),
                 );
             }
-            Expression::Variable(name, _ty) => {
+            Expression::Variable(name, ty_expr) => {
+                // Register variable with HM typechecker for type inference
+                if let Some(ty_expr) = ty_expr {
+                    let t = self.typecheck(&(span.clone(), ty_expr.1.clone()));
+                    self.hm_typechecker.get_env_mut().define_variable(name, t);
+                }
+
                 if unlikely(self.context.variables.contains(&name.to_string())) {
                     let mut message =
                         Message::error("Variable redeclaration".to_string(), span.into_range());
@@ -716,49 +735,54 @@ impl Compiler {
 
                 self.context.assignments.insert(name.clone(), true);
 
-                if let Some(symbol) = self.context.variables.key(&name) {
-                    if unlikely(self.context.constants.contains_key(&symbol)) {
-                        let assigned = likely(*self.context.constants.get(&symbol).unwrap());
+                // Typecheck the value to infer its type and register with HM typechecker
+                let value_ty = self.typecheck(&(span.clone(), value.1.clone()));
 
-                        if !assigned {
-                            self.context.constants.entry(symbol).and_modify(|state| {
-                                *state = true;
-                            });
-                        } else {
-                            let mut message =
-                                Message::error("Assignment error".to_string(), span.into_range());
-                            message.push(Label::new(
-                                format!(
-                                    "Unable to assign to an already assigned constant '{}'",
-                                    name
-                                ),
-                                span.into_range(),
-                            ));
-                            self.messages.push(message);
-                        }
-                    }
+                // @TODO: investigate the usage of `check_assignment` for type checking
+                // self.hm_typechecker
+                //     .check_assignment(&name, value_ty.clone(), span.clone())
 
-                    // let ty = self.typecheck(value);
-                    let mut expr = self.do_compile(value);
+                // Register variable with inferred type in HM typechecker
+                self.hm_typechecker
+                    .get_env_mut()
+                    .define_variable(&name, value_ty.clone());
 
-                    bytecode.append(&mut expr);
-                    bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
-
-                    // Do not pop if assigning to the same place
-                    if self.context.variables.len() == symbol + 1 {
-                        bytecode.push(Byte::new(Instruction::DUPLICATE));
-                    }
+                // Register variable in context if not exists (for let statements)
+                let symbol = if let Some(sym) = self.context.variables.key(&name) {
+                    sym
                 } else {
-                    let mut message =
-                        Message::error("Undefined variable".to_string(), span.into_range());
-                    message.push(Label::new(
-                        format!(
-                            "Unable to assign to a non-existing variable/constant '{}'",
-                            name
-                        ),
-                        span.into_range(),
-                    ));
-                    self.messages.push(message);
+                    self.context.variables.intern(name.clone())
+                };
+
+                if unlikely(self.context.constants.contains_key(&symbol)) {
+                    let assigned = likely(*self.context.constants.get(&symbol).unwrap());
+
+                    if !assigned {
+                        self.context.constants.entry(symbol).and_modify(|state| {
+                            *state = true;
+                        });
+                    } else {
+                        let mut message =
+                            Message::error("Assignment error".to_string(), span.into_range());
+                        message.push(Label::new(
+                            format!(
+                                "Unable to assign to an already assigned constant '{}'",
+                                name
+                            ),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
+                }
+
+                let mut expr = self.do_compile(value);
+
+                bytecode.append(&mut expr);
+                bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
+
+                // Do not pop if assigning to the same place
+                if self.context.variables.len() == symbol + 1 {
+                    bytecode.push(Byte::new(Instruction::DUPLICATE));
                 }
             }
             Expression::Match(lhs, children) => {

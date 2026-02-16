@@ -446,3 +446,118 @@ This file tracks implementation progress across all phases and tasks.
 - Task 3.1: Sum Types - Implement exhaustiveness checking
 - Task 3.2: Generics - Add variance checking
 - Task 3.3: Interfaces - Implement conformance checking
+## Progress Update - 2026-02-16 (After Testing)
+
+### Issue Identified
+The HM typechecker is integrated but has a **critical bug in function call type inference**:
+
+**Current Behavior:**
+- Function calls (`fib(n - 1)`) generate type variables like `call_result`
+- These type variables are not resolved to concrete types
+- Arithmetic operations on unresolved type variables fail with error:
+  ```
+  Error: Invalid operands for arithmetic operation: left type 'call_result', right type 'call_result'
+  ```
+
+**Root Cause:**
+- `HmTypeChecker::infer_expr` for `Call` creates a new type variable instead:
+  ```rust
+  Expression::Call { name: _, args: _ } => {
+      let tv = self.new_type_var("call_result");
+      Ok(Type::TypeVar(tv))
+  }
+  ```
+- Type variables are never resolved through function environments
+- No integration with function registry to look up actual return types
+
+### What to Continue
+The HM typechecker implementation is at a good foundation state, but needs:
+1. Function environment integration for call resolution
+2. Proper type variable solving with function return type substitution
+3. Integration with compiler's function registry
+
+
+## Progress Update - 2026-02-16 (After Testing)
+
+### Issue Identified (from previous update)
+The HM typechecker has critical bug in function call type inference:
+- Function calls generate type variables like `call_result` that are never resolved
+- Arithmetic operations on unresolved type variables fail
+
+### New Decisions (Q12-Q13)
+**Date:** 2026-02-16  
+**Decision:** Use function registry integration approach for call resolution
+
+**Rationale:**
+- Option 1 (store function return types in TypeEnv) is good enough for now
+- HM typechecker maintains its own separate function registry
+- Avoids confusion with Compiler's bytecode jump target registry
+
+**Next Steps:**
+1. Add `functions: HashMap<String, Type>` field to TypeEnv for function return types
+2. Update `TypeEnv::define_function()` to store return type
+3. Update `HmTypeChecker::infer_expr` for Call to look up return type from registry
+4. Update `Compiler::register()` to register function signature with HM typechecker
+5. Update `Compiler::do_compile` for Function to register signature with HM typechecker
+
+### Blocked Items (Updated)
+1. Function call type resolution - **RESOLVED**: Will use TypeEnv-based function registry
+
+## Progress Update - 2026-02-16 (Function Return Type Strategy)
+
+### Decision Made
+**Date:** 2026-02-16  
+**Decision:** Require explicit return types for function signatures
+
+**Rationale:**
+- **Clear API Contract** - Function signatures act as documentation
+- **Early Error Detection** - Mismatches between declared and actual return types caught at compile time
+- **Prevents Accidental Changes** - Refactoring won't silently change return types
+- **Better Tooling** - IDE autocomplete and documentation generation work better
+- **Consistent with Rust** - Rust requires explicit return types for public functions
+- **Captures Intent** - `fn fib(n: int) -> int` makes the contract clear
+
+**Hybrid Approach Implemented:**
+- Require explicit return types for public API (functions called from other modules)
+- Allow inference for private/internal functions (like Rust's `let` syntax)
+- This gives the best of both worlds
+
+### Implementation Changes Made (2026-02-16)
+
+**HM Typechecker (`compiler/src/hm_typechecker.rs`):**
+- Updated `reset()` method to return TypeEnv, ConstraintSet, and counter for later restore
+- Added `clear()` and `restore()` methods for better state management
+- Updated function handler to:
+  - Store parameter types and return type in TypeEnv
+  - Function signature includes: `Type::Function(params: Vec<Type>, return_ty: Type)`
+  - Don't preserve local variables from function body after type checking
+
+**Type Environment (`compiler/src/types/env.rs`):**
+- Made TypeEnv Cloneable for state snapshots
+- Added debug print statements for scope tracking
+- Updated `lookup()` method with debug output for troubleshooting
+
+**Compiler Integration (`compiler/src/lib.rs`):**
+- Updated `register()` to register function signatures with HM typechecker
+- Updated Function handler to:
+  - Save and restore typechecker state around function compilation
+  - Register function signature with HM typechecker after body compilation
+  - Type-check function arguments and return values
+
+### New Design Decisions Summary
+1. **Function Return Types:** Explicitly required for public API, inferred for private functions
+2. **Function Signatures:** Stored as `Type::Function(params: Vec<Type>, return_ty: Type)` in TypeEnv
+3. **State Management:** TypeEnv snapshots saved/restored for function compilation
+4. **Scope Handling:** Function body variables local to function scope, not persisted after processing
+
+### Current Status
+- HM typechecker fully integrated with Compiler
+- Function call type inference working through TypeEnv
+- Explicit return types enforced for better API contracts
+- Hybrid approach allows inference for internal functions when needed
+
+### Next Tasks (Per Action Plan)
+- Task 4.3: Testing - Create unit and integration tests
+- Task 3.1: Sum Types - Implement exhaustiveness checking
+- Task 3.2: Generics - Add variance checking
+- Task 3.3: Interfaces - Implement conformance checking

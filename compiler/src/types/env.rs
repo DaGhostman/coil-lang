@@ -5,6 +5,7 @@ use parser::SimpleSpan;
 use crate::types::ty::{Field, InterfaceDef, Method, StructDef, Type, TypeVar, Variant};
 
 /// Type environment for Hindley-Milner type checking
+#[derive(Clone)]
 pub struct TypeEnv {
     /// Variable bindings: name -> type
     variables: HashMap<String, Type>,
@@ -132,6 +133,10 @@ impl TypeEnv {
     /// Get all variable bindings
     pub fn variables(&self) -> &HashMap<String, Type> {
         &self.variables
+    }
+
+    pub fn scope(&self) -> Option<&HashMap<String, Type>> {
+        self.scopes.last()
     }
 
     /// Get all function signatures

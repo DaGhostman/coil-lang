@@ -275,6 +275,9 @@ impl<'a> Display for Expression<'a> {
 
                 write!(f, "\n}}")
             }
+            Self::Argument(ty, name) => {
+                write!(f, "{} {}", ty, name)
+            }
             e => todo!("Missing rest of nodes: {}", e),
         }
     }

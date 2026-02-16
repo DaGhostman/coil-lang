@@ -17,7 +17,7 @@ impl Constraint {
 }
 
 /// Set of constraints for type checking
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ConstraintSet {
     pub constraints: Vec<Constraint>,
 }
@@ -79,11 +79,13 @@ impl ConstraintSet {
                     "Type mismatch at {:?}: expected {}, found {}",
                     constraint.span, constraint.left, constraint.right
                 ));
-                
+
                 // Add helpful suggestion
                 let left_name = constraint.left.type_name();
                 let right_name = constraint.right.type_name();
-                if left_name == "int" && right_name == "float" || left_name == "float" && right_name == "int" {
+                if left_name == "int" && right_name == "float"
+                    || left_name == "float" && right_name == "int"
+                {
                     errors.push(format!(
                         "  Note: Numeric type coercion is not implicit in Zero-Script. Consider using an explicit cast."
                     ));
