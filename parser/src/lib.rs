@@ -564,11 +564,10 @@ impl<'pratt> Pratt<'pratt> {
                     .delimited_by(op!("{"), op!("}")),
             )
             .map_with(|(lhs, arms), e| {
-                let arms = arms.unwrap_or_default();
-                arms.iter().for_each(|a| {
-                    eprintln!("{}", a.1);
-                });
-                (e.span(), Box::new(Expression::Match(lhs, arms)))
+                (
+                    e.span(),
+                    Box::new(Expression::Match(lhs, arms.unwrap_or_default())),
+                )
             })
     }
 

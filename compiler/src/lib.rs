@@ -816,6 +816,7 @@ impl Compiler {
                                 self.messages.push(message);
                             }
 
+                            bytecode.push(Byte::new(Instruction::DUPLICATE));
                             let mut pattern_code = self.do_compile(&pattern);
                             bytecode.append(&mut pattern_code);
                             bytecode.push(Byte::new(Instruction::EQ));
