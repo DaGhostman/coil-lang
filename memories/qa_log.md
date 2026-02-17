@@ -306,7 +306,7 @@
 - Scope is popped after processing
 
 ### Q15: Function Return Type Inference
-**Date:** 2026-02-16  
+**Date:** 2026-02-16
 **Question:** Should functions without explicit return type default to void or infer the type?
 
 **Considerations:**
@@ -330,3 +330,75 @@
 2. If explicit return type exists, validate against inferred type
 3. If no explicit return type, use inferred type
 4. Handle multiple return statements with type unification
+
+### Q16: Function Call Type Resolution (Current Session)
+**Date:** 2026-02-17
+**Issue:** Function calls with inferred return types don't resolve to concrete types
+
+**User Input:**
+- Use TypeEnv-based function registry for call resolution
+- Function signatures stored as Type::Function(params: Vec<Type>, return_ty: Type)
+
+**Rationale:**
+- TypeEnv already has scope management and variable/function storage
+- Separate registry keeps type checking concerns isolated from bytecode generation
+- Simplest implementation for now, can evolve later if needed
+
+**Decision:**
+- Store function return types in TypeEnv during compilation
+- Look them up during call inference
+- Ensure Call expression resolves return types from TypeEnv
+
+**Next Steps:**
+1. Review how function signatures are registered in TypeEnv
+2. Fix Call expression handling to resolve return types from TypeEnv
+3. Test with various function signature patterns
+
+**Session Complete (2026-02-17):**
+- test.0s compiles and runs successfully
+- Function call resolution working for functions with explicit return types
+- fib(32) returns 2178309 correctly
+- fizbuz(3/5/15) outputs fiz/buz/fizbuz correctly
+
+### Q17: Match Exhaustiveness Checking
+**Date:** 2026-02-17
+**Decision:** Implement basic exhaustiveness checking for match expressions
+
+### Q18: Sum Types Support
+**Date:** 2026-02-17
+**Decision:** Implement sum types with variant discriminants using `Type::Variant` syntax
+
+**Implementation:**
+- Variant syntax: `Color::Red` instead of just `Red`
+- Sequential numeric discriminants assigned (Red=0, Green=1, Blue=2)
+- HM typechecker handles variants with type variable generation
+- Compiler tracks variant discriminants per sum type
+
+**Rationale:**
+- Clean, explicit syntax for variant access
+- Type-safe variant dispatch via discriminant comparison
+- Consistent with Rust's enum variant syntax
+
+**Session Complete (2026-02-17 Session 2):**
+- test.0s compiles and runs successfully with sum types
+- Variant discriminants working correctly
+- Match expressions working with numeric discriminants
+
+**Implementation:**
+- Pattern value extraction for integer, float, string, bool literals
+- Default case detection for match expressions
+- Basic exhaustiveness warnings for integer matches without default
+- Type narrowing in match arms
+
+**Rationale:**
+- Early detection of incomplete matches
+- Helps prevent runtime errors
+- Consistent with Rust's match exhaustiveness checking
+
+**Session 2 (2026-02-17):**
+- Added exhaustiveness checking for match expressions in HmTypeChecker
+- Pattern value extraction implemented for common literal types
+- Default case detection implemented
+- Basic warnings for integer matches without default
+- Type narrowing implemented in match arms
+- HM typechecker integrated and functional

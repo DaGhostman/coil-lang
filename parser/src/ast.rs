@@ -12,9 +12,9 @@ pub enum Expression<'expr> {
     Bool(bool),
     Module(String, Output<'expr>),
 
-    Argument(&'expr str, &'expr str),
+    Argument(Output<'expr>, Output<'expr>),
     Identifier(&'expr str),
-    Type(&'expr str),
+    Type(Output<'expr>),
     Comment(&'expr str),
     Print(Output<'expr>, Option<Vec<Output<'expr>>>),
     Format(Output<'expr>, Option<Vec<Output<'expr>>>),
@@ -69,7 +69,7 @@ pub enum Expression<'expr> {
     Function {
         name: &'expr str,
         args: Output<'expr>,
-        returns: Option<&'expr str>,
+        returns: Option<Output<'expr>>,
         body: Output<'expr>,
     },
 
@@ -91,14 +91,15 @@ pub enum Expression<'expr> {
     Match(Output<'expr>, Vec<Output<'expr>>),
 
     // HM Type System Features
-    TypeVar(&'expr str, usize),      // Type variable for inference
-    SumType(Vec<Expression<'expr>>), // Sum type (enum)
-    Variant(&'expr str, Vec<Expression<'expr>>), // Variant for sum type
+    TypeVar(&'expr str, usize), // Type variable for inference
+    SumType(Output<'expr>, Vec<Output<'expr>>), // Sum type (enum)
+    Variant(Output<'expr>, Option<Output<'expr>>), // Variant for sum type
+    VariantItem(Output<'expr>, Output<'expr>), // Variant for sum type
     GenericDecl(Vec<&'expr str>, Output<'expr>), // Generic type declaration
     GenericCall(&'expr str, Vec<Output<'expr>>), // Generic type call
-    InterfaceDecl(&'expr str, Vec<Expression<'expr>>), // Interface definition
-    StructDecl(&'expr str, Vec<Expression<'expr>>), // Struct definition
-    ImplTrait(&'expr str, &'expr str), // Trait implementation
+    InterfaceDecl(&'expr str, Vec<Output<'expr>>), // Interface definition
+    StructDecl(&'expr str, Vec<Output<'expr>>), // Struct definition
+    ImplTrait(Output<'expr>, Output<'expr>), // Trait implementation
     MatchArm(Output<'expr>, Output<'expr>), // Match arm with pattern
     TypePattern(Vec<Expression<'expr>>), // Pattern matching type
     FieldPattern(&'expr str, Option<Output<'expr>>), // Field pattern
@@ -185,7 +186,9 @@ impl<'a> Display for Expression<'a> {
                     "fn {}({}){} {{\n{}}}",
                     name,
                     args.1,
-                    returns.map_or(String::default(), |ret| format!(" -> {}", ret)),
+                    returns
+                        .clone()
+                        .map_or(String::default(), |ret| format!(" -> {}", &ret.1)),
                     body.1
                 )
             }
@@ -222,15 +225,16 @@ impl<'a> Display for Expression<'a> {
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
             Self::TypeVar(name, id) => write!(f, "T<{}:{}>", id, name),
-            Self::SumType(variants) => {
+            Self::SumType(name, variants) => {
                 let names = variants
                     .iter()
-                    .map(|v| v.to_string())
+                    .map(|v| v.1.to_string())
                     .collect::<Vec<_>>()
                     .join(" | ");
                 write!(f, "enum<{}>", names)
             }
-            Self::Variant(name, _) => write!(f, "{}", name),
+            Self::Variant(name, _) => write!(f, "{}", name.1),
+            Self::VariantItem(ty, name) => write!(f, "{}::{}", ty.1, name.1),
             Self::GenericDecl(params, body) => {
                 let p = params
                     .iter()
@@ -254,7 +258,7 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "struct {} {{ ... }}", name)
             }
             Self::ImplTrait(r#trait, r#type) => {
-                write!(f, "impl {} for {}", r#trait, r#type)
+                write!(f, "impl {} for {}", r#trait.1, r#type.1)
             }
             Self::MatchArm((_, pattern), (_, body)) => {
                 write!(f, "case {} => {}", pattern, body)
@@ -274,8 +278,11 @@ impl<'a> Display for Expression<'a> {
                 }
                 write!(f, "\n}}")
             }
+            Self::Type(t) => {
+                write!(f, "{}", t.1)
+            }
             Self::Argument(ty, name) => {
-                write!(f, "{} {}", ty, name)
+                write!(f, "{} {}", ty.1, name.1)
             }
             e => todo!("Missing rest of nodes: {}", e),
         }

@@ -1,0 +1,43 @@
+fn fib(int n) -> int {
+    if n <= 2 {
+        return 1;
+    }
+
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn add(int x, int y) -> int {
+    return x + y;
+}
+
+fn fizbuz(int n) {
+    match n {
+        case 3 => { print "fiz"; }
+        case 5 => { print "buz"; }
+        case 15 => { print "fizbuz"; }
+    }
+}
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+fn print_color(Color c) -> void {
+    match c {
+        case Color::Red => { print "Red"; }
+        case Color::Green => { print "Green"; }
+        case Color::Blue => { print "Blue"; }
+    }
+}
+
+fn main() {
+    print "%i", fib(3);
+    print "%i", add(10, add(20, 20));
+    fizbuz(3);
+    fizbuz(5);
+    fizbuz(15);
+    print_color(Color::Red);
+    print_color(Color::Green);
+}

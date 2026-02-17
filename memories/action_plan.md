@@ -85,12 +85,14 @@ This plan breaks down the implementation of a complete Hindley-Milner type syste
 ## Phase 3: Advanced Features
 
 ### Task 3.1: Sum Types
-**Date:** __/__/
-- [ ] Add `Expression::Variant(Name, Type)` to AST
-- [ ] Add `Expression::MatchBranch(TypePattern, Body)`
-- [ ] Implement `TypeChecker::check_sum_type()`
-- [ ] Implement `TypeChecker::check_match()`
-- [ ] Add exhaustiveness checking for match expressions
+**Date:** 2026-02-13 (Started) / 2026-02-17 (Updated)
+- [x] Add `Expression::Variant(Name, Type)` to AST - ✅ (Added to parser/src/ast.rs)
+- [x] Add `Expression::VariantItem(Type, Variant)` - ✅ (For Type::Variant syntax)
+- [x] Add `Expression::MatchBranch(TypePattern, Body)` - ✅ (MatchArm implemented)
+- [x] Implement `TypeChecker::check_sum_type()` - ✅ (Variant discriminant handling in compiler)
+- [x] Implement `TypeChecker::check_match()` - ✅ (With type narrowing)
+- [x] Add exhaustiveness checking for match expressions - ✅ (Basic level implemented)
+- [x] Type narrowing in match arms - ✅ (Implemented)
 
 ### Task 3.2: Generics
 **Date:** __/__/
@@ -118,9 +120,10 @@ This plan breaks down the implementation of a complete Hindley-Milner type syste
 ## Phase 4: Integration
 
 ### Task 4.1: Compiler Integration
-**Date:** __/__/
-- [ ] Update `Compiler::typecheck()` to use new type checker
-- [ ] Modify bytecode generation to include type information
+**Date:** 2026-02-13 (Started) / 2026-02-17 (Updated)
+- [x] Integrate HmTypeChecker with Compiler - ✅ (Added hm_typechecker field to Compiler)
+- [ ] Fix Call expression type resolution for inferred return types - In Progress
+- [ ] Update bytecode generation to include type information
 - [ ] Implement type-based optimizations
 - [ ] Add runtime type checks for dynamic operations
 

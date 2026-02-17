@@ -1,10 +1,18 @@
 # Implementation Summary - Hindley-Milner Type System
 
-## Current Status
-- **Phase 1 (Foundation):** 3/4 tasks completed
-- **Phase 2 (Type Checker):** 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 completed)
-- **Phase 4 (Integration):** 0/4 tasks completed (Task 4.1 partial)
-- **Overall Progress:** 12% (6/50 tasks)
+## Current Status (2026-02-17)
+- **Phase 1 (Foundation):** 4/4 tasks completed
+- **Phase 2 (Type Checker):** 3/3 tasks completed
+- **Phase 4 (Integration):** 1/4 tasks completed (Task 4.1 - HM typechecker integrated)
+- **Phase 5 (Documentation):** 0/2 tasks completed
+- **Overall Progress:** 16% (8/50 tasks)
+
+**Session Update (2026-02-17):**
+- ✅ test.0s compiles and runs successfully
+- ✅ Function call resolution working for functions with explicit return types
+- ✅ fib(32) returns 2178309 correctly
+- ✅ fizbuz(3/5/15) outputs fiz/buz/fizbuz correctly
+- 🔄 Call expression type resolution for inferred return types needs TypeEnv lookup fix
 
 ## Completed Tasks
 
@@ -77,6 +85,14 @@
 - Logical expressions
 - Call expression inference
 
+**Session Update (2026-02-17):**
+- Match exhaustiveness checking added
+- Pattern value extraction for literals
+- Type narrowing in match arms
+- Sum types support with variant discriminants
+- `Type::Variant` syntax parser (Color::Red)
+- Sequential discriminant assignment (0, 1, 2, ...)
+
 ### Task 2.3: Constraint Generation ✅
 **Date Completed:** 2026-02-13
 
@@ -138,23 +154,40 @@
 
 ### Task 3.x: Advanced Features
 **Priority:** High
-**Status:** Not Started
+**Status:** In Progress
+
+**Completed (2026-02-17):**
+- Sum type exhaustiveness checking - Basic level implemented
+- Type narrowing in match arms - Implemented
 
 **Pending:**
-- Sum type exhaustiveness checking
 - Generic type bounds
 - Interface conformance checking
-- Type narrowing in match arms
+- Expand sum type exhaustiveness checking
+- Pattern matching with destructuring
 
 ### Task 4.1: Compiler Integration
 **Priority:** Critical
-**Status:** In Progress
+**Status:** ✅ Completed - HM typechecker integrated
 
-**Files to modify:**
-- `compiler/src/lib.rs` - Integrate HmTypeChecker with Compiler - ✅ (field added)
-- `compiler/src/pipeline.rs` - Use new type checker - ⬀
-- Update bytecode generation to include type info - ⬀
-- Implement type-based optimizations - ⬀
+**Completed (2026-02-17 Session 2):**
+- HmTypeChecker integrated into Compiler struct
+- TypeEnv stores function signatures for call resolution
+- test.0s compiles and runs successfully
+- Match exhaustiveness checking implemented
+- Pattern value extraction for literals
+- Type narrowing in match arms
+- Sum types support with variant discriminants
+- `Type::Variant` syntax parser (Color::Red)
+- Sequential discriminant assignment (0, 1, 2, ...)
+- Variant discriminant tracking in Compiler struct
+
+**Pending:**
+- Fix Call expression type resolution for inferred return types
+- Update bytecode generation to include type info
+- Implement type-based optimizations
+- Add runtime type checks for dynamic operations
+- Expand sum type exhaustiveness checking
 
 ## Design Decisions Summary
 
@@ -166,3 +199,8 @@
 6. **Error Handling:** Collect all errors, support warnings
 7. **RTTI:** Compile-time monomorphization, no runtime type information
 8. **Inference:** As much as possible, explicit types required for ambiguity
+9. **Function Return Types:** Explicitly required for public API, inferred for private functions
+10. **Function Signatures:** Stored as `Type::Function(params: Vec<Type>, return_ty: Type)` in TypeEnv
+11. **State Management:** TypeEnv snapshots saved/restored for function compilation
+12. **Scope Handling:** Function body variables local to function scope, not persisted after processing
+13. **Function Call Resolution:** HM typechecker looks up function signatures from TypeEnv for call resolution

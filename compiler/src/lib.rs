@@ -55,6 +55,8 @@ pub struct Compiler {
     context: Context,
     // HM Type Checker
     hm_typechecker: HmTypeChecker,
+    // Variant discriminants: type_name -> (variant_name -> discriminant_value)
+    variant_discriminants: HashMap<String, HashMap<String, i64>>,
 }
 
 impl Default for Compiler {
@@ -75,6 +77,7 @@ impl Default for Compiler {
             messages: Vec::default(),
             context: Context::default(),
             hm_typechecker: HmTypeChecker::new(),
+            variant_discriminants: HashMap::default(),
         }
     }
 }
@@ -93,6 +96,13 @@ impl<'ctx> Context {
             classes: self.classes.clone(),
             prev: Some(Box::new(self.to_owned())),
         }
+    }
+
+    fn clear(&mut self) {
+        self.defers.clear();
+        self.constants.clear();
+        self.variables = Default::default();
+        self.assignments.clear();
     }
 }
 
@@ -199,6 +209,8 @@ impl Compiler {
                 body,
             } => {
                 let (env, constraints, counter) = self.hm_typechecker.reset();
+                self.context = self.context.child();
+                self.context.clear();
                 // Register function signature with HM typechecker for type inference
                 // self.hm_typechecker.check(ast).ok();
 
@@ -231,6 +243,9 @@ impl Compiler {
                 self.hm_typechecker
                     .get_env_mut()
                     .define_function(name, _type);
+                if let Some(ctx) = self.context.get_prev().clone() {
+                    self.context = *ctx;
+                }
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -326,6 +341,36 @@ impl Compiler {
                         .collect::<Vec<_>>(),
                 );
                 self.context.symbols.intern(name.to_string());
+            }
+            Expression::SumType(name, variants) => {
+                // Register variant discriminants for the sum type
+                // For now, we use a placeholder type name since the enum name isn't captured
+                let mut discriminants = HashMap::new();
+                for (idx, variant) in variants.iter().enumerate() {
+                    let var_name = match variant.1.borrow() {
+                        Expression::VariantItem(_n, name_expr) => {
+                            // Extract variant name from Type::Name
+                            match name_expr.1.borrow() {
+                                Expression::Identifier(n) => n.to_string(),
+                                _ => variant.1.to_string(),
+                            }
+                        }
+                        Expression::Variant(name_expr, _n) => {
+                            // Legacy variant syntax
+                            match name_expr.1.borrow() {
+                                Expression::Identifier(n) => n.to_string(),
+                                _ => variant.1.to_string(),
+                            }
+                        }
+                        _ => unreachable!("Variant should be VariantItem or Variant"),
+                    };
+                    discriminants.insert(var_name, idx as i64);
+                }
+
+                let name = self.resolve_variable(name);
+
+                // Use a placeholder type name
+                self.variant_discriminants.insert(name, discriminants);
             }
             Expression::Implementation(what, owner, methods) => {
                 let namespace = self.namespace.clone();
@@ -444,11 +489,70 @@ impl Compiler {
                     self.messages.push(message);
                 }
             }
-            Expression::Argument(ty, n) => {
-                let _ = self.context.variables.intern(n.to_string());
+            Expression::VariantItem(ty_expr, name_expr) => {
+                // Variant item (Type::Variant) - emit the discriminant value
+                // Extract type name from Output<'expr>
+                let type_name = match ty_expr.1.borrow() {
+                    Expression::Type(t) => t.1.to_string(),
+                    _ => ty_expr.1.to_string(),
+                };
+
+                // Extract variant name from Output<'expr>
+                let var_name = match name_expr.1.borrow() {
+                    Expression::Identifier(n) => n.to_string(),
+                    _ => name_expr.1.to_string(),
+                };
+
+                // Look up discriminant value
+                if let Some(discriminants) = self.variant_discriminants.get(&type_name) {
+                    if let Some(discriminant) = discriminants.get(&var_name) {
+                        bytecode.push(Byte::new_with_value(
+                            Instruction::CONST,
+                            Value::from(*discriminant).raw() as _,
+                        ));
+                    } else {
+                        let mut message = Message::error(
+                            format!("Unknown variant '{}::{}'", type_name, var_name),
+                            span.into_range(),
+                        );
+                        self.messages.push(message);
+                    }
+                } else {
+                    let mut message =
+                        Message::error(format!("Unknown type '{}'", type_name), span.into_range());
+                    self.messages.push(message);
+                }
+            }
+            // Expression::Variant(name_expr, fields) => {
+            //     // Variant for sum type - emit the discriminant value
+            //     // Note: This is for legacy variant syntax in enum declarations
+            //     let var_name = match name_expr.1.borrow() {
+            //         Expression::Identifier(n) => n.to_string(),
+            //         _ => name_expr.1.to_string(),
+            //     };
+            //     // For enum declaration variants, we don't have discriminants yet
+            //     // Emit as 0 (will be updated when SumType is processed)
+            //     bytecode.push(Byte::new_with_value(
+            //         Instruction::CONST,
+            //         Value::from(0).raw() as _,
+            //     ));
+            // }
+            Expression::Argument(ty_expr, n_expr) => {
+                // Extract type name from Output<'expr>
+                let ty_name = match ty_expr.1.borrow() {
+                    Expression::Type(t) => t.1.to_string(),
+                    _ => ty_expr.1.to_string(),
+                };
+                // Extract variable name from Output<'expr>
+                let var_name = match n_expr.1.borrow() {
+                    Expression::Identifier(n) => n.to_string(),
+                    _ => n_expr.1.to_string(),
+                };
+
+                let _ = self.context.variables.intern(var_name.clone());
                 self.hm_typechecker
                     .get_env_mut()
-                    .define_variable(n, Type::from(ty.to_string()));
+                    .define_variable(&var_name, Type::from(ty_name));
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
             Expression::Identifier(n) => {
@@ -698,7 +802,12 @@ impl Compiler {
             Expression::Variable(name, ty_expr) => {
                 // Register variable with HM typechecker for type inference
                 if let Some(ty_expr) = ty_expr {
-                    let t = self.typecheck(&(span.clone(), ty_expr.1.clone()));
+                    // Extract type from Output<'expr>
+                    let ty_name = match ty_expr.1.borrow() {
+                        Expression::Type(t) => t.1.to_string(),
+                        _ => ty_expr.1.to_string(),
+                    };
+                    let t = Type::from(ty_name);
                     self.hm_typechecker.get_env_mut().define_variable(name, t);
                 }
 

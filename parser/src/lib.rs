@@ -125,6 +125,7 @@ impl<'pratt> Pratt<'pratt> {
     {
         recursive(|expr| {
             let atom = choice((
+                self.variant(),
                 self.call(expr.clone()),
                 self.float(),
                 self.int(),
@@ -341,9 +342,10 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        let arg = text::ident()
+        let arg = self
+            .ident()
             .padded()
-            .then(text::ident().padded())
+            .then(self.ident())
             .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
 
         arg.separated_by(op!(','))
@@ -365,7 +367,7 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("fn")
             .then(text::ident().padded())
             .then(self.arg_list())
-            .then(op!("->").ignore_then(text::ident().padded()).or_not())
+            .then(op!("->").ignore_then(self.ident()).or_not())
             .then(self.block(stmt))
             .map_with(|((((_, name), args), returns), body), e| {
                 (
@@ -497,6 +499,13 @@ impl<'pratt> Pratt<'pratt> {
                 self.match_(stmt.clone()),
                 self.block(stmt.clone()),
                 self.variable().then_ignore(op!(";")),
+                self.type_alias().then_ignore(op!(";")),
+                self.new_type().then_ignore(op!(";")),
+                self.sum_type(stmt.clone()),
+                self.struct_(stmt.clone()),
+                self.interface_(stmt.clone()),
+                self.impl_trait(stmt.clone()),
+                self.generic_decl(stmt.clone()),
                 self.expr_statement(),
                 self.print().then_ignore(op!(";")),
                 self.return_().then_ignore(op!(";")),
@@ -541,6 +550,236 @@ impl<'pratt> Pratt<'pratt> {
                     // Just declare variable without value: let x: int
                     (e.span(), Box::new(Expression::Variable(name, ty)))
                 }
+            })
+    }
+
+    fn type_alias(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("type")
+            .ignore_then(text::ident())
+            .then(op!("=").ignore_then(self.ident()))
+            .map_with(|(name, target), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::TypeAlias(
+                        name,
+                        (e.span(), Box::new(Expression::Type(target))),
+                    )),
+                )
+            })
+    }
+
+    fn new_type(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("newtype")
+            .ignore_then(text::ident())
+            .then(op!("=").ignore_then(self.ident()))
+            .map_with(|(name, target), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::NewType(
+                        name,
+                        (e.span(), Box::new(Expression::Type(target))),
+                    )),
+                )
+            })
+    }
+
+    fn variant_item<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.ident()
+            .then(self.arg_list().or_not())
+            .map_with(|(name, fields), e| (e.span(), Box::new(Expression::Variant(name, fields))))
+    }
+
+    fn sum_type<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("enum")
+            .ignore_then(self.ident())
+            .then(
+                self.variant_item(stmt.clone())
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .or_not()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(name, variants), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::SumType(name, variants.unwrap_or_default())),
+                )
+            })
+    }
+
+    fn variant(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        // Parse Type::Variant syntax
+        self.ident()
+            .then_ignore(op!("::"))
+            .then(self.ident())
+            .map_with(|(type_name, variant_name), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::VariantItem(type_name, variant_name)),
+                )
+            })
+    }
+
+    fn struct_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("struct")
+            .ignore_then(text::ident())
+            .then(
+                self.ident()
+                    .then(op!(":").ignore_then(self.ident()))
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .or_not()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(name, fields), e| {
+                let field_exprs = fields
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(fname, ftype)| {
+                        (
+                            e.span(),
+                            Box::new(Expression::Field(
+                                fname,
+                                (e.span(), Box::new(Expression::Type(ftype))),
+                            )),
+                        )
+                    })
+                    .collect();
+                (
+                    e.span(),
+                    Box::new(Expression::StructDecl(name, field_exprs)),
+                )
+            })
+    }
+
+    fn interface_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("interface")
+            .ignore_then(text::ident())
+            .then(
+                self.ident()
+                    .then(self.arg_list())
+                    .then(op!("->").ignore_then(self.ident()))
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .or_not()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(name, methods), e| {
+                let method_exprs = methods
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|((mname, args), ret)| {
+                        (
+                            e.span(),
+                            Box::new(Expression::Method(
+                                false,
+                                (e.span(), Box::new(Expression::Argument(ret, mname))),
+                            )),
+                        )
+                    })
+                    .collect();
+                (
+                    e.span(),
+                    Box::new(Expression::InterfaceDecl(name, method_exprs)),
+                )
+            })
+    }
+
+    fn impl_trait<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("impl")
+            .ignore_then(self.ident())
+            .then_ignore(keyword!("for"))
+            .then(self.ident())
+            .map_with(|(r#trait, r#type), e| {
+                (e.span(), Box::new(Expression::ImplTrait(r#trait, r#type)))
+            })
+    }
+
+    fn generic_decl<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("fn")
+            .ignore_then(text::ident())
+            .then(
+                op!("<").ignore_then(
+                    text::ident()
+                        .separated_by(op!(","))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .then_ignore(op!(">")),
+                ),
+            )
+            .then(self.arg_list())
+            .then(op!("->").ignore_then(self.ident()).or_not())
+            .then(self.block(stmt))
+            .map_with(|((((name, generics), args), returns), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Function {
+                        name,
+                        args,
+                        returns,
+                        body,
+                    }),
+                )
             })
     }
 
