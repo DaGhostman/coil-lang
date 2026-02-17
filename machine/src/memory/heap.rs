@@ -55,12 +55,12 @@ impl Heap {
         self.head = Some(object);
         self.alloc_bytes += size;
 
-        #[cfg(debug_assertions)]
-        println!(
-            "0x{:x} alloc {object} ({size} bytes) [{}]",
-            object.addr(),
-            self.alloc_bytes
-        );
+        // #[cfg(debug_assertions)]
+        // println!(
+        //     "0x{:x} alloc {object} ({size} bytes) [{}]",
+        //     object.addr(),
+        //     self.alloc_bytes
+        // );
 
         (object, content)
     }
@@ -151,12 +151,12 @@ impl Heap {
         let size = object.size();
         self.alloc_bytes -= size;
 
-        #[cfg(debug_assertions)]
-        println!(
-            "0x{:x} free {object} ({size} bytes) [{}]",
-            object.addr(),
-            self.alloc_bytes
-        );
+        // #[cfg(debug_assertions)]
+        // println!(
+        //     "0x{:x} free {object} ({size} bytes) [{}]",
+        //     object.addr(),
+        //     self.alloc_bytes
+        // );
 
         match object {
             Object::String(s) => {
@@ -282,7 +282,7 @@ impl Object {
     }
 
     /// Return whether the object is marked.
-    #[must_use] 
+    #[must_use]
     pub fn is_marked(&self) -> bool {
         match self {
             Self::String(s) => s.is_marked(),
@@ -306,7 +306,7 @@ impl Object {
     }
 
     /// Get the next object reference in the linked list.
-    #[must_use] 
+    #[must_use]
     pub fn get_next(&self) -> Option<Self> {
         match self {
             Self::String(s) => s.get_next(),
@@ -322,7 +322,7 @@ impl Object {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn addr(&self) -> u64 {
         match self {
             Self::String(s) => s.as_ptr() as u64,
@@ -360,7 +360,7 @@ pub struct ObjInstance {
 }
 
 impl ObjInstance {
-    #[must_use] 
+    #[must_use]
     pub fn default() -> Self {
         Self {
             fields: Table::default(),
@@ -389,7 +389,7 @@ pub struct ObjString {
 }
 
 impl ObjString {
-    #[must_use] 
+    #[must_use]
     pub fn hash(s: &str) -> u32 {
         let mut hash = 2_166_136_261;
         for b in s.bytes() {
@@ -493,7 +493,7 @@ pub struct Gc<T> {
 }
 
 impl<T> Gc<T> {
-    #[must_use] 
+    #[must_use]
     pub fn new(boxed: Box<GcData<T>>) -> Self {
         Self {
             ptr: NonNull::from(Box::leak(boxed)),
@@ -504,12 +504,12 @@ impl<T> Gc<T> {
         _ = unsafe { Box::from_raw(self.ptr.as_ptr()) };
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
         lhs.ptr.eq(&rhs.ptr)
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn as_ptr(&self) -> *const GcData<T> {
         self.ptr.as_ptr()
     }
@@ -558,7 +558,7 @@ impl<V> Default for Table<V> {
 
 impl<V> Table<V> {
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self(UnsafeCell::new(Store::new()))
     }

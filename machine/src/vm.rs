@@ -200,21 +200,21 @@ impl<const S: usize> Machine<S> {
                 );
             }
 
-            #[cfg(debug_assertions)]
-            {
-                println!("Performing GC trace");
-                self.heap.trace(
-                    &self
-                        .stack
-                        .as_slice()
-                        .iter()
-                        .map(|v| v.raw() as u64)
-                        .collect::<Vec<u64>>(),
-                );
-
-                println!("Performing GC collection");
-                unsafe { self.heap.sweep() };
-            }
+            // #[cfg(debug_assertions)]
+            // {
+            //     println!("Performing GC trace");
+            //     self.heap.trace(
+            //         &self
+            //             .stack
+            //             .as_slice()
+            //             .iter()
+            //             .map(|v| v.raw() as u64)
+            //             .collect::<Vec<u64>>(),
+            //     );
+            //
+            //     println!("Performing GC collection");
+            //     unsafe { self.heap.sweep() };
+            // }
 
             match opcode.bytecode() {
                 Instruction::POP => {

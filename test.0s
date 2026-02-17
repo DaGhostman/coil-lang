@@ -27,9 +27,12 @@ enum Color {
 fn print_color(Color c) -> void {
     match c {
         case Color::Red => { print "Red"; }
-        case Color::Green => { print "Green"; }
-        case Color::Blue => { print "Blue"; }
+        case Color::Blue => {
+            print "Blue";
+        }
     }
+
+    print "Rust-style enum works!";
 }
 
 fn main() {

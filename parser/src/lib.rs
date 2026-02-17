@@ -501,11 +501,6 @@ impl<'pratt> Pratt<'pratt> {
                 self.variable().then_ignore(op!(";")),
                 self.type_alias().then_ignore(op!(";")),
                 self.new_type().then_ignore(op!(";")),
-                self.sum_type(stmt.clone()),
-                self.struct_(stmt.clone()),
-                self.interface_(stmt.clone()),
-                self.impl_trait(stmt.clone()),
-                self.generic_decl(stmt.clone()),
                 self.expr_statement(),
                 self.print().then_ignore(op!(";")),
                 self.return_().then_ignore(op!(";")),
@@ -524,6 +519,11 @@ impl<'pratt> Pratt<'pratt> {
         choice((
             self.func(stmt.clone()),
             self.defer(stmt.clone()),
+            self.sum_type(),
+            self.struct_(stmt.clone()),
+            self.interface_(stmt.clone()),
+            self.impl_trait(stmt.clone()),
+            self.generic_decl(stmt.clone()),
             stmt.clone(),
         ))
     }
@@ -589,33 +589,49 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    fn variant_item<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
+    fn variant_item(
         &self,
-        stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Parse Rust-style variant: NONE or SOME(int)
+        //
+
         self.ident()
-            .then(self.arg_list().or_not())
-            .map_with(|(name, fields), e| (e.span(), Box::new(Expression::Variant(name, fields))))
+            .then(
+                op!('(')
+                    .ignore_then(self.ident().separated_by(op!(",")).collect::<Vec<_>>())
+                    .then_ignore(op!(')'))
+                    .or_not(), // op!("(")
+                               //     .ignore_then(self.ident().separated_by(op!(",")).repeated().collect())
+                               //     .then_ignore(op!(")"))
+                               //     .or_not(),
+            )
+            .map_with(|(name, field), e| {
+                // Create Variant for enum declaration with optional fields
+                // let fields = if let Some(fname) = field {
+                //     // Variant with field: SOME(int)
+                //     vec![(
+                //         e.span(),
+                //         Box::new(Expression::Argument(
+                //             (e.span(), Box::new(Expression::Type(fname))),
+                //             fname,
+                //         )),
+                //     )]
+                // } else {
+                //     Vec::new()
+                // };
+                (e.span(), Box::new(Expression::Variant(name, field)))
+            })
     }
 
-    fn sum_type<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
+    fn sum_type(
         &self,
-        stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("enum")
             .ignore_then(self.ident())
             .then(
-                self.variant_item(stmt.clone())
+                self.variant_item()
                     .separated_by(op!(","))
                     .allow_trailing()
                     .collect::<Vec<_>>()

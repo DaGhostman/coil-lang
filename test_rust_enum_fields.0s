@@ -1,0 +1,18 @@
+enum Test {
+    NONE,
+    SOME(int),
+}
+
+fn main() {
+
+    match Test::Some(42) {
+        case Test::NONE => {
+            print "None";
+        }
+        case Test::SOME => {
+            print "Some";
+        }
+    }
+
+    print "Rust-style enum with fields!";
+}

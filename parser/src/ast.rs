@@ -93,7 +93,7 @@ pub enum Expression<'expr> {
     // HM Type System Features
     TypeVar(&'expr str, usize), // Type variable for inference
     SumType(Output<'expr>, Vec<Output<'expr>>), // Sum type (enum)
-    Variant(Output<'expr>, Option<Output<'expr>>), // Variant for sum type
+    Variant(Output<'expr>, Option<Vec<Output<'expr>>>), // Variant for sum type
     VariantItem(Output<'expr>, Output<'expr>), // Variant for sum type
     GenericDecl(Vec<&'expr str>, Output<'expr>), // Generic type declaration
     GenericCall(&'expr str, Vec<Output<'expr>>), // Generic type call
@@ -233,7 +233,21 @@ impl<'a> Display for Expression<'a> {
                     .join(" | ");
                 write!(f, "enum<{}>", names)
             }
-            Self::Variant(name, _) => write!(f, "{}", name.1),
+            Self::Variant(name, fields) => {
+                write!(
+                    f,
+                    "{}{}",
+                    name.1,
+                    fields
+                        .clone()
+                        .map(|f| f
+                            .iter()
+                            .map(|f| f.1.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", "))
+                        .unwrap_or(String::new())
+                )
+            }
             Self::VariantItem(ty, name) => write!(f, "{}::{}", ty.1, name.1),
             Self::GenericDecl(params, body) => {
                 let p = params

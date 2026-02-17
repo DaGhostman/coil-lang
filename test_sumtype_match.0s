@@ -1,0 +1,17 @@
+enum Test {
+    NONE,
+    SOME(int),
+}
+
+fn main() {
+    let x = Test::SOME;
+    match x {
+        case Test::NONE => {
+            print "None";
+        }
+        case Test::SOME => {
+            print "Some";
+        }
+    }
+    print "Done";
+}

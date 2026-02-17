@@ -1,0 +1,8 @@
+enum Test {
+    NONE,
+    SOME(int),
+}
+
+fn main() {
+    print "Hello";
+}
