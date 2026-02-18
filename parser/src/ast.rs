@@ -73,6 +73,14 @@ pub enum Expression<'expr> {
         body: Output<'expr>,
     },
 
+    FunctionWithGenerics {
+        generics: Vec<&'expr str>,
+        name: &'expr str,
+        args: Output<'expr>,
+        returns: Option<Output<'expr>>,
+        body: Output<'expr>,
+    },
+
     Branch(Option<Output<'expr>>, Output<'expr>),
 
     If(Vec<Output<'expr>>),

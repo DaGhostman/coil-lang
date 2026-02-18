@@ -355,6 +355,19 @@ impl<'pratt> Pratt<'pratt> {
             .delimited_by(op!("("), op!(")"))
     }
 
+    fn generic_params(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Vec<&'pratt str>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
+        text::ident()
+            .padded()
+            .separated_by(op!(","))
+            .at_least(1)
+            .collect()
+            .delimited_by(op!("<"), op!(">"))
+    }
+
     fn func<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -364,22 +377,60 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("fn")
+        // Create a closure that builds the function expression
+        let build_func = |name: &'pratt str,
+                          args: Output<'pratt>,
+                          returns: Option<Output<'pratt>>,
+                          body: Output<'pratt>,
+                          span| {
+            (
+                span,
+                Box::new(Expression::Function {
+                    name,
+                    args,
+                    returns,
+                    body,
+                }),
+            )
+        };
+
+        // Create a closure that builds the function with generics expression
+        let build_func_with_generics = |generics: Vec<&'pratt str>,
+                                        name: &'pratt str,
+                                        args: Output<'pratt>,
+                                        returns: Option<Output<'pratt>>,
+                                        body: Output<'pratt>,
+                                        span| {
+            (
+                span,
+                Box::new(Expression::FunctionWithGenerics {
+                    generics,
+                    name,
+                    args,
+                    returns,
+                    body,
+                }),
+            )
+        };
+
+        // Try with generics first, fall back to without
+        self.generic_params()
+            .then(keyword!("fn"))
             .then(text::ident().padded())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.ident()).or_not())
-            .then(self.block(stmt))
-            .map_with(|((((_, name), args), returns), body), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::Function {
-                        name,
-                        args,
-                        returns,
-                        body,
-                    }),
-                )
+            .then(self.block(stmt.clone()))
+            .map_with(move |(((((generics, _), name), args), returns), body), e| {
+                build_func_with_generics(generics, name, args, returns, body, e.span())
             })
+            .or(keyword!("fn")
+                .then(text::ident().padded())
+                .then(self.arg_list())
+                .then(op!("->").ignore_then(self.ident()).or_not())
+                .then(self.block(stmt))
+                .map_with(move |((((_, name), args), returns), body), e| {
+                    build_func(name, args, returns, body, e.span())
+                }))
     }
 
     fn defer<

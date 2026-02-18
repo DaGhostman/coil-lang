@@ -402,6 +402,45 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::NOOP => continue,
+                Instruction::VARIANT_SET => {
+                    //Variant_set { tag: usize, field_count: usize },
+                    let field_count = opcode.operand_u16(1) as usize;
+                    let tag = opcode.operand_u16(0) as usize;
+
+                    // Collect field values from stack (in reverse order since stack is LIFO)
+                    let mut fields = Vec::with_capacity(field_count);
+                    for _ in 0..field_count {
+                        fields.push(self.stack.pop());
+                    }
+                    fields.reverse();
+
+                    // Push discriminant and field count as value (we'll use raw for discriminant)
+                    // For now, we just push the tag as the variant value
+                    self.stack.push(Value::from(tag as i64));
+                }
+                Instruction::MATCH_BRANCH => {
+                    // Match_branch { tag: usize, offset: usize },
+                    let tag = opcode.operand_u16(0) as usize;
+                    let offset = opcode.operand_u32() as usize;
+
+                    // Peek the top value (discriminant)
+                    let discriminant = self.stack.peek().as_int() as usize;
+
+                    if discriminant == tag {
+                        code.seek(offset);
+                    }
+                }
+                Instruction::MATCH_DEFAULT => {
+                    // Match_default { offset: usize },
+                    let offset = opcode.operand_u32() as usize;
+                    code.seek(offset);
+                }
+                Instruction::VARIANT_POP => {
+                    // Pop the variant value and its fields from stack
+                    // The stack has: discriminant, field1, field2, ..., fieldN
+                    // We need to pop the discriminant and keep the fields
+                    self.stack.pop();
+                }
                 _ => return ExecutionResult::invalid(),
             }
         }

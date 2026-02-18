@@ -1,7 +1,7 @@
-use parser::{SimpleSpan, ast::Expression};
+use parser::{ast::Expression, SimpleSpan};
 use std::borrow::Borrow;
 
-use crate::types::{ConstraintSet, Substitution, Type, TypeEnv, TypeVar, constraint::Constraint};
+use crate::types::{constraint::Constraint, ConstraintSet, Substitution, Type, TypeEnv, TypeVar};
 
 /// A type checking error with span information
 #[derive(Clone, Debug)]
@@ -224,6 +224,13 @@ impl HmTypeChecker {
                 args,
                 returns,
                 body,
+            }
+            | Expression::FunctionWithGenerics {
+                name,
+                args,
+                returns,
+                body,
+                generics: _,
             } => {
                 // Create a new scope for the function
                 self.env.push_scope();
@@ -459,7 +466,11 @@ impl HmTypeChecker {
 
                                     variant_types.push(Type::TypeVar(sum_type_var));
                                 }
-                                Expression::VariantWithDestructure(type_expr, name_expr, fields) => {
+                                Expression::VariantWithDestructure(
+                                    type_expr,
+                                    name_expr,
+                                    fields,
+                                ) => {
                                     // Sum type variant with destructured fields
                                     let ty_name = match type_expr.1.borrow() {
                                         Expression::Type(t) => t.1.to_string(),
@@ -469,7 +480,7 @@ impl HmTypeChecker {
                                         Expression::Identifier(n) => n.to_string(),
                                         _ => name_expr.1.to_string(),
                                     };
-                                    
+
                                     // Collect field types from destructured variables
                                     // Fields are identifier names, their types will be inferred from enum declaration
                                     let field_types: Vec<Type> = fields
@@ -479,7 +490,10 @@ impl HmTypeChecker {
                                                 Expression::Identifier(name) => {
                                                     // Variable declaration - create type variable for inference
                                                     let tv = self.new_type_var(name);
-                                                    self.env.define_variable(name, Type::TypeVar(tv.clone()));
+                                                    self.env.define_variable(
+                                                        name,
+                                                        Type::TypeVar(tv.clone()),
+                                                    );
                                                     Type::TypeVar(tv)
                                                 }
                                                 _ => Type::Void,
@@ -488,7 +502,8 @@ impl HmTypeChecker {
                                         .collect();
 
                                     pattern_values.push(format!(
-                                        "variant:{}::{}{{destructured}}", ty_name, var_name
+                                        "variant:{}::{}{{destructured}}",
+                                        ty_name, var_name
                                     ));
 
                                     // Create a type variable for the sum type

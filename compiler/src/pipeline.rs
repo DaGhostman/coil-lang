@@ -6,9 +6,9 @@ use std::{
     path::PathBuf,
 };
 
-use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
+use ariadne::{sources, Color, Config, IndexType, Label, LabelAttach, Report, ReportKind};
 use common::{ArchivedByte, Byte, Instruction, Interner, Message, MessageKind};
-use parser::{Pratt, SimpleSpan, ast::Expression};
+use parser::{ast::Expression, Pratt, SimpleSpan};
 use rkyv::{rancor::Error, vec::ArchivedVec};
 
 use crate::Compiler;

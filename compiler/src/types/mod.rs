@@ -1,10 +1,10 @@
-pub mod ty;
-pub mod substitution;
 pub mod constraint;
-pub mod unify;
 pub mod env;
+pub mod substitution;
+pub mod ty;
+pub mod unify;
 
-pub use ty::{Type, TypeVar, StructDef};
-pub use substitution::Substitution;
 pub use constraint::ConstraintSet;
 pub use env::TypeEnv;
+pub use substitution::Substitution;
+pub use ty::{StructDef, Type, TypeVar};

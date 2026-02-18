@@ -4,8 +4,8 @@ mod types;
 
 use std::{any::Any, borrow::Borrow, collections::HashMap};
 
-use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
-use parser::{SimpleSpan, ast::Expression};
+use common::{likely, unlikely, Byte, Instruction, Interner, Label, Message, Value};
+use parser::{ast::Expression, SimpleSpan};
 
 pub use crate::types::ty::Type;
 pub use pipeline::*;
@@ -532,6 +532,53 @@ impl Compiler {
                     self.messages.push(message);
                 }
             }
+            Expression::VariantWithDestructure(_ty, _name, fields) => {
+                // Variant with destructured fields - emit variant discriminant + push fields on stack
+                // For match patterns like: Result::Ok(value)
+                // We need to push the discriminant and then the field values
+                let type_name = match _ty.1.borrow() {
+                    Expression::Type(t) => t.1.to_string(),
+                    _ => _ty.1.to_string(),
+                };
+
+                let var_name = match _name.1.borrow() {
+                    Expression::Identifier(n) => n.to_string(),
+                    _ => _name.1.to_string(),
+                };
+
+                if let Some(discriminants) = self.variant_discriminants.get(&type_name) {
+                    if let Some(discriminant) = discriminants.get(&var_name) {
+                        // Clone discriminant to avoid borrow issues
+                        let discrim_val = *discriminant;
+                        // Push discriminant
+                        bytecode.push(Byte::new_with_value(
+                            Instruction::CONST,
+                            Value::from(discrim_val).raw() as _,
+                        ));
+
+                        // Push field values on stack (for pattern matching)
+                        for field in fields {
+                            bytecode.append(&mut self.do_compile(field));
+                        }
+
+                        // Emit variant set instruction: tag + field_count
+                        bytecode.push(
+                            Byte::new(Instruction::VARIANT_SET)
+                                .with_operands_u16([discrim_val as u16, fields.len() as u16]),
+                        );
+                    } else {
+                        let mut message = Message::error(
+                            format!("Unknown variant '{}::{}'", type_name, var_name),
+                            span.into_range(),
+                        );
+                        self.messages.push(message);
+                    }
+                } else {
+                    let mut message =
+                        Message::error(format!("Unknown type '{}'", type_name), span.into_range());
+                    self.messages.push(message);
+                }
+            }
             // Expression::Variant(name_expr, fields) => {
             //     // Variant for sum type - emit the discriminant value
             //     // Note: This is for legacy variant syntax in enum declarations
@@ -951,9 +998,21 @@ impl Compiler {
                                 // Bind each field as a variable in the current scope
                                 for field in fields {
                                     if let Expression::Identifier(name) = field.1.borrow() {
-                                        self.context.variables.intern(name.to_string());
+                                        let var_name = name.to_string();
+                                        self.context.variables.intern(var_name.clone());
+                                        // Pop the variant from stack, keeping the field
+                                        bytecode.push(Byte::new(Instruction::VARIANT_POP));
+                                        // Store the field value into the variable
+                                        let symbol = self
+                                            .context
+                                            .variables
+                                            .key(&var_name)
+                                            .expect("Field should be interned");
+                                        bytecode.push(
+                                            Byte::new(Instruction::STORE)
+                                                .with_operand_u32(symbol as u32),
+                                        );
                                     }
-                                    bytecode.append(&mut self.do_compile(field));
                                 }
                             }
 

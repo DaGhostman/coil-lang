@@ -62,6 +62,12 @@ pub enum Instruction {
     NATIVE,
     INIT,
     SET,
+
+    // -- Variants (sum types)
+    VARIANT_SET,
+    MATCH_BRANCH,
+    MATCH_DEFAULT,
+    VARIANT_POP,
 }
 
 impl From<u8> for Instruction {
