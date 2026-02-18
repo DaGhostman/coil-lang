@@ -1,18 +1,25 @@
 # Implementation Summary - Hindley-Milner Type System
 
-## Current Status (2026-02-17)
+## Current Status (2026-02-18)
 - **Phase 1 (Foundation):** 4/4 tasks completed
 - **Phase 2 (Type Checker):** 3/3 tasks completed
-- **Phase 4 (Integration):** 1/4 tasks completed (Task 4.1 - HM typechecker integrated)
+- **Phase 3 (Advanced Features):** 1/4 tasks completed (Task 3.1 - Sum Types with runtime)
+- **Phase 4 (Integration):** 1/4 tasks completed (Task 4.1 - HM typechecker + Runtime)
 - **Phase 5 (Documentation):** 0/2 tasks completed
-- **Overall Progress:** 16% (8/50 tasks)
+- **Overall Progress:** 20% (10/50 tasks)
 
 **Session Update (2026-02-17):**
 - ✅ test.0s compiles and runs successfully
 - ✅ Function call resolution working for functions with explicit return types
 - ✅ fib(32) returns 2178309 correctly
 - ✅ fizbuz(3/5/15) outputs fiz/buz/fizbuz correctly
-- 🔄 Call expression type resolution for inferred return types needs TypeEnv lookup fix
+
+**Session Update (2026-02-18):**
+- ✅ Variant runtime support with stack-based values (no heap allocation)
+- ✅ Discriminant assignment: Sequential numeric values (0, 1, 2, ...)
+- ✅ Pattern matching with destructuring: `case Color::Red => { ... }`
+- ✅ Bytecode: VARIANT_SET, MATCH_BRANCH, MATCH_DEFAULT, VARIANT_POP
+- ✅ test.0s output: `250fizbuzfizbuzRedRust-style enum works!GreenRust-style enum works!`
 
 ## Completed Tasks
 
