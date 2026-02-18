@@ -94,17 +94,18 @@ pub enum Expression<'expr> {
     TypeVar(&'expr str, usize), // Type variable for inference
     SumType(Output<'expr>, Vec<Output<'expr>>), // Sum type (enum)
     Variant(Output<'expr>, Option<Vec<Output<'expr>>>), // Variant for sum type
-    VariantItem(Output<'expr>, Output<'expr>), // Variant for sum type
+    VariantItem(Output<'expr>, Output<'expr>), // Simple variant (e.g., Color::Red)
+    VariantWithDestructure(Output<'expr>, Output<'expr>, Vec<Output<'expr>>), // Variant with type, name, and destructured fields (e.g., Color::Rgb(255, 127, 0))
     GenericDecl(Vec<&'expr str>, Output<'expr>), // Generic type declaration
     GenericCall(&'expr str, Vec<Output<'expr>>), // Generic type call
     InterfaceDecl(&'expr str, Vec<Output<'expr>>), // Interface definition
-    StructDecl(&'expr str, Vec<Output<'expr>>), // Struct definition
-    ImplTrait(Output<'expr>, Output<'expr>), // Trait implementation
-    MatchArm(Output<'expr>, Output<'expr>), // Match arm with pattern
-    TypePattern(Vec<Expression<'expr>>), // Pattern matching type
+    StructDecl(&'expr str, Vec<Output<'expr>>),  // Struct definition
+    ImplTrait(Output<'expr>, Output<'expr>),     // Trait implementation
+    MatchArm(Output<'expr>, Output<'expr>),      // Match arm with pattern
+    TypePattern(Vec<Expression<'expr>>),         // Pattern matching type
     FieldPattern(&'expr str, Option<Output<'expr>>), // Field pattern
-    TypeAlias(&'expr str, Output<'expr>), // Type alias
-    NewType(&'expr str, Output<'expr>), // New type declaration
+    TypeAlias(&'expr str, Output<'expr>),        // Type alias
+    NewType(&'expr str, Output<'expr>),          // New type declaration
 
     Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
@@ -148,6 +149,14 @@ impl<'a> Display for Expression<'a> {
             Self::Dec(n) => write!(f, "{}--", n.borrow().1),
             Self::Negate(n) => write!(f, "-{}", n.borrow().1),
             Self::Positive(n) => write!(f, "+{}", n.borrow().1),
+            Self::List(items) => {
+                let items_str = items
+                    .iter()
+                    .map(|i| i.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "[{}]", items_str)
+            }
             Self::Expr(e) => write!(f, "{}", e.1),
             Self::ExprStatement(e) => write!(f, "{};", e.1),
             Self::Fragment(list) | Self::Block(list) => write!(
@@ -249,6 +258,24 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::VariantItem(ty, name) => write!(f, "{}::{}", ty.1, name.1),
+            Self::VariantWithDestructure(ty, name, fields) => {
+                let fields_str = fields
+                    .iter()
+                    .map(|f| f.1.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "{}::{}{}",
+                    ty.1,
+                    name.1,
+                    if fields_str.is_empty() {
+                        String::new()
+                    } else {
+                        format!("({})", fields_str)
+                    }
+                )
+            }
             Self::GenericDecl(params, body) => {
                 let p = params
                     .iter()

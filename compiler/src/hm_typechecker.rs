@@ -239,13 +239,13 @@ impl HmTypeChecker {
                                 _ => ty_expr.1.to_string(),
                             };
                             let ty = Type::from(ty_name);
-                            
+
                             // Extract variable name from Output<'expr>
                             let var_name = match var_expr.1.borrow() {
                                 Expression::Identifier(n) => n.to_string(),
                                 _ => var_expr.1.to_string(),
                             };
-                            
+
                             param_types.push(ty.clone());
                             self.env.define_variable(&var_name, ty);
                         }
@@ -394,6 +394,17 @@ impl HmTypeChecker {
                 Ok(Type::TypeVar(tv))
             }
 
+            Expression::VariantWithDestructure(_type_expr, name_expr, _fields) => {
+                // Variant with destructured fields - return a sum type
+                // The fields will be handled in the Match arm processing
+                let var_name = match name_expr.1.borrow() {
+                    Expression::Identifier(n) => n.to_string(),
+                    _ => name_expr.1.to_string(),
+                };
+                let tv = self.new_type_var(&var_name);
+                Ok(Type::TypeVar(tv))
+            }
+
             Expression::Match(lhs, arms) => {
                 let lhs_ty = self.infer_expr(lhs.1.borrow())?;
 
@@ -403,37 +414,116 @@ impl HmTypeChecker {
                 let mut last_body_ty = Type::Void;
 
                 for (span, arm) in arms {
-                    if let Expression::MatchArm((_, pattern), (_, body)) = arm.borrow() {
-                        // Extract pattern value for exhaustiveness checking
-                        match pattern.borrow() {
-                            Expression::Integer(n) => pattern_values.push(format!("int:{}", n)),
-                            Expression::Float(n) => pattern_values.push(format!("float:{}", n)),
-                            Expression::String(s) => pattern_values.push(format!("str:{}", s)),
-                            Expression::Bool(b) => pattern_values.push(format!("bool:{}", b)),
-                            Expression::Default(_) => has_default = true,
-                            Expression::VariantItem(type_expr, name_expr) => {
-                                // Sum type variant pattern - extract type information
-                                let ty_name = match type_expr.1.borrow() {
-                                    Expression::Type(t) => t.1.to_string(),
-                                    _ => type_expr.1.to_string(),
-                                };
-                                let var_name = match name_expr.1.borrow() {
-                                    Expression::Identifier(n) => n.to_string(),
-                                    _ => name_expr.1.to_string(),
-                                };
-                                pattern_values.push(format!("variant:{}::{}", ty_name, var_name));
+                    if let Expression::MatchArm((s, pattern), (_, body)) = arm.borrow() {
+                        // Handle comma-separated variants (List of patterns) or single pattern
+                        let patterns: Vec<(SimpleSpan, Box<Expression<'_>>)> =
+                            match pattern.borrow() {
+                                Expression::List(variants) => variants.iter().cloned().collect(),
+                                _ => {
+                                    // Single pattern - wrap in a reference to match the expected type
+                                    vec![(s.clone(), pattern.clone())]
+                                }
+                            };
+
+                        // Track variant types for conformance checking across patterns in same arm
+                        let mut variant_types: Vec<Type> = Vec::new();
+
+                        // Process each variant in the comma-separated list
+                        for variant in patterns {
+                            match variant.1.borrow() {
+                                Expression::Integer(n) => pattern_values.push(format!("int:{}", n)),
+                                Expression::Float(n) => pattern_values.push(format!("float:{}", n)),
+                                Expression::String(s) => pattern_values.push(format!("str:{}", s)),
+                                Expression::Bool(b) => pattern_values.push(format!("bool:{}", b)),
+                                Expression::Default(_) => has_default = true,
+                                Expression::VariantItem(type_expr, name_expr) => {
+                                    // Sum type variant pattern - extract type information
+                                    let ty_name = match type_expr.1.borrow() {
+                                        Expression::Type(t) => t.1.to_string(),
+                                        _ => type_expr.1.to_string(),
+                                    };
+                                    let var_name = match name_expr.1.borrow() {
+                                        Expression::Identifier(n) => n.to_string(),
+                                        _ => name_expr.1.to_string(),
+                                    };
+                                    pattern_values
+                                        .push(format!("variant:{}::{}", ty_name, var_name));
+
+                                    // Create a type variable for the sum type to enable destructuring
+                                    let sum_type_var =
+                                        self.new_type_var(&format!("{}_sum", ty_name));
+                                    self.env.define_variable(
+                                        &format!("{}_sum", ty_name),
+                                        Type::TypeVar(sum_type_var.clone()),
+                                    );
+
+                                    variant_types.push(Type::TypeVar(sum_type_var));
+                                }
+                                Expression::VariantWithDestructure(type_expr, name_expr, fields) => {
+                                    // Sum type variant with destructured fields
+                                    let ty_name = match type_expr.1.borrow() {
+                                        Expression::Type(t) => t.1.to_string(),
+                                        _ => type_expr.1.to_string(),
+                                    };
+                                    let var_name = match name_expr.1.borrow() {
+                                        Expression::Identifier(n) => n.to_string(),
+                                        _ => name_expr.1.to_string(),
+                                    };
+                                    
+                                    // Collect field types from destructured variables
+                                    // Fields are identifier names, their types will be inferred from enum declaration
+                                    let field_types: Vec<Type> = fields
+                                        .iter()
+                                        .map(|field| {
+                                            match field.1.borrow() {
+                                                Expression::Identifier(name) => {
+                                                    // Variable declaration - create type variable for inference
+                                                    let tv = self.new_type_var(name);
+                                                    self.env.define_variable(name, Type::TypeVar(tv.clone()));
+                                                    Type::TypeVar(tv)
+                                                }
+                                                _ => Type::Void,
+                                            }
+                                        })
+                                        .collect();
+
+                                    pattern_values.push(format!(
+                                        "variant:{}::{}{{destructured}}", ty_name, var_name
+                                    ));
+
+                                    // Create a type variable for the sum type
+                                    let sum_type_var =
+                                        self.new_type_var(&format!("{}_sum", ty_name));
+                                    self.env.define_variable(
+                                        &format!("{}_sum", ty_name),
+                                        Type::TypeVar(sum_type_var.clone()),
+                                    );
+
+                                    variant_types.push(Type::TypeVar(sum_type_var));
+                                }
+                                _ => {
+                                    // For complex patterns, try to infer type
+                                }
                             }
-                            _ => {
-                                // For complex patterns, try to infer type
+
+                            // Add constraint for each variant
+                            let variant_ty = self.infer_expr(variant.1.borrow())?;
+                            self.constraints
+                                .add(lhs_ty.clone(), variant_ty, span.clone());
+                        }
+
+                        // Conformance checking: All patterns in the same arm should have the same type
+                        // Check that all variant types are the same (same variant with same field structure)
+                        if variant_types.len() > 1 {
+                            let first_ty = &variant_types[0];
+                            for (i, ty) in variant_types.iter().enumerate().skip(1) {
+                                // Add constraint that all variant types unify
+                                self.constraints
+                                    .add(first_ty.clone(), ty.clone(), span.clone());
                             }
                         }
 
-                        let pattern_ty = self.infer_expr(pattern)?;
-                        self.constraints
-                            .add(lhs_ty.clone(), pattern_ty, span.clone());
-
                         // Type narrowing: The body type should match the pattern type for this arm
-                        // This enables proper exhaustiveness checking and type inference
                         let body_ty = self.infer_expr(body)?;
                         last_body_ty = body_ty;
                     }
@@ -513,7 +603,7 @@ impl HmTypeChecker {
                     _ => ty_expr.1.to_string(),
                 };
                 Ok(Type::from(ty_name))
-            },
+            }
 
             Expression::TypeAlias(_name, target) => {
                 // Type alias just returns the target type

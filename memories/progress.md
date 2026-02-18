@@ -760,3 +760,89 @@ fn fib(int n) -> int {
 - Task 3.1: Sum Types - Implement exhaustiveness checking
 - Task 3.2: Generics - Add variance checking
 - Task 3.3: Interfaces - Implement conformance checking
+
+## Progress Update - 2026-02-17 (Session Complete - Sum Type Destructuring)
+
+### Session Summary
+**Date:** 2026-02-17
+**Task:** Implement sum type destructuring with Rust-style syntax
+
+### What Was Implemented
+
+**Sum Type Destructuring Syntax:**
+- Parser supports comma-separated variants in match arms
+- Syntax: `case Color::Red, Color::Green => { ... }`
+- Variant destructuring: `case Result::Ok(value) => { ... }`
+- Field names are variables to bind (not literals)
+
+**AST Extensions:**
+- Added `VariantWithDestructure(Output<'expr>, Output<'expr>, Vec<Output<'expr>>)`
+- Parameters: type_name, variant_name, destructured_fields (identifiers)
+- Used for match patterns like `case Result::Ok(value)`
+
+**HM Typechecker Updates:**
+- Added `VariantWithDestructure` handling in match expression processing
+- Type inference for destructured fields (creates type variables)
+- Conformance checking: all patterns in same arm should have same field structure
+- Pattern value extraction for variant patterns
+
+**Compiler Updates:**
+- Added `VariantWithDestructure` to variant discriminant registration
+- Added `VariantWithDestructure` pattern binding in match arm compilation
+- Variables are interned for destructured fields
+- Block scope creates proper variable scope for match arm bindings
+
+**Key Files Modified:**
+- `parser/src/ast.rs` - Added VariantWithDestructure variant
+- `parser/src/lib.rs` - Updated variant and match_arm parsers
+- `compiler/src/hm_typechecker.rs` - Updated for VariantWithDestructure
+- `compiler/src/lib.rs` - Updated variant discriminant handling
+
+**Testing:**
+- Basic sum type matching works (`test_match.0s`)
+- Comma-separated variants work (`case A, B =>`)
+- Variable binding in patterns needs runtime implementation
+
+### Known Issues
+
+**Issue 1: Variant Construction with Values**
+- `Result::Ok(42)` syntax not fully supported
+- Current: Only `Result::Ok` (no parentheses) works
+- Needed: Variant construction with value on heap
+
+**Issue 2: Pattern Value Extraction**
+- `Result::Ok(value)` pattern binds variable but value not properly loaded
+- Current: Just emits discriminant constant
+- Needed: Push value from stack, store in variable, then compare discriminant
+
+**Runtime Implementation Plan:**
+1. **Heap-based Variant Storage:**
+   - Plain variants (no fields): use discriminant directly (stack-based)
+   - Variants with fields: allocate on heap with discriminant + value(s)
+
+2. **Runtime Representation:**
+   - Runtime type for sum types
+   - Discriminants for plain variants
+   - Heap-allocated structures for variants with values
+   - Proper garbage collection support
+
+3. **Implementation Steps:**
+   - Add sum type runtime representation
+   - Implement heap allocation for variants with fields
+   - Update match pattern matching to properly extract values
+   - Implement discriminant comparison at runtime
+
+**Next Session Goals:**
+- Implement heap-based variant storage
+- Fix variant construction with values (`Result::Ok(42)`)
+- Implement proper pattern value extraction
+- Add runtime sum type representation
+
+### Design Decisions This Session:
+
+1. **Variant Syntax:** Rust-style with `Type::Variant` for simple variants
+2. **Destructuring Syntax:** `Type::Variant(field)` for match patterns
+3. **Comma-separated Patterns:** Multiple variants in same match arm: `case A, B =>`
+4. **Type Inference:** Destructured fields get type variables for inference
+5. **Conformance:** Patterns in same arm must have same field structure
+6. **Runtime Storage:** Plain variants on stack, variants with fields on heap

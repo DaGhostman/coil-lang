@@ -93,6 +93,12 @@ This plan breaks down the implementation of a complete Hindley-Milner type syste
 - [x] Implement `TypeChecker::check_match()` - ✅ (With type narrowing)
 - [x] Add exhaustiveness checking for match expressions - ✅ (Basic level implemented)
 - [x] Type narrowing in match arms - ✅ (Implemented)
+- [x] Add `Expression::VariantWithDestructure(Type, Name, Vec<Field>)` - ✅ (For match patterns)
+- [x] Comma-separated variants in same arm - ✅ (Parser support)
+- [x] Destructuring pattern binding - ✅ (Type inference implemented)
+- [ ] Fix variant construction with values (`Result::Ok(42)`) - In Progress
+- [ ] Implement runtime sum type representation - In Progress
+- [ ] Implement heap-based variant storage for variants with fields - In Progress
 
 ### Task 3.2: Generics
 **Date:** __/__/

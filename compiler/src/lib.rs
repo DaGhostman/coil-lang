@@ -355,6 +355,13 @@ impl Compiler {
                                 _ => variant.1.to_string(),
                             }
                         }
+                        Expression::VariantWithDestructure(_ty, name_expr, _fields) => {
+                            // Extract variant name from variant with destructured fields
+                            match name_expr.1.borrow() {
+                                Expression::Identifier(n) => n.to_string(),
+                                _ => variant.1.to_string(),
+                            }
+                        }
                         Expression::Variant(name_expr, _n) => {
                             // Legacy variant syntax
                             match name_expr.1.borrow() {
@@ -362,7 +369,9 @@ impl Compiler {
                                 _ => variant.1.to_string(),
                             }
                         }
-                        _ => unreachable!("Variant should be VariantItem or Variant"),
+                        _ => unreachable!(
+                            "Variant should be VariantItem, VariantWithDestructure, or Variant"
+                        ),
                     };
                     discriminants.insert(var_name, idx as i64);
                 }
@@ -926,20 +935,44 @@ impl Compiler {
                             }
 
                             bytecode.push(Byte::new(Instruction::DUPLICATE));
-                            let mut pattern_code = self.do_compile(&pattern);
-                            bytecode.append(&mut pattern_code);
-                            bytecode.push(Byte::new(Instruction::EQ));
-
-                            let mut body_code = self.do_compile(&body);
-                            if is_condition {
-                                bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
-                                    (self.bytecode.len() + bytecode.len() + body_code.len() + 2)
-                                        as u32,
-                                ));
+                            let mut compiled_patterns = vec![];
+                            if let Expression::List(patterns) = pattern.1.borrow() {
+                                compiled_patterns =
+                                    patterns.iter().map(|p| self.do_compile(p)).collect();
+                            } else {
+                                compiled_patterns.push(self.do_compile(pattern));
                             }
-                            bytecode.append(&mut body_code);
-                            jumps.push(bytecode.len());
-                            bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
+
+                            // Handle VariantWithDestructure patterns - bind field names as variables
+                            // This is needed for match arms like: case Result::Ok(value) => { ... }
+                            if let Expression::VariantWithDestructure(_ty, _name, fields) =
+                                pattern.1.borrow()
+                            {
+                                // Bind each field as a variable in the current scope
+                                for field in fields {
+                                    if let Expression::Identifier(name) = field.1.borrow() {
+                                        self.context.variables.intern(name.to_string());
+                                    }
+                                    bytecode.append(&mut self.do_compile(field));
+                                }
+                            }
+
+                            compiled_patterns.iter_mut().for_each(|mut pattern_code| {
+                                bytecode.append(&mut pattern_code);
+                                bytecode.push(Byte::new(Instruction::EQ));
+
+                                let mut body_code = self.do_compile(&body);
+                                if is_condition {
+                                    bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
+                                        (self.bytecode.len() + bytecode.len() + body_code.len() + 2)
+                                            as u32,
+                                    ));
+                                }
+                                bytecode.append(&mut body_code);
+                                jumps.push(bytecode.len());
+                                bytecode
+                                    .push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
+                            });
                         }
                         _ => {
                             let mut message = Message::error(

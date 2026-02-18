@@ -651,14 +651,42 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         // Parse Type::Variant syntax
+        // Syntax: Color::Red (simple) or Result::Ok(int x) (with destructuring)
+        // For match patterns, we use variable names for destructuring
         self.ident()
             .then_ignore(op!("::"))
             .then(self.ident())
-            .map_with(|(type_name, variant_name), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::VariantItem(type_name, variant_name)),
-                )
+            .then(
+                // Destructured fields must be identifiers (variable names) for match patterns
+                // Syntax: Result::Ok(x) where 'x' is a variable to bind
+                self.ident()
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("("), op!(")"))
+                    .or_not(),
+            )
+            .map_with(|((type_name, variant_name), destructured), e| {
+                match destructured {
+                    Some(fields) => {
+                        // Variant with destructured fields for match patterns: Result::Ok(x)
+                        (
+                            e.span(),
+                            Box::new(Expression::VariantWithDestructure(
+                                type_name,
+                                variant_name,
+                                fields,
+                            )),
+                        )
+                    }
+                    None => {
+                        // Simple variant: Color::Red
+                        (
+                            e.span(),
+                            Box::new(Expression::VariantItem(type_name, variant_name)),
+                        )
+                    }
+                }
             })
     }
 
@@ -835,11 +863,38 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Parse match arm with Rust-style sum type destructuring
+        // Syntax: case Type::Variant1, Type::Variant2 => { ... }
+        // Also supports literals: case 1, 2, 3 => { ... }
+        // The parser supports comma-separated variants in the same arm
+
         keyword!("case")
-            .ignore_then(self.expr())
-            .then(op!("=>").ignore_then(self.block(stmt)))
-            .map_with(|(pattern, body), e| {
-                (e.span(), Box::new(Expression::MatchArm(pattern, body)))
+            .ignore_then(
+                // Parse pattern - can be identifier (for variants), integer, float, string, bool
+                // Variants: Color::Red, Result::Ok
+                // Literals: 1, 2.5, "hello", true
+                choice((
+                    // First try to parse variant (Type::Name)
+                    self.variant(),
+                    // Then try other expressions (literals, identifiers)
+                    self.expr(),
+                ))
+                .separated_by(op!(","))
+                .collect::<Vec<_>>(),
+            )
+            .then_ignore(op!("=>"))
+            .then(self.block(stmt))
+            .map_with(|(patterns, body), e| {
+                // Wrap patterns in a List expression for multiple patterns
+                let patterns_expr = if patterns.len() == 1 {
+                    patterns.into_iter().next().unwrap()
+                } else {
+                    (e.span(), Box::new(Expression::List(patterns)))
+                };
+                (
+                    e.span(),
+                    Box::new(Expression::MatchArm(patterns_expr, body)),
+                )
             })
     }
 
