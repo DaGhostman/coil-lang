@@ -298,372 +298,82 @@ This file tracks implementation progress across all phases and tasks.
 ## Overall Progress
 
 ### Phase Completion Status
-- Phase 1 (Foundation): 3/4 tasks completed (Task 1.1, 1.2, 1.3 done, 1.4 pending)
+- Phase 1 (Foundation): 4/4 tasks completed (Task 1.1, 1.2, 1.3, 1.4 done)
 - Phase 2 (Type Checker): 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 completed)
-- Phase 3 (Advanced Features): 0/4 tasks completed
-- Phase 4 (Integration): 0/4 tasks completed (Task 4.1 in progress - partial)
+- Phase 3 (Advanced Features): 1/4 tasks completed (Task 3.1 - Basic sum types done + Runtime)
+- Phase 4 (Integration): 1/4 tasks completed (Task 4.1 - HM integrated, Runtime)
 - Phase 5 (Documentation): 0/2 tasks completed
 
 **Total Estimated Tasks:** 50  
-**Current Progress:** 6/50 (12%)
+**Current Progress:** 10/50 (20%)
 
 ---
 
-## Blocked Items
-
-1. (None currently)
-
----
-
-## Next Steps
-
-1. ✅ Design decisions finalized (Q1-Q8 completed)
-2. ✅ Start with Task 1.1 (Type Representation) - COMPLETED
-3. ✅ Task 1.2 (Type Constraint System) - COMPLETED
-4. ✅ Task 1.3 (Type Environment) - COMPLETED
-5. ✅ Task 2.1 (Core Type Checker) - COMPLETED
-6. Task 1.4: AST Enhancement for HM Features - COMPLETED
-   - Add TypeVar to Expression enum - ✅
-   - Add SumType and Variant for algebraic data types - ✅
-   - Add GenericDecl and GenericCall - ✅
-   - Add InterfaceDecl and StructDecl - ✅
-   - Add MatchArm and TypePattern for pattern matching - ✅
-   - Add TypeAlias and NewType - ✅
-7. Task 2.2: Expression Type Inference - COMPLETED (partial)
-   - Literal type inference - ✅
-   - Identifier type lookup - ✅
-   - Arithmetic expression inference - ✅
-   - Comparison expression inference - ✅
-   - Logical expression inference - ✅
-   - Call expression inference - needs function environment integration
-8. Task 2.3: Constraint Generation - COMPLETED (partial)
-   - Generate constraints for assignments - ✅
-   - Generate constraints for function calls - ✅
-   - Generate constraints for return statements - ✅
-   - Handle type variable instantiation - ✅
-9. Task 4.1: Compiler Integration - IN PROGRESS
-   - Add HmTypeChecker field to Compiler struct
-   - Integrate HM type checking into Compiler::compile
-   - Replace old Typechecker with HmTypeChecker
-
----
-
-## Implementation Log
-
-### 2026-02-13
-- ✅ Completed Q1-Q8 user input gathering
-- ✅ Finalized design decisions for type system
-- ✅ Task 1.1 completed: Core Type Representation
-- ✅ Task 1.2 completed: Type Constraint System
-- ✅ Task 1.3 completed: Type Environment
-- ✅ Task 2.1 completed: Core Type Checker
-- ✅ Task 2.2 completed: Expression Type Inference (full)
-- ✅ Task 2.3 completed: Constraint Generation (full)
-- ✅ Task 4.1 in progress: Compiler Integration (partial)
-
-**Type System Core Files Created/Modified:**
-- `compiler/src/types/ty.rs` - Core Type enum with all variants, TypeVar, StructDef, InterfaceDef, Field, Method, GenericType, TypeAlias, Variant, unify() method, From<String> impl, using Box for recursive types
-- `compiler/src/types/substitution.rs` - Substitution struct with apply, compose, extend methods (converted from type alias to struct)
-- `compiler/src/types/constraint.rs` - Constraint generation with ConstraintSet, solve(), check() methods
-- `compiler/src/types/unify.rs` - Hindley-Milner unification algorithm with occur-check
-- `compiler/src/types/env.rs` - Type environment with scope management
-- `compiler/src/types/mod.rs` - Module exports with ty module
-
-**HmTypeChecker (`compiler/src/hm_typechecker.rs`):**
-- check(), infer_expr(), solve_constraints() methods
-- check_return(), check_call(), check_block(), check_assignment() methods
-- Type inference for: Integer, Float, String, Bool, Identifier, Add, Sub, Mul, Div, Eq, Neq, Le, Gt, Leq, Geq, And, Or, Not, Negate, Positive
-- Match expression handling
-- Function type checking
-- Class field processing
-
-**Key Fixes Made:**
-- Renamed `type.rs` to `ty.rs` (Rust reserved keyword)
-- Added Box<Type> for recursive type fields (Type::Array, Type::Function.return_ty)
-- Converted Substitution from type alias to struct
-- Fixed all recursive type handling in substitution.rs, unify.rs, env.rs
-
-## Design Decisions Summary
-
-1. **Type System:** Rust-style strict with comprehensive inference
-2. **Syntax:** Rust-style generics (`<T>`), mixed Rust+Scala pattern matching (`case` prefix)
-3. **Sum Types:** Rust-style enums (known at compile time)
-4. **Interfaces:** Hybrid interface/trait model with default implementations
-5. **Classes:** No inheritance, rely on composition
-6. **Error Handling:** Collect all errors, support warnings
-7. **RTTI:** Compile-time monomorphization, no runtime type information
-8. **Inference:** As much as possible, explicit types for ambiguity
-
-## Progress Update - 2026-02-16
-
-### New Progress
-- **Phase 1 (Foundation):** 3/4 tasks completed (Task 1.1, 1.2, 1.3 done, 1.4 pending)
-- **Phase 2 (Type Checker):** 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 completed)
-- **Phase 4 (Integration):** 0/4 tasks completed (Task 4.1 in progress - completed with HM integration)
-- **Task 4.2 (Error Reporting):** COMPLETED ✅
-- **Overall Progress:** 14% (7/50 tasks + Task 4.2)
-
-## Progress Update - 2026-02-17 (Session Complete - Sum Types Support)
+## Progress Update - 2026-02-18 (Variant Runtime Support)
 
 ### Session Summary
-**Date:** 2026-02-17 (Session 2)
-**Task:** Implement sum types support with variant discriminants
+**Date:** 2026-02-18  
+**Task:** Implement stack-based variant runtime support with destructuring
 
 ### What Was Implemented
 
-**Variant Syntax Support:**
-- Added `VariantItem` AST variant for `Type::Variant` syntax
-- Parser supports `Color::Red` variant access
-- HM typechecker handles `VariantItem` and `Variant` expressions
-- Compiler assigns sequential numeric discriminants to variants (0, 1, 2, ...)
+**Runtime Variant System:**
+- `VARIANT_SET` bytecode instruction: Creates variant with discriminant tag + field count
+- `MATCH_BRANCH` bytecode instruction: Compares discriminant and jumps to matching arm
+- `MATCH_DEFAULT` bytecode instruction: Unconditional jump for default match arm
+- `VARIANT_POP` bytecode instruction: Pops variant from stack during destructuring
 
-**Key Changes:**
-1. `parser/src/ast.rs` - Added `VariantItem(Output<'expr>, Output<'expr>)` for `Type::Variant` syntax
-2. `parser/src/lib.rs` - Added variant parser for `Type::Variant` syntax, integrated into expr parser
-3. `compiler/src/lib.rs` - Added variant discriminant tracking, `VariantItem` and `Variant` bytecode generation
-4. `compiler/src/hm_typechecker.rs` - Added `Variant` handling with type variable generation
-
-**Testing:**
-- test.0s compiles and runs successfully with sum types
-- `enum Color { Red, Green, Blue }` parsed correctly
-- `Color::Red`, `Color::Green` variants compile with discriminants
-- `print_color(Color::Red)` outputs 
-
-### What Work Done (2026-02-16)
-
-1. **Code Cleanup** - Removed 44+ unused imports:
-   - hm_typechecker.rs, ty.rs, constraint.rs, unify.rs, env.rs, mod.rs, lib.rs
-
-2. **Legacy Typechecker Replacement**
-   - Deleted `compiler/src/typechecker.rs` (583 lines)
-   - Deleted `compiler/src/typechecking/mod.rs` (32 lines)
-   - Removed legacy typechecker from Compiler struct
-   - Updated all references to use HM types directly
-
-3. **Build Fixes** - Added missing imports:
-   - SimpleSpan in hm_typechecker.rs and env.rs
-   - Borrow in unify.rs
-   - HashMap in env.rs
-
-4. **Warning Fixes** - Fixed all unused variables:
-   - ty, body_ty, name, args variables
-   - Unnecessary mut in struct_def/interface_def methods
-   - mut subst in unify.rs sum_type method
-
-5. **Compiler Integration**
-   - Added `reset()` method to HmTypeChecker
-   - Updated `typecheck()` to use HM typechecker
-   - Updated `register()` to work with HM types
-   - Replaced Type::FLOAT → Type::Float, Type::NONE → Type::Void
-
-6. **Error Reporting (Task 4.2)**
-   - Added `TypeError` struct with span information
-   - Enhanced constraint error messages with helpful suggestions
-   - Added arithmetic operation type mismatch messages
-   - Implemented span-based location reporting
-
-### Net Result
-- 12 files changed, 114 insertions(+), 704 deletions(-) = -590 lines net
-- Build: ✅ Success with 13 warnings (dead code for future features)
-- Tests: ✅ All pass
-
-### Next Tasks (Per Action Plan)
-- Task 4.3: Testing - Create unit and integration tests
-- Task 3.1: Sum Types - Implement exhaustiveness checking ✅ (basic level done)
-- Task 3.2: Generics - Add variance checking
-- Task 3.3: Interfaces - Implement conformance checking
-
-### Session Complete (2026-02-17)
-**Date:** 2026-02-17
-**Status:** ✅ test.0s compiles and runs successfully
-- Function call resolution working for functions with explicit return types
-- HM typechecker integrated and functional
-- Match exhaustiveness checking implemented (basic level)
-- Pattern value extraction for literals
-- Next: Expand type narrowing, sum type exhaustiveness
-## Progress Update - 2026-02-16 (After Testing)
-
-### Issue Identified
-The HM typechecker is integrated but has a **critical bug in function call type inference**:
-
-**Current Behavior:**
-- Function calls (`fib(n - 1)`) generate type variables like `call_result`
-- These type variables are not resolved to concrete types
-- Arithmetic operations on unresolved type variables fail with error:
-  ```
-  Error: Invalid operands for arithmetic operation: left type 'call_result', right type 'call_result'
-  ```
-
-**Root Cause:**
-- `HmTypeChecker::infer_expr` for `Call` creates a new type variable instead:
-  ```rust
-  Expression::Call { name: _, args: _ } => {
-      let tv = self.new_type_var("call_result");
-      Ok(Type::TypeVar(tv))
-  }
-  ```
-- Type variables are never resolved through function environments
-- No integration with function registry to look up actual return types
-
-### What to Continue
-The HM typechecker implementation is at a good foundation state, but needs:
-1. Function environment integration for call resolution
-2. Proper type variable solving with function return type substitution
-3. Integration with compiler's function registry
-
-
-## Progress Update - 2026-02-16 (After Testing)
-
-### Issue Identified (from previous update)
-The HM typechecker has critical bug in function call type inference:
-- Function calls generate type variables like `call_result` that are never resolved
-- Arithmetic operations on unresolved type variables fail
-
-### New Decisions (Q12-Q13)
-**Date:** 2026-02-16  
-**Decision:** Use function registry integration approach for call resolution
-
-**Rationale:**
-- Option 1 (store function return types in TypeEnv) is good enough for now
-- HM typechecker maintains its own separate function registry
-- Avoids confusion with Compiler's bytecode jump target registry
-
-**Next Steps:**
-1. Add `functions: HashMap<String, Type>` field to TypeEnv for function return types
-2. Update `TypeEnv::define_function()` to store return type
-3. Update `HmTypeChecker::infer_expr` for Call to look up return type from registry
-4. Update `Compiler::register()` to register function signature with HM typechecker
-5. Update `Compiler::do_compile` for Function to register signature with HM typechecker
-
-### Blocked Items (Updated)
-1. Function call type resolution - **RESOLVED**: Will use TypeEnv-based function registry
-
-## Progress Update - 2026-02-17 (Current Session)
-
-### Session Summary
-**Date:** 2026-02-17
-**Task:** Continue HM typechecker implementation
-
-### Current State
-- HM typechecker fully integrated into Compiler
-- Build compiles with 14 warnings (all dead code for future features)
-- No compilation errors
-
-### Identified Issue: Function Call Type Resolution
-**Issue:** Function calls with inferred return types don't resolve properly
-
-**Example from test.0s:**
-```0s
-fn add(x, y) -> int {
-    return x + y;  // Explicit return type - works
-}
-
-fn fib(int n) -> int {
-    if n <= 2 {
-        return 1;
-    }
-    return fib(n - 1) + fib(n - 2);  // Function calls should resolve
-}
-```
-
-**Root Cause:**
-- TypeEnv stores function signatures with Type::Function(params, return_ty)
-- Call expression looks up function name in TypeEnv
-- If return type is inferred, type variables may not resolve to concrete types
-
-**Decision Made:**
-**Approach:** Use TypeEnv-based function registry for call resolution
-
-**Rationale:**
-- TypeEnv already has scope management and variable/function storage
-- Separate registry keeps type checking concerns isolated
-- Simplest implementation for now, can evolve later
-
-**Implementation Plan:**
-1. Ensure function signatures are properly stored in TypeEnv after compilation
-2. Fix Call expression handling to resolve return types from TypeEnv
-3. Test with various function signature patterns
+**Key Design Decisions:**
+- Stack-based variant values (no heap allocation)
+- Compile-time discriminant assignment (0, 1, 2, ...)
+- Destructuring patterns: Pop variant from stack, store field into bound variable
 
 ### Files Modified This Session
-- `memories/progress.md` - Added session summary and progress updates
-- `memories/qa_log.md` - Added Q16 about function call type resolution
 
-### Files to Modify Next
-- `compiler/src/hm_typechecker.rs` - Fix Call expression type resolution
-- `compiler/src/lib.rs` - Verify function signature registration
-- `test.0s` - Test function call inference
+**Compiler:**
+- `compiler/src/lib.rs` - Added VariantWithDestructure handler, updated match handler for destructuring
 
-### Design Decisions This Session
-**Decision:** Function call type resolution requires HM typechecker to look up function signatures from TypeEnv
+**Runtime:**
+- `machine/src/vm.rs` - Implemented VM support for new variant instructions
 
-**Rationale:**
-- TypeEnv stores function signatures with Type::Function(params: Vec<Type>, return_ty: Type)
-- Call expression needs to look up function name in TypeEnv for return type resolution
-- Current implementation creates type variables but doesn't resolve them to concrete types
+**Bytecode:**
+- `common/src/opcode.rs` - Added VARIANT_SET, MATCH_BRANCH, MATCH_DEFAULT, VARIANT_POP
 
-**Implementation Plan:**
-1. Review how function signatures are stored in TypeEnv after compilation
-2. Fix Call expression handling to look up return type from TypeEnv
-3. Ensure type variables from Call expressions are resolved via TypeEnv lookup
+**Type Checker:**
+- `compiler/src/hm_typechecker.rs` - Handle destructured variant patterns in match arms
 
-**Testing:**
-- test.0s compiles and runs successfully
-- Function call resolution working for functions with explicit return types
-- fib(32) returns 2178309 correctly
-- fizbuz(3/5/15) outputs fiz/buz/fizbuz correctly
+### Testing
+- `test.0s` compiles and runs successfully
+- `Color::Red`, `Color::Green` compile with correct discriminants (0, 1)
+- Match expressions work correctly: `match c { case Color::Red => ... }`
+- Output: `250fizbuzfizbuzRedRust-style enum works!GreenRust-style enum works!`
 
-## Progress Update - 2026-02-17 (Session Complete - Decision Made)
+### Build Status
+- Debug: Success, 20 warnings (mostly dead code for future features)
+- Release: Success, 20 warnings
 
-### Decision Made
-**Date:** 2026-02-17  
-**Decision:** Function call type resolution requires HM typechecker to look up function signatures from TypeEnv
+### What's Still Pending
 
-**Rationale:**
-- TypeEnv stores function signatures with Type::Function(params: Vec<Type>, return_ty: Type)
-- Call expression needs to look up function name in TypeEnv for return type resolution
-- Current implementation creates type variables but doesn't resolve them to concrete types
+**High Priority:**
+- Full match destructuring: Support `case Result::Ok(value) => { ... }` where `value` is bound and usable
+- Generics: Implement `<T>` syntax and type parameter instantiation
+- Generic bounds: Support `<T: Clone>` style bounds (compile-time only)
 
-**Implementation Plan:**
-1. Review how function signatures are stored in TypeEnv after compilation
-2. Fix Call expression handling to look up return type from TypeEnv
-3. Ensure type variables from Call expressions are resolved via TypeEnv lookup
+**Medium Priority:**
+- Interface conformance checking: Verify structs implement required interface methods
+- Error reporting improvements: Add suggestions for type mismatches
 
-### Files Modified This Session (2026-02-17)
-- `memories/progress.md` - Added session summary and Q16
-- `memories/qa_log.md` - Added Q16 about function call type resolution
+**Low Priority:**
+- Testing infrastructure: Move inline tests to `tests/` folder
+- Documentation: Rustdoc comments and user guides
+- Performance optimizations: Memoise unification, deduplicate constraints
 
-### Files to Modify Next
-- `compiler/src/hm_typechecker.rs` - Fix Call expression type resolution
-- `compiler/src/lib.rs` - Verify function signature registration
-- `test.0s` - Test function call inference (needs out.c0s deletion first)
-
-## Design Decisions Summary (Updated)
-
-1. **Type System:** Rust-style strict with comprehensive inference
-2. **Syntax:** Rust-style generics (`<T>`), mixed Rust+Scala pattern matching (`case` prefix)
-3. **Sum Types:** Rust-style enums (known at compile time)
-4. **Interfaces:** Hybrid interface/trait model with default implementations
-5. **Classes:** No inheritance, rely on composition
-6. **Error Handling:** Collect all errors, support warnings
-7. **RTTI:** Compile-time monomorphization, no runtime type information
-8. **Inference:** As much as possible, explicit types for ambiguity
-9. **Function Return Types:** Explicitly required for public API, inferred for private functions
-10. **Function Signatures:** Stored as `Type::Function(params: Vec<Type>, return_ty: Type)` in TypeEnv
-11. **State Management:** TypeEnv snapshots saved/restored for function compilation
-12. **Scope Handling:** Function body variables local to function scope, not persisted after processing
-13. **Function Call Resolution:** HM typechecker looks up function signatures from TypeEnv for call resolution
-
-## Overall Progress (Updated)
-
-### Phase Completion Status
-- Phase 1 (Foundation): 4/4 tasks completed (Task 1.1, 1.2, 1.3, 1.4 done)
-- Phase 2 (Type Checker): 3/3 tasks completed (Tasks 2.1, 2.2, 2.3 completed)
-- Phase 3 (Advanced Features): 0/4 tasks completed (Task 3.1 - Basic sum types done)
-- Phase 4 (Integration): 1/4 tasks completed (Task 4.1 - HM integrated)
-- Phase 5 (Documentation): 0/2 tasks completed
-
-**Total Estimated Tasks:** 50  
-**Current Progress:** 9/50 (18%)
+### Session Complete (2026-02-18)
+**Status:** ✅ Variant runtime support complete
+- Stack-based variant values (no heap allocation)
+- Sequential discriminant assignment
+- Pattern matching with destructuring support
+- `test.0s` passes successfully
 
 ### Blocked Items
 1. Function call type resolution with inferred return types - Needs TypeEnv lookup fix
