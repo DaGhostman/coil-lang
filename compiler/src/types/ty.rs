@@ -196,7 +196,35 @@ impl GenericSignature {
         }
     }
 
-    /// Instantiate this generic signature with concrete types
+    pub fn validate_bounds(&self, args: &[Type]) -> Result<(), Vec<String>> {
+        if args.len() != self.type_params.len() {
+            return Err(vec![format!(
+                "Expected {} type arguments, got {}",
+                self.type_params.len(),
+                args.len()
+            )]);
+        }
+
+        let mut errors = Vec::new();
+        for (param, arg) in self.type_params.iter().zip(args.iter()) {
+            for bound in &param.bounds {
+                if !arg.satisfies_bound(bound) {
+                    errors.push(format!(
+                        "Type {} does not satisfy bound '{}'",
+                        arg.type_name(),
+                        bound.name
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     pub fn instantiate(&self, args: &[Type]) -> Type {
         if args.len() != self.type_params.len() {
             return Type::Void;
@@ -525,6 +553,50 @@ impl Type {
                 }
             }
         }
+    }
+
+    pub fn satisfies_bound(&self, bound: &TypeBound) -> bool {
+        match bound.name.as_str() {
+            "Copy" => self.is_copy(),
+            "Clone" => self.is_copy(),
+            "Numeric" => self.is_numeric(),
+            "Display" => self.is_display(),
+            "Eq" => self.is_eq(),
+            "Ord" => self.is_ord(),
+            _ => true,
+        }
+    }
+
+    fn is_copy(&self) -> bool {
+        match self {
+            Type::Int | Type::Float | Type::Bool | Type::Void | Type::None => true,
+            Type::Tuple(tys) => tys.iter().all(|t| t.is_copy()),
+            Type::Array(_) => false,
+            Type::String => false,
+            Type::Function(_, _) => true,
+            Type::TypeVar(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_numeric(&self) -> bool {
+        matches!(self, Type::Int | Type::Float)
+    }
+
+    fn is_display(&self) -> bool {
+        matches!(self, Type::Int | Type::Float | Type::String | Type::Bool)
+    }
+
+    fn is_eq(&self) -> bool {
+        match self {
+            Type::Int | Type::Float | Type::Bool | Type::String | Type::Void | Type::None => true,
+            Type::Tuple(tys) => tys.iter().all(|t| t.is_eq()),
+            _ => false,
+        }
+    }
+
+    fn is_ord(&self) -> bool {
+        matches!(self, Type::Int | Type::Float | Type::String)
     }
 }
 

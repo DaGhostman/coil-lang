@@ -45,15 +45,15 @@ impl HmTypeChecker {
         let mut type_params: Vec<TypeVar> = Vec::new();
         if let Some(generics) = generics {
             for (i, (gen_name, bounds)) in generics.iter().enumerate() {
-                let tv = TypeVar::new(i, gen_name);
-                // TODO: Store bounds information for later validation
-                let _bounds = bounds;
+                let bounds_vec: Vec<crate::types::ty::TypeBound> = bounds
+                    .iter()
+                    .map(|b| crate::types::ty::TypeBound::new(b))
+                    .collect();
+                let tv = TypeVar::new(i, gen_name).with_bounds(bounds_vec);
                 type_params.push(tv.clone());
-                // Register the type parameter in the environment
                 self.env
                     .define_variable(gen_name, Type::TypeVar(tv.clone()));
             }
-            // Store the generic signature
             self.env.define_generics(name, type_params.clone());
         }
 
@@ -347,7 +347,12 @@ impl HmTypeChecker {
                     })
                     .collect();
 
-                // Try to instantiate the generic function
+                if let Some(signature) = self.env.lookup_generic_signature(&identifier) {
+                    if let Err(bounds_errors) = signature.validate_bounds(&type_arg_types) {
+                        return Err(bounds_errors);
+                    }
+                }
+
                 if let Some(instantiated_ty) =
                     self.env.instantiate_generic(&identifier, &type_arg_types)
                 {

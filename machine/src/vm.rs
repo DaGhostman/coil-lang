@@ -181,24 +181,19 @@ impl<const S: usize> Machine<S> {
 
     #[inline(always)]
     fn execute(&mut self, code: &mut SeekableIterator<'_, Byte>) -> ExecutionResult {
-        #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
         let frame = self.frames.get_mut();
 
         while let Some(opcode) = code.next() {
-            #[cfg(debug_assertions)]
-            {
-                eprintln!(
-                    "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
-                    frame_no,
-                    code.tell(),
-                    format!("{:?}", opcode.bytecode()),
-                    opcode.operand_u16(0),
-                    opcode.operand_u16(1),
-                    self.stack.as_slice()
-                );
-            }
+            eprintln!(
+                "#{:<2} @ {:0>4} - {:?} [{:?}, {:?}]",
+                frame_no,
+                code.tell(),
+                opcode.bytecode(),
+                opcode.operand_u16(0),
+                opcode.operand_u16(1)
+            );
 
             // #[cfg(debug_assertions)]
             // {
@@ -403,19 +398,17 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::NOOP => continue,
                 Instruction::VARIANT_SET => {
-                    //Variant_set { tag: usize, field_count: usize },
                     let field_count = opcode.operand_u16(1) as usize;
                     let tag = opcode.operand_u16(0) as usize;
 
-                    // Collect field values from stack (in reverse order since stack is LIFO)
                     let mut fields = Vec::with_capacity(field_count);
                     for _ in 0..field_count {
                         fields.push(self.stack.pop());
                     }
-                    fields.reverse();
 
-                    // Push discriminant and field count as value (we'll use raw for discriminant)
-                    // For now, we just push the tag as the variant value
+                    for field in fields {
+                        self.stack.push(field);
+                    }
                     self.stack.push(Value::from(tag as i64));
                 }
                 Instruction::MATCH_BRANCH => {
@@ -439,6 +432,8 @@ impl<const S: usize> Machine<S> {
                     // Pop the variant value and its fields from stack
                     // The stack has: discriminant, field1, field2, ..., fieldN
                     // We need to pop the discriminant and keep the fields
+                    // But we don't know field_count at runtime, so we'll pop just 1 for now
+                    // and handle fields separately in match
                     self.stack.pop();
                 }
                 _ => return ExecutionResult::invalid(),

@@ -1079,10 +1079,9 @@ impl Compiler {
                     let expr = child.1.as_ref();
                     match expr {
                         Expression::MatchArm(pattern, body) => {
-                            let is_condition =
-                                !matches!(pattern.1.as_ref(), Expression::Default(_));
+                            let is_default = matches!(pattern.1.as_ref(), Expression::Default(_));
 
-                            if !is_condition && jumps.len() != last_idx {
+                            if is_default && jumps.len() != last_idx {
                                 let mut message = Message::warn(
                                     "`default` branch should be at the end of expression"
                                         .to_string(),
@@ -1099,57 +1098,122 @@ impl Compiler {
                                 self.messages.push(message);
                             }
 
-                            bytecode.push(Byte::new(Instruction::DUPLICATE));
-                            let mut compiled_patterns = vec![];
-                            if let Expression::List(patterns) = pattern.1.borrow() {
-                                compiled_patterns =
-                                    patterns.iter().map(|p| self.do_compile(p)).collect();
-                            } else {
-                                compiled_patterns.push(self.do_compile(pattern));
-                            }
-
-                            // Handle VariantWithDestructure patterns - bind field names as variables
-                            // This is needed for match arms like: case Result::Ok(value) => { ... }
                             if let Expression::VariantWithDestructure(_ty, _name, fields) =
                                 pattern.1.borrow()
                             {
-                                // Bind each field as a variable in the current scope
-                                for field in fields {
-                                    if let Expression::Identifier(name) = field.1.borrow() {
-                                        let var_name = name.to_string();
-                                        self.context.variables.intern(var_name.clone());
-                                        // Pop the variant from stack, keeping the field
-                                        bytecode.push(Byte::new(Instruction::VARIANT_POP));
-                                        // Store the field value into the variable
-                                        let symbol = self
-                                            .context
-                                            .variables
-                                            .key(&var_name)
-                                            .expect("Field should be interned");
+                                let type_name = match _ty.1.borrow() {
+                                    Expression::Type(t) => t.1.to_string(),
+                                    _ => _ty.1.to_string(),
+                                };
+                                let var_name = match _name.1.borrow() {
+                                    Expression::Identifier(n) => n.to_string(),
+                                    _ => _name.1.to_string(),
+                                };
+
+                                if let Some(discriminants) =
+                                    self.variant_discriminants.get(&type_name)
+                                {
+                                    if let Some(discriminant) = discriminants.get(&var_name) {
+                                        for field in fields.iter() {
+                                            if let Expression::Identifier(name) = field.1.borrow() {
+                                                let var_name = name.to_string();
+                                                self.context.variables.intern(var_name.clone());
+                                            }
+                                        }
+
+                                        bytecode.push(Byte::new(Instruction::DUPLICATE));
+                                        bytecode.push(Byte::new_with_value(
+                                            Instruction::CONST,
+                                            Value::from(*discriminant).raw() as _,
+                                        ));
+                                        bytecode.push(Byte::new(Instruction::EQ));
+
+                                        let field_extraction_count = fields.len() * 2 + 1;
+                                        let mut body_code = self.do_compile(&body);
+                                        let jmpf_target = self.bytecode.len()
+                                            + bytecode.len()
+                                            + field_extraction_count
+                                            + 1
+                                            + body_code.len()
+                                            + 1;
                                         bytecode.push(
-                                            Byte::new(Instruction::STORE)
-                                                .with_operand_u32(symbol as u32),
+                                            Byte::new(Instruction::JMPF)
+                                                .with_operand_u32(jmpf_target as u32),
+                                        );
+
+                                        bytecode.push(Byte::new(Instruction::POP));
+
+                                        for field in fields.iter() {
+                                            if let Expression::Identifier(name) = field.1.borrow() {
+                                                let var_name = name.to_string();
+                                                let symbol = self
+                                                    .context
+                                                    .variables
+                                                    .key(&var_name)
+                                                    .expect("Field should be interned");
+                                                bytecode.push(
+                                                    Byte::new(Instruction::STORE)
+                                                        .with_operand_u32(symbol as u32),
+                                                );
+                                                bytecode.push(Byte::new(Instruction::POP));
+                                            }
+                                        }
+
+                                        bytecode.append(&mut body_code);
+                                        jumps.push(bytecode.len());
+                                        bytecode.push(
+                                            Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
+                                        );
+                                    } else {
+                                        let mut message = Message::error(
+                                            format!(
+                                                "Unknown variant '{}::{}'",
+                                                type_name, var_name
+                                            ),
+                                            child.0.clone().into_range(),
+                                        );
+                                        self.messages.push(message);
+                                    }
+                                } else {
+                                    let mut message = Message::error(
+                                        format!("Unknown type '{}'", type_name),
+                                        child.0.clone().into_range(),
+                                    );
+                                    self.messages.push(message);
+                                }
+                            } else {
+                                bytecode.push(Byte::new(Instruction::DUPLICATE));
+                                let mut compiled_patterns = vec![];
+                                if let Expression::List(patterns) = pattern.1.borrow() {
+                                    compiled_patterns =
+                                        patterns.iter().map(|p| self.do_compile(p)).collect();
+                                } else {
+                                    compiled_patterns.push(self.do_compile(pattern));
+                                }
+
+                                compiled_patterns.iter_mut().for_each(|mut pattern_code| {
+                                    bytecode.append(&mut pattern_code);
+                                    bytecode.push(Byte::new(Instruction::EQ));
+
+                                    let mut body_code = self.do_compile(&body);
+                                    if !is_default {
+                                        bytecode.push(
+                                            Byte::new(Instruction::JMPF).with_operand_u32(
+                                                (self.bytecode.len()
+                                                    + bytecode.len()
+                                                    + body_code.len()
+                                                    + 2)
+                                                    as u32,
+                                            ),
                                         );
                                     }
-                                }
+                                    bytecode.append(&mut body_code);
+                                    jumps.push(bytecode.len());
+                                    bytecode.push(
+                                        Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
+                                    );
+                                });
                             }
-
-                            compiled_patterns.iter_mut().for_each(|mut pattern_code| {
-                                bytecode.append(&mut pattern_code);
-                                bytecode.push(Byte::new(Instruction::EQ));
-
-                                let mut body_code = self.do_compile(&body);
-                                if is_condition {
-                                    bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
-                                        (self.bytecode.len() + bytecode.len() + body_code.len() + 2)
-                                            as u32,
-                                    ));
-                                }
-                                bytecode.append(&mut body_code);
-                                jumps.push(bytecode.len());
-                                bytecode
-                                    .push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
-                            });
                         }
                         _ => {
                             let mut message = Message::error(
