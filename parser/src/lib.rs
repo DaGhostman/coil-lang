@@ -118,16 +118,55 @@ impl<'pratt> Pratt<'pratt> {
         text::ident().padded().map_with(output!(Identifier))
     }
 
+    fn type_expr(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        // Parse type expressions with optional generic parameters
+        // Syntax: int, string, Result<int, string>, etc.
+        self.ident()
+            .then(
+                op!("<")
+                    .ignore_then(
+                        self.ident()
+                            .separated_by(op!(","))
+                            .allow_trailing()
+                            .collect::<Vec<_>>(),
+                    )
+                    .then_ignore(op!(">"))
+                    .or_not(),
+            )
+            .map_with(|(name_output, type_args), e| {
+                let name = match *name_output.1 {
+                    Expression::Identifier(n) => n,
+                    _ => "",
+                };
+                if let Some(args) = type_args {
+                    // Generic type: Result<int, string>
+                    let type_args: Vec<Output<'pratt>> = args
+                        .into_iter()
+                        .map(|arg| (e.span(), Box::new(Expression::Type(arg))))
+                        .collect();
+                    (e.span(), Box::new(Expression::GenericCall(name, type_args)))
+                } else {
+                    // Simple type: int, string - keep the original Output
+                    name_output
+                }
+            })
+    }
+
     fn expr(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         recursive(|expr| {
             let atom = choice((
+                // Variant must come before call because Color::Red looks like call(Color) otherwise
                 self.variant(),
                 self.call(expr.clone()),
                 self.float(),
                 self.int(),
+                self.string(),
                 self.ident(),
                 op!("true")
                     .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
@@ -602,7 +641,7 @@ impl<'pratt> Pratt<'pratt> {
     {
         keyword!("let")
             .ignore_then(text::ident())
-            .then(op!(":").ignore_then(self.ident()).or_not())
+            .then(op!(":").ignore_then(self.type_expr()).or_not())
             .then(op!("=").ignore_then(self.expr()).or_not())
             .map_with(|((name, ty), val), e| {
                 if let Some(v) = val {
@@ -709,8 +748,21 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Parse generic parameters: <T, E> or just use empty vec for non-generic enums
+        let generic_params = op!("<")
+            .ignore_then(
+                text::ident()
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(op!(">"))
+            .or_not()
+            .map(|opts| opts.unwrap_or_default());
+
         keyword!("enum")
             .ignore_then(self.ident())
+            .then(generic_params)
             .then(
                 self.variant_item()
                     .separated_by(op!(","))
@@ -719,10 +771,14 @@ impl<'pratt> Pratt<'pratt> {
                     .or_not()
                     .delimited_by(op!("{"), op!("}")),
             )
-            .map_with(|(name, variants), e| {
+            .map_with(|((name, type_params), variants), e| {
                 (
                     e.span(),
-                    Box::new(Expression::SumType(name, variants.unwrap_or_default())),
+                    Box::new(Expression::SumType(
+                        name,
+                        type_params,
+                        variants.unwrap_or_default(),
+                    )),
                 )
             })
     }
@@ -731,44 +787,44 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // Parse Type::Variant syntax
-        // Syntax: Color::Red (simple) or Result::Ok(int x) (with destructuring)
-        // For match patterns, we use variable names for destructuring
-        self.ident()
+        // Parse Type::Variant syntax - ONLY matches when there's a :: present
+        // This ensures it doesn't accidentally consume identifiers that aren't variants
+        // Syntax: Color::Red or Result::Ok(value)
+
+        // First, try to match ident::ident pattern
+        let with_fields = self
+            .ident()
             .then_ignore(op!("::"))
             .then(self.ident())
             .then(
-                // Destructured fields must be identifiers (variable names) for match patterns
-                // Syntax: Result::Ok(x) where 'x' is a variable to bind
-                self.ident()
-                    .separated_by(op!(","))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(op!("("), op!(")"))
+                op!("(")
+                    .ignore_then(
+                        // Parse simple values: integers, floats, strings, or identifiers
+                        choice((self.int(), self.float(), self.string(), self.ident()))
+                            .separated_by(op!(","))
+                            .allow_trailing()
+                            .collect::<Vec<_>>(),
+                    )
+                    .then_ignore(op!(")"))
                     .or_not(),
             )
-            .map_with(|((type_name, variant_name), destructured), e| {
-                match destructured {
-                    Some(fields) => {
-                        // Variant with destructured fields for match patterns: Result::Ok(x)
-                        (
-                            e.span(),
-                            Box::new(Expression::VariantWithDestructure(
-                                type_name,
-                                variant_name,
-                                fields,
-                            )),
-                        )
-                    }
-                    None => {
-                        // Simple variant: Color::Red
-                        (
-                            e.span(),
-                            Box::new(Expression::VariantItem(type_name, variant_name)),
-                        )
-                    }
-                }
-            })
+            .map_with(|((type_name, variant_name), fields), e| match fields {
+                Some(field_values) => (
+                    e.span(),
+                    Box::new(Expression::VariantWithDestructure(
+                        type_name,
+                        variant_name,
+                        field_values,
+                    )),
+                ),
+                None => (
+                    e.span(),
+                    Box::new(Expression::VariantItem(type_name, variant_name)),
+                ),
+            });
+
+        // Try with fields first, then simple variant
+        with_fields
     }
 
     fn struct_<

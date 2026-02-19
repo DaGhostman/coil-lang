@@ -3,10 +3,26 @@
 ## Current Status (2026-02-19)
 - **Phase 1 (Foundation):** 5/5 tasks completed
 - **Phase 2 (Type Checker):** 3/3 tasks completed
-- **Phase 3 (Advanced Features):** 2/4 tasks completed (Task 3.1 - Sum Types, Task 3.2 - Generics)
+- **Phase 3 (Advanced Features):** 3/4 tasks completed (Task 3.1 - Sum Types, Task 3.2 - Generics, Task 3.3 - Generic Sum Types)
 - **Phase 4 (Integration):** 2/4 tasks completed (Task 4.1 - HM typechecker + Runtime, Task 4.2 - Generics Integration)
 - **Phase 5 (Documentation):** 0/2 tasks completed
-- **Overall Progress:** 24% (12/50 tasks)
+- **Overall Progress:** 26% (13/50 tasks)
+
+**Session Update (2026-02-19) - Generic Sum Types:**
+- ✅ Generic enum declaration parsing (`enum Result<T, E> { Ok(T), Err(E) }`)
+- ✅ Type annotations with generics (`let ok: Result<int, string> = ...`)
+- ✅ Variant construction with fields (`Result::Ok(42)`, `Result::Err("error")`)
+- ✅ Added string parsing to expressions (was missing before)
+- ✅ Type::SumType now includes name and type_params fields
+- ✅ Variant struct now includes type_params
+- ✅ Updated parser, type system, and compiler to handle generic sum types
+
+**Working Test Results:**
+- `enum Result<T, E> { Ok(T), Err(E) }` - parses correctly
+- `let ok: Result<int, string> = Result::Ok(42)` - works
+- `let err: Result<int, string> = Result::Err("error")` - works
+- `tests/sum_gen5.0s` outputs "42error" correctly
+- `tests/sum_basic.0s` outputs "RedGreenBlue" correctly
 
 **Session Update (2026-02-17):**
 - ✅ test.0s compiles and runs successfully

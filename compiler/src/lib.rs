@@ -391,7 +391,7 @@ impl Compiler {
                 );
                 self.context.symbols.intern(name.to_string());
             }
-            Expression::SumType(name, variants) => {
+            Expression::SumType(name, _type_params, variants) => {
                 // Register variant discriminants for the sum type
                 // For now, we use a placeholder type name since the enum name isn't captured
                 let mut discriminants = HashMap::new();

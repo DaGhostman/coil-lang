@@ -141,18 +141,46 @@ pub fn unify_types(t1: &Type, t2: &Type, substitution: &mut Substitution) -> Uni
         }
 
         // Sum types
-        (Type::SumType(v1), Type::SumType(v2)) => {
+        (
+            Type::SumType {
+                name: n1,
+                type_params: tp1,
+                variants: v1,
+            },
+            Type::SumType {
+                name: n2,
+                type_params: tp2,
+                variants: v2,
+            },
+        ) => {
+            if n1 != n2 {
+                return UnifyResult::failure("Sum type name mismatch");
+            }
+            if tp1.len() != tp2.len() {
+                return UnifyResult::failure("Sum type parameter count mismatch");
+            }
             if v1.len() != v2.len() {
                 return UnifyResult::failure("Sum type variant count mismatch");
             }
 
-            let subst = substitution.clone();
+            let mut subst = substitution.clone();
+            // Unify type parameters
+            for (tp1, tp2) in tp1.iter().zip(tp2.iter()) {
+                let unified = unify_types(
+                    &Type::TypeVar(tp1.clone()),
+                    &Type::TypeVar(tp2.clone()),
+                    &mut subst,
+                );
+                if let UnifyResult::Failure(msg) = unified {
+                    return UnifyResult::Failure(msg);
+                }
+            }
+
             for (variant1, variant2) in v1.iter().zip(v2.iter()) {
                 if variant1.name != variant2.name {
-                    return UnifyResult::failure("Sum type variant name mismatch");
+                    return UnifyResult::Failure("Sum type variant name mismatch".to_string());
                 }
                 // TODO: unify variant fields
-                let _ = subst;
             }
 
             UnifyResult::success(subst)
@@ -235,7 +263,11 @@ fn apply_substitution(ty: &Type, substitution: &Substitution) -> Type {
             &alias.name,
             apply_substitution(&alias.target, substitution),
         )),
-        Type::SumType(variants) => {
+        Type::SumType {
+            name,
+            type_params,
+            variants,
+        } => {
             let new_variants = variants
                 .iter()
                 .map(|v| {
@@ -248,10 +280,15 @@ fn apply_substitution(ty: &Type, substitution: &Substitution) -> Type {
                         })
                         .collect();
                     variant.with_fields(new_fields);
+                    variant.type_params = v.type_params.clone();
                     variant
                 })
                 .collect();
-            Type::SumType(new_variants)
+            Type::SumType {
+                name: name.clone(),
+                type_params: type_params.clone(),
+                variants: new_variants,
+            }
         }
         _ => ty.clone(),
     }
@@ -288,11 +325,20 @@ fn occurs_check(tv: &TypeVar, ty: &Type, substitution: &Substitution) -> bool {
             .iter()
             .any(|p| occurs_check(tv, p, substitution)),
         Type::Alias(alias) => occurs_check(tv, &alias.target, substitution),
-        Type::SumType(variants) => variants.iter().any(|v| {
-            v.fields
+        Type::SumType {
+            type_params,
+            variants,
+            ..
+        } => {
+            type_params
                 .iter()
-                .any(|f| occurs_check(tv, &f.ty, substitution))
-        }),
+                .any(|tp| occurs_check(tv, &Type::TypeVar(tp.clone()), substitution))
+                || variants.iter().any(|v| {
+                    v.fields
+                        .iter()
+                        .any(|f| occurs_check(tv, &f.ty, substitution))
+                })
+        }
         _ => false,
     }
 }

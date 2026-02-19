@@ -105,8 +105,8 @@ pub enum Expression<'expr> {
 
     // HM Type System Features
     TypeVar(&'expr str, usize), // Type variable for inference
-    SumType(Output<'expr>, Vec<Output<'expr>>), // Sum type (enum)
-    Variant(Output<'expr>, Option<Vec<Output<'expr>>>), // Variant for sum type
+    SumType(Output<'expr>, Vec<&'expr str>, Vec<Output<'expr>>), // Sum type (enum) with optional type params: enum Result<T, E> { Ok(T), Err(E) }
+    Variant(Output<'expr>, Option<Vec<Output<'expr>>>),          // Variant for sum type
     VariantItem(Output<'expr>, Output<'expr>), // Simple variant (e.g., Color::Red)
     VariantWithDestructure(Output<'expr>, Output<'expr>, Vec<Output<'expr>>), // Variant with type, name, and destructured fields (e.g., Color::Rgb(255, 127, 0))
     GenericDecl(Vec<&'expr str>, Output<'expr>), // Generic type declaration
@@ -261,13 +261,18 @@ impl<'a> Display for Expression<'a> {
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
             Self::TypeVar(name, id) => write!(f, "T<{}:{}>", id, name),
-            Self::SumType(name, variants) => {
+            Self::SumType(name, type_params, variants) => {
                 let names = variants
                     .iter()
                     .map(|v| v.1.to_string())
                     .collect::<Vec<_>>()
                     .join(" | ");
-                write!(f, "enum<{}>", names)
+                if type_params.is_empty() {
+                    write!(f, "enum<{}>", names)
+                } else {
+                    let params = type_params.join(", ");
+                    write!(f, "enum{}<{}> {{{}}}", name.1, params, names)
+                }
             }
             Self::Variant(name, fields) => {
                 write!(

@@ -65,7 +65,11 @@ impl Substitution {
             Type::Alias(alias) => {
                 Type::Alias(TypeAlias::new(&alias.name, self.apply(*alias.target)))
             }
-            Type::SumType(variants) => {
+            Type::SumType {
+                name,
+                type_params,
+                variants,
+            } => {
                 let sum_variants = variants
                     .into_iter()
                     .map(|v| {
@@ -76,10 +80,15 @@ impl Substitution {
                                 .map(|f| Field::new(&f.name, self.apply(*f.ty)))
                                 .collect(),
                         );
+                        variant.type_params = v.type_params;
                         variant
                     })
                     .collect();
-                Type::SumType(sum_variants)
+                Type::SumType {
+                    name,
+                    type_params,
+                    variants: sum_variants,
+                }
             }
             _ => ty,
         }
@@ -126,9 +135,16 @@ impl Substitution {
             }),
             Type::Generic(r#gen) => r#gen.params.iter().any(|p| self.contains_var(&*p, var)),
             Type::Alias(alias) => self.contains_var(&*alias.target, var),
-            Type::SumType(variants) => variants
-                .iter()
-                .any(|v| v.fields.iter().any(|f| self.contains_var(&*f.ty, var))),
+            Type::SumType {
+                type_params,
+                variants,
+                ..
+            } => {
+                type_params.iter().any(|tp| tp.id == var.id)
+                    || variants
+                        .iter()
+                        .any(|v| v.fields.iter().any(|f| self.contains_var(&*f.ty, var)))
+            }
             _ => false,
         }
     }

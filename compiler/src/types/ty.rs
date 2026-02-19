@@ -266,7 +266,11 @@ impl GenericSignature {
                     new_alias.generics = alias.generics.clone();
                     Type::Alias(new_alias)
                 }
-                Type::SumType(variants) => {
+                Type::SumType {
+                    name,
+                    type_params,
+                    variants,
+                } => {
                     let new_variants: Vec<Variant> = variants
                         .iter()
                         .map(|v| {
@@ -277,10 +281,29 @@ impl GenericSignature {
                                 .collect();
                             let mut new_variant = Variant::new(&v.name);
                             new_variant.fields = new_fields;
+                            new_variant.type_params = v.type_params.clone();
                             new_variant
                         })
                         .collect();
-                    Type::SumType(new_variants)
+                    let new_type_params: Vec<TypeVar> = type_params
+                        .iter()
+                        .map(|tp| {
+                            if let Some(new_type) = subst.get(&tp.id) {
+                                if let Type::TypeVar(tv) = new_type {
+                                    tv.clone()
+                                } else {
+                                    tp.clone()
+                                }
+                            } else {
+                                tp.clone()
+                            }
+                        })
+                        .collect();
+                    Type::SumType {
+                        name: name.clone(),
+                        type_params: new_type_params,
+                        variants: new_variants,
+                    }
                 }
                 _ => ty.clone(),
             }
@@ -326,7 +349,11 @@ pub enum Type {
     Alias(TypeAlias),
 
     // Sum types (Rust-style enums)
-    SumType(Vec<Variant>),
+    SumType {
+        name: String,
+        type_params: Vec<TypeVar>,
+        variants: Vec<Variant>,
+    },
 }
 
 /// Variant for sum types
@@ -334,6 +361,7 @@ pub enum Type {
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Field>,
+    pub type_params: Vec<TypeVar>,
 }
 
 impl Variant {
@@ -341,11 +369,16 @@ impl Variant {
         Self {
             name: name.to_string(),
             fields: Vec::new(),
+            type_params: Vec::new(),
         }
     }
 
     pub fn with_fields(&mut self, fields: Vec<Field>) {
         self.fields = fields;
+    }
+
+    pub fn with_type_params(&mut self, type_params: Vec<TypeVar>) {
+        self.type_params = type_params;
     }
 }
 
@@ -394,11 +427,12 @@ impl Type {
     }
 
     /// Create a new sum type (enum)
-    pub fn sum_type(name: &str, variants: Vec<Variant>) -> Self {
-        // For now, we'll wrap variants in a struct-like type
-        // This will be refined as we add more enum-specific features
-        let _ = name;
-        Type::SumType(variants)
+    pub fn sum_type(name: &str, type_params: Vec<TypeVar>, variants: Vec<Variant>) -> Self {
+        Type::SumType {
+            name: name.to_string(),
+            type_params,
+            variants,
+        }
     }
 
     /// Check if this type is a type variable
@@ -469,13 +503,26 @@ impl Type {
             Type::Alias(alias) => {
                 format!("{} = {}", alias.name, alias.target.type_name())
             }
-            Type::SumType(variants) => {
+            Type::SumType {
+                name,
+                type_params,
+                variants,
+            } => {
                 let variant_names = variants
                     .iter()
                     .map(|v| v.name.clone())
                     .collect::<Vec<_>>()
                     .join(" | ");
-                format!("enum<{}>", variant_names)
+                if type_params.is_empty() {
+                    format!("enum<{}>", variant_names)
+                } else {
+                    let param_names = type_params
+                        .iter()
+                        .map(|tp| tp.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("enum{}<{}> {{{}}}", name, param_names, variant_names)
+                }
             }
         }
     }
