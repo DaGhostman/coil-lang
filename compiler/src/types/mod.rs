@@ -7,4 +7,4 @@ pub mod unify;
 pub use constraint::ConstraintSet;
 pub use env::TypeEnv;
 pub use substitution::Substitution;
-pub use ty::{StructDef, Type, TypeVar};
+pub use ty::{GenericSignature, StructDef, Type, TypeVar};

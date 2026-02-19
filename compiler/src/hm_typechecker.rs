@@ -1,7 +1,9 @@
-use parser::{ast::Expression, SimpleSpan};
+use parser::{ast::Expression, ast::Output, SimpleSpan};
 use std::borrow::Borrow;
 
-use crate::types::{constraint::Constraint, ConstraintSet, Substitution, Type, TypeEnv, TypeVar};
+use crate::types::{
+    constraint::Constraint, ConstraintSet, GenericSignature, Substitution, Type, TypeEnv, TypeVar,
+};
 
 /// A type checking error with span information
 #[derive(Clone, Debug)]
@@ -27,6 +29,91 @@ pub struct HmTypeChecker {
 }
 
 impl HmTypeChecker {
+    /// Handle function declaration (with or without generics)
+    fn handle_function<'a>(
+        &mut self,
+        name: &'a str,
+        args: &Output<'a>,
+        returns: Option<&Output<'a>>,
+        body: &Output<'a>,
+        generics: Option<&Vec<(&'a str, Vec<&'a str>)>>,
+    ) -> Result<Type, Vec<String>> {
+        // Create a new scope for the function
+        self.env.push_scope();
+
+        // Process generic type parameters
+        let mut type_params: Vec<TypeVar> = Vec::new();
+        if let Some(generics) = generics {
+            for (i, (gen_name, bounds)) in generics.iter().enumerate() {
+                let tv = TypeVar::new(i, gen_name);
+                // TODO: Store bounds information for later validation
+                let _bounds = bounds;
+                type_params.push(tv.clone());
+                // Register the type parameter in the environment
+                self.env
+                    .define_variable(gen_name, Type::TypeVar(tv.clone()));
+            }
+            // Store the generic signature
+            self.env.define_generics(name, type_params.clone());
+        }
+
+        // Process arguments and collect parameter types
+        let mut param_types = Vec::new();
+        if let Expression::Fragment(arg_list) = args.1.borrow() {
+            for arg in arg_list.iter() {
+                if let Expression::Argument(ty_expr, var_expr) = arg.1.borrow() {
+                    // Extract type from Output<'expr>
+                    let ty_name = match ty_expr.1.borrow() {
+                        Expression::Type(t) => t.1.to_string(),
+                        _ => ty_expr.1.to_string(),
+                    };
+                    let ty = Type::from(ty_name);
+
+                    // Extract variable name from Output<'expr>
+                    let var_name = match var_expr.1.borrow() {
+                        Expression::Identifier(n) => n.to_string(),
+                        _ => var_expr.1.to_string(),
+                    };
+
+                    param_types.push(ty.clone());
+                    self.env.define_variable(&var_name, ty);
+                }
+            }
+        }
+
+        // Process return type - explicit is preferred
+        let return_ty = if let Some(ret_expr) = returns {
+            // Extract type name from Output<'expr>
+            let ty_name = match ret_expr.1.borrow() {
+                Expression::Type(t) => t.1.to_string(),
+                _ => ret_expr.1.to_string(),
+            };
+            Type::from(ty_name)
+        } else {
+            // Inference fallback: default to Void for functions without explicit return type
+            // Note: It's recommended to explicitly declare return types for clarity
+            Type::Void
+        };
+
+        // Check body
+        let _ = self.infer_expr(body.1.borrow())?;
+
+        // Pop scope
+        self.env.pop_scope();
+
+        // Register function signature in TypeEnv for call resolution
+        let func_ty = Type::Function(param_types.clone(), Box::new(return_ty.clone()));
+        self.env.define_function(name, func_ty.clone());
+
+        // If this is a generic function, also store the generic signature
+        if !type_params.is_empty() {
+            let generic_sig = GenericSignature::new(name, type_params, param_types, return_ty);
+            self.env.define_generic_signature(name, generic_sig);
+        }
+
+        Ok(func_ty)
+    }
+
     /// Create a new HM type checker
     pub fn new() -> Self {
         Self {
@@ -224,66 +311,87 @@ impl HmTypeChecker {
                 args,
                 returns,
                 body,
-            }
-            | Expression::FunctionWithGenerics {
+            } => self.handle_function(name, &args, returns.as_ref(), &body, None),
+
+            Expression::FunctionWithGenerics {
                 name,
                 args,
                 returns,
                 body,
-                generics: _,
+                generics,
+            } => self.handle_function(name, &args, returns.as_ref(), &body, Some(generics)),
+
+            Expression::GenericFunctionCall {
+                name,
+                type_args,
+                args,
             } => {
-                // Create a new scope for the function
-                self.env.push_scope();
-
-                // Process arguments and collect parameter types
-                let mut param_types = Vec::new();
-                if let Expression::Fragment(arg_list) = args.1.borrow() {
-                    for arg in arg_list.iter() {
-                        if let Expression::Argument(ty_expr, var_expr) = arg.1.borrow() {
-                            // Extract type from Output<'expr>
-                            let ty_name = match ty_expr.1.borrow() {
-                                Expression::Type(t) => t.1.to_string(),
-                                _ => ty_expr.1.to_string(),
-                            };
-                            let ty = Type::from(ty_name);
-
-                            // Extract variable name from Output<'expr>
-                            let var_name = match var_expr.1.borrow() {
-                                Expression::Identifier(n) => n.to_string(),
-                                _ => var_expr.1.to_string(),
-                            };
-
-                            param_types.push(ty.clone());
-                            self.env.define_variable(&var_name, ty);
-                        }
+                // Extract function name from the name expression
+                let identifier = match name.1.borrow() {
+                    Expression::Identifier(n) => n.to_string(),
+                    _ => {
+                        let tv = self.new_type_var("complex_generic_call");
+                        return Ok(Type::TypeVar(tv));
                     }
-                }
-
-                // Process return type - explicit is preferred
-                let return_ty = if let Some(ret_expr) = returns {
-                    // Extract type name from Output<'expr>
-                    let ty_name = match ret_expr.1.borrow() {
-                        Expression::Type(t) => t.1.to_string(),
-                        _ => ret_expr.1.to_string(),
-                    };
-                    Type::from(ty_name)
-                } else {
-                    // Inference fallback: default to Void for functions without explicit return type
-                    // Note: It's recommended to explicitly declare return types for clarity
-                    Type::Void
                 };
 
-                // Check body
-                let _ = self.infer_expr(body.1.borrow())?;
+                // Parse type arguments
+                let type_arg_types: Vec<Type> = type_args
+                    .iter()
+                    .map(|ta| {
+                        let ty_name = match ta.1.borrow() {
+                            Expression::Type(t) => t.1.to_string(),
+                            _ => ta.1.to_string(),
+                        };
+                        Type::from(ty_name)
+                    })
+                    .collect();
 
-                // Pop scope
-                self.env.pop_scope();
+                // Try to instantiate the generic function
+                if let Some(instantiated_ty) =
+                    self.env.instantiate_generic(&identifier, &type_arg_types)
+                {
+                    match instantiated_ty {
+                        Type::Function(params, return_ty) => {
+                            // Check argument types
+                            if let Some(args) = args {
+                                if params.len() == args.len() {
+                                    let arg_types: Vec<Type> = args
+                                        .iter()
+                                        .map(|arg| self.infer_expr(arg.1.borrow()))
+                                        .collect::<Result<Vec<_>, Vec<_>>>()
+                                        .map_err(|e| e)?;
 
-                // Register function signature in TypeEnv for call resolution
-                let func_ty = Type::Function(param_types, Box::new(return_ty));
-                self.env.define_function(name, func_ty.clone());
-
-                Ok(func_ty)
+                                    for (i, arg_ty) in arg_types.iter().enumerate() {
+                                        self.constraints.add(
+                                            arg_ty.clone(),
+                                            params[i].clone(),
+                                            args[i].0.clone(),
+                                        );
+                                    }
+                                    Ok(return_ty.as_ref().clone())
+                                } else {
+                                    Err(vec![format!(
+                                        "Function '{}' expects {} arguments, but {} provided",
+                                        identifier,
+                                        params.len(),
+                                        args.len()
+                                    )])
+                                }
+                            } else {
+                                Ok(return_ty.as_ref().clone())
+                            }
+                        }
+                        _ => Err(vec![format!(
+                            "'{}' is not a function after instantiation",
+                            identifier
+                        )]),
+                    }
+                } else {
+                    // Generic signature not found, create a type variable
+                    let tv = self.new_type_var(&format!("{}_generic_ret", identifier));
+                    Ok(Type::TypeVar(tv))
+                }
             }
 
             Expression::Call { name, args } => {
@@ -373,6 +481,39 @@ impl HmTypeChecker {
 
                 self.env.define_variable(&var_name, value_ty.clone());
                 Ok(value_ty)
+            }
+
+            Expression::TypedAssignment { name, ty, value } => {
+                // Extract expected type from annotation
+                let expected_ty_name = match ty.1.borrow() {
+                    Expression::Type(t) => t.1.to_string(),
+                    _ => ty.1.to_string(),
+                };
+                let expected_ty = Type::from(expected_ty_name);
+
+                // Infer the value type
+                let value_ty = self.infer_expr(value.1.borrow())?;
+
+                // Check if types match - generate error if not
+                if value_ty != expected_ty {
+                    // If value_ty is a type variable, we can't check yet
+                    if !matches!(value_ty, Type::TypeVar(_)) {
+                        return Err(vec![format!(
+                            "Type mismatch: expected '{}', found '{}'",
+                            expected_ty.type_name(),
+                            value_ty.type_name()
+                        )]);
+                    }
+                }
+
+                // Generate constraint: value_ty == expected_ty
+                self.constraints
+                    .add(value_ty.clone(), expected_ty.clone(), ty.0.clone());
+
+                // Define variable with the expected type
+                self.env.define_variable(name, expected_ty.clone());
+
+                Ok(expected_ty)
             }
 
             Expression::Block(stmts) | Expression::Fragment(stmts) | Expression::Program(stmts) => {

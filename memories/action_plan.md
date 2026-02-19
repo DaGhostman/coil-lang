@@ -101,12 +101,15 @@ This plan breaks down the implementation of a complete Hindley-Milner type syste
 - [ ] Implement heap-based variant storage for variants with fields - In Progress
 
 ### Task 3.2: Generics
-**Date:** __/__/
-- [ ] Add `Expression::GenericDecl(TypeVar, Body)`
-- [ ] Add `Expression::GenericCall(Name, Vec<Type>)`
-- [ ] Implement generic type instantiation
-- [ ] Add constraint solving for generics
-- [ ] Implement `TypeChecker::check_generic()`
+**Date:** 2026-02-19
+- [x] Add `Expression::GenericDecl(TypeVar, Body)` - ✅ (already existed)
+- [x] Add `Expression::GenericCall(Name, Vec<Type>)` - ✅ (already existed)
+- [x] Add `Expression::GenericFunctionCall` for turbofish syntax - ✅
+- [x] Implement generic type instantiation - ✅ (GenericSignature::instantiate)
+- [x] Add constraint solving for generics - ✅ (in HM typechecker)
+- [x] Implement `TypeChecker::check_generic()` - ✅ (in HM typechecker)
+- [x] Add TypeBound for bounds support - ✅
+- [x] Add instantiation cache in TypeEnv - ✅
 
 ### Task 3.3: Interfaces & OOP
 **Date:** __/__/

@@ -86,18 +86,59 @@ This file tracks implementation progress across all phases and tasks.
 ---
 
 ### Task 1.4: AST Enhancement for HM Features
-**Status:** ⬀  
-**Date Started:** __/__  
+**Status:** ✅  
+**Date Started:** 2026-02-13
+**Date Completed:** 2026-02-19
 **Files:**
-- `parser/src/ast.rs` - ⬀
-- `parser/src/lib.rs` - ⬀ (parser rules)
+- `parser/src/ast.rs` - ✅
+- `parser/src/lib.rs` - ✅ (parser rules)
 
-**Sub-tasks:**
-- [ ] Add TypeVar to Expression enum - ⬀
-- [ ] Add SumType and Variant for algebraic data types - ⬀
-- [ ] Add GenericDecl and GenericCall - ⬀
-- [ ] Add InterfaceDecl and StructDecl - ⬀
-- [ ] Add MatchArm and TypePattern for pattern matching - ⬀
+**Sub-tasks Completed:**
+- [x] Add TypeVar to Expression enum - ✅
+- [x] Add SumType and Variant for algebraic data types - ✅
+- [x] Add GenericDecl and GenericCall - ✅
+- [x] Add InterfaceDecl and StructDecl - ✅
+- [x] Add MatchArm and TypePattern for pattern matching - ✅
+
+**Notes:** Task 1.4 completed. All AST variants added including:
+- TypeVar, SumType, Variant, VariantItem, VariantWithDestructure
+- GenericDecl, GenericCall, GenericFunctionCall
+- InterfaceDecl, StructDecl, ImplTrait
+- MatchArm, TypePattern, FieldPattern
+- TypeAlias, NewType
+
+---
+
+### Task 1.5: Generics Implementation
+**Status:** ✅
+**Date Started:** 2026-02-19
+**Date Completed:** 2026-02-19
+
+**Files:**
+- `parser/src/ast.rs` - Added `GenericFunctionCall`, `GenericParam` variants
+- `parser/src/lib.rs` - Added generic parsing with bounds (`<T: Copy>`), turbofish syntax
+- `compiler/src/types/ty.rs` - Added `TypeBound`, `GenericSignature` with `instantiate()`
+- `compiler/src/types/env.rs` - Added generic signatures and instantiation cache
+- `compiler/src/hm_typechecker.rs` - Added generic function handling, type inference
+- `compiler/src/lib.rs` - Added bytecode generation for generic calls
+
+**Sub-tasks Completed:**
+- [x] Generic function declaration parsing (`fn foo<T>(...)`)
+- [x] Generic function call parsing (`foo::<Type>(args)`)
+- [x] Type bounds syntax (`<T: Copy>`, `<T: Copy + Clone>`)
+- [x] Multiple type parameters (`<A, B>`)
+- [x] Type inference for generics
+- [x] Type mismatch error detection
+- [x] Tests for positive and negative cases
+
+**Test Files:**
+- `tests/generics_positive.0s` - Positive test cases
+- `tests/generics_constraints.0s` - Constraint test cases
+- `tests/generics_neg_bounds.0s` - Negative test cases
+
+**Notes:** 
+- Generics implemented using monomorphisation approach
+- Type bounds syntax is parsed but validation is not enforced at runtime yet
 - [ ] Add TypeAlias and NewType - ⬀
 - [ ] Add parser rules for type declarations - ⬀
 - [ ] Add parser rules for struct/interface/impl - ⬀

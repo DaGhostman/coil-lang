@@ -73,8 +73,13 @@ pub enum Expression<'expr> {
         body: Output<'expr>,
     },
 
+    GenericParam {
+        name: &'expr str,
+        bounds: Vec<&'expr str>,
+    },
+
     FunctionWithGenerics {
-        generics: Vec<&'expr str>,
+        generics: Vec<(&'expr str, Vec<&'expr str>)>, // (name, bounds)
         name: &'expr str,
         args: Output<'expr>,
         returns: Option<Output<'expr>>,
@@ -106,6 +111,11 @@ pub enum Expression<'expr> {
     VariantWithDestructure(Output<'expr>, Output<'expr>, Vec<Output<'expr>>), // Variant with type, name, and destructured fields (e.g., Color::Rgb(255, 127, 0))
     GenericDecl(Vec<&'expr str>, Output<'expr>), // Generic type declaration
     GenericCall(&'expr str, Vec<Output<'expr>>), // Generic type call
+    GenericFunctionCall {
+        name: Output<'expr>,
+        type_args: Vec<Output<'expr>>,
+        args: Option<Vec<Output<'expr>>>,
+    }, // Generic function call with type arguments: foo::<i32>(42)
     InterfaceDecl(&'expr str, Vec<Output<'expr>>), // Interface definition
     StructDecl(&'expr str, Vec<Output<'expr>>),  // Struct definition
     ImplTrait(Output<'expr>, Output<'expr>),     // Trait implementation
@@ -117,6 +127,12 @@ pub enum Expression<'expr> {
 
     Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
+
+    TypedAssignment {
+        name: &'expr str,
+        ty: Output<'expr>,
+        value: Output<'expr>,
+    }, // Typed assignment: let x: int = value
 
     Implementation(&'expr str, &'expr str, Vec<Output<'expr>>),
     Class(&'expr str, Vec<Output<'expr>>),
@@ -240,6 +256,9 @@ impl<'a> Display for Expression<'a> {
             Self::Assignment(n, e) => {
                 write!(f, "{} = {}", n.1, e.1)
             }
+            Self::TypedAssignment { name, ty, value } => {
+                write!(f, "{}: {} = {}", name, ty.1, value.1)
+            }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
             Self::TypeVar(name, id) => write!(f, "T<{}:{}>", id, name),
             Self::SumType(name, variants) => {
@@ -299,6 +318,27 @@ impl<'a> Display for Expression<'a> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "{}<{}>", name, a)
+            }
+            Self::GenericFunctionCall {
+                name,
+                type_args,
+                args,
+            } => {
+                let type_str = type_args
+                    .iter()
+                    .map(|a| a.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let args_str = args
+                    .as_ref()
+                    .map(|a| {
+                        a.iter()
+                            .map(|a| a.1.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                write!(f, "{}::<{}>({})", name.1, type_str, args_str)
             }
             Self::InterfaceDecl(name, _methods) => {
                 write!(f, "interface {} {{ ... }}", name)

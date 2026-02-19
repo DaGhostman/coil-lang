@@ -212,7 +212,7 @@ impl Compiler {
                 self.context = self.context.child();
                 self.context.clear();
                 // Register function signature with HM typechecker for type inference
-                // self.hm_typechecker.check(ast).ok();
+                self.hm_typechecker.check(ast).ok();
 
                 self.functions
                     .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
@@ -239,7 +239,56 @@ impl Compiler {
                     ));
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
-                self.hm_typechecker.restore(env, constraints, counter);
+                // Keep the updated environment with generic signatures instead of restoring
+                // self.hm_typechecker.restore(env, constraints, counter);
+                self.hm_typechecker
+                    .get_env_mut()
+                    .define_function(name, _type);
+                if let Some(ctx) = self.context.get_prev().clone() {
+                    self.context = *ctx;
+                }
+            }
+            Expression::FunctionWithGenerics {
+                name,
+                args,
+                returns: _returns,
+                body,
+                generics: _,
+            } => {
+                // Handle generic functions similarly to regular functions
+                let (env, constraints, counter) = self.hm_typechecker.reset();
+                self.context = self.context.child();
+                self.context.clear();
+                // Register function signature with HM typechecker for type inference
+                self.hm_typechecker.check(ast).ok();
+
+                self.functions
+                    .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
+
+                let mut a = self.do_compile(args);
+
+                self.bytecode.append(&mut a);
+
+                let mut c = self.do_compile(body);
+                self.bytecode.append(&mut c);
+
+                self.context.defers.iter().for_each(|offset| {
+                    self.bytecode
+                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+                });
+
+                if !matches!(
+                    self.bytecode.last().map(|b| b.bytecode()),
+                    Some(Instruction::RETURN)
+                ) {
+                    self.bytecode.push(Byte::new_with_value(
+                        Instruction::CONST,
+                        Value::default().raw() as _,
+                    ));
+                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                }
+                // Keep the updated environment with generic signatures
+                // self.hm_typechecker.restore(env, constraints, counter);
                 self.hm_typechecker
                     .get_env_mut()
                     .define_function(name, _type);
@@ -493,6 +542,38 @@ impl Compiler {
                         Message::error("Unknown function".to_string(), span.into_range());
                     message.push(Label::new(
                         format!("Unable to call unknown function '{}'", n),
+                        span.into_range(),
+                    ));
+                    self.messages.push(message);
+                }
+            }
+            Expression::GenericFunctionCall {
+                name,
+                type_args: _,
+                args,
+            } => {
+                // Generic function call - treat as regular function call for now
+                // The type arguments are handled by the HM typechecker for type inference
+                let identifier = self.resolve_variable(name);
+                let n = self.aliases.get(&identifier).unwrap_or(&identifier);
+
+                if let Some(offset) = self.functions.get(n).copied() {
+                    if let Some(args) = args {
+                        args.iter()
+                            .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
+                    }
+
+                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(
+                        args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                    ));
+                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
+                } else if self.native.get(n).is_some() {
+                    todo!("Not implemented");
+                } else {
+                    let mut message =
+                        Message::error("Unknown generic function".to_string(), span.into_range());
+                    message.push(Label::new(
+                        format!("Unable to call unknown generic function '{}'", n),
                         span.into_range(),
                     ));
                     self.messages.push(message);
@@ -946,6 +1027,43 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
 
                 // Do not pop if assigning to the same place
+                if self.context.variables.len() == symbol + 1 {
+                    bytecode.push(Byte::new(Instruction::DUPLICATE));
+                }
+            }
+            Expression::TypedAssignment { name, ty, value } => {
+                let name =
+                    self.resolve_variable(&(span.clone(), Box::new(Expression::Identifier(name))));
+
+                self.context.assignments.insert(name.clone(), true);
+
+                // Typecheck the value to infer its type and register with HM typechecker
+                let value_ty = self.typecheck(&(span.clone(), value.1.clone()));
+
+                // Define variable with the expected type from annotation
+                let expected_ty_name = match ty.1.borrow() {
+                    parser::ast::Expression::Type(t) => t.1.to_string(),
+                    _ => ty.1.to_string(),
+                };
+                let expected_ty = crate::types::Type::from(expected_ty_name);
+
+                // Register variable with expected type in HM typechecker
+                self.hm_typechecker
+                    .get_env_mut()
+                    .define_variable(&name, expected_ty);
+
+                // Register variable in context if not exists
+                let symbol = if let Some(sym) = self.context.variables.key(&name) {
+                    sym
+                } else {
+                    self.context.variables.intern(name.clone())
+                };
+
+                let mut expr = self.do_compile(value);
+
+                bytecode.append(&mut expr);
+                bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
+
                 if self.context.variables.len() == symbol + 1 {
                     bytecode.push(Byte::new(Instruction::DUPLICATE));
                 }

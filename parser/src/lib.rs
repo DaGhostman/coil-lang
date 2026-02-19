@@ -6,12 +6,11 @@ use std::{
 
 pub use chumsky::span::SimpleSpan;
 use chumsky::{
-    IterParser, Parser,
     error::Rich,
     extra,
     pratt::{infix, left, postfix, prefix, right},
     prelude::{choice, just, none_of, recursive},
-    text,
+    text, IterParser, Parser,
 };
 use common::{Label, Message};
 
@@ -357,11 +356,29 @@ impl<'pratt> Pratt<'pratt> {
 
     fn generic_params(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, Vec<&'pratt str>, extra::Err<Rich<'pratt, char>>>
-    + Clone
-    + 'pratt {
-        text::ident()
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        Vec<(&'pratt str, Vec<&'pratt str>)>,
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+           + 'pratt {
+        // Parse generic parameters with optional bounds: T or T: Copy + Clone
+        let generic_param = text::ident()
             .padded()
+            .then(
+                op!(":")
+                    .ignore_then(
+                        text::ident()
+                            .separated_by(op!("+"))
+                            .at_least(1)
+                            .collect::<Vec<_>>(),
+                    )
+                    .or_not(),
+            )
+            .map(|(name, bounds)| (name, bounds.unwrap_or_default()));
+
+        generic_param
             .separated_by(op!(","))
             .at_least(1)
             .collect()
@@ -395,7 +412,7 @@ impl<'pratt> Pratt<'pratt> {
         };
 
         // Create a closure that builds the function with generics expression
-        let build_func_with_generics = |generics: Vec<&'pratt str>,
+        let build_func_with_generics = |generics: Vec<(&'pratt str, Vec<&'pratt str>)>,
                                         name: &'pratt str,
                                         args: Output<'pratt>,
                                         returns: Option<Output<'pratt>>,
@@ -589,14 +606,27 @@ impl<'pratt> Pratt<'pratt> {
             .then(op!("=").ignore_then(self.expr()).or_not())
             .map_with(|((name, ty), val), e| {
                 if let Some(v) = val {
-                    // Create Assignment for let x: int = 5
-                    (
-                        e.span(),
-                        Box::new(Expression::Assignment(
-                            (e.span(), Box::new(Expression::Identifier(name))),
-                            v,
-                        )),
-                    )
+                    // Check if there's a type annotation
+                    if let Some(ty_expr) = ty {
+                        // Typed assignment: let x: int = value
+                        (
+                            e.span(),
+                            Box::new(Expression::TypedAssignment {
+                                name,
+                                ty: ty_expr,
+                                value: v,
+                            }),
+                        )
+                    } else {
+                        // Regular Assignment for let x = value
+                        (
+                            e.span(),
+                            Box::new(Expression::Assignment(
+                                (e.span(), Box::new(Expression::Identifier(name))),
+                                v,
+                            )),
+                        )
+                    }
                 } else {
                     // Just declare variable without value: let x: int
                     (e.span(), Box::new(Expression::Variable(name, ty)))
@@ -851,11 +881,25 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Parse a single generic parameter with optional bounds: T or T: Copy + Clone
+        let generic_param = text::ident()
+            .then(
+                op!(":")
+                    .ignore_then(
+                        text::ident()
+                            .separated_by(op!("+"))
+                            .at_least(1)
+                            .collect::<Vec<_>>(),
+                    )
+                    .or_not(),
+            )
+            .map(|(name, bounds)| (name, bounds.unwrap_or_default()));
+
         keyword!("fn")
             .ignore_then(text::ident())
             .then(
                 op!("<").ignore_then(
-                    text::ident()
+                    generic_param
                         .separated_by(op!(","))
                         .allow_trailing()
                         .collect::<Vec<_>>()
@@ -868,7 +912,8 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|((((name, generics), args), returns), body), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Function {
+                    Box::new(Expression::FunctionWithGenerics {
+                        generics,
                         name,
                         args,
                         returns,
@@ -956,13 +1001,9 @@ impl<'pratt> Pratt<'pratt> {
     >(
         &self,
         expr: T,
-    ) -> impl Parser<
-        'pratt,
-        &'pratt str,
-        Option<Vec<Output<'pratt>>>,
-        extra::Err<Rich<'pratt, char>>,
-    > + Clone
-    + 'pratt {
+    ) -> impl Parser<'pratt, &'pratt str, Option<Vec<Output<'pratt>>>, extra::Err<Rich<'pratt, char>>>
+           + Clone
+           + 'pratt {
         expr.clone()
             .separated_by(op!(','))
             .allow_trailing()
@@ -980,9 +1021,47 @@ impl<'pratt> Pratt<'pratt> {
         expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Generic function call with turbofish syntax: foo::<Type>(args)
+        // Or angle bracket syntax: foo<Type>(args)
+        let turbofish = op!("::")
+            .ignore_then(op!("<"))
+            .ignore_then(
+                self.ident()
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(op!(">"));
+
+        let angle_bracket = op!("<")
+            .then(
+                self.ident()
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(op!(">"))
+            .map(|(_, types)| types);
+
         self.ident()
+            .then(turbofish.or(angle_bracket).or_not())
             .then(self.params(expr))
-            .map_with(|(name, args), e| (e.span(), Box::new(Expression::Call { name, args })))
+            .map_with(|((name, type_args), args), e| {
+                if let Some(type_args) = type_args {
+                    // Generic function call: foo::<Type>(args) or foo<Type>(args)
+                    (
+                        e.span(),
+                        Box::new(Expression::GenericFunctionCall {
+                            name,
+                            type_args,
+                            args,
+                        }),
+                    )
+                } else {
+                    // Regular function call: foo(args)
+                    (e.span(), Box::new(Expression::Call { name, args }))
+                }
+            })
     }
 
     pub fn parse(&self, input: &'pratt str) -> Result<Output<'pratt>, common::Message> {

@@ -2,11 +2,26 @@ use std::fmt::Display;
 
 use common::Byte;
 
+/// Type bound for generics (e.g., T: Copy)
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct TypeBound {
+    pub name: String,
+}
+
+impl TypeBound {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+        }
+    }
+}
+
 /// Type variable for Hindley-Milner type inference
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct TypeVar {
     pub id: usize,
     pub name: String,
+    pub bounds: Vec<TypeBound>,
 }
 
 impl TypeVar {
@@ -14,7 +29,17 @@ impl TypeVar {
         Self {
             id,
             name: name.to_string(),
+            bounds: Vec::new(),
         }
+    }
+
+    pub fn with_bounds(mut self, bounds: Vec<TypeBound>) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    pub fn add_bound(&mut self, bound: TypeBound) {
+        self.bounds.push(bound);
     }
 }
 
@@ -149,6 +174,125 @@ impl GenericType {
             name: name.to_string(),
             params: params.into_iter().map(|p| Box::new(p)).collect(),
         }
+    }
+}
+
+/// A generic function signature with type parameters
+#[derive(Clone, PartialEq, Eq)]
+pub struct GenericSignature {
+    pub name: String,
+    pub type_params: Vec<TypeVar>,
+    pub params: Vec<Type>,
+    pub return_ty: Box<Type>,
+}
+
+impl GenericSignature {
+    pub fn new(name: &str, type_params: Vec<TypeVar>, params: Vec<Type>, return_ty: Type) -> Self {
+        Self {
+            name: name.to_string(),
+            type_params,
+            params,
+            return_ty: Box::new(return_ty),
+        }
+    }
+
+    /// Instantiate this generic signature with concrete types
+    pub fn instantiate(&self, args: &[Type]) -> Type {
+        if args.len() != self.type_params.len() {
+            return Type::Void;
+        }
+
+        let mut substitution: std::collections::HashMap<usize, Type> =
+            std::collections::HashMap::new();
+        for (param, arg) in self.type_params.iter().zip(args.iter()) {
+            substitution.insert(param.id, arg.clone());
+        }
+
+        fn apply_subst(ty: &Type, subst: &std::collections::HashMap<usize, Type>) -> Type {
+            match ty {
+                Type::TypeVar(tv) => subst.get(&tv.id).cloned().unwrap_or_else(|| ty.clone()),
+                Type::Array(box_inner) => Type::Array(Box::new(apply_subst(box_inner, subst))),
+                Type::Function(params, box_ret) => {
+                    let new_params: Vec<Type> =
+                        params.iter().map(|p| apply_subst(p, subst)).collect();
+                    let new_ret = apply_subst(box_ret, subst);
+                    Type::Function(new_params, Box::new(new_ret))
+                }
+                Type::Tuple(tys) => {
+                    Type::Tuple(tys.iter().map(|t| apply_subst(t, subst)).collect())
+                }
+                Type::Generic(gt) => {
+                    let new_params: Vec<Type> =
+                        gt.params.iter().map(|p| apply_subst(p, subst)).collect();
+                    Type::Generic(GenericType::new(&gt.name, new_params))
+                }
+                Type::Struct(def) => {
+                    let new_fields: Vec<Field> = def
+                        .fields
+                        .iter()
+                        .map(|f| Field::new(&f.name, apply_subst(&f.ty, subst)))
+                        .collect();
+                    let mut new_def = StructDef::new(&def.name, new_fields);
+                    new_def.generics = def.generics.clone();
+                    Type::Struct(new_def)
+                }
+                Type::Interface(def) => {
+                    let new_methods: Vec<Method> = def
+                        .methods
+                        .iter()
+                        .map(|m| {
+                            let new_params: Vec<Box<Type>> = m
+                                .params
+                                .iter()
+                                .map(|p| Box::new(apply_subst(p, subst)))
+                                .collect();
+                            let new_ret = apply_subst(&m.return_ty, subst);
+                            Method {
+                                name: m.name.clone(),
+                                params: new_params,
+                                return_ty: Box::new(new_ret),
+                                default_impl: m.default_impl.clone(),
+                            }
+                        })
+                        .collect();
+                    let mut new_def = InterfaceDef::new(&def.name, new_methods);
+                    new_def.generics = def.generics.clone();
+                    new_def.extends = def.extends.clone();
+                    Type::Interface(new_def)
+                }
+                Type::Alias(alias) => {
+                    let new_target = apply_subst(&alias.target, subst);
+                    let mut new_alias = TypeAlias::new(&alias.name, new_target);
+                    new_alias.generics = alias.generics.clone();
+                    Type::Alias(new_alias)
+                }
+                Type::SumType(variants) => {
+                    let new_variants: Vec<Variant> = variants
+                        .iter()
+                        .map(|v| {
+                            let new_fields: Vec<Field> = v
+                                .fields
+                                .iter()
+                                .map(|f| Field::new(&f.name, apply_subst(&f.ty, subst)))
+                                .collect();
+                            let mut new_variant = Variant::new(&v.name);
+                            new_variant.fields = new_fields;
+                            new_variant
+                        })
+                        .collect();
+                    Type::SumType(new_variants)
+                }
+                _ => ty.clone(),
+            }
+        }
+
+        let new_params: Vec<Type> = self
+            .params
+            .iter()
+            .map(|p| apply_subst(p, &substitution))
+            .collect();
+        let new_ret = apply_subst(&self.return_ty, &substitution);
+        Type::Function(new_params, Box::new(new_ret))
     }
 }
 
