@@ -531,9 +531,30 @@ impl Compiler {
                             .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                     }
 
-                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(
-                        args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                    ));
+                    bytecode.push(
+                        Byte::new(Instruction::CALL).with_operand_u32(
+                            args.as_ref()
+                                .map(|items| {
+                                    items.len()
+                                        + items
+                                            .iter()
+                                            .map(|i| {
+                                                if let Expression::VariantWithDestructure(
+                                                    _,
+                                                    _,
+                                                    variants,
+                                                ) = i.1.borrow()
+                                                {
+                                                    variants.len()
+                                                } else {
+                                                    0
+                                                }
+                                            })
+                                            .sum::<usize>()
+                                })
+                                .unwrap_or(0) as u32,
+                        ),
+                    );
                     bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
                 } else if self.native.get(n).is_some() {
                     todo!("Not implemented");
