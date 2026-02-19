@@ -186,13 +186,15 @@ impl<const S: usize> Machine<S> {
         let frame = self.frames.get_mut();
 
         while let Some(opcode) = code.next() {
+            #[cfg(debug_assertions)]
             eprintln!(
-                "#{:<2} @ {:0>4} - {:?} [{:?}, {:?}]",
+                "#{:<2} @ {:0>4} - {:?}({:?}, {:?}) - {:?}",
                 frame_no,
                 code.tell(),
                 opcode.bytecode(),
                 opcode.operand_u16(0),
-                opcode.operand_u16(1)
+                opcode.operand_u16(1),
+                self.stack.as_slice()
             );
 
             // #[cfg(debug_assertions)]
@@ -220,7 +222,12 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::CONST => self.stack.push(Value::from(opcode.constant())),
                 Instruction::STORE => {
-                    let val = self.stack.peek();
+                    let val = if self.stack.current() == opcode.operand_u32() as _ {
+                        self.stack.peek()
+                    } else {
+                        &self.stack.pop()
+                    };
+
                     self.stack[frame.get() + opcode.operand_u32() as usize] = *val;
                 }
                 Instruction::LOAD => {

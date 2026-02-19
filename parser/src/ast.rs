@@ -378,6 +378,17 @@ impl<'a> Display for Expression<'a> {
             Self::Argument(ty, name) => {
                 write!(f, "{} {}", ty.1, name.1)
             }
+            Self::Program(nodes) => {
+                write!(
+                    f,
+                    "{}",
+                    nodes
+                        .iter()
+                        .map(|n| n.1.to_string())
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                )
+            }
             e => todo!("Missing rest of nodes: {}", e),
         }
     }

@@ -4,8 +4,8 @@ mod types;
 
 use std::{any::Any, borrow::Borrow, collections::HashMap};
 
-use common::{likely, unlikely, Byte, Instruction, Interner, Label, Message, Value};
-use parser::{ast::Expression, SimpleSpan};
+use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
+use parser::{SimpleSpan, ast::Expression};
 
 pub use crate::types::ty::Type;
 pub use pipeline::*;
@@ -1023,13 +1023,14 @@ impl Compiler {
 
                 let mut expr = self.do_compile(value);
 
-                bytecode.append(&mut expr);
-                bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
+                self.bytecode.append(&mut expr);
+                self.bytecode
+                    .push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
 
                 // Do not pop if assigning to the same place
-                if self.context.variables.len() == symbol + 1 {
-                    bytecode.push(Byte::new(Instruction::DUPLICATE));
-                }
+                // if self.context.variables.len() == symbol + 1 {
+                //     self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                // }
             }
             Expression::TypedAssignment { name, ty, value } => {
                 let name =
@@ -1061,12 +1062,13 @@ impl Compiler {
 
                 let mut expr = self.do_compile(value);
 
-                bytecode.append(&mut expr);
-                bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
+                self.bytecode.append(&mut expr);
+                self.bytecode
+                    .push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
 
-                if self.context.variables.len() == symbol + 1 {
-                    bytecode.push(Byte::new(Instruction::DUPLICATE));
-                }
+                // if self.context.variables.len() == symbol + 1 {
+                //     bytecode.push(Byte::new(Instruction::DUPLICATE));
+                // }
             }
             Expression::Match(lhs, children) => {
                 let mut lhs_code = self.do_compile(lhs);
@@ -1128,38 +1130,20 @@ impl Compiler {
                                         ));
                                         bytecode.push(Byte::new(Instruction::EQ));
 
-                                        let field_extraction_count = fields.len() * 2 + 1;
                                         let mut body_code = self.do_compile(&body);
                                         let jmpf_target = self.bytecode.len()
                                             + bytecode.len()
-                                            + field_extraction_count
-                                            + 1
                                             + body_code.len()
-                                            + 1;
+                                            + 2
+                                            + 2; // field_extraction_count;
+
                                         bytecode.push(
                                             Byte::new(Instruction::JMPF)
                                                 .with_operand_u32(jmpf_target as u32),
                                         );
 
-                                        bytecode.push(Byte::new(Instruction::POP));
-
-                                        for field in fields.iter() {
-                                            if let Expression::Identifier(name) = field.1.borrow() {
-                                                let var_name = name.to_string();
-                                                let symbol = self
-                                                    .context
-                                                    .variables
-                                                    .key(&var_name)
-                                                    .expect("Field should be interned");
-                                                bytecode.push(
-                                                    Byte::new(Instruction::STORE)
-                                                        .with_operand_u32(symbol as u32),
-                                                );
-                                                bytecode.push(Byte::new(Instruction::POP));
-                                            }
-                                        }
-
                                         bytecode.append(&mut body_code);
+                                        bytecode.push(Byte::new(Instruction::POP));
                                         jumps.push(bytecode.len());
                                         bytecode.push(
                                             Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
@@ -1182,7 +1166,6 @@ impl Compiler {
                                     self.messages.push(message);
                                 }
                             } else {
-                                bytecode.push(Byte::new(Instruction::DUPLICATE));
                                 let mut compiled_patterns = vec![];
                                 if let Expression::List(patterns) = pattern.1.borrow() {
                                     compiled_patterns =
@@ -1192,22 +1175,23 @@ impl Compiler {
                                 }
 
                                 compiled_patterns.iter_mut().for_each(|mut pattern_code| {
+                                    bytecode.push(Byte::new(Instruction::DUPLICATE));
                                     bytecode.append(&mut pattern_code);
                                     bytecode.push(Byte::new(Instruction::EQ));
 
                                     let mut body_code = self.do_compile(&body);
+                                    // The magic 2, accounting for the JMPF & JMP being inserted
+                                    // after the count has been taken
+                                    let jmpf_target =
+                                        self.bytecode.len() + bytecode.len() + body_code.len() + 3;
                                     if !is_default {
                                         bytecode.push(
-                                            Byte::new(Instruction::JMPF).with_operand_u32(
-                                                (self.bytecode.len()
-                                                    + bytecode.len()
-                                                    + body_code.len()
-                                                    + 2)
-                                                    as u32,
-                                            ),
+                                            Byte::new(Instruction::JMPF)
+                                                .with_operand_u32(jmpf_target as _),
                                         );
                                     }
                                     bytecode.append(&mut body_code);
+                                    bytecode.push(Byte::new(Instruction::POP));
                                     jumps.push(bytecode.len());
                                     bytecode.push(
                                         Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
@@ -1229,13 +1213,16 @@ impl Compiler {
                     }
                 }
 
-                let len = bytecode.len();
+                bytecode.push(Byte::new(Instruction::POP));
+                // dbg!(&jumps);
                 jumps.iter().for_each(|jump| {
+                    let len = bytecode.len();
                     if let Some(instruction) = bytecode.get_mut(*jump) {
                         *instruction = Byte::new(Instruction::JMP)
                             .with_operand_u32((self.bytecode.len() + len) as u32);
                     }
                 });
+                self.bytecode.append(&mut bytecode);
             }
             _expr => {
                 let mut message =
