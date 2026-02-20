@@ -2,15 +2,63 @@ mod hm_typechecker;
 mod pipeline;
 mod types;
 
-use std::{any::Any, borrow::Borrow, collections::HashMap};
-
-use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
-use parser::{SimpleSpan, ast::Expression};
+use std::{borrow::Borrow, collections::HashMap};
 
 pub use crate::types::ty::Type;
+use common::{likely, unlikely, Byte, Instruction, Interner, Label, Message, Value};
+use parser::{ast::Expression, SimpleSpan};
 pub use pipeline::*;
 
 use crate::hm_typechecker::HmTypeChecker;
+use crate::types::ty::TypeVar;
+
+/// Patch point in bytecode template - marks locations that need type-dependent modification
+#[derive(Clone, Debug)]
+pub struct PatchPoint {
+    pub offset: usize,
+    pub patch_type: PatchType,
+}
+
+#[derive(Clone, Debug)]
+pub enum PatchType {
+    ArithmeticOp {
+        type_var_id: usize,
+    },
+    VariantTag {
+        type_name: String,
+        variant_name: String,
+    },
+    MatchBranch {
+        type_name: String,
+        variant_name: String,
+    },
+    CallArity {
+        param_index: usize,
+        type_var_ids: Vec<usize>,
+    },
+    NestedGenericCall {
+        func_name: String,
+        type_arg_type_var_ids: Vec<usize>,
+    },
+}
+
+#[derive(Clone)]
+pub struct BytecodeTemplate {
+    pub name: String,
+    pub type_params: Vec<TypeVar>,
+    pub param_types: Vec<Type>,
+    pub return_ty: Type,
+    pub bytecode: Vec<Byte>,
+    pub patch_points: Vec<PatchPoint>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionBounds {
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+    pub is_generic: bool,
+}
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -27,6 +75,29 @@ macro_rules! binary {
         $result.push($instruction);
     };
 }
+macro_rules! binary {
+    ($result: expr, $self: expr, $lhs: expr, $rhs: expr, $instruction: expr) => {
+        $result.append(&mut $self.do_compile($lhs));
+        $result.append(&mut $self.do_compile($rhs));
+
+        $result.push($instruction);
+    };
+}
+macro_rules! binary_with_patch {
+    ($result: expr, $self: expr, $lhs: expr, $rhs: expr, $instruction: expr, $type_var_id: expr) => {
+        $result.append(&mut $self.do_compile($lhs));
+        $result.append(&mut $self.do_compile($rhs));
+
+        let offset = $result.len();
+        $result.push($instruction);
+
+        if let Some(tv_id) = $type_var_id {
+            $self
+                .context
+                .add_patch_point(offset, PatchType::ArithmeticOp { type_var_id: tv_id });
+        }
+    };
+}
 
 #[derive(Default, Clone)]
 struct Context {
@@ -41,6 +112,9 @@ struct Context {
     methods: HashMap<String, HashMap<String, String>>,
 
     prev: Option<Box<Self>>,
+    type_params: Vec<TypeVar>,
+    patch_points: Vec<PatchPoint>,
+    compiling_template: bool,
 }
 
 pub struct Compiler {
@@ -57,6 +131,10 @@ pub struct Compiler {
     hm_typechecker: HmTypeChecker,
     // Variant discriminants: type_name -> (variant_name -> discriminant_value)
     variant_discriminants: HashMap<String, HashMap<String, i64>>,
+    // Monomorphization support
+    generic_templates: HashMap<String, BytecodeTemplate>,
+    function_bounds: Vec<FunctionBounds>,
+    instantiations: HashMap<String, usize>,
 }
 
 impl Default for Compiler {
@@ -78,6 +156,9 @@ impl Default for Compiler {
             context: Context::default(),
             hm_typechecker: HmTypeChecker::new(),
             variant_discriminants: HashMap::default(),
+            generic_templates: HashMap::default(),
+            function_bounds: Vec::default(),
+            instantiations: HashMap::default(),
         }
     }
 }
@@ -95,6 +176,9 @@ impl<'ctx> Context {
             symbols: self.symbols.clone(),
             classes: self.classes.clone(),
             prev: Some(Box::new(self.to_owned())),
+            type_params: self.type_params.clone(),
+            patch_points: Vec::default(),
+            compiling_template: self.compiling_template,
         }
     }
 
@@ -103,6 +187,16 @@ impl<'ctx> Context {
         self.constants.clear();
         self.variables = Default::default();
         self.assignments.clear();
+    }
+
+    fn add_patch_point(&mut self, offset: usize, patch_type: PatchType) {
+        if self.compiling_template {
+            self.patch_points.push(PatchPoint { offset, patch_type });
+        }
+    }
+
+    fn find_type_var(&self, name: &str) -> Option<&TypeVar> {
+        self.type_params.iter().find(|tv| tv.name == name)
     }
 }
 
@@ -162,6 +256,304 @@ impl Compiler {
         }
     }
 
+    fn extract_type_var_id(&self, ty: &Type) -> Option<usize> {
+        match ty {
+            Type::TypeVar(tv) => Some(tv.id),
+            _ => None,
+        }
+    }
+
+    fn emit_arithmetic_op<'a>(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        lhs: &'a (SimpleSpan, Box<Expression<'a>>),
+        rhs: &'a (SimpleSpan, Box<Expression<'a>>),
+        int_op: Instruction,
+        float_op: Instruction,
+    ) {
+        bytecode.append(&mut self.do_compile(lhs));
+        bytecode.append(&mut self.do_compile(rhs));
+
+        let lhs_ty = self.typecheck(lhs);
+        let is_float = lhs_ty == Type::Float;
+        let op = if is_float { float_op } else { int_op };
+
+        let offset = bytecode.len();
+        bytecode.push(Byte::new(op));
+
+        if let Some(tv) = self.extract_type_var_id(&lhs_ty) {
+            self.context
+                .add_patch_point(offset, PatchType::ArithmeticOp { type_var_id: tv });
+        }
+    }
+
+    fn extract_param_types<'a>(&self, args: &(SimpleSpan, Box<Expression<'a>>)) -> Vec<Type> {
+        let mut param_types = Vec::new();
+        if let Expression::Fragment(arg_list) = args.1.borrow() {
+            for arg in arg_list.iter() {
+                if let Expression::Argument(ty_expr, _var_expr) = arg.1.borrow() {
+                    let ty_name = match ty_expr.1.borrow() {
+                        Expression::Type(t) => t.1.to_string(),
+                        _ => ty_expr.1.to_string(),
+                    };
+                    param_types.push(Type::from(ty_name));
+                }
+            }
+        }
+        param_types
+    }
+
+    fn instantiate_generic(&mut self, name: &str, type_args: &[Type]) -> Option<usize> {
+        let type_args_str: Vec<String> = type_args.iter().map(|t| t.type_name()).collect();
+        let key = format!("{}<{}>", name, type_args_str.join(", "));
+
+        if let Some(&offset) = self.instantiations.get(&key) {
+            return Some(offset);
+        }
+
+        let template = self.generic_templates.get(name)?.clone();
+
+        if template.type_params.len() != type_args.len() {
+            return None;
+        }
+
+        let subst: HashMap<usize, Type> = template
+            .type_params
+            .iter()
+            .zip(type_args.iter())
+            .map(|(tv, ty)| (tv.id, ty.clone()))
+            .collect();
+
+        let start = self.bytecode.len();
+
+        let mut patched_bytecode = template.bytecode.clone();
+        let patch_points = template.patch_points.clone();
+
+        self.apply_type_patches(
+            &mut patched_bytecode,
+            &subst,
+            &template.param_types,
+            &patch_points,
+        );
+
+        self.resolve_nested_generics(&mut patched_bytecode, &subst, &patch_points);
+
+        self.bytecode.extend(patched_bytecode);
+
+        let end = self.bytecode.len();
+
+        self.function_bounds.push(FunctionBounds {
+            name: key.clone(),
+            start,
+            end,
+            is_generic: true,
+        });
+
+        self.instantiations.insert(key, start);
+        Some(start)
+    }
+
+    fn type_stack_size(&self, ty: &Type) -> usize {
+        match ty {
+            Type::SumType { variants, .. } => {
+                1 + variants.iter().map(|v| v.fields.len()).max().unwrap_or(0)
+            }
+            Type::TypeVar(_) => 1,
+            _ => 1,
+        }
+    }
+
+    fn calculate_param_arity(&self, param_types: &[Type]) -> usize {
+        param_types.iter().map(|t| self.type_stack_size(t)).sum()
+    }
+
+    fn apply_type_patches(
+        &mut self,
+        bytecode: &mut [Byte],
+        subst: &HashMap<usize, Type>,
+        param_types: &[Type],
+        patch_points: &[PatchPoint],
+    ) {
+        let concrete_param_types: Vec<Type> = param_types
+            .iter()
+            .map(|ty| self.substitute_type(ty, subst))
+            .collect();
+
+        for patch in patch_points {
+            if patch.offset >= bytecode.len() {
+                continue;
+            }
+
+            let byte = &mut bytecode[patch.offset];
+
+            match &patch.patch_type {
+                PatchType::ArithmeticOp { type_var_id } => {
+                    if let Some(concrete_ty) = subst.get(type_var_id) {
+                        let current_op = byte.bytecode().clone();
+                        let new_op = match (current_op, concrete_ty) {
+                            (Instruction::ADD, Type::Float) => Instruction::ADDF,
+                            (Instruction::SUB, Type::Float) => Instruction::SUBF,
+                            (Instruction::MUL, Type::Float) => Instruction::MULF,
+                            (Instruction::DIV, Type::Float) => Instruction::DIVF,
+                            (Instruction::MOD, Type::Float) => Instruction::MODF,
+                            (Instruction::ADDF, Type::Int) => Instruction::ADD,
+                            (Instruction::SUBF, Type::Int) => Instruction::SUB,
+                            (Instruction::MULF, Type::Int) => Instruction::MUL,
+                            (Instruction::DIVF, Type::Int) => Instruction::DIV,
+                            (Instruction::MODF, Type::Int) => Instruction::MOD,
+                            _ => current_op,
+                        };
+                        *byte = Byte::new(new_op).with_operand_u32(byte.operand_u32());
+                    }
+                }
+                PatchType::CallArity {
+                    param_index,
+                    type_var_ids,
+                } => {
+                    let mut extra_arity = 0usize;
+                    for type_var_id in type_var_ids {
+                        if let Some(concrete_ty) = subst.get(type_var_id) {
+                            extra_arity += self.type_stack_size(concrete_ty).saturating_sub(1);
+                        }
+                    }
+
+                    if extra_arity > 0 {
+                        let current_arity = byte.operand_u32() as usize;
+                        let new_arity = current_arity + extra_arity;
+                        *byte = Byte::new(Instruction::CALL).with_operand_u32(new_arity as u32);
+                    }
+                }
+                PatchType::VariantTag {
+                    type_name,
+                    variant_name,
+                } => {
+                    if let Some(discriminants) = self.variant_discriminants.get(type_name) {
+                        if let Some(&discriminant) = discriminants.get(variant_name) {
+                            *byte = Byte::new_with_value(
+                                Instruction::CONST,
+                                Value::from(discriminant).raw() as _,
+                            );
+                        }
+                    }
+                }
+                PatchType::MatchBranch {
+                    type_name,
+                    variant_name,
+                } => {
+                    if let Some(discriminants) = self.variant_discriminants.get(type_name) {
+                        if let Some(&discriminant) = discriminants.get(variant_name) {
+                            let offset = byte.operand_u32();
+                            *byte = Byte::new(Instruction::MATCH_BRANCH)
+                                .with_operands_u16([discriminant as u16, (offset >> 16) as u16]);
+                        }
+                    }
+                }
+                PatchType::NestedGenericCall {
+                    func_name,
+                    type_arg_type_var_ids,
+                } => {
+                    // Note: Nested generic calls are handled in a second pass
+                    // by resolve_nested_generics() after initial patching
+                    // Here we just mark that this needs resolution
+                    // The actual patching happens after instantiate_generic completes
+                    let _ = (func_name, type_arg_type_var_ids);
+                }
+            }
+        }
+    }
+
+    fn resolve_nested_generics(
+        &mut self,
+        bytecode: &mut [Byte],
+        subst: &HashMap<usize, Type>,
+        patch_points: &[PatchPoint],
+    ) {
+        for patch in patch_points {
+            if patch.offset >= bytecode.len() {
+                continue;
+            }
+
+            if let PatchType::NestedGenericCall {
+                func_name,
+                type_arg_type_var_ids,
+            } = &patch.patch_type
+            {
+                let concrete_type_args: Vec<Type> = type_arg_type_var_ids
+                    .iter()
+                    .filter_map(|tv_id| subst.get(tv_id).cloned())
+                    .collect();
+
+                if concrete_type_args.len() == type_arg_type_var_ids.len() {
+                    if let Some(nested_offset) =
+                        self.instantiate_generic(func_name, &concrete_type_args)
+                    {
+                        let byte = &mut bytecode[patch.offset];
+                        *byte = Byte::new(Instruction::JMP).with_operand_u32(nested_offset as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    fn substitute_type(&self, ty: &Type, subst: &HashMap<usize, Type>) -> Type {
+        match ty {
+            Type::TypeVar(tv) => subst.get(&tv.id).cloned().unwrap_or_else(|| ty.clone()),
+            Type::Function(params, ret) => Type::Function(
+                params
+                    .iter()
+                    .map(|p| self.substitute_type(p, subst))
+                    .collect(),
+                Box::new(self.substitute_type(ret, subst)),
+            ),
+            Type::Array(inner) => Type::Array(Box::new(self.substitute_type(inner, subst))),
+            Type::Tuple(types) => Type::Tuple(
+                types
+                    .iter()
+                    .map(|t| self.substitute_type(t, subst))
+                    .collect(),
+            ),
+            Type::SumType {
+                name,
+                type_params,
+                variants,
+            } => {
+                let new_type_params: Vec<TypeVar> = type_params
+                    .iter()
+                    .map(|tp| {
+                        if let Some(Type::TypeVar(new_tv)) = subst.get(&tp.id) {
+                            new_tv.clone()
+                        } else {
+                            tp.clone()
+                        }
+                    })
+                    .collect();
+                let new_variants: Vec<crate::types::ty::Variant> = variants
+                    .iter()
+                    .map(|v| {
+                        let mut new_variant = v.clone();
+                        new_variant.fields = v
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                crate::types::ty::Field::new(
+                                    &f.name,
+                                    self.substitute_type(&f.ty, subst),
+                                )
+                            })
+                            .collect();
+                        new_variant
+                    })
+                    .collect();
+                Type::SumType {
+                    name: name.clone(),
+                    type_params: new_type_params,
+                    variants: new_variants,
+                }
+            }
+            _ => ty.clone(),
+        }
+    }
+
     fn do_compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
@@ -211,11 +603,12 @@ impl Compiler {
                 let (env, constraints, counter) = self.hm_typechecker.reset();
                 self.context = self.context.child();
                 self.context.clear();
-                // Register function signature with HM typechecker for type inference
                 self.hm_typechecker.check(ast).ok();
 
-                self.functions
-                    .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
+                let func_name = format!("{}{}", self.namespace, name);
+                let start = self.bytecode.len();
+
+                self.functions.insert(func_name.clone(), start);
 
                 let mut a = self.do_compile(args);
 
@@ -239,8 +632,16 @@ impl Compiler {
                     ));
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
-                // Keep the updated environment with generic signatures instead of restoring
-                // self.hm_typechecker.restore(env, constraints, counter);
+
+                let end = self.bytecode.len();
+
+                self.function_bounds.push(FunctionBounds {
+                    name: func_name,
+                    start,
+                    end,
+                    is_generic: false,
+                });
+
                 self.hm_typechecker
                     .get_env_mut()
                     .define_function(name, _type);
@@ -253,20 +654,37 @@ impl Compiler {
                 args,
                 returns: _returns,
                 body,
-                generics: _,
+                generics,
             } => {
-                // Handle generic functions similarly to regular functions
-                let (env, constraints, counter) = self.hm_typechecker.reset();
+                let (_env, _constraints, _counter) = self.hm_typechecker.reset();
                 self.context = self.context.child();
                 self.context.clear();
-                // Register function signature with HM typechecker for type inference
                 self.hm_typechecker.check(ast).ok();
 
-                self.functions
-                    .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
+                let type_params: Vec<TypeVar> = generics
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (gen_name, bounds))| {
+                        let bounds_vec: Vec<crate::types::ty::TypeBound> = bounds
+                            .iter()
+                            .map(|b| crate::types::ty::TypeBound::new(b))
+                            .collect();
+                        TypeVar::new(i, gen_name).with_bounds(bounds_vec)
+                    })
+                    .collect();
+
+                self.context.type_params = type_params.clone();
+                self.context.compiling_template = true;
+
+                let param_types = self.extract_param_types(args);
+                let return_ty = _returns
+                    .as_ref()
+                    .map(|r| self.typecheck(r))
+                    .unwrap_or(Type::Void);
+
+                let start = self.bytecode.len();
 
                 let mut a = self.do_compile(args);
-
                 self.bytecode.append(&mut a);
 
                 let mut c = self.do_compile(body);
@@ -287,8 +705,26 @@ impl Compiler {
                     ));
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
-                // Keep the updated environment with generic signatures
-                // self.hm_typechecker.restore(env, constraints, counter);
+
+                let end = self.bytecode.len();
+
+                let template_bytecode = self.bytecode[start..end].to_vec();
+                let patch_points = self.context.patch_points.clone();
+
+                self.bytecode.truncate(start);
+
+                let template = BytecodeTemplate {
+                    name: name.to_string(),
+                    type_params: type_params.clone(),
+                    param_types: param_types.clone(),
+                    return_ty: return_ty.clone(),
+                    bytecode: template_bytecode,
+                    patch_points,
+                };
+
+                self.generic_templates
+                    .insert(format!("{}{}", self.namespace, name), template);
+
                 self.hm_typechecker
                     .get_env_mut()
                     .define_function(name, _type);
@@ -570,25 +1006,106 @@ impl Compiler {
             }
             Expression::GenericFunctionCall {
                 name,
-                type_args: _,
+                type_args,
                 args,
             } => {
-                // Generic function call - treat as regular function call for now
-                // The type arguments are handled by the HM typechecker for type inference
                 let identifier = self.resolve_variable(name);
-                let n = self.aliases.get(&identifier).unwrap_or(&identifier);
+                let full_name = format!("{}{}", self.namespace, identifier);
+                let n = self
+                    .aliases
+                    .get(&identifier)
+                    .cloned()
+                    .unwrap_or_else(|| identifier.clone());
+                let template_name = self
+                    .aliases
+                    .get(&identifier)
+                    .cloned()
+                    .unwrap_or_else(|| full_name.clone());
 
-                if let Some(offset) = self.functions.get(n).copied() {
+                let type_arg_types: Vec<Type> = type_args
+                    .iter()
+                    .map(|ta| {
+                        let ty_name = match ta.1.borrow() {
+                            Expression::Type(t) => t.1.to_string(),
+                            _ => ta.1.to_string(),
+                        };
+                        Type::from(ty_name)
+                    })
+                    .collect();
+
+                let type_var_ids: Vec<usize> = type_arg_types
+                    .iter()
+                    .filter_map(|ty| self.extract_type_var_id(ty))
+                    .collect();
+
+                let is_nested_generic = self.context.compiling_template
+                    && self.generic_templates.contains_key(&template_name);
+
+                if is_nested_generic && !type_var_ids.is_empty() {
                     if let Some(args) = args {
-                        args.iter()
-                            .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
+                        for arg in args {
+                            bytecode.append(&mut self.do_compile(arg));
+                        }
                     }
 
+                    let arity = args.as_ref().map(|items| items.len()).unwrap_or(0);
+
+                    let call_offset = bytecode.len();
+                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(arity as u32));
+
+                    let jmp_offset = bytecode.len();
+                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(0));
+
+                    self.context.add_patch_point(
+                        jmp_offset,
+                        PatchType::NestedGenericCall {
+                            func_name: template_name,
+                            type_arg_type_var_ids: type_var_ids,
+                        },
+                    );
+                } else if let Some(offset) =
+                    self.instantiate_generic(&template_name, &type_arg_types)
+                {
+                    if let Some(args) = args {
+                        for arg in args {
+                            bytecode.append(&mut self.do_compile(arg));
+                        }
+                    }
+
+                    let arity = args
+                        .as_ref()
+                        .map(|items| {
+                            items.len()
+                                + items
+                                    .iter()
+                                    .map(|i| {
+                                        if let Expression::VariantWithDestructure(_, _, variants) =
+                                            i.1.borrow()
+                                        {
+                                            variants.len()
+                                        } else {
+                                            0
+                                        }
+                                    })
+                                    .sum::<usize>()
+                        })
+                        .unwrap_or(0);
+
+                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(arity as u32));
+                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
+                } else if self.functions.get(&n).is_some() {
+                    if let Some(args) = args {
+                        for arg in args {
+                            bytecode.append(&mut self.do_compile(arg));
+                        }
+                    }
+
+                    let offset = self.functions[&n];
                     bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(
                         args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
                     ));
                     bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
-                } else if self.native.get(n).is_some() {
+                } else if self.native.get(&n).is_some() {
                     todo!("Not implemented");
                 } else {
                     let mut message =
@@ -837,69 +1354,48 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
+                self.emit_arithmetic_op(
+                    &mut bytecode,
                     lhs,
                     rhs,
-                    Byte::new(
-                        //if likely(self.typecheck(lhs) == Type::Float) {
-                        // Instruction::ADDF
-                        // } else {
-                        Instruction::ADD // },
-                    )
+                    Instruction::ADD,
+                    Instruction::ADDF,
                 );
             }
             Expression::Sub(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
+                self.emit_arithmetic_op(
+                    &mut bytecode,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
-                        Instruction::SUBF
-                    } else {
-                        Instruction::SUB
-                    },)
+                    Instruction::SUB,
+                    Instruction::SUBF,
                 );
             }
             Expression::Mul(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
+                self.emit_arithmetic_op(
+                    &mut bytecode,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
-                        Instruction::MULF
-                    } else {
-                        Instruction::MUL
-                    },)
+                    Instruction::MUL,
+                    Instruction::MULF,
                 );
             }
             Expression::Mod(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
+                self.emit_arithmetic_op(
+                    &mut bytecode,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
-                        Instruction::MODF
-                    } else {
-                        Instruction::MOD
-                    },)
+                    Instruction::MOD,
+                    Instruction::MODF,
                 );
             }
             Expression::Div(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
+                self.emit_arithmetic_op(
+                    &mut bytecode,
                     lhs,
                     rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::Float) {
-                        Instruction::DIVF
-                    } else {
-                        Instruction::DIV
-                    },)
+                    Instruction::DIV,
+                    Instruction::DIVF,
                 );
             }
             Expression::And(lhs, rhs) => {
