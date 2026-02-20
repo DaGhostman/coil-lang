@@ -1,0 +1,16 @@
+// Test file for generics implementation
+// Negative tests - these should produce type errors
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    // Test: Wrong argument type for generic parameter
+    // identity expects T, but we're passing int when T should be float
+    let y: int = identity<int>(42);
+    // This should error: passing int when float expected
+    let z: float = identity<int>(99);
+    print "%i", y;
+    print "%f", z;
+}

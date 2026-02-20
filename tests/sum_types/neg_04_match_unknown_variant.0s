@@ -1,0 +1,14 @@
+// Test: Match on unknown variant
+// Expected: Should error on unknown variant in match
+
+enum Color {
+    Red,
+    Green
+}
+
+fn check(Color c) {
+    match c {
+        case Color::Red => { print "Red"; }
+        case Color::Blue => { print "Blue"; }
+    }
+}

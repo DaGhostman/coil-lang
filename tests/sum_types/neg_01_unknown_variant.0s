@@ -1,0 +1,11 @@
+// Test: Unknown variant
+// Expected: Should error on non-existent variant
+
+enum Color {
+    Red,
+    Green
+}
+
+fn main() {
+    let c = Color::Blue;
+}

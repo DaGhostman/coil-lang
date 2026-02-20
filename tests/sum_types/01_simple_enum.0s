@@ -1,0 +1,13 @@
+// Test: Basic enum declaration
+// Expected: Should compile simple enum
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+fn main() {
+    let c = Color::Red;
+    print "Created color";
+}

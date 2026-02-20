@@ -1,0 +1,19 @@
+// Test: Generic chain - multiple nested levels
+// Expected: Should handle deep nesting
+
+fn first<T>(T x) -> T {
+    return x;
+}
+
+fn second<T>(T x) -> T {
+    return first<T>(x);
+}
+
+fn third<T>(T x) -> T {
+    return second<T>(x);
+}
+
+fn main() {
+    let result: int = third<int>(42);
+    print "%i", result;
+}

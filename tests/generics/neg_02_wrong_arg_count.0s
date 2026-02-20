@@ -1,0 +1,10 @@
+// Test: Type argument count mismatch
+// Expected: Should error or handle gracefully
+
+fn single<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let x: int = single<int, float>(42);
+}

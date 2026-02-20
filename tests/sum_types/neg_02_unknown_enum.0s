@@ -1,0 +1,6 @@
+// Test: Unknown enum type
+// Expected: Should error on non-existent enum type
+
+fn main() {
+    let c = UnknownType::SomeVariant;
+}

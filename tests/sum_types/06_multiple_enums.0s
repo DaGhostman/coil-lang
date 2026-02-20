@@ -1,0 +1,32 @@
+// Test: Multiple enums in same program
+// Expected: Should handle multiple enum types
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+enum Size {
+    Small,
+    Medium,
+    Large
+}
+
+fn describe(Color c, Size s) {
+    match c {
+        case Color::Red => { print "Red"; }
+        case Color::Green => { print "Green"; }
+        case Color::Blue => { print "Blue"; }
+    }
+    
+    match s {
+        case Size::Small => { print "Small"; }
+        case Size::Medium => { print "Medium"; }
+        case Size::Large => { print "Large"; }
+    }
+}
+
+fn main() {
+    describe(Color::Red, Size::Large);
+}

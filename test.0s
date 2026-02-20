@@ -18,6 +18,11 @@ fn fizbuz(int n) {
     }
 }
 
+enum Colors {
+    RGB(int, int, int),
+    CMYK(float, float, float, float),
+}
+
 enum Color {
     Red,
     Green,
@@ -36,6 +41,15 @@ fn print_color(Color c) -> void {
     print "Rust-style enum works!";
 }
 
+fn print_pallete(Colors c, int x) {
+    match c {
+        case Colors::RGB(r, g, b) => { print "rgb(%i, %i, %i)", r, g, b; }
+        case Colors::CMYK(c, m, y, k) => { print "cmyk(%f, %f, %f, %f)", c, m, y, k; }
+    }
+
+    print "X is: %i", x;
+}
+
 fn main() {
     print "%i", fib(3);
     print "%i", add(10, add(20, 20));
@@ -44,4 +58,5 @@ fn main() {
     fizbuz(15);
     print_color(Color::Red);
     print_color(Color::Green);
+    print_pallete(Colors::RGB(100, 500, 0));
 }

@@ -1,0 +1,12 @@
+// Test: Generic with multiple type parameters
+// Expected: Should compile and handle multiple type args
+
+fn pair<A, B>(A a, B b) -> int {
+    return 1;
+}
+
+fn main() {
+    let x: int = pair<int, float>(42, 3.14);
+    let y: int = pair<float, int>(2.71, 100);
+    print "%i", x;
+}

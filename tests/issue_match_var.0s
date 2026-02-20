@@ -1,0 +1,7 @@
+// Simple test - match with local variable
+fn main() -> void {
+    let x = 1;
+    match x {
+        case 1 => { print "%i", 42; }
+    }
+}

@@ -1,0 +1,12 @@
+// Test: Variable declarations
+// Expected: Should compile various variable declarations
+
+fn main() {
+    let a = 42;
+    let b: int = 100;
+    let c = 3.14;
+    let d: float = 2.71;
+    let e = true;
+    let f = "hello";
+    print "%i %i %f %f", a, b, c, d;
+}

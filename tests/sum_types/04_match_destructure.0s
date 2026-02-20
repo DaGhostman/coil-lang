@@ -1,0 +1,19 @@
+// Test: Match with field destructuring
+// Expected: Should extract field values in match
+
+enum Pair {
+    Values(int, int)
+}
+
+fn sum_pair(Pair p) -> int {
+    match p {
+        case Pair::Values(a, b) => {
+            return a + b;
+        }
+    }
+}
+
+fn main() {
+    let result: int = sum_pair(Pair::Values(10, 20));
+    print "%i", result;
+}

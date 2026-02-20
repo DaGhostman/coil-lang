@@ -1,0 +1,31 @@
+// Test file for generics - negative constraint tests
+// These tests should produce type errors
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn first<T, U>(T x, U y) -> T {
+    return x;
+}
+
+fn main() {
+    // Test 1: Type mismatch - assigning float result to int
+    let a: int = identity<float>(42);
+    print "%i", a;
+}
+
+// Second test file for more negative cases
+fn identity2<T>(T x) -> T {
+    return x;
+}
+
+fn second<T, U>(T x, U y) -> U {
+    return y;
+}
+
+fn main2() {
+    // Test 2: Wrong return type from generic function
+    let b: float = identity<int>(99);
+    print "%f", b;
+}

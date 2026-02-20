@@ -1,0 +1,22 @@
+// Test: Match with default case
+// Expected: Should handle default in match
+
+enum Direction {
+    North,
+    South,
+    East,
+    West
+}
+
+fn is_north(Direction d) -> int {
+    match d {
+        case Direction::North => { return 1; }
+        case default => { return 0; }
+    }
+}
+
+fn main() {
+    let n: int = is_north(Direction::North);
+    let s: int = is_north(Direction::South);
+    print "%i %i", n, s;
+}

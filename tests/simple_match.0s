@@ -1,0 +1,15 @@
+enum Colors {
+    RGB(int, int, int)
+}
+
+fn main() -> void {
+    let y: int = 3;
+    let x: int = 1;
+
+    match x { case 1 => { print "%i", 42; } }
+
+    let c = Colors::RGB(255, 128, 64);
+    match c {
+        case Colors::RGB(r, g, b) => { print "rgb(%i, %i, %i)", r, g, b; }
+    }
+}

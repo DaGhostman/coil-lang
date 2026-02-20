@@ -6,11 +6,12 @@ use std::{
 
 pub use chumsky::span::SimpleSpan;
 use chumsky::{
+    IterParser, Parser,
     error::Rich,
     extra,
     pratt::{infix, left, postfix, prefix, right},
     prelude::{choice, just, none_of, recursive},
-    text, IterParser, Parser,
+    text,
 };
 use common::{Label, Message};
 
@@ -167,19 +168,13 @@ impl<'pratt> Pratt<'pratt> {
                 self.float(),
                 self.int(),
                 self.string(),
+                choice((op!("true"), op!("false")))
+                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
+                    .labelled("boolean"),
                 self.ident(),
-                op!("true")
-                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
-                    .labelled("boolean"),
-                op!("false")
-                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
-                    .labelled("boolean"),
             ));
 
             choice((atom, self.group(expr.clone()))).pratt((
-                postfix(Precedence::Unary as u16, op!('!'), |lhs, _, e| {
-                    (e.span(), Box::new(Expression::Not(lhs)))
-                }),
                 infix(
                     right(Precedence::Binary as u16),
                     op!("<<"),
@@ -234,9 +229,9 @@ impl<'pratt> Pratt<'pratt> {
                     choice((
                         op!("=="),
                         op!("!="),
-                        op!(">"),
                         op!(">="),
                         op!("<="),
+                        op!(">"),
                         op!("<"),
                     )),
                     |lhs, op, rhs, e| {
@@ -245,9 +240,9 @@ impl<'pratt> Pratt<'pratt> {
                             Box::new(match op {
                                 "==" => Expression::Eq(lhs, rhs),
                                 "!=" => Expression::Neq(lhs, rhs),
-                                ">" => Expression::Gt(lhs, rhs),
                                 ">=" => Expression::Geq(lhs, rhs),
                                 "<=" => Expression::Leq(lhs, rhs),
+                                ">" => Expression::Gt(lhs, rhs),
                                 "<" => Expression::Le(lhs, rhs),
                                 _ => unreachable!("No more comparison operators"),
                             }),
@@ -279,16 +274,21 @@ impl<'pratt> Pratt<'pratt> {
                 //     op!("<="),
                 //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Leq(lhs, rhs))),
                 // ),
+                prefix(Precedence::Unary as u16, op!('!'), |_, rhs, e| {
+                    (e.span(), Box::new(Expression::Not(rhs)))
+                }),
+                prefix(Precedence::Unary as u16, op!('~'), |_, rhs, e| {
+                    (e.span(), Box::new(Expression::Flip(rhs)))
+                }),
                 prefix(
                     Precedence::Negate as u16,
-                    choice((op!('-'), op!('~'), op!('+'))),
+                    choice((op!('-'), op!('+'), op!('~'))),
                     |c, rhs, e| {
                         (
                             e.span(),
                             Box::new(match c {
                                 '-' => Expression::Negate(rhs),
                                 '+' => Expression::Positive(rhs),
-                                '~' => Expression::Not(rhs),
                                 _ => unreachable!("No other prefix operators"),
                             }),
                         )
@@ -401,7 +401,7 @@ impl<'pratt> Pratt<'pratt> {
         Vec<(&'pratt str, Vec<&'pratt str>)>,
         extra::Err<Rich<'pratt, char>>,
     > + Clone
-           + 'pratt {
+    + 'pratt {
         // Parse generic parameters with optional bounds: T or T: Copy + Clone
         let generic_param = text::ident()
             .padded()
@@ -536,18 +536,28 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("if")
+        let if_branch = keyword!("if")
             .ignore_then(self.expr())
-            .then(self.block(stmt))
-            .map_with(|(iterable, body), e| {
+            .then(self.block(stmt.clone()))
+            .map_with(|(condition, body), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Loop {
-                        identifier: None,
-                        iterable,
-                        body,
-                    }),
+                    Box::new(Expression::Branch(Some(condition), body)),
                 )
+            });
+
+        let else_branch = keyword!("else")
+            .ignore_then(self.block(stmt))
+            .map_with(|body, e| (e.span(), Box::new(Expression::Branch(None, body))));
+
+        if_branch
+            .then(else_branch.or_not())
+            .map_with(|(if_br, else_br), e| {
+                let mut branches = vec![if_br];
+                if let Some(else_b) = else_br {
+                    branches.push(else_b);
+                }
+                (e.span(), Box::new(Expression::If(branches)))
             })
     }
 
@@ -604,14 +614,15 @@ impl<'pratt> Pratt<'pratt> {
                 self.while_(stmt.clone()),
                 self.if_(stmt.clone()),
                 self.match_(stmt.clone()),
+                self.defer(stmt.clone()),
                 self.block(stmt.clone()),
                 self.variable().then_ignore(op!(";")),
                 self.type_alias().then_ignore(op!(";")),
                 self.new_type().then_ignore(op!(";")),
-                self.expr_statement(),
-                self.print().then_ignore(op!(";")),
                 self.return_().then_ignore(op!(";")),
+                self.print().then_ignore(op!(";")),
                 self.comment(),
+                self.expr_statement(),
             ))
         })
         .map_with(output!(Statement))
@@ -799,8 +810,8 @@ impl<'pratt> Pratt<'pratt> {
             .then(
                 op!("(")
                     .ignore_then(
-                        // Parse simple values: integers, floats, strings, or identifiers
-                        choice((self.int(), self.float(), self.string(), self.ident()))
+                        // Parse simple values: floats first (to avoid partial int match), then integers, strings, or identifiers
+                        choice((self.float(), self.int(), self.string(), self.ident()))
                             .separated_by(op!(","))
                             .allow_trailing()
                             .collect::<Vec<_>>(),
@@ -1057,9 +1068,13 @@ impl<'pratt> Pratt<'pratt> {
     >(
         &self,
         expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Option<Vec<Output<'pratt>>>, extra::Err<Rich<'pratt, char>>>
-           + Clone
-           + 'pratt {
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        Option<Vec<Output<'pratt>>>,
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+    + 'pratt {
         expr.clone()
             .separated_by(op!(','))
             .allow_trailing()

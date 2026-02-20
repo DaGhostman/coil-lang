@@ -39,6 +39,7 @@ pub enum Instruction {
     DIVF,
     MODF,
     NOT,
+    FLP,
     NEG,
     AND,
     OR,

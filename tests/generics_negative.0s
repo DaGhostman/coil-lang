@@ -1,0 +1,12 @@
+// Test file for generics implementation
+// Negative tests - these should produce type errors
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    // Test 1: Type mismatch - int expected but float provided
+    let x1: int = identity<float>(42);
+    print "%i", x1;
+}

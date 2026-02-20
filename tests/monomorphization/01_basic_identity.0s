@@ -1,0 +1,11 @@
+// Test: Basic monomorphization - identity function with int
+// Expected: Should compile and instantiate identity<int>
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let a: int = identity<int>(42);
+    print "%i", a;
+}

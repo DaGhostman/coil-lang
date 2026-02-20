@@ -1,0 +1,19 @@
+// Test: Match on wrong enum type
+// Expected: Should error on type mismatch
+
+enum Color {
+    Red,
+    Green
+}
+
+enum Shape {
+    Circle,
+    Square
+}
+
+fn check(Color c) {
+    match c {
+        case Shape::Circle => { print "Circle"; }
+        case Shape::Square => { print "Square"; }
+    }
+}

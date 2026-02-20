@@ -1,0 +1,11 @@
+// Test: Simple identity function
+// Expected: Should compile and return same value
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let a: int = identity<int>(42);
+    print "%i", a;
+}

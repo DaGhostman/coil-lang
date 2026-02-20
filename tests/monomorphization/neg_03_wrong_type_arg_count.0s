@@ -1,0 +1,10 @@
+// Test: Wrong number of type arguments
+// Expected: Should error on type arg count mismatch
+
+fn pair<A, B>(A a, B b) -> int {
+    return 1;
+}
+
+fn main() {
+    let x: int = pair<int>(42, 100);
+}

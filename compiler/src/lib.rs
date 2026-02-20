@@ -233,7 +233,7 @@ impl Compiler {
         match variable.1.borrow() {
             Expression::Identifier(n) => n.to_string(),
             f => {
-                eprintln!("{}", f);
+                eprintln!("Variable '{}' is undefined", f);
                 todo!("Function name as expression")
             }
         }
@@ -307,15 +307,41 @@ impl Compiler {
         let type_args_str: Vec<String> = type_args.iter().map(|t| t.type_name()).collect();
         let key = format!("{}<{}>", name, type_args_str.join(", "));
 
+        eprintln!("DEBUG instantiate_generic: name={}, key={}", name, key);
+
         if let Some(&offset) = self.instantiations.get(&key) {
+            eprintln!("DEBUG: Found cached instantiation at {}", offset);
             return Some(offset);
         }
 
-        let template = self.generic_templates.get(name)?.clone();
+        let template = self.generic_templates.get(name);
+        eprintln!(
+            "DEBUG: Template lookup result: {:?}",
+            template.as_ref().map(|t| &t.name)
+        );
+
+        let template = match template {
+            Some(t) => t.clone(),
+            None => {
+                eprintln!("DEBUG: Template NOT found for name={}", name);
+                return None;
+            }
+        };
 
         if template.type_params.len() != type_args.len() {
+            eprintln!(
+                "DEBUG: Type param mismatch: template has {}, args has {}",
+                template.type_params.len(),
+                type_args.len()
+            );
             return None;
         }
+
+        eprintln!(
+            "DEBUG: Instantiating template '{}' with {} type params",
+            template.name,
+            template.type_params.len()
+        );
 
         let subst: HashMap<usize, Type> = template
             .type_params
@@ -592,6 +618,11 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(child));
                 });
 
+                self.context.defers.iter().for_each(|offset| {
+                    bytecode.push(Byte::new(Instruction::CALL));
+                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+                });
+
                 self.context = *self.context.get_prev().clone().unwrap();
             }
             Expression::Function {
@@ -616,11 +647,6 @@ impl Compiler {
 
                 let mut c = self.do_compile(body);
                 self.bytecode.append(&mut c);
-
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
 
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
@@ -690,10 +716,10 @@ impl Compiler {
                 let mut c = self.do_compile(body);
                 self.bytecode.append(&mut c);
 
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
+                // self.context.defers.iter().for_each(|offset| {
+                //     self.bytecode
+                //         .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+                // });
 
                 if !matches!(
                     self.bytecode.last().map(|b| b.bytecode()),
@@ -767,19 +793,19 @@ impl Compiler {
                 let mut params_len = 0;
                 if let Some(params) = params {
                     params_len = params.len();
-                    params.iter().for_each(|param| {
+                    params.iter().rev().for_each(|param| {
                         bytecode.append(&mut self.do_compile(param));
                     });
                 }
                 bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
             }
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
-                self.context.defers.iter().for_each(|offset| {
-                    self.bytecode
-                        .push(Byte::new(Instruction::CALL).with_operand_u32(0));
-                    self.bytecode
-                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                });
+                // self.context.defers.iter().for_each(|offset| {
+                //     self.bytecode
+                //         .push(Byte::new(Instruction::CALL).with_operand_u32(0));
+                //     self.bytecode
+                //         .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+                // });
 
                 // if let Expression::Identifier(name) = *expr.1.borrow() {
                 //     let ty = self.typechecker.get_variable_type(&name.into());
@@ -1022,6 +1048,15 @@ impl Compiler {
                     .cloned()
                     .unwrap_or_else(|| full_name.clone());
 
+                eprintln!(
+                    "DEBUG: GenericFunctionCall identifier={}, full_name={}, template_name={}",
+                    identifier, full_name, template_name
+                );
+                eprintln!(
+                    "DEBUG: Available templates: {:?}",
+                    self.generic_templates.keys().collect::<Vec<_>>()
+                );
+
                 let type_arg_types: Vec<Type> = type_args
                     .iter()
                     .map(|ta| {
@@ -1066,7 +1101,9 @@ impl Compiler {
                 } else if let Some(offset) =
                     self.instantiate_generic(&template_name, &type_arg_types)
                 {
+                    eprintln!("DEBUG: instantiate_generic returned offset={}", offset);
                     if let Some(args) = args {
+                        eprintln!("DEBUG: Compiling {} args", args.len());
                         for arg in args {
                             bytecode.append(&mut self.do_compile(arg));
                         }
@@ -1091,8 +1128,17 @@ impl Compiler {
                         })
                         .unwrap_or(0);
 
+                    eprintln!(
+                        "DEBUG: Emitting CALL(arity={}) and JMP(offset={})",
+                        arity, offset
+                    );
+                    eprintln!(
+                        "DEBUG: Current bytecode len before emit: {}",
+                        bytecode.len()
+                    );
                     bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(arity as u32));
                     bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
+                    eprintln!("DEBUG: Current bytecode len after emit: {}", bytecode.len());
                 } else if self.functions.get(&n).is_some() {
                     if let Some(args) = args {
                         for arg in args {
@@ -1347,11 +1393,20 @@ impl Compiler {
             Expression::Eq(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
             }
+            Expression::Neq(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
+            }
             Expression::Not(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NOT));
             }
+            Expression::Flip(lhs) => {
+                unary!(bytecode, self, lhs, Byte::new(Instruction::FLP));
+            }
             Expression::Negate(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
+            }
+            Expression::Positive(lhs) => {
+                unary!(bytecode, self, lhs, Byte::new(Instruction::NOOP));
             }
             Expression::Add(lhs, rhs) => {
                 self.emit_arithmetic_op(
@@ -1400,6 +1455,9 @@ impl Compiler {
             }
             Expression::And(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::AND));
+            }
+            Expression::Or(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::OR));
             }
             Expression::Integer(num) => bytecode.push(Byte::new_with_value(
                 Instruction::CONST,

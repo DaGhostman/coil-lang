@@ -1,0 +1,10 @@
+// Test: Print statements
+// Expected: Should compile print with various formats
+
+fn main() {
+    print "hello";
+    print "%i", 42;
+    print "%f", 3.14;
+    print "%i %i", 1, 2;
+    print "mixed %i and %f", 10, 2.5;
+}

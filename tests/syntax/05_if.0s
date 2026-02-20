@@ -1,0 +1,15 @@
+// Test: If statements
+// Expected: Should compile if/else
+
+fn main() {
+    let x = 10;
+    if x > 5 {
+        print "greater";
+    }
+    
+    if x < 5 {
+        print "less";
+    } else {
+        print "not less";
+    }
+}

@@ -1,0 +1,16 @@
+// Test: Generic with type bounds
+// Expected: Should compile with bounds checking
+
+fn with_bounds<T: Copy>(T x) -> T {
+    return x;
+}
+
+fn multi_bounds<T: Copy + Clone>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let a: int = with_bounds<int>(42);
+    let b: int = multi_bounds<int>(100);
+    print "%i %i", a, b;
+}

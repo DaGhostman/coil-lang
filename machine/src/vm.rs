@@ -243,6 +243,7 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(lhs);
                 }
                 Instruction::NOT => unary!(self.stack, !, as_bool),
+                Instruction::FLP => unary!(self.stack, !, as_int),
                 Instruction::NEG => unary!(self.stack, -, as_int),
                 Instruction::ADD => binary!(self.stack, +, as_int),
                 Instruction::SUB => binary!(self.stack, -, as_int),
@@ -277,6 +278,7 @@ impl<const S: usize> Machine<S> {
                         let format_string = (unsafe { &*ptr }).data.as_str();
 
                         let mut message = String::default();
+                        let mut param_idx = 0usize;
 
                         let mut chars = format_string.chars().peekable();
                         while let Some(ch) = chars.next() {
@@ -284,59 +286,64 @@ impl<const S: usize> Machine<S> {
                                 match chars.peek() {
                                     Some('i') => {
                                         chars.next();
-                                        message.push_str(&params.pop().as_int().to_string());
+                                        message.push_str(&params[param_idx].as_int().to_string());
+                                        param_idx += 1;
                                     }
                                     Some('f') => {
                                         chars.next();
-                                        // message
-                                        //     .push_str(&format!("{:.?}", params.pop().as_float()));
                                         let _ =
-                                            write!(&mut message, "{:.?}", params.pop().as_float());
+                                            write!(&mut message, "{:.?}", params[param_idx].as_float());
+                                        param_idx += 1;
                                     }
                                     Some('b') => {
                                         chars.next();
                                         let _ = write!(
                                             &mut message,
                                             "{:0b}",
-                                            params.pop().raw().addr()
+                                            params[param_idx].raw().addr()
                                         );
+                                        param_idx += 1;
                                     }
                                     Some('s') => {
                                         chars.next();
                                         let string_val =
-                                            (unsafe { &*params.pop().as_ptr::<ObjString>() })
+                                            (unsafe { &*params[param_idx].as_ptr::<ObjString>() })
                                                 .data
                                                 .as_str();
-                                        // Allocated::<crate::String>::new(params.pop().as_ptr());
                                         message.push_str(string_val);
+                                        param_idx += 1;
                                     }
                                     Some('x') => {
                                         chars.next();
                                         let _ = write!(
                                             &mut message,
                                             "{:0x}",
-                                            params.pop().raw().addr()
+                                            params[param_idx].raw().addr()
                                         );
+                                        param_idx += 1;
                                     }
                                     Some('z') => {
                                         chars.next();
-                                        message.push_str(if params.pop().raw() > 0 as _ {
+                                        message.push_str(if params[param_idx].raw() > 0 as _ {
                                             "true"
                                         } else {
                                             "false"
                                         });
+                                        param_idx += 1;
                                     }
                                     Some('u') => {
                                         chars.next();
-                                        message.push_str(&params.pop().raw().addr().to_string());
+                                        message.push_str(&params[param_idx].raw().addr().to_string());
+                                        param_idx += 1;
                                     }
                                     Some('p') => {
                                         chars.next();
                                         let _ = write!(
                                             &mut message,
                                             "{:08x}",
-                                            params.pop().as_ptr::<bool>().addr()
+                                            params[param_idx].as_ptr::<bool>().addr()
                                         );
+                                        param_idx += 1;
                                     }
                                     _ => {
                                         message.push('%');

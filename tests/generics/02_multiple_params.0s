@@ -1,0 +1,16 @@
+// Test: Multiple type parameters
+// Expected: Should handle multiple generic types
+
+fn pair<A, B>(A a, B b) -> int {
+    return 1;
+}
+
+fn triple<A, B, C>(A a, B b, C c) -> int {
+    return 2;
+}
+
+fn main() {
+    let x: int = pair<int, float>(1, 2.0);
+    let y: int = triple<int, int, int>(1, 2, 3);
+    print "%i %i", x, y;
+}

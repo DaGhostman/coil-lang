@@ -1,0 +1,9 @@
+// Test: Defer statement
+// Expected: Should compile defer
+
+fn main() {
+    defer {
+        print "deferred";
+    }
+    print "first";
+}

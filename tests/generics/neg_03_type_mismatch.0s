@@ -1,0 +1,11 @@
+// Test: Generic with incompatible type
+// Expected: Should error on type mismatch
+
+fn take_int<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let x: int = take_int<float>(3.14);
+    print "%i", x;
+}

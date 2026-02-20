@@ -1,0 +1,32 @@
+// Test: Option-like enum
+// Expected: Should handle Some/None pattern
+
+enum Option {
+    Some(int),
+    None
+}
+
+fn maybe_double(int x) -> Option {
+    if x > 0 {
+        let doubled = x * 2;
+        return Option::Some(doubled);
+    }
+    return Option::None;
+}
+
+fn unwrap_or(Option o, int default) -> int {
+    match o {
+        case Option::Some(value) => { return value; }
+        case Option::None => { return default; }
+    }
+}
+
+fn main() {
+    let some: Option = maybe_double(21);
+    let none: Option = maybe_double(0);
+    
+    let a: int = unwrap_or(some, 0);
+    let b: int = unwrap_or(none, -1);
+    
+    print "%i %i", a, b;
+}

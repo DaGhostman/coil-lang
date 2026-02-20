@@ -1,0 +1,9 @@
+// Test: Assignments
+// Expected: Should compile variable assignments
+
+fn main() {
+    let x = 10;
+    x = 20;
+    x = x + 5;
+    print "%i", x;
+}

@@ -1,0 +1,13 @@
+// Test: Multiple instantiations of same generic
+// Expected: Should create separate instantiations for each type
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let a: int = identity<int>(42);
+    let b: float = identity<float>(3.14);
+    let c: int = identity<int>(100);
+    print "%i %f %i", a, b, c;
+}

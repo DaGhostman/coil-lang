@@ -1,0 +1,9 @@
+// Test: Logical operations
+// Expected: Should compile logical ops
+
+fn main() {
+    let a = true && false;
+    let b = true || false;
+    let c = ~true;
+    print "%i %i %i", a, b, c;
+}

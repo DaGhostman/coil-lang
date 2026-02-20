@@ -1,0 +1,6 @@
+// Test: Unknown generic function
+// Expected: Should error on unknown function
+
+fn main() {
+    let x: int = unknown_generic<int>(42);
+}

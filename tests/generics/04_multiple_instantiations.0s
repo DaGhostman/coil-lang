@@ -1,0 +1,14 @@
+// Test: Multiple instantiations
+// Expected: Should create separate instantiations for each type
+
+fn id<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let a: int = id<int>(1);
+    let b: float = id<float>(2.0);
+    let c: int = id<int>(3);
+    let d: float = id<float>(4.0);
+    print "%i %f %i %f", a, b, c, d;
+}

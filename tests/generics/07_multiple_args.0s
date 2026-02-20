@@ -1,0 +1,17 @@
+// Test: Generic with multiple arguments
+// Expected: Should handle multiple generic arguments
+
+fn swap<A, B>(A a, B b) -> int {
+    print "swapped";
+    return 0;
+}
+
+fn combine<T>(T a, T b) -> int {
+    return 1;
+}
+
+fn main() {
+    let x: int = swap<int, float>(1, 2.0);
+    let y: int = combine<int>(10, 20);
+    print "%i %i", x, y;
+}

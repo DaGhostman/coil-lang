@@ -1,0 +1,11 @@
+// Test: Arithmetic operations
+// Expected: Should compile all arithmetic ops
+
+fn main() {
+    let a = 10 + 5;
+    let b = 10 - 5;
+    let c = 10 * 5;
+    let d = 10 / 5;
+    let e = 10 % 3;
+    print "%i %i %i %i %i", a, b, c, d, e;
+}

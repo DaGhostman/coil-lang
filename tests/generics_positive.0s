@@ -1,0 +1,44 @@
+// Test file for generics implementation
+// Positive tests - these should compile and run correctly
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn make_pair<A, B>(A a, B b) -> int {
+    return 1;
+}
+
+fn with_bounds<T: Copy>(T x) -> T {
+    return x;
+}
+
+fn with_multiple_bounds<T: Copy + Clone>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    // Test 1: Basic generic identity
+    let x1: int = identity<int>(42);
+    print "%i", x1;
+    
+    // Test 2: Generic with type inference
+    let x2: int = identity(100);
+    print "%i", x2;
+    
+    // Test 3: Multiple type parameters
+    let x3: int = make_pair<int, int>(1, 2);
+    print "%i", x3;
+    
+    // Test 4: Generic with bounds
+    let x4: int = with_bounds<int>(50);
+    print "%i", x4;
+    
+    // Test 5: Generic with multiple bounds
+    let x5: int = with_multiple_bounds<int>(75);
+    print "%i", x5;
+    
+    // Test 6: Float generic
+    let x6: float = identity<float>(3.14);
+    print "%f", x6;
+}

@@ -1,0 +1,23 @@
+// Test: Match on simple enum
+// Expected: Should match variants correctly
+
+enum Status {
+    Ok,
+    Error,
+    Pending
+}
+
+fn check(Status s) -> int {
+    match s {
+        case Status::Ok => { return 1; }
+        case Status::Error => { return -1; }
+        case Status::Pending => { return 0; }
+    }
+}
+
+fn main() {
+    let ok_result: int = check(Status::Ok);
+    let err_result: int = check(Status::Error);
+    let pend_result: int = check(Status::Pending);
+    print "%i %i %i", ok_result, err_result, pend_result;
+}

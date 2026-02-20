@@ -1,0 +1,25 @@
+// Test: Result-like enum
+// Expected: Should handle Ok/Err pattern
+
+enum Result {
+    Ok(int),
+    Err(string)
+}
+
+fn divide(int a, int b) -> Result {
+    if b == 0 {
+        return Result::Err("division by zero");
+    }
+    let result = a / b;
+    return Result::Ok(result);
+}
+
+fn main() {
+    let good: Result = divide(10, 2);
+    let bad: Result = divide(10, 0);
+    
+    match good {
+        case Result::Ok(value) => { print "Result: %i", value; }
+        case Result::Err(msg) => { print "Error: %s", msg; }
+    }
+}

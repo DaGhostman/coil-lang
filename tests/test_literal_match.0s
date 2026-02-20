@@ -1,0 +1,6 @@
+// Test - direct literal match (no variable)
+fn main() -> void {
+    match 1 {
+        case 1 => { print "%i", 42; }
+    }
+}

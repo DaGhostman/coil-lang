@@ -1,0 +1,16 @@
+// Test: Nested generic calls
+// Expected: Should instantiate nested generics correctly
+
+fn inner<T>(T x) -> T {
+    return x;
+}
+
+fn outer<T>(T x) -> T {
+    return inner<T>(x);
+}
+
+fn main() {
+    let a: int = outer<int>(42);
+    let b: float = outer<float>(3.14);
+    print "%i %f", a, b;
+}

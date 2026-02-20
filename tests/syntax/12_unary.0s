@@ -1,0 +1,9 @@
+// Test: Unary operations
+// Expected: Should compile unary ops
+
+fn main() {
+    let a = -10;
+    let b = +5;
+    let c = ~true;
+    print "%i %i %i", a, b, c;
+}

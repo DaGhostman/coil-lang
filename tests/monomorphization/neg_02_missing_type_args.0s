@@ -1,0 +1,11 @@
+// Test: Generic function without type arguments in call
+// Expected: Should handle via type inference or error
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    let x: int = identity(42);
+    print "%i", x;
+}

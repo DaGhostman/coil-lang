@@ -1,0 +1,8 @@
+// Test: Bitwise operations
+// Note: Bitwise ops not yet implemented in compiler
+// Expected: Should compile when implemented
+
+fn main() {
+    // These would need compiler support
+    print "bitwise ops not yet implemented";
+}

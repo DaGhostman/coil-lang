@@ -1,0 +1,48 @@
+// Test file for generics - constraint tests
+// These tests check generic type constraints
+
+fn identity<T>(T x) -> T {
+    return x;
+}
+
+fn first<T, U>(T x, U y) -> T {
+    return x;
+}
+
+fn second<T, U>(T x, U y) -> U {
+    return y;
+}
+
+fn return_same<T>(T x) -> T {
+    return x;
+}
+
+fn main() {
+    // Test 1: Multiple type params - first returns first arg
+    let a: int = first<int, int>(1, 2);
+    print "%i", a;
+    
+    // Test 2: Multiple type params - second returns second arg
+    let b: int = second<int, int>(1, 2);
+    print "%i", b;
+    
+    // Test 3: Mixed types - first returns first arg (ignores second)
+    let c: int = first<int, float>(42, 3.14);
+    print "%i", c;
+    
+    // Test 4: Identity with int
+    let e: int = identity(100);
+    print "%i", e;
+    
+    // Test 5: Identity with float  
+    let f: float = identity(1.5);
+    print "%f", f;
+    
+    // Test 6: Chained identity
+    let g: int = return_same(return_same(42));
+    print "%i", g;
+    
+    // Test 7: Generic passed directly
+    let h: int = return_same(99);
+    print "%i", h;
+}

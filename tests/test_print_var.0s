@@ -1,0 +1,5 @@
+// Debug test - no match, just print variable
+fn main() -> void {
+    let x = 1;
+    print "%i", x;
+}

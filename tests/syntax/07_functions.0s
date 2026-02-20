@@ -1,0 +1,26 @@
+// Test: Function definitions
+// Expected: Should compile various function signatures
+
+fn no_args() -> int {
+    return 42;
+}
+
+fn one_arg(int x) -> int {
+    return x;
+}
+
+fn two_args(int a, int b) -> int {
+    return a + b;
+}
+
+fn no_return(int x) {
+    print "%i", x;
+}
+
+fn main() {
+    let a = no_args();
+    let b = one_arg(10);
+    let c = two_args(5, 10);
+    no_return(100);
+    print "%i %i %i", a, b, c;
+}

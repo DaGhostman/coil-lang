@@ -1,0 +1,9 @@
+// Test: Comments
+// Expected: Should ignore comments
+
+// This is a comment
+fn main() {
+    // Another comment
+    let x = 42; // inline comment
+    print "%i", x;
+}

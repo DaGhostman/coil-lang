@@ -1,0 +1,9 @@
+// Test: Block expressions
+// Note: Block expressions as values not yet implemented
+// Expected: Should compile when implemented
+
+fn main() {
+    // Block expressions as values need compiler support
+    let x = 10;
+    print "%i", x;
+}

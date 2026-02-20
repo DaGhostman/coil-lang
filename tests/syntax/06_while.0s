@@ -1,0 +1,10 @@
+// Test: While loop
+// Expected: Should compile while loop
+
+fn main() {
+    let x = 0;
+    while x < 5 {
+        print "%i", x;
+        x = x + 1;
+    }
+}

@@ -24,6 +24,7 @@ pub enum Expression<'expr> {
     Resume(Output<'expr>, Option<Output<'expr>>),
     Negate(Output<'expr>),
     Not(Output<'expr>),
+    Flip(Output<'expr>),
     Positive(Output<'expr>),
     Default(&'expr str),
     Inc(Output<'expr>),
@@ -151,7 +152,8 @@ impl<'a> Display for Expression<'a> {
             Self::Integer(n) => write!(f, "{}", n),
             Self::Float(n) => write!(f, "{:.?}", n),
             Self::Identifier(id) => write!(f, "{}", id),
-            Self::Not(n) => write!(f, "~{}", n.1),
+            Self::Not(n) => write!(f, "!{}", n.1),
+            Self::Flip(n) => write!(f, "~{}", n.1),
             Self::Sub(lhs, rhs) => write!(f, "{} - {}", lhs.borrow().1, rhs.borrow().1),
             Self::Add(lhs, rhs) => write!(f, "{} + {}", lhs.borrow().1, rhs.borrow().1),
             Self::Mul(lhs, rhs) => write!(f, "{} * {}", lhs.borrow().1, rhs.borrow().1),
@@ -389,7 +391,43 @@ impl<'a> Display for Expression<'a> {
                         .join("\n")
                 )
             }
-            e => todo!("Missing rest of nodes: {}", e),
+            Self::Format(lhs, items) => {
+                write!(
+                    f,
+                    "{}{}",
+                    lhs.1,
+                    items
+                        .as_ref()
+                        .map(|i| {
+                            let mut r = i.iter().map(|i| i.1.to_string()).collect::<Vec<String>>();
+                            r.push("".to_string());
+                            r.join(", ")
+                        })
+                        .unwrap_or_default()
+                )
+            }
+            Self::Bool(state) => {
+                write!(f, "{}", if *state { "true" } else { "false" })
+            }
+            Self::Return(expr) => {
+                write!(f, "return {}", expr.1)
+            }
+            Self::Comment(c) => {
+                write!(f, "// {}", c)
+            }
+            Self::ImplicitReturn(r) => {
+                write!(f, "{}", r.1)
+            }
+            Self::Leq(lhs, rhs) => {
+                write!(f, "{} <= {}", lhs.1, rhs.1)
+            }
+            Self::Geq(lhs, rhs) => {
+                write!(f, "{} >= {}", lhs.1, rhs.1)
+            }
+            e => {
+                eprintln!("Missing rest of nodes: '{}'", e);
+                todo!("Missing rest of nodes: {}", e)
+            }
         }
     }
 }
