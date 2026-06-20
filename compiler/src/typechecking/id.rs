@@ -19,7 +19,7 @@
 //! happens for wrapper nodes — `Program` and `Statement` covering the
 //! same range, for example).
 
-use parser::ast::Output;
+use parser::ast::{Output, Pattern};
 
 /// A stable identifier for an AST node.
 ///
@@ -234,12 +234,45 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             }
         }
 
-        // Match: lhs + (pattern, body) pairs.
-        Expression::Match(lhs, arms) => {
-            pre_walk(lhs, table);
-            for (pat, body) in arms {
-                pre_walk(pat, table);
-                pre_walk(body, table);
+        // Match: scrutinee + arms. Each arm carries a pattern
+        // (which is *not* an expression and has no NodeId) and a
+        // body (which is a normal `Output`). The pre-walk visits
+        // the body of each arm so the infer pass can keep its
+        // NodeId counter in lockstep; the pattern is visited by
+        // [`pre_walk_pattern`] for structural traversal without
+        // minting IDs.
+        Expression::Match { scrutinee, arms } => {
+            pre_walk(scrutinee, table);
+            for arm in arms {
+                pre_walk_pattern(&arm.pattern, table);
+                pre_walk(&arm.body, table);
+            }
+        }
+
+        // ---- Phase 15A: sum types and constructors ----
+        // `enum_decl` carries a list of `EnumVariant` outputs (the
+        // payload types inside the parentheses). The pre-walk visits
+        // each variant's output, which dispatches to the
+        // `EnumVariant` arm below.
+        Expression::EnumDecl { variants, .. } => {
+            for v in variants {
+                pre_walk(v, table);
+            }
+        }
+        // `EnumVariant` payload types are wrapped in
+        // `Expression::Type(...)` outputs — they have no children
+        // to walk, but the pre-walk still mints an ID for each
+        // entry (so the cache lines up with the infer pass).
+        Expression::EnumVariant { payload, .. } => {
+            for p in payload {
+                pre_walk(p, table);
+            }
+        }
+        // `Construct` carries the application arguments as
+        // positional `Output`s, just like a call.
+        Expression::Construct { args, .. } => {
+            for arg in args {
+                pre_walk(arg, table);
             }
         }
 
@@ -256,6 +289,29 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
                 for arg in a {
                     pre_walk(arg, table);
                 }
+            }
+        }
+    }
+}
+
+/// Structural walk over a [`Pattern`] tree.
+///
+/// Patterns are not expressions and do not carry a [`NodeId`] — they
+/// don't produce a `Ty`. The HM infer pass handles patterns
+/// separately (via `Checker::infer_pattern`, land in 15B). The
+/// pre-walk still needs to visit every nested pattern so the
+/// structural invariants of the AST are explored (and so any future
+/// pattern-level analysis — exhaustiveness checking, for instance —
+/// can rely on a consistent walk).
+///
+/// `Wildcard` and `Binding` are leaves. `Constructor` recurses into
+/// each sub-pattern in the payload.
+pub fn pre_walk_pattern(pattern: &Pattern, _table: &mut IdTable) {
+    match pattern {
+        Pattern::Wildcard | Pattern::Binding { .. } => {}
+        Pattern::Constructor { payload, .. } => {
+            for p in payload {
+                pre_walk_pattern(p, _table);
             }
         }
     }
