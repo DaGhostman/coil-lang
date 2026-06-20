@@ -740,56 +740,38 @@ impl Compiler {
                     self.messages.push(message);
                 }
             }
-            Expression::Match(lhs, children) => {
-                let lhs = self.do_compile(lhs);
 
-                let mut jumps: Vec<usize> = Vec::with_capacity(children.len());
-                let last_idx = children.len() - 1;
-
-                children.iter().enumerate().for_each(|(idx, (rhs, body))| {
-                    let is_condition = !matches!(*rhs.1, Expression::Default(_));
-
-                    if !is_condition && idx != last_idx {
-                        let mut message = Message::warn(
-                            "`default` branch should be at the end of expression".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(Label::new(
-                            "Code after this block is not reachable".to_string(),
-                            rhs.0.into_range(),
-                        ));
-                        message.with_help(
-                            "Maybe you need to move this to the bottom of the list?".to_string(),
-                        );
-
-                        self.messages.push(message);
-                    }
-
-                    if is_condition {
-                        bytecode.append(&mut lhs.clone());
-                        bytecode.append(&mut self.do_compile(rhs));
-                        bytecode.push(Byte::new(Instruction::EQ));
-                    }
-
-                    let mut body = self.do_compile(body);
-                    if is_condition {
-                        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
-                            (self.bytecode.len() + bytecode.len() + body.len() + 2) as u32,
-                        ));
-                    }
-                    bytecode.append(&mut body);
-                    jumps.push(bytecode.len());
-                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(u32::MAX));
-                });
-
-                let len = bytecode.len();
-                jumps.iter().for_each(|jump| {
-                    if let Some(instruction) = bytecode.get_mut(*jump) {
-                        *instruction = Byte::new(Instruction::JMP)
-                            .with_operand_u32((self.bytecode.len() + len) as u32);
-                    }
-                });
+            // ---- Phase 15A placeholders (TODO 15B/15C) ----
+            // These keep the workspace building while the
+            // typechecker and code emitter are extended to
+            // understand sum types and pattern matching. None of
+            // them are semantically correct yet — the compiler's
+            // test suite is expected to fail on enum/match/construct
+            // source until 15B/15C land. The HM pre-walk still
+            // visits the new nodes (see `id.rs`), so the NodeId
+            // cache stays aligned with the AST shape.
+            Expression::EnumDecl { .. } => {
+                // TODO 15B: register the enum declaration with
+                // the typechecker and emit the discriminant table.
             }
+            Expression::EnumVariant { .. } => {
+                // TODO 15B
+            }
+            Expression::Construct { .. } => {
+                // TODO 15C: emit MAKE_ENUM with the variant tag
+                // and the payload bytes.
+            }
+            Expression::Match { scrutinee, arms } => {
+                // Recurse into the scrutinee and each arm body so
+                // their bytecodes are emitted; the pattern
+                // matching / branch logic is rewritten in 15C.
+                bytecode.append(&mut self.do_compile(scrutinee));
+                for arm in arms {
+                    let _ = &arm.pattern; // patterns are not expressions
+                    bytecode.append(&mut self.do_compile(&arm.body));
+                }
+            }
+
             _expr => {
                 let mut message =
                     Message::error("Unknown expression".to_string(), span.into_range());
