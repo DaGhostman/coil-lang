@@ -299,3 +299,26 @@ fn format_string_type_mismatch_errors() {
         msgs
     );
 }
+
+#[test]
+fn format_string_percent_z_accepts_bool() {
+    // `%z` is the bool specifier. `print "%z", true` should
+    // type-check with no diagnostics.
+    let (_ty, msgs) = check("print \"%z\", true;");
+    assert!(
+        msgs.is_empty(),
+        "expected `%z` to accept bool, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_string_percent_z_rejects_int() {
+    // `%z` requires a bool; passing an int is a type error.
+    let (_ty, msgs) = check("print \"%z\", 42;");
+    assert!(
+        msgs.iter().any(|m| m.contains("requires bool")),
+        "expected 'requires bool' error for `%z` with int, got: {:?}",
+        msgs
+    );
+}
