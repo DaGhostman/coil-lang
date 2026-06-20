@@ -15,6 +15,9 @@ use super::ty::{Scheme, Ty};
 /// - `Fun(a, b)`         → `a -> b` (with parens around nested `Fun`s)
 /// - `App(Foo, [...])`   → `Foo<args>` (omits `<>` when arg list is empty)
 /// - `List(t)`           → `[t]`
+/// - `Sum { name, .. }`  → `enum Name { A, B(int), .. }` (compact)
+/// - `Constructor { .. }` → `Owner::vN` (tag-only; the pretty-printer
+///    has no env access to look up the actual variant name).
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -40,6 +43,33 @@ impl fmt::Display for Ty {
                 }
             }
             Ty::List(inner) => write!(f, "[{}]", inner),
+            Ty::Sum { name, variants } => {
+                write!(f, "enum {} {{ ", name)?;
+                for (i, (vname, payload)) in variants.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", vname)?;
+                    if !payload.is_empty() {
+                        write!(f, "(")?;
+                        for (j, p) in payload.iter().enumerate() {
+                            if j > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", p)?;
+                        }
+                        write!(f, ")")?;
+                    }
+                }
+                write!(f, " }}")
+            }
+            Ty::Constructor { owner, tag, .. } => {
+                // The pretty-printer has no env access — render the
+                // owner by tag. The 15C emitter (which has the
+                // checker's enum tables) does the final name lookup
+                // when emitting MAKE_ENUM.
+                write!(f, "{}::v{}", owner, tag)
+            }
         }
     }
 }
@@ -130,5 +160,45 @@ mod tests {
             ty: Ty::Fun(Box::new(Ty::Var(TyVarId(0))), Box::new(Ty::Var(TyVarId(1)))),
         };
         assert_eq!(format!("{}", s), "forall t0 t1. t0 -> t1");
+    }
+
+    // ---- Sum / Constructor Display ----
+
+    #[test]
+    fn display_sum_with_no_payloads() {
+        let ty = Ty::Sum {
+            name: "E".into(),
+            variants: vec![("A".into(), vec![]), ("B".into(), vec![])],
+        };
+        assert_eq!(format!("{}", ty), "enum E { A, B }");
+    }
+
+    #[test]
+    fn display_sum_with_payloads() {
+        let ty = Ty::Sum {
+            name: "Option".into(),
+            variants: vec![
+                ("None".into(), vec![]),
+                ("Some".into(), vec![int()]),
+            ],
+        };
+        assert_eq!(format!("{}", ty), "enum Option { None, Some(int) }");
+    }
+
+    #[test]
+    fn display_constructor() {
+        let sum = Ty::Sum {
+            name: "Option".into(),
+            variants: vec![
+                ("None".into(), vec![]),
+                ("Some".into(), vec![int()]),
+            ],
+        };
+        let ctor = Ty::Constructor {
+            owner: Box::new(sum),
+            tag: 1,
+            arity: 1,
+        };
+        assert_eq!(format!("{}", ctor), "enum Option { None, Some(int) }::v1");
     }
 }

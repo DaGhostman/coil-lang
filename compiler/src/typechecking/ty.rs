@@ -43,6 +43,16 @@ impl TyVarId {
 /// - `Fun(a, b)` is a function type `a -> b`.
 /// - `App(c, args)` is a type-level application, e.g. `Foo<int, string>`.
 /// - `List(inner)` is sugar over `App(Con("List"), [inner])`.
+/// - `Sum { name, variants }` is an algebraic sum type
+///   (`enum Option { None, Some(int) }`). The variant list is the
+///   source-declaration order; the `name` field is the enum's name
+///   (used for diagnostic rendering and isorecursive encoding of
+///   recursive payloads — see `infer::register_enum`).
+/// - `Constructor { owner, tag, arity }` is the type of a specific
+///   variant inside a sum. The `owner` is the parent sum type (kept
+///   as a `Box` so the `Ty` is cheap to clone). `tag` is the
+///   zero-based variant index in the owner's `variants` list;
+///   `arity` is cached to spare codegen a per-call lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Var(TyVarId),
@@ -50,6 +60,15 @@ pub enum Ty {
     Fun(Box<Ty>, Box<Ty>),
     App(Box<Ty>, Vec<Ty>),
     List(Box<Ty>),
+    Sum {
+        name: String,
+        variants: Vec<(String, Vec<Ty>)>,
+    },
+    Constructor {
+        owner: Box<Ty>,
+        tag: u32,
+        arity: usize,
+    },
 }
 
 impl Ty {
@@ -153,6 +172,25 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         Ty::List(inner) => {
             go(inner, acc);
         }
+        // Sum types: the `name` field carries no free variables.
+        // Variant payload types may be polymorphic (e.g. `enum Pair
+        // { P(int, T) }` where T is fresh) so we walk them.
+        // Recursive payloads use `Ty::Con("EnumName")` for the
+        // self-reference, which has no free variables — so the
+        // recursion terminates without an explicit depth check.
+        Ty::Sum { variants, .. } => {
+            for (_, payload) in variants {
+                for p in payload {
+                    go(p, acc);
+                }
+            }
+        }
+        // Constructor types: the tag and arity are inert; the
+        // interesting part is the owner (which is always the parent
+        // sum type).
+        Ty::Constructor { owner, .. } => {
+            go(owner, acc);
+        }
     }
 }
 
@@ -230,5 +268,55 @@ mod tests {
         let s = Scheme::mono(int());
         assert!(s.bounds.is_empty());
         assert_eq!(s.ty, int());
+    }
+
+    // ---- Sum / Constructor ----
+
+    #[test]
+    fn ftv_of_sum_walks_variant_payloads() {
+        // enum E { A(int), B(string) }  — ftv is the union of the
+        // payload free variables (here, just the vars inside the
+        // payloads).
+        let sum = Ty::Sum {
+            name: "E".into(),
+            variants: vec![
+                ("A".into(), vec![v(0)]),
+                ("B".into(), vec![string()]),
+            ],
+        };
+        assert_eq!(ftv_ty(&sum), HashSet::from([TyVarId(0)]));
+    }
+
+    #[test]
+    fn ftv_of_constructor_walks_owner() {
+        // The owner of a Constructor is the parent sum. Its ftv is
+        // the union of the owner's variant-payload ftvs.
+        let sum = Ty::Sum {
+            name: "E".into(),
+            variants: vec![("A".into(), vec![v(1), v(2)])],
+        };
+        let ctor = Ty::Constructor {
+            owner: Box::new(sum),
+            tag: 0,
+            arity: 2,
+        };
+        assert_eq!(ftv_ty(&ctor), HashSet::from([TyVarId(1), TyVarId(2)]));
+    }
+
+    #[test]
+    fn ftv_of_recursive_sum_is_empty_when_payloads_use_con() {
+        // `enum Tree { Leaf, Node(int, Tree, Tree) }` — the
+        // recursive reference inside `Node` is `Ty::Con("Tree")`
+        // (the isorecursive encoding, see `register_enum`), which
+        // has no free vars. So the entire sum has no free vars.
+        let tree = Ty::Con("Tree".into());
+        let sum = Ty::Sum {
+            name: "Tree".into(),
+            variants: vec![
+                ("Leaf".into(), vec![]),
+                ("Node".into(), vec![int(), tree.clone(), tree]),
+            ],
+        };
+        assert!(ftv_ty(&sum).is_empty());
     }
 }

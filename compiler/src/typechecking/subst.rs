@@ -136,6 +136,18 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             args.iter().map(|t| apply_ty(subst, t)).collect(),
         ),
         Ty::List(inner) => Ty::List(Box::new(apply_ty(subst, inner))),
+        Ty::Sum { name, variants } => Ty::Sum {
+            name: name.clone(),
+            variants: variants
+                .iter()
+                .map(|(n, payload)| (n.clone(), payload.iter().map(|t| apply_ty(subst, t)).collect()))
+                .collect(),
+        },
+        Ty::Constructor { owner, tag, arity } => Ty::Constructor {
+            owner: Box::new(apply_ty(subst, owner)),
+            tag: *tag,
+            arity: *arity,
+        },
     }
 }
 

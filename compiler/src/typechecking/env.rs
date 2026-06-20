@@ -231,6 +231,23 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
             args.iter().map(|t| substitute_vars(t, mapping)).collect(),
         ),
         Ty::List(inner) => Ty::List(Box::new(substitute_vars(inner, mapping))),
+        Ty::Sum { name, variants } => Ty::Sum {
+            name: name.clone(),
+            variants: variants
+                .iter()
+                .map(|(n, payload)| {
+                    (
+                        n.clone(),
+                        payload.iter().map(|t| substitute_vars(t, mapping)).collect(),
+                    )
+                })
+                .collect(),
+        },
+        Ty::Constructor { owner, tag, arity } => Ty::Constructor {
+            owner: Box::new(substitute_vars(owner, mapping)),
+            tag: *tag,
+            arity: *arity,
+        },
     }
 }
 
