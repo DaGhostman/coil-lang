@@ -3185,6 +3185,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn enum_decl_cache_aligned_with_id_table() {
+        // Regression test for the ID-alignment bug in
+        // `infer_enum_decl`: the pre-walk mints one ID for the
+        // `EnumDecl` node, one for each `EnumVariant` node, and one
+        // for each `Expression::Type` payload. The infer pass must
+        // consume exactly the same number of IDs (via `self.infer`)
+        // so the cache lines up with the id table.
+        //
+        // Concretely: `enum Option { None, Some(int) }` produces
+        //   1 (EnumDecl) + 2 (variants) + 1 (Some's payload type) = 4
+        // pre-walk IDs, and `infer` must consume all 4. The cache
+        // therefore has the same length as the id table.
+        for src in &[
+            "enum Option { None, Some(int) }",
+            "enum E { A, B, C }",
+            "enum Tree { Leaf, Node(int, Tree, Tree) }",
+        ] {
+            let (mut c, _) = check(src);
+            let msgs = c.take_messages();
+            assert!(msgs.is_empty(), "{:?} for `{}`", msgs, src);
+            assert_eq!(
+                c.cache_len(),
+                c.id_table().len(),
+                "cache ({}) and id_table ({}) out of sync for `{}` \
+                 — `infer_enum_decl` is not consuming every pre-walked ID",
+                c.cache_len(),
+                c.id_table().len(),
+                src,
+            );
+            // Sanity: every pre-walked ID has a cached entry
+            // (cache_len == id_table.len() already implies this,
+            // but make the intent explicit).
+            for id in c.id_table().ids() {
+                assert!(
+                    c.lookup_at(*id).is_some(),
+                    "pre-walked ID {:?} has no cache entry for `{}`",
+                    id,
+                    src,
+                );
+            }
+        }
+    }
+
     // ---- Constructor calls ----
 
     #[test]
