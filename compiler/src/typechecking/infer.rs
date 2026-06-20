@@ -1648,8 +1648,14 @@ impl Checker {
             // pattern's bindings don't leak.
             self.env.push();
 
-            // Step 2: type the pattern, binding variables.
-            let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee);
+            // Step 2: type the pattern, binding variables. The
+            // pattern AST doesn't carry its own range today, so we
+            // pass the arm's body range as a reasonable proxy for
+            // error anchoring — it's close enough that ariadne
+            // points near the offending pattern instead of at byte
+            // 0 of the source.
+            let pattern_range = arm.body.0.into_range();
+            let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee, &pattern_range);
 
             // Step 3: unify pattern type with scrutinee.
             self.unify(
@@ -1704,7 +1710,18 @@ impl Checker {
     /// the pattern's type IS the scrutinee's type. The tag
     /// matching (which determines whether the arm is reachable) is
     /// captured separately in [`ArmCoverage`].
-    fn infer_pattern(&mut self, pattern: &Pattern, expected_ty: &Ty) -> Ty {
+    ///
+    /// `pattern_range` is the source range of the pattern itself —
+    /// or, when not available, a reasonable proxy (the arm's body
+    /// range). It is used to anchor pattern-related diagnostics
+    /// (`unknown constructor`, `wrong arity`) so ariadne points at
+    /// the offending pattern instead of byte 0 of the source.
+    fn infer_pattern(
+        &mut self,
+        pattern: &Pattern,
+        expected_ty: &Ty,
+        pattern_range: &Range<usize>,
+    ) -> Ty {
         match pattern {
             Pattern::Wildcard => {
                 // Wildcard matches anything, binds nothing. The
@@ -1739,13 +1756,12 @@ impl Checker {
                         // error. Record the error and return the
                         // expected type so the arm body is still
                         // processed.
-                        let range = expected_ty_span_range(expected_ty);
                         self.messages.push(Message::error(
                             format!(
                                 "Pattern references unknown constructor `{}::{}`",
                                 enum_str, variant_str
                             ),
-                            range,
+                            pattern_range.clone(),
                         ));
                         return expected_ty.clone();
                     }
@@ -1763,7 +1779,6 @@ impl Checker {
 
                 // 2. Arity check on sub-patterns.
                 if payload.len() != arity {
-                    let range = expected_ty_span_range(expected_ty);
                     return self.error_with_help(
                         format!(
                             "Constructor pattern `{}::{}` expects {} sub-patterns, got {}",
@@ -1772,7 +1787,7 @@ impl Checker {
                             arity,
                             payload.len()
                         ),
-                        range,
+                        pattern_range.clone(),
                         Some("check the variant's declared payload arity".to_string()),
                     );
                 }
@@ -1783,7 +1798,7 @@ impl Checker {
                 // (already resolved, e.g. `int` for
                 // `Option::Some(int)`).
                 for (sub_pat, payload_ty) in payload.iter().zip(expected_payloads.iter()) {
-                    let _ = self.infer_pattern(sub_pat, payload_ty);
+                    let _ = self.infer_pattern(sub_pat, payload_ty, pattern_range);
                 }
 
                 // 4. The pattern's type is the *expected* type —
@@ -2047,15 +2062,6 @@ impl Checker {
         }
         Some(out)
     }
-}
-
-/// Best-effort source range for an expected (inferred) type. The
-/// expected type itself is a `Ty`, not a `Range`, so this helper
-/// returns an empty range. (The diagnostic uses the caller's
-/// range when one is available; this fallback is for pattern
-/// errors that come from a non-`Output` position.)
-fn expected_ty_span_range(_ty: &Ty) -> Range<usize> {
-    0..0
 }
 
 /// Map a format specifier character to the type it expects.
