@@ -1,4 +1,4 @@
-use ast::{Expression, Output, Visibility};
+use ast::{Expression, MatchArm, Output, Pattern, Visibility};
 use std::{
     marker::PhantomData,
     num::{ParseFloatError, ParseIntError},
@@ -123,8 +123,26 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Note: `case` is listed in the Phase 15A plan as a reserved
+        // keyword for 15D polish, but it is not actively parsed in
+        // 15A. Registering it would require either including a
+        // no-op `keyword!("case")` in a `choice` (changing the
+        // output type) or a typed `text::keyword::<...>` call that
+        // leaks chumsky internals. Defer the registration to 15D
+        // when the keyword gains a real parser.
+
         recursive(|expr| {
             let atom = choice((
+                // `match` is a keyword atom — registered before
+                // `self.ident()` so the identifier parser refuses
+                // to match it.
+                self.match_expr(expr.clone()),
+                // `EnumName::Variant(args)` — qualified constructor
+                // application. MUST be tried before `self.call(...)`
+                // because both start with `ident`: the backtracking
+                // inside `choice` will try the next alternative if
+                // the `::` after the first ident is missing.
+                self.construct(expr.clone()),
                 self.call(expr.clone()),
                 self.instantiate(expr.clone()),
                 // float comes before int so that `1.0` is parsed as a
@@ -530,10 +548,14 @@ impl<'pratt> Pratt<'pratt> {
     {
         let stmt = self.statement();
 
+        // `enum_decl` is registered before `variable()` (which lives
+        // inside `stmt`) so a leading `enum` keyword is not
+        // mis-parsed as `let`.
         choice((
             self.class(),
             self.impl_block(stmt.clone()),
             self.func(stmt.clone()),
+            self.enum_decl(),
             self.defer(stmt.clone()),
             stmt.clone(),
         ))
@@ -716,6 +738,203 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(name, args), e| (e.span(), Box::new(Expression::Call { name, args })))
     }
 
+    // ============================================================
+    //  Phase 15A: sum types, qualified constructors, match
+    // ============================================================
+
+    /// `EnumName::Variant(args)` — a *qualified* constructor
+    /// application. The `::` is mandatory: a bare `Variant(args)` is
+    /// parsed as a `Call` (and the typechecker in 15B will redirect
+    /// `Call` to `Construct` if the name resolves to a constructor).
+    ///
+    /// Tried before `call` in the atom choice so the `::` is matched
+    /// before the `(`.
+    fn construct<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::ident()
+            .padded()
+            .then_ignore(just("::").padded())
+            .then(text::ident().padded())
+            .then(self.params(expr))
+            .map_with(|((enum_name, variant_name), args), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Construct {
+                        enum_name,
+                        variant_name,
+                        args: args.unwrap_or_default(),
+                    }),
+                )
+            })
+    }
+
+    /// `match scrutinee { pat => body, ... }` — a pattern-match
+    /// expression. The body of each arm is a full `expr` (so it can
+    /// be a block, a literal, another match, etc.). Patterns are
+    /// parsed by [`Self::pattern`].
+    ///
+    /// Takes the recursive `expr` parser as a parameter (rather than
+    /// calling `self.expr()`) so nested match expressions share the
+    /// outer `recursive` group instead of spawning a fresh one on
+    /// every call — which would overflow the stack at construction
+    /// time.
+    fn match_expr<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("match")
+            .ignore_then(expr.clone())
+            .then(
+                self.arm(expr.clone())
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('{'), op!('}')),
+            )
+            .map_with(|(scrutinee, arms), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Match { scrutinee, arms }),
+                )
+            })
+    }
+
+    /// `pattern => expr` — one arm inside a `match` block.
+    ///
+    /// Returns a [`MatchArm`] directly (not an `Output`) because
+    /// patterns are not expressions and don't carry a span.
+    fn arm<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, MatchArm<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.pattern()
+            .then_ignore(op!("=>"))
+            .then(expr)
+            .map_with(|(pattern, body), _| MatchArm { pattern, body })
+    }
+
+    /// A match-arm pattern: `_`/`default` (wildcard), `name` (binding),
+    /// or `Enum::Variant(p1, p2, ...)` (constructor with nested
+    /// patterns). Wrapped in `recursive` so constructor payloads can
+    /// themselves contain nested patterns.
+    fn pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Pattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        recursive(|pattern_parser| {
+            // `Enum::Variant(p1, p2, ...)` — the first ident must be
+            // followed by `::`, otherwise this alternative fails and
+            // the choice falls through to the binding alternative.
+            let constructor = text::ident()
+                .padded()
+                .then_ignore(just("::").padded())
+                .then(text::ident().padded())
+                .then(
+                    pattern_parser
+                        .clone()
+                        .separated_by(op!(','))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(op!('('), op!(')'))
+                        .or_not(),
+                )
+                .map_with(|((enum_name, variant_name), payload), _| {
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name,
+                        payload: payload.unwrap_or_default(),
+                    }
+                });
+
+            choice((
+                // `_` and `default` both parse to the same wildcard
+                // node — the literal token is discarded (Decision C).
+                just("_").padded().to(Pattern::Wildcard),
+                keyword!("default").to(Pattern::Wildcard),
+                constructor,
+                // Bare identifier — binds the scrutinee. Tried after
+                // `constructor` so a name followed by `::` is taken
+                // as a constructor, not a binding.
+                text::ident()
+                    .padded()
+                    .map_with(|name, _| Pattern::Binding { name }),
+            ))
+        })
+    }
+
+    /// `enum Name { Variant1, Variant2(T1, T2), ... }` — a top-level
+    /// sum-type declaration. Registered in [`Self::declaration`]
+    /// before `variable()` so a leading `enum` keyword isn't
+    /// mis-parsed as `let`.
+    fn enum_decl(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("enum")
+            .ignore_then(text::ident().padded())
+            .then(
+                self.enum_variant()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('{'), op!('}')),
+            )
+            .map_with(|(name, variants), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::EnumDecl { name, variants }),
+                )
+            })
+    }
+
+    /// `Variant` or `Variant(T1, T2, ...)` — one entry inside an
+    /// `enum` body. The payload is a list of *type names* (not
+    /// expressions) wrapped in `Expression::Type(...)` to match the
+    /// `class` field syntax.
+    fn enum_variant(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::ident()
+            .padded()
+            .then(
+                text::ident()
+                    .padded()
+                    .map_with(output!(Type))
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('('), op!(')'))
+                    .or_not(),
+            )
+            .map_with(|(name, payload), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::EnumVariant {
+                        name,
+                        payload: payload.unwrap_or_default(),
+                    }),
+                )
+            })
+    }
+
     pub fn parse(&self, input: &'pratt str) -> Result<Output<'pratt>, common::Message> {
         match self
             .declaration()
@@ -743,6 +962,7 @@ impl<'pratt> Pratt<'pratt> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ast::{Expression, MatchArm, Pattern};
     use crate::Pratt;
     use chumsky::Parser;
 
@@ -767,6 +987,35 @@ mod tests {
                 .unwrap()
                 .1
                 .to_string()
+        };
+    }
+
+    /// Parse a top-level declaration, returning the inner
+    /// `Expression` for structural assertions (no `Display` round-trip).
+    macro_rules! decl_ast {
+        ($case: literal) => {
+            Pratt::default()
+                .declaration()
+                .parse($case)
+                .into_result()
+                .expect("parse failed")
+                .1
+                .as_ref()
+                .clone()
+        };
+    }
+
+    /// Parse an expression, returning the inner `Expression`.
+    macro_rules! expr_ast {
+        ($case: literal) => {
+            Pratt::default()
+                .expr()
+                .parse($case)
+                .into_result()
+                .expect("parse failed")
+                .1
+                .as_ref()
+                .clone()
         };
     }
 
@@ -817,5 +1066,260 @@ mod tests {
             stmt!("fn main() -> void {\n  print \"Hello, %s\", 42;\n  }")
         );
         same!("foo(1, 3, 4) * foo(2)");
+    }
+
+    // ============================================================
+    //  Phase 15A tests
+    // ============================================================
+
+    #[test]
+    fn enum_parses_to_enum_decl() {
+        let ast = decl_ast!("enum Option { None, Some(int) }");
+        match ast {
+            Expression::EnumDecl { name, variants } => {
+                assert_eq!(name, "Option");
+                assert_eq!(variants.len(), 2);
+
+                // First variant: `None` — zero-arity.
+                match variants[0].1.as_ref() {
+                    Expression::EnumVariant { name, payload } => {
+                        assert_eq!(*name, "None");
+                        assert!(payload.is_empty());
+                    }
+                    other => panic!("expected EnumVariant(None), got {:?}", other),
+                }
+
+                // Second variant: `Some(int)` — single Type payload.
+                match variants[1].1.as_ref() {
+                    Expression::EnumVariant { name, payload } => {
+                        assert_eq!(*name, "Some");
+                        assert_eq!(payload.len(), 1);
+                        match payload[0].1.as_ref() {
+                            Expression::Type(t) => assert_eq!(*t, "int"),
+                            other => panic!("expected Type(\"int\"), got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected EnumVariant(Some), got {:?}", other),
+                }
+            }
+            other => panic!("expected EnumDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qualified_construct_parses_to_construct() {
+        // `let x = Option::Some(42);` — the RHS of the assignment is
+        // a Construct. The `let` returns a Fragment of
+        // [Variable(x), Assignment(x, Construct(...))] or similar;
+        // the test walks down to the Construct node.
+        let ast = decl_ast!("let x = Option::Some(42);");
+        // Top-level is a `Statement` wrapping the Fragment produced
+        // by `variable()`.
+        let frag = match ast {
+            Expression::Statement(s) => match s.1.as_ref() {
+                Expression::Fragment(items) => items.clone(),
+                other => panic!("expected Fragment inside Statement, got {:?}", other),
+            },
+            Expression::Fragment(items) => items,
+            other => panic!("expected Statement/Fragment from let, got {:?}", other),
+        };
+        // Second item is the `Option::Some(42)` expression (wrapped
+        // in Expr by the recursive expr() rule).
+        let construct = match frag[1].1.as_ref() {
+            Expression::Expr(e) => match e.1.as_ref() {
+                Expression::Construct {
+                    enum_name,
+                    variant_name,
+                    args,
+                } => (
+                    *enum_name,
+                    *variant_name,
+                    args.clone(),
+                ),
+                other => panic!("expected Construct inside Expr, got {:?}", other),
+            },
+            other => panic!("expected Expr, got {:?}", other),
+        };
+        assert_eq!(construct.0, "Option");
+        assert_eq!(construct.1, "Some");
+        assert_eq!(construct.2.len(), 1);
+        match construct.2[0].1.as_ref() {
+            Expression::Integer(n) => assert_eq!(*n, 42),
+            other => panic!("expected Integer(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_construct_is_a_call_not_a_construct() {
+        // `Some(42)` (no `::`) is parsed as a `Call` — the typechecker
+        // in 15B will redirect `Call` to `Construct` if the name
+        // resolves to a constructor.
+        let ast = expr_ast!("Some(42)");
+        // The recursive expr() rule wraps the result in `Expr`.
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Call { name, args } => {
+                match name.1.as_ref() {
+                    Expression::Identifier(n) => assert_eq!(*n, "Some"),
+                    other => panic!("expected Identifier(\"Some\"), got {:?}", other),
+                }
+                let args = args.expect("Some(42) must have args");
+                assert_eq!(args.len(), 1);
+                match args[0].1.as_ref() {
+                    Expression::Integer(n) => assert_eq!(*n, 42),
+                    other => panic!("expected Integer(42), got {:?}", other),
+                }
+            }
+            other => panic!("expected Call (NOT Construct), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_with_constructor_patterns() {
+        let ast = expr_ast!("match x { Option::None => 0, Option::Some(v) => v }");
+        // The recursive expr() rule wraps the result in `Expr`.
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { scrutinee, arms } => {
+                // Scrutinee is `x` (Identifier, possibly wrapped in
+                // Expr by the recursive expr() rule).
+                match scrutinee.1.as_ref() {
+                    Expression::Identifier(n) => assert_eq!(*n, "x"),
+                    Expression::Expr(e) => match e.1.as_ref() {
+                        Expression::Identifier(n) => assert_eq!(*n, "x"),
+                        other => panic!("expected Identifier(x), got {:?}", other),
+                    },
+                    other => panic!("expected scrutinee to be `x`, got {:?}", other),
+                }
+                assert_eq!(arms.len(), 2);
+
+                // First arm: `Option::None => 0`
+                let MatchArm { pattern, body } = &arms[0];
+                match pattern {
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name,
+                        payload,
+                    } => {
+                        assert_eq!(*enum_name, "Option");
+                        assert_eq!(*variant_name, "None");
+                        assert!(payload.is_empty());
+                    }
+                    other => panic!("expected Constructor(Option::None), got {:?}", other),
+                }
+                match body.1.as_ref() {
+                    Expression::Integer(n) => assert_eq!(*n, 0),
+                    other => panic!("expected Integer(0), got {:?}", other),
+                }
+
+                // Second arm: `Option::Some(v) => v`
+                let MatchArm { pattern, body } = &arms[1];
+                match pattern {
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name,
+                        payload,
+                    } => {
+                        assert_eq!(*enum_name, "Option");
+                        assert_eq!(*variant_name, "Some");
+                        assert_eq!(payload.len(), 1);
+                        match &payload[0] {
+                            Pattern::Binding { name } => assert_eq!(*name, "v"),
+                            other => panic!("expected Binding(v), got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Constructor(Option::Some(v)), got {:?}", other),
+                }
+                match body.1.as_ref() {
+                    Expression::Identifier(n) => assert_eq!(*n, "v"),
+                    other => panic!("expected Identifier(v), got {:?}", other),
+                }
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wildcard_and_default_both_parse_to_wildcard() {
+        // `_` and `default` both parse to the same `Pattern::Wildcard`
+        // node — the literal token is discarded (Decision C).
+        let ast1 = expr_ast!("match x { _ => 0 }");
+        let inner1 = match ast1 {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner1 {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert!(matches!(arms[0].pattern, Pattern::Wildcard));
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+
+        let ast2 = expr_ast!("match x { default => 0 }");
+        let inner2 = match ast2 {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner2 {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert!(matches!(arms[0].pattern, Pattern::Wildcard));
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_constructor_pattern() {
+        let ast = expr_ast!("match x { Option::Some(Option::Some(v)) => v }");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Match { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                match &arms[0].pattern {
+                    Pattern::Constructor {
+                        enum_name,
+                        variant_name,
+                        payload,
+                    } => {
+                        assert_eq!(*enum_name, "Option");
+                        assert_eq!(*variant_name, "Some");
+                        assert_eq!(payload.len(), 1);
+                        // Nested pattern is itself a Constructor.
+                        match &payload[0] {
+                            Pattern::Constructor {
+                                enum_name: inner_enum,
+                                variant_name: inner_variant,
+                                payload: inner_payload,
+                            } => {
+                                assert_eq!(*inner_enum, "Option");
+                                assert_eq!(*inner_variant, "Some");
+                                assert_eq!(inner_payload.len(), 1);
+                                match &inner_payload[0] {
+                                    Pattern::Binding { name } => assert_eq!(*name, "v"),
+                                    other => panic!("expected Binding(v), got {:?}", other),
+                                }
+                            }
+                            other => panic!(
+                                "expected nested Constructor(Option::Some(v)), got {:?}",
+                                other
+                            ),
+                        }
+                    }
+                    other => panic!("expected outer Constructor(Option::Some(...)), got {:?}", other),
+                }
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
     }
 }
