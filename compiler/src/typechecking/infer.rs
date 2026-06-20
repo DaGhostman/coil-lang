@@ -392,7 +392,38 @@ impl Checker {
                 }
                 self.infer(body)
             }
-            Expression::Match(lhs, arms) => self.infer_match(lhs, arms, range),
+            Expression::Match { scrutinee, arms } => {
+                // TODO 15B: rewrite infer_match to walk the arms
+                // with a `current_match_lhs` scope, unify each
+                // pattern's bindings with the scrutinee type, and
+                // unify the body types. For 15A, the stub
+                // recurses into the scrutinee and each arm body
+                // so their IDs stay aligned with the pre-walk and
+                // their types land in the cache.
+                let scrutinee_ty = self.infer(scrutinee);
+                let prev = self.current_match_lhs.replace(scrutinee_ty);
+                let mut result_ty = Ty::Var(self.counter.fresh());
+                let mut first = true;
+                for arm in arms {
+                    let body_ty = self.infer(&arm.body);
+                    if first {
+                        result_ty = body_ty;
+                        first = false;
+                    } else {
+                        self.unify(
+                            &result_ty,
+                            &body_ty,
+                            &arm.body.0.into_range(),
+                            "match arm body",
+                        );
+                    }
+                }
+                self.current_match_lhs = prev;
+                if first {
+                    return self.error("match has no arms".to_string(), range);
+                }
+                result_ty
+            }
             Expression::Loop { iterable, body, .. } => {
                 let it = self.infer(iterable);
                 self.unify(&it, &boolean(), &iterable.0.into_range(), "while condition");
@@ -461,6 +492,24 @@ impl Checker {
             Expression::Update(_, e) => self.infer(e),
             Expression::Instantiate(class_expr, _args) => self.infer(class_expr),
             Expression::Field(_, _, _) => unit_ty(),
+
+            // ---- Phase 15A placeholders (TODO 15B) ----
+            // These keep the workspace building while the
+            // typechecker is extended to understand sum types and
+            // pattern matching. None of them are semantically
+            // correct yet; the compiler's test suite is expected
+            // to fail on enum/match/construct source until 15B
+            // lands. The HM pre-walk still visits the new nodes
+            // (see `id.rs`), so the NodeId cache stays aligned
+            // with the AST shape — these stubs simply don't
+            // recurse into the new children, which means the
+            // pre-walk mints more IDs than infer consumes. That
+            // misalignment is acceptable for 15A and will be
+            // resolved when 15B replaces these arms with real
+            // implementations.
+            Expression::EnumDecl { .. } => Ty::Var(self.counter.fresh()),
+            Expression::EnumVariant { .. } => unit_ty(),
+            Expression::Construct { .. } => Ty::Var(self.counter.fresh()),
 
             // ---- Fallback ----
 //
@@ -593,37 +642,6 @@ impl Checker {
                     self.unify(&result_ty, &body_ty, &body.0.into_range(), "if branch");
                 }
             }
-        }
-        result_ty
-    }
-
-    fn infer_match(
-        &mut self,
-        lhs: &Output,
-        arms: &[(Output, Output)],
-        range: Range<usize>,
-    ) -> Ty {
-        let lhs_ty = self.infer(lhs);
-        let prev = self.current_match_lhs.replace(lhs_ty.clone());
-
-        let mut result_ty = Ty::Var(self.counter.fresh());
-        let mut first = true;
-        for (pat, body) in arms {
-            let pat_ty = self.infer(pat);
-            self.unify(&lhs_ty, &pat_ty, &pat.0.into_range(), "match pattern");
-            let body_ty = self.infer(body);
-            if first {
-                result_ty = body_ty;
-                first = false;
-            } else {
-                self.unify(&result_ty, &body_ty, &body.0.into_range(), "match arm body");
-            }
-        }
-
-        self.current_match_lhs = prev;
-        if first {
-            // No arms: degenerate match; the result type is the LHS.
-            return self.error("match has no arms".to_string(), range);
         }
         result_ty
     }
