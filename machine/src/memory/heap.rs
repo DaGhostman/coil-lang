@@ -183,6 +183,42 @@ impl Heap {
             current = reference.get_next();
         }
     }
+
+    /// Return the head of the heap's intrusive linked list of
+    /// allocated objects. Used by the VM at runtime (Phase 15C)
+    /// to walk the list and look up an [`Object`] by its address
+    /// when reconstructing heap-object metadata from a raw
+    /// pointer on the operand stack. Returns `None` if the heap
+    /// is empty.
+    pub fn head_for_lookup(&self) -> Option<Object> {
+        self.head
+    }
+
+    /// True iff `addr` matches the address of some currently
+    /// allocated object on the heap. Used by the VM at runtime
+    /// (specifically in [`crate::vm::Machine::execute`] for
+    /// [`common::Instruction::MAKE_ENUM`]) to distinguish
+    /// immediate values (ints, floats, bools) from heap pointers
+    /// (strings, instances, enums) on the operand stack. Values
+    /// are stored as `*mut u8` and the runtime doesn't tag them,
+    /// so the only safe test is membership in the heap's
+    /// intrusive linked list.
+    ///
+    /// This is O(n) in the number of live objects. Acceptable
+    /// because `MAKE_ENUM` is only emitted at constructor call
+    /// sites (typically a handful per program), and the heap is
+    /// usually small. A generation table or per-frame pointer map
+    /// would let us do this in O(1) — that's a 15D+ optimisation.
+    pub fn contains_addr(&self, addr: *mut u8) -> bool {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            if reference.addr() as *mut u8 == addr {
+                return true;
+            }
+            current = reference.get_next();
+        }
+        false
+    }
 }
 
 impl Drop for Heap {

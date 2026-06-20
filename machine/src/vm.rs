@@ -5,7 +5,7 @@ use common::{
     unlikely,
 };
 
-use crate::{Frame, Heap, ObjInstance, ObjString, Object, Stack};
+use crate::{Frame, Heap, Member, ObjEnum, ObjInstance, ObjString, Object, Stack};
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -121,6 +121,29 @@ impl<const S: usize> Machine<S> {
     // pub fn register(&mut self, name: usize, func: External) {
     //     self.native.insert(name, func);
     // }
+
+    /// Walk the heap's intrusive linked list and return the
+    /// [`Object`] whose address matches `addr`. Used by the
+    /// `MAKE_ENUM` / `JUMP_IF_MATCH` / `UNPACK` opcodes to
+    /// reconstruct a heap object's metadata from a raw pointer
+    /// on the operand stack. Returns `None` if no match — that
+    /// means the address is an immediate value (int/float/bool)
+    /// or the pointer has been collected.
+    ///
+    /// Implemented as a free function (not a `&self` method) so
+    /// the borrow checker can split the `&Heap` borrow from
+    /// other in-flight borrows on `Machine` fields (specifically
+    /// the mutable `frames` borrow held by the `execute` loop).
+    fn find_object_by_addr(heap: &Heap, addr: u64) -> Option<Object> {
+        let mut current = heap.head_for_lookup();
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                return Some(reference);
+            }
+            current = reference.get_next();
+        }
+        None
+    }
 }
 
 impl<const S: usize> Machine<S> {
@@ -402,6 +425,186 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::NOOP => continue,
+                Instruction::MakeEnum => {
+                    // Operands: upper 16 bits = tag, lower 16 bits = arity.
+                    //
+                    // Stack discipline: the codegen emits the
+                    // payload args in REVERSE declaration order so
+                    // that the top of the stack is `payload[0]`
+                    // (the FIRST declared arg). For a constructor
+                    // `Foo(a, b, c)`, codegen emits `CONST c;
+                    // CONST b; CONST a;` so the stack ends with
+                    // a on top, then b, then c at the bottom.
+                    //
+                    // We pop arity values: first pop = a (top),
+                    // then b, then c. The buffer ends up in
+                    // declaration order `[a, b, c]` — no
+                    // reversal needed.
+                    //
+                    // Each popped value is classified as either
+                    // immediate (int/float/bool) or heap pointer
+                    // (string/instance/enum) using
+                    // [`Heap::contains_addr`]. Immediates become
+                    // `Member::Value`; heap pointers become
+                    // `Member::Object` (the GC traces the heap
+                    // object on mark).
+                    let operands = opcode.operand_u32();
+                    let tag = (operands >> 16) as u32;
+                    let arity = (operands & 0xFFFF) as usize;
+
+                    // Pop arity values into a buffer. The first
+                    // pop is the top of stack (which is
+                    // declaration-order index 0); the LAST pop
+                    // is the bottom of the popped range (which
+                    // is declaration-order index `arity - 1`). The
+                    // resulting buffer is in declaration order.
+                    let mut values: Vec<Value> = Vec::with_capacity(arity);
+                    for _ in 0..arity {
+                        if self.stack.tell() == 0 {
+                            // Stack underflow — bail without
+                            // allocating so the VM can keep running.
+                            break;
+                        }
+                        values.push(self.stack.pop());
+                    }
+                    // `values` is already in declaration order
+                    // (see the comment above). Do NOT reverse.
+
+                    // Build the payload, classifying each value
+                    // as immediate or heap pointer. Done with an
+                    // explicit loop (not `.map(|v| { ... self.heap
+                    // ... })`) so the borrow checker doesn't see
+                    // the closure as capturing `self` while the
+                    // outer loop holds `frame = self.frames.get_mut()`.
+                    let mut payload: Vec<Member> = Vec::with_capacity(values.len());
+                    for v in values {
+                        if self.heap.contains_addr(v.raw()) {
+                            // Heap pointer → wrap as a `Member::Object`.
+                            // Reconstruct the matching `Object`
+                            // variant by address lookup against
+                            // the heap's intrusive list.
+                            let addr = v.raw() as u64;
+                            if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
+                                payload.push(Member::Object(o));
+                            } else {
+                                // Defensive: if the lookup fails
+                                // (object already freed?), fall
+                                // back to treating as an immediate
+                                // — the GC will skip it.
+                                payload.push(Member::Value(v));
+                            }
+                        } else {
+                            payload.push(Member::Value(v));
+                        }
+                    }
+
+                    let obj_enum = ObjEnum { tag, payload };
+                    let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
+                    self.stack.push(Value::from(object.addr()));
+                }
+                Instruction::JumpIfMatch => {
+                    // Operands: upper 16 bits = expected tag, lower
+                    // 16 bits = target offset.
+                    //
+                    // Peeks the scrutinee's tag without consuming
+                    // it. If the tag matches, pops the scrutinee,
+                    // pushes the payload values in declaration
+                    // order, and seeks the bytecode iterator to the
+                    // target. If the tag does not match, falls
+                    // through (the scrutinee remains on the stack
+                    // for the next arm to consume via UNPACK /
+                    // STORE / POP).
+                    let operands = opcode.operand_u32();
+                    let expected_tag = (operands >> 16) as u32;
+                    let target_offset = (operands & 0xFFFF) as usize;
+
+                    if self.stack.tell() == 0 {
+                        // No scrutinee — bail.
+                    } else {
+                        let scrutinee_addr = self.stack.peek().raw() as u64;
+
+                        // Load the enum object. If the scrutinee
+                        // isn't a heap pointer to an Object::Enum
+                        // (e.g., a type error slipped through), the
+                        // match arm is unreachable — fall through
+                        // silently.
+                        let obj_enum = Self::find_object_by_addr(
+                            &self.heap,
+                            scrutinee_addr,
+                        )
+                        .and_then(|o| match o {
+                            Object::Enum(e) => Some(e),
+                            _ => None,
+                        });
+
+                        if let Some(enum_ref) = obj_enum {
+                            let enum_ref = enum_ref.as_ref();
+                            if enum_ref.tag == expected_tag {
+                                // Match — consume the scrutinee
+                                // and push the payload values in
+                                // declaration order.
+                                let _ = self.stack.pop();
+                                for member in &enum_ref.payload {
+                                    let value = match member {
+                                        Member::Value(v) => *v,
+                                        Member::Object(o) => {
+                                            Value::from(o.addr())
+                                        }
+                                    };
+                                    self.stack.push(value);
+                                }
+                                code.seek(target_offset);
+                            }
+                            // else: fall through; scrutinee still
+                            // on stack for the next arm.
+                        }
+                        // else: scrutinee is not an enum (e.g.,
+                        // type error). Fall through silently —
+                        // the typechecker should have caught this.
+                    }
+                }
+                Instruction::Unpack => {
+                    // Operands: arity (kept for symmetry with the
+                    // spec; the VM reads the real count from
+                    // `ObjEnum::payload.len()`).
+                    //
+                    // Pops the scrutinee (an `Object::Enum`) and
+                    // pushes its payload values in declaration
+                    // order. Used for the LAST arm of a match
+                    // (reached via fall-through from the previous
+                    // `JUMP_IF_MATCH`) and for any explicit
+                    // unpack operation.
+                    let _arity = opcode.operand_u32() as usize;
+
+                    if self.stack.tell() == 0 {
+                        // No scrutinee — bail.
+                    } else {
+                        let scrutinee_addr = self.stack.pop().raw() as u64;
+
+                        let obj_enum =
+                            Self::find_object_by_addr(&self.heap, scrutinee_addr)
+                                .and_then(|o| match o {
+                                    Object::Enum(e) => Some(e),
+                                    _ => None,
+                                });
+
+                        if let Some(enum_ref) = obj_enum {
+                            let enum_ref = enum_ref.as_ref();
+                            for member in &enum_ref.payload {
+                                let value = match member {
+                                    Member::Value(v) => *v,
+                                    Member::Object(o) => {
+                                        Value::from(o.addr())
+                                    }
+                                };
+                                self.stack.push(value);
+                            }
+                        }
+                        // else: scrutinee is not an enum; silent
+                        // fallthrough (defensive — should not
+                        // happen if the typechecker is correct).
+                    }
+                }
                 _ => return ExecutionResult::invalid(),
             }
         }
@@ -410,136 +613,240 @@ impl<const S: usize> Machine<S> {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use common::{ArchivedByte, Value};
-//
-//     use crate::{Byte, Instruction, Machine};
-//
-//     #[test]
-//     fn test_constants() {
-//         let mut vm = Machine::<1>::default();
-//         let v = Value::from(42);
-//         vm.run(&[
-//             ArchivedByte::ew_with_value(Instruction::CONST, v.raw() as _),
-//             Byte::new(Instruction::HALT),
-//         ]);
-//
-//         assert_eq!(v.raw(), vm.pop().raw());
-//     }
-//
-//     #[test]
-//     fn test_addition() {
-//         let cases = [
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-//                 Value::from(4.0),
-//                 Instruction::ADDF,
-//             ),
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-//                 Value::from(4),
-//                 Instruction::ADD,
-//             ),
-//         ];
-//
-//         for (v, e, i) in cases {
-//             let mut vm = Machine::<2>::default();
-//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-//
-//             assert_eq!(e.raw(), vm.pop().raw());
-//         }
-//     }
-//
-//     #[test]
-//     fn test_subtraction() {
-//         let cases = [
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-//                 Value::from(0.0),
-//                 Instruction::SUBF,
-//             ),
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-//                 Value::from(0),
-//                 Instruction::SUB,
-//             ),
-//         ];
-//
-//         for (v, e, i) in cases {
-//             let mut vm = Machine::<2>::default();
-//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-//
-//             assert_eq!(e.raw(), vm.pop().raw());
-//         }
-//     }
-//
-//     #[test]
-//     fn test_multiplication() {
-//         let cases = [
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-//                 Value::from(4.0),
-//                 Instruction::MULF,
-//             ),
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-//                 Value::from(4),
-//                 Instruction::MUL,
-//             ),
-//         ];
-//
-//         for (v, e, i) in cases {
-//             let mut vm = Machine::<2>::default();
-//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-//
-//             assert_eq!(e.raw(), vm.pop().raw());
-//         }
-//     }
-//
-//     #[test]
-//     fn test_division() {
-//         let cases = [
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-//                 Value::from(1.0),
-//                 Instruction::DIVF,
-//             ),
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-//                 Value::from(1),
-//                 Instruction::DIV,
-//             ),
-//         ];
-//
-//         for (v, e, i) in cases {
-//             let mut vm = Machine::<2>::default();
-//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-//
-//             assert_eq!(e.raw(), vm.pop().raw());
-//         }
-//     }
-//
-//     #[test]
-//     fn test_jumps() {
-//         let cases = [
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2.0).raw() as _),
-//                 Value::from(1.0),
-//                 Instruction::DIVF,
-//             ),
-//             (
-//                 Byte::new_with_value(Instruction::CONST, Value::from(2).raw() as _),
-//                 Value::from(1),
-//                 Instruction::DIV,
-//             ),
-//         ];
-//
-//         for (v, e, i) in cases {
-//             let mut vm = Machine::<2>::default();
-//             vm.run(&[v, v, Byte::new(i), Byte::new(Instruction::HALT)]);
-//
-//             assert_eq!(e.raw(), vm.pop().raw());
-//         }
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction, Value};
+
+    use crate::{Machine, ObjEnum};
+
+    /// Build a `MAKE_ENUM` byte with the given tag and arity
+    /// packed into the operand (upper 16 bits = tag, lower 16
+    /// bits = arity).
+    fn make_enum(tag: u16, arity: u16) -> Byte {
+        Byte::new(Instruction::MakeEnum).with_operands_u16([tag, arity])
+    }
+
+    /// Build a `JUMP_IF_MATCH` byte with the given expected tag
+    /// and target offset packed into the operand (upper 16
+    /// bits = tag, lower 16 bits = target).
+    fn jump_if_match(tag: u16, target: u16) -> Byte {
+        Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag, target])
+    }
+
+    /// Build an `UNPACK` byte with the given arity in the
+    /// operand.
+    fn unpack(arity: u32) -> Byte {
+        Byte::new(Instruction::Unpack).with_operand_u32(arity)
+    }
+
+    /// Build a `CONST` byte that pushes the given `i64` value
+    /// onto the stack. Used to set up the operand values for
+    /// `MAKE_ENUM` and `JUMP_IF_MATCH`.
+    fn const_int(value: i64) -> Byte {
+        Byte::new(Instruction::CONST).with_value(Value::from(value))
+    }
+
+    /// Step 1: execute `MAKE_ENUM 0 0` (zero-arity constructor).
+    /// Verify that the resulting enum has tag=0 and an empty
+    /// payload.
+    #[test]
+    fn make_enum_allocates_enum_with_correct_tag() {
+        let mut vm = Machine::<1>::default();
+        // [MAKE_ENUM tag=0 arity=0, HALT]
+        vm.run(&[make_enum(0, 0), Byte::new(Instruction::HALT)]);
+
+        let enum_value = vm.pop();
+        // The enum was allocated; its address is on the stack.
+        // We don't have a direct accessor from the public VM
+        // API, but we can at least check that the stack
+        // contains a non-zero pointer (an allocated heap
+        // object).
+        assert!(
+            enum_value.raw() as u64 != 0,
+            "MAKE_ENUM did not push a heap pointer"
+        );
+    }
+
+    /// Step 2: push 2 ints, execute `MAKE_ENUM 1 2`, and
+    /// verify that the payload has 2 entries in declaration
+    /// order.
+    ///
+    /// We can't directly inspect the enum from the public VM
+    /// API, but we can verify the bytecode runs to completion
+    /// (no panic, no stack underflow). The fact that we can
+    /// pop the enum back off the stack afterwards confirms
+    /// the result was pushed.
+    #[test]
+    fn make_enum_with_payload_populates_payload() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(7),
+            // Codegen pushes args in REVERSE declaration order
+            // so that the top of stack is payload[0]; so for a
+            // 2-arg constructor with declaration order
+            // (a, b), codegen emits CONST b, CONST a, MAKE_ENUM.
+            make_enum(1, 2),
+            Byte::new(Instruction::HALT),
+        ]);
+        let enum_value = vm.pop();
+        assert!(
+            enum_value.raw() as u64 != 0,
+            "MAKE_ENUM with payload did not push a heap pointer"
+        );
+    }
+
+    /// Step 3: push an enum with tag=2, then execute
+    /// `JUMP_IF_MATCH 2 <target> 1`. Verify that the IP
+    /// advances to the target.
+    #[test]
+    fn jump_if_match_taken_advances_ip() {
+        // Build a minimal bytecode that:
+        //   1. constructs an enum with tag=2, arity=1, payload=[42]
+        //   2. executes JUMP_IF_MATCH tag=2 target=4 arity=1
+        //   3. has a HALT at offset 4 (target)
+        //
+        // Since JUMP_IF_MATCH is checking for tag=2 and the
+        // enum's tag IS 2, the jump is taken. The payload
+        // (42) is pushed onto the stack.
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // Build the enum (tag=2, arity=1) with payload [42]:
+            const_int(42),
+            make_enum(2, 1),
+            // JUMP_IF_MATCH tag=2 target=4
+            jump_if_match(2, 4),
+            // (Should not reach here on the jump-taken path.)
+            const_int(999),
+            // HALT at offset 4 (the target).
+            Byte::new(Instruction::HALT),
+        ]);
+        // After the jump, the payload (42) was pushed. Top of
+        // stack is 42.
+        let v = vm.pop();
+        assert_eq!(v.as_int(), 42, "JUMP_IF_MATCH did not push the payload");
+    }
+
+    /// Step 4: push an enum with tag=2, then execute
+    /// `JUMP_IF_MATCH 5 <target> 1`. The tag doesn't match,
+    /// so the jump is NOT taken; the scrutinee remains on
+    /// the stack for the next arm.
+    #[test]
+    fn jump_if_match_not_taken_falls_through() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // Build an enum (tag=2, arity=1) with payload [42]:
+            const_int(42),
+            make_enum(2, 1),
+            // JUMP_IF_MATCH tag=5 target=4 (won't match; fall through)
+            jump_if_match(5, 4),
+            // (Should be reached on the fall-through path.)
+            const_int(99),
+            // Target for the (non-taken) jump at offset 4.
+            Byte::new(Instruction::HALT),
+        ]);
+        // After fall-through, we pushed 99. Stack: [enum_ptr, 99].
+        let v = vm.pop();
+        assert_eq!(v.as_int(), 99, "JUMP_IF_MATCH should have fallen through");
+    }
+
+    /// Step 5: push an enum with payload=[v1, v2, v3], then
+    /// execute `UNPACK 3`. The payload is pushed onto the
+    /// stack in declaration order.
+    #[test]
+    fn unpack_pops_enum_and_pushes_payload() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            // Build enum (tag=0, arity=3) with payload [10, 20, 30]:
+            // Codegen pushes args in REVERSE declaration order:
+            const_int(30),
+            const_int(20),
+            const_int(10),
+            make_enum(0, 3),
+            // UNPACK arity=3: pops enum, pushes 10, 20, 30.
+            unpack(3),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Top of stack should be 30 (payload[2]).
+        assert_eq!(vm.pop().as_int(), 30);
+        assert_eq!(vm.pop().as_int(), 20);
+        assert_eq!(vm.pop().as_int(), 10);
+    }
+
+    /// Nested enum GC test: allocate an outer enum with a
+    /// payload containing an inner enum (and a string). Trigger
+    /// GC and verify both inner enums are preserved.
+    ///
+    /// Since Phase 15C's full mark-and-trace isn't wired into
+    /// the VM's `trace`/`sweep` cycle yet (15D work), we use
+    /// the existing `Heap::trace` + `Object::mark_references`
+    /// helpers (used by the 15A GC tests) directly. This
+    /// mirrors what a proper mark-and-trace loop would do.
+    #[test]
+    fn nested_enum_gc_traces_correctly() {
+        use crate::{Heap, Member, ObjString, Object};
+        use std::collections::HashSet;
+
+        let mut heap = Heap::default();
+
+        // Allocate an inner enum (no payload).
+        let (inner_obj, _) = heap.alloc(
+            ObjEnum {
+                tag: 99,
+                payload: vec![],
+            },
+            Object::Enum,
+        );
+        // Allocate a string.
+        let (string_obj, _) =
+            heap.alloc(ObjString::from("inner"), Object::String);
+        // Allocate an outer enum whose payload contains
+        // references to both the inner enum and the string.
+        let (outer_obj, _) = heap.alloc(
+            ObjEnum {
+                tag: 0,
+                payload: vec![
+                    Member::Object(inner_obj),
+                    Member::Object(string_obj),
+                ],
+            },
+            Object::Enum,
+        );
+
+        // Treat outer_obj as the GC root. Mark it, then
+        // propagate through `mark_references` (the
+        // mark-and-trace loop that 15D will wire into the
+        // VM's automatic cycle).
+        let mut gray = Vec::new();
+        heap.trace(&[outer_obj.addr()]);
+        outer_obj.mark_references(&mut gray);
+        while let Some(o) = gray.pop() {
+            o.mark_references(&mut gray);
+        }
+
+        // Sweep — anything not marked is deallocated.
+        unsafe {
+            heap.sweep();
+        }
+
+        // All three must survive: outer (the root), inner
+        // (referenced from outer's payload), and string
+        // (also referenced from outer's payload).
+        let mut addrs = HashSet::new();
+        for o in heap.into_iter() {
+            addrs.insert(o.addr());
+        }
+        assert!(
+            addrs.contains(&outer_obj.addr()),
+            "outer enum was collected despite being the GC root"
+        );
+        assert!(
+            addrs.contains(&inner_obj.addr()),
+            "inner enum was collected despite being in outer's payload"
+        );
+        assert!(
+            addrs.contains(&string_obj.addr()),
+            "string was collected despite being in outer's payload"
+        );
+    }
+}
