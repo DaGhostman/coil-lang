@@ -38,10 +38,11 @@
 //! always returns the type *under the current substitution* (via
 //! [`apply_ty`]); the substitution is never returned explicitly.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use common::{Label, Message};
-use parser::ast::{Expression, Output, Visibility};
+use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
 
 use super::env::{instantiate, Env, TyVarCounter};
 use super::id::{self, IdTable, NodeId};
@@ -94,6 +95,69 @@ pub struct Checker {
     /// [`infer`](Self::infer) processes each node; consulted by the
     /// bytecode emitter (Phase 9) via [`lookup_at`](Self::lookup_at).
     cache: std::collections::HashMap<NodeId, Ty>,
+
+    // ---- Sum-type tables (Phase 15B) ----
+    //
+    // We keep four parallel data structures for sum types. The `Vec`
+    // fields hold the source-declaration order (insertion order); the
+    // `BTreeMap` fields index by variant name for lookup. Tag values
+    // are assigned by the position in the `Vec`, NOT alphabetically —
+    // a `BTreeMap`-only representation would silently miscompile
+    // (see `MUST-HAVE #2` in the Phase 15B plan).
+    /// enum name → list of variant names in source-declaration order.
+    enums: BTreeMap<String, Vec<String>>,
+    /// enum name → (variant name → tag index).
+    enum_tags: BTreeMap<String, BTreeMap<String, u32>>,
+    /// enum name → per-variant payload type list (in source order).
+    /// Each entry is the list of types the variant takes; the outer
+    /// index matches the tag.
+    enum_payloads: BTreeMap<String, Vec<Vec<Ty>>>,
+    /// enum name → per-variant arity (in source order). Cached here
+    /// so the codegen layer (15C) doesn't have to redo the
+    /// `payloads[i].len()` lookup at every constructor site.
+    enum_arities: BTreeMap<String, Vec<usize>>,
+
+    /// Deferred exhaustiveness checks. Each entry is a match site
+    /// that should be verified AFTER the main inference pass — that
+    /// way the substitution is closed and the scrutinee's final type
+    /// is observable (free type variables at the match site can
+    /// otherwise hide the resolved sum type).
+    pending_exhaustive: Vec<PendingExhaustive>,
+}
+
+/// One pending exhaustiveness check, recorded at the match site and
+/// run in [`Checker::run_pending_exhaustiveness`].
+///
+/// `scrutinee_ty` is captured at the time the match is processed;
+/// the post-pass resolves it under the final substitution.
+#[derive(Debug, Clone)]
+struct PendingExhaustive {
+    /// Resolved scrutinee type at the time of the match. The
+    /// post-pass re-applies the current substitution so any
+    /// variables bound since the match site are visible.
+    scrutinee_ty: Ty,
+    /// The arms, in order. Each entry says which tag (if any) this
+    /// arm covers, the arm's source range, and whether the arm is
+    /// a wildcard / binding (which covers all remaining cases).
+    arms: Vec<ArmCoverage>,
+    /// Source range of the `match` keyword — used for the
+    /// non-exhaustive diagnostic.
+    match_range: Range<usize>,
+}
+
+/// Per-arm coverage info, captured at the match site.
+#[derive(Debug, Clone)]
+struct ArmCoverage {
+    /// The variant tag this arm covers, if it was a constructor
+    /// pattern. `None` for wildcards, bindings, and irrefutable
+    /// catches.
+    tag: Option<u32>,
+    /// True if the arm was a wildcard (`_`) or a binding (`name`).
+    /// Such arms cover all remaining cases (Rust-style).
+    is_catchall: bool,
+    /// The arm's source range — used for the "unreachable arm"
+    /// diagnostic.
+    range: Range<usize>,
 }
 
 impl Default for Checker {
@@ -122,6 +186,11 @@ impl Checker {
             ids: IdTable::new(),
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
+            enums: BTreeMap::new(),
+            enum_tags: BTreeMap::new(),
+            enum_payloads: BTreeMap::new(),
+            enum_arities: BTreeMap::new(),
+            pending_exhaustive: Vec::new(),
         }
     }
 
@@ -134,17 +203,44 @@ impl Checker {
     /// [`env_mut`](Self::env_mut) and [`Env::pop`] if you need to drop
     /// it.
     pub fn check_program(&mut self, ast: &Output) -> Ty {
-        // Mint NodeIds for every AST node (pre-walk). The visit order
-        // matches `infer`'s recursion, so the IDs line up.
+        // Reset per-program state. The pre-pass, the main infer
+        // pass, and the post-pass all share the same checker; only
+        // the per-program tables and caches get cleared.
         self.ids = IdTable::new();
         self.next_id_idx = 0;
+        self.cache.clear();
+        self.enums.clear();
+        self.enum_tags.clear();
+        self.enum_payloads.clear();
+        self.enum_arities.clear();
+        self.pending_exhaustive.clear();
+
+        // Mint NodeIds for every AST node (pre-walk). The visit order
+        // matches `infer`'s recursion, so the IDs line up.
         id::pre_walk(ast, &mut self.ids);
+
+        // Forward-declaration pre-pass: walk the AST once and
+        // register every `enum` declaration's shape. This must run
+        // before the main infer pass so constructor / match uses
+        // that appear textually before their enum declaration still
+        // resolve correctly.
+        if let Err(msgs) = self.pre_register_enums(ast) {
+            self.messages.extend(msgs);
+        }
 
         // Top frame so natives and globals have a place to bind (Phase 7).
         // The frame is left on the stack so callers (and tests) can
         // inspect declared bindings via [`env`](Self::env).
         self.env.push();
         let ty = self.infer(ast);
+        // NOTE: the frame is intentionally NOT popped — see the
+        // doc-comment above.
+
+        // Post-pass: run deferred exhaustiveness checks now that
+        // the substitution is closed and every scrutinee type can
+        // be fully resolved.
+        self.run_pending_exhaustiveness();
+
         // Return the fully-resolved type so callers see e.g. `Foo`
         // rather than `Var(0)` even when the type was inferred
         // through let-binding + unify.
@@ -393,36 +489,7 @@ impl Checker {
                 self.infer(body)
             }
             Expression::Match { scrutinee, arms } => {
-                // TODO 15B: rewrite infer_match to walk the arms
-                // with a `current_match_lhs` scope, unify each
-                // pattern's bindings with the scrutinee type, and
-                // unify the body types. For 15A, the stub
-                // recurses into the scrutinee and each arm body
-                // so their IDs stay aligned with the pre-walk and
-                // their types land in the cache.
-                let scrutinee_ty = self.infer(scrutinee);
-                let prev = self.current_match_lhs.replace(scrutinee_ty);
-                let mut result_ty = Ty::Var(self.counter.fresh());
-                let mut first = true;
-                for arm in arms {
-                    let body_ty = self.infer(&arm.body);
-                    if first {
-                        result_ty = body_ty;
-                        first = false;
-                    } else {
-                        self.unify(
-                            &result_ty,
-                            &body_ty,
-                            &arm.body.0.into_range(),
-                            "match arm body",
-                        );
-                    }
-                }
-                self.current_match_lhs = prev;
-                if first {
-                    return self.error("match has no arms".to_string(), range);
-                }
-                result_ty
+                self.infer_match(scrutinee, arms, range)
             }
             Expression::Loop { iterable, body, .. } => {
                 let it = self.infer(iterable);
@@ -441,14 +508,12 @@ impl Checker {
             }
 
             // ---- I/O ----
-            Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
-                let fmt_ty = self.infer(fmt);
-                self.unify(&fmt_ty, &string(), &fmt.0.into_range(), "print format");
-                if let Some(p) = params {
-                    for param in p {
-                        let _ = self.infer(param);
-                    }
-                }
+            Expression::Print(fmt, params) => {
+                self.infer_print(fmt, params, range, "print");
+                unit_ty()
+            }
+            Expression::Format(fmt, params) => {
+                self.infer_print(fmt, params, range, "format");
                 unit_ty()
             }
 
@@ -499,17 +564,36 @@ impl Checker {
             // pattern matching. None of them are semantically
             // correct yet; the compiler's test suite is expected
             // to fail on enum/match/construct source until 15B
-            // lands. The HM pre-walk still visits the new nodes
-            // (see `id.rs`), so the NodeId cache stays aligned
-            // with the AST shape — these stubs simply don't
-            // recurse into the new children, which means the
-            // pre-walk mints more IDs than infer consumes. That
-            // misalignment is acceptable for 15A and will be
-            // resolved when 15B replaces these arms with real
-            // implementations.
-            Expression::EnumDecl { .. } => Ty::Var(self.counter.fresh()),
-            Expression::EnumVariant { .. } => unit_ty(),
-            Expression::Construct { .. } => Ty::Var(self.counter.fresh()),
+            // lands. The HM pre-walk visits the new nodes (see
+            // `id.rs`) and mints a `NodeId` for every child, so
+            // these stubs recurse into their children (consuming
+            // those IDs to stay lockstep with the pre-walk) but
+            // discard the inferred types — the return value is
+            // just a placeholder until 15B replaces these arms
+            // with real implementations.
+            Expression::EnumDecl { name, variants } => {
+                // The pre-pass collected the variant names and
+                // arities (for collision checks). The main pass
+                // builds the actual `Ty::Sum` from the AST's
+                // payload types and registers everything with the
+                // env.
+                self.infer_enum_decl(name, variants, &range);
+                unit_ty()
+            }
+            Expression::EnumVariant { payload, .. } => {
+                // The pre-walk mints an ID for every payload
+                // element. Recurse so this arm's ID consumption
+                // stays in lockstep. The actual payload parsing
+                // happens in `infer_enum_decl`, which knows the
+                // parent variant name and target arity.
+                for p in payload {
+                    let _ = self.infer(p);
+                }
+                unit_ty()
+            }
+            Expression::Construct { enum_name, variant_name, args } => {
+                self.infer_construct(enum_name, variant_name, args, range)
+            }
 
             // ---- Fallback ----
 //
@@ -1010,6 +1094,992 @@ impl Checker {
             }
         }
         out
+    }
+
+    // ============================================================
+    //  Sum types and pattern matching (Phase 15B)
+    // ============================================================
+
+    /// Forward-declaration pre-pass: walk the AST once and reserve
+    /// every `enum` declaration's name, variants, and arities. This
+    /// runs before the main infer pass so that constructor / match
+    /// uses that appear textually before their enum declaration
+    /// still resolve correctly.
+    ///
+    /// Returns `Err(messages)` if any duplicate or invalid
+    /// declaration is found; on `Err` the checker still has the
+    /// pre-pass's tables partially populated (caller decides whether
+    /// to continue). The main pass is robust to a missing entry —
+    /// it just leaves the offending node without a registered
+    /// type.
+    fn pre_register_enums(&mut self, ast: &Output) -> Result<(), Vec<Message>> {
+        let mut errors = Vec::new();
+        self.pre_register_enums_walk(ast, &mut errors);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Recursive walker for the pre-pass. Mirrors the structure of
+    /// `id::pre_walk_children` but only does work on `EnumDecl`
+    /// nodes — everything else is structural recursion. Does NOT
+    /// call `self.infer` (and so does not consume IDs from the
+    /// pre-walk table).
+    fn pre_register_enums_walk(&mut self, node: &Output, errors: &mut Vec<Message>) {
+        match node.1.as_ref() {
+            Expression::EnumDecl { name, variants } => {
+                let name_str = name.to_string();
+                let mut variant_names = Vec::new();
+                let mut arities = Vec::new();
+                let mut payloads: Vec<Vec<Ty>> = Vec::new();
+
+                for v in variants {
+                    if let Expression::EnumVariant {
+                        name: vname,
+                        payload,
+                    } = v.1.as_ref()
+                    {
+                        variant_names.push(vname.to_string());
+                        arities.push(payload.len());
+                        // Parse the actual payload types from
+                        // `Expression::Type(name)` AST nodes. We
+                        // use the same `parse_type_name_str` as
+                        // the main pass so the pre-pass's
+                        // `enum_payloads` table holds real types
+                        // that the main pass can use directly
+                        // (no placeholder substitution needed).
+                        let mut variant_payloads = Vec::new();
+                        for p in payload {
+                            if let Expression::Type(tname) = p.1.as_ref() {
+                                variant_payloads.push(self.parse_type_name_str(tname));
+                            } else {
+                                // Defensive — parser should
+                                // produce Type nodes for the
+                                // payload. Fall back to a
+                                // fresh var so the main pass
+                                // can re-derive the type.
+                                variant_payloads.push(Ty::Var(self.counter.fresh()));
+                            }
+                        }
+                        payloads.push(variant_payloads);
+                    }
+                }
+
+                // Check 1: duplicate enum name.
+                if self.enums.contains_key(&name_str) {
+                    let mut msg = Message::error(
+                        format!("Duplicate enum `{}`", name_str),
+                        node.0.into_range(),
+                    );
+                    msg.with_help(format!(
+                        "an enum named `{}` was already declared; remove or rename this declaration",
+                        name_str
+                    ));
+                    errors.push(msg);
+                    return;
+                }
+
+                // Check 2: variant name collides with a previously
+                // registered enum's variant name (cross-enum).
+                for vn in &variant_names {
+                    let taken = self.enum_tags.values().any(|tags| tags.contains_key(vn));
+                    if taken {
+                        let mut msg = Message::error(
+                            format!(
+                                "Duplicate constructor `{}` (also declared by another enum)",
+                                vn
+                            ),
+                            node.0.into_range(),
+                        );
+                        msg.with_help(
+                            "constructor names must be unique across all enums".to_string(),
+                        );
+                        errors.push(msg);
+                        return;
+                    }
+                }
+
+                // Check 3: variant name shadows a built-in
+                // (currently no such checks — natives are registered
+                // with full names like `print` and don't share the
+                // `::` namespace. Reserved for future use.)
+
+                // Reserve. We use `BTreeMap` for tags (lookups are
+                // by variant name, not order). The `Vec` for
+                // variant order is the canonical declaration order.
+                let mut tag_map = BTreeMap::new();
+                for (i, vn) in variant_names.iter().enumerate() {
+                    tag_map.insert(vn.clone(), i as u32);
+                }
+
+                self.enums.insert(name_str.clone(), variant_names);
+                self.enum_tags.insert(name_str.clone(), tag_map);
+                self.enum_payloads.insert(name_str.clone(), payloads);
+                self.enum_arities.insert(name_str.clone(), arities);
+            }
+
+            // Recurse into the same children that `id::pre_walk` would
+            // visit. We mirror the structure of `pre_walk_children`
+            // but only need to find nested EnumDecls — most
+            // branches can just walk their expression children.
+            Expression::Noop(_)
+            | Expression::Comment(_)
+            | Expression::Integer(_)
+            | Expression::Float(_)
+            | Expression::String(_)
+            | Expression::Bool(_)
+            | Expression::Identifier(_)
+            | Expression::Type(_)
+            | Expression::Default(_)
+            | Expression::Use { .. }
+            | Expression::Module(_, _)
+            | Expression::Variable(_, _)
+            | Expression::Constant(_, _)
+            | Expression::Argument(_, _)
+            | Expression::Field(_, _, _) => {}
+
+            Expression::Expr(e)
+            | Expression::Group(e)
+            | Expression::Statement(e)
+            | Expression::ExprStatement(e)
+            | Expression::Return(e)
+            | Expression::ImplicitReturn(e)
+            | Expression::Yield(e)
+            | Expression::Negate(e)
+            | Expression::Not(e)
+            | Expression::Positive(e)
+            | Expression::Inc(e)
+            | Expression::Dec(e)
+            | Expression::Defer(e)
+            | Expression::Member(e)
+            | Expression::Update(_, e) => {
+                self.pre_register_enums_walk(e, errors);
+            }
+
+            Expression::Assignment(name, value) => {
+                self.pre_register_enums_walk(name, errors);
+                self.pre_register_enums_walk(value, errors);
+            }
+
+            Expression::Add(l, r)
+            | Expression::Sub(l, r)
+            | Expression::Mul(l, r)
+            | Expression::Div(l, r)
+            | Expression::Mod(l, r)
+            | Expression::Pow(l, r)
+            | Expression::Shl(l, r)
+            | Expression::Shr(l, r)
+            | Expression::Xor(l, r)
+            | Expression::And(l, r)
+            | Expression::Or(l, r)
+            | Expression::BitAnd(l, r)
+            | Expression::BitOr(l, r)
+            | Expression::Eq(l, r)
+            | Expression::Neq(l, r)
+            | Expression::Le(l, r)
+            | Expression::Gt(l, r)
+            | Expression::Leq(l, r)
+            | Expression::Geq(l, r) => {
+                self.pre_register_enums_walk(l, errors);
+                self.pre_register_enums_walk(r, errors);
+            }
+
+            Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
+                self.pre_register_enums_walk(fmt, errors);
+                if let Some(p) = params {
+                    for param in p {
+                        self.pre_register_enums_walk(param, errors);
+                    }
+                }
+            }
+
+            Expression::Resume(target, arg) => {
+                self.pre_register_enums_walk(target, errors);
+                if let Some(a) = arg {
+                    self.pre_register_enums_walk(a, errors);
+                }
+            }
+
+            Expression::Block(cs)
+            | Expression::Program(cs)
+            | Expression::Fragment(cs)
+            | Expression::List(cs) => {
+                for c in cs {
+                    self.pre_register_enums_walk(c, errors);
+                }
+            }
+            Expression::If(branches) => {
+                for b in branches {
+                    self.pre_register_enums_walk(b, errors);
+                }
+            }
+            Expression::Implementation(_, _, methods) => {
+                for m in methods {
+                    self.pre_register_enums_walk(m, errors);
+                }
+            }
+            Expression::Class(_, fields) => {
+                for f in fields {
+                    self.pre_register_enums_walk(f, errors);
+                }
+            }
+
+            Expression::Function { args, body, .. } => {
+                self.pre_register_enums_walk(args, errors);
+                self.pre_register_enums_walk(body, errors);
+            }
+
+            Expression::Branch(cond, body) => {
+                if let Some(c) = cond {
+                    self.pre_register_enums_walk(c, errors);
+                }
+                self.pre_register_enums_walk(body, errors);
+            }
+
+            Expression::Call { name, args } => {
+                self.pre_register_enums_walk(name, errors);
+                if let Some(a) = args {
+                    for arg in a {
+                        self.pre_register_enums_walk(arg, errors);
+                    }
+                }
+            }
+
+            Expression::Loop {
+                iterable,
+                body,
+                identifier,
+            } => {
+                self.pre_register_enums_walk(iterable, errors);
+                self.pre_register_enums_walk(body, errors);
+                if let Some(i) = identifier {
+                    self.pre_register_enums_walk(i, errors);
+                }
+            }
+
+            Expression::Match { scrutinee, arms } => {
+                self.pre_register_enums_walk(scrutinee, errors);
+                for arm in arms {
+                    // Patterns are not expressions — no recursion
+                    // into the pattern body. (Constructor patterns
+                    // contain only nested patterns.)
+                    self.pre_register_enums_walk(&arm.body, errors);
+                }
+            }
+
+            // The `EnumDecl` arm above handles every EnumDecl in
+            // the tree; no second arm is needed here. `EnumVariant`
+            // and `Construct` are still reachable (e.g. inside a
+            // function body) and just recurse.
+            Expression::EnumVariant { payload, .. } => {
+                for p in payload {
+                    self.pre_register_enums_walk(p, errors);
+                }
+            }
+            Expression::Construct { args, .. } => {
+                for arg in args {
+                    self.pre_register_enums_walk(arg, errors);
+                }
+            }
+
+            Expression::Method(_, body) => {
+                self.pre_register_enums_walk(body, errors);
+            }
+            Expression::Access(receiver, _) => {
+                self.pre_register_enums_walk(receiver, errors);
+            }
+            Expression::Instantiate(class, args) => {
+                self.pre_register_enums_walk(class, errors);
+                if let Some(a) = args {
+                    for arg in a {
+                        self.pre_register_enums_walk(arg, errors);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build a fully-formed `Ty::Sum` from an enum declaration's
+    /// AST. The pre-pass already collected the variant names,
+    /// arities, and concrete payload types — this method walks
+    /// the AST's payload children to keep ID consumption in
+    /// lockstep with the pre-walk, builds the `Ty::Sum`, and
+    /// registers the enum and each variant in the env.
+    fn infer_enum_decl(
+        &mut self,
+        name: &str,
+        variants: &[Output],
+        _range: &Range<usize>,
+    ) {
+        let name_str = name.to_string();
+        // Look up the pre-reserved shape. If missing, the
+        // pre-pass rejected this enum (duplicate / collision);
+        // the caller has already pushed a diagnostic. Just walk
+        // the children to keep IDs aligned.
+        let pre_shape = match self.enums.get(&name_str).cloned() {
+            Some(v) => v,
+            None => {
+                for v in variants {
+                    let _ = self.infer(v);
+                }
+                return;
+            }
+        };
+        let pre_payloads = match self.enum_payloads.get(&name_str).cloned() {
+            Some(p) => p,
+            None => {
+                for v in variants {
+                    let _ = self.infer(v);
+                }
+                return;
+            }
+        };
+
+        // Walk each variant. We must recurse into the payload
+        // children to keep ID consumption aligned with the
+        // pre-walk (which minted an ID for each `Expression::Type`
+        // inside the variant). The pre-pass has already parsed
+        // the payload types; the recursion is purely for
+        // ID-alignment.
+        let mut built_variants: Vec<(String, Vec<Ty>)> = Vec::new();
+        for (i, v) in variants.iter().enumerate() {
+            if let Expression::EnumVariant {
+                name: vname,
+                payload,
+            } = v.1.as_ref()
+            {
+                let vname_str = vname.to_string();
+                let pre_pay = pre_payloads
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| (0..payload.len()).map(|_| Ty::Con("?".into())).collect());
+
+                // Sanity: name + arity should match the pre-pass
+                // shape. If not, the pre-pass has already
+                // complained — fall back to safe defaults.
+                if pre_shape.get(i) != Some(&vname_str)
+                    || pre_pay.len() != payload.len()
+                {
+                    for p in payload {
+                        let _ = self.infer(p);
+                    }
+                    continue;
+                }
+                // Recurse into the payload so ID consumption
+                // stays aligned.
+                for p in payload {
+                    let _ = self.infer(p);
+                }
+                built_variants.push((vname_str, pre_pay));
+            }
+        }
+
+        // Build the Ty::Sum.
+        let sum_ty = Ty::Sum {
+            name: name_str.clone(),
+            variants: built_variants.clone(),
+        };
+
+        // Register the enum itself as a type.
+        self.env.insert_top(
+            name_str.clone(),
+            Scheme::mono(Ty::Con(name_str.clone())),
+        );
+
+        // Register each variant as a callable in the env. Use the
+        // qualified name `EnumName::VariantName` as the binding
+        // key — `Construct` looks up by qualified name in this
+        // map.
+        for (i, (vname, payload_tys)) in built_variants.iter().enumerate() {
+            let arity = payload_tys.len();
+            let ctor_ty = Ty::Constructor {
+                owner: Box::new(sum_ty.clone()),
+                tag: i as u32,
+                arity,
+            };
+            let scheme = if arity == 0 {
+                Scheme::mono(ctor_ty)
+            } else {
+                // Curried: arg1 -> arg2 -> ... -> Constructor.
+                let mut fun_ty = ctor_ty;
+                for arg_ty in payload_tys.iter().rev() {
+                    fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+                }
+                Scheme::mono(fun_ty)
+            };
+            let qualified = format!("{}::{}", name_str, vname);
+            self.env.insert_top(qualified, scheme);
+        }
+    }
+
+    /// Type-check a constructor application: `EnumName::Variant(args)`.
+    fn infer_construct(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+        args: &[Output],
+        range: Range<usize>,
+    ) -> Ty {
+        let enum_str = enum_name.to_string();
+        let variant_str = variant_name.to_string();
+
+        // Look up the enum. Error if not registered.
+        let tags = match self.enum_tags.get(&enum_str) {
+            Some(t) => t.clone(),
+            None => {
+                return self.error(
+                    format!("Cannot find enum `{}` in this scope", enum_str),
+                    range,
+                );
+            }
+        };
+
+        // Look up the variant tag.
+        let tag = match tags.get(&variant_str) {
+            Some(t) => *t,
+            None => {
+                return self.error(
+                    format!(
+                        "Cannot find variant `{}` on enum `{}`",
+                        variant_str, enum_str
+                    ),
+                    range,
+                );
+            }
+        };
+
+        let arity = self
+            .enum_arities
+            .get(&enum_str)
+            .and_then(|a| a.get(tag as usize).copied())
+            .unwrap_or(0);
+        let expected_payloads = self
+            .enum_payloads
+            .get(&enum_str)
+            .and_then(|p| p.get(tag as usize).cloned())
+            .unwrap_or_default();
+
+        // Arity check.
+        if args.len() != arity {
+            return self.error(
+                format!(
+                    "Constructor `{}::{}` expects {} arguments, got {}",
+                    enum_str,
+                    variant_str,
+                    arity,
+                    args.len()
+                ),
+                range,
+            );
+        }
+
+        // Infer each arg and unify with the expected payload type.
+        for (arg, expected) in args.iter().zip(expected_payloads.iter()) {
+            let arg_ty = self.infer(arg);
+            self.unify(
+                expected,
+                &arg_ty,
+                &arg.0.into_range(),
+                &format!("constructor `{}::{}` argument", enum_str, variant_str),
+            );
+        }
+
+        // Build the result. The owner is the full `Ty::Sum` so
+        // later unifications (in match patterns) can compare tag
+        // and arity directly.
+        let sum_ty = Ty::Sum {
+            name: enum_str.clone(),
+            variants: self
+                .enum_payloads
+                .get(&enum_str)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .zip(self.enums.get(&enum_str).cloned().unwrap_or_default())
+                .map(|(p, n)| (n, p))
+                .collect(),
+        };
+
+        Ty::Constructor {
+            owner: Box::new(sum_ty),
+            tag,
+            arity,
+        }
+    }
+
+    /// Match an expression against a list of pattern arms.
+    ///
+    /// 1. Infer the scrutinee's type.
+    /// 2. Walk each arm:
+    ///    a. Type the pattern (binding variables in a fresh env
+    ///       frame so they don't leak across arms).
+    ///    b. Unify the pattern type with the scrutinee type.
+    ///    c. Infer the body and unify it with the result type.
+    /// 3. Record coverage info for the deferred exhaustiveness
+    ///    check.
+    fn infer_match(
+        &mut self,
+        scrutinee: &Output,
+        arms: &[MatchArm],
+        range: Range<usize>,
+    ) -> Ty {
+        let scrutinee_ty = self.infer(scrutinee);
+        let resolved_scrutinee = apply_ty_prune(&self.subst, &scrutinee_ty);
+
+        // Set up current_match_lhs for `Expression::Default`
+        // (which Decision C preserves but is unreachable in real
+        // source — wildcard patterns never reach it).
+        let prev = self.current_match_lhs.replace(scrutinee_ty.clone());
+
+        let mut result_ty = Ty::Var(self.counter.fresh());
+        let mut first = true;
+        let mut coverage: Vec<ArmCoverage> = Vec::with_capacity(arms.len());
+
+        if arms.is_empty() {
+            self.current_match_lhs = prev;
+            return self.error("match has no arms".to_string(), range);
+        }
+
+        for arm in arms {
+            // Step 1: each arm gets a fresh env frame so the
+            // pattern's bindings don't leak.
+            self.env.push();
+
+            // Step 2: type the pattern, binding variables.
+            let pat_ty = self.infer_pattern(&arm.pattern, &resolved_scrutinee);
+
+            // Step 3: unify pattern type with scrutinee.
+            self.unify(
+                &resolved_scrutinee,
+                &pat_ty,
+                &arm.body.0.into_range(),
+                "match pattern against scrutinee",
+            );
+
+            // Step 4: capture coverage info.
+            let arm_cov = self.arm_coverage(&arm.pattern, &arm.body.0.into_range());
+            coverage.push(arm_cov);
+
+            // Step 5: infer body, unify with result.
+            let body_ty = self.infer(&arm.body);
+            if first {
+                result_ty = body_ty;
+                first = false;
+            } else {
+                self.unify(
+                    &result_ty,
+                    &body_ty,
+                    &arm.body.0.into_range(),
+                    "match arm body",
+                );
+            }
+
+            // Step 6: pop the per-arm env frame.
+            self.env.pop();
+        }
+
+        self.current_match_lhs = prev;
+
+        // Record for the post-pass exhaustiveness check. The
+        // scrutinee type stored here is the resolved (pruned)
+        // version at the time of the match; the post-pass will
+        // re-apply the current substitution to handle any
+        // variables bound by intervening code.
+        self.pending_exhaustive.push(PendingExhaustive {
+            scrutinee_ty: resolved_scrutinee,
+            arms: coverage,
+            match_range: range,
+        });
+
+        result_ty
+    }
+
+    /// Type-check a pattern against an expected type, binding
+    /// variables into the current env frame. Returns the pattern's
+    /// type, which is the **expected** type (the sum type, not
+    /// the constructor type) — patterns desugar the scrutinee, so
+    /// the pattern's type IS the scrutinee's type. The tag
+    /// matching (which determines whether the arm is reachable) is
+    /// captured separately in [`ArmCoverage`].
+    fn infer_pattern(&mut self, pattern: &Pattern, expected_ty: &Ty) -> Ty {
+        match pattern {
+            Pattern::Wildcard => {
+                // Wildcard matches anything, binds nothing. The
+                // body's bindings (if any) come from nested
+                // patterns; wildcard itself has no payload.
+                expected_ty.clone()
+            }
+            Pattern::Binding { name } => {
+                // `name => body` binds `name` to the scrutinee in
+                // the arm's env. This makes the arm cover every
+                // case (Rust semantics).
+                self.env
+                    .insert_top(name.to_string(), Scheme::mono(expected_ty.clone()));
+                expected_ty.clone()
+            }
+            Pattern::Constructor {
+                enum_name,
+                variant_name,
+                payload,
+            } => {
+                // 1. Look up the variant's tag in the registry.
+                let enum_str = enum_name.to_string();
+                let variant_str = variant_name.to_string();
+                let tag_opt = self
+                    .enum_tags
+                    .get(&enum_str)
+                    .and_then(|t| t.get(&variant_str).copied());
+                let tag = match tag_opt {
+                    Some(t) => t,
+                    None => {
+                        // Unknown constructor in a pattern is an
+                        // error. Record the error and return the
+                        // expected type so the arm body is still
+                        // processed.
+                        let range = expected_ty_span_range(expected_ty);
+                        self.messages.push(Message::error(
+                            format!(
+                                "Pattern references unknown constructor `{}::{}`",
+                                enum_str, variant_str
+                            ),
+                            range,
+                        ));
+                        return expected_ty.clone();
+                    }
+                };
+                let arity = self
+                    .enum_arities
+                    .get(&enum_str)
+                    .and_then(|a| a.get(tag as usize).copied())
+                    .unwrap_or(0);
+                let expected_payloads = self
+                    .enum_payloads
+                    .get(&enum_str)
+                    .and_then(|p| p.get(tag as usize).cloned())
+                    .unwrap_or_default();
+
+                // 2. Arity check on sub-patterns.
+                if payload.len() != arity {
+                    let range = expected_ty_span_range(expected_ty);
+                    return self.error_with_help(
+                        format!(
+                            "Constructor pattern `{}::{}` expects {} sub-patterns, got {}",
+                            enum_str,
+                            variant_str,
+                            arity,
+                            payload.len()
+                        ),
+                        range,
+                        Some("check the variant's declared payload arity".to_string()),
+                    );
+                }
+
+                // 3. Recurse into each sub-pattern with the
+                // corresponding payload type. The payload type
+                // comes from the pre-pass's `enum_payloads`
+                // (already resolved, e.g. `int` for
+                // `Option::Some(int)`).
+                for (sub_pat, payload_ty) in payload.iter().zip(expected_payloads.iter()) {
+                    let _ = self.infer_pattern(sub_pat, payload_ty);
+                }
+
+                // 4. The pattern's type is the *expected* type —
+                // patterns desugar the scrutinee, so the pattern
+                // returns whatever the scrutinee had. (If the
+                // scrutinee was a Ty::Constructor for a specific
+                // tag, the pattern is still of that same type;
+                // exhaustiveness checking will report the
+                // arm as unreachable.)
+                expected_ty.clone()
+            }
+        }
+    }
+
+    /// Capture per-arm coverage info for the deferred
+    /// exhaustiveness check.
+    fn arm_coverage(&self, pattern: &Pattern, range: &Range<usize>) -> ArmCoverage {
+        match pattern {
+            Pattern::Wildcard => ArmCoverage {
+                tag: None,
+                is_catchall: true,
+                range: range.clone(),
+            },
+            Pattern::Binding { .. } => ArmCoverage {
+                tag: None,
+                is_catchall: true,
+                range: range.clone(),
+            },
+            Pattern::Constructor {
+                enum_name,
+                variant_name,
+                ..
+            } => {
+                let tag = self
+                    .enum_tags
+                    .get(enum_name.to_string().as_str())
+                    .and_then(|t| t.get(variant_name.to_string().as_str()).copied());
+                ArmCoverage {
+                    tag,
+                    is_catchall: false,
+                    range: range.clone(),
+                }
+            }
+        }
+    }
+
+    /// Post-pass: run every deferred exhaustiveness check. By this
+    /// point the substitution is closed, so the scrutinee type is
+    /// fully resolved (any free type variables that were bound
+    /// since the match site are visible here).
+    fn run_pending_exhaustiveness(&mut self) {
+        // Drain into a local so we can release the borrow on
+        // `self` before mutating `self.messages`.
+        let pending: Vec<PendingExhaustive> = std::mem::take(&mut self.pending_exhaustive);
+        for p in &pending {
+            self.check_exhaustiveness(p);
+        }
+    }
+
+    /// Verify a single match site. Records diagnostics but does
+    /// not abort — error recovery continues.
+    fn check_exhaustiveness(&mut self, pending: &PendingExhaustive) {
+        // Re-resolve the scrutinee under the current substitution
+        // so any variables bound between the match site and the
+        // post-pass are visible.
+        let resolved = apply_ty_prune(&self.subst, &pending.scrutinee_ty);
+
+        // Track which tags have been seen and whether a
+        // catch-all (wildcard / binding) is present. A catch-all
+        // suppresses the non-exhaustive error (Rust semantics).
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut has_catchall = false;
+        for arm in &pending.arms {
+            if arm.is_catchall {
+                has_catchall = true;
+            } else if let Some(t) = arm.tag {
+                if !seen.insert(t) {
+                    // Duplicate tag — this arm is unreachable.
+                    self.messages.push(Message::error(
+                        "Unreachable arm: this pattern is matched by an earlier arm".to_string(),
+                        arm.range.clone(),
+                    ));
+                }
+            }
+        }
+
+        if has_catchall {
+            // A wildcard / binding arm covers every remaining
+            // case. No further error needed.
+            return;
+        }
+
+        // Unwrap a Constructor to its parent sum (the scrutinee
+        // is usually a Constructor because constructors are how
+        // enum values come into the match site). For Ty::Var /
+        // Ty::Con, no exhaustiveness check.
+        let sum_ty = match &resolved {
+            Ty::Sum { .. } => &resolved,
+            Ty::Constructor { owner, .. } => owner.as_ref(),
+            _ => return,
+        };
+
+        if let Ty::Sum { variants, .. } = sum_ty {
+            let covered: BTreeSet<u32> = seen;
+            let missing: Vec<String> = variants
+                .iter()
+                .enumerate()
+                .filter(|(tag, _)| !covered.contains(&(*tag as u32)))
+                .map(|(_, (n, _))| n.clone())
+                .collect();
+            if !missing.is_empty() {
+                let names = missing
+                    .iter()
+                    .map(|s| format!("`{}`", s))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut msg = Message::error(
+                    format!("Non-exhaustive match: variants not covered: {}", names),
+                    pending.match_range.clone(),
+                );
+                msg.with_help(
+                    "add a wildcard arm `_ => ...` to cover the remaining cases".to_string(),
+                );
+                self.messages.push(msg);
+            }
+        }
+    }
+
+    /// Type-check a `print` (or `format`) expression: the format
+    /// string must be a string literal, and each `%X` specifier's
+    /// corresponding argument must have a matching type.
+    fn infer_print(
+        &mut self,
+        fmt: &Output,
+        params: &Option<Vec<Output>>,
+        range: Range<usize>,
+        ctx: &str,
+    ) {
+        let fmt_ty = self.infer(fmt);
+        self.unify(&fmt_ty, &string(), &fmt.0.into_range(), "print format");
+
+        // Pull the format string out of the literal so we can
+        // parse its specifiers. If the format isn't a string
+        // literal, skip validation (the user has a type error
+        // elsewhere; we shouldn't cascade).
+        let fmt_str = match fmt.1.as_ref() {
+            Expression::String(s) => Some(s.to_string()),
+            _ => None,
+        };
+
+        let mut spec_index = 0usize;
+        if let (Some(s), Some(p)) = (fmt_str.as_deref(), params) {
+            for (i, ch) in s.char_indices() {
+                if ch == '%' {
+                    // Look ahead for the specifier.
+                    let rest = &s[i + 1..];
+                    let mut chars = rest.chars();
+                    if let Some(spec) = chars.next() {
+                        // Handle `%%` (literal %). It consumes
+                        // no argument.
+                        if spec == '%' {
+                            continue;
+                        }
+                        // We have `%X`. Validate the Nth arg.
+                        if let Some(arg) = p.get(spec_index) {
+                            let arg_ty = self.infer(arg);
+                            let expected = format_specifier_type(spec);
+                            let arg_ty_pruned =
+                                apply_ty_prune(&self.subst, &arg_ty);
+                            if !type_matches_specifier(&arg_ty_pruned, spec) {
+                                let mut msg = Message::error(
+                                    format!(
+                                        "Format specifier `%{}` requires {}, found {}",
+                                        spec,
+                                        expected,
+                                        arg_ty_pruned
+                                    ),
+                                    arg.0.into_range(),
+                                );
+                                msg.with_help(format!(
+                                    "while checking `{}` format argument #{}",
+                                    ctx,
+                                    spec_index + 1
+                                ));
+                                self.messages.push(msg);
+                            }
+                            spec_index += 1;
+                        } else {
+                            // Specifier with no arg — also an
+                            // error.
+                            let mut msg = Message::error(
+                                format!(
+                                    "Format string has more specifiers than arguments \
+                                     (`%{}` is argument #{})",
+                                    spec,
+                                    spec_index + 1
+                                ),
+                                range.clone(),
+                            );
+                            msg.with_help(format!(
+                                "add an argument for `%%{}` in the call site",
+                                spec
+                            ));
+                            self.messages.push(msg);
+                            return;
+                        }
+                    } else {
+                        // Trailing `%` with no specifier. Skip.
+                        break;
+                    }
+                }
+            }
+        } else if let Some(p) = params {
+            // No specifiers (or non-literal format) — type-check
+            // each param and discard (the VM still consumes the
+            // args at the bytecode level, even if the format
+            // string contains no specifiers).
+            for arg in p {
+                let _ = self.infer(arg);
+            }
+        }
+    }
+
+    // ============================================================
+    //  Public accessors (Phase 15B)
+    // ============================================================
+
+    /// Look up the variant tag for `(enum_name, variant_name)`.
+    /// Returns the source-declaration-order index. Used by the
+    /// bytecode emitter (15C) to build `MAKE_ENUM` instructions.
+    pub fn tag_for(&self, enum_name: &str, variant_name: &str) -> Option<u32> {
+        self.enum_tags
+            .get(enum_name)
+            .and_then(|t| t.get(variant_name).copied())
+    }
+
+    /// Look up the payload arity for `(enum_name, variant_name)`.
+    /// Cached at registration time so codegen doesn't have to redo
+    /// the `payloads[i].len()` lookup at every constructor site.
+    pub fn arity_for(&self, enum_name: &str, variant_name: &str) -> Option<usize> {
+        self.tag_for(enum_name, variant_name).and_then(|t| {
+            self.enum_arities
+                .get(enum_name)
+                .and_then(|a| a.get(t as usize).copied())
+        })
+    }
+
+    /// Iterate the variants of an enum in source-declaration
+    /// order. Each entry is `(variant_name, tag, payload_types)`.
+    /// Used by the bytecode emitter (15C) and by external
+    /// exhaustiveness tooling.
+    pub fn enum_variants(&self, enum_name: &str) -> Option<Vec<(String, u32, Vec<Ty>)>> {
+        let names = self.enums.get(enum_name)?.clone();
+        let tags = self.enum_tags.get(enum_name)?.clone();
+        let payloads = self.enum_payloads.get(enum_name)?.clone();
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let tag = tags.get(name).copied().unwrap_or(i as u32);
+            let payload = payloads.get(i).cloned().unwrap_or_default();
+            out.push((name.clone(), tag, payload));
+        }
+        Some(out)
+    }
+}
+
+/// Best-effort source range for an expected (inferred) type. The
+/// expected type itself is a `Ty`, not a `Range`, so this helper
+/// returns an empty range. (The diagnostic uses the caller's
+/// range when one is available; this fallback is for pattern
+/// errors that come from a non-`Output` position.)
+fn expected_ty_span_range(_ty: &Ty) -> Range<usize> {
+    0..0
+}
+
+/// Map a format specifier character to the type it expects.
+fn format_specifier_type(spec: char) -> &'static str {
+    match spec {
+        'i' | 'd' | 'b' | 'x' | 'u' | 'p' => "int",
+        'f' => "float",
+        's' => "string",
+        'z' => "bool",
+        _ => "an unknown type",
+    }
+}
+
+/// True if `ty` (already resolved under the substitution) is the
+/// type expected by `spec`.
+fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
+    match spec {
+        'i' | 'd' | 'b' | 'x' | 'u' | 'p' => matches!(ty, Ty::Con(n) if n == "int"),
+        'f' => matches!(ty, Ty::Con(n) if n == "float"),
+        's' => matches!(ty, Ty::Con(n) if n == "string"),
+        'z' => matches!(ty, Ty::Con(n) if n == "bool"),
+        // Unknown specifier — can't be matched; the caller will
+        // still record a diagnostic, but we don't want to say it
+        // matches every type.
+        _ => false,
     }
 }
 
@@ -2016,5 +3086,295 @@ mod tests {
     fn unknown_call_argument_types_dont_crash() {
         let msgs = assert_messages("foo(1, 2, 3);");
         assert!(!msgs.is_empty());
+    }
+
+    // ================================================================
+    //  Sum types and pattern matching (Phase 15B)
+    // ================================================================
+
+    // ---- Enum registration ----
+
+    #[test]
+    fn enum_decl_registers_sum_type() {
+        let (mut c, _) = check("enum E { A, B }");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        assert!(c.enums.contains_key("E"));
+        let variants = c.enums.get("E").unwrap();
+        assert_eq!(variants, &vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn enum_with_payload_registers_constructor() {
+        // After registration, `Option::Some` is bound as a curried
+        // function in the env: `int -> Constructor`.
+        let (mut c, _) = check("enum Option { None, Some(int) }");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let scheme = c.env().lookup("Option::Some").expect("not bound");
+        let ty = apply_ty_prune(c.subst(), &scheme.ty);
+        assert_eq!(
+            ty,
+            Ty::Fun(
+                Box::new(int()),
+                Box::new(Ty::Constructor {
+                    owner: Box::new(Ty::Sum {
+                        name: "Option".into(),
+                        variants: vec![
+                            ("None".into(), vec![]),
+                            ("Some".into(), vec![int()]),
+                        ],
+                    }),
+                    tag: 1,
+                    arity: 1,
+                }),
+            )
+        );
+    }
+
+    #[test]
+    fn enum_tags_assigned_in_declaration_order() {
+        // MUST-HAVE #2: source order, NOT alphabetical.
+        // `enum E { Z, A, M, B }` → Z=0, A=1, M=2, B=3.
+        let (mut c, _) = check("enum E { Z, A, M, B }");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        assert_eq!(c.tag_for("E", "Z"), Some(0));
+        assert_eq!(c.tag_for("E", "A"), Some(1));
+        assert_eq!(c.tag_for("E", "M"), Some(2));
+        assert_eq!(c.tag_for("E", "B"), Some(3));
+    }
+
+    #[test]
+    fn recursive_enum_typechecks() {
+        // MUST-HAVE #1: recursive payload uses `Ty::Con("Tree")`,
+        // not the unfolded `Ty::Sum`. The HM occurs check should
+        // NOT fire.
+        let (mut c, _) = check("enum Tree { Leaf, Node(int, Tree, Tree) }");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        // The recursive variant's payload should reference the
+        // enum by name (opaque) — the public `enum_variants` API
+        // is the canonical interface to inspect this.
+        let variants = c.enum_variants("Tree").expect("Tree not registered");
+        let node_payload = variants.iter().find(|(n, _, _)| n == "Node").unwrap().2.clone();
+        assert_eq!(
+            node_payload,
+            vec![int(), Ty::Con("Tree".into()), Ty::Con("Tree".into())]
+        );
+    }
+
+    #[test]
+    fn duplicate_enum_is_error() {
+        let msgs = assert_messages("enum A { X } enum A { Y }");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Duplicate enum")),
+            "expected duplicate-enum error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn duplicate_constructor_is_error() {
+        let msgs = assert_messages("enum A { Foo } enum B { Foo }");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Duplicate constructor")),
+            "expected duplicate-constructor error, got: {:?}",
+            msgs
+        );
+    }
+
+    // ---- Constructor calls ----
+
+    #[test]
+    fn constructor_call_with_wrong_arity_is_error() {
+        // Option::Some takes 1 arg, called with 2.
+        let src = "Option::Some(1, 2); enum Option { None, Some(int) }";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("expects 1 arguments")),
+            "expected arity error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn constructor_call_with_correct_arity_typechecks() {
+        let src = "Option::Some(42); enum Option { None, Some(int) }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        // Check via the cache that the call produced a Constructor type.
+        let ids = c.id_table().ids();
+        let found = ids.iter().find_map(|id| match c.lookup_at(*id) {
+            Some(Ty::Constructor { tag, arity, .. }) => Some((tag, arity)),
+            _ => None,
+        });
+        assert_eq!(found, Some((1, 1)));
+    }
+
+    #[test]
+    fn unknown_enum_constructor_is_error() {
+        let msgs = assert_messages("Nonexistent::Some(1);");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Cannot find enum")),
+            "expected unknown-enum error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn unknown_variant_on_known_enum_is_error() {
+        let src = "Option::Purlpe(1); enum Option { None, Some(int) }";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Cannot find variant")),
+            "expected unknown-variant error, got: {:?}",
+            msgs
+        );
+    }
+
+    // ---- Pattern matching ----
+
+    #[test]
+    fn match_with_all_variants_no_error() {
+        // Enum declarations are top-level statements (no trailing
+        // `;`) and must appear at the end of a sequence of
+        // statements. Zero-arity constructors require `()`.
+        let src = "let x = Option::Some(1); match x { Option::None() => 0, Option::Some(v) => v }; enum Option { None, Some(int) }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn match_with_wildcard_no_exhaustiveness_error() {
+        let src = "let x = Option::Some(1); match x { _ => 0 }; enum Option { None, Some(int) }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn match_non_exhaustive_reports_missing() {
+        let src = "let x = Option::None(); match x { Option::None() => 0 }; enum Option { None, Some(int) }";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Non-exhaustive match")),
+            "expected non-exhaustive error, got: {:?}",
+            msgs
+        );
+        let msg = msgs.iter().find(|m| m.message().contains("Non-exhaustive")).unwrap();
+        assert!(
+            msg.message().contains("Some"),
+            "expected `Some` to be mentioned, got: {:?}",
+            msg.message()
+        );
+    }
+
+    #[test]
+    fn match_with_unreachable_arm_reports() {
+        let src = "let x = Option::None(); match x { Option::None() => 0, Option::None() => 1 }; enum Option { None, Some(int) }";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Unreachable arm")),
+            "expected unreachable-arm error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn match_pattern_binding_does_not_leak() {
+        // `v` is bound inside the arm; referencing it after the
+        // match should error.
+        let src = "let x = Option::Some(1); match x { Option::Some(v) => 0 }; v; enum Option { None, Some(int) }";
+        let msgs = assert_messages(src);
+        // The `v` reference after the match is unknown.
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Cannot find value `v`")),
+            "expected 'v not found' error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn nested_constructor_pattern_typechecks() {
+        // Patterns can be nested; the inner sub-patterns are
+        // checked against the corresponding payload types. We
+        // wrap a value in a single-level enum so the inner
+        // pattern is `Wrap::Inner(int)` — the nested pattern
+        // case. (Truly recursive `Option<Option<T>>` is not
+        // constructible because `Option::Some` takes `int`
+        // directly, so we use a custom enum that wraps a type
+        // whose pattern can be nested.)
+        let src = "let x = Wrap::W(Inner::I(7)); match x { Wrap::W(Inner::I(v)) => v }; enum Inner { I(int) } enum Wrap { W(Inner) }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn forward_reference_to_constructor_works() {
+        // The enum is declared AFTER the use; the pre-pass makes
+        // this work.
+        let src = "let x = Option::Some(1); enum Option { None, Some(int) }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    // ---- Format-string typecheck ----
+
+    #[test]
+    fn format_string_percent_i_requires_int() {
+        let msgs = assert_messages(r#"print "%i", "hello";"#);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("requires int")),
+            "expected '%i requires int' error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_string_percent_s_requires_string() {
+        let msgs = assert_messages("print \"%s\", 42;");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("requires string")),
+            "expected '%s requires string' error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_string_percent_f_requires_float() {
+        let msgs = assert_messages("print \"%f\", 1;");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("requires float")),
+            "expected '%f requires float' error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_string_with_constructor_value_errors_on_percent_s() {
+        // Red-team critical: passing a `Constructor` (a sum) where
+        // a string is expected must be flagged.
+        let src = "print \"%s\", Option::Some(1); enum Option { None, Some(int) }";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("requires string")),
+            "expected 'requires string' error, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_string_with_constructor_via_match_works() {
+        // The match arm's body must be inferable as a string, and
+        // print "%s", s should accept it.
+        let src = "let s = match Option::Some(1) { Option::None() => \"none\", Option::Some(_) => \"some\" }; print \"%s\", s; enum Option { None, Some(int) }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
     }
 }

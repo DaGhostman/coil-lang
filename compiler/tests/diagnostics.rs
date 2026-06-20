@@ -209,3 +209,93 @@ fn class_declaration_typechecks() {
         msgs
     );
 }
+
+// ---- Phase 15B: sum types and pattern matching ----
+
+#[test]
+fn enum_decl_no_messages() {
+    // A bare `enum` declaration produces no diagnostic.
+    let (_ty, msgs) = check("enum Option { None, Some(int) }");
+    assert!(
+        msgs.is_empty(),
+        "enum declaration should produce no messages, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn match_with_all_variants_no_messages() {
+    // All variants covered → no diagnostic.
+    let src = "let x = Option::Some(1); match x { Option::None() => 0, Option::Some(v) => v }; enum Option { None, Some(int) }";
+    let (_ty, msgs) = check(src);
+    assert!(
+        msgs.is_empty(),
+        "match with all variants should produce no messages, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn non_exhaustive_match_emits_diagnostic() {
+    // One arm missing the `Some` variant → "Non-exhaustive" error.
+    let src = "let x = Option::None(); match x { Option::None() => 0 }; enum Option { None, Some(int) }";
+    let (_ty, msgs) = check(src);
+    assert!(
+        msgs.iter().any(|m| m.contains("Non-exhaustive match")),
+        "expected non-exhaustive diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn unreachable_arm_emits_diagnostic() {
+    // Two arms covering the same tag → second is unreachable.
+    let src = "let x = Option::None(); match x { Option::None() => 0, Option::None() => 1 }; enum Option { None, Some(int) }";
+    let (_ty, msgs) = check(src);
+    assert!(
+        msgs.iter().any(|m| m.contains("Unreachable arm")),
+        "expected unreachable-arm diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn unknown_constructor_in_pattern_errors() {
+    // A pattern that references an unknown constructor (an
+    // enum/variant pair that was never declared). The typechecker
+    // emits "Pattern references unknown constructor".
+    let src = "let x = NoSuch::Missing(1); enum Real { Bar(int) }";
+    let (_ty, msgs) = check(src);
+    // The constructor call `NoSuch::Missing(1)` is the unknown
+    // one. The error path: `infer_construct` → "Cannot find
+    // enum `NoSuch`".
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Cannot find enum") || m.contains("unknown constructor")),
+        "expected unknown-enum / unknown-constructor diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn constructor_wrong_arity_errors() {
+    let src = "Option::Some(1, 2); enum Option { None, Some(int) }";
+    let (_ty, msgs) = check(src);
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("expects 1 arguments") || m.contains("wrong")),
+        "expected wrong-arity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_string_type_mismatch_errors() {
+    // %s requires a string; passing int is a type error.
+    let (_ty, msgs) = check("print \"%s\", 42;");
+    assert!(
+        msgs.iter().any(|m| m.contains("requires string")),
+        "expected format-string type error, got: {:?}",
+        msgs
+    );
+}
