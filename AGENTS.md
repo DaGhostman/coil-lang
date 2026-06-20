@@ -234,3 +234,201 @@ and negative).
 
 `cargo build` produces only the three pre-existing parser warnings
 (no new compiler warnings). The compiler crate is warning-free.
+
+## PHASE 15C - VM AND CODEGEN FOR SUM TYPES AND MATCH (COMPLETED)
+
+### Summary
+
+Wired sum types and pattern matching end-to-end: appended three new
+VM opcodes (`MakeEnum`, `JumpIfMatch`, `Unpack`), implemented their
+runtime semantics, replaced the 15A codegen stubs with a real
+threaded-code match emitter, and verified end-to-end with
+`examples/option.0s` (which prints `42`).
+
+### New opcodes (appended, not inserted)
+
+- `MakeEnum` — packs `tag` in upper 16 operand bits and `arity` in
+  lower 16. Pops arity values (top of stack = `payload[0]` in source
+  order because codegen emits args in reverse) and allocates an
+  `ObjEnum` on the heap. Each popped `Value` is classified as an
+  immediate (int/float/bool) or a heap pointer (string/instance/
+  enum) via `Heap::contains_addr`, producing `Member::Value` or
+  `Member::Object` accordingly so the GC traces correctly.
+- `JumpIfMatch` — packs `expected_tag` in upper 16 and `target_offset`
+  in lower 16. Peeks the scrutinee; on match, pops it, pushes the
+  payload in declaration order, and seeks the bytecode iterator to
+  the target. On miss, falls through with the scrutinee still on the
+  stack.
+- `Unpack` — operand carries the arity (redundant with
+  `ObjEnum::payload.len()` but kept for symmetry). Pops the scrutinee
+  and pushes its payload values in declaration order. Used by the
+  last constructor arm of a `match` (reached by fall-through).
+
+### Match codegen layout (canonical "threaded code")
+
+The compiled bytecode for `match x { A => a, B => b, C => c }`:
+
+```
+<scrutinee bytecode>
+JUMP_IF_MATCH tag_A target_body_A
+JUMP_IF_MATCH tag_B target_body_B
+UNPACK arity_C
+body_c            <- reached by fall-through
+JMP end            <- skipped after body_c
+body_b            <- reached via JUMP_IF_MATCH B
+JMP end            <- skipped after body_b
+body_a            <- reached via JUMP_IF_MATCH A
+<- match end here
+```
+
+Arms are emitted in reverse source order so the bytecode grows
+downward; the LAST arm is reached by fall-through and is the first
+body in the bytecode, each non-last arm terminates with a `JMP end`
+to skip past the bodies placed earlier. Placeholders are patched in
+a second pass after the arm-body offsets are known.
+
+### Decisions locked in (during implementation)
+
+1. **Append-only opcode additions.** New opcodes are APPENDED to
+   the end of the `Instruction` enum to preserve every existing
+   `#[repr(u8)]` discriminant. Inserting before `SET` would shift
+   every later opcode's numeric value and silently corrupt every
+   `.0s` archive ever compiled.
+2. **Stack discipline: reverse-emit, no-reverse-pop.** Codegen emits
+   payload args in reverse declaration order so the stack top holds
+   `args[0]`. `MakeEnum` pops arity values top-first — first pop is
+   `args[0]`, last pop is `args[arity-1]` — and the resulting buffer
+   is already in declaration order without an explicit reversal.
+3. **`find_object_by_addr` is a free function, not a `&self` method.**
+   The borrow checker splits the `&Heap` borrow from other
+   in-flight borrows on `Machine` fields (specifically the mutable
+   `frames` borrow held by the `execute` loop).
+4. **Heap-pointer classification by `Heap::contains_addr`.** O(n)
+   walk over the intrusive linked list — acceptable because
+   `MakeEnum` is only emitted at constructor call sites and the
+   heap is typically small. A generation table or per-frame
+   pointer map would make this O(1); deferred to 15D+.
+5. **`Member::Object` carries a full `Object`, not a raw pointer.**
+   The `Object` is reconstructed by walking the intrusive list to
+   find the entry whose address matches the popped `Value`. If the
+   lookup fails (object already freed?), the payload falls back to
+   `Member::Value` (defensive — the GC will skip it).
+6. **Print/Format emit directly to `self.bytecode`, not a local
+   `Vec`.** Any nested match in the params list computes absolute
+   jump targets in `self.bytecode`; the old "return a Vec" pattern
+   would silently miscompile (the placeholder patch would write to
+   the wrong buffer).
+7. **`emit_pattern_binding` is a free function** with the
+   `&mut Interner<String>` and `&mut Vec<Byte>` parameters split
+   out, so the borrow checker doesn't see `self.context.variables`
+   and `self.bytecode` as simultaneously borrowed inside the helper.
+8. **`Expression::Type` consumes an ID but emits empty bytecode.**
+   The pre-walk mints a `NodeId` for each `Expression::Type`
+   wrapper inside enum payload lists so the HM typechecker's ID
+   table stays aligned; the codegen arm is a no-op.
+9. **`JumpIfMatch` falls through on a non-enum scrutinee** (e.g.,
+   if a type error slipped through typechecking). The arm is
+   unreachable but the VM doesn't crash — same defensive posture
+   as `Unpack`.
+10. **No new `Instruction::Pattern` arm.** Patterns are not
+    standalone expressions; they only appear as `arm.pattern` and
+    are handled by `emit_pattern_binding` directly. The pre-walk's
+    `pre_walk_pattern` correctly doesn't mint IDs for them.
+
+### Diagnostics produced
+
+The codegen and VM are silent on type errors (the typechecker, 15B,
+already produced those diagnostics upstream). The new VM arm for
+non-enum scrutinees is defensive: it falls through silently rather
+than panicking, on the principle that the typechecker is the source
+of truth.
+
+### Test counts (15C final)
+
+| Suite | Count | Delta vs 15B |
+|-------|-------|--------------|
+| `compiler/src/typechecking/*` (unit) | 231 | 0 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 9 | +3 |
+| `compiler/src/pipeline.rs::tests` (ariadne) | 2 | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 24 | 0 |
+| `common` | 2 | 0 |
+| `machine` | 8 | +6 |
+| `parser` | 9 | 0 |
+| doctests | 6 | 0 |
+| **Total** | **291** | **+9** |
+
+The 9-test delta is exactly the 6 new VM tests + 3 new codegen
+tests specified in 15C.5 and 15C.6:
+
+VM tests (`machine/src/vm.rs::tests`):
+1. `make_enum_allocates_enum_with_correct_tag`
+2. `make_enum_with_payload_populates_payload`
+3. `jump_if_match_taken_advances_ip`
+4. `jump_if_match_not_taken_falls_through`
+5. `unpack_pops_enum_and_pushes_payload`
+6. `nested_enum_gc_traces_correctly`
+
+Codegen tests (`compiler/src/lib.rs::tests`):
+1. `construct_emits_make_enum_with_correct_tag_and_arity`
+2. `match_emits_jump_if_match_cascade`
+3. `wildcard_match_arm_emits_pop`
+
+### End-to-end smoke test
+
+`examples/option.0s` compiles and runs correctly, printing `42`:
+
+```0s
+enum Option {
+    None,
+    Some(int),
+}
+
+fn unwrap(Option o) -> int {
+    return match o {
+        Option::None => 0,
+        Option::Some(v) => v,
+    };
+}
+
+fn main() {
+    print "%i", unwrap(Option::Some(42));
+}
+```
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `common/src/opcode.rs` | +21 LOC | Append 3 new opcodes |
+| `machine/src/vm.rs` | +575 LOC (net) | Dispatch arms + 6 tests + restoration of commented tests |
+| `machine/src/memory/heap.rs` | +36 LOC | `head_for_lookup` + `contains_addr` helpers |
+| `compiler/src/lib.rs` | +556 LOC (net) | Real codegen for `EnumDecl`/`Variant`/`Construct`/`Match`/`Type` + `Print`/`Format` refactor + `emit_pattern_binding` + 3 codegen tests |
+| `examples/option.0s` | new | End-to-end smoke test |
+| `AGENTS.md` | this section | Documentation |
+
+### Build status (15C)
+
+`cargo build` produces only the three pre-existing parser warnings
+(no new compiler or machine warnings). Both the compiler and
+machine crates are warning-free for the new work.
+
+### Anything 15D needs to know
+
+- The heap-pointer-classification in `MakeEnum` is O(n) in the
+  number of live heap objects. A generation table or per-frame
+  pointer map would let `MakeEnum` and `Unpack` classify in O(1).
+- `Object::mark_references` for `Object::Enum` already traces its
+  `payload` (15A work), but the VM's automatic `trace`/`sweep`
+  cycle is NOT yet wired into `Machine::execute`. 15D's first task
+  should be to call `heap.trace(roots)` + `heap.sweep()` at
+  allocation pressure points (or after every N allocations).
+- The `Match` codegen handles `Wildcard`, `Binding`, and nested
+  `Constructor` patterns. Nested constructor patterns work via
+  `emit_pattern_binding` which emits `UNPACK` + recurses. Nested
+  patterns have no dedicated test yet — consider adding one
+  alongside the first 15D `mark_references` test.
+- `Expression::Pattern` does not exist as a standalone variant;
+  patterns only appear via `arm.pattern`. The `_expr =>` catch-all
+  in `do_compile` already produces an "Unknown expression"
+  diagnostic for any new variant — useful as a safety net if 15D
+  introduces new pattern shapes.
