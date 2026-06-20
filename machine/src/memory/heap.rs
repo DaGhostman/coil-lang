@@ -165,6 +165,9 @@ impl Heap {
             Object::Instance(i) => {
                 i.release();
             }
+            Object::Enum(e) => {
+                e.release();
+            }
         }
     }
 
@@ -236,6 +239,15 @@ use std::{
 /// A type alias for a heap-allocated string.
 pub type RefString = Gc<ObjString>;
 pub type RefInstance = Gc<ObjInstance>;
+/// A type alias for a heap-allocated enum (sum-type) value.
+///
+/// Added in Phase 15A so the GC knows how to traverse enum payloads
+/// from the moment they exist — preventing silent runtime UB the
+/// first time `MAKE_ENUM` is introduced in Phase 15C. The variant is
+/// not yet constructed by any instruction; it is reachable only
+/// through manual `heap.alloc(ObjEnum { ... }, Object::Enum)` in
+/// tests.
+pub type RefEnum = Gc<ObjEnum>;
 
 /// An enumeration of all potential errors that occur when working with objects.
 #[derive(Debug)]
@@ -259,6 +271,12 @@ pub enum Object {
     /// A string object
     String(RefString),
     Instance(RefInstance),
+    /// A sum-type (enum) value. Phase 15A placeholder — see
+    /// [`ObjEnum`] and [`RefEnum`]. The payload is a flat list of
+    /// NaN-boxed [`Value`]s; the GC marks every value in the list,
+    /// following pointers recursively so nested enums and inner
+    /// strings are preserved.
+    Enum(RefEnum),
 }
 
 impl Object {
@@ -267,6 +285,7 @@ impl Object {
         let marked = match self {
             Self::String(s) => s.mark(),
             Self::Instance(i) => i.mark(),
+            Self::Enum(e) => e.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -278,6 +297,7 @@ impl Object {
         match self {
             Self::String(s) => s.unmark(),
             Self::Instance(i) => i.unmark(),
+            Self::Enum(e) => e.unmark(),
         }
     }
 
@@ -287,11 +307,20 @@ impl Object {
         match self {
             Self::String(s) => s.is_marked(),
             Self::Instance(i) => i.is_marked(),
+            Self::Enum(e) => e.is_marked(),
         }
     }
 
     /// Mark all object references that can be directly access by the current object and put them
     /// in `grey_objects` if they have not been marked.
+    ///
+    /// For an [`Object::Enum`], every payload entry is examined:
+    /// `Member::Object` entries are pushed onto the grey stack so
+    /// their targets are traced; `Member::Value` entries are
+    /// immediates (ints, floats, bools) and carry no heap reference.
+    /// This mirrors the mark logic for [`Object::Instance`] field
+    /// values, generalised from the keyed `Table<Member>` to a
+    /// positional `Vec<Member>`.
     pub fn mark_references(&self, grey_objects: &mut Vec<Self>) {
         match self {
             Self::String(_) => {}
@@ -302,6 +331,13 @@ impl Object {
                     i.mark(grey_objects);
                 }
             }),
+            Self::Enum(e) => {
+                for member in &e.as_ref().payload {
+                    if let Member::Object(o) = member {
+                        o.mark(grey_objects);
+                    }
+                }
+            }
         }
     }
 
@@ -311,6 +347,7 @@ impl Object {
         match self {
             Self::String(s) => s.get_next(),
             Self::Instance(i) => i.get_next(),
+            Self::Enum(e) => e.get_next(),
         }
     }
 
@@ -319,6 +356,7 @@ impl Object {
         match self {
             Self::String(s) => s.set_next(next),
             Self::Instance(i) => i.set_next(next),
+            Self::Enum(e) => e.set_next(next),
         }
     }
 
@@ -327,6 +365,7 @@ impl Object {
         match self {
             Self::String(s) => s.as_ptr() as u64,
             Self::Instance(i) => i.as_ptr() as u64,
+            Self::Enum(e) => e.as_ptr() as u64,
         }
     }
 }
@@ -336,6 +375,7 @@ impl GcSized for Object {
         match self {
             Self::String(s) => s.size(),
             Self::Instance(i) => i.size(),
+            Self::Enum(e) => e.size(),
         }
     }
 }
@@ -345,6 +385,7 @@ impl fmt::Display for Object {
         match self {
             Self::String(s) => write!(f, "{}", s.as_ref()),
             Self::Instance(_) => write!(f, "0x{:08x}", self.addr()),
+            Self::Enum(_) => write!(f, "0x{:08x}", self.addr()),
         }
     }
 }
@@ -379,6 +420,30 @@ impl ObjInstance {
 impl GcSized for ObjInstance {
     fn size(&self) -> usize {
         std::mem::size_of::<Self>() + self.fields.capacity()
+    }
+}
+
+/// The content of a heap-allocated enum (sum-type) value.
+///
+/// `tag` is the variant discriminator; in Phase 15A it is unused by
+/// the VM (the variant is not yet constructed by any instruction).
+/// `payload` is the flat list of [`Member`]s that make up the
+/// variant's tuple payload — each entry is either a `Member::Value`
+/// (an immediate like an int or float) or a `Member::Object` (a
+/// pointer to another heap object). Using [`Member`] mirrors the
+/// shape of [`ObjInstance::fields`] so the GC can reuse the same
+/// mark logic for nested enum payloads (e.g.
+/// `enum Tree { Node(int, Tree, Tree) }`).
+///
+/// The list is laid out in declaration order.
+pub struct ObjEnum {
+    pub tag: u32,
+    pub payload: Vec<Member>,
+}
+
+impl GcSized for ObjEnum {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.payload.capacity() * std::mem::size_of::<Member>()
     }
 }
 
@@ -834,4 +899,130 @@ enum Entry<V> {
 struct EntryInner<V> {
     key: RefString,
     val: V,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk the heap's intrusive list and return the addresses of
+    /// every allocated object. Used by the GC tests to assert
+    /// which objects survived a sweep.
+    fn live_object_addrs(heap: &Heap) -> std::collections::HashSet<u64> {
+        let mut addrs = std::collections::HashSet::new();
+        for obj in heap {
+            addrs.insert(obj.addr());
+        }
+        addrs
+    }
+
+    /// Manually construct an `Object::Enum` whose payload contains
+    /// a `Member::Object` pointer to another heap object, and
+    /// verify the GC preserves both.
+    ///
+    /// The existing `Heap::trace` marks the root set but does not
+    /// call `mark_references` transitively (a known limitation of
+    /// the 15A GC — full mark-and-trace is 15C's job). So the test
+    /// invokes `mark_references` directly after `trace`, mimicking
+    /// what a proper mark-and-trace loop would do.
+    #[test]
+    fn enum_gc_marks_payload_pointers() {
+        let mut heap = Heap::default();
+
+        // 1. Allocate the inner object (a string).
+        let (string_obj, string_ref) = heap.alloc(ObjString::from("inner"), Object::String);
+        let string_addr = string_obj.addr();
+        let string_member = Member::Object(string_obj);
+
+        // 2. Allocate the enum with the string in its payload.
+        let enum_value = ObjEnum {
+            tag: 0,
+            payload: vec![string_member],
+        };
+        let (enum_obj, _enum_ref) = heap.alloc(enum_value, Object::Enum);
+        let enum_addr = enum_obj.addr();
+
+        // 3. Mark the enum as a root and propagate the mark to its
+        //    payload (which holds the string pointer).
+        let mut gray = Vec::new();
+        heap.trace(&[enum_addr]);
+        enum_obj.mark_references(&mut gray);
+
+        // 4. Sweep — anything not marked is deallocated.
+        unsafe { heap.sweep() };
+
+        // 5. Both objects must still be alive.
+        let live = live_object_addrs(&heap);
+        assert!(
+            live.contains(&string_addr),
+            "string at 0x{:x} was collected despite being reachable from enum payload",
+            string_addr
+        );
+        assert!(
+            live.contains(&enum_addr),
+            "enum at 0x{:x} was collected despite being a GC root",
+            enum_addr
+        );
+        // Sanity: the string ref is still dereferenceable.
+        let _ = string_ref.as_ref();
+    }
+
+    /// Nested enums: an `Object::Enum` whose payload contains a
+    /// `Member::Object` pointer to *another* `Object::Enum`. The
+    /// outer enum's `mark_references` must mark the inner enum,
+    /// whose own `mark_references` is a no-op (empty payload) but
+    /// must still keep it alive through sweep.
+    #[test]
+    fn enum_gc_marks_nested_enum_payloads() {
+        let mut heap = Heap::default();
+
+        // Inner enum: empty payload.
+        let (inner_obj, _inner_ref) = heap.alloc(
+            ObjEnum {
+                tag: 1,
+                payload: vec![],
+            },
+            Object::Enum,
+        );
+        let inner_addr = inner_obj.addr();
+
+        // Outer enum: payload contains the inner enum as a
+        // `Member::Object`.
+        let outer = ObjEnum {
+            tag: 0,
+            payload: vec![Member::Object(inner_obj)],
+        };
+        let (outer_obj, _outer_ref) = heap.alloc(outer, Object::Enum);
+        let outer_addr = outer_obj.addr();
+
+        // Mark outer as root, propagate through its payload to mark
+        // the inner enum.
+        let mut gray = Vec::new();
+        heap.trace(&[outer_addr]);
+        outer_obj.mark_references(&mut gray);
+
+        // Drain the grey stack — each newly-marked object should
+        // also have its references traced. For the inner enum
+        // (empty payload) this is a no-op, but we still call it to
+        // exercise the arm.
+        while let Some(obj) = gray.pop() {
+            obj.mark_references(&mut gray);
+        }
+
+        // Sweep.
+        unsafe { heap.sweep() };
+
+        // Both must survive.
+        let live = live_object_addrs(&heap);
+        assert!(
+            live.contains(&inner_addr),
+            "inner enum at 0x{:x} was collected despite being reachable from outer enum payload",
+            inner_addr
+        );
+        assert!(
+            live.contains(&outer_addr),
+            "outer enum at 0x{:x} was collected despite being a GC root",
+            outer_addr
+        );
+    }
 }
