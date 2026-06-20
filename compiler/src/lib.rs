@@ -6,7 +6,7 @@ use std::{borrow::Borrow, collections::HashMap};
 use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
 use parser::{
     SimpleSpan,
-    ast::{Expression, Output},
+    ast::{Expression, Output, Pattern},
 };
 
 pub use pipeline::*;
@@ -110,6 +110,67 @@ impl<'ctx> Context {
     pub fn get_prev(&self) -> &Option<Box<Self>> {
         &self.prev
     }
+}
+
+/// Emit the bytecode that binds (or discards) the sub-patterns
+/// of a constructor pattern, given that the top of the stack
+/// holds the constructor's payload values in declaration order.
+///
+/// For each sub-pattern:
+/// - `Binding { name }` — intern `name` in `variables`, then
+///   `STORE <symbol>` to pop the top of stack into that slot.
+/// - `Wildcard` — `POP` to discard the value.
+/// - `Constructor { .. }` — `UNPACK <arity>` to pop the enum
+///   value and push its payload, then recurse into each
+///   sub-pattern of the inner constructor.
+///
+/// This function is called once per match arm body, right after
+/// the `JUMP_IF_MATCH` / `UNPACK` has filled the stack with
+/// payload values. After it returns, the stack is empty (the
+/// payload values are all bound to local slots or discarded).
+///
+/// `emit_pattern_binding_self` is the `&mut Vec<Byte>` variant
+/// used by the match handler when it emits directly to
+/// `self.bytecode`. The two helpers are split to keep the
+/// borrowed `&mut Vec` out of the recursive call site (so the
+/// borrow checker doesn't see `self.context.variables` and
+/// `self.bytecode` as simultaneously borrowed inside the helper
+/// — they're separate parameters).
+fn emit_pattern_binding(
+    variables: &mut Interner<String>,
+    pattern: &Pattern,
+    bytecode: &mut Vec<Byte>,
+) {
+    match pattern {
+        Pattern::Wildcard => {
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+        Pattern::Binding { name } => {
+            let symbol = variables.intern(name.to_string());
+            bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
+        }
+        Pattern::Constructor { payload, .. } => {
+            bytecode.push(
+                Byte::new(Instruction::Unpack).with_operand_u32(payload.len() as u32),
+            );
+            for sub in payload {
+                emit_pattern_binding(variables, sub, bytecode);
+            }
+        }
+    }
+}
+
+/// Same as [`emit_pattern_binding`] but takes `&mut Vec<Byte>` for
+/// use in code paths that already hold a mutable borrow of
+/// `self.bytecode` (e.g., the match handler that emits
+/// directly to `self.bytecode`).
+#[allow(dead_code)]
+fn emit_pattern_binding_self(
+    variables: &mut Interner<String>,
+    pattern: &Pattern,
+    bytecode: &mut Vec<Byte>,
+) {
+    emit_pattern_binding(variables, pattern, bytecode);
 }
 
 impl Compiler {
@@ -266,27 +327,46 @@ impl Compiler {
                 }
             }
             Expression::Print(format, params) => {
-                bytecode.append(&mut self.do_compile(format));
+                // The Print handler emits to `self.bytecode`
+                // DIRECTLY (not a local Vec) so that any nested
+                // expression (e.g., a `match` inside the params
+                // list) can compute ABSOLUTE jump targets in
+                // `self.bytecode`. The format string is emitted
+                // first, then the params (which may include a
+                // `match`), then FORMAT and PRINT.
+                let format_bc = self.do_compile(format);
+                self.bytecode.extend(format_bc);
+
                 let mut params_len = 0;
                 if let Some(params) = params {
                     params_len = params.len();
-                    params.iter().for_each(|param| {
-                        bytecode.append(&mut self.do_compile(param));
-                    });
+                    for param in params {
+                        let bc = self.do_compile(param);
+                        self.bytecode.extend(bc);
+                    }
                 }
-                bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
-                bytecode.push(Byte::new(Instruction::PRINT));
+
+                self.bytecode.push(
+                    Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32),
+                );
+                self.bytecode.push(Byte::new(Instruction::PRINT));
             }
             Expression::Format(format, params) => {
-                bytecode.append(&mut self.do_compile(format));
+                // Same as Print: emit directly to `self.bytecode`
+                // for nested-match correctness.
+                let format_bc = self.do_compile(format);
+                self.bytecode.extend(format_bc);
+
                 let mut params_len = 0;
                 if let Some(params) = params {
                     params_len = params.len();
-                    params.iter().for_each(|param| {
-                        bytecode.append(&mut self.do_compile(param));
-                    });
+                    for param in params {
+                        let bc = self.do_compile(param);
+                        self.bytecode.extend(bc);
+                    }
                 }
-                bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
             }
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
                 self.context.defers.iter().for_each(|offset| {
@@ -462,6 +542,17 @@ impl Compiler {
             Expression::Argument(_, n) => {
                 let _ = self.context.variables.intern(n.to_string());
                 // bytecode.push(Byte::new(Instruction::LOAD)
+            }
+            Expression::Type(_) => {
+                // Type names appear as metadata inside enum
+                // declarations (e.g. `Some(int)` wraps `int` as
+                // an `Expression::Type`). The typechecker has
+                // already extracted the type name and registered
+                // the enum shape; no runtime bytecode is
+                // emitted for the type wrapper. The pre-walk
+                // still mints a NodeId (so this arm consumes one
+                // to stay in lockstep), but the bytecode here is
+                // empty.
             }
             Expression::Identifier(n) => {
                 if let Some(symbol) = self.context.variables.key(&n.to_string()) {
@@ -741,34 +832,341 @@ impl Compiler {
                 }
             }
 
-            // ---- Phase 15A placeholders (TODO 15B/15C) ----
-            // These keep the workspace building while the
-            // typechecker and code emitter are extended to
-            // understand sum types and pattern matching. None of
-            // them are semantically correct yet — the compiler's
-            // test suite is expected to fail on enum/match/construct
-            // source until 15B/15C land. The HM pre-walk still
-            // visits the new nodes (see `id.rs`), so the NodeId
-            // cache stays aligned with the AST shape.
-            Expression::EnumDecl { .. } => {
-                // TODO 15B: register the enum declaration with
-                // the typechecker and emit the discriminant table.
+            // ---- Phase 15A: sum types and pattern matching ----
+            //
+            // The HM typechecker (15B) handles all type-level
+            // validation (enum registration, constructor arity
+            // checks, exhaustiveness). The codegen (15C) is only
+            // responsible for emitting the matching bytecode.
+            //
+            // ID alignment: the pre-walk in
+            // `crate::typechecking::id::pre_walk_children` mints
+            // NodeIds for `EnumDecl` (1), each `EnumVariant`
+            // node (1 per variant), each `Expression::Type`
+            // payload (1 per payload type), the `Construct`
+            // node (1), and each of its `args` (1 per arg). The
+            // `Match` arm bodies each get 1 ID. Patterns do NOT
+            // mint IDs (see `pre_walk_pattern`). The codegen
+            // below consumes exactly that many IDs by recursing
+            // via `self.do_compile`.
+            Expression::EnumDecl { name: _, variants } => {
+                // Recurse into each variant. Each variant's
+                // `do_compile` consumes 1 ID (for the variant
+                // itself) and then descends into each payload's
+                // `Type` expression. We don't emit any bytecode
+                // here — the enum declaration is metadata that's
+                // already been registered with the typechecker
+                // (15B).
+                for v in variants {
+                    bytecode.append(&mut self.do_compile(v));
+                }
             }
-            Expression::EnumVariant { .. } => {
-                // TODO 15B
+            Expression::EnumVariant { payload, .. } => {
+                // Recurse into each payload's `Type` expression.
+                // We don't emit bytecode — the variant's payload
+                // shape is metadata that's already registered
+                // with the typechecker (15B).
+                for p in payload {
+                    bytecode.append(&mut self.do_compile(p));
+                }
             }
-            Expression::Construct { .. } => {
-                // TODO 15C: emit MAKE_ENUM with the variant tag
-                // and the payload bytes.
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                args,
+            } => {
+                // Look up the variant's tag and arity in the
+                // typechecker's tables. The typechecker would
+                // already have rejected this construct if the
+                // enum / variant isn't registered, so the
+                // `expect`s below only fire when something is
+                // seriously out of sync (e.g., the typechecker
+                // was bypassed).
+                let tag = self
+                    .checker
+                    .tag_for(enum_name, variant_name)
+                    .expect("Construct: enum/variant not registered with typechecker");
+                let arity = self
+                    .checker
+                    .arity_for(enum_name, variant_name)
+                    .expect("Construct: arity missing from typechecker");
+
+                // Emit the args in REVERSE declaration order.
+                // After this, the stack top holds `args[0]` (the
+                // first payload value in source order). The VM's
+                // `MAKE_ENUM` pops the top arity values, reverses
+                // the buffer, and stores them in declaration
+                // order — so the final `ObjEnum::payload[i]`
+                // matches `args[i]`.
+                for arg in args.iter().rev() {
+                    bytecode.append(&mut self.do_compile(arg));
+                }
+
+                // Emit MAKE_ENUM with the tag (upper 16) and
+                // arity (lower 16) packed in the operand.
+                bytecode.push(
+                    Byte::new(Instruction::MakeEnum)
+                        .with_operands_u16([tag as u16, arity as u16]),
+                );
             }
             Expression::Match { scrutinee, arms } => {
-                // Recurse into the scrutinee and each arm body so
-                // their bytecodes are emitted; the pattern
-                // matching / branch logic is rewritten in 15C.
-                bytecode.append(&mut self.do_compile(scrutinee));
-                for arm in arms {
-                    let _ = &arm.pattern; // patterns are not expressions
-                    bytecode.append(&mut self.do_compile(&arm.body));
+                // ---- Match codegen (Phase 15C) ----
+                //
+                // Strategy (canonical "threaded code" / "jump
+                // table" layout):
+                //
+                //   1. Emit the scrutinee (leaves it on the stack).
+                //   2. For each non-last arm with a constructor
+                //      pattern, emit a `JUMP_IF_MATCH <tag,
+                //      target, arity>` placeholder.
+                //   3. For the LAST arm (or any wildcard/binding
+                //      arm reached by fall-through), emit the
+                //      scrutinee-consumer:
+                //        - Constructor last arm: `UNPACK <arity>`.
+                //        - Wildcard: `POP` to discard.
+                //        - Binding: `STORE <symbol>` to bind.
+                //   4. In REVERSE source order, emit each arm's
+                //      binding code (STORE/POP for sub-patterns)
+                //      followed by the arm body. For every
+                //      non-FIRST arm (in source order) emit a
+                //      `JMP <end>` placeholder after the body so
+                //      it doesn't fall through into the next
+                //      body. The LAST arm body has no JMP after
+                //      it — execution proceeds to the
+                //      JMP-to-end of the previous arm and exits
+                //      the match.
+                //   5. Patch JUMP_IF_MATCH placeholders to point
+                //      to each arm body's absolute offset, and
+                //      JMP-to-end placeholders to point to the
+                //      END of the match (just past the FIRST arm
+                //      body in source order).
+                //
+                // Resulting bytecode (for `match x { A => a,
+                // B => b, C => c }`):
+                //
+                //   <scrutinee bytecode>
+                //   JUMP_IF_MATCH tag_A, target_body_A, _
+                //   JUMP_IF_MATCH tag_B, target_body_B, _
+                //   UNPACK arity_C
+                //   body_c            ← reached by fall-through
+                //   JMP end            ← skipped after body_c
+                //   body_b            ← reached via JUMP_IF_MATCH B
+                //   JMP end            ← skipped after body_b
+                //   body_a            ← reached via JUMP_IF_MATCH A
+                //   ← match end here
+
+                if arms.is_empty() {
+                    // No arms — emit the scrutinee so the stack
+                    // doesn't accumulate a dangling value, then
+                    // POP it.
+                    bytecode.append(&mut self.do_compile(scrutinee));
+                    bytecode.push(Byte::new(Instruction::POP));
+                } else {
+                    // Phase 15C match codegen.
+                    //
+                    // We use the canonical "threaded code" /
+                    // "jump table" layout. Bytecode is:
+                    //
+                    //   1. Emit the scrutinee (leaves it on
+                    //      the stack).
+                    //   2. For each non-last arm with a
+                    //      constructor pattern, emit a
+                    //      `JUMP_IF_MATCH tag, target, arity`
+                    //      placeholder.
+                    //   3. For the LAST arm (or any
+                    //      wildcard/binding arm), emit the
+                    //      scrutinee-consumer: `UNPACK arity`
+                    //      (constructor last arm), `POP`
+                    //      (wildcard), or `STORE symbol`
+                    //      (binding).
+                    //   4. Emit the LAST arm's binding code
+                    //      (STORE / POP for sub-patterns).
+                    //   5. Emit the LAST arm's body.
+                    //   6. (No JMP needed after the last arm.)
+                    //   7. For arm N-1, N-2, ..., 1 (in
+                    //      REVERSE source order):
+                    //      a. Emit binding code.
+                    //      b. Emit the arm body.
+                    //      c. Emit JMP-to-end (skip past
+                    //         the remaining arm bodies to
+                    //         the END of the match).
+                    //   8. Finally, emit arm 0's binding code
+                    //      and body (no JMP after — arm 0 is
+                    //      the last body in the bytecode, so
+                    //      nothing to skip).
+                    //
+                    // After emission we patch the
+                    // JUMP_IF_MATCH placeholders with the
+                    // absolute offsets of each arm body, and
+                    // the JMP-to-end placeholders with the
+                    // absolute offset just past all the arm
+                    // bodies (the END of the match).
+
+                    // Step 1: scrutinee.
+                    let scrutinee_bc = self.do_compile(scrutinee);
+                    self.bytecode.extend(scrutinee_bc);
+
+                    // Step 2 + 3: emit JUMP_IF_MATCH
+                    // placeholders for non-last constructor
+                    // arms, then the scrutinee-consumer for
+                    // the last arm.
+                    let mut jump_if_match_places: Vec<(usize, u32)> = Vec::new();
+
+                    for (i, arm) in arms.iter().enumerate() {
+                        let is_last = i == arms.len() - 1;
+
+                        match &arm.pattern {
+                            Pattern::Constructor {
+                                enum_name,
+                                variant_name,
+                                payload,
+                            } => {
+                                let tag = self
+                                    .checker
+                                    .tag_for(enum_name, variant_name)
+                                    .expect("Match arm constructor: typechecker should have registered the enum");
+                                if !is_last {
+                                    // Non-last constructor arm
+                                    // — emit JUMP_IF_MATCH with
+                                    // placeholder target.
+                                    let placeholder = self.bytecode.len();
+                                    jump_if_match_places.push((placeholder, tag));
+                                    self.bytecode.push(
+                                        Byte::new(Instruction::JumpIfMatch)
+                                            .with_operands_u16([tag as u16, 0]),
+                                    );
+                                } else {
+                                    // Last constructor arm —
+                                    // emit UNPACK. The scrutinee
+                                    // is still on the stack
+                                    // because every previous
+                                    // JUMP_IF_MATCH fell through.
+                                    let arity = self
+                                        .checker
+                                        .arity_for(enum_name, variant_name)
+                                        .expect("Match arm constructor: typechecker should have registered the arity");
+                                    self.bytecode.push(
+                                        Byte::new(Instruction::Unpack)
+                                            .with_operand_u32(arity as u32),
+                                    );
+                                    let _ = payload; // silence unused; payload handled below
+                                }
+                            }
+                            Pattern::Wildcard => {
+                                // Wildcard arm — POP the
+                                // scrutinee.
+                                self.bytecode.push(Byte::new(Instruction::POP));
+                            }
+                            Pattern::Binding { name } => {
+                                // Binding arm — STORE the
+                                // scrutinee under the
+                                // binding's symbol.
+                                let symbol =
+                                    self.context.variables.intern(name.to_string());
+                                self.bytecode.push(
+                                    Byte::new(Instruction::STORE)
+                                        .with_operand_u32(symbol as u32),
+                                );
+                            }
+                        }
+                    }
+
+                    // Step 4-8: emit each arm's binding code
+                    // and body. We go in REVERSE source order
+                    // so the bytecode layout is:
+                    //   [last arm body]
+                    //   [JMP end (skip remaining)]
+                    //   [second-to-last arm body]
+                    //   [JMP end]
+                    //   ...
+                    //   [first arm body]
+                    //
+                    // Each non-first arm body is preceded by
+                    // JMP-to-end so it doesn't fall through
+                    // into the next body.
+                    let mut arm_body_offsets: Vec<usize> =
+                        vec![0; arms.len()];
+                    let mut jmp_to_end_places: Vec<usize> = Vec::new();
+
+                    // We process arms in reverse order so the
+                    // LAST arm body comes first in the
+                    // bytecode, then non-last arms with
+                    // JMP-to-end after each.
+                    for i in (0..arms.len()).rev() {
+                        let arm = &arms[i];
+                        let is_first = i == 0;
+
+                        // Record the offset where this arm
+                        // body starts (absolute in
+                        // self.bytecode). JUMP_IF_MATCH for
+                        // this arm (if any) was emitted earlier
+                        // with a placeholder; we patch the
+                        // placeholder to point here.
+                        arm_body_offsets[i] = self.bytecode.len();
+
+                        // Emit binding code for this arm's
+                        // sub-patterns.
+                        if let Pattern::Constructor { payload, .. } = &arm.pattern {
+                            for sub_pat in payload {
+                                emit_pattern_binding(
+                                    &mut self.context.variables,
+                                    sub_pat,
+                                    &mut self.bytecode,
+                                );
+                            }
+                        }
+
+                        // Emit the arm body.
+                        let body_bc = self.do_compile(&arm.body);
+                        self.bytecode.extend(body_bc);
+
+                        // For non-first arms, emit a
+                        // JMP-to-end placeholder so the arm
+                        // body doesn't fall through into the
+                        // next (previous-in-source-order) arm
+                        // body.
+                        if !is_first {
+                            jmp_to_end_places.push(self.bytecode.len());
+                            self.bytecode
+                                .push(Byte::new(Instruction::JMP).with_operand_u32(0));
+                        }
+                    }
+
+                    // The END of the match is just past the
+                    // last (first-in-source-order) arm body
+                    // — i.e., the current self.bytecode.len().
+                    let end_offset = self.bytecode.len() as u32;
+
+                    // Patch JMP-to-end placeholders.
+                    for place in jmp_to_end_places {
+                        self.bytecode[place] = Byte::new(Instruction::JMP)
+                            .with_operand_u32(end_offset);
+                    }
+
+                    // Patch JUMP_IF_MATCH placeholders.
+                    // Each placeholder corresponds to the arm
+                    // whose tag it tests; in source order, the
+                    // i-th JUMP_IF_MATCH is for the i-th
+                    // non-last constructor arm.
+                    let mut non_last_index = 0;
+                    for i in 0..arms.len() {
+                        // Skip arms that don't emit a
+                        // JUMP_IF_MATCH (non-constructor
+                        // arms or the last arm).
+                        let is_last = i == arms.len() - 1;
+                        let is_constructor = matches!(
+                            &arms[i].pattern,
+                            Pattern::Constructor { .. }
+                        );
+                        if is_last || !is_constructor {
+                            continue;
+                        }
+                        let (place, tag) = jump_if_match_places[non_last_index];
+                        let target = arm_body_offsets[i] as u16;
+                        self.bytecode[place] = Byte::new(Instruction::JumpIfMatch)
+                            .with_operands_u16([tag as u16, target]);
+                        non_last_index += 1;
+                    }
                 }
             }
 
@@ -913,5 +1311,91 @@ mod tests {
         let _bc = c.compile("test", &ast);
         let msgs = std::mem::take(&mut c.messages);
         assert!(msgs.is_empty(), "expected no messages, got: {:?}", msgs);
+    }
+
+    // ============================================================
+    //  Phase 15C: sum types and pattern matching codegen
+    // ============================================================
+
+    /// Codegen test 1: a constructor call emits a `MAKE_ENUM`
+    /// with the correct tag and arity in the operand (upper 16
+    /// bits = tag, lower 16 bits = arity).
+    #[test]
+    fn construct_emits_make_enum_with_correct_tag_and_arity() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Option { None, Some(int) } let x = Option::Some(42);",
+        );
+
+        // Find the MAKE_ENUM instruction. Its operands encode
+        // (tag, arity) — for `Option::Some(42)`, tag=1, arity=1.
+        let make_enum = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeEnum))
+            .expect("expected at least one MakeEnum in the bytecode");
+        let tag = (make_enum.operand_u32() >> 16) as u16;
+        let arity = (make_enum.operand_u32() & 0xFFFF) as u16;
+        assert_eq!(tag, 1, "expected tag=1 (Some)");
+        assert_eq!(arity, 1, "expected arity=1 for Some(int)");
+    }
+
+    /// Codegen test 2: a `match` with multiple constructor arms
+    /// emits a cascade of `JUMP_IF_MATCH` instructions
+    /// (one per non-last constructor arm).
+    #[test]
+    fn match_emits_jump_if_match_cascade() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Option { None, Some(int) } \
+             match Option::Some(1) { \
+                 Option::None() => 0, \
+                 Option::Some(v) => v, \
+             };",
+        );
+
+        // Two arms, both constructor. Two JUMP_IF_MATCH should
+        // be emitted (one per arm — actually only one, since
+        // arm 0 is non-last and arm 1 is last. So we expect 1
+        // JUMP_IF_MATCH and 1 UNPACK.
+        let jump_if_match_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
+            .count();
+        let unpack_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::Unpack))
+            .count();
+        assert_eq!(
+            jump_if_match_count, 1,
+            "expected 1 JUMP_IF_MATCH (one per non-last constructor arm)"
+        );
+        assert_eq!(
+            unpack_count, 1,
+            "expected 1 UNPACK (one for the last constructor arm)"
+        );
+    }
+
+    /// Codegen test 3: a wildcard match arm emits `POP` to
+    /// discard the scrutinee.
+    #[test]
+    fn wildcard_match_arm_emits_pop() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Option { None, Some(int) } \
+             let x = Option::Some(42); \
+             match x { _ => 42 };",
+        );
+
+        // The wildcard arm is the LAST (and only) arm, reached
+        // by fall-through from the scrutinee. It emits `POP` to
+        // discard the scrutinee.
+        let pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::POP))
+            .count();
+        assert!(
+            pop_count >= 1,
+            "expected at least one POP for the wildcard scrutinee"
+        );
     }
 }
