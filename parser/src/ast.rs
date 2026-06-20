@@ -100,8 +100,6 @@ pub enum Expression<'expr> {
         body: Output<'expr>,
     },
 
-    Match(Output<'expr>, Vec<(Output<'expr>, Output<'expr>)>),
-
     Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
 
@@ -114,6 +112,101 @@ pub enum Expression<'expr> {
     Update(Output<'expr>, Output<'expr>),
 
     Instantiate(Output<'expr>, Option<Vec<Output<'expr>>>),
+
+    // ---- Phase 15A: sum types and pattern matching ----
+    /// `enum Name { Variant1, Variant2(T1, T2), ... }` — a top-level
+    /// sum-type declaration. Carries no executable body; the
+    /// declaration is registered with the typechecker in 15B and the
+    /// code emitter in 15C. In 15A, parsing produces this node so the
+    /// AST is stable, but downstream passes stub it out (see
+    /// `infer.rs` and `lib.rs`).
+    EnumDecl {
+        name: &'expr str,
+        variants: Vec<Output<'expr>>,
+    },
+    /// One variant inside an `EnumDecl` payload list. The payload
+    /// types are wrapped as `Expression::Type(...)` (matching the
+    /// existing `class` field syntax) so the parser can re-use the
+    /// same type-name production. Zero-arity variants carry an empty
+    /// payload.
+    EnumVariant {
+        name: &'expr str,
+        payload: Vec<Output<'expr>>,
+    },
+    /// `EnumName::Variant(args...)` — a *qualified* constructor
+    /// application. The enum name is required (bare `Variant(...)` is
+    /// parsed as a `Call`, not a `Construct`).
+    Construct {
+        enum_name: &'expr str,
+        variant_name: &'expr str,
+        args: Vec<Output<'expr>>,
+    },
+    /// `match scrutinee { pat => body, ... }` — pattern matching. The
+    /// pre-walk walks the `scrutinee` and each arm's `body`; pattern
+    /// descendants are walked separately by the HM pre-walk helper
+    /// (see `compiler::typechecking::id::pre_walk_pattern`).
+    Match {
+        scrutinee: Output<'expr>,
+        arms: Vec<MatchArm<'expr>>,
+    },
+}
+
+/// One arm inside an `Expression::Match`. The pattern is
+/// `Pattern<'expr>`; the body is the standard `Output<'expr>`
+/// expression wrapper.
+#[derive(Clone, PartialEq, Debug)]
+pub struct MatchArm<'expr> {
+    pub pattern: Pattern<'expr>,
+    pub body: Output<'expr>,
+}
+
+/// Patterns matched against the scrutinee in a `match` expression.
+///
+/// - `Wildcard` matches anything and binds nothing. Produced for both
+///   the `_` and `default` source tokens; the literal token is
+///   discarded during parsing (Decision C in the Phase 15A plan).
+/// - `Binding { name }` matches anything and binds `name` to the
+///   scrutinee. (Implemented as a 15B hook; 15A only parses it.)
+/// - `Constructor` matches a specific enum variant. The payload list
+///   has the same arity as the variant's payload; nested patterns
+///   enable tuple destructuring.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Pattern<'expr> {
+    Wildcard,
+    Binding { name: &'expr str },
+    Constructor {
+        enum_name: &'expr str,
+        variant_name: &'expr str,
+        payload: Vec<Pattern<'expr>>,
+    },
+}
+
+impl<'a> Display for Pattern<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard => write!(f, "_"),
+            Self::Binding { name } => write!(f, "{}", name),
+            Self::Constructor {
+                enum_name,
+                variant_name,
+                payload,
+            } => {
+                write!(f, "{}::{}", enum_name, variant_name)?;
+                if !payload.is_empty() {
+                    write!(
+                        f,
+                        "({})",
+                        payload
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<'a> Display for Expression<'a> {
@@ -218,6 +311,73 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{} = {}", n.1, e.1)
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
+            Self::EnumDecl { name, variants } => {
+                let vs = variants
+                    .iter()
+                    .map(|v| match v.1.as_ref() {
+                        Self::EnumVariant { name, payload } => {
+                            if payload.is_empty() {
+                                name.to_string()
+                            } else {
+                                format!(
+                                    "{}({})",
+                                    name,
+                                    payload
+                                        .iter()
+                                        .map(|p| p.1.to_string())
+                                        .collect::<Vec<String>>()
+                                        .join(", ")
+                                )
+                            }
+                        }
+                        _ => String::from("?"),
+                    })
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(f, "enum {} {{ {} }}", name, vs)
+            }
+            Self::EnumVariant { name, payload } => {
+                if payload.is_empty() {
+                    write!(f, "{}", name)
+                } else {
+                    write!(
+                        f,
+                        "{}({})",
+                        name,
+                        payload
+                            .iter()
+                            .map(|p| p.1.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )
+                }
+            }
+            Self::Construct {
+                enum_name,
+                variant_name,
+                args,
+            } => write!(
+                f,
+                "{}::{}({})",
+                enum_name,
+                variant_name,
+                args.iter()
+                    .map(|a| a.1.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+            Self::Match { scrutinee, arms } => {
+                let as_str = arms
+                    .iter()
+                    .map(|a| {
+                        let pat = a.pattern.to_string();
+                        let body = a.body.1.to_string();
+                        format!("{} => {}", pat, body)
+                    })
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(f, "match {} {{ {} }}", scrutinee.1, as_str)
+            }
             e => todo!("Missing rest of nodes: {}", e),
         }
     }
