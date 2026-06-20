@@ -3,7 +3,19 @@ use std::{borrow::Borrow, fmt::Display};
 use chumsky::span::SimpleSpan;
 pub type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug, Copy)]
+pub enum Visibility {
+    Private,
+    Public,
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Visibility::Private
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
 pub enum Expression<'expr> {
     Noop(Output<'expr>),
     Integer(i64),
@@ -95,11 +107,11 @@ pub enum Expression<'expr> {
 
     Implementation(&'expr str, &'expr str, Vec<Output<'expr>>),
     Class(&'expr str, Vec<Output<'expr>>),
-    Field(Output<'expr>, Output<'expr>),
-    Method(bool, Output<'expr>),
+    Field(Visibility, Output<'expr>, Output<'expr>),
+    Method(Visibility, Output<'expr>),
     Member(Output<'expr>),
-    Access(&'expr str),
-    Update(&'expr str, Output<'expr>),
+    Access(Output<'expr>, &'expr str),
+    Update(Output<'expr>, Output<'expr>),
 
     Instantiate(Output<'expr>, Option<Vec<Output<'expr>>>),
 }

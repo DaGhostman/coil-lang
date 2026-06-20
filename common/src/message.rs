@@ -8,7 +8,7 @@ pub enum MessageKind {
     INFO,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone)]
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct Label {
     message: String,
     range: Range<usize>,
@@ -33,7 +33,7 @@ impl ToString for Label {
     }
 }
 
-#[derive(Hash, PartialEq, Eq, Clone)]
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct Message {
     kind: MessageKind,
     message: String,

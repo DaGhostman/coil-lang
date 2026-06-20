@@ -1,4 +1,4 @@
-use ast::{Expression, Output};
+use ast::{Expression, Output, Visibility};
 use std::{
     marker::PhantomData,
     num::{ParseFloatError, ParseIntError},
@@ -126,21 +126,40 @@ impl<'pratt> Pratt<'pratt> {
         recursive(|expr| {
             let atom = choice((
                 self.call(expr.clone()),
-                self.int(),
+                self.instantiate(expr.clone()),
+                // float comes before int so that `1.0` is parsed as a
+                // float, not an `int` `1` followed by a stray `.0`.
                 self.float(),
+                self.int(),
+                self.string(),
+                // Keyword atoms come before self.ident() so they're
+                // registered in chumsky's KEYWORDS set before the
+                // identifier parser is built (which then refuses to
+                // match them).
+                keyword!("true")
+                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
+                    .labelled("boolean"),
+                keyword!("false")
+                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
+                    .labelled("boolean"),
+                keyword!("new")
+                    .ignore_then(text::ident())
+                    .map_with(|class, e| {
+                        let class_output = (e.span(), Box::new(Expression::Identifier(class)));
+                        (
+                            e.span(),
+                            Box::new(Expression::Instantiate(class_output, None)),
+                        )
+                    })
+                    .labelled("new"),
                 self.ident(),
-                op!("true")
-                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
-                    .labelled("boolean"),
-                op!("false")
-                    .map_with(|state, e| (e.span(), Box::new(Expression::Bool(state == "true"))))
-                    .labelled("boolean"),
             ));
 
             choice((atom, self.group(expr.clone()))).pratt((
-                postfix(Precedence::Unary as u16, op!('!'), |lhs, _, e| {
-                    (e.span(), Box::new(Expression::Not(lhs)))
-                }),
+                // No postfix `!` here — it would conflict with `!=`
+                // (which should be parsed as a single infix operator).
+                // Bitwise/logical negation is the prefix `~` operator,
+                // listed further down.
                 infix(
                     right(Precedence::Binary as u16),
                     op!("<<"),
@@ -192,12 +211,15 @@ impl<'pratt> Pratt<'pratt> {
                 ),
                 infix(
                     right(Precedence::Compare as u16),
+                    // Multi-character operators come first so that
+                    // `>=` is matched as `>=` rather than as `>`
+                    // followed by `=`.
                     choice((
                         op!("=="),
                         op!("!="),
-                        op!(">"),
                         op!(">="),
                         op!("<="),
+                        op!(">"),
                         op!("<"),
                     )),
                     |lhs, op, rhs, e| {
@@ -430,15 +452,12 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("if")
             .ignore_then(self.expr())
             .then(self.block(stmt))
-            .map_with(|(iterable, body), e| {
-                (
+            .map_with(|(cond, body), e| {
+                let branch: Output = (
                     e.span(),
-                    Box::new(Expression::Loop {
-                        identifier: None,
-                        iterable,
-                        body,
-                    }),
-                )
+                    Box::new(Expression::Branch(Some(cond), body)),
+                );
+                (e.span(), Box::new(Expression::If(vec![branch])))
             })
     }
 
@@ -512,10 +531,136 @@ impl<'pratt> Pratt<'pratt> {
         let stmt = self.statement();
 
         choice((
+            self.class(),
+            self.impl_block(stmt.clone()),
             self.func(stmt.clone()),
             self.defer(stmt.clone()),
             stmt.clone(),
         ))
+    }
+
+    /// `class Name { [pub] field: Type, ... }`
+    ///
+    /// Fields are private by default; `pub` makes them public.
+    fn class(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("class")
+            .ignore_then(text::ident())
+            .then(
+                self.field_decl()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(name, fields), e| (e.span(), Box::new(Expression::Class(name, fields))))
+    }
+
+    /// `[pub] name: Type` — a class field declaration.
+    fn field_decl(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("pub")
+            .or_not()
+            .then(text::ident())
+            .then_ignore(op!(":"))
+            .then(text::ident().map_with(output!(Type)))
+            .map_with(|((vis, name), ty), e| {
+                let visibility = if vis.is_some() {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                let name_output: Output = (e.span(), Box::new(Expression::Identifier(name)));
+                (
+                    e.span(),
+                    Box::new(Expression::Field(visibility, name_output, ty)),
+                )
+            })
+    }
+
+    /// `impl Owner { [pub] fn ... , ... }`
+    ///
+    /// Methods are private by default; `pub` makes them public.
+    /// `what` (the trait name) is not yet used — implementations are
+    /// always for the owner class.
+    fn impl_block<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("impl")
+            .ignore_then(text::ident())
+            .then(
+                self.method_decl(stmt)
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(owner, methods), e| {
+                // Empty `what` — trait implementations are not yet supported.
+                (
+                    e.span(),
+                    Box::new(Expression::Implementation("", owner, methods)),
+                )
+            })
+    }
+
+    /// `[pub] fn name(...) -> ret { body }` — a method declaration
+    /// inside an `impl` block.
+    fn method_decl<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("pub")
+            .or_not()
+            .then(self.func(stmt))
+            .map_with(|(vis, func), e| {
+                let visibility = if vis.is_some() {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                (e.span(), Box::new(Expression::Method(visibility, func)))
+            })
+    }
+
+    /// `new ClassName(args)` — instantiation.
+    ///
+    /// Constructed as an atom-style parser so it can be embedded in
+    /// expressions. Returns `(ClassName, args)` via `Instantiate`.
+    fn instantiate<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("new")
+            .ignore_then(text::ident())
+            .then(self.params(expr))
+            .map_with(|(class, args), e| {
+                let class_output = (e.span(), Box::new(Expression::Identifier(class)));
+                (
+                    e.span(),
+                    Box::new(Expression::Instantiate(class_output, args)),
+                )
+            })
     }
 
     fn variable(

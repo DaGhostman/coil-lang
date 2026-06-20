@@ -1,14 +1,16 @@
 mod pipeline;
-mod typechecker;
 mod typechecking;
 
 use std::{borrow::Borrow, collections::HashMap};
 
 use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
-use parser::{SimpleSpan, ast::Expression};
+use parser::{
+    SimpleSpan,
+    ast::{Expression, Output},
+};
 
 pub use pipeline::*;
-pub use typechecker::*;
+pub use typechecking::{Checker, Ty};
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -52,7 +54,14 @@ pub struct Compiler {
     messages: Vec<Message>,
     context: Context,
     // --
-    typechecker: Typechecker,
+    /// Hindley–Milner checker. Run once per `compile` via
+    /// `Checker::check_program`; its cache is consulted by `do_compile`
+    /// to pick `ADD` vs `ADDF`, `==` vs `==` (floats), etc.
+    checker: crate::typechecking::Checker,
+    /// Index into [`crate::typechecking::Checker::ids`] used by
+    /// `do_compile` to recover the `NodeId` of the node it's currently
+    /// emitting. Reset at the start of each `compile`.
+    emit_idx: usize,
 }
 
 impl Default for Compiler {
@@ -74,7 +83,8 @@ impl Default for Compiler {
             messages: Vec::default(),
             context: Context::default(),
             // ---
-            typechecker: Typechecker::default(),
+            checker: crate::typechecking::Checker::new(),
+            emit_idx: 0,
         }
     }
 }
@@ -111,11 +121,11 @@ impl Compiler {
         &self.messages
     }
 
-    pub fn register(&mut self, name: &str, params: &[Type], returns: Type) -> &mut Self {
+    pub fn register(&mut self, name: &str, params: &[Ty], returns: &Ty) -> &mut Self {
         let idx = self.native.len();
         self.native.insert(name.to_string(), idx);
-        self.typechecker
-            .register_native_function(name, params, returns);
+        // Phase 10: only the HM checker is used now.
+        self.checker.register_native(name, params, returns);
 
         self
     }
@@ -133,8 +143,31 @@ impl Compiler {
         }
     }
 
-    fn typecheck<'check>(&mut self, ast: &(SimpleSpan, Box<Expression<'check>>)) -> Type {
-        self.typechecker.check(ast)
+    /// Look up the inferred type of the `lhs` we're about to use as
+    /// the operand of a binary operator. The ID for `lhs` lives at
+    /// the current `emit_idx` (since `lhs` is the next AST node to be
+    /// visited). Returns true iff that type is the float constructor.
+    ///
+    /// Recurses into `lhs` and `rhs`, appending their bytecodes to
+    /// `bytecode` in the same order as the legacy emitter. The caller
+    /// is then responsible for emitting the operator-specific
+    /// instruction.
+    fn compile_binary_operands(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        lhs: &Output,
+        rhs: &Output,
+    ) -> bool {
+        // Capture lhs's ID before recursing — `do_compile(lhs)`
+        // advances `emit_idx` past lhs's entire subtree.
+        let lhs_id = self.checker.id_table().ids()[self.emit_idx];
+        bytecode.append(&mut self.do_compile(lhs));
+        bytecode.append(&mut self.do_compile(rhs));
+        matches!(
+            self.checker.lookup_at(lhs_id),
+            Some(crate::typechecking::ty::Ty::Con(ref name))
+                if name == crate::typechecking::ty::FLOAT
+        )
     }
 
     fn do_compile<'compiler>(
@@ -142,7 +175,12 @@ impl Compiler {
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let mut bytecode = vec![];
-        let _type = self.typecheck(ast);
+        // Phase 9: pull the next `NodeId` from the pre-walk's
+        // minting order. Both `do_compile` and `Checker::infer` walk
+        // the AST in pre-order, so the `n`-th call here consumes the
+        // `n`-th ID. We use it later for opcode selection.
+        let _self_id = self.checker.id_table().ids()[self.emit_idx];
+        self.emit_idx += 1;
         let (span, child) = ast;
 
         match child.borrow() {
@@ -295,7 +333,7 @@ impl Compiler {
                         .iter()
                         .enumerate()
                         .map(|(idx, v)| match v.1.borrow() {
-                            Expression::Field(n, _) => (self.resolve_variable(n), idx),
+                            Expression::Field(_, n, _) => (self.resolve_variable(n), idx),
                             _ => unreachable!(
                                 "The should be only fields inside of a class definition"
                             ),
@@ -488,56 +526,36 @@ impl Compiler {
                 });
             }
             Expression::Le(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
-                        Instruction::LEF
-                    } else {
-                        Instruction::LE
-                    },)
-                );
+                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::LEF
+                } else {
+                    Instruction::LE
+                }));
             }
             Expression::Gt(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
-                        Instruction::GTF
-                    } else {
-                        Instruction::GT
-                    },)
-                );
+                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::GTF
+                } else {
+                    Instruction::GT
+                }));
             }
             Expression::Leq(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
-                        Instruction::LEQF
-                    } else {
-                        Instruction::LEQ
-                    })
-                );
+                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::LEQF
+                } else {
+                    Instruction::LEQ
+                }));
             }
             Expression::Geq(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if self.typecheck(lhs) == Type::FLOAT {
-                        Instruction::GEQF
-                    } else {
-                        Instruction::GEQ
-                    })
-                );
+                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::GEQF
+                } else {
+                    Instruction::GEQ
+                }));
             }
             Expression::Eq(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
@@ -549,69 +567,44 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                        Instruction::ADDF
-                    } else {
-                        Instruction::ADD
-                    },)
-                );
+                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::ADDF
+                } else {
+                    Instruction::ADD
+                }));
             }
             Expression::Sub(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                        Instruction::SUBF
-                    } else {
-                        Instruction::SUB
-                    },)
-                );
+                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::SUBF
+                } else {
+                    Instruction::SUB
+                }));
             }
             Expression::Mul(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                        Instruction::MULF
-                    } else {
-                        Instruction::MUL
-                    },)
-                );
+                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                }));
             }
             Expression::Mod(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                        Instruction::MODF
-                    } else {
-                        Instruction::MOD
-                    },)
-                );
+                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::MODF
+                } else {
+                    Instruction::MOD
+                }));
             }
             Expression::Div(lhs, rhs) => {
-                binary!(
-                    bytecode,
-                    self,
-                    lhs,
-                    rhs,
-                    Byte::new(if likely(self.typecheck(lhs) == Type::FLOAT) {
-                        Instruction::DIVF
-                    } else {
-                        Instruction::DIV
-                    },)
-                );
+                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::DIVF
+                } else {
+                    Instruction::DIV
+                }));
             }
             Expression::And(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::AND));
@@ -820,19 +813,123 @@ impl Compiler {
     ) -> Vec<Byte> {
         let ns = self.namespace.clone();
         self.namespace = module.to_string();
+
+        // Phase 9: run HM inference up-front. The cache populated here
+        // is consulted by `do_compile` for opcode selection (e.g.,
+        // `ADD` vs `ADDF`).
+        self.emit_idx = 0;
+        let _program_ty = self.checker.check_program(ast);
+
         let mut program = self.do_compile(ast);
         self.namespace = ns.to_string();
 
-        self.messages
-            .append(&mut self.typechecker.get_messages().collect());
-        // let messages = self.typechecker.get_messages();
-        // self.messages.reserve(messages.len());
-        // for message in messages {
-        //     self.messages.push(message.clone());
-        // }
+        // Drain the HM checker's messages into the pipeline-visible
+        // message list. The legacy typechecker is gone (Phase 10).
+        self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
 
         self.bytecode.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parser::Pratt;
+
+    fn compile_src(src: &str) -> Vec<Byte> {
+        let ast = Pratt::default().parse(src).expect("parse failed");
+        Compiler::default().compile("test", &ast)
+    }
+
+    /// End-to-end: a simple integer expression compiles to bytecode
+    /// using the HM checker's cache. We don't check exact bytes (those
+    /// change as the emitter evolves); we just verify the pipeline
+    /// runs without panicking and produces a non-empty bytecode.
+    #[test]
+    fn integer_arithmetic_emits_bytecode() {
+        let bc = compile_src("42;");
+        assert!(!bc.is_empty());
+    }
+
+    /// Float arithmetic should pick `ADDF` (float) instead of `ADD`
+    /// (int) — that's the whole point of the Phase 9 cache lookup.
+    #[test]
+    fn float_arithmetic_emits_float_opcode() {
+        use common::Instruction;
+        let bc = compile_src("1.0 + 2.0;");
+        // Find the binary operator instruction. The bytecode is
+        // initialised with CALL/JMP/HALT, then operand code, then the
+        // operator. We search for the LAST ADDF / ADD.
+        let mut last_binop: Option<&Instruction> = None;
+        for b in &bc {
+            if matches!(
+                b.bytecode(),
+                Instruction::ADDF | Instruction::ADD
+            ) {
+                last_binop = Some(b.bytecode());
+            }
+        }
+        assert!(
+            matches!(last_binop, Some(Instruction::ADDF)),
+            "expected ADDF for float arithmetic"
+        );
+    }
+
+    /// Integer arithmetic should pick `ADD`, not `ADDF`.
+    #[test]
+    fn integer_arithmetic_emits_int_opcode() {
+        use common::Instruction;
+        let bc = compile_src("1 + 2;");
+        let mut last_binop: Option<&Instruction> = None;
+        for b in &bc {
+            if matches!(
+                b.bytecode(),
+                Instruction::ADDF | Instruction::ADD
+            ) {
+                last_binop = Some(b.bytecode());
+            }
+        }
+        assert!(
+            matches!(last_binop, Some(Instruction::ADD)),
+            "expected ADD for integer arithmetic"
+        );
+    }
+
+    /// Mixed int+float picks float (because HM unifies the operands
+    /// and one is float). The pipeline emits a single, well-typed
+    /// result — either way, the test should not panic.
+    #[test]
+    fn mixed_int_float_arithmetic_emits_bytecode() {
+        let bc = compile_src("1 + 2.0;");
+        assert!(!bc.is_empty());
+    }
+
+    /// The HM checker should record diagnostic messages on type errors;
+    /// `compile` should drain them into the compiler's message list.
+    #[test]
+    fn type_errors_appear_in_messages() {
+        let ast = Pratt::default().parse("x;").expect("parse failed");
+        let mut c = Compiler::default();
+        c.compile("test", &ast);
+        assert!(
+            !c.messages.is_empty(),
+            "expected at least one error message for unknown identifier"
+        );
+    }
+
+    /// `register_native` adds the native to the HM checker. A subsequent
+    /// call to the native type-checks cleanly.
+    #[test]
+    fn register_native_visible_to_emitter() {
+        use crate::typechecking::ty::{string, unit};
+        let mut c = Compiler::default();
+        c.register("print", &[string()], &unit());
+        // `print "hi";` should compile without errors.
+        let ast = Pratt::default().parse("print \"hi\";").expect("parse failed");
+        let _bc = c.compile("test", &ast);
+        let msgs = std::mem::take(&mut c.messages);
+        assert!(msgs.is_empty(), "expected no messages, got: {:?}", msgs);
     }
 }
