@@ -62,6 +62,27 @@ pub enum Instruction {
     NATIVE,
     INIT,
     SET,
+
+    // ---- Phase 15C: sum types and pattern matching ----
+    //
+    // CRITICAL: these are APPENDED (not inserted) to keep the
+    // `#[repr(u8)]` discriminant values of every prior opcode
+    // stable. Inserting a new variant before `SET` would shift
+    // the numeric value of `SET` (and every later opcode) and
+    // silently corrupt every `.0s` archive ever compiled.
+    //
+    // Operand layout (Phase 15C):
+    // - `MAKE_ENUM`:    upper 16 bits = tag, lower 16 bits = arity.
+    // - `JUMP_IF_MATCH`: upper 16 bits = tag, lower 16 bits = target
+    //   offset (in bytecode positions). The payload arity is read
+    //   from the runtime enum object (`ObjEnum::payload.len()`) so
+    //   no separate arity field is needed.
+    // - `UNPACK`:       full u32 = arity (redundant with
+    //   `ObjEnum::payload.len()` but kept for symmetry with the
+    //   spec; the VM reads it from the enum at runtime).
+    MakeEnum,
+    JumpIfMatch,
+    Unpack,
 }
 
 impl From<u8> for Instruction {
