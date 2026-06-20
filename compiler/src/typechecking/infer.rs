@@ -2974,6 +2974,46 @@ mod tests {
     }
 
     #[test]
+    fn pattern_error_span_points_at_arm_body() {
+        // Regression test for the `0..0` pattern-error span bug.
+        // Pattern errors used to land at byte 0 of the source because
+        // `expected_ty_span_range` always returned `0..0`. After
+        // threading `arm.body.0.into_range()` through `infer_pattern`,
+        // the diagnostic for a wrong-arity pattern should anchor
+        // somewhere inside the source — NOT at byte 0.
+        let src = "let x = Option::Some(1); match x { Option::Some(a, b) => 0 }; enum Option { None, Some(int) }";
+        let (mut c, _) = check(src);
+        let src_len = src.len();
+        let msgs = c.take_messages();
+        assert!(
+            !msgs.is_empty(),
+            "expected at least one diagnostic for `{}`",
+            src
+        );
+        // The wrong-arity error from `infer_pattern` must NOT be
+        // at byte 0.
+        let arity_msg = msgs
+            .iter()
+            .find(|m| m.message().contains("expects"))
+            .expect("expected a wrong-arity pattern diagnostic");
+        let r = arity_msg.range();
+        assert!(
+            r.start > 0,
+            "pattern diagnostic anchored at byte 0 — `0..0` regression: \
+             range={:?} msg={:?} src={:?}",
+            r,
+            arity_msg.message(),
+            src
+        );
+        assert!(
+            r.end <= src_len,
+            "pattern diagnostic range {:?} exceeds source length {}",
+            r,
+            src_len
+        );
+    }
+
+    #[test]
     fn multiple_natives_coexist() {
         let mut c = Checker::new();
         c.register_native("print", &[string()], &unit_ty());
