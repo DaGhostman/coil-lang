@@ -2067,7 +2067,7 @@ impl Checker {
 /// Map a format specifier character to the type it expects.
 fn format_specifier_type(spec: char) -> &'static str {
     match spec {
-        'i' | 'd' | 'b' | 'x' | 'u' | 'p' => "int",
+        'i' | 'b' | 'x' | 'u' | 'p' => "int",
         'f' => "float",
         's' => "string",
         'z' => "bool",
@@ -2079,13 +2079,14 @@ fn format_specifier_type(spec: char) -> &'static str {
 /// type expected by `spec`.
 fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
     match spec {
-        'i' | 'd' | 'b' | 'x' | 'u' | 'p' => matches!(ty, Ty::Con(n) if n == "int"),
+        'i' | 'b' | 'x' | 'u' | 'p' => matches!(ty, Ty::Con(n) if n == "int"),
         'f' => matches!(ty, Ty::Con(n) if n == "float"),
         's' => matches!(ty, Ty::Con(n) if n == "string"),
         'z' => matches!(ty, Ty::Con(n) if n == "bool"),
-        // Unknown specifier — can't be matched; the caller will
-        // still record a diagnostic, but we don't want to say it
-        // matches every type.
+        // Unknown specifier (including `%d`, which the VM does not
+        // implement) — can't be matched; the caller will still
+        // record a diagnostic, but we don't want to say it matches
+        // every type.
         _ => false,
     }
 }
