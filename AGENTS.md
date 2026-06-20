@@ -211,18 +211,24 @@ Phase 15B plan appended to that document.
 | Unreachable arm | `Unreachable arm: this pattern is matched by an earlier arm` |
 | Format specifier mismatch | `Format specifier \`%s\` requires string, found int` + help |
 
-### Test counts (15B final)
+### Test counts (15B + post-review fixes final)
 
 | Suite | Count |
 |-------|-------|
-| `compiler/src/typechecking/*` (unit) | 237 |
-| `compiler/tests/diagnostics.rs` (golden integration) | 22 |
+| `compiler/src/typechecking/*` (unit) | 239 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 24 |
 | `compiler/src/lib.rs::tests` (end-to-end pipeline) | included above |
 | `compiler/src/pipeline.rs::tests` (ariadne integration) | included above |
 | `common` | 2 |
-| `parser` | 3 |
+| `parser` | 9 |
 | doctests | 6 |
-| **Total** | **278** |
+| **Total** | **282** |
+
+15B landed at 278 tests. Post-review (Fixes 1, 2, 4 in this
+phase) added 4 regression tests: one for the ID-alignment
+regression in `infer_enum_decl`, one for pattern-error span
+anchoring, and two for the `%z` bool format specifier (positive
+and negative).
 
 ### Build status (15B)
 
