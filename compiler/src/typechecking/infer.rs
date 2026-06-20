@@ -1437,14 +1437,22 @@ impl Checker {
             }
         };
 
-        // Walk each variant. We must recurse into the payload
-        // children to keep ID consumption aligned with the
-        // pre-walk (which minted an ID for each `Expression::Type`
-        // inside the variant). The pre-pass has already parsed
-        // the payload types; the recursion is purely for
-        // ID-alignment.
+        // Walk each variant. We delegate to `self.infer(v)` for the
+        // whole variant — its `EnumVariant` arm in `infer_inner`
+        // recurses into the payload children. That gives us
+        // exactly `1 + len(payload)` IDs per variant, which matches
+        // what the pre-walk mints (one for the `EnumVariant` node
+        // plus one per payload `Expression::Type`). The pre-pass
+        // has already parsed the payload types, so the infer
+        // recursion is purely for ID-alignment.
         let mut built_variants: Vec<(String, Vec<Ty>)> = Vec::new();
         for (i, v) in variants.iter().enumerate() {
+            // Consume IDs for the variant itself + its payload
+            // before any early `continue`. The pre-walk visited
+            // this node and its payload regardless of whether we
+            // accept it.
+            let _ = self.infer(v);
+
             if let Expression::EnumVariant {
                 name: vname,
                 payload,
@@ -1458,19 +1466,12 @@ impl Checker {
 
                 // Sanity: name + arity should match the pre-pass
                 // shape. If not, the pre-pass has already
-                // complained — fall back to safe defaults.
+                // complained — skip registering this variant but
+                // keep IDs aligned (already done above).
                 if pre_shape.get(i) != Some(&vname_str)
                     || pre_pay.len() != payload.len()
                 {
-                    for p in payload {
-                        let _ = self.infer(p);
-                    }
                     continue;
-                }
-                // Recurse into the payload so ID consumption
-                // stays aligned.
-                for p in payload {
-                    let _ = self.infer(p);
                 }
                 built_variants.push((vname_str, pre_pay));
             }
