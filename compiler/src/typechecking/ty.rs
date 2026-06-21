@@ -52,7 +52,8 @@ impl TyVarId {
 ///   variant inside a sum. The `owner` is the parent sum type (kept
 ///   as a `Box` so the `Ty` is cheap to clone). `tag` is the
 ///   zero-based variant index in the owner's `variants` list;
-///   `arity` is cached to spare codegen a per-call lookup.
+///   `arity` is cached to spare codegen a per-call lookup. `arity`
+///   counts the total number of fields (0 for Unit, N for Tuple/Record).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Var(TyVarId),
@@ -62,13 +63,77 @@ pub enum Ty {
     List(Box<Ty>),
     Sum {
         name: String,
-        variants: Vec<(String, Vec<Ty>)>,
+        variants: Vec<(String, EnumVariantPayloadTy)>,
     },
     Constructor {
         owner: Box<Ty>,
         tag: u32,
         arity: usize,
     },
+}
+
+/// The payload shape of a single `Ty::Sum` variant. Phase 17B
+/// introduced this as an EXPLICIT shape enum (not a synthetic-name
+/// trick — see the 17B red-team finding #1). The shape is preserved
+/// end-to-end through unification, pretty-printing, and codegen
+/// reordering.
+///
+/// Field naming rules:
+///
+/// - `Unit` — no fields.
+/// - `Tuple(Vec<Ty>)` — positional types, in declaration order.
+/// - `Record(Vec<(String, Ty)>)` — `(field_name, field_type)` pairs,
+///   in declaration order. Field names are needed for matching
+///   record-pattern bindings to their declaration-order slot
+///   positions and for typechecker shape-mismatch errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumVariantPayloadTy {
+    Unit,
+    Tuple(Vec<Ty>),
+    Record(Vec<(String, Ty)>),
+}
+
+impl EnumVariantPayloadTy {
+    /// Number of fields (0 for Unit, N for Tuple/Record). Used by
+    /// codegen to know how many stack values to push/pop.
+    pub fn field_count(&self) -> usize {
+        match self {
+            EnumVariantPayloadTy::Unit => 0,
+            EnumVariantPayloadTy::Tuple(tys) => tys.len(),
+            EnumVariantPayloadTy::Record(fields) => fields.len(),
+        }
+    }
+
+    /// Iterate the field types in declaration order. Used by the
+    /// typechecker to unify record-pattern / record-call-site
+    /// shapes against the declared shape (declaration order).
+    pub fn field_types(&self) -> Vec<&Ty> {
+        match self {
+            EnumVariantPayloadTy::Unit => Vec::new(),
+            EnumVariantPayloadTy::Tuple(tys) => tys.iter().collect(),
+            EnumVariantPayloadTy::Record(fields) => {
+                fields.iter().map(|(_, ty)| ty).collect()
+            }
+        }
+    }
+
+    /// `(field_name, field_type)` pairs in declaration order. The
+    /// bridge between Tuple and Record for codegen reordering —
+    /// tuple variants get synthetic names `"0"`, `"1"`, …; record
+    /// variants get their declared names. This helper is used ONLY
+    /// at the codegen level (see 17B red-team finding #1: not in
+    /// Display, unify, or the AST data structure).
+    pub fn field_pairs(&self) -> Vec<(String, Ty)> {
+        match self {
+            EnumVariantPayloadTy::Unit => Vec::new(),
+            EnumVariantPayloadTy::Tuple(tys) => tys
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| (i.to_string(), ty.clone()))
+                .collect(),
+            EnumVariantPayloadTy::Record(fields) => fields.clone(),
+        }
+    }
 }
 
 impl Ty {
@@ -180,7 +245,7 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         // recursion terminates without an explicit depth check.
         Ty::Sum { variants, .. } => {
             for (_, payload) in variants {
-                for p in payload {
+                for p in payload.field_types() {
                     go(p, acc);
                 }
             }
@@ -280,8 +345,14 @@ mod tests {
         let sum = Ty::Sum {
             name: "E".into(),
             variants: vec![
-                ("A".into(), vec![v(0)]),
-                ("B".into(), vec![string()]),
+                (
+                    "A".into(),
+                    EnumVariantPayloadTy::Tuple(vec![v(0)]),
+                ),
+                (
+                    "B".into(),
+                    EnumVariantPayloadTy::Tuple(vec![string()]),
+                ),
             ],
         };
         assert_eq!(ftv_ty(&sum), HashSet::from([TyVarId(0)]));
@@ -293,7 +364,10 @@ mod tests {
         // the union of the owner's variant-payload ftvs.
         let sum = Ty::Sum {
             name: "E".into(),
-            variants: vec![("A".into(), vec![v(1), v(2)])],
+            variants: vec![(
+                "A".into(),
+                EnumVariantPayloadTy::Tuple(vec![v(1), v(2)]),
+            )],
         };
         let ctor = Ty::Constructor {
             owner: Box::new(sum),
@@ -313,10 +387,85 @@ mod tests {
         let sum = Ty::Sum {
             name: "Tree".into(),
             variants: vec![
-                ("Leaf".into(), vec![]),
-                ("Node".into(), vec![int(), tree.clone(), tree]),
+                ("Leaf".into(), EnumVariantPayloadTy::Unit),
+                (
+                    "Node".into(),
+                    EnumVariantPayloadTy::Tuple(vec![int(), tree.clone(), tree]),
+                ),
             ],
         };
         assert!(ftv_ty(&sum).is_empty());
+    }
+
+    // ---- EnumVariantPayloadTy ----
+
+    #[test]
+    fn payload_field_count_unit() {
+        assert_eq!(EnumVariantPayloadTy::Unit.field_count(), 0);
+    }
+
+    #[test]
+    fn payload_field_count_tuple() {
+        let p = EnumVariantPayloadTy::Tuple(vec![int(), string()]);
+        assert_eq!(p.field_count(), 2);
+    }
+
+    #[test]
+    fn payload_field_count_record() {
+        let p = EnumVariantPayloadTy::Record(vec![
+            ("x".into(), int()),
+            ("y".into(), string()),
+        ]);
+        assert_eq!(p.field_count(), 2);
+    }
+
+    #[test]
+    fn payload_field_types_unit() {
+        assert!(EnumVariantPayloadTy::Unit.field_types().is_empty());
+    }
+
+    #[test]
+    fn payload_field_types_tuple() {
+        let p = EnumVariantPayloadTy::Tuple(vec![int(), string()]);
+        assert_eq!(p.field_types(), vec![&int(), &string()]);
+    }
+
+    #[test]
+    fn payload_field_types_record() {
+        let p = EnumVariantPayloadTy::Record(vec![
+            ("x".into(), int()),
+            ("y".into(), string()),
+        ]);
+        assert_eq!(p.field_types(), vec![&int(), &string()]);
+    }
+
+    #[test]
+    fn payload_field_pairs_unit() {
+        assert!(EnumVariantPayloadTy::Unit.field_pairs().is_empty());
+    }
+
+    #[test]
+    fn payload_field_pairs_tuple_uses_synthetic_names() {
+        // Tuple `Foo(int, int)` → field_pairs returns
+        // `[("0", int), ("1", int)]` (synthetic names — used by
+        // codegen reordering). This is the ONLY place the
+        // synthetic-name trick is applied.
+        let p = EnumVariantPayloadTy::Tuple(vec![int(), int()]);
+        assert_eq!(
+            p.field_pairs(),
+            vec![("0".into(), int()), ("1".into(), int())]
+        );
+    }
+
+    #[test]
+    fn payload_field_pairs_record_keeps_declared_names() {
+        let p = EnumVariantPayloadTy::Record(vec![
+            ("x".into(), int()),
+            ("y".into(), int()),
+        ]);
+        assert_eq!(
+            p.field_pairs(),
+            vec![("x".into(), int()), ("y".into(), int())]
+        );
     }
 }

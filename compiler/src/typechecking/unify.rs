@@ -159,9 +159,12 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         }
 
         // Sum types: two same-named sums are equal iff their variants
-        // match in number, name (per slot), and payload arity, with
-        // the payload types themselves unifiable. Sums of different
-        // names are always distinct.
+        // match in number, name (per slot), and payload arity (with
+        // matching shapes — see 17B red-team finding #5: a variant
+        // declared as tuple cannot unify with the same-named
+        // variant declared as record), with the payload types
+        // themselves unifiable. Sums of different names are always
+        // distinct.
         (Ty::Sum { name: a, variants: av }, Ty::Sum { name: b, variants: bv }) if a == b => {
             if av.len() != bv.len() {
                 return Err(UnifyError::Mismatch {
@@ -189,7 +192,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                         },
                     });
                 }
-                if ap.len() != bp.len() {
+                if ap.field_count() != bp.field_count() {
                     return Err(UnifyError::Mismatch {
                         left: Ty::Sum {
                             name: a.clone(),
@@ -201,7 +204,25 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                         },
                     });
                 }
-                for (x, y) in ap.iter().zip(bp.iter()) {
+                // Shape check (17B): two same-named variants in
+                // different sums must have the same shape. Shape is
+                // matched by discriminant (Unit / Tuple / Record),
+                // not by structural arity.
+                if std::mem::discriminant(ap) != std::mem::discriminant(bp) {
+                    return Err(UnifyError::Mismatch {
+                        left: Ty::Sum {
+                            name: a.clone(),
+                            variants: av.clone(),
+                        },
+                        right: Ty::Sum {
+                            name: b.clone(),
+                            variants: bv.clone(),
+                        },
+                    });
+                }
+                let ap_tys = ap.field_types();
+                let bp_tys = bp.field_types();
+                for (x, y) in ap_tys.iter().zip(bp_tys.iter()) {
                     current = unify_with(&current, x, y)?;
                 }
             }
@@ -235,7 +256,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                     });
                 }
             };
-            if variant.1.len() != c_arity {
+            if variant.1.field_count() != c_arity {
                 return Err(UnifyError::Mismatch {
                     left: ctor,
                     right: sum,
@@ -303,7 +324,7 @@ fn bind_var(subst: &Subst, var: TyVarId, ty: Ty) -> Result<Subst, UnifyError> {
 mod tests {
     use super::*;
     use crate::typechecking::subst::apply_ty_prune;
-    use crate::typechecking::ty::{boolean, float, int, list, string};
+    use crate::typechecking::ty::{boolean, float, int, list, string, EnumVariantPayloadTy};
 
     fn v(i: u32) -> Ty {
         Ty::Var(TyVarId(i))
@@ -561,12 +582,12 @@ mod tests {
 
     // ---- Sum / Constructor unification ----
 
-    fn sum(name: &str, variants: Vec<(&str, Vec<Ty>)>) -> Ty {
+    fn sum(name: &str, variants: Vec<(&str, EnumVariantPayloadTy)>) -> Ty {
         Ty::Sum {
             name: name.to_string(),
             variants: variants
                 .into_iter()
-                .map(|(n, ps)| (n.to_string(), ps))
+                .map(|(n, p)| (n.to_string(), p))
                 .collect(),
         }
     }
@@ -582,16 +603,28 @@ mod tests {
     #[test]
     fn unify_same_name_empty_sums_succeeds() {
         // enum E { A, B }  ~  enum E { A, B }  → identity.
-        let s1 = sum("E", vec![("A", vec![]), ("B", vec![])]);
-        let s2 = sum("E", vec![("A", vec![]), ("B", vec![])]);
+        let s1 = sum("E", vec![("A", EnumVariantPayloadTy::Unit), ("B", EnumVariantPayloadTy::Unit)]);
+        let s2 = sum("E", vec![("A", EnumVariantPayloadTy::Unit), ("B", EnumVariantPayloadTy::Unit)]);
         assert!(unify(&s1, &s2).is_ok());
     }
 
     #[test]
     fn unify_same_name_sums_with_payloads_succeeds() {
         // enum O { None, Some(int) } ~ enum O { None, Some(int) }
-        let s1 = sum("O", vec![("None", vec![]), ("Some", vec![int()])]);
-        let s2 = sum("O", vec![("None", vec![]), ("Some", vec![int()])]);
+        let s1 = sum(
+            "O",
+            vec![
+                ("None", EnumVariantPayloadTy::Unit),
+                ("Some", EnumVariantPayloadTy::Tuple(vec![int()])),
+            ],
+        );
+        let s2 = sum(
+            "O",
+            vec![
+                ("None", EnumVariantPayloadTy::Unit),
+                ("Some", EnumVariantPayloadTy::Tuple(vec![int()])),
+            ],
+        );
         assert!(unify(&s1, &s2).is_ok());
     }
 
@@ -599,16 +632,22 @@ mod tests {
     fn unify_sums_with_polymorphic_payload_binds_vars() {
         // enum E { A } with payload α  ~  enum E { A } with payload int
         // → α = int.
-        let s1 = sum("E", vec![("A", vec![v(0)])]);
-        let s2 = sum("E", vec![("A", vec![int()])]);
+        let s1 = sum(
+            "E",
+            vec![("A", EnumVariantPayloadTy::Tuple(vec![v(0)]))],
+        );
+        let s2 = sum(
+            "E",
+            vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))],
+        );
         let s = unify(&s1, &s2).unwrap();
         assert_eq!(apply_ty(&s, &v(0)), int());
     }
 
     #[test]
     fn unify_different_name_sums_is_mismatch() {
-        let s1 = sum("E", vec![("A", vec![])]);
-        let s2 = sum("F", vec![("A", vec![])]);
+        let s1 = sum("E", vec![("A", EnumVariantPayloadTy::Unit)]);
+        let s2 = sum("F", vec![("A", EnumVariantPayloadTy::Unit)]);
         assert!(matches!(
             unify(&s1, &s2).unwrap_err(),
             UnifyError::Mismatch { .. }
@@ -617,8 +656,14 @@ mod tests {
 
     #[test]
     fn unify_sums_with_different_variant_count_is_mismatch() {
-        let s1 = sum("E", vec![("A", vec![]), ("B", vec![])]);
-        let s2 = sum("E", vec![("A", vec![])]);
+        let s1 = sum(
+            "E",
+            vec![
+                ("A", EnumVariantPayloadTy::Unit),
+                ("B", EnumVariantPayloadTy::Unit),
+            ],
+        );
+        let s2 = sum("E", vec![("A", EnumVariantPayloadTy::Unit)]);
         assert!(matches!(
             unify(&s1, &s2).unwrap_err(),
             UnifyError::Mismatch { .. }
@@ -627,8 +672,20 @@ mod tests {
 
     #[test]
     fn unify_sums_with_different_variant_name_is_mismatch() {
-        let s1 = sum("E", vec![("A", vec![]), ("B", vec![])]);
-        let s2 = sum("E", vec![("A", vec![]), ("C", vec![])]);
+        let s1 = sum(
+            "E",
+            vec![
+                ("A", EnumVariantPayloadTy::Unit),
+                ("B", EnumVariantPayloadTy::Unit),
+            ],
+        );
+        let s2 = sum(
+            "E",
+            vec![
+                ("A", EnumVariantPayloadTy::Unit),
+                ("C", EnumVariantPayloadTy::Unit),
+            ],
+        );
         assert!(matches!(
             unify(&s1, &s2).unwrap_err(),
             UnifyError::Mismatch { .. }
@@ -637,8 +694,64 @@ mod tests {
 
     #[test]
     fn unify_sums_with_different_payload_arity_is_mismatch() {
-        let s1 = sum("E", vec![("A", vec![int()])]);
-        let s2 = sum("E", vec![("A", vec![int(), int()])]);
+        let s1 = sum(
+            "E",
+            vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))],
+        );
+        let s2 = sum(
+            "E",
+            vec![("A", EnumVariantPayloadTy::Tuple(vec![int(), int()]))],
+        );
+        assert!(matches!(
+            unify(&s1, &s2).unwrap_err(),
+            UnifyError::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn unify_sums_with_matching_record_shapes_succeeds() {
+        // Two same-named enums where the matching variant has the
+        // same record shape on both sides — they unify.
+        let s1 = sum(
+            "E",
+            vec![(
+                "A",
+                EnumVariantPayloadTy::Record(vec![
+                    ("x".to_string(), int()),
+                    ("y".to_string(), string()),
+                ]),
+            )],
+        );
+        let s2 = sum(
+            "E",
+            vec![(
+                "A",
+                EnumVariantPayloadTy::Record(vec![
+                    ("x".to_string(), int()),
+                    ("y".to_string(), string()),
+                ]),
+            )],
+        );
+        assert!(unify(&s1, &s2).is_ok());
+    }
+
+    #[test]
+    fn unify_sums_with_mismatched_shapes_is_mismatch() {
+        // Same variant name, different shapes: `A(int)` (tuple)
+        // vs `A { x: int }` (record). These MUST NOT unify — the
+        // shape discriminates them, even though the field count
+        // matches.
+        let s1 = sum(
+            "E",
+            vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))],
+        );
+        let s2 = sum(
+            "E",
+            vec![(
+                "A",
+                EnumVariantPayloadTy::Record(vec![("x".to_string(), int())]),
+            )],
+        );
         assert!(matches!(
             unify(&s1, &s2).unwrap_err(),
             UnifyError::Mismatch { .. }
@@ -648,7 +761,13 @@ mod tests {
     #[test]
     fn unify_constructor_with_its_parent_sum_succeeds() {
         // Constructor { tag=1, arity=1 } ~ Sum { Some(int) }
-        let s = sum("O", vec![("None", vec![]), ("Some", vec![int()])]);
+        let s = sum(
+            "O",
+            vec![
+                ("None", EnumVariantPayloadTy::Unit),
+                ("Some", EnumVariantPayloadTy::Tuple(vec![int()])),
+            ],
+        );
         let c = ctor(s.clone(), 1, 1);
         assert!(unify(&c, &s).is_ok());
     }
@@ -657,7 +776,13 @@ mod tests {
     fn unify_constructor_with_other_sum_is_mismatch() {
         // Constructor { tag=0, arity=0 } ~ Sum { Some(int) }
         // — wrong arity.
-        let s = sum("O", vec![("None", vec![]), ("Some", vec![int()])]);
+        let s = sum(
+            "O",
+            vec![
+                ("None", EnumVariantPayloadTy::Unit),
+                ("Some", EnumVariantPayloadTy::Tuple(vec![int()])),
+            ],
+        );
         let c = ctor(s.clone(), 0, 0);
         assert!(unify(&c, &s).is_ok()); // None has arity 0, so this works
         let c_bad = ctor(s.clone(), 1, 0);
@@ -670,7 +795,13 @@ mod tests {
     #[test]
     fn unify_constructor_with_out_of_range_tag_is_mismatch() {
         // Constructor { tag=5 } ~ Sum with 2 variants — tag out of range.
-        let s = sum("O", vec![("None", vec![]), ("Some", vec![int()])]);
+        let s = sum(
+            "O",
+            vec![
+                ("None", EnumVariantPayloadTy::Unit),
+                ("Some", EnumVariantPayloadTy::Tuple(vec![int()])),
+            ],
+        );
         let c = ctor(s.clone(), 5, 0);
         assert!(matches!(
             unify(&c, &s).unwrap_err(),
@@ -689,8 +820,11 @@ mod tests {
         let s = sum(
             "Tree",
             vec![
-                ("Leaf", vec![]),
-                ("Node", vec![int(), tree.clone(), tree]),
+                ("Leaf", EnumVariantPayloadTy::Unit),
+                (
+                    "Node",
+                    EnumVariantPayloadTy::Tuple(vec![int(), tree.clone(), tree]),
+                ),
             ],
         );
         assert!(unify(&s, &s).is_ok());

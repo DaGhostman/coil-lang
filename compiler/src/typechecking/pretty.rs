@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use super::ty::{Scheme, Ty};
+use super::ty::{EnumVariantPayloadTy, Scheme, Ty};
 
 /// Format a `Ty` the way a user would read it:
 ///
@@ -50,15 +50,28 @@ impl fmt::Display for Ty {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}", vname)?;
-                    if !payload.is_empty() {
-                        write!(f, "(")?;
-                        for (j, p) in payload.iter().enumerate() {
-                            if j > 0 {
-                                write!(f, ", ")?;
+                    match payload {
+                        EnumVariantPayloadTy::Unit => {}
+                        EnumVariantPayloadTy::Tuple(tys) => {
+                            write!(f, "(")?;
+                            for (j, p) in tys.iter().enumerate() {
+                                if j > 0 {
+                                    write!(f, ", ")?;
+                                }
+                                write!(f, "{}", p)?;
                             }
-                            write!(f, "{}", p)?;
+                            write!(f, ")")?;
                         }
-                        write!(f, ")")?;
+                        EnumVariantPayloadTy::Record(fields) => {
+                            write!(f, " {{ ")?;
+                            for (j, (fname, fty)) in fields.iter().enumerate() {
+                                if j > 0 {
+                                    write!(f, ", ")?;
+                                }
+                                write!(f, "{}: {}", fname, fty)?;
+                            }
+                            write!(f, " }}")?;
+                        }
                     }
                 }
                 write!(f, " }}")
@@ -168,7 +181,10 @@ mod tests {
     fn display_sum_with_no_payloads() {
         let ty = Ty::Sum {
             name: "E".into(),
-            variants: vec![("A".into(), vec![]), ("B".into(), vec![])],
+            variants: vec![
+                ("A".into(), EnumVariantPayloadTy::Unit),
+                ("B".into(), EnumVariantPayloadTy::Unit),
+            ],
         };
         assert_eq!(format!("{}", ty), "enum E { A, B }");
     }
@@ -178,11 +194,33 @@ mod tests {
         let ty = Ty::Sum {
             name: "Option".into(),
             variants: vec![
-                ("None".into(), vec![]),
-                ("Some".into(), vec![int()]),
+                ("None".into(), EnumVariantPayloadTy::Unit),
+                ("Some".into(), EnumVariantPayloadTy::Tuple(vec![int()])),
             ],
         };
         assert_eq!(format!("{}", ty), "enum Option { None, Some(int) }");
+    }
+
+    #[test]
+    fn display_sum_with_record_payloads() {
+        // enum E { Unit, Rec { x: int, y: string } }
+        let ty = Ty::Sum {
+            name: "E".into(),
+            variants: vec![
+                ("Unit".into(), EnumVariantPayloadTy::Unit),
+                (
+                    "Rec".into(),
+                    EnumVariantPayloadTy::Record(vec![
+                        ("x".into(), int()),
+                        ("y".into(), string()),
+                    ]),
+                ),
+            ],
+        };
+        assert_eq!(
+            format!("{}", ty),
+            "enum E { Unit, Rec { x: int, y: string } }"
+        );
     }
 
     #[test]
@@ -190,8 +228,8 @@ mod tests {
         let sum = Ty::Sum {
             name: "Option".into(),
             variants: vec![
-                ("None".into(), vec![]),
-                ("Some".into(), vec![int()]),
+                ("None".into(), EnumVariantPayloadTy::Unit),
+                ("Some".into(), EnumVariantPayloadTy::Tuple(vec![int()])),
             ],
         };
         let ctor = Ty::Constructor {

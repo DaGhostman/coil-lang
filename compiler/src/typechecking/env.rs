@@ -236,10 +236,27 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
             variants: variants
                 .iter()
                 .map(|(n, payload)| {
-                    (
-                        n.clone(),
-                        payload.iter().map(|t| substitute_vars(t, mapping)).collect(),
-                    )
+                    let new_payload = match payload {
+                        crate::typechecking::ty::EnumVariantPayloadTy::Unit => {
+                            crate::typechecking::ty::EnumVariantPayloadTy::Unit
+                        }
+                        crate::typechecking::ty::EnumVariantPayloadTy::Tuple(tys) => {
+                            crate::typechecking::ty::EnumVariantPayloadTy::Tuple(
+                                tys.iter()
+                                    .map(|t| substitute_vars(t, mapping))
+                                    .collect(),
+                            )
+                        }
+                        crate::typechecking::ty::EnumVariantPayloadTy::Record(fields) => {
+                            crate::typechecking::ty::EnumVariantPayloadTy::Record(
+                                fields
+                                    .iter()
+                                    .map(|(n, t)| (n.clone(), substitute_vars(t, mapping)))
+                                    .collect(),
+                            )
+                        }
+                    };
+                    (n.clone(), new_payload)
                 })
                 .collect(),
         },

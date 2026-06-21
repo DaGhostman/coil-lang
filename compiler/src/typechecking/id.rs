@@ -19,7 +19,7 @@
 //! happens for wrapper nodes — `Program` and `Statement` covering the
 //! same range, for example).
 
-use parser::ast::{Output, Pattern};
+use parser::ast::{EnumConstructPayload, EnumVariantPayload, Output, Pattern, PatternPayload};
 
 /// A stable identifier for an AST node.
 ///
@@ -250,31 +250,53 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         }
 
         // ---- Phase 15A: sum types and constructors ----
-        // `enum_decl` carries a list of `EnumVariant` outputs (the
-        // payload types inside the parentheses). The pre-walk visits
-        // each variant's output, which dispatches to the
-        // `EnumVariant` arm below.
+        // Phase 17B: `enum_decl` carries a list of `EnumVariant`
+        // outputs (the variants). The pre-walk visits each
+        // variant's output, which dispatches to the `EnumVariant`
+        // arm below.
         Expression::EnumDecl { variants, .. } => {
             for v in variants {
                 pre_walk(v, table);
             }
         }
-        // `EnumVariant` payload types are wrapped in
-        // `Expression::Type(...)` outputs — they have no children
-        // to walk, but the pre-walk still mints an ID for each
-        // entry (so the cache lines up with the infer pass).
-        Expression::EnumVariant { payload, .. } => {
-            for p in payload {
-                pre_walk(p, table);
+        // `EnumVariant` carries the payload shape (`EnumVariantPayload`):
+        // - Unit: no children.
+        // - Tuple: each element is a `Output` (typically
+        //   `Expression::Type(...)`); pre-walk each so the cache
+        //   lines up.
+        // - Record: each field's `value` is a `Output` (typically
+        //   `Expression::Type(...)`); pre-walk each. The field's
+        //   `name` is just a string — no NodeId.
+        Expression::EnumVariant { payload, .. } => match payload {
+            EnumVariantPayload::Unit => {}
+            EnumVariantPayload::Tuple(parts) => {
+                for p in parts {
+                    pre_walk(p, table);
+                }
             }
-        }
-        // `Construct` carries the application arguments as
-        // positional `Output`s, just like a call.
-        Expression::Construct { args, .. } => {
-            for arg in args {
-                pre_walk(arg, table);
+            EnumVariantPayload::Record(fields) => {
+                for f in fields {
+                    pre_walk(&f.value, table);
+                }
             }
-        }
+        },
+        // `Construct` carries the application shape
+        // (`EnumConstructPayload`). Unit has no children. Tuple /
+        // Record each carry `Output` sub-expressions that need
+        // NodeIds (so the infer pass can type-check them).
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Unit => {}
+            EnumConstructPayload::Tuple(args) => {
+                for arg in args {
+                    pre_walk(arg, table);
+                }
+            }
+            EnumConstructPayload::Record(parts) => {
+                for p in parts {
+                    pre_walk(&p.value, table);
+                }
+            }
+        },
 
         // Method: body (visibility is metadata, no AST to recurse).
         Expression::Method(_, body) => pre_walk(body, table),
@@ -305,15 +327,26 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
 /// can rely on a consistent walk).
 ///
 /// `Wildcard` and `Binding` are leaves. `Constructor` recurses into
-/// each sub-pattern in the payload.
+/// each sub-pattern in the payload. Phase 17B: payload is
+/// `PatternPayload` (Unit / Tuple / Record). Record patterns have
+/// `PatternField` entries — the field `pattern` recurses, but the
+/// field name is just a string (no NodeId).
 pub fn pre_walk_pattern(pattern: &Pattern, _table: &mut IdTable) {
     match pattern {
         Pattern::Wildcard | Pattern::Binding { .. } => {}
-        Pattern::Constructor { payload, .. } => {
-            for p in payload {
-                pre_walk_pattern(p, _table);
+        Pattern::Constructor { payload, .. } => match payload {
+            PatternPayload::Unit => {}
+            PatternPayload::Tuple(parts) => {
+                for p in parts {
+                    pre_walk_pattern(p, _table);
+                }
             }
-        }
+            PatternPayload::Record(fields) => {
+                for pf in fields {
+                    pre_walk_pattern(&pf.pattern, _table);
+                }
+            }
+        },
     }
 }
 

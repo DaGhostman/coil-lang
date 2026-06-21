@@ -49,7 +49,7 @@ use super::id::{self, IdTable, NodeId};
 use super::ty::Scheme;
 use super::subst::{apply_ty, apply_ty_prune, compose, Subst};
 use super::ty::{
-    boolean, float, int, list, string, unit as unit_ty, Ty,
+    boolean, float, int, list, string, unit as unit_ty, EnumVariantPayloadTy, Ty,
 };
 use super::unify::{unify_with, UnifyError};
 
@@ -108,10 +108,11 @@ pub struct Checker {
     enums: BTreeMap<String, Vec<String>>,
     /// enum name → (variant name → tag index).
     enum_tags: BTreeMap<String, BTreeMap<String, u32>>,
-    /// enum name → per-variant payload type list (in source order).
-    /// Each entry is the list of types the variant takes; the outer
-    /// index matches the tag.
-    enum_payloads: BTreeMap<String, Vec<Vec<Ty>>>,
+    /// enum name → per-variant payload shape (in source order).
+    /// Phase 17B: each entry is `EnumVariantPayloadTy` (Unit,
+    /// Tuple, or Record) — shape is recorded explicitly, not via
+    /// synthetic names. The outer index matches the tag.
+    enum_payloads: BTreeMap<String, Vec<EnumVariantPayloadTy>>,
     /// enum name → per-variant arity (in source order). Cached here
     /// so the codegen layer (15C) doesn't have to redo the
     /// `payloads[i].len()` lookup at every constructor site.
@@ -586,18 +587,29 @@ impl Checker {
                 unit_ty()
             }
             Expression::EnumVariant { payload, .. } => {
+                use parser::ast::EnumVariantPayload;
                 // The pre-walk mints an ID for every payload
                 // element. Recurse so this arm's ID consumption
                 // stays in lockstep. The actual payload parsing
                 // happens in `infer_enum_decl`, which knows the
                 // parent variant name and target arity.
-                for p in payload {
-                    let _ = self.infer(p);
+                match payload {
+                    EnumVariantPayload::Unit => {}
+                    EnumVariantPayload::Tuple(parts) => {
+                        for p in parts {
+                            let _ = self.infer(p);
+                        }
+                    }
+                    EnumVariantPayload::Record(fields) => {
+                        for f in fields {
+                            let _ = self.infer(&f.value);
+                        }
+                    }
                 }
                 unit_ty()
             }
-            Expression::Construct { enum_name, variant_name, args } => {
-                self.infer_construct(enum_name, variant_name, args, range)
+            Expression::Construct { enum_name, variant_name, fields } => {
+                self.infer_construct(enum_name, variant_name, fields, range)
             }
 
             // ---- Fallback ----
@@ -1133,12 +1145,13 @@ impl Checker {
     /// call `self.infer` (and so does not consume IDs from the
     /// pre-walk table).
     fn pre_register_enums_walk(&mut self, node: &Output, errors: &mut Vec<Message>) {
+        use parser::ast::EnumVariantPayload;
         match node.1.as_ref() {
             Expression::EnumDecl { name, variants } => {
                 let name_str = name.to_string();
                 let mut variant_names = Vec::new();
                 let mut arities = Vec::new();
-                let mut payloads: Vec<Vec<Ty>> = Vec::new();
+                let mut payloads: Vec<EnumVariantPayloadTy> = Vec::new();
 
                 for v in variants {
                     if let Expression::EnumVariant {
@@ -1147,28 +1160,43 @@ impl Checker {
                     } = v.1.as_ref()
                     {
                         variant_names.push(vname.to_string());
-                        arities.push(payload.len());
-                        // Parse the actual payload types from
-                        // `Expression::Type(name)` AST nodes. We
-                        // use the same `parse_type_name_str` as
-                        // the main pass so the pre-pass's
-                        // `enum_payloads` table holds real types
-                        // that the main pass can use directly
-                        // (no placeholder substitution needed).
-                        let mut variant_payloads = Vec::new();
-                        for p in payload {
-                            if let Expression::Type(tname) = p.1.as_ref() {
-                                variant_payloads.push(self.parse_type_name_str(tname));
-                            } else {
-                                // Defensive — parser should
-                                // produce Type nodes for the
-                                // payload. Fall back to a
-                                // fresh var so the main pass
-                                // can re-derive the type.
-                                variant_payloads.push(Ty::Var(self.counter.fresh()));
+                        // Phase 17B: build the typed payload shape
+                        // directly from the AST shape
+                        // (`EnumVariantPayload`), recording Unit /
+                        // Tuple / Record explicitly.
+                        let payload_ty = match payload {
+                            EnumVariantPayload::Unit => {
+                                arities.push(0);
+                                EnumVariantPayloadTy::Unit
                             }
-                        }
-                        payloads.push(variant_payloads);
+                            EnumVariantPayload::Tuple(parts) => {
+                                let mut tys = Vec::with_capacity(parts.len());
+                                for p in parts {
+                                    if let Expression::Type(tname) = p.1.as_ref() {
+                                        tys.push(self.parse_type_name_str(tname));
+                                    } else {
+                                        tys.push(Ty::Var(self.counter.fresh()));
+                                    }
+                                }
+                                arities.push(tys.len());
+                                EnumVariantPayloadTy::Tuple(tys)
+                            }
+                            EnumVariantPayload::Record(fields) => {
+                                let mut pairs = Vec::with_capacity(fields.len());
+                                for f in fields {
+                                    let fty = if let Expression::Type(tname) = f.value.1.as_ref()
+                                    {
+                                        self.parse_type_name_str(tname)
+                                    } else {
+                                        Ty::Var(self.counter.fresh())
+                                    };
+                                    pairs.push((f.name.to_string(), fty));
+                                }
+                                arities.push(pairs.len());
+                                EnumVariantPayloadTy::Record(pairs)
+                            }
+                        };
+                        payloads.push(payload_ty);
                     }
                 }
 
@@ -1378,15 +1406,23 @@ impl Checker {
             // the tree; no second arm is needed here. `EnumVariant`
             // and `Construct` are still reachable (e.g. inside a
             // function body) and just recurse.
-            Expression::EnumVariant { payload, .. } => {
-                for p in payload {
-                    self.pre_register_enums_walk(p, errors);
-                }
+            Expression::EnumVariant { .. } => {
+                // Phase 17B: the variant is a wrapper for the
+                // shape-tagged payload. The pre-walk does NOT mint
+                // IDs for the `RecordFieldDecl` entries inside a
+                // record payload — they're metadata for the
+                // typechecker, not expressions.
+                // The shape itself is consumed by `pre_register_enums`
+                // through the `EnumDecl` arm above (which has
+                // already cloned the variant payloads). Nothing to
+                // do here.
             }
-            Expression::Construct { args, .. } => {
-                for arg in args {
-                    self.pre_register_enums_walk(arg, errors);
-                }
+            Expression::Construct { .. } => {
+                // `Construct` carries the call-site arguments as
+                // positional `Output`s, just like a call. The
+                // pre-walk mints IDs for each argument (because
+                // they're full `Output` nodes), but the shape
+                // discriminator (Unit / Tuple / Record) is metadata.
             }
 
             Expression::Method(_, body) => {
@@ -1408,7 +1444,7 @@ impl Checker {
 
     /// Build a fully-formed `Ty::Sum` from an enum declaration's
     /// AST. The pre-pass already collected the variant names,
-    /// arities, and concrete payload types — this method walks
+    /// arities, and concrete payload shapes — this method walks
     /// the AST's payload children to keep ID consumption in
     /// lockstep with the pre-walk, builds the `Ty::Sum`, and
     /// registers the enum and each variant in the env.
@@ -1418,6 +1454,7 @@ impl Checker {
         variants: &[Output],
         _range: &Range<usize>,
     ) {
+        use parser::ast::EnumVariantPayload;
         let name_str = name.to_string();
         // Look up the pre-reserved shape. If missing, the
         // pre-pass rejected this enum (duplicate / collision);
@@ -1445,12 +1482,12 @@ impl Checker {
         // Walk each variant. We delegate to `self.infer(v)` for the
         // whole variant — its `EnumVariant` arm in `infer_inner`
         // recurses into the payload children. That gives us
-        // exactly `1 + len(payload)` IDs per variant, which matches
-        // what the pre-walk mints (one for the `EnumVariant` node
-        // plus one per payload `Expression::Type`). The pre-pass
-        // has already parsed the payload types, so the infer
-        // recursion is purely for ID-alignment.
-        let mut built_variants: Vec<(String, Vec<Ty>)> = Vec::new();
+        // exactly `1 + N` IDs per variant where N is the number
+        // of payload entries the pre-walk visited (1 per Tuple
+        // element, 1 per Record field's value, 0 for Unit). The
+        // pre-pass has already built the typed payload, so the
+        // infer recursion is purely for ID-alignment.
+        let mut built_variants: Vec<(String, EnumVariantPayloadTy)> = Vec::new();
         for (i, v) in variants.iter().enumerate() {
             // Consume IDs for the variant itself + its payload
             // before any early `continue`. The pre-walk visited
@@ -1464,18 +1501,31 @@ impl Checker {
             } = v.1.as_ref()
             {
                 let vname_str = vname.to_string();
-                let pre_pay = pre_payloads
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| (0..payload.len()).map(|_| Ty::Con("?".into())).collect());
+                let pre_pay = match pre_payloads.get(i) {
+                    Some(p) => p.clone(),
+                    None => {
+                        continue;
+                    }
+                };
 
-                // Sanity: name + arity should match the pre-pass
-                // shape. If not, the pre-pass has already
+                // Sanity: name + payload arity should match the
+                // pre-pass shape. If not, the pre-pass has already
                 // complained — skip registering this variant but
                 // keep IDs aligned (already done above).
-                if pre_shape.get(i) != Some(&vname_str)
-                    || pre_pay.len() != payload.len()
-                {
+                if pre_shape.get(i) != Some(&vname_str) {
+                    continue;
+                }
+                let expected_count = match &pre_pay {
+                    EnumVariantPayloadTy::Unit => 0,
+                    EnumVariantPayloadTy::Tuple(tys) => tys.len(),
+                    EnumVariantPayloadTy::Record(fields) => fields.len(),
+                };
+                let actual_count = match payload {
+                    EnumVariantPayload::Unit => 0,
+                    EnumVariantPayload::Tuple(parts) => parts.len(),
+                    EnumVariantPayload::Record(fields) => fields.len(),
+                };
+                if expected_count != actual_count {
                     continue;
                 }
                 built_variants.push((vname_str, pre_pay));
@@ -1498,8 +1548,12 @@ impl Checker {
         // qualified name `EnumName::VariantName` as the binding
         // key — `Construct` looks up by qualified name in this
         // map.
-        for (i, (vname, payload_tys)) in built_variants.iter().enumerate() {
-            let arity = payload_tys.len();
+        for (i, (vname, payload_ty)) in built_variants.iter().enumerate() {
+            // Field count = 0 for Unit, N for Tuple/Record.
+            // Same arity, regardless of shape — the shape
+            // discrimination happens at call-site / pattern
+            // inference, not at the constructor's HM type.
+            let arity = payload_ty.field_count();
             let ctor_ty = Ty::Constructor {
                 owner: Box::new(sum_ty.clone()),
                 tag: i as u32,
@@ -1509,8 +1563,13 @@ impl Checker {
                 Scheme::mono(ctor_ty)
             } else {
                 // Curried: arg1 -> arg2 -> ... -> Constructor.
+                // Field order matches declaration order for both
+                // Tuple and Record — codegen reorders record
+                // call sites to declaration order before pushing
+                // the MAKE_ENUM.
+                let arg_tys: Vec<Ty> = payload_ty.field_types().into_iter().cloned().collect();
                 let mut fun_ty = ctor_ty;
-                for arg_ty in payload_tys.iter().rev() {
+                for arg_ty in arg_tys.iter().rev() {
                     fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
                 }
                 Scheme::mono(fun_ty)
@@ -1520,14 +1579,19 @@ impl Checker {
         }
     }
 
-    /// Type-check a constructor application: `EnumName::Variant(args)`.
+    /// Type-check a constructor application: `EnumName::Variant(args)`,
+    /// `EnumName::Variant { ... }`, or `EnumName::Variant` (Unit).
+    /// Field-by-field inference with shape-mismatch detection
+    /// (17B red-team finding #5: a tuple call site against a record
+    /// declaration, or vice versa, is a type error).
     fn infer_construct(
         &mut self,
         enum_name: &str,
         variant_name: &str,
-        args: &[Output],
+        fields: &parser::ast::EnumConstructPayload<'_>,
         range: Range<usize>,
     ) -> Ty {
+        use parser::ast::EnumConstructPayload;
         let enum_str = enum_name.to_string();
         let variant_str = variant_name.to_string();
 
@@ -1561,35 +1625,168 @@ impl Checker {
             .get(&enum_str)
             .and_then(|a| a.get(tag as usize).copied())
             .unwrap_or(0);
-        let expected_payloads = self
+        let expected_payload = self
             .enum_payloads
             .get(&enum_str)
             .and_then(|p| p.get(tag as usize).cloned())
-            .unwrap_or_default();
+            .unwrap_or(EnumVariantPayloadTy::Unit);
 
-        // Arity check.
-        if args.len() != arity {
-            return self.error(
+        // Shape analysis (17B red-team #5).
+        // Two failure modes:
+        //  - Arity mismatch within the same shape (e.g. tuple(2 args)
+        //    against a tuple declared with 1 field). Reported as
+        //    "expects N arguments" — the original 15B message.
+        //  - Shape mismatch across shapes (tuple vs record / unit vs
+        //    others). Reported as "payload shape mismatch" — the
+        //    17B red-team amendment #5.
+        let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, fields) {
+            (EnumVariantPayloadTy::Unit, EnumConstructPayload::Unit) => (true, false),
+            (EnumVariantPayloadTy::Tuple(_), EnumConstructPayload::Tuple(args)) => {
+                let want = expected_payload.field_count();
+                (args.len() == want, args.len() != want)
+            }
+            (EnumVariantPayloadTy::Record(_), EnumConstructPayload::Record(parts)) => {
+                let want = expected_payload.field_count();
+                (parts.len() == want, parts.len() != want)
+            }
+            _ => (false, false),
+        };
+
+        if !shape_matches {
+            // Distinguish "shape mismatch" (17B) from "arity mismatch
+            // within same shape" (15B legacy). When the shape itself
+            // is wrong, emit the new shape-mismatch diagnostic;
+            // otherwise emit the legacy arity message.
+            if same_shape_with_wrong_arity {
+                return self.error(
+                    format!(
+                        "Constructor `{}::{}` expects {} arguments, got {}",
+                        enum_str,
+                        variant_str,
+                        expected_payload.field_count(),
+                        match fields {
+                            EnumConstructPayload::Unit => 0,
+                            EnumConstructPayload::Tuple(args) => args.len(),
+                            EnumConstructPayload::Record(parts) => parts.len(),
+                        },
+                    ),
+                    range,
+                );
+            }
+            return self.error_with_help(
                 format!(
-                    "Constructor `{}::{}` expects {} arguments, got {}",
+                    "Constructor `{}::{}` payload shape mismatch (declared as {}, called as {})",
                     enum_str,
                     variant_str,
-                    arity,
-                    args.len()
+                    payload_kind_name(&expected_payload),
+                    match fields {
+                        EnumConstructPayload::Unit => "unit",
+                        EnumConstructPayload::Tuple(_) => "tuple",
+                        EnumConstructPayload::Record(_) => "record",
+                    },
                 ),
                 range,
+                Some(format!(
+                    "use {} syntax for `{}::{}`",
+                    if matches!(expected_payload, EnumVariantPayloadTy::Record(_)) {
+                        "record"
+                    } else {
+                        "tuple / unit"
+                    },
+                    enum_str,
+                    variant_str,
+                )),
             );
         }
 
-        // Infer each arg and unify with the expected payload type.
-        for (arg, expected) in args.iter().zip(expected_payloads.iter()) {
-            let arg_ty = self.infer(arg);
-            self.unify(
-                expected,
-                &arg_ty,
-                &arg.0.into_range(),
-                &format!("constructor `{}::{}` argument", enum_str, variant_str),
-            );
+        // Field-by-field type check.
+        match fields {
+            EnumConstructPayload::Unit => {}
+            EnumConstructPayload::Tuple(args) => {
+                let expected_tys = expected_payload.field_types();
+                for (arg, expected_ty) in args.iter().zip(expected_tys.iter()) {
+                    let arg_ty = self.infer(arg);
+                    self.unify(
+                        expected_ty,
+                        &arg_ty,
+                        &arg.0.into_range(),
+                        &format!("constructor `{}::{}` argument", enum_str, variant_str),
+                    );
+                }
+            }
+            EnumConstructPayload::Record(parts) => {
+                // Build a name → value map for the call site, then
+                // walk the DECLARATION order. Each declared field
+                // must be supplied exactly once; the codegen
+                // reorders the bytecode accordingly.
+                let mut call_site: std::collections::HashMap<&str, &Output> =
+                    std::collections::HashMap::with_capacity(parts.len());
+                for p in parts {
+                    if call_site.insert(p.name, &p.value).is_some() {
+                        return self.error_with_help(
+                            format!(
+                                "Duplicate field `{}` in record constructor `{}::{}`",
+                                p.name, enum_str, variant_str,
+                            ),
+                            range,
+                            Some("each field must be supplied exactly once".to_string()),
+                        );
+                    }
+                }
+                let EnumVariantPayloadTy::Record(decl_fields) = &expected_payload else {
+                    // unreachable — shape_matches already proved it
+                    unreachable!();
+                };
+                for (decl_name, decl_ty) in decl_fields.iter() {
+                    let arg = match call_site.get(decl_name.as_str()) {
+                        Some(a) => *a,
+                        None => {
+                            return self.error_with_help(
+                                format!(
+                                    "Missing field `{}` in record constructor `{}::{}`",
+                                    decl_name, enum_str, variant_str,
+                                ),
+                                range,
+                                Some(format!(
+                                    "add `{}: <expr>` to the call site",
+                                    decl_name,
+                                )),
+                            );
+                        }
+                    };
+                    let arg_ty = self.infer(arg);
+                    self.unify(
+                        decl_ty,
+                        &arg_ty,
+                        &arg.0.into_range(),
+                        &format!(
+                            "constructor `{}::{}.{}` argument",
+                            enum_str, variant_str, decl_name,
+                        ),
+                    );
+                }
+                // Check for any unknown field names (extra
+                // fields supplied at the call site).
+                for p in parts {
+                    if !decl_fields.iter().any(|(dn, _)| dn == p.name) {
+                        return self.error_with_help(
+                            format!(
+                                "Unknown field `{}` in record constructor `{}::{}`",
+                                p.name, enum_str, variant_str,
+                            ),
+                            range,
+                            Some(format!(
+                                "the declared fields are: {}",
+                                decl_fields
+                                    .iter()
+                                    .map(|(n, _)| format!("`{}`", n))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            )),
+                        );
+                    }
+                }
+            }
         }
 
         // Build the result. The owner is the full `Ty::Sum` so
@@ -1727,6 +1924,7 @@ impl Checker {
         expected_ty: &Ty,
         pattern_range: &Range<usize>,
     ) -> Ty {
+        use parser::ast::PatternPayload;
         match pattern {
             Pattern::Wildcard => {
                 // Wildcard matches anything, binds nothing. The
@@ -1771,29 +1969,69 @@ impl Checker {
                         return expected_ty.clone();
                     }
                 };
-                let arity = self
+                let _arity = self
                     .enum_arities
                     .get(&enum_str)
                     .and_then(|a| a.get(tag as usize).copied())
                     .unwrap_or(0);
-                let expected_payloads = self
+                let expected_payload = self
                     .enum_payloads
                     .get(&enum_str)
                     .and_then(|p| p.get(tag as usize).cloned())
-                    .unwrap_or_default();
+                    .unwrap_or(EnumVariantPayloadTy::Unit);
 
-                // 2. Arity check on sub-patterns.
-                if payload.len() != arity {
+                // 2. Shape check (17B red-team #5) — tuple vs
+                // record shape must match the declared variant.
+                // Distinguish:
+                //  - Same shape, wrong sub-pattern count
+                //    (`expected N sub-patterns, got M` — legacy
+                //    15B message).
+                //  - Different shapes (tuple vs record / unit)
+                //    (`payload shape mismatch` — 17B message).
+                let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, payload) {
+                    (EnumVariantPayloadTy::Unit, PatternPayload::Unit) => (true, false),
+                    (EnumVariantPayloadTy::Tuple(_), PatternPayload::Tuple(parts)) => {
+                        let want = expected_payload.field_count();
+                        (parts.len() == want, parts.len() != want)
+                    }
+                    (EnumVariantPayloadTy::Record(_), PatternPayload::Record(fields)) => {
+                        let want = expected_payload.field_count();
+                        (fields.len() == want, fields.len() != want)
+                    }
+                    _ => (false, false),
+                };
+                if !shape_matches {
+                    if same_shape_with_wrong_arity {
+                        return self.error_with_help(
+                            format!(
+                                "Constructor pattern `{}::{}` expects {} sub-patterns, got {}",
+                                enum_str,
+                                variant_str,
+                                expected_payload.field_count(),
+                                match payload {
+                                    PatternPayload::Unit => 0,
+                                    PatternPayload::Tuple(parts) => parts.len(),
+                                    PatternPayload::Record(fields) => fields.len(),
+                                },
+                            ),
+                            pattern_range.clone(),
+                            Some("check the variant's declared payload arity".to_string()),
+                        );
+                    }
                     return self.error_with_help(
                         format!(
-                            "Constructor pattern `{}::{}` expects {} sub-patterns, got {}",
+                            "Constructor pattern `{}::{}` payload shape mismatch (declared as {}, pattern uses {})",
                             enum_str,
                             variant_str,
-                            arity,
-                            payload.len()
+                            payload_kind_name(&expected_payload),
+                            match payload {
+                                PatternPayload::Unit => "unit",
+                                PatternPayload::Tuple(_) => "tuple",
+                                PatternPayload::Record(_) => "record",
+                            },
                         ),
                         pattern_range.clone(),
-                        Some("check the variant's declared payload arity".to_string()),
+                        Some("check the variant's declared payload shape".to_string()),
                     );
                 }
 
@@ -1802,8 +2040,79 @@ impl Checker {
                 // comes from the pre-pass's `enum_payloads`
                 // (already resolved, e.g. `int` for
                 // `Option::Some(int)`).
-                for (sub_pat, payload_ty) in payload.iter().zip(expected_payloads.iter()) {
-                    let _ = self.infer_pattern(sub_pat, payload_ty, pattern_range);
+                match payload {
+                    PatternPayload::Unit => {}
+                    PatternPayload::Tuple(parts) => {
+                        let expected_tys = expected_payload.field_types();
+                        for (sub_pat, expected_ty) in
+                            parts.iter().zip(expected_tys.iter())
+                        {
+                            let _ = self.infer_pattern(sub_pat, expected_ty, pattern_range);
+                        }
+                    }
+                    PatternPayload::Record(fields) => {
+                        // Build a name → pattern map for the
+                        // pattern site, then walk DECLARATION
+                        // order. Each declared field must be
+                        // present exactly once; the codegen binds
+                        // in slot order (= declaration order).
+                        let mut pattern_site: std::collections::HashMap<&str, &Pattern> =
+                            std::collections::HashMap::with_capacity(fields.len());
+                        for pf in fields {
+                            if pattern_site.insert(pf.name, &pf.pattern).is_some() {
+                                return self.error_with_help(
+                                    format!(
+                                        "Duplicate field `{}` in record pattern `{}::{}`",
+                                        pf.name, enum_str, variant_str,
+                                    ),
+                                    pattern_range.clone(),
+                                    Some("each field must appear exactly once".to_string()),
+                                );
+                            }
+                        }
+                        let EnumVariantPayloadTy::Record(decl_fields) = &expected_payload else {
+                            unreachable!()
+                        };
+                        for (decl_name, decl_ty) in decl_fields.iter() {
+                            let sub_pat = match pattern_site.get(decl_name.as_str()) {
+                                Some(p) => *p,
+                                None => {
+                                    return self.error_with_help(
+                                        format!(
+                                            "Missing field `{}` in record pattern `{}::{}`",
+                                            decl_name, enum_str, variant_str,
+                                        ),
+                                        pattern_range.clone(),
+                                        Some(format!(
+                                            "add `{0}: _` (or `{0}: binding`) to the pattern",
+                                            decl_name,
+                                        )),
+                                    );
+                                }
+                            };
+                            let _ = self.infer_pattern(sub_pat, decl_ty, pattern_range);
+                        }
+                        // Check for unknown field names.
+                        for pf in fields {
+                            if !decl_fields.iter().any(|(dn, _)| dn == pf.name) {
+                                return self.error_with_help(
+                                    format!(
+                                        "Unknown field `{}` in record pattern `{}::{}`",
+                                        pf.name, enum_str, variant_str,
+                                    ),
+                                    pattern_range.clone(),
+                                    Some(format!(
+                                        "the declared fields are: {}",
+                                        decl_fields
+                                            .iter()
+                                            .map(|(n, _)| format!("`{}`", n))
+                                            .collect::<Vec<_>>()
+                                            .join(", "),
+                                    )),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // 4. The pattern's type is the *expected* type —
@@ -2062,10 +2371,49 @@ impl Checker {
         let mut out = Vec::with_capacity(names.len());
         for (i, name) in names.iter().enumerate() {
             let tag = tags.get(name).copied().unwrap_or(i as u32);
-            let payload = payloads.get(i).cloned().unwrap_or_default();
-            out.push((name.clone(), tag, payload));
+            let payload_tys: Vec<Ty> = match payloads.get(i) {
+                Some(EnumVariantPayloadTy::Unit) => Vec::new(),
+                Some(EnumVariantPayloadTy::Tuple(tys)) => tys.clone(),
+                Some(EnumVariantPayloadTy::Record(fields)) => {
+                    fields.iter().map(|(_, ty)| ty.clone()).collect()
+                }
+                None => Vec::new(),
+            };
+            out.push((name.clone(), tag, payload_tys));
         }
         Some(out)
+    }
+
+    /// Look up the declared payload for `(enum_name, variant_name)`
+    /// as a list of `(field_name, field_type)` pairs in
+    /// DECLARATION order. The codegen uses this to reorder record
+    /// call-site fields to declaration order (the VM's
+    /// `MAKE_ENUM` pushes payload args in pop order — the first
+    /// popped is `payload[0]`).
+    ///
+    /// For Unit variants, returns an empty Vec. For Tuple
+    /// variants, the field names are synthetic (`"0"`, `"1"`, …)
+    /// — see `EnumVariantPayloadTy::field_pairs`. For Record
+    /// variants, the field names are the declared names.
+    pub fn payload_tys_for(&self, enum_name: &str, variant_name: &str) -> Vec<(String, Ty)> {
+        let tag = match self.tag_for(enum_name, variant_name) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        match self.enum_payloads.get(enum_name).and_then(|p| p.get(tag as usize)) {
+            Some(payload) => payload.field_pairs(),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Human-readable name of a payload shape, used in
+/// typecheck-error messages.
+fn payload_kind_name(payload: &EnumVariantPayloadTy) -> &'static str {
+    match payload {
+        EnumVariantPayloadTy::Unit => "unit",
+        EnumVariantPayloadTy::Tuple(_) => "tuple",
+        EnumVariantPayloadTy::Record(_) => "record",
     }
 }
 
@@ -2114,6 +2462,7 @@ fn is_declaration_like(node: &Output) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typechecking::ty::EnumVariantPayloadTy;
     use parser::Pratt;
 
     /// Parse and infer `src`, returning the checker state and inferred type.
@@ -3174,8 +3523,8 @@ mod tests {
                     owner: Box::new(Ty::Sum {
                         name: "Option".into(),
                         variants: vec![
-                            ("None".into(), vec![]),
-                            ("Some".into(), vec![int()]),
+                            ("None".into(), EnumVariantPayloadTy::Unit),
+                            ("Some".into(), EnumVariantPayloadTy::Tuple(vec![int()])),
                         ],
                     }),
                     tag: 1,

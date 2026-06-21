@@ -140,7 +140,27 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             name: name.clone(),
             variants: variants
                 .iter()
-                .map(|(n, payload)| (n.clone(), payload.iter().map(|t| apply_ty(subst, t)).collect()))
+                .map(|(n, payload)| {
+                    let new_payload = match payload {
+                        crate::typechecking::ty::EnumVariantPayloadTy::Unit => {
+                            crate::typechecking::ty::EnumVariantPayloadTy::Unit
+                        }
+                        crate::typechecking::ty::EnumVariantPayloadTy::Tuple(tys) => {
+                            crate::typechecking::ty::EnumVariantPayloadTy::Tuple(
+                                tys.iter().map(|t| apply_ty(subst, t)).collect(),
+                            )
+                        }
+                        crate::typechecking::ty::EnumVariantPayloadTy::Record(fields) => {
+                            crate::typechecking::ty::EnumVariantPayloadTy::Record(
+                                fields
+                                    .iter()
+                                    .map(|(n, t)| (n.clone(), apply_ty(subst, t)))
+                                    .collect(),
+                            )
+                        }
+                    };
+                    (n.clone(), new_payload)
+                })
                 .collect(),
         },
         Ty::Constructor { owner, tag, arity } => Ty::Constructor {
