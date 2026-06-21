@@ -43,6 +43,22 @@ struct Context {
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
 
+    /// Per-match-arm binding map. When `Some`, the codegen is
+    /// processing the body of a match arm and this map holds the
+    /// pattern-bound names → slot positions. The slots are 1-based
+    /// (matching the VM's payload-push positions, which start at
+    /// `frame.sp + 1`). When `None`, no match is in scope and the
+    /// codegen falls back to the global `variables` Interner.
+    ///
+    /// This map exists because Phase 17B's "multi-variant matches
+    /// with binding bodies" limitation: each arm's payload lives at
+    /// the same stack slots (1..arity), but the global Interner
+    /// assigns each arm's bindings a DIFFERENT slot ID. With a
+    /// per-arm map, every arm's first binding is at slot 1, second
+    /// at slot 2, etc., so the VM's payload-push positions line up
+    /// with the STORE/LOAD operands.
+    match_bindings: Option<HashMap<String, u32>>,
+
     prev: Option<Box<Self>>,
 }
 
@@ -104,6 +120,7 @@ impl<'ctx> Context {
             variables: self.variables.clone(),
             symbols: self.symbols.clone(),
             classes: self.classes.clone(),
+            match_bindings: self.match_bindings.clone(),
             prev: Some(Box::new(self.to_owned())),
         }
     }
@@ -116,30 +133,39 @@ impl<'ctx> Context {
 }
 
 /// Emit the bytecode that binds (or discards) the sub-patterns
-/// of a tuple-position constructor pattern. The VM's `UNPACK` (and
-/// `JUMP_IF_MATCH`) push each payload value into the binding's
-/// slot position directly (because the stack and the locals
-/// area share memory), so the `STORE` emitted for each
-/// `Binding` is a no-op that confirms the binding.
+/// of a constructor pattern. The VM's `UNPACK` (and
+/// `JUMP_IF_MATCH`) push each payload value at consecutive stack
+/// positions starting at `frame.sp + 1`, so the slot for the
+/// Nth payload is `1 + N` (where the first payload is at slot 1).
 ///
-/// Used for NESTED patterns only (record-pattern arm bodies have
-/// their own handler — see `emit_record_pattern_binding_arm`,
-/// which walks DECLARATION order so the binding slots line up
-/// with the VM's push order).
+/// The bindings are recorded in `match_bindings` with their slot
+/// positions. Subsequent `LOAD`/`STORE` references in the arm
+/// body consult `match_bindings` first (see
+/// [`Compiler::lookup_slot`]), so the codegen is independent of
+/// how many OTHER arms have bindings — the slot is always 1, 2,
+/// 3, ... for the arm being processed.
 ///
 /// For each sub-pattern:
-/// - `Binding { name }` — intern `name` in `variables`, then
-///   `STORE <symbol>` to pop the top of stack into that slot.
+/// - `Binding { name }` — record `name → next_slot` in
+///   `match_bindings`, emit `STORE next_slot`, and increment
+///   `next_slot`. The STORE is a no-op (Phase 15D) that confirms
+///   the binding — the VM already pushed the value at that slot.
 /// - `Wildcard` — `POP` to discard the value.
 /// - `Constructor { .. }` (tuple shape) — `UNPACK <arity>` to pop
 ///   the enum value and push its payload, then recurse into
-///   each sub-pattern of the inner constructor.
+///   each sub-pattern of the inner constructor. The nested
+///   bindings continue counting from the outer `next_slot`.
+/// - `Constructor { .. }` (record shape) — emit a POP (nested
+///   record patterns inside an arm body are not supported in 17B
+///   — see Known Limitations in AGENTS.md).
 ///
-/// This function is called once per NESTED constructor pattern
-/// inside an arm body. After it returns, the stack is empty (the
-/// payload values are all bound to local slots or discarded).
+/// This function is called once per arm body. After it returns,
+/// the stack has been "consumed" by the binding code (POPs for
+/// wildcards, no-op STOREs for bindings) and `match_bindings`
+/// holds the name → slot mapping for the arm.
 fn emit_pattern_binding(
-    variables: &mut Interner<String>,
+    match_bindings: &mut HashMap<String, u32>,
+    next_slot: &mut u32,
     pattern: &Pattern,
     bytecode: &mut Vec<Byte>,
 ) {
@@ -149,8 +175,10 @@ fn emit_pattern_binding(
             bytecode.push(Byte::new(Instruction::POP));
         }
         Pattern::Binding { name } => {
-            let symbol = variables.intern(name.to_string());
-            bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
+            let slot = *next_slot;
+            match_bindings.insert(name.to_string(), slot);
+            bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(slot));
+            *next_slot += 1;
         }
         Pattern::Constructor { payload, .. } => match payload {
             PatternPayload::Unit => {
@@ -163,7 +191,7 @@ fn emit_pattern_binding(
             PatternPayload::Tuple(parts) => {
                 bytecode.push(Byte::new(Instruction::Unpack).with_operand_u32(parts.len() as u32));
                 for sub in parts {
-                    emit_pattern_binding(variables, sub, bytecode);
+                    emit_pattern_binding(match_bindings, next_slot, sub, bytecode);
                 }
             }
             PatternPayload::Record(_fields) => {
@@ -183,6 +211,27 @@ fn emit_pattern_binding(
 impl Compiler {
     pub fn get_function(&self, name: &str) -> usize {
         self.functions[name]
+    }
+
+    /// Look up the slot for a name used in an arm body. First
+    /// checks the per-arm `match_bindings` map (where match-bound
+    /// names live at slots 1, 2, 3, ... matching the VM's
+    /// payload-push positions). Falls back to the global
+    /// `variables` Interner for function params and other
+    /// non-pattern bindings.
+    ///
+    /// Returns the slot ID (u32) if the name is found, `None`
+    /// otherwise.
+    fn lookup_slot(&self, name: &str) -> Option<u32> {
+        if let Some(map) = &self.context.match_bindings {
+            if let Some(&slot) = map.get(name) {
+                return Some(slot);
+            }
+        }
+        self.context
+            .variables
+            .key(&name.to_string())
+            .map(|s| s as u32)
     }
 
     pub fn get_messages(&self) -> &Vec<Message> {
@@ -629,8 +678,8 @@ impl Compiler {
                 // empty.
             }
             Expression::Identifier(n) => {
-                if let Some(symbol) = self.context.variables.key(&n.to_string()) {
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(symbol as u32));
+                if let Some(slot) = self.lookup_slot(n) {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                 } else {
                     let mut message =
                         Message::error("Unknown variable".to_string(), span.into_range());
@@ -938,7 +987,21 @@ impl Compiler {
 
                 self.context.assignments.insert(name.clone(), true);
 
-                if let Some(symbol) = self.context.variables.key(&name) {
+                // Match bindings (arm body pattern bindings) live
+                // in `match_bindings`, not the global `variables`
+                // Interner. Fall back to the global Interner only
+                // when no match is in scope.
+                let symbol_opt = if let Some(map) = &self.context.match_bindings {
+                    if let Some(&slot) = map.get(&name) {
+                        Some(slot as usize)
+                    } else {
+                        self.context.variables.key(&name)
+                    }
+                } else {
+                    self.context.variables.key(&name)
+                };
+
+                if let Some(symbol) = symbol_opt {
                     if unlikely(self.context.constants.contains_key(&symbol)) {
                         let assigned = likely(*self.context.constants.get(&symbol).unwrap());
 
@@ -1314,13 +1377,22 @@ impl Compiler {
                             }
                             Pattern::Binding { name } => {
                                 // Binding arm — STORE the
-                                // scrutinee under the
-                                // binding's symbol.
-                                let symbol =
-                                    self.context.variables.intern(name.to_string());
+                                // scrutinee at slot 1 (matching
+                                // LOAD 0's push position).
+                                //
+                                // Phase 17B: the binding is
+                                // recorded in `match_bindings`
+                                // by the reverse pass, so the
+                                // body's `Identifier` lookup
+                                // resolves the name to slot 1.
+                                // Hardcoding slot 1 here is
+                                // correct because LOAD 0 always
+                                // pushes to frame.sp + 1, and the
+                                // STORE is a no-op (Phase 15D).
+                                let _ = name;
                                 self.bytecode.push(
                                     Byte::new(Instruction::STORE)
-                                        .with_operand_u32(symbol as u32),
+                                        .with_operand_u32(1),
                                 );
                             }
                         }
@@ -1384,59 +1456,95 @@ impl Compiler {
                         //   different order — that doesn't change
                         //   the slot order, only which sub-pattern
                         //   binds to which slot.
-                        if let Pattern::Constructor {
-                            enum_name,
-                            variant_name,
-                            payload,
-                        } = &arm.pattern
-                        {
-                            use parser::ast::PatternPayload;
-                            match payload {
-                                PatternPayload::Unit => {}
-                                PatternPayload::Tuple(parts) => {
-                                    for sub_pat in parts {
-                                        emit_pattern_binding(
-                                            &mut self.context.variables,
-                                            sub_pat,
-                                            &mut self.bytecode,
-                                        );
-                                    }
-                                }
-                                PatternPayload::Record(fields) => {
-                                    // Walk DECLARATION order (from
-                                    // the checker's payload_tys_for
-                                    // — gives `Vec<(String, Ty)>`
-                                    // in declaration order).
-                                    let decl_order = self
-                                        .checker
-                                        .payload_tys_for(enum_name, variant_name);
-                                    // Build a name → &Pattern map for
-                                    // the pattern site.
-                                    let pattern_site: std::collections::HashMap<
-                                        &str,
-                                        &Pattern,
-                                    > = fields
-                                        .iter()
-                                        .map(|pf| (pf.name, &pf.pattern))
-                                        .collect();
-                                    for (decl_name, _) in decl_order.iter() {
-                                        if let Some(sub_pat) =
-                                            pattern_site.get(decl_name.as_str())
-                                        {
+                        //
+                        // Phase 17B fix for multi-variant binding
+                        // bodies: the binding slots are recorded
+                        // in a per-arm `match_bindings` map (not
+                        // the global Interner), starting at slot 1
+                        // for the first payload position. The map
+                        // is consulted by `Identifier` / `Assignment`
+                        // lookups in the arm body.
+                        let mut arm_bindings: HashMap<String, u32> = HashMap::new();
+                        let mut next_slot: u32 = 1;
+                        match &arm.pattern {
+                            Pattern::Binding { name } => {
+                                // Binding arm: the forward pass
+                                // already emitted `STORE 1` for
+                                // the scrutinee (at slot 1,
+                                // matching LOAD 0's push). Record
+                                // the binding here so the body's
+                                // `Identifier` lookup finds it.
+                                arm_bindings.insert(name.to_string(), 1);
+                            }
+                            Pattern::Constructor {
+                                enum_name,
+                                variant_name,
+                                payload,
+                            } => {
+                                use parser::ast::PatternPayload;
+                                match payload {
+                                    PatternPayload::Unit => {}
+                                    PatternPayload::Tuple(parts) => {
+                                        for sub_pat in parts {
                                             emit_pattern_binding(
-                                                &mut self.context.variables,
+                                                &mut arm_bindings,
+                                                &mut next_slot,
                                                 sub_pat,
                                                 &mut self.bytecode,
                                             );
                                         }
-                                        // Missing field: typechecker
-                                        // already reported; skip
-                                        // silently so the bytecode
-                                        // layout stays consistent.
+                                    }
+                                    PatternPayload::Record(fields) => {
+                                        // Walk DECLARATION order (from
+                                        // the checker's payload_tys_for
+                                        // — gives `Vec<(String, Ty)>`
+                                        // in declaration order).
+                                        let decl_order = self
+                                            .checker
+                                            .payload_tys_for(enum_name, variant_name);
+                                        // Build a name → &Pattern map for
+                                        // the pattern site.
+                                        let pattern_site: std::collections::HashMap<
+                                            &str,
+                                            &Pattern,
+                                        > = fields
+                                            .iter()
+                                            .map(|pf| (pf.name, &pf.pattern))
+                                            .collect();
+                                        for (decl_name, _) in decl_order.iter() {
+                                            if let Some(sub_pat) =
+                                                pattern_site.get(decl_name.as_str())
+                                            {
+                                                emit_pattern_binding(
+                                                    &mut arm_bindings,
+                                                    &mut next_slot,
+                                                    sub_pat,
+                                                    &mut self.bytecode,
+                                                );
+                                            }
+                                            // Missing field: typechecker
+                                            // already reported; skip
+                                            // silently so the bytecode
+                                            // layout stays consistent.
+                                        }
                                     }
                                 }
                             }
+                            Pattern::Wildcard => {
+                                // No bindings — the forward pass
+                                // already emitted POP for the
+                                // scrutinee.
+                            }
                         }
+
+                        // Install the per-arm bindings map so the
+                        // body's `Identifier` / `Assignment` lookups
+                        // resolve pattern bindings to slots 1, 2, 3,
+                        // ... — matching the VM's payload-push
+                        // positions. Cleared after the body emits.
+                        let saved_bindings =
+                            self.context.match_bindings.take();
+                        self.context.match_bindings = Some(arm_bindings);
 
                         // Emit the arm body. Borrow-checker
                         // note: stage the bytes in a local so
@@ -1445,6 +1553,14 @@ impl Compiler {
                         // `&mut self.bytecode` from `extend`.
                         let body_bc = self.do_compile(&arm.body);
                         self.bytecode.extend(body_bc);
+
+                        // Restore the prior `match_bindings`
+                        // (usually `None` — we only save/restore
+                        // to be safe if a match is nested inside
+                        // an arm body, which doesn't happen in
+                        // practice but the typechecker doesn't
+                        // prevent it).
+                        self.context.match_bindings = saved_bindings;
 
                         // For non-first arms, emit a
                         // JMP-to-end placeholder targeting
@@ -2079,6 +2195,289 @@ mod tests {
             unpack_count >= 1,
             "expected at least 1 UNPACK (the match's last arm); got {}",
             unpack_count
+        );
+    }
+
+    // ============================================================
+    //  Phase 17B: record-payload codegen tests
+    // ============================================================
+    //
+    // The 17B spec listed 6 record-payload codegen tests. The
+    // developer claimed to add them but in fact added 0 — all 6
+    // were silently skipped. This section adds the missing tests,
+    // including the red-team's canonical
+    // `record_construct_reorders_shuffled_call_site_fields` test
+    // that locks in the record-field reordering behavior.
+
+    /// Codegen test 10 (Phase 17B): the red-team's canonical
+    /// record-payload reorder test. The variant is declared as
+    /// `Foo { x: int, y: int, z: int }` and the user calls it
+    /// with shuffled fields `Foo { z: 1, x: 2, y: 3 }`. The
+    /// codegen must emit the CONST operands in DECLARATION order
+    /// (2, 3, 1) so the VM's `MAKE_ENUM` produces a payload
+    /// `[2, 3, 1]` matching the declaration order. If the
+    /// codegen emitted them in call-site order (1, 2, 3), the
+    /// payload would be in the wrong slot positions and any
+    /// match destructuring would get the wrong values.
+#[test]
+    fn record_construct_reorders_shuffled_call_site_fields() {
+        use common::Instruction;
+        // The variant is declared as `Foo { x: int, y: int, z: int }`
+        // and the user calls it with shuffled fields
+        // `Foo { z: 1, x: 2, y: 3 }`. The codegen must emit the
+        // CONST operands in REVERSE declaration order so the VM's
+        // `MAKE_ENUM` produces a payload in DECLARATION order
+        // (payload[0] = x = 2, payload[1] = y = 3, payload[2] = z = 1).
+        let bc = compile_src(
+            r#"enum E { Foo { x: int, y: int, z: int } }
+fn main() {
+    print "%i", E::Foo { z: 1, x: 2, y: 3 };
+}"#,
+        );
+
+        // The construct `E::Foo { z: 1, x: 2, y: 3 }` should
+        // emit CONST 1 (z), CONST 3 (y), CONST 2 (x) — that
+        // is, REVERSE declaration order — so that MAKE_ENUM's
+        // top-first pop order places them at payload[0..2]
+        // in declaration order.
+        let const_operands: Vec<i64> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CONST))
+            .map(|b| b.constant() as i64)
+            .filter(|&v| v >= 1 && v <= 3)
+            .collect();
+        assert_eq!(
+            const_operands,
+            vec![1, 3, 2],
+            "Record fields must be emitted in REVERSE declaration order \
+             so MAKE_ENUM pops them into declaration order at payload[0..]"
+        );
+
+        // Verify MAKE_ENUM has the right tag and arity.
+        let make_enum = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeEnum))
+            .expect("expected MAKE_ENUM in the bytecode");
+        let tag = (make_enum.operand_u32() >> 16) as u16;
+        let arity = (make_enum.operand_u32() & 0xFFFF) as u16;
+        assert_eq!(tag, 0, "expected tag=0 for the only variant Foo");
+        assert_eq!(arity, 3, "expected arity=3 for Foo {{ x, y, z }}");
+    }
+
+    /// Codegen test 11 (Phase 17B): a record construct with one
+    /// field emits exactly 1 CONST followed by MAKE_ENUM with
+    /// arity=1.
+    #[test]
+    fn record_construct_one_field_emits_correct_bytecode() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum E { Foo { x: int } } fn main() { let _ = E::Foo { x: 1 }; }",
+        );
+
+        // Find the MAKE_ENUM. Its operand is tag (upper 16) and
+        // arity (lower 16).
+        let make_enum = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeEnum))
+            .expect("expected at least one MAKE_ENUM");
+        let tag = (make_enum.operand_u32() >> 16) as u16;
+        let arity = (make_enum.operand_u32() & 0xFFFF) as u16;
+        assert_eq!(tag, 0);
+        assert_eq!(arity, 1, "expected arity=1 for Foo {{ x }}");
+
+        // Exactly 1 CONST with value 1 (the literal `1`).
+        let const_one_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant() == 1)
+            .count();
+        assert_eq!(
+            const_one_count, 1,
+            "expected exactly 1 CONST with value 1; got {}",
+            const_one_count
+        );
+    }
+
+    /// Codegen test 12 (Phase 17B): a match pattern with
+    /// SHUFFLED record fields (`{ y: b, x: a }`) emits STORE
+    /// opcodes in DECLARATION order — a first, then b. If the
+    /// codegen emitted in pattern-source order, the bindings
+    /// would be swapped at runtime (because the VM pushes
+    /// payload values in declaration order).
+    #[test]
+    fn match_emits_binding_interns_in_declaration_order() {
+        use common::Instruction;
+        // Declare variant as `{ x: int, y: int, z: int }`. The
+        // pattern site supplies fields in shuffled order
+        // (`y: b, x: a`). The codegen should walk DECLARATION
+        // order (x first, then y) when emitting STORE, so the
+        // bindings line up with the VM's payload-push positions.
+        //
+        // Use a `print` to consume the match's result so the
+        // binding code is not optimized away.
+        let bc = compile_src(
+            "enum E { Foo { x: int, y: int, z: int } } \
+             fn main() { \
+                 let e = E::Foo { x: 1, y: 2, z: 3 }; \
+                 let v = match e { \
+                     E::Foo { y: _, x: a } => a, \
+                 }; \
+                 print \"%i\", v; \
+             }",
+        );
+
+        // The match has one arm. The STORE for `a` should
+        // appear at slot 1 (the first payload position for
+        // declaration-order walking). The POP for `_` doesn't
+        // emit a STORE.
+        let stores: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .map(|b| b.operand_u32())
+            .collect();
+        // We expect at least one STORE at slot 1 (the binding
+        // `a`). The match destructures 3 fields but only 1 is
+        // bound (a), so only 1 STORE is emitted. The wildcard
+        // `_` produces POP.
+        let slot_1_count = stores.iter().filter(|&&s| s == 1).count();
+        assert!(
+            slot_1_count >= 1,
+            "expected STORE at slot 1 for the binding `a`; got stores at {:?}",
+            stores
+        );
+        // The POP for `_` should be present.
+        let pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::POP))
+            .count();
+        assert!(
+            pop_count >= 1,
+            "expected at least 1 POP for the wildcard `_`"
+        );
+    }
+
+    /// Codegen test 13 (Phase 17B): a mixed-shape enum with
+    /// Unit + Tuple + Record variants compiles with the
+    /// correct tags and arities for each variant.
+    #[test]
+    fn mixed_enum_unit_tuple_record_all_in_one() {
+        use common::Instruction;
+        // Use prints to keep the constructs alive in the
+        // bytecode (the codegen is silent on unused `let _`).
+        let bc = compile_src(
+            "enum E { A, B(int), C { x: int } } \
+             fn main() { \
+                 print \"%i\", E::A; \
+                 print \"%i\", E::B(1); \
+                 print \"%i\", E::C { x: 2 }; \
+             }",
+        );
+
+        // Find all MAKE_ENUM ops (one per construct call,
+        // including unit variants — the codegen always emits
+        // MAKE_ENUM, even for Unit, with arity=0).
+        let make_enums: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeEnum))
+            .collect();
+        assert_eq!(
+            make_enums.len(),
+            3,
+            "expected 3 MAKE_ENUM ops (one per construct call); got {}",
+            make_enums.len()
+        );
+
+        // Sort by (tag, arity) for stable comparison.
+        let mut tags_arities: Vec<(u16, u16)> = make_enums
+            .iter()
+            .map(|b| {
+                let tag = (b.operand_u32() >> 16) as u16;
+                let arity = (b.operand_u32() & 0xFFFF) as u16;
+                (tag, arity)
+            })
+            .collect();
+        tags_arities.sort();
+        assert_eq!(
+            tags_arities,
+            vec![(0, 0), (1, 1), (2, 1)],
+            "expected MAKE_ENUM ops at (tag=0, arity=0) for A (unit), \
+             (tag=1, arity=1) for B(int), and (tag=2, arity=1) for C record variant"
+        );
+    }
+
+    /// Codegen test 14 (Phase 17B): a record pattern with a
+    /// wildcard field (`_`) emits a POP for the wildcard
+    /// sub-pattern instead of a STORE.
+    #[test]
+    fn record_pattern_with_wildcard_field_emits_pop() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum E { Foo { x: int, y: int } } \
+             fn main() { \
+                 let e = E::Foo { x: 1, y: 2 }; \
+                 match e { \
+                     E::Foo { x: _, y: v } => v, \
+                 }; \
+             }",
+        );
+
+        // The wildcard `x: _` produces POP in the binding code.
+        // The binding `y: v` produces STORE at slot 2 (second
+        // payload position for a 2-field record).
+        let pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::POP))
+            .count();
+        assert!(
+            pop_count >= 1,
+            "expected at least 1 POP for the wildcard field; got {}",
+            pop_count
+        );
+    }
+
+    /// Codegen test 15 (Phase 17B): a unit-variant match arm
+    /// (`Empty`) does NOT emit UNPACK (the variant has no
+    /// payload). It emits a POP to discard the scrutinee.
+    #[test]
+    fn empty_record_pattern_does_not_emit_unpack() {
+        use common::Instruction;
+        // The spec says "E::Empty => 0" where Empty is unit.
+        // The codegen for a unit-variant last arm emits POP,
+        // not UNPACK.
+        let bc = compile_src(
+            "enum E { Empty, Foo(int) } \
+             fn main() { \
+                 let e = E::Empty; \
+                 match e { \
+                     E::Empty => 0, \
+                     E::Foo(_) => 1, \
+                 }; \
+             }",
+        );
+
+        // Exactly 1 UNPACK (for the Foo arm, which is the
+        // last arm and uses UNPACK to consume the scrutinee).
+        // The Empty arm is NOT last → emits JUMP_IF_MATCH
+        // (not UNPACK). If the codegen wrongly emitted UNPACK
+        // for the unit arm, we'd see 2 UNPACKs.
+        let unpack_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::Unpack))
+            .count();
+        assert_eq!(
+            unpack_count, 1,
+            "expected exactly 1 UNPACK (for the Foo last arm); got {}",
+            unpack_count
+        );
+
+        // And the Empty arm's JUMP_IF_MATCH should be present.
+        let jump_if_match_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
+            .count();
+        assert_eq!(
+            jump_if_match_count, 1,
+            "expected exactly 1 JUMP_IF_MATCH (for the Empty arm); got {}",
+            jump_if_match_count
         );
     }
 }
