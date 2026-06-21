@@ -109,6 +109,27 @@ fn example_fib_still_works() {
     assert_eq!(output, "13");
 }
 
+#[test]
+fn example_record_prints_169() {
+    // The record-shape example: distance² from origin (5² + 12² = 169).
+    let output = run_example("examples/record.0s");
+    assert_eq!(output, "169");
+}
+
+#[test]
+fn example_mixed_prints_zero_circle_square_triangle() {
+    // The mixed-shape example: 4 print statements, one per
+    // variant (Empty, CircleR(5), Rect { 3, 4 }, Tri { 1, 2, 3 }).
+    // Output: 0 (Empty), 25 (5²), 12 (3×4), 2 ((1+2+3)/3).
+    //
+    // The bindings-body codegen was fixed in 17B-cleanup so the
+    // multi-variant binding case (CircleR(r), Rect { width, height },
+    // Tri { a, b, c }) produces correct output — see
+    // `compiler/src/lib.rs` `match_bindings` for details.
+    let output = run_example("examples/mixed.0s");
+    assert_eq!(output, "025122");
+}
+
 // ============================================================
 //  Phase 16: BlockBuilder codegen — golden regression tests
 // ============================================================
