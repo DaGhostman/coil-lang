@@ -1,5 +1,5 @@
 fn sadge(string n) {
-    print "0x%x - %s", n, n;
+    print "%s", n;
 }
 
 

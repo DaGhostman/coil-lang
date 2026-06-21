@@ -744,8 +744,9 @@ impl<'pratt> Pratt<'pratt> {
 
     /// `EnumName::Variant(args)` — a *qualified* constructor
     /// application. The `::` is mandatory: a bare `Variant(args)` is
-    /// parsed as a `Call` (and the typechecker in 15B will redirect
-    /// `Call` to `Construct` if the name resolves to a constructor).
+    /// parsed as a `Call` (and the typechecker will report
+    /// 'Cannot find function' for bare constructors — users must
+    /// qualify with `EnumName::VariantName`).
     ///
     /// Tried before `call` in the atom choice so the `::` is matched
     /// before the `(`.
@@ -1152,8 +1153,8 @@ mod tests {
     #[test]
     fn bare_construct_is_a_call_not_a_construct() {
         // `Some(42)` (no `::`) is parsed as a `Call` — the typechecker
-        // in 15B will redirect `Call` to `Construct` if the name
-        // resolves to a constructor.
+        // reports an error ('Cannot find function `Some`') for bare
+        // constructors — see 15B for details.
         let ast = expr_ast!("Some(42)");
         // The recursive expr() rule wraps the result in `Expr`.
         let inner = match ast {
