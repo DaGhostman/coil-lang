@@ -35,6 +35,15 @@ impl Pipeline {
         todo!("Handle function registration of native functions");
     }
 
+    /// Borrow the inner `Compiler` mutably. Used by the
+    /// integration tests in `compiler/src/lib.rs::tests`
+    /// that need to inspect the compiler's diagnostic
+    /// messages directly.
+    #[cfg(test)]
+    pub fn compiler_mut(&mut self) -> &mut Compiler {
+        &mut self.compiler
+    }
+
     pub fn new() -> Self {
         let cwd = std::env::current_dir().expect("Unable to determine current working directory");
 
@@ -155,6 +164,74 @@ impl Pipeline {
         .expect("Unable to write compiled output to file");
     }
 
+    /// Compile a source string in-memory and return the
+    /// resulting bytecode. Used by the golden pipeline tests
+    /// in `compiler/tests/pipeline.rs` so the tests don't
+    /// need a temporary `.c0s` file round-trip via
+    /// `Pipeline::compile`.
+    ///
+    /// The returned bytecode is the same shape
+    /// `Pipeline::compile` writes to disk: a `[CALL, JMP
+    /// <main>, HALT, ...]` prologue followed by the
+    /// per-function bodies. Suitable for direct execution
+    /// by `Machine::run`.
+    ///
+    /// Returns `Err(())` on parse failure or non-empty
+    /// typecheck messages (we surface those as a hard error
+    /// because golden tests assume the example is
+    /// well-typed).
+    /// Compile a parsed AST and return the bytecode
+    /// (ignoring typecheck messages). Used by the
+    /// `fizbuz_runs_to_completion` golden test, which
+    /// exercises a .0s example that the typechecker
+    /// rejects (`return;` is parsed as a variable name)
+    /// but the codegen still produces valid bytecode for.
+    pub fn compile_test(
+        &mut self,
+        module: &str,
+        ast: &(SimpleSpan, Box<Expression<'_>>),
+    ) -> Vec<Byte> {
+        let mut bytecode = self.compiler.compile(module, ast);
+
+        // Patch the JMP at offset 1 (the second prologue
+        // instruction) to jump to the user's `main`
+        // function. Mirrors the patching logic in
+        // `compile_src` but is exposed for tests that
+        // bypass the typecheck-message check.
+        let main_offset = self.compiler.get_function("main") as u32;
+        if let Some(byte) = bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset);
+        }
+
+        bytecode
+    }
+
+    pub fn compile_src(&mut self, src: &str) -> Result<Vec<Byte>, ()> {
+        let parser = Pratt::default();
+        let ast = parser.parse(src).map_err(|_| ())?;
+
+        let mut bytecode = self.compiler.compile("", &ast);
+
+        // Drain any typecheck messages — for golden tests,
+        // we expect the example to be well-typed.
+        let messages = self.compiler.get_messages();
+        if !messages.is_empty() {
+            return Err(());
+        }
+
+        // Patch the JMP at offset 1 (the second prologue
+        // instruction) to jump to the user's `main`
+        // function. We patch the returned `bytecode` Vec
+        // (not `self.compiler.bytecode`, which is a
+        // separate clone).
+        if let Some(byte) = bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.get_function("main") as u32);
+        }
+
+        Ok(bytecode)
+    }
+
     pub fn run(self, filename: String) -> Result<Vec<Byte>, ()> {
         let mut f = File::open(filename).expect("Unable to find file");
         let mut buffer = Vec::with_capacity(1024);
@@ -228,10 +305,7 @@ mod tests {
             let _ = builder.finish();
         }));
 
-        assert!(
-            result.is_ok(),
-            "ariadne panicked on a well-formed message"
-        );
+        assert!(result.is_ok(), "ariadne panicked on a well-formed message");
     }
 
     /// The help hint should be included in the rendered report. We
@@ -251,17 +325,20 @@ mod tests {
         msg.with_help("consider prefixing with `_`".to_string());
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let builder = Report::build(ReportKind::Warning, ("test.0s".to_string(), msg.range().clone()))
-                .with_config(
-                    Config::new()
-                        .with_index_type(IndexType::Byte)
-                        .with_underlines(true)
-                        .with_label_attach(LabelAttach::End)
-                        .with_multiline_arrows(true)
-                        .with_compact(false),
-                )
-                .with_help(msg.help().as_ref().unwrap())
-                .finish();
+            let builder = Report::build(
+                ReportKind::Warning,
+                ("test.0s".to_string(), msg.range().clone()),
+            )
+            .with_config(
+                Config::new()
+                    .with_index_type(IndexType::Byte)
+                    .with_underlines(true)
+                    .with_label_attach(LabelAttach::End)
+                    .with_multiline_arrows(true)
+                    .with_compact(false),
+            )
+            .with_help(msg.help().as_ref().unwrap())
+            .finish();
             let _ = builder;
         }));
         assert!(result.is_ok());

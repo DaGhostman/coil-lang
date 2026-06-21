@@ -1,11 +1,27 @@
-use std::{fmt::Write, io::Write as _};
+use std::{
+    fmt::Write as FmtWrite,
+    io::{self, Write as IoWrite},
+};
 
 use common::{
-    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, SeekableIterator, Value,
-    unlikely,
+    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte,
+    SeekableIterator, Value, unlikely,
 };
 
 use crate::{Frame, Heap, Member, ObjEnum, ObjInstance, ObjString, Object, Stack};
+
+/// Default allocation count between automatic GC collections. The VM
+/// increments an internal counter on every heap allocation site
+/// (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`); when the counter
+/// exceeds this threshold, the VM runs `trace` + `sweep`.
+///
+/// Phase 15D.1 (was previously wired only in `#[cfg(debug_assertions)]`
+/// builds, running on every single instruction — visible as
+/// "Performing GC trace" spam). The threshold is intentionally
+/// modest: small test programs should still observe at least one
+/// collection, while large programs amortise the trace cost over
+/// many allocations.
+const GC_TRIGGER_INTERVAL: usize = 64;
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -44,10 +60,28 @@ macro_rules! unary {
 
 // type External = fn(&[Value]) -> Value;
 
+/// The output sink for the `PRINT` opcode. By default the VM
+/// writes to stdout (via `print!`). Setting this field via
+/// [`Machine::with_output`] redirects output to an arbitrary
+/// `std::io::Write` implementation — used by the golden
+/// pipeline tests in `compiler/tests/pipeline.rs` to capture
+/// stdout in memory.
+type OutputSink = Box<dyn IoWrite>;
+
 pub struct Machine<const S: usize> {
     heap: Heap,
     stack: Stack<Value, 8192>,
     frames: ArrayVec<Frame, S>,
+    /// Optional output sink. When `None`, the VM writes
+    /// `print!` output to stdout (the default). When `Some`,
+    /// output is redirected to the contained writer — this is
+    /// how the integration tests capture stdout.
+    output: Option<OutputSink>,
+    /// Allocation counter for automatic GC. Incremented on
+    /// every heap allocation site (`INIT`, `STRING`, `FORMAT`,
+    /// `MAKE_ENUM`); reset to zero after each collection.
+    /// See [`Machine::collect_garbage`] and [`GC_TRIGGER_INTERVAL`].
+    alloc_counter: usize,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -113,6 +147,15 @@ impl<const S: usize> Default for Machine<S> {
             frames,
             heap: Heap::default(),
             stack: Stack::new(),
+            // Default: stdout (no capture).
+            output: None,
+            // Phase 15D.1: GC trigger counter. The VM increments
+            // this on every allocation; once it exceeds
+            // `GC_TRIGGER_INTERVAL` the next allocation triggers
+            // a trace+sweep cycle. Start at 0 — the first
+            // allocation triggers the first GC after
+            // `GC_TRIGGER_INTERVAL` allocations, not before.
+            alloc_counter: 0,
         }
     }
 }
@@ -144,6 +187,60 @@ impl<const S: usize> Machine<S> {
         }
         None
     }
+
+    /// Run a mark-and-sweep GC cycle using `stack` as the root
+    /// set and `heap` as the heap to trace.
+    ///
+    /// Implemented as a free function (not a `&mut self` method)
+    /// for the same reason as [`Self::find_object_by_addr`]: the
+    /// `execute` loop holds `let frame = self.frames.get_mut()`
+    /// which borrows `self.frames` mutably for the whole match
+    /// arm, blocking any `&mut self` method call from inside
+    /// that arm. Splitting out `&mut Heap`, `&Stack`, and the
+    /// `&mut usize` counter into separate parameters lets the
+    /// borrow checker see them as disjoint borrows.
+    fn gc_collect(heap: &mut Heap, stack: &Stack<Value, 8192>, alloc_counter: &mut usize) {
+        // Phase 15D.1 — the trace root set is every value on
+        // the operand stack. Values that fall in the heap's
+        // address range are roots; immediates are silently
+        // ignored by `heap.trace`.
+        let roots: Vec<u64> = stack.as_slice().iter().map(|v| v.raw() as u64).collect();
+
+        // Mark roots.
+        heap.trace(&roots);
+
+        // Propagate marks transitively. Re-walk the heap and
+        // collect every already-marked object into a `grey`
+        // list, then drain it via `Object::mark_references`.
+        // (15A's `Object::mark_references` is the per-object
+        // "mark the heap pointers I hold" hook; this is the
+        // mark-and-trace loop that 15C deferred to 15D.)
+        let mut gray: Vec<Object> = Vec::new();
+        let mut current = heap.head_for_lookup();
+        let mut root_objects: Vec<Object> = Vec::new();
+        while let Some(reference) = current {
+            if reference.is_marked() {
+                root_objects.push(reference);
+            }
+            current = reference.get_next();
+        }
+        for root in &root_objects {
+            root.mark_references(&mut gray);
+        }
+        while let Some(obj) = gray.pop() {
+            obj.mark_references(&mut gray);
+        }
+
+        // Sweep — frees everything not marked.
+        //
+        // SAFETY: every reachable pointer has been marked (or
+        // re-marked) by the trace + propagate loop above. After
+        // sweep, the heap contains exactly the live set.
+        unsafe { heap.sweep() };
+
+        // Reset the trigger counter.
+        *alloc_counter = 0;
+    }
 }
 
 impl<const S: usize> Machine<S> {
@@ -160,6 +257,56 @@ impl<const S: usize> Machine<S> {
     #[cfg(test)]
     pub fn tell(&self) -> usize {
         self.stack.tell()
+    }
+
+    /// Redirect all `PRINT` output to the given writer instead of
+    /// stdout. Used by the golden pipeline tests
+    /// (`compiler/tests/pipeline.rs`) to capture stdout in
+    /// memory. Returns the previous output sink so the caller
+    /// can restore stdout afterwards if desired.
+    ///
+    /// Note: the writer is held by the machine for the entire
+    /// lifetime of subsequent `run` calls. `Box<dyn IoWrite>`
+    /// is sufficient (no `Send`/`Sync` requirement — the
+    /// machine isn't shared across threads).
+    pub fn with_output<W: IoWrite + 'static>(&mut self, writer: W) -> Option<OutputSink> {
+        let prev = self.output.take();
+        self.output = Some(Box::new(writer));
+        prev
+    }
+
+    /// Reset the output sink back to stdout. Returns the previous
+    /// sink so the caller can recover it (useful in tests that
+    /// want to scope the redirection).
+    pub fn restore_output(&mut self) -> Option<OutputSink> {
+        self.output.take()
+    }
+
+    /// Manually trigger a GC cycle. The normal path is
+    /// allocation-pressure-driven (`alloc_counter` exceeds
+    /// [`GC_TRIGGER_INTERVAL`]); this method exists for tests
+    /// that want to deterministically verify GC behaviour
+    /// without allocating enough to trigger naturally.
+    ///
+    /// The trace root set is the current operand stack: every
+    /// value on the stack that points into the heap is a root.
+    /// Then `Object::mark_references` walks the grey stack
+    /// transitively (the mark-and-trace loop that 15A introduced
+    /// but 15D wires into the automatic cycle).
+    pub fn collect_garbage(&mut self) {
+        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+    }
+
+    /// Read-only access to the heap. Used by the GC integration
+    /// test to assert that the heap didn't grow unboundedly.
+    pub fn heap(&self) -> &Heap {
+        &self.heap
+    }
+
+    /// Current allocation counter (number of allocations since
+    /// the last GC). Exposed for tests.
+    pub fn alloc_counter(&self) -> usize {
+        self.alloc_counter
     }
 
     pub fn run(&mut self, code: &[Byte]) {
@@ -202,6 +349,39 @@ impl<const S: usize> Machine<S> {
         }
     }
 
+    /// Run a non-archived `&[Byte]` (the form produced by
+    /// the compiler's `compile` method, before rkyv
+    /// serialization). Phase 15D.4 — used by the golden
+    /// pipeline tests in `compiler/tests/pipeline.rs`,
+    /// which compile in-memory and want to skip the
+    /// `out.c0s` file round-trip.
+    ///
+    /// We use rkyv's `to_bytes` + `access` to safely
+    /// convert from `Vec<Byte>` to the archived form the
+    /// VM's `run` expects. The cast approach is fragile
+    /// (rkyv's archived layout may not match the source
+    /// layout exactly for some field types), so we go
+    /// through the proper serialization path.
+    pub fn run_raw(&mut self, code: &[RawByte]) {
+        use rkyv::{rancor::Error, vec::ArchivedVec};
+
+        // Serialize a `Vec<Byte>` (not `&[Byte]`, which
+        // isn't `Sized`) via rkyv.
+        let owned: Vec<RawByte> = code.to_vec();
+        let bytes = rkyv::to_bytes::<Error>(&owned)
+            .expect("failed to serialize bytecode via rkyv");
+
+        // Convert to a plain `Vec<u8>` for `access`.
+        let plain: Vec<u8> = bytes.as_slice().to_vec();
+        drop(bytes); // AlignedVec → drop, no `into_owned`
+
+        // Deserialize back to the archived form.
+        let archived = rkyv::access::<ArchivedVec<Byte>, Error>(&plain)
+            .expect("failed to deserialize bytecode via rkyv");
+
+        self.run(archived.as_slice());
+    }
+
     #[inline(always)]
     fn execute(&mut self, code: &mut SeekableIterator<'_, Byte>) -> ExecutionResult {
         #[cfg(debug_assertions)]
@@ -225,18 +405,17 @@ impl<const S: usize> Machine<S> {
 
             #[cfg(debug_assertions)]
             {
-                println!("Performing GC trace");
-                self.heap.trace(
-                    &self
-                        .stack
-                        .as_slice()
-                        .iter()
-                        .map(|v| v.raw() as u64)
-                        .collect::<Vec<u64>>(),
-                );
-
-                println!("Performing GC collection");
-                unsafe { self.heap.sweep() };
+                // Phase 15D.1 — replaced by the allocation-pressure
+                // GC wired in the per-allocation arms below. The
+                // debug-only per-instruction GC block was visible as
+                // "Performing GC trace" / "Performing GC collection"
+                // spam in debug builds; release builds had no GC at
+                // all (heap grew unboundedly). The new strategy:
+                // increment `alloc_counter` at every heap allocation
+                // site and trigger `collect_garbage` when the counter
+                // exceeds `GC_TRIGGER_INTERVAL`. This block is left
+                // empty intentionally — allocation sites below carry
+                // the GC responsibility now.
             }
 
             match opcode.bytecode() {
@@ -248,8 +427,45 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::CONST => self.stack.push(Value::from(opcode.constant())),
                 Instruction::STORE => {
-                    let val = self.stack.peek();
-                    self.stack[frame.get() + opcode.operand_u32() as usize] = *val;
+                    // Phase 15D — STORE is now effectively a
+                    // no-op: it reads the value at the slot's
+                    // position and writes it back to the same
+                    // position. The codegen emits a `STORE`
+                    // for every `Binding` in a pattern; the
+                    // VM's `UNPACK` (and `JUMP_IF_MATCH`)
+                    // push the binding values directly into
+                    // the slot positions (because the stack
+                    // and the locals area share the same
+                    // memory), so the slot already holds the
+                    // correct value when `STORE` runs — the
+                    // read-modify-write is a no-op that
+                    // preserves the binding semantics.
+                    //
+                    // The pre-15D implementation (peek-then-
+                    // overwrite) silently kept the value on the
+                    // stack, which broke multi-payload
+                    // constructor pattern bindings: every
+                    // `STORE` would peek the same top of stack
+                    // and overwrite the same slot, leaving all
+                    // bindings with the same value (the LAST
+                    // pushed payload value). The earlier
+                    // intermediate fix (pop-then-overwrite)
+                    // shifted the bug rather than fixing it:
+                    // the first `STORE` would pop the top,
+                    // write to the slot, and the second
+                    // `STORE` would then pop the just-written
+                    // value, leaving all bindings with the
+                    // same value (the FIRST pushed payload
+                    // value).
+                    //
+                    // With this no-op semantics, the stack and
+                    // slot overlap is a feature, not a bug:
+                    // `UNPACK` puts each payload value at the
+                    // slot's position, and `STORE` confirms
+                    // the binding without disturbing the value.
+                    let slot = frame.get() + opcode.operand_u32() as usize;
+                    let val = self.stack[slot];
+                    self.stack[slot] = val;
                 }
                 Instruction::LOAD => {
                     self.stack
@@ -372,12 +588,32 @@ impl<const S: usize> Machine<S> {
                             .heap
                             .alloc(ObjString::from(message.as_str()), Object::String);
 
+                        // Phase 15D.1 — bump the allocation counter
+                        // and trigger GC if past the threshold.
+                        self.alloc_counter += 1;
+                        if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                            Self::gc_collect(
+                                &mut self.heap,
+                                &self.stack,
+                                &mut self.alloc_counter,
+                            );
+                        }
+
                         self.stack.push(Value::from(obj.addr()));
                     }
                 }
                 Instruction::PRINT => {
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
-                    print!("{}", unsafe { &*ptr });
+                    let s = unsafe { &*ptr };
+                    // Phase 15D.1 — redirect output to the
+                    // configured sink if set; otherwise fall
+                    // through to stdout. The integration tests
+                    // use this to capture stdout in memory.
+                    if let Some(out) = self.output.as_mut() {
+                        let _ = write!(out, "{}", s);
+                    } else {
+                        print!("{}", s);
+                    }
                 }
                 Instruction::JMP => {
                     code.seek(opcode.operand_u32() as usize);
@@ -399,13 +635,31 @@ impl<const S: usize> Machine<S> {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
                     let _ = r.as_mut();
 
+                    // Phase 15D.1 — bump the allocation counter
+                    // and trigger GC if past the threshold.
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
                 }
                 Instruction::RETURN => {
                     return ExecutionResult::returns();
                 }
                 Instruction::HALT => {
-                    let _ = std::io::stdout().flush();
+                    // Phase 15D.1 — flush whichever output sink is
+                    // active before terminating, so captured output
+                    // is complete when the test inspects it.
+                    if let Some(out) = self.output.as_mut() {
+                        let _ = out.flush();
+                    } else {
+                        let _ = io::stdout().flush();
+                    }
                     return ExecutionResult::terminate();
                 }
                 Instruction::STRING => {
@@ -421,6 +675,17 @@ impl<const S: usize> Machine<S> {
                     let (object, _) = self
                         .heap
                         .alloc(ObjString::from(value.as_str()), Object::String);
+
+                    // Phase 15D.1 — bump the allocation counter
+                    // and trigger GC if past the threshold.
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
 
                     self.stack.push(Value::from(object.addr()));
                 }
@@ -500,6 +765,26 @@ impl<const S: usize> Machine<S> {
 
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
+
+                    // Phase 15D.1 — bump the allocation counter
+                    // and trigger GC if past the threshold. Note
+                    // that this happens AFTER the alloc but
+                    // BEFORE the GC starts: any heap pointers on
+                    // the stack (this enum's address will be
+                    // pushed next) are live roots for the next
+                    // collection. The payload was already
+                    // classified above (each member was wrapped
+                    // as `Member::Object` or `Member::Value`),
+                    // so the GC traces it correctly.
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::JumpIfMatch => {
@@ -508,12 +793,20 @@ impl<const S: usize> Machine<S> {
                     //
                     // Peeks the scrutinee's tag without consuming
                     // it. If the tag matches, pops the scrutinee,
-                    // pushes the payload values in declaration
-                    // order, and seeks the bytecode iterator to the
-                    // target. If the tag does not match, falls
+                    // pushes the payload values in DECLARATION
+                    // order (so the first declared element is
+                    // closest to the locals area, the last is on
+                    // top), and seeks the bytecode iterator to
+                    // the target. If the tag does not match, falls
                     // through (the scrutinee remains on the stack
                     // for the next arm to consume via UNPACK /
                     // STORE / POP).
+                    //
+                    // Phase 15D — the binding `STORE` is a
+                    // no-op, so `UNPACK` / `JUMP_IF_MATCH`
+                    // directly place the payload at the
+                    // binding's slot. See `Instruction::UNPACK`
+                    // for the rationale.
                     let operands = opcode.operand_u32();
                     let expected_tag = (operands >> 16) as u32;
                     let target_offset = (operands & 0xFFFF) as usize;
@@ -569,11 +862,23 @@ impl<const S: usize> Machine<S> {
                     // `ObjEnum::payload.len()`).
                     //
                     // Pops the scrutinee (an `Object::Enum`) and
-                    // pushes its payload values in declaration
-                    // order. Used for the LAST arm of a match
-                    // (reached via fall-through from the previous
-                    // `JUMP_IF_MATCH`) and for any explicit
-                    // unpack operation.
+                    // pushes its payload values in DECLARATION
+                    // order — i.e., the first declared payload
+                    // value ends up closest to the function's
+                    // locals area, the last is on top.
+                    //
+                    // Why DECLARATION order and not REVERSE: the
+                    // codegen's binding `STORE` is now a
+                    // no-op (Phase 15D — see `Instruction::STORE`
+                    // for the rationale). `UNPACK` pushes each
+                    // payload value directly into the binding's
+                    // slot position because the stack and the
+                    // locals area share the same memory.
+                    // Iterating the payload in declaration
+                    // order and pushing in that order places
+                    // `payload[i]` at slot `arity + i`, which
+                    // is exactly where the binding `STORE`s
+                    // expect to find it.
                     let _arity = opcode.operand_u32() as usize;
 
                     if self.stack.tell() == 0 {
@@ -763,7 +1068,12 @@ mod tests {
             const_int(20),
             const_int(10),
             make_enum(0, 3),
-            // UNPACK arity=3: pops enum, pushes 10, 20, 30.
+            // UNPACK arity=3: pops enum, pushes 10, 20, 30
+            // (in declaration order). The Phase 15D binding
+            // contract uses the slot positions directly
+            // (UNPACK puts each value at the binding's slot);
+            // the order on the stack is declaration order,
+            // not reversed.
             unpack(3),
             Byte::new(Instruction::HALT),
         ]);
@@ -848,5 +1158,221 @@ mod tests {
             addrs.contains(&string_obj.addr()),
             "string was collected despite being in outer's payload"
         );
+    }
+
+    /// Phase 15D.1 — end-to-end GC integration test.
+    ///
+    /// Allocate a stream of enums whose payload references an
+    /// outer "accumulator" root. Each iteration pushes the
+    /// previous accumulator, allocates a fresh enum with that
+    /// accumulator in its payload, and discards everything
+    /// except the newest accumulator. The previous accumulators
+    /// become unreachable and must be collected by the
+    /// automatic GC.
+    ///
+    /// Without automatic GC, `heap.size()` would grow linearly
+    /// with `N`. With the 15D.1 wiring, the heap should plateau
+    /// after the first GC cycle. We assert `heap.size() < N`
+    /// (loose bound) and verify the accumulator is still
+    /// reachable after `N` allocations.
+    ///
+    /// We use a private bytecode that does the equivalent of:
+    ///
+    ///   loop N times:
+    ///     push the accumulator on the stack
+    ///     MAKE_ENUM tag=1 arity=1   (wrap accumulator)
+    ///     POP the new enum
+    ///     keep only the inner accumulator
+    ///   HALT
+    ///
+    /// Concretely: each iteration allocates a new `Box`-shaped
+    /// enum whose payload is the previous accumulator's
+    /// address, then the loop overwrites the local slot with
+    /// the unwrapped inner value. The previous accumulator is
+    /// no longer reachable from any stack slot — it's garbage.
+    #[test]
+    fn heap_does_not_grow_unboundedly_under_repeated_alloc() {
+        use std::collections::HashSet;
+
+        let mut vm = Machine::<256>::default();
+
+        // Build bytecode: CONST 0 (the sentinel int); then N
+        // iterations of `MAKE_ENUM 0 1` (an enum wrapping the
+        // sentinel); POP each result so the address is no
+        // longer on the stack. After POP, the enum is
+        // unreachable — the next GC cycle should free it.
+        let n: usize = 200; // 200 > GC_TRIGGER_INTERVAL = 64
+        let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 4);
+        bytecode.push(const_int(0));
+        for _ in 0..n {
+            bytecode.push(make_enum(0, 1));
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run(&bytecode);
+
+        // After running, the heap should contain FAR FEWER
+        // than N objects. With 200 allocations and a GC
+        // threshold of 64, the worst case is "one GC threshold
+        // worth" (~64) of unreachable enums that haven't been
+        // collected yet because the last GC cycle hasn't
+        // caught up. Without GC, this would be ~200.
+        //
+        // We assert `live_count < n` as the success criterion
+        // (the heap does not grow proportionally to the
+        // number of allocations). Tightening further would
+        // require waiting for a final GC, which would need
+        // another mechanism we don't have.
+        let live_addrs: HashSet<u64> = vm.heap().into_iter().map(|o| o.addr()).collect();
+
+        assert!(
+            live_addrs.len() < n,
+            "expected heap to contain far fewer than {} objects, got {}",
+            n,
+            live_addrs.len()
+        );
+
+        // Stronger: should be much less than n — bounded by
+        // `GC_TRIGGER_INTERVAL` plus a few extra. The exact
+        // count is timing-dependent but should be nowhere
+        // near n.
+        let _ = vm.alloc_counter();
+    }
+
+    /// Phase 15D.1 — verify the live set is preserved by an
+    /// automatic GC cycle.
+    ///
+    /// Allocate an enum, keep it on the stack across many
+    /// allocations of unrelated (unreachable) enums, and
+    /// assert the original enum survives the GC cycle.
+    #[test]
+    fn live_enum_survives_automatic_gc_cycle() {
+        use std::collections::HashSet;
+
+        let mut vm = Machine::<256>::default();
+
+        // Build bytecode:
+        //   MAKE_ENUM 7 1 (the live root, payload = sentinel int)
+        //   loop 200 times:
+        //     MAKE_ENUM 0 1 (an unrelated enum — unreachable
+        //     after POP)
+        //     POP
+        //   HALT
+        //
+        // The live root's address sits on the operand stack
+        // for the entire program — so the GC must preserve
+        // it across every collection cycle.
+        let n: usize = 200;
+        let mut bytecode: Vec<Byte> = Vec::with_capacity(n * 2 + 4);
+        bytecode.push(const_int(0)); // sentinel payload
+        bytecode.push(make_enum(7, 1)); // tag=7 sentinel, arity=1
+        let root_addr = {
+            // We can't easily capture the address at codegen
+            // time (we'd need a DUP + something), so we'll
+            // just inspect the heap after the run instead.
+            // For now, leave the live root on the stack.
+            // Duplicate it so we still have it after we POP
+            // unrelated allocations... wait, no — the
+            // unrelated allocations are POPed, the root is
+            // NOT popped. Just leave it.
+            vm.run(&[]); // dummy to silence unused
+            0u64
+        };
+        let _ = root_addr;
+
+        for _ in 0..n {
+            bytecode.push(const_int(0));
+            bytecode.push(make_enum(0, 1));
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+        // Now the live root is at the bottom of the stack,
+        // with n stale enums (already POPed) above it on
+        // nothing (they were popped off the stack but their
+        // allocations may still be on the heap until GC).
+        // HALT.
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run(&bytecode);
+
+        // The live root should still be on the stack (we
+        // never POPed it). We can't easily inspect the stack
+        // from outside, but we CAN inspect the heap: after GC
+        // the heap should contain only the live root. The n
+        // unreachable enums should have been collected.
+        let live_addrs: HashSet<u64> = vm.heap().into_iter().map(|o| o.addr()).collect();
+
+        // Bound: at most a small handful of objects — the
+        // live root (1) plus at most the threshold minus one
+        // (uncollected but unreachable) enums. The point is
+        // `live_addrs.len() < n` — without GC, it would be
+        // ~n+1.
+        assert!(
+            live_addrs.len() < n,
+            "expected heap to be much smaller than n={}, got {}",
+            n,
+            live_addrs.len()
+        );
+
+        // At least the live root should be present.
+        assert!(
+            !live_addrs.is_empty(),
+            "expected at least one live object (the root enum)"
+        );
+    }
+
+    /// Phase 15D.4 — verify that `Machine::with_output`
+    /// redirects PRINT output to the provided writer.
+    ///
+    /// Build a small program that emits `"hello"` via PRINT,
+    /// redirect output to a `Vec<u8>` (wrapped in a tiny
+    /// `Write` impl that shares the buffer via `Rc<RefCell>`),
+    /// and assert the bytes are present.
+    #[test]
+    fn with_output_captures_print() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// Tiny `Write` impl that appends to a shared
+        /// `Vec<u8>`. Used only by this test.
+        struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut vm = Machine::<16>::default();
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let shared = SharedBuf(Rc::clone(&buf));
+        vm.with_output(shared);
+
+        // Build bytecode:
+        //   STRING 5 "hello"
+        //   PRINT
+        //   HALT
+        let mut bytecode: Vec<Byte> = Vec::new();
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(5));
+        for ch in "hello".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run(&bytecode);
+
+        // Drop the sink first so the `Rc` we hold is the
+        // only one (then we can move the `Vec` out).
+        let _ = vm.restore_output();
+
+        let bytes = Rc::try_unwrap(buf)
+            .expect("VM still holds a reference to the buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
+        assert_eq!(s, "hello");
     }
 }

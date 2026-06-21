@@ -14,3 +14,6 @@ common = { path = "../common" }
 parser = { path = "../parser" }
 regex = "1.11.2"
 rkyv = "0.8.12"
+
+[dev-dependencies]
+machine = { path = "../machine" }

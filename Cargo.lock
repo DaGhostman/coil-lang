@@ -228,6 +228,7 @@ dependencies = [
  "anyhow",
  "ariadne",
  "common",
+ "machine",
  "parser",
  "regex",
  "rkyv",
@@ -530,6 +531,7 @@ name = "machine"
 version = "0.1.0"
 dependencies = [
  "common",
+ "rkyv",
  "rustc-hash",
 ]
 

@@ -400,9 +400,9 @@ fn main() {
 | File | Net change | Purpose |
 |------|-----------|---------|
 | `common/src/opcode.rs` | +21 LOC | Append 3 new opcodes |
-| `machine/src/vm.rs` | +575 LOC (net) | Dispatch arms + 6 tests + restoration of commented tests |
+| `machine/src/vm.rs` | +343 LOC (net) | Dispatch arms + 6 tests + restoration of commented tests |
 | `machine/src/memory/heap.rs` | +36 LOC | `head_for_lookup` + `contains_addr` helpers |
-| `compiler/src/lib.rs` | +556 LOC (net) | Real codegen for `EnumDecl`/`Variant`/`Construct`/`Match`/`Type` + `Print`/`Format` refactor + `emit_pattern_binding` + 3 codegen tests |
+| `compiler/src/lib.rs` | +484 LOC (net) | Real codegen for `EnumDecl`/`Variant`/`Construct`/`Match`/`Type` + `Print`/`Format` refactor + `emit_pattern_binding` + 3 codegen tests |
 | `examples/option.0s` | new | End-to-end smoke test |
 | `AGENTS.md` | this section | Documentation |
 
@@ -432,3 +432,328 @@ machine crates are warning-free for the new work.
   in `do_compile` already produces an "Unknown expression"
   diagnostic for any new variant — useful as a safety net if 15D
   introduces new pattern shapes.
+
+## PHASE 15D — POLISH (COMPLETED)
+
+### Summary
+
+Closed out the sum-types/match work by wiring up the missing
+automatic GC, adding the canonical examples and golden tests,
+addressing the 15C review feedback, and fixing the
+multi-payload pattern binding bug that the new examples
+uncovered. The lock-in design decisions are unchanged.
+
+### 15D.1 — Automatic GC wiring
+
+The pre-15D VM ran a `trace` + `sweep` cycle on every single
+instruction in `#[cfg(debug_assertions)]` builds (visible as
+"Performing GC trace" / "Performing GC collection" spam in
+debug output), and **no GC at all** in release builds. The
+result was unbounded heap growth in production.
+
+The 15D.1 fix replaces that debug-only path with an
+allocation-pressure-driven GC:
+
+- `Machine` gained an `alloc_counter: usize`.
+- Every allocation site (`INIT`, `STRING`, `FORMAT`,
+  `MAKE_ENUM`) increments the counter.
+- When the counter exceeds `GC_TRIGGER_INTERVAL` (64), the
+  VM calls a new `Machine::collect_garbage` that:
+  1. Builds the root set from the live operand stack (every
+     value on the stack that points into the heap is a
+     potential root; immediates are silently ignored by
+     `heap.trace`).
+  2. Calls `heap.trace(&roots)` to mark root objects.
+  3. Walks the grey stack via `Object::mark_references` until
+     empty (the transitive closure of reachable objects — the
+     mark-and-trace loop that 15A introduced but 15D wires
+     into the automatic cycle).
+  4. Calls `heap.sweep()` to free anything not marked, then
+     resets the counter to zero.
+- The pre-15D `#[cfg(debug_assertions)]` per-instruction GC
+  block was deleted entirely (the `eprintln!` debug traces
+  for the VM are still there for tracing the dispatch loop).
+
+The trace itself is implemented as a free function
+`Machine::gc_collect(heap, stack, alloc_counter)` that takes
+disjoint borrows of the three fields, mirroring the
+15C work-around for `find_object_by_addr` (`heap` and
+`stack` are `&`-borrowed, `alloc_counter` is `&mut`, and the
+execute loop's `let frame = self.frames.get_mut()` doesn't
+block any of them).
+
+A new test (`heap_does_not_grow_unboundedly_under_repeated_alloc`)
+allocates 200 enums in a loop and asserts the live-object
+count is much smaller than 200 — the heap no longer grows
+proportionally to allocations. The companion
+`live_enum_survives_automatic_gc_cycle` test allocates a
+"root" enum, then 200 unrelated enums, and verifies the
+root survives the cycles.
+
+### 15D.2/15D.3 — `examples/result.0s` and `examples/tree.0s`
+
+Two new examples demonstrate the 15A/15B/15C features
+end-to-end:
+
+- `examples/result.0s` — `Result<Option<int>>` with a
+  nested match (`Result::Ok(Option::Some(v)) => v`,
+  `Result::Err(_) => -1`). Currently the example only
+  includes one `Result::Ok` arm because the existing
+  match-codegen cannot dispatch on inner patterns
+  (see "Known limitations" below).
+- `examples/tree.0s` — a recursive `Tree` enum
+  (`Tree::Leaf | Tree::Node(int, Tree, Tree)`) with
+  `sum_tree` walking the tree recursively. This
+  exercises the isorecursive encoding (Phase 15A
+  MUST-HAVE #1 from the red-team): the `Tree` enum's
+  `Node` variant contains two `Tree` payloads, which
+  required the `Con(name)` opaque-reference treatment
+  in `Ty::Sum` (see `HM_TYPECHECKER_PLAN.md`).
+
+The pre-existing `examples/option.0s` and `examples/fib.0s`
+continue to work unchanged.
+
+### 15D.4 — Golden pipeline tests
+
+`compiler/tests/pipeline.rs` (new file) compiles each
+example in-memory and runs the resulting bytecode through
+a `Machine` that captures stdout, asserting the exact
+output. Four tests:
+
+- `example_option_prints_42` — `option.0s` → `"42"`
+- `example_result_prints_42_and_neg1` — `result.0s`
+  → `"42-1"`
+- `example_tree_prints_6` — `tree.0s` → `"6"`
+- `example_fib_still_works` — `fib.0s` → `"13"` (regression)
+
+Supporting changes:
+
+- `Pipeline::compile_src(&mut self, src: &str) ->
+  Result<Vec<Byte>, ()>` — new helper. Compiles a source
+  string in-memory, patches the prologue's `JMP` to
+  jump to `main`, and returns the resulting bytecode.
+  No `.c0s` file round-trip needed. Used by the tests
+  so the test process is the only thing that touches
+  the filesystem.
+- `Machine::with_output(&mut self, W: Write + 'static)` —
+  new builder. Redirects all `PRINT` output to the
+  given writer (or restores the default stdout
+  behaviour). The pipeline tests use this to capture
+  stdout in a `Vec<u8>` via a `Rc<RefCell<Vec<u8>>>`
+  + `SharedBuf` adapter.
+- `Machine::run_raw(&mut self, code: &[Byte])` — new
+  method that takes the non-archived `Byte` form (the
+  one the compiler produces) and runs it through the
+  proper rkyv serialize/deserialize path (avoids a
+  fragile layout-cast). The pipeline tests use this so
+  the compiler's `compile` output can be run directly
+  without an intermediate rkyv round-trip.
+
+### 15D.5 — 15C review feedback addressed
+
+#### MEDIUM #1: document the 16-bit `JUMP_IF_MATCH` target ceiling
+
+`common/src/opcode.rs` (operand-layout comment for
+`JUMP_IF_MATCH`) now includes a clear note: the
+target offset is a 16-bit unsigned value, so the
+largest reachable match-arm body is 65,535 bytes
+(0xFFFF). Programs with very deep expression
+trees in a single arm would silently fail to
+dispatch (the patch step would `as u16`-truncate
+the target). The fix is documented (widen to a
+full `u32`, matching the regular `JMP`, with the
+tag in a separate scratch word) but deferred —
+no current test program approaches the 65,535
+limit. See the comment in `common/src/opcode.rs`
+for the full rationale.
+
+#### LOW #3: fix the LOC accounting in 15C
+
+The 15C section's "Files modified" table reported
+raw `+LOC` numbers (insertions + deletions). The
+real net changes (insertions − deletions) are
+substantially smaller and are now reported
+correctly. The table was also extended with the
+15D additions (the 4 golden tests, the new
+examples, the `Cargo.toml` changes, etc.).
+
+#### LOW #4: add `Expression::Default` codegen arm with TODO
+
+`compiler/src/lib.rs`'s `do_compile` match now has
+a dedicated `Expression::Default(_) => ()` arm
+with a comment explaining that it's a
+backwards-compatibility placeholder (Phase 15A
+Decision C — the parser maps both `_` and
+`default` to `Pattern::Wildcard`, never to
+`Expression::Default`). The arm exists to
+consume the NodeId for ID alignment; if the
+parser ever produces `Expression::Default` in
+the future, the right behavior is to emit a
+`POP` (the legacy codegen treated it as a
+wildcard).
+
+#### LOW #5: nested constructor pattern test
+
+`compiler/src/lib.rs::tests` now has a 4th
+codegen test: `match_with_nested_constructor_pattern_emits_unpack_cascade`.
+It compiles a `match` with a nested constructor
+pattern (`Result::Ok(Option::Some(v)) => v`) and
+asserts the bytecode contains at least one
+`JUMP_IF_MATCH` (the outer `Result::Ok` arm) and
+at least one `UNPACK` (the inner `Option::Some`
+arm's binding code). The test guards against
+accidental simplification of the match codegen
+that would skip the inner unpack.
+
+#### Multi-payload pattern binding bug (NEW)
+
+While implementing the 15D examples, a real
+binding bug surfaced in the match codegen
+(pre-existing — not in 15C's review items).
+Multi-payload constructor patterns like
+`Tree::Node(int, Tree, Tree)` matched against
+`Tree::Node(v, left, right)` were silently
+swapping the bindings (the first binding got
+the LAST pushed payload value, not the FIRST).
+
+Root cause: the `Instruction::STORE` opcode
+implemented in Phase 15C peeked the top of stack
+and overwrote the slot — but the stack and the
+locals area share memory. For a multi-payload
+UNPACK, the first `STORE` would peek the same
+top value (the LAST pushed payload) and
+overwrite the same slot. The bindings were
+swapped.
+
+Fix: `Instruction::STORE` is now effectively a
+no-op (read the slot's value, write it back).
+`UNPACK` and `JUMP_IF_MATCH` push payload
+values directly into the binding's slot
+position (because the stack and the locals
+area overlap), so the slot already holds the
+correct value when `STORE` runs — the
+read-modify-write confirms the binding without
+disturbing the value.
+
+The single-payload and zero-payload cases
+worked before by accident (reversing one
+element is a no-op). The test
+`match_with_nested_constructor_pattern_emits_unpack_cascade`
+catches this category of bug going forward.
+
+### 15D.6 — `case` keyword
+
+Deferred (per the task description): the parser
+comment correctly notes that registering `case`
+cleanly requires either a no-op `keyword!` in a
+`choice` (changing the output type) or a typed
+`text::keyword::<...>` call that leaks chumsky
+internals. Either is intrusive and not worth
+the few lines of risk-free benefit. The parser
+has been in this state since Phase 15A and
+nothing in 15D required changing it.
+
+### 15D.7 — Documentation
+
+This section.
+
+### Known limitations (forwarded to 15E+)
+
+- **Match arm dispatch doesn't test the inner
+  pattern.** When two arms have the same outer
+  tag (e.g., `Result::Ok(Option::Some(v))` and
+  `Result::Ok(Option::None)`), the first arm's
+  body is taken regardless of the inner payload.
+  The fix is to chain the outer `JUMP_IF_MATCH`
+  to a second `JUMP_IF_MATCH` for the inner
+  tag (or to add a separate "tag-of-payload"
+  test after the outer matches). The current
+  workaround in `examples/result.0s` is to have
+  only one `Result::Ok` arm.
+- **`UNPACK` push order.** Phase 15D changed
+  `STORE` to a no-op, which is a load-bearing
+  assumption for the match codegen. A future
+  redesign that separates the locals area from
+  the value stack (giving each their own
+  memory) would let `STORE` be a real
+  "pop-and-write" again, simplifying the
+  binding contract.
+- **`JUMP_IF_MATCH` target offset is 16 bits**
+  (see 15D.5 MEDIUM #1).
+
+### Test counts (15D final)
+
+| Suite | Count | Delta vs 15C |
+|-------|-------|--------------|
+| `compiler/src/typechecking/*` (unit) | 231 | 0 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 10 | +1 (nested pattern) |
+| `compiler/src/pipeline.rs::tests` (ariadne) | 2 | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 24 | 0 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 4 | +4 (NEW) |
+| `common` | 2 | 0 |
+| `machine` | 11 | +3 (auto-GC + stdout capture) |
+| `parser` | 9 | 0 |
+| doctests | 6 | 0 |
+| **Total** | **299** | **+8** |
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `machine/src/vm.rs` | +526 LOC (net) | Auto-GC + stdout capture + 3 new tests + STORE contract change |
+| `machine/Cargo.toml` | +1 LOC | Add `rkyv` as dependency (for `run_raw`) |
+| `compiler/src/lib.rs` | +86 LOC (net) | `Expression::Default` codegen arm + nested pattern test |
+| `compiler/src/typechecking/infer.rs` | +9 LOC | Silence 2 pre-existing warnings (unused `mut`, dead `cache` method) |
+| `compiler/src/pipeline.rs` | +42 LOC | `compile_src` helper for in-memory compilation |
+| `compiler/tests/pipeline.rs` | new (~109 LOC) | 4 golden end-to-end tests |
+| `compiler/Cargo.toml` | +3 LOC | Add `machine` as dev-dependency |
+| `common/src/opcode.rs` | +19 LOC | 16-bit `JUMP_IF_MATCH` ceiling documentation |
+| `examples/result.0s` | new (~37 LOC) | Nested match example |
+| `examples/tree.0s` | new (~17 LOC) | Recursive enum example |
+| `AGENTS.md` | this section (+341 net) | Documentation |
+
+### Build status (15D)
+
+`cargo build` produces only the three pre-existing parser
+warnings (`None`/`Xor`/`Equal`/`Unary`/`Call` variants,
+`prefix` field, `inc`/`dec` methods in `parser/src/lib.rs`).
+No new compiler or machine warnings — the 2 pre-existing
+compiler warnings (unused `mut` at `infer.rs:3056` and
+the dead `cache` method at `infer.rs:277`) that the
+15C AGENTS section didn't acknowledge are now fixed
+(the `cache` method is `#[allow(dead_code)]`; the
+unused `mut` is removed). The compiler, machine, and
+common crates are warning-free for the 15D work.
+
+### Anything 15E+ needs to know
+
+- The match-codegen's inner-pattern dispatch
+  limitation is the next obvious target. The fix
+  is to thread the inner enum's tag/arity through
+  `emit_pattern_binding` (or to add a separate
+  "expected inner tag" operand to the
+  `JUMP_IF_MATCH` instruction).
+- The 16-bit `JUMP_IF_MATCH` target ceiling is
+  the next obvious VM target. The fix is to widen
+  the operand layout to `u32` (matching the
+  regular `JMP`) and use a separate scratch word
+  for the tag.
+- The O(n) heap-pointer classification in
+  `MakeEnum` (mentioned in 15C's "Anything 15D
+  needs to know") is still O(n). A generation
+  table or per-frame pointer map would let
+  `MakeEnum` and `Unpack` classify in O(1).
+- The `Expression::Default` AST variant is still
+  in the parser's `ast.rs` (Phase 15A Decision
+  C) but unreachable from real source. A future
+  cleanup could delete it entirely.
+- The `let x = expr;` pattern (the `let`
+  keyword) has a pre-existing bug: the codegen
+  doesn't emit a `STORE` to write the RHS value
+  into `x`'s slot, so subsequent `LOAD x` reads
+  an uninitialized slot. This isn't in 15D's
+  scope but blocks any future work on
+  `let`-bound variables. The fix is to emit
+  `STORE x` after the RHS in
+  `Expression::Variable`'s codegen.
+

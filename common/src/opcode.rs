@@ -80,6 +80,25 @@ pub enum Instruction {
     // - `UNPACK`:       full u32 = arity (redundant with
     //   `ObjEnum::payload.len()` but kept for symmetry with the
     //   spec; the VM reads it from the enum at runtime).
+    //
+    // **KNOWN LIMITATION (Phase 15D, MEDIUM #1)**: the
+    // `JUMP_IF_MATCH` target offset is a 16-bit unsigned
+    // value, so the largest jump target is 65,535 bytes
+    // (0xFFFF). A program whose bytecode exceeds this
+    // would have its `JUMP_IF_MATCH` target silently
+    // truncated by the `with_operands_u16` constructor.
+    // In practice the 15C codegen always patches the
+    // `JUMP_IF_MATCH` placeholder with an absolute offset
+    // computed from `arm_body_offsets[i] as u16`, so any
+    // match arm body past 65,535 bytes is unreachable.
+    // Programs with large arm bodies (e.g., very deep
+    // expression trees in a single arm) would silently
+    // fail to dispatch. The fix is to widen the operand
+    // layout to a full `u32` (matching the regular
+    // `JMP`) and use a separate scratch word for the
+    // tag. That change is deferred to a future phase
+    // because no current test program approaches the
+    // 65,535-byte limit.
     MakeEnum,
     JumpIfMatch,
     Unpack,

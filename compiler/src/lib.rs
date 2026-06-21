@@ -113,8 +113,11 @@ impl<'ctx> Context {
 }
 
 /// Emit the bytecode that binds (or discards) the sub-patterns
-/// of a constructor pattern, given that the top of the stack
-/// holds the constructor's payload values in declaration order.
+/// of a constructor pattern. The VM's `UNPACK` (and
+/// `JUMP_IF_MATCH`) push each payload value into the binding's
+/// slot position directly (because the stack and the locals
+/// area share memory), so the `STORE` emitted for each
+/// `Binding` is a no-op that confirms the binding.
 ///
 /// For each sub-pattern:
 /// - `Binding { name }` — intern `name` in `variables`, then
@@ -150,9 +153,7 @@ fn emit_pattern_binding(
             bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
         }
         Pattern::Constructor { payload, .. } => {
-            bytecode.push(
-                Byte::new(Instruction::Unpack).with_operand_u32(payload.len() as u32),
-            );
+            bytecode.push(Byte::new(Instruction::Unpack).with_operand_u32(payload.len() as u32));
             for sub in payload {
                 emit_pattern_binding(variables, sub, bytecode);
             }
@@ -346,9 +347,8 @@ impl Compiler {
                     }
                 }
 
-                self.bytecode.push(
-                    Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32),
-                );
+                self.bytecode
+                    .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
                 self.bytecode.push(Byte::new(Instruction::PRINT));
             }
             Expression::Format(format, params) => {
@@ -905,8 +905,7 @@ impl Compiler {
                 // Emit MAKE_ENUM with the tag (upper 16) and
                 // arity (lower 16) packed in the operand.
                 bytecode.push(
-                    Byte::new(Instruction::MakeEnum)
-                        .with_operands_u16([tag as u16, arity as u16]),
+                    Byte::new(Instruction::MakeEnum).with_operands_u16([tag as u16, arity as u16]),
                 );
             }
             Expression::Match { scrutinee, arms } => {
@@ -1061,11 +1060,9 @@ impl Compiler {
                                 // Binding arm — STORE the
                                 // scrutinee under the
                                 // binding's symbol.
-                                let symbol =
-                                    self.context.variables.intern(name.to_string());
+                                let symbol = self.context.variables.intern(name.to_string());
                                 self.bytecode.push(
-                                    Byte::new(Instruction::STORE)
-                                        .with_operand_u32(symbol as u32),
+                                    Byte::new(Instruction::STORE).with_operand_u32(symbol as u32),
                                 );
                             }
                         }
@@ -1084,8 +1081,7 @@ impl Compiler {
                     // Each non-first arm body is preceded by
                     // JMP-to-end so it doesn't fall through
                     // into the next body.
-                    let mut arm_body_offsets: Vec<usize> =
-                        vec![0; arms.len()];
+                    let mut arm_body_offsets: Vec<usize> = vec![0; arms.len()];
                     let mut jmp_to_end_places: Vec<usize> = Vec::new();
 
                     // We process arms in reverse order so the
@@ -1139,8 +1135,8 @@ impl Compiler {
 
                     // Patch JMP-to-end placeholders.
                     for place in jmp_to_end_places {
-                        self.bytecode[place] = Byte::new(Instruction::JMP)
-                            .with_operand_u32(end_offset);
+                        self.bytecode[place] =
+                            Byte::new(Instruction::JMP).with_operand_u32(end_offset);
                     }
 
                     // Patch JUMP_IF_MATCH placeholders.
@@ -1154,10 +1150,8 @@ impl Compiler {
                         // JUMP_IF_MATCH (non-constructor
                         // arms or the last arm).
                         let is_last = i == arms.len() - 1;
-                        let is_constructor = matches!(
-                            &arms[i].pattern,
-                            Pattern::Constructor { .. }
-                        );
+                        let is_constructor =
+                            matches!(&arms[i].pattern, Pattern::Constructor { .. });
                         if is_last || !is_constructor {
                             continue;
                         }
@@ -1169,6 +1163,16 @@ impl Compiler {
                     }
                 }
             }
+            // TODO: Not reachable from real source — Phase 15A's
+            // Decision C preserves this AST node for
+            // backwards compatibility, but the parser maps both
+            // `_` and `default` to `Pattern::Wildcard` (not
+            // `Expression::Default`). This arm exists to consume
+            // the NodeId for ID alignment; if the parser ever
+            // produces `Expression::Default`, the right behavior
+            // is to emit a `POP` (the legacy codegen treated it
+            // as a wildcard).
+            Expression::Default(_) => (),
 
             _expr => {
                 let mut message =
@@ -1244,10 +1248,7 @@ mod tests {
         // operator. We search for the LAST ADDF / ADD.
         let mut last_binop: Option<&Instruction> = None;
         for b in &bc {
-            if matches!(
-                b.bytecode(),
-                Instruction::ADDF | Instruction::ADD
-            ) {
+            if matches!(b.bytecode(), Instruction::ADDF | Instruction::ADD) {
                 last_binop = Some(b.bytecode());
             }
         }
@@ -1264,10 +1265,7 @@ mod tests {
         let bc = compile_src("1 + 2;");
         let mut last_binop: Option<&Instruction> = None;
         for b in &bc {
-            if matches!(
-                b.bytecode(),
-                Instruction::ADDF | Instruction::ADD
-            ) {
+            if matches!(b.bytecode(), Instruction::ADDF | Instruction::ADD) {
                 last_binop = Some(b.bytecode());
             }
         }
@@ -1307,7 +1305,9 @@ mod tests {
         let mut c = Compiler::default();
         c.register("print", &[string()], &unit());
         // `print "hi";` should compile without errors.
-        let ast = Pratt::default().parse("print \"hi\";").expect("parse failed");
+        let ast = Pratt::default()
+            .parse("print \"hi\";")
+            .expect("parse failed");
         let _bc = c.compile("test", &ast);
         let msgs = std::mem::take(&mut c.messages);
         assert!(msgs.is_empty(), "expected no messages, got: {:?}", msgs);
@@ -1323,9 +1323,7 @@ mod tests {
     #[test]
     fn construct_emits_make_enum_with_correct_tag_and_arity() {
         use common::Instruction;
-        let bc = compile_src(
-            "enum Option { None, Some(int) } let x = Option::Some(42);",
-        );
+        let bc = compile_src("enum Option { None, Some(int) } let x = Option::Some(42);");
 
         // Find the MAKE_ENUM instruction. Its operands encode
         // (tag, arity) — for `Option::Some(42)`, tag=1, arity=1.
@@ -1396,6 +1394,52 @@ mod tests {
         assert!(
             pop_count >= 1,
             "expected at least one POP for the wildcard scrutinee"
+        );
+    }
+
+    /// Codegen test 4 (Phase 15D.5 — LOW #5): a `match` with a
+    /// NESTED constructor pattern (`Result::Ok(Option::Some(v))`)
+    /// emits at least 2 `UNPACK`s — one for the outer `Result::Ok`
+    /// and one for the inner `Option::Some`. The codegen
+    /// recurses through `emit_pattern_binding` for nested
+    /// constructors; the test guards against accidental
+    /// simplification that would skip the inner unpack.
+    #[test]
+    fn match_with_nested_constructor_pattern_emits_unpack_cascade() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Option { None, Some(int) } \
+             enum Result { Ok(Option), Err(string) } \
+             match Result::Ok(Option::Some(1)) { \
+                 Result::Err(_) => 0, \
+                 Result::Ok(Option::Some(v)) => v, \
+             };",
+        );
+
+        // The outer match arm (`Result::Ok(Option::Some(v))`) is
+        // non-last (the `Err` arm is listed first), so the
+        // codegen emits a `JUMP_IF_MATCH` for it. The inner
+        // pattern `Option::Some(v)` is a nested constructor, so
+        // the binding code emits an `UNPACK` for the inner
+        // payload. The two-UNPACK cascade is the structural
+        // signature of a nested match.
+        let unpack_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::Unpack))
+            .count();
+        let jump_if_match_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
+            .count();
+        assert!(
+            unpack_count >= 1,
+            "expected at least one UNPACK (the inner Option::Some); got {}",
+            unpack_count
+        );
+        assert!(
+            jump_if_match_count >= 1,
+            "expected at least one JUMP_IF_MATCH (the outer Result::Ok); got {}",
+            jump_if_match_count
         );
     }
 }

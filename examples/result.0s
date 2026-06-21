@@ -1,0 +1,38 @@
+// examples/result.0s — sum-of-sum demonstrating nested match + Result<Option<int>>
+//
+// Two patterns: `Result::Err(_)` (wildcard) and
+// `Result::Ok(Option::Some(v))` (nested constructor with a
+// binding). The 15D codegen's match dispatch tests the
+// outer tag with `JUMP_IF_MATCH` / `UNPACK` but does NOT
+// re-test the inner tag when the outer matches — so two
+// `Result::Ok` arms with different inner patterns would
+// share a single JUMP_IF_MATCH target. We keep the example
+// to one `Result::Ok` arm to avoid that case (the
+// `Option::None` case is exercised by `examples/option.0s`).
+//
+// Each `print` exercises one match arm:
+//   - `Result::Ok(Option::Some(42))` → matches the
+//     `Result::Ok(Option::Some(v))` arm, v=42.
+//   - `Result::Err("oops")`           → matches the
+//     wildcard Err arm, returns -1.
+enum Option {
+    None,
+    Some(int),
+}
+
+enum Result {
+    Ok(Option),
+    Err(string),
+}
+
+fn unwrap_result(Result r) -> int {
+    return match r {
+        Result::Err(_) => -1,
+        Result::Ok(Option::Some(v)) => v,
+    };
+}
+
+fn main() {
+    print "%i", unwrap_result(Result::Ok(Option::Some(42)));    // 42
+    print "%i", unwrap_result(Result::Err("oops"));             // -1
+}

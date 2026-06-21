@@ -272,8 +272,13 @@ impl Checker {
     }
 
     /// Iterate the cache (id → type). Useful for tests and for the
-    /// eventual bytecode emitter integration.
+    /// eventual bytecode emitter integration. Phase 15D marks
+    /// this `#[allow(dead_code)]` because no current test or
+    /// call site uses it — the codegen consults the cache
+    /// directly via `lookup_at` instead. Kept for the eventual
+    /// "give me the full type environment" debugging surface.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn cache(&self) -> impl Iterator<Item = (NodeId, &Ty)> {
         self.cache.iter().map(|(k, v)| (*k, v))
     }
@@ -3053,7 +3058,7 @@ mod tests {
     fn cache_lookup_returns_inferred_type() {
         // `1 + 2` parses to Expr(Add(Integer, Integer)); we expect the
         // cache to hold int() for each of those nodes.
-        let (mut c, _) = check("1 + 2;");
+        let (c, _) = check("1 + 2;");
         let ids = c.id_table().ids();
         for id in ids {
             let ty = c.lookup_at(*id).unwrap_or_else(|| panic!("no cache entry for {:?}", id));
