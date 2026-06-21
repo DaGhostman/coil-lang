@@ -322,3 +322,110 @@ fn format_string_percent_z_rejects_int() {
         msgs
     );
 }
+
+// ---- Phase 17B: record-shape diagnostics ----
+
+#[test]
+fn record_construct_missing_field_diagnostic() {
+    // Variant declared with two fields; constructor supplies
+    // only one. Typechecker should emit a "missing field" error.
+    let (_ty, msgs) = check(
+        "enum E { Foo { x: int, y: int } } \
+         fn main() { E::Foo { x: 1 }; }",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Missing field `y`")),
+        "expected 'Missing field `y`' diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_construct_extra_field_diagnostic() {
+    // Variant declared with two fields; constructor supplies
+    // an unknown third. Typechecker should emit an "unknown
+    // field" / "no field `z`" error.
+    let (_ty, msgs) = check(
+        "enum E { Foo { x: int, y: int } } \
+         fn main() { E::Foo { x: 1, y: 2, z: 3 }; }",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Unknown field `z`") || m.contains("no field `z`")),
+        "expected 'Unknown field `z`' / 'no field `z`' diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_pattern_unknown_field_diagnostic() {
+    // Pattern references a field that doesn't exist in the
+    // variant's declaration. The pattern may use either
+    // `z: v` (explicit binding) or `{ z }` (shorthand).
+    let (_ty, msgs) = check(
+        "enum E { Foo { x: int, y: int } } \
+         fn main() { \
+             let e = E::Foo { x: 1, y: 2 }; \
+             match e { E::Foo { z: v, x: _, y: _ } => v }; \
+         }",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Unknown field `z`") || m.contains("missing field `z`")),
+        "expected 'Unknown field `z`' / 'missing field `z`' diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_construct_shape_mismatch_diagnostic() {
+    // The variant is declared as a record (`{ x, y }`) but
+    // the user calls it with tuple syntax `(a, b)`. This is
+    // a shape mismatch.
+    let (_ty, msgs) = check(
+        "enum E { Foo { x: int, y: int } } \
+         fn main() { E::Foo(1, 2); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("shape mismatch") || m.contains("uses tuple syntax")),
+        "expected 'shape mismatch' / 'uses tuple syntax' diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_construct_duplicate_field_diagnostic() {
+    // The user supplies the same field twice in a record
+    // constructor. The typechecker should reject this.
+    let (_ty, msgs) = check(
+        "enum E { Foo { x: int, y: int } } \
+         fn main() { E::Foo { x: 1, x: 2 }; }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Duplicate field `x`") || m.contains("duplicate")),
+        "expected 'Duplicate field `x`' diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn mixed_shape_enum_with_match_uses_correct_shape() {
+    // Regression test: a match across all three variant
+    // shapes (Unit, Tuple, Record) compiles cleanly without
+    // any diagnostics.
+    let (_ty, msgs) = check(
+        "enum E { A, B(int), C { x: int } } \
+         fn classify(E e) -> int { \
+             return match e { \
+                 E::A => 0, \
+                 E::B(v) => v, \
+                 E::C { x: v } => v, \
+             }; \
+         }",
+    );
+    assert!(
+        msgs.is_empty(),
+        "mixed-shape match with all shapes should type-check, got: {:?}",
+        msgs
+    );
+}
