@@ -790,30 +790,14 @@ impl<'pratt> Pratt<'pratt> {
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(op!("{"), op!("}"))
-            .map_with(|fields, _e| {
-                // Reject duplicate field names at parse time.
-                let mut seen = std::collections::HashSet::new();
-                let mut dups: Vec<&'pratt str> = Vec::new();
-                for f in &fields {
-                    if !seen.insert(f.1.name) {
-                        dups.push(f.1.name);
-                    }
-                }
-                if !dups.is_empty() {
-                    let names = dups
-                        .into_iter()
-                        .map(|n| format!("`{}`", n))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let msg = format!("Duplicate field name(s): {}", names);
-                    // We can't easily emit a chumsky error here from
-                    // inside `map_with` without a borrowed emitter;
-                    // fall back to chumsky's rich-error machinery via
-                    // a custom error below. For now, just deduplicate
-                    // silently (the first wins) — typechecker reports
-                    // the rest as "extra field".
-                    let _ = msg;
-                }
+            .map(|fields| {
+                // Duplicate field names pass through to the
+                // typechecker, which reports them with a
+                // source-anchored "Duplicate field `x`" message.
+                // The parser intentionally does NOT reject them
+                // — emitting a chumsky error here from inside
+                // `map_with` would require a borrowed emitter and
+                // duplicate the diagnostic machinery.
                 EnumConstructPayload::Record(
                     fields.into_iter().map(|(_, f)| f).collect(),
                 )
