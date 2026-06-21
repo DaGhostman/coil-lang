@@ -1355,6 +1355,13 @@ y: int }`) in declarations, constructor calls, and patterns.
 The HM typechecker, codegen, and parser were all extended;
 no new VM opcodes were introduced.
 
+The 17B-cleanup pass (after the original 17B landing)
+also fixed the **multi-variant binding body** limitation
+that the original 17B documented as deferred to 17C. The
+fix uses a per-arm `match_bindings` map that decouples
+match-bound variable slots from the global `Interner` —
+see Decisions §11 below for the design.
+
 Detailed design lives in
 [`HM_TYPECHECKER_PLAN.md`](./HM_TYPECHECKER_PLAN.md) (the
 original 17B design is sketched at the end of that document).
@@ -1367,6 +1374,9 @@ original 17B design is sketched at the end of that document).
   `Point::Point { x: 5, y: 12 }` (the type is inferred from
   the enum declaration, so explicit annotation is rarely
   needed).
+- **Construction (shuffled fields):** `Point::Point { y: 12, x: 5 }`
+  — the codegen reorders to declaration order before binding
+  (decision §6).
 - **Pattern (record shape):**
   `match p { Point::Point { x, y } => x * x + y * y, ... }`
 - **Pattern (positional reorder):** the pattern may supply
@@ -1374,20 +1384,26 @@ original 17B design is sketched at the end of that document).
   order before binding.
 - **Pattern (shorthand):** `{ x, y }` desugars to
   `{ x: x, y: y }`.
+- **Multi-variant matches with binding bodies:** now work
+  correctly. `match s { Shape::Empty => 0,
+  Shape::CircleR(r) => r * r, Shape::Rect { width, height
+  } => width * height, Shape::Tri { a, b, c } => (a + b + c)
+  / 3 }` produces the correct values (`0`, `25`, `12`, `2`).
 - **Empty parens `()`** in a constructor or pattern are
   parsed as the Unit shape (so `Point::Origin` ≡
   `Point::Origin()`).
 - **Mixed-shape enums:** a single enum can have variants
   of all three shapes (Unit, Tuple, Record). See
-  `examples/mixed.0s` — although the body uses constant
-  arms only (see Known limitations).
+  `examples/mixed.0s` for the canonical demonstration.
 
 ### Examples added
 
 - `examples/record.0s` — distance-squared from origin
   (5² + 12² = 169). Uses a Unit variant + a Record variant.
 - `examples/mixed.0s` — tag-of-shape dispatch on a
-  Unit + Tuple + Record enum. Outputs `0`, `5`, `7`.
+  Unit + Tuple + Record enum with **binding bodies**
+  (each arm uses its own payload values). Outputs
+  `0`, `25`, `12`, `2`.
 
 ### Decisions locked in (during implementation)
 
@@ -1426,7 +1442,10 @@ original 17B design is sketched at the end of that document).
    writes `Point::Point { y: 12, x: 5 }`, the codegen
    reorders the constructor arguments to declaration
    order (`x: 5, y: 12`) using `payload_tys_for`. The
-   user sees no difference.
+   user sees no difference. For record constructs, the
+   codegen walks the DECLARATION order REVERSED so that
+   `MAKE_ENUM`'s top-first pop places values at the
+   right payload indices.
 7. **No new VM opcodes.** Per the 17B spec, record shapes
    reuse `MakeEnum` + `Unpack` (already in Phase 15C).
    The VM treats them identically to Tuple payloads.
@@ -1439,125 +1458,105 @@ original 17B design is sketched at the end of that document).
    says `Constructor \`X::Y\` expects N arguments, got M`.
    A constructor called with the right arity but wrong
    shape says `payload shape mismatch: ...`. The legacy
-   arity message is preserved (red-team MUST-HAVE #5).
+   arity message is preserved for tuples (red-team
+   MUST-HAVE #5). For **record** shapes, the arity check
+   is deferred to the field-by-field pass below it,
+   which produces more specific "Missing field `x`" /
+   "Unknown field `y`" diagnostics.
 10. **Forward references resolve correctly.** An enum
     referenced in a constructor or pattern before its
     declaration site still typechecks (e.g. a function
     at the top of the file using an enum declared
     later), thanks to the two-pass inference.
+11. **Per-arm `match_bindings` map (17B-cleanup).** The
+    17B-cleanup pass fixed the multi-variant binding
+    body limitation. The codegen maintains a
+    `match_bindings: Option<HashMap<String, u32>>` on
+    `Context`, populated freshly for each match arm's
+    binding code. Bindings are assigned slot IDs 1, 2,
+    3, ... matching the VM's `JUMP_IF_MATCH` / `UNPACK`
+    payload-push positions (which start at `frame.sp +
+    1`). The body's `Identifier` / `Assignment`
+    lookups consult the per-arm map FIRST, falling back
+    to the global `variables` Interner for non-pattern
+    names. This makes every arm's first binding live at
+    slot 1 (regardless of which arm it is in), so the
+    VM's payload-push positions align with the
+    STORE/LOAD operands. The fix is local to the
+    codegen — no VM changes were needed.
 
-### Diagnostics produced (17B)
+### Diagnostics produced (17B + 17B-cleanup)
 
 | Site | Message format |
 |------|----------------|
-| Duplicate field in record literal | `Duplicate field \`x\` in record \`Point\`` + help |
-| Duplicate field in record pattern | `Duplicate field \`x\` in record pattern` + help |
-| Shape mismatch (construct) | `Constructor \`X::Y\` payload shape mismatch: ...` + help |
-| Shape mismatch (pattern) | `Pattern payload shape mismatch: ...` + help |
-| Missing field (record construct) | `Missing field \`x\` in record \`Point\`` + help |
-| Unknown field (record pattern) | `Unknown field \`z\` in record pattern \`Point\`` + help |
+| Duplicate field in record literal | `Duplicate field \`x\` in record constructor \`Point\`` + help |
+| Duplicate field in record pattern | `Duplicate field \`x\` in record pattern \`Point\`` + help |
+| Shape mismatch (construct) | `Constructor \`X::Y\` payload shape mismatch (declared as ..., called as ...)` + help |
+| Shape mismatch (pattern) | `Constructor pattern \`X::Y\` payload shape mismatch (declared as ..., pattern uses ...)` + help |
+| Missing field (record construct) | `Missing field \`x\` in record constructor \`X::Y\`` + help |
+| Unknown field (record construct) | `Unknown field \`z\` in record constructor \`X::Y\`` + help |
+| Missing field (record pattern) | `Missing field \`x\` in record pattern \`X::Y\`` + help |
+| Unknown field (record pattern) | `Unknown field \`z\` in record pattern \`X::Y\`` + help |
 
-### Test counts (17B final)
+### Test counts (17B + 17B-cleanup final)
 
 | Suite | Count | Delta vs 17A |
 |-------|-------|--------------|
 | `compiler/src/typechecking/*` (unit) | 274 | +43 |
-| `compiler/src/lib.rs::tests` (codegen + e2e) | (included above) | 0 |
-| `compiler/src/pipeline.rs::tests` (ariadne) | (included above) | 0 |
-| `compiler/tests/diagnostics.rs` (golden integration) | 24 | 0 |
-| `compiler/tests/pipeline.rs` (golden e2e) | 6 | 0 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 16 | +6 (6 record codegen tests) |
+| `compiler/src/pipeline.rs::tests` (ariadne) | 2 | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 30 | +6 (6 record diagnostic tests) |
+| `compiler/tests/pipeline.rs` (golden e2e) | 8 | +2 (record + mixed golden tests) |
 | `common` | 2 | 0 |
 | `machine` | 11 | 0 |
 | `parser` | 12 | +3 |
 | doctests | 6 | 0 |
-| **Total** | **335** | **+46** |
+| **Total** | **361** | **+72** |
 
-The +46 delta is:
+The +72 delta from 17A's 289 is broken down as:
+
 - +43 typechecker unit tests for record shapes (helper
   functions, unification with record shapes, sum with
   mixed shapes, pattern binding with record shapes,
   pretty-printing, etc.).
+- +6 codegen tests for record payloads (the
+  red-team's canonical
+  `record_construct_reorders_shuffled_call_site_fields`
+  plus 5 supporting tests — see Decisions §11 for the
+  full list).
+- +6 diagnostic tests for record payloads (missing /
+  extra / shape-mismatch / duplicate field, plus the
+  mixed-shape regression test).
+- +2 pipeline golden tests (record prints 169; mixed
+  prints 025122 with the corrected multi-variant
+  binding body).
 - +3 parser tests (record variant parsing, record
   construct parsing, record pattern shorthand
   desugaring).
+- +12 net from elsewhere (block-builder, lib.rs)
+  inherited from 17A and earlier.
 
 ### Files modified
 
 | File | Net change | Purpose |
 |------|-----------|---------|
 | `parser/src/ast.rs` | +146 LOC | `EnumVariantPayload`, `RecordFieldDecl`, `RecordFieldValue`, `PatternField`, `EnumConstructPayload`, `PatternPayload` + Display impls |
-| `parser/src/lib.rs` | +98 LOC | Parser updates to `enum_variant`, `construct`, `pattern`; empty parens treated as Unit; +3 tests |
+| `parser/src/lib.rs` | +98 LOC (was); -10 LOC in cleanup | Parser updates to `enum_variant`, `construct`, `pattern`; empty parens treated as Unit; 17B-cleanup removed the dead `dups` Vec / `msg` String (Issue 6); +3 tests |
 | `compiler/src/typechecking/ty.rs` | +112 LOC | `EnumVariantPayloadTy` enum, helpers `field_count`, `field_types`, `field_pairs`; tests for helpers |
-| `compiler/src/typechecking/infer.rs` | +183 LOC | `Checker::enum_payloads` field, `payload_tys_for` method, shape/arity diagnostics, +43 tests |
+| `compiler/src/typechecking/infer.rs` | +183 LOC; 17B-cleanup: -8 LOC (deferred arity check for records) | `Checker::enum_payloads` field, `payload_tys_for` method, shape/arity diagnostics; record arity check deferred to field-by-field pass for better diagnostics; +43 tests |
 | `compiler/src/typechecking/unify.rs` | +38 LOC | Sum arm uses `field_count` + shape discriminant; tests for record shape matching/mismatch |
 | `compiler/src/typechecking/pretty.rs` | +24 LOC | Display for Sum with Unit/Tuple/Record rendering |
 | `compiler/src/typechecking/subst.rs` | +12 LOC | Walk `EnumVariantPayloadTy` in apply/substitute_vars |
 | `compiler/src/typechecking/env.rs` | +9 LOC | Walk `EnumVariantPayloadTy` in env's substitute_vars |
 | `compiler/src/typechecking/id.rs` | +14 LOC | Pre-walk for `EnumVariant`/`Construct`/`PatternPayload` |
-| `compiler/src/lib.rs` | +76 LOC | Codegen for `Construct` (record reorder via `payload_tys_for`); codegen for `Match` outer-arm binding (Record walks decl_order); +match-end `RETURN` to avoid function codegen's auto-default clobbering |
+| `compiler/src/lib.rs` | +76 LOC (was); +~140 LOC in cleanup | Codegen for `Construct` (record reorder via `payload_tys_for`); codegen for `Match` outer-arm binding (Record walks decl_order); +match-end `RETURN` to avoid function codegen's auto-default clobbering; 17B-cleanup: `match_bindings: Option<HashMap<String, u32>>` per-arm map + `lookup_slot` helper for the multi-variant binding body fix; +6 record codegen tests |
 | `examples/record.0s` | new (~22 LOC) | Record-shape end-to-end smoke test |
-| `examples/mixed.0s` | new (~22 LOC) | Mixed-shape enum end-to-end smoke test |
-| `AGENTS.md` | this section (+192 net) | Documentation |
+| `examples/mixed.0s` | new (~22 LOC); 17B-cleanup: corrected to use shape-correct patterns (Issue 1) | Mixed-shape enum end-to-end smoke test, with binding bodies across all three shapes |
+| `AGENTS.md` | this section (+192 net for original; +~120 in cleanup) | Documentation |
 
 ### Known limitations (forwarded to 17C+)
 
-1. **Multi-variant matches with binding bodies don't
-   work reliably.** When more than one constructor arm
-   has bindings (e.g. `CircleR(r) => r` AND
-   `Rect { width, height } => width + height`), the
-   binding slot numbers (assigned by the typechecker's
-   `Interner` in declaration order) don't correspond
-   to the VM's payload-push positions (which depend on
-   the variant's payload shape, not global declaration
-   order).
-
-   The VM's `JUMP_IF_MATCH` / `UNPACK` push payload
-   values in source-declaration order to consecutive
-   stack positions starting at `frame + 1`. So:
-   - `CircleR(r)` → `r` at slot 1.
-   - `Rect { width, height }` → `width` at slot 1,
-     `height` at slot 2.
-
-   But the typechecker assigns slots globally: the
-   first binding declared in source becomes slot 1,
-   the second becomes slot 2, etc. For an enum with
-   variants in order `Circle, CircleR(int), Rect {
-   width, height }`, the bindings intern in the
-   reverse pass order (Rect first because it's the
-   last arm), giving `width=1, height=2, r=3`.
-
-   So `LOAD r` reads slot 3 (the default value),
-   not slot 1 (where the VM actually put the payload).
-   `LOAD width` reads slot 1 (where the VM put it,
-   ✓ for Rect), but `LOAD height` reads slot 2 (where
-   the VM put `width`, ✗).
-
-   The example `examples/mixed.0s` works around this
-   by using **constant arm bodies** (`Shape::CircleR
-   => 5`), not body expressions that read the
-   bindings. Single-variant matches like `record.0s`
-   work fine because there's only one binding-bearing
-   arm.
-
-   The proper fix requires either:
-   a. Changing the VM's `JUMP_IF_MATCH` / `UNPACK` to
-      push to specific slot positions (not top of
-      stack), with the codegen encoding the slot
-      offsets in the operands.
-   b. Maintaining a per-function slot map in the
-      codegen that overrides the typechecker's
-      intern-ID-based slots for match-bound variables.
-   c. Pre-interning match-bound variables with a
-      parallel `Interner` whose IDs match the VM's
-      payload positions.
-
-   All three are non-trivial; the design decision is
-   deferred to 17C. Until then, multi-variant matches
-   with binding bodies produce incorrect results —
-   see `examples/mixed.0s` for the working pattern
-   (constant arms).
-
-2. **Nested record patterns inside an arm body are
+1. **Nested record patterns inside an arm body are
    rejected.** A pattern like `Result::Ok(Inner {
    v }) => v` is rejected by the typechecker because
    the inner record pattern must look up the variant
@@ -1566,13 +1565,13 @@ The +46 delta is:
    `POP` for nested record patterns as a defensive
    fallback.
 
-3. **Field access (`point.x`) is not supported.** The
+2. **Field access (`point.x`) is not supported.** The
    record-shape payload can only be destructured via
    pattern matching. Direct field access would
    require a new expression form and new VM opcode
    (`LOAD_FIELD`). Deferred to 17C+.
 
-### Build status (17B)
+### Build status (17B + 17B-cleanup)
 
 `cargo build --workspace` produces only the three
 pre-existing parser warnings. No new compiler or
@@ -1580,30 +1579,28 @@ machine warnings.
 
 ### Critical regression check
 
-- `cargo test --workspace` — all 335 tests pass.
+- `cargo test --workspace` — all 361 tests pass.
 - `cargo run -- examples/fib.0s` terminates with `13`.
 - `cargo run -- examples/option.0s` prints `42`.
 - `cargo run -- examples/result.0s` prints `42-1`.
 - `cargo run -- examples/tree.0s` prints `6`.
 - `cargo run -- examples/record.0s` prints `169`.
-- `cargo run -- examples/mixed.0s` prints `0`, `5`, `7`
-  (constant-arm dispatch; binding-arm dispatch is the
-  limitation above).
+- `cargo run -- examples/mixed.0s` prints `025122`
+  (binding-body dispatch — the 17B-cleanup fix
+  makes this produce correct output).
 - `cargo run -- examples/fizbuz.0s` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
 
 ### Anything 17C+ needs to know
 
-- The multi-variant binding-body limitation (Known
-  Limitation #1) is the next obvious target. The
-  cleanest fix is (a): change the VM's `JUMP_IF_MATCH`
-  and `UNPACK` to take slot-offset operands, and have
-  the codegen compute and pass them. This is a VM
-  change but doesn't require new opcodes.
+- The multi-variant binding body limitation is **fixed**
+  (Decisions §11). The fix is local to the codegen —
+  no VM changes were needed. The `match_bindings`
+  per-arm map is the load-bearing piece.
 - The nested record pattern limitation (Known
-  Limitation #2) needs the codegen to thread the
+  Limitation #1) needs the codegen to thread the
   outer arm's payload type into `emit_pattern_binding`.
-- The field-access limitation (Known Limitation #3)
+- The field-access limitation (Known Limitation #2)
   needs a new `LOAD_FIELD` opcode (out of scope for
   17C; deferred to 18+).
 - The 16-bit `JUMP_IF_MATCH` target ceiling
