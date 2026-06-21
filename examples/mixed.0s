@@ -1,0 +1,31 @@
+// examples/mixed.0s — mixed-shape enum variants (Unit + Tuple
+// + Record), with a match that dispatches between them.
+//
+// This example demonstrates that Phase 17B supports all three
+// variant shapes in the same enum. The match body is restricted
+// to CONSTANT arm bodies (a literal on each arm) because of a
+// pre-existing codegen limitation: when more than one constructor
+// arm has a binding, the binding slot numbers don't line up with
+// the VM's payload-push positions. See the "Known limitations"
+// section of AGENTS.md for the full discussion.
+//
+// Expected output: 0, 5, 7 (one line per shape).
+enum Shape {
+    Circle,
+    CircleR(int),
+    Rect { width: int, height: int },
+}
+
+fn tag(Shape s) -> int {
+    return match s {
+        Shape::Circle => 0,
+        Shape::CircleR => 5,
+        Shape::Rect => 7,
+    };
+}
+
+fn main() {
+    print "%i", tag(Shape::Circle);
+    print "%i", tag(Shape::CircleR(42));
+    print "%i", tag(Shape::Rect { width: 3, height: 4 });
+}

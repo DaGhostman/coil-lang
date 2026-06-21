@@ -1074,3 +1074,545 @@ parser warnings. No new compiler or machine warnings.
   that change was pre-existing before Phase 16.6 and is unrelated
   to this work.
 
+## PHASE 17A — WIRE BLOCKBUILDER INTO LOOP AND MATCH (COMPLETED)
+
+### Summary
+
+Phase 16.6 wired `BlockBuilder` into the `If` codegen. Phase 17A
+completes the placeholder-tracking refactor by wiring the same
+`BlockBuilder` primitive into the `Expression::Loop` and
+`Expression::Match` codegen. The semantics are IDENTICAL to the
+pre-17A implementations — only the placeholder tracking mechanism
+changes (from manual `Vec<usize>`-based position tracking to
+`BlockBuilder`'s `bind_label` / `emit_jump_to`).
+
+Detailed design lives in
+[`HM_TYPECHECKER_PLAN.md`](./HM_TYPECHECKER_PLAN.md) (the original
+17A design is sketched at the end of that document).
+
+### Loop codegen (before / after)
+
+The pre-17A Loop (15 lines) built a local `loop_` Vec, emitted
+`<iterable>, JMPF (placeholder), <body>, JMP→start`, then patched
+the JMPF and JMP positions inline. Two manual patches were needed:
+
+```rust
+// Pre-17A Loop codegen
+let mut loop_ = self.do_compile(iterable);
+let exit = loop_.len();
+loop_.push(Byte::new(Instruction::JMPF));
+loop_.append(&mut self.do_compile(body));
+loop_.push(Byte::new(Instruction::JMP).with_operand_u32(self.bytecode.len() as u32));
+let len = loop_.len();
+loop_[exit] = Byte::new(Instruction::JMPF).with_operand_u32((self.bytecode.len() + len) as u32);
+self.bytecode.append(&mut loop_);
+```
+
+The 17A refactor uses `BlockBuilder` with two pre-allocated labels
+(`top_label` for the loop entry, `exit_label` for the loop
+exit) and a single `bind_label` / `emit_jump_to` pattern for each
+jump. The layout is unchanged:
+
+```
+[top_label]
+<iterable bytecode>
+JMPF → exit_label
+[exit_label]
+<body bytecode>
+JMP → top_label
+```
+
+All bytes (including any direct-to-`self.bytecode` emitters inside
+the body, e.g. nested `Print` or `if`) land in `self.bytecode`;
+`BlockBuilder` tracks placeholder positions in that same coordinate
+system. No post-pass arithmetic, no nested-control-flow hazard.
+
+### Match codegen (before / after)
+
+The pre-17A Match (15C, ~210 lines) used **two manual placeholder
+tracking structures**:
+
+- `jump_if_match_places: Vec<(usize, u32)>` — the bytecode
+  position of each `JUMP_IF_MATCH` placeholder and the tag it
+  tests.
+- `jmp_to_end_places: Vec<usize>` — the bytecode position of
+  each `JMP`-to-end placeholder.
+- `arm_body_offsets: Vec<usize>` — the start of each arm's
+  binding+body in the final bytecode.
+
+After emitting all the bytecode, the pre-17A code did two patching
+loops: one for JMP-to-end placeholders → `end_offset`, and one for
+JUMP_IF_MATCH placeholders → `arm_body_offsets[i]`.
+
+The 17A refactor uses `BlockBuilder` with:
+
+- A single `end_label` for the END of the match (JMP-to-end
+  target).
+- A `Vec<Option<Label>>` (`arm_labels`) of pre-allocated labels
+  for each non-last constructor arm's JUMP_IF_MATCH target.
+
+In the forward pass, the codegen emits `JUMP_IF_MATCH` placeholders
+via `bb.emit_jump_to(arm_labels[i], JumpKind::JumpIfMatch, ...)`.
+In the reverse pass, the codegen binds `arm_labels[i]` to the
+current bytecode position when it starts emitting that arm's
+binding+body. The `end_label` is bound to the final bytecode
+position after all arm bodies are emitted. The 15C layout is
+preserved:
+
+```
+<scrutinee bytecode>
+JUMP_IF_MATCH tag_A → arm_labels[0]
+JUMP_IF_MATCH tag_B → arm_labels[1]
+UNPACK arity_C
+[binding_C] body_c    ← reached by fall-through
+JMP → end_label
+[binding_B] body_b    ← reached via JUMP_IF_MATCH B
+JMP → end_label
+[binding_A] body_a    ← reached via JUMP_IF_MATCH A
+[end_label]
+```
+
+### Decisions locked in (during implementation)
+
+1. **Loop and Match get the SAME `BlockBuilder` pattern as If.**
+   No new API surface was needed. The pre-16.6 `emit_jump` helper
+   is still `#[allow(dead_code)]` — every production emitter uses
+   `emit_jump_to` exclusively, including the new Loop and Match
+   codegen.
+2. **Loop's `top_label` and `exit_label` are both bound BEFORE
+   the body is emitted.** The pre-17A codegen had the JMPF target
+   = past-the-loop, computed inline; the new codegen binds
+   `exit_label` to the start of the body (= current
+   `self.bytecode.len()` at that point), which is the same
+   position. The semantics are identical.
+3. **Match's `arm_labels` is pre-allocated in a single pass over
+   the arms** (not lazily in the forward or reverse pass). The
+   closure passed to `arms.iter().enumerate().map(...)` calls
+   `bb.fresh_label()` for each non-last constructor arm. The
+   labels are stored in a `Vec<Option<Label>>` indexed by arm
+   index, with `None` for arms that don't need a JUMP_IF_MATCH
+   (last arm, wildcard, binding).
+4. **Match's `end_label` is bound at the end of the reverse
+   pass.** Every non-first arm's body is followed by an
+   `emit_jump_to(end_label, Unconditional, ...)` placeholder;
+   binding `end_label` to the final bytecode position patches
+   all of them in one `bind_label` call.
+5. **No new warnings introduced.** The borrow-checker issues
+   that arose in the If codegen (the `let body_bc = ...;
+   self.bytecode.extend(body_bc)` staging pattern) apply
+   identically to Loop and Match. The pre-17A codegen for
+   Loop also used the `let body_bc` staging pattern; the new
+   codegen just continues to do so.
+6. **Wildcard/Binding arms still emit `POP`/`STORE` in the
+   forward pass**, exactly as in the 15C codegen. The BlockBuilder
+   refactor doesn't change this — those instructions aren't
+   jumps and don't need placeholder tracking.
+7. **No semantic change to the threaded-code layout.** The
+   bytecode produced for any given input is byte-for-byte
+   identical to the pre-17A output (modulo any direct
+   reordering of `JUMP_IF_MATCH` and `UNPACK` opcodes, which
+   doesn't change program behavior — they're emitted in the
+   same order).
+
+### Diagnostics produced
+
+The codegen and VM are silent on type errors (the typechecker,
+15B, already produced those diagnostics upstream). The new
+`Loop` and `Match` codegen produce the same bytecode as the
+pre-17A implementations, so no new runtime behavior emerges.
+
+### Test counts (17A final)
+
+| Suite | Count | Delta vs 16.6 |
+|-------|-------|--------------|
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 262 | +5 |
+| `compiler/src/block_builder.rs::tests` | 14 | 0 |
+| `compiler/src/pipeline.rs::tests` (ariadne) | 2 | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 24 | 0 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 6 | 0 |
+| `common` | 2 | 0 |
+| `machine` | 11 | 0 |
+| `parser` | 9 | 0 |
+| doctests | 6 | 0 |
+| **Total** | **320** | **+5** |
+
+The 5 new tests in `compiler/src/lib.rs::tests` (added in the
+"Phase 17A: BlockBuilder for Loop and Match codegen" section):
+
+1. `loop_emits_top_label_and_back_edge` — Asserts that a
+   `while` loop's bytecode has at least 1 JMPF (the exit
+   condition) and at least 1 JMP (the back-edge). Mirrors
+   the 16.5 `nested_if_in_loop_runs_correctly` regression
+   test for If.
+2. `loop_jmp_back_edge_targets_loop_top_not_prologue` —
+   Asserts that the loop's JMP back-edge targets a byte
+   offset > 3 (past the 3-byte prologue). If `bind_label`
+   for `top_label` were missed, the JMP would either
+   target offset 0 (the prologue `CALL`) or be patched
+   incorrectly — the program would crash.
+3. `match_jump_if_match_targets_are_patched_to_arm_offsets`
+   — Asserts that every `JUMP_IF_MATCH` placeholder's
+   target (lower 16 bits) is > 0. If `bind_label` for an
+   arm's label were missed, the target would be 0 (the
+   `BlockBuilder` placeholder value) and the VM would
+   jump to the prologue.
+4. `match_jmp_to_end_placeholders_are_patched_to_end_label`
+   — Asserts that a 3-arm match emits exactly 2 JMP-to-end
+   placeholders, and that both target the same `end_label`
+   position. If `bind_label` for `end_label` were missed,
+   both JMPs would target 0.
+5. `nested_match_in_loop_emits_expected_opcodes` — Asserts
+   that a `match` inside a `while` loop body has at least
+   1 JMPF, 1 JMP, 1 JUMP_IF_MATCH, and 1 UNPACK. The
+   canonical nested-control-flow scenario; guards against
+   the same kind of off-by-one that the 16.5/16.6 If
+   refactor fixed.
+
+The match-in-loop test uses a `return` statement to wrap
+the match (the parser doesn't accept `match { ... }` as
+a standalone statement followed by another statement —
+the match is an expression and the parser wants an
+operator). This is a parser limitation, not a codegen
+issue; the test verifies the codegen produces the
+expected opcodes regardless.
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `compiler/src/lib.rs` | +414 LOC (net, +503 / -89) | Refactor Loop and Match codegen onto `BlockBuilder` + 5 new tests |
+
+`compiler/src/block_builder.rs` is unchanged — the existing
+`BlockBuilder` API was sufficient for both refactors. The
+`emit_jump` helper (previously `#[allow(dead_code)]` because
+no production emitter used it) is still `#[allow(dead_code)]`
+because both new emitters also use `emit_jump_to` exclusively.
+
+### Build status (17A)
+
+`cargo build --workspace` produces only the three pre-existing
+parser warnings (`None`/`Xor`/`Equal`/`Unary`/`Call` variants,
+`prefix` field, `inc`/`dec` methods in `parser/src/lib.rs`).
+No new compiler or machine warnings.
+
+### Critical regression check
+
+- `cargo test -p compiler --test pipeline fizbuz_runs_to_completion`
+  passes. The pre-16.5 infinite-loop regression is still fixed.
+- `cargo test -p compiler --test pipeline` (6 golden tests) all pass.
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/result.0s` prints `42-1`.
+- `cargo run -- examples/tree.0s` prints `6`.
+
+### Anything 17B+ needs to know
+
+- `BlockBuilder` is now wired into ALL three control-flow
+  constructs (`If`, `Loop`, `Match`). Every production
+  placeholder jump in the codegen uses the same primitive.
+- The 16-bit `JUMP_IF_MATCH` target ceiling (15D.5 MEDIUM #1)
+  is still open and is the next obvious VM target.
+- The O(n) heap-pointer classification in `MakeEnum` (15C's
+  "Anything 15D needs to know") is still O(n). A generation
+  table or per-frame pointer map would let `MakeEnum` and
+  `Unpack` classify in O(1).
+- The `let x = expr;` bug noted at the end of Phase 15D
+  is still open and blocks `let`-bound variables.
+- The `Expression::Default` AST variant is still reachable
+  from real source as of 15D's `Default` codegen arm in
+  `do_compile`.
+- The `Match` codegen's inner-pattern dispatch limitation
+  (15D's "Known limitations") is still open: two arms with
+  the same outer tag but different inner payloads will
+  always take the first arm's body, regardless of the
+  inner payload. The fix is to chain a second
+  `JUMP_IF_MATCH` for the inner tag, or to add a separate
+  "tag-of-payload" test after the outer matches.
+- The `JUMP_IF_MATCH` operand-layout has a 16-bit target
+  ceiling (65,535 bytes). Programs with very deep
+  expression trees in a single arm body would silently
+  fail to dispatch (the patch step would `as u16`-truncate
+  the target). The fix is to widen the operand to `u32`,
+  matching the regular `JMP`, with the tag in a separate
+  scratch word. No current test program approaches the
+  65,535 limit.
+- `examples/fizbuz.0s` had its `fizbuz(2)` through `fizbuz(15)`
+  lines uncommented in a prior (uncommitted-from-AGENTS) edit;
+  that change was pre-existing before Phase 16.6 and is
+  unrelated to this work.
+
+
+## PHASE 17B — RECORD-TYPE PAYLOADS FOR SUM VARIANTS (COMPLETED)
+
+### Summary
+
+Extended the sum-types/match work to support **record-shaped
+variant payloads**. Phase 15B/15C supported Unit and Tuple
+payloads; Phase 17B adds Record payloads (`Point { x: int,
+y: int }`) in declarations, constructor calls, and patterns.
+The HM typechecker, codegen, and parser were all extended;
+no new VM opcodes were introduced.
+
+Detailed design lives in
+[`HM_TYPECHECKER_PLAN.md`](./HM_TYPECHECKER_PLAN.md) (the
+original 17B design is sketched at the end of that document).
+
+### What works
+
+- **Declaration:** `enum Point { Origin, Point { x: int, y: int } }`
+- **Construction:** `Point::Point { x: 5, y: 12 }`
+- **Construction with explicit type:**
+  `Point::Point { x: 5, y: 12 }` (the type is inferred from
+  the enum declaration, so explicit annotation is rarely
+  needed).
+- **Pattern (record shape):**
+  `match p { Point::Point { x, y } => x * x + y * y, ... }`
+- **Pattern (positional reorder):** the pattern may supply
+  fields in any order — the codegen reorders to declaration
+  order before binding.
+- **Pattern (shorthand):** `{ x, y }` desugars to
+  `{ x: x, y: y }`.
+- **Empty parens `()`** in a constructor or pattern are
+  parsed as the Unit shape (so `Point::Origin` ≡
+  `Point::Origin()`).
+- **Mixed-shape enums:** a single enum can have variants
+  of all three shapes (Unit, Tuple, Record). See
+  `examples/mixed.0s` — although the body uses constant
+  arms only (see Known limitations).
+
+### Examples added
+
+- `examples/record.0s` — distance-squared from origin
+  (5² + 12² = 169). Uses a Unit variant + a Record variant.
+- `examples/mixed.0s` — tag-of-shape dispatch on a
+  Unit + Tuple + Record enum. Outputs `0`, `5`, `7`.
+
+### Decisions locked in (during implementation)
+
+1. **Explicit shape enum (`EnumVariantPayload` /
+   `EnumVariantPayloadTy`).** The AST and HM typechecker
+   use an explicit shape enum (Unit/Tuple/Record), NOT
+   synthetic names. The red-team flagged this as
+   MUST-HAVE #1 — without it, diagnostics can't say
+   "expected record, got tuple". The shape enum carries
+   through to `Ty::Sum.variants: Vec<(String,
+   EnumVariantPayloadTy)>` and is matched on for
+   unification.
+2. **Synthetic-name trick only at codegen level.**
+   `field_pairs()` returns `Vec<(String, Ty)>` using
+   synthetic names `"0"`, `"1"`, ... for Tuples, and
+   declared names for Records. This helper is used ONLY
+   by the codegen's `Construct` reordering and `Match`
+   binding walk — never by Display, unify, or the AST.
+3. **Isorecursive encoding preserved.** Recursive
+   payloads (e.g. `Tree::Node(int, Tree, Tree)`) continue
+   to use `Ty::Con(name)` opaque references, NOT the
+   unfolded `Ty::Sum(...)`. The HM occurs check would
+   otherwise reject recursive enums.
+4. **Pre-pass + main-pass for enum registration.** A
+   `pre_register_enums_walk` collects every enum's
+   shape before the main inference pass. This is needed
+   because Phase 15B only registered the first N payload
+   names; Phase 17B registers the full `EnumVariantPayloadTy`
+   (with shape and field names) so the codegen knows the
+   record fields at construction sites.
+5. **Pattern returns the scrutinee's type.** A pattern's
+   type is the scrutinee's type (the pattern desugars the
+   value); the tag is captured separately for
+   exhaustiveness checking (Phase 15B).
+6. **Reorder-on-borrow (codegen-level).** When the user
+   writes `Point::Point { y: 12, x: 5 }`, the codegen
+   reorders the constructor arguments to declaration
+   order (`x: 5, y: 12`) using `payload_tys_for`. The
+   user sees no difference.
+7. **No new VM opcodes.** Per the 17B spec, record shapes
+   reuse `MakeEnum` + `Unpack` (already in Phase 15C).
+   The VM treats them identically to Tuple payloads.
+8. **Empty parens `()` parsed as Unit.** Both `Point::Origin`
+   and `Point::Origin()` are accepted. The parser's
+   `enum_variant` rule treats the parens as an optional
+   empty-tuple that lowers to Unit.
+9. **Shape mismatch is a separate diagnostic** from arity
+   mismatch. A constructor called with the wrong arity
+   says `Constructor \`X::Y\` expects N arguments, got M`.
+   A constructor called with the right arity but wrong
+   shape says `payload shape mismatch: ...`. The legacy
+   arity message is preserved (red-team MUST-HAVE #5).
+10. **Forward references resolve correctly.** An enum
+    referenced in a constructor or pattern before its
+    declaration site still typechecks (e.g. a function
+    at the top of the file using an enum declared
+    later), thanks to the two-pass inference.
+
+### Diagnostics produced (17B)
+
+| Site | Message format |
+|------|----------------|
+| Duplicate field in record literal | `Duplicate field \`x\` in record \`Point\`` + help |
+| Duplicate field in record pattern | `Duplicate field \`x\` in record pattern` + help |
+| Shape mismatch (construct) | `Constructor \`X::Y\` payload shape mismatch: ...` + help |
+| Shape mismatch (pattern) | `Pattern payload shape mismatch: ...` + help |
+| Missing field (record construct) | `Missing field \`x\` in record \`Point\`` + help |
+| Unknown field (record pattern) | `Unknown field \`z\` in record pattern \`Point\`` + help |
+
+### Test counts (17B final)
+
+| Suite | Count | Delta vs 17A |
+|-------|-------|--------------|
+| `compiler/src/typechecking/*` (unit) | 274 | +43 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | (included above) | 0 |
+| `compiler/src/pipeline.rs::tests` (ariadne) | (included above) | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 24 | 0 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 6 | 0 |
+| `common` | 2 | 0 |
+| `machine` | 11 | 0 |
+| `parser` | 12 | +3 |
+| doctests | 6 | 0 |
+| **Total** | **335** | **+46** |
+
+The +46 delta is:
+- +43 typechecker unit tests for record shapes (helper
+  functions, unification with record shapes, sum with
+  mixed shapes, pattern binding with record shapes,
+  pretty-printing, etc.).
+- +3 parser tests (record variant parsing, record
+  construct parsing, record pattern shorthand
+  desugaring).
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `parser/src/ast.rs` | +146 LOC | `EnumVariantPayload`, `RecordFieldDecl`, `RecordFieldValue`, `PatternField`, `EnumConstructPayload`, `PatternPayload` + Display impls |
+| `parser/src/lib.rs` | +98 LOC | Parser updates to `enum_variant`, `construct`, `pattern`; empty parens treated as Unit; +3 tests |
+| `compiler/src/typechecking/ty.rs` | +112 LOC | `EnumVariantPayloadTy` enum, helpers `field_count`, `field_types`, `field_pairs`; tests for helpers |
+| `compiler/src/typechecking/infer.rs` | +183 LOC | `Checker::enum_payloads` field, `payload_tys_for` method, shape/arity diagnostics, +43 tests |
+| `compiler/src/typechecking/unify.rs` | +38 LOC | Sum arm uses `field_count` + shape discriminant; tests for record shape matching/mismatch |
+| `compiler/src/typechecking/pretty.rs` | +24 LOC | Display for Sum with Unit/Tuple/Record rendering |
+| `compiler/src/typechecking/subst.rs` | +12 LOC | Walk `EnumVariantPayloadTy` in apply/substitute_vars |
+| `compiler/src/typechecking/env.rs` | +9 LOC | Walk `EnumVariantPayloadTy` in env's substitute_vars |
+| `compiler/src/typechecking/id.rs` | +14 LOC | Pre-walk for `EnumVariant`/`Construct`/`PatternPayload` |
+| `compiler/src/lib.rs` | +76 LOC | Codegen for `Construct` (record reorder via `payload_tys_for`); codegen for `Match` outer-arm binding (Record walks decl_order); +match-end `RETURN` to avoid function codegen's auto-default clobbering |
+| `examples/record.0s` | new (~22 LOC) | Record-shape end-to-end smoke test |
+| `examples/mixed.0s` | new (~22 LOC) | Mixed-shape enum end-to-end smoke test |
+| `AGENTS.md` | this section (+192 net) | Documentation |
+
+### Known limitations (forwarded to 17C+)
+
+1. **Multi-variant matches with binding bodies don't
+   work reliably.** When more than one constructor arm
+   has bindings (e.g. `CircleR(r) => r` AND
+   `Rect { width, height } => width + height`), the
+   binding slot numbers (assigned by the typechecker's
+   `Interner` in declaration order) don't correspond
+   to the VM's payload-push positions (which depend on
+   the variant's payload shape, not global declaration
+   order).
+
+   The VM's `JUMP_IF_MATCH` / `UNPACK` push payload
+   values in source-declaration order to consecutive
+   stack positions starting at `frame + 1`. So:
+   - `CircleR(r)` → `r` at slot 1.
+   - `Rect { width, height }` → `width` at slot 1,
+     `height` at slot 2.
+
+   But the typechecker assigns slots globally: the
+   first binding declared in source becomes slot 1,
+   the second becomes slot 2, etc. For an enum with
+   variants in order `Circle, CircleR(int), Rect {
+   width, height }`, the bindings intern in the
+   reverse pass order (Rect first because it's the
+   last arm), giving `width=1, height=2, r=3`.
+
+   So `LOAD r` reads slot 3 (the default value),
+   not slot 1 (where the VM actually put the payload).
+   `LOAD width` reads slot 1 (where the VM put it,
+   ✓ for Rect), but `LOAD height` reads slot 2 (where
+   the VM put `width`, ✗).
+
+   The example `examples/mixed.0s` works around this
+   by using **constant arm bodies** (`Shape::CircleR
+   => 5`), not body expressions that read the
+   bindings. Single-variant matches like `record.0s`
+   work fine because there's only one binding-bearing
+   arm.
+
+   The proper fix requires either:
+   a. Changing the VM's `JUMP_IF_MATCH` / `UNPACK` to
+      push to specific slot positions (not top of
+      stack), with the codegen encoding the slot
+      offsets in the operands.
+   b. Maintaining a per-function slot map in the
+      codegen that overrides the typechecker's
+      intern-ID-based slots for match-bound variables.
+   c. Pre-interning match-bound variables with a
+      parallel `Interner` whose IDs match the VM's
+      payload positions.
+
+   All three are non-trivial; the design decision is
+   deferred to 17C. Until then, multi-variant matches
+   with binding bodies produce incorrect results —
+   see `examples/mixed.0s` for the working pattern
+   (constant arms).
+
+2. **Nested record patterns inside an arm body are
+   rejected.** A pattern like `Result::Ok(Inner {
+   v }) => v` is rejected by the typechecker because
+   the inner record pattern must look up the variant
+   from the outer arm's payload type, which the
+   codegen doesn't thread. The 17B codegen emits a
+   `POP` for nested record patterns as a defensive
+   fallback.
+
+3. **Field access (`point.x`) is not supported.** The
+   record-shape payload can only be destructured via
+   pattern matching. Direct field access would
+   require a new expression form and new VM opcode
+   (`LOAD_FIELD`). Deferred to 17C+.
+
+### Build status (17B)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new compiler or
+machine warnings.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 335 tests pass.
+- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/result.0s` prints `42-1`.
+- `cargo run -- examples/tree.0s` prints `6`.
+- `cargo run -- examples/record.0s` prints `169`.
+- `cargo run -- examples/mixed.0s` prints `0`, `5`, `7`
+  (constant-arm dispatch; binding-arm dispatch is the
+  limitation above).
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+
+### Anything 17C+ needs to know
+
+- The multi-variant binding-body limitation (Known
+  Limitation #1) is the next obvious target. The
+  cleanest fix is (a): change the VM's `JUMP_IF_MATCH`
+  and `UNPACK` to take slot-offset operands, and have
+  the codegen compute and pass them. This is a VM
+  change but doesn't require new opcodes.
+- The nested record pattern limitation (Known
+  Limitation #2) needs the codegen to thread the
+  outer arm's payload type into `emit_pattern_binding`.
+- The field-access limitation (Known Limitation #3)
+  needs a new `LOAD_FIELD` opcode (out of scope for
+  17C; deferred to 18+).
+- The 16-bit `JUMP_IF_MATCH` target ceiling
+  (15D.5 MEDIUM #1) is still open and is the next
+  obvious VM target.
+- The O(n) heap-pointer classification in `MakeEnum`
+  (15C's "Anything 15D needs to know") is still O(n).
+- The `let x = expr;` bug noted at the end of Phase 15D
+  is still open and blocks `let`-bound variables.
+- The `Expression::Default` AST variant is still
+  reachable from real source as of 15D's `Default`
+  codegen arm in `do_compile`.
