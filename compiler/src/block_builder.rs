@@ -1,94 +1,97 @@
 //! Deferred-target bytecode emission for control flow.
 //!
-//! `BlockBuilder` is a basic-block builder for the codegen pass. It
-//! owns a local `Vec<Byte>` and a set of "labels" — opaque
-//! placeholders for forward-jump targets. Jumps are emitted with
-//! a placeholder operand (zero); the placeholder is patched when
-//! the target label is bound.
+//! `BlockBuilder` is a placeholder-tracking utility for the codegen pass.
+//! It does NOT own a byte buffer — all bytes are emitted to an external
+//! `Vec<Byte>` (typically `Compiler::bytecode`). BlockBuilder tracks the
+//! positions of placeholder jumps in that external buffer, and patches
+//! their operands when `bind_label` is called.
 //!
-//! # Absolute offsets (Phase 16.5)
+//! # Why no local byte buffer?
 //!
-//! Every `BlockBuilder` is constructed with a `base: u32` — the
-//! absolute position in the parent bytecode buffer where these
-//! bytes will eventually be appended. All jump targets produced
-//! by the builder are stored as **absolute** offsets:
-//! `base + relative_position_in_bytes`.
+//! The pre-fix design had each `BlockBuilder` own a local `Vec<Byte>`
+//! with an absolute `base` offset. Nested control flow "just worked"
+//! because each child builder was constructed with a base derived from
+//! the parent's local buffer position. In practice this was brittle:
 //!
-//! This means once the builder's bytes are appended to the
-//! parent buffer, the jump targets are correct *without a
-//! relocation pass*. The pre-16.5 design used 0-based local
-//! offsets and required a separate `relocate_jumps(bytecode,
-//! base)` post-pass to convert them to absolute — that pass was
-//! removed in Phase 16.5.
+//! - `Print` (and `Format`) emit directly to `Compiler::bytecode`,
+//!   NOT to the BlockBuilder's local buffer. A nested `if` inside a
+//!   `print` argument has its body land in `Compiler::bytecode` while
+//!   the BlockBuilder still thinks the body is at `base + local_len`.
+//! - JMPF / JMP placeholders inside a BlockBuilder end up with the
+//!   wrong absolute target if their body was redirected to
+//!   `Compiler::bytecode` mid-emission.
 //!
-//! # Composition
+//! The fix: BlockBuilder never owns bytes. All bytes go to an external
+//! `Vec<Byte>`; positions recorded in `pending` are absolute positions
+//! in THAT external buffer. Patching on `bind_label` is therefore
+//! trivially correct — no coordinate-system conversion, no `relocate`
+//! post-pass, no nested-control-flow hazard.
 //!
-//! Each `do_compile` call that needs control flow creates its OWN
-//! `BlockBuilder` with `base = self.bytecode.len() as u32` and
-//! appends the finalized bytes back to `self.bytecode`.
-//!
-//! Children that themselves contain jumps are compiled into their
-//! own `BlockBuilder` with a new `base = current base + offset`
-//! (where `offset` is the position of the child's bytes in the
-//! parent's local buffer). Because each builder is constructed
-//! with its own base, nested control flow "just works" — there is
-//! no mixed-coordinate-systems hazard.
-//!
-//! # Example
+//! # Usage
 //!
 //! ```ignore
-//! let mut bb = BlockBuilder::new(self.bytecode.len() as u32);
+//! let mut bb = BlockBuilder::new();
+//! let mut bytecode: Vec<Byte> = Vec::new();
 //!
-//! // Emit <cond> then JMPF to "end".
-//! bb.extend(self.do_compile(cond));
-//! let end = bb.emit_jump(JumpKind::JumpIfFalse);
+//! // Emit <cond>; placeholder JMPF; will patch to `target` later.
+//! bytecode.extend(self.do_compile(cond));
+//! let jmpf = bb.emit_jump(JumpKind::JumpIfFalse, &mut bytecode);
 //!
-//! // Emit <then-body>.
-//! bb.extend(self.do_compile(then_body));
+//! // Emit <body>.
+//! bytecode.extend(self.do_compile(body));
 //!
-//! // Bind "end" to the current position.
-//! bb.bind_label(end);
-//!
-//! let result = bb.finalize().expect("all labels bound");
-//! bytecode.extend(result);
+//! // Patch the JMPF to point at the current end of bytecode.
+//! let end_pos = bytecode.len() as u32;
+//! bb.bind_label(jmpf, end_pos, &mut bytecode);
 //! ```
+//!
+//! # Validation
+//!
+//! [`BlockBuilder::finalize`] returns `Err(BlockError::UnboundLabel(_))`
+//! if any label was targeted by an emitted jump but never bound via
+//! [`BlockBuilder::bind_label`]. Production codegen should `expect()`
+//! the result (a failure here is a programmer error, not a user error).
+//!
+//! # Idempotency
+//!
+//! `bind_label` is **idempotent in this design**: calling it again on
+//! the same label re-patches every pending jump targeting the label
+//! with the new target. (This is intentionally simpler than the
+//! pre-fix non-idempotent design — re-binding is a common case for
+//! forward jumps that move as the body grows, and the simpler
+//! semantics avoids the `rebind_label` distinction.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{Byte, Instruction};
 
-#[cfg(test)]
-use common::Value;
-
-/// Opaque handle for a forward-jump target. Two `BlockBuilder`s
-/// must never share labels unless one is a child of the other
-/// (label IDs are globally unique within a single `compile()`
-/// invocation).
+/// Opaque handle for a forward-jump target. Two `BlockBuilder`s must
+/// never share labels (label IDs are globally unique within a single
+/// `BlockBuilder`).
 ///
-/// We use a separate `Label` type (not `common::Label`, which is
-/// for ariadne diagnostics) to avoid confusion in the codegen.
+/// We use a separate `Label` type (not `common::Label`, which is for
+/// ariadne diagnostics) to avoid confusion in the codegen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Label(usize);
+pub struct Label(u32);
 
 impl Label {
-    /// The numeric ID of this label. Used by
-    /// [`BlockBuilder::fresh_label`] internally and exposed for
-    /// debugging / assertions.
+    /// The numeric ID of this label. Exposed for debugging / test
+    /// assertions only.
     #[allow(dead_code)] // Test-only accessor.
-    pub fn id(self) -> usize {
+    pub fn id(self) -> u32 {
         self.0
     }
 }
 
-/// What kind of jump to emit. Carries enough info to construct
-/// the placeholder. The `target` operand is filled in at
-/// `bind_label` time.
+/// What kind of jump to emit. Carries enough info to construct the
+/// placeholder. The `target` operand is filled in at `bind_label`
+/// time.
 ///
 /// `JumpIfMatch::arity` is accepted for API symmetry with the
-/// instruction's full layout, but the operand only stores the
-/// `tag` (upper 16 bits) and the target offset (lower 16 bits).
-/// The VM reads the real arity from the enum at runtime — see
-/// the comment in `common/src/opcode.rs` for the operand layout.
+/// instruction's full layout, but the operand only stores the `tag`
+/// (upper 16 bits) and the target offset (lower 16 bits). The VM
+/// reads the real arity from the enum at runtime — see the comment
+/// in `common/src/opcode.rs` for the operand layout.
 #[allow(dead_code)] // JumpIfTrue / JumpIfMatch are reserved for future Match codegen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum JumpKind {
@@ -106,12 +109,13 @@ pub enum JumpKind {
     JumpIfMatch { tag: u32, arity: u32 },
 }
 
-/// Result of [`BlockBuilder::finalize`]. Failure means at least
-/// one allocated label was never bound.
+/// Result of [`BlockBuilder::finalize`]. Failure means at least one
+/// allocated label was never bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockError {
-    /// `label` was allocated via [`BlockBuilder::fresh_label`]
-    /// but never bound via [`BlockBuilder::bind_label`].
+    /// `label` was allocated via [`BlockBuilder::fresh_label`] or
+    /// [`BlockBuilder::emit_jump`] but never bound via
+    /// [`BlockBuilder::bind_label`].
     UnboundLabel(Label),
 }
 
@@ -127,165 +131,140 @@ impl std::fmt::Display for BlockError {
 
 impl std::error::Error for BlockError {}
 
-/// A basic-block builder with deferred-target jumps that
-/// produces **absolute** offsets.
+/// A placeholder-tracking utility for deferred-target control-flow
+/// jumps.
 ///
-/// # Absolute offsets
+/// # Design
 ///
-/// `base` is the absolute position in the parent bytecode
-/// buffer where these bytes will eventually be appended. All
-/// jump targets produced by `emit_jump` / `emit_jump_to` are
-/// `base + relative_position_in_bytes` once their label is
-/// bound. Because the targets are absolute from the moment
-/// they are patched, appending the finalized bytes to the
-/// parent buffer produces correct bytecode without a
-/// relocation pass.
+/// `BlockBuilder` does NOT own a byte buffer. All emitted jumps are
+/// pushed to an external `Vec<Byte>` (typically `Compiler::bytecode`).
+/// The positions of these jumps are recorded in `pending` as ABSOLUTE
+/// positions in that external buffer. When `bind_label` is called,
+/// every pending jump targeting the bound label has its operand
+/// patched to the new target position.
+///
+/// Because positions are tracked in a single coordinate system
+/// (the external buffer), nested control flow "just works": a child
+/// `BlockBuilder` shares the parent's external buffer, so its
+/// placeholders record positions in the same `bytecode.len()`
+/// coordinate system. There is no `relocate` post-pass, no `base`
+/// field, no coordinate-system conversion.
 ///
 /// # Invariant
 ///
 /// Every [`BlockBuilder::emit_jump`] and
-/// [`BlockBuilder::emit_jump_to`] call allocates or targets a
-/// label. The label must eventually be bound via
-/// [`BlockBuilder::bind_label`] (or updated via
-/// [`BlockBuilder::rebind_label`] if the binding moves), or
-/// `finalize` returns [`BlockError::UnboundLabel`].
+/// [`BlockBuilder::emit_jump_to`] call allocates or targets a label.
+/// The label must eventually be bound via [`BlockBuilder::bind_label`],
+/// or [`BlockBuilder::finalize`] returns [`BlockError::UnboundLabel`].
 ///
-/// # Non-idempotency (AMENDMENT 3)
+/// # Idempotency of `bind_label`
 ///
-/// `bind_label` is **non-idempotent**: calling it twice on the
-/// same label PANICS with a clear message. For the rare update
-/// case (loop back-edge semantics where the binding moves
-/// after the body has been emitted), use [`rebind_label`].
-///
-/// [`rebind_label`]: BlockBuilder::rebind_label
+/// `bind_label` is **idempotent**: calling it again on the same
+/// label re-patches every pending jump targeting that label with the
+/// new target position. This is useful for forward jumps that move
+/// as the body grows (e.g., a `for` loop body that grows after the
+/// loop header is emitted).
 pub struct BlockBuilder {
-    bytes: Vec<Byte>,
-    /// Absolute position in the parent buffer where these bytes
-    /// will be appended. ALL jump targets produced by this
-    /// builder are `base + relative_position`.
-    base: u32,
-    next_label: usize,
-    /// For each label id, the list of operand positions in `bytes`
-    /// (one per emitted jump targeting that label) that should
-    /// be patched. Entries are KEPT (not removed) on `bind_label`
-    /// so that `rebind_label` can re-patch them with a new
-    /// position.
-    pending: BTreeMap<usize, Vec<usize>>,
-    /// Set of label ids that have been bound. Used to enforce
-    /// AMENDMENT 3 (non-idempotency of `bind_label`) and to
-    /// check `rebind_label`'s precondition.
-    bound: BTreeSet<usize>,
+    /// For each label id, the list of absolute positions in the
+    /// external `Vec<Byte>` where jumps targeting this label were
+    /// emitted. The list is NOT cleared by `bind_label` — instead,
+    /// `bind_label` re-patches every position in the list. This is
+    /// the mechanism that makes `bind_label` idempotent.
+    pending: BTreeMap<u32, Vec<usize>>,
+    /// Set of label ids that have been bound via `bind_label`.
+    /// Used by `finalize` to detect allocated-and-emitted-but-never-
+    /// bound labels. A label that was allocated via `fresh_label`
+    /// but never targeted by any jump is allowed (it's harmless).
+    bound: BTreeSet<u32>,
+    /// Monotonically increasing label id allocator.
+    next_label_id: u32,
 }
 
 impl Default for BlockBuilder {
-    /// Default to `base = 0` — useful in tests and for
-    /// standalone use, but production codegen always passes an
-    /// explicit base equal to `self.bytecode.len()`.
     fn default() -> Self {
-        Self::new(0)
+        Self::new()
     }
 }
 
 impl BlockBuilder {
-    /// Create an empty builder anchored at absolute offset
-    /// `base`. All jump targets produced by this builder are
-    /// `base + relative_position`.
-    ///
-    /// In production codegen, `base` is always
-    /// `self.bytecode.len() as u32` at the moment the builder
-    /// is created.
-    pub fn new(base: u32) -> Self {
+    /// Create an empty placeholder tracker.
+    pub fn new() -> Self {
         Self {
-            bytes: Vec::new(),
-            base,
-            next_label: 0,
             pending: BTreeMap::new(),
             bound: BTreeSet::new(),
+            next_label_id: 0,
         }
     }
 
-    /// The absolute base offset this builder was constructed
-    /// with. Exposed for debugging / assertions; not used by
-    /// current production codegen.
-    #[allow(dead_code)] // Accessor for tests.
-    pub fn base(&self) -> u32 {
-        self.base
-    }
-
-    /// Allocate a new label id. The label is NOT bound yet.
-    /// Returns a label that no other `BlockBuilder` shares.
+    /// Allocate a new label id. The label is NOT bound yet. Returns
+    /// a label that no other `BlockBuilder` shares (label IDs are
+    /// globally unique within a single `BlockBuilder`).
     pub fn fresh_label(&mut self) -> Label {
-        let id = self.next_label;
-        self.next_label += 1;
+        let id = self.next_label_id;
+        self.next_label_id += 1;
         Label(id)
     }
 
-    /// Bind `label` to the current absolute position
-    /// (`base + self.bytes.len()`).
-    ///
-    /// Patches every previously-emitted jump that targeted
-    /// `label` with this position. The label is marked as bound;
-    /// calling `bind_label` again on the same label PANICS
-    /// (AMENDMENT 3).
-    pub fn bind_label(&mut self, label: Label) {
-        if !self.bound.insert(label.0) {
-            panic!(
-                "BlockBuilder::bind_label called twice on label {:?} \
-                 (AMENDMENT 3: bind_label is non-idempotent; \
-                 use rebind_label for the update case)",
-                label
-            );
-        }
-        let position = self.base + self.bytes.len() as u32;
-        self.patch_pending(label, position);
-    }
-
-    /// Update the binding of `label` to `new_position` (an
-    /// ABSOLUTE offset). Re-patches every previously-emitted
-    /// jump that targeted `label` with `new_position`. Used by
-    /// loops to update the top-of-loop binding after the body
-    /// has been emitted.
-    ///
-    /// Panics if `label` was never bound.
-    #[allow(dead_code)] // Reserved for future complex control flow.
-    pub fn rebind_label(&mut self, label: Label, new_position: u32) {
-        if !self.bound.contains(&label.0) {
-            panic!(
-                "BlockBuilder::rebind_label called on unbound label {:?}",
-                label
-            );
-        }
-        self.patch_pending(label, new_position);
-    }
-
-    /// Append a single byte.
-    #[allow(dead_code)] // Single-byte emit — current production codegen uses `extend`.
-    pub fn emit(&mut self, byte: Byte) {
-        self.bytes.push(byte);
-    }
-
-    /// Append a sequence of bytes. Equivalent to
-    /// `self.bytes.extend_from_slice(&bytes)`.
-    pub fn extend(&mut self, bytes: Vec<Byte>) {
-        self.bytes.extend(bytes);
-    }
-
-    /// Emit a jump placeholder with a FRESHLY ALLOCATED label
-    /// as the target. The caller must later `bind_label` the
-    /// returned label. Equivalent to
-    /// `let l = self.fresh_label(); self.emit_jump_to(l, kind); l`.
-    pub fn emit_jump(&mut self, kind: JumpKind) -> Label {
+    /// Emit a jump placeholder with a FRESHLY ALLOCATED label as
+    /// the target. The caller must later `bind_label` the returned
+    /// label. Equivalent to
+    /// `let l = self.fresh_label(); self.emit_jump_to(l, kind, bytecode); l`.
+    #[allow(dead_code)] // Not used by the current If codegen; reserved for future
+                        // control-flow emitters (e.g., Loop, While).
+    pub fn emit_jump(&mut self, kind: JumpKind, bytecode: &mut Vec<Byte>) -> Label {
         let label = self.fresh_label();
-        self.emit_jump_to(label, kind);
+        self.emit_jump_to(label, kind, bytecode);
         label
     }
 
     /// Emit a jump placeholder targeting an EXISTING label
-    /// (e.g., a backward jump to the top of a loop, or a
-    /// forward jump to `end_label` of an `if` chain).
-    pub fn emit_jump_to(&mut self, target: Label, kind: JumpKind) {
-        let byte_pos = self.bytes.len();
-        let byte = match kind {
+    /// (e.g., a forward jump to `end_label` of an `if` chain).
+    /// The placeholder's operand is `0`; it will be patched by
+    /// `bind_label`.
+    pub fn emit_jump_to(&mut self, target: Label, kind: JumpKind, bytecode: &mut Vec<Byte>) {
+        let byte_pos = bytecode.len();
+        let byte = Self::make_jump_placeholder(kind);
+        bytecode.push(byte);
+        // Record that this byte position should be patched when
+        // `target` is bound. We keep the entry (don't remove on
+        // bind) so re-binding re-patches.
+        self.pending.entry(target.0).or_default().push(byte_pos);
+    }
+
+    /// Bind `label` to an ABSOLUTE target position in `bytecode`.
+    /// Patches every pending jump that targets `label` with
+    /// `target`. **Idempotent**: calling again on the same label
+    /// re-patches every pending jump with the new target.
+    pub fn bind_label(&mut self, label: Label, target: u32, bytecode: &mut [Byte]) {
+        self.bound.insert(label.0);
+        if let Some(positions) = self.pending.get(&label.0) {
+            for pos in positions {
+                Self::patch_jump_operand(bytecode, *pos, target);
+            }
+        }
+    }
+
+    /// Validate that every label that was targeted by an emitted
+    /// jump has been bound at least once via `bind_label`.
+    /// Returns `Err(BlockError::UnboundLabel(_))` if not.
+    ///
+    /// A label that was allocated via `fresh_label` but never
+    /// targeted by any jump is allowed (it has no effect on the
+    /// bytecode; this is harmless).
+    pub fn finalize(self) -> Result<(), BlockError> {
+        for label_id in self.pending.keys() {
+            if !self.bound.contains(label_id) {
+                return Err(BlockError::UnboundLabel(Label(*label_id)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Internal helper: construct the placeholder byte for a given
+    /// `JumpKind`. The placeholder's operand is `0`; the caller is
+    /// responsible for patching via `bind_label`.
+    fn make_jump_placeholder(kind: JumpKind) -> Byte {
+        match kind {
             JumpKind::Unconditional => {
                 Byte::new(Instruction::JMP).with_operand_u32(0)
             }
@@ -300,56 +279,17 @@ impl BlockBuilder {
                 // (placeholder = 0; patched on bind_label).
                 // `arity` is intentionally discarded — the VM
                 // reads the real arity from the enum at runtime.
-                Byte::new(Instruction::JumpIfMatch)
-                    .with_operands_u16([tag as u16, 0])
-            }
-        };
-        self.bytes.push(byte);
-        // Record that this byte should be patched when
-        // `target` is bound. We keep the entry (don't remove
-        // on bind) so `rebind_label` can re-patch.
-        self.pending.entry(target.0).or_default().push(byte_pos);
-    }
-
-    /// Current **absolute** position in the parent buffer
-    /// (`base + self.bytes.len()`). Returns the position at
-    /// which the next emitted byte would land once the
-    /// finalized bytes are appended to the parent.
-    #[allow(dead_code)] // Test-only — production codegen binds labels via `bind_label`.
-    pub fn current_position(&self) -> u32 {
-        self.base + self.bytes.len() as u32
-    }
-
-    /// Finalize: validate that every allocated label is bound,
-    /// then return the local byte buffer. All jump targets in
-    /// the returned buffer are **absolute** (`base +
-    /// relative_position`), ready to be appended to the
-    /// parent without any post-pass.
-    pub fn finalize(self) -> Result<Vec<Byte>, BlockError> {
-        for label_id in 0..self.next_label {
-            if !self.bound.contains(&label_id) {
-                return Err(BlockError::UnboundLabel(Label(label_id)));
-            }
-        }
-        Ok(self.bytes)
-    }
-
-    /// Internal helper: patch every pending jump that targets
-    /// `label` with `position` (an absolute offset).
-    fn patch_pending(&mut self, label: Label, position: u32) {
-        if let Some(operand_positions) = self.pending.get(&label.0) {
-            for pos in operand_positions {
-                Self::patch_jump_operand(&mut self.bytes, *pos, position);
+                Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag as u16, 0])
             }
         }
     }
 
-    /// Patch the operand of a jump at `byte_pos` to point to
-    /// `target` (an absolute offset). Preserves the tag (upper
-    /// 16 bits) for `JumpIfMatch`; replaces the entire operand
-    /// for `JMP`/`JMPF`/`JMPT`.
-    fn patch_jump_operand(bytes: &mut [Byte], byte_pos: usize, target: u32) {
-        let byte = &mut bytes[byte_pos];
+    /// Internal helper: patch the operand of a jump at `byte_pos`
+    /// to point to `target` (an absolute offset in `bytecode`).
+    /// Preserves the tag (upper 16 bits) for `JumpIfMatch`; replaces
+    /// the entire operand for `JMP`/`JMPF`/`JMPT`.
+    fn patch_jump_operand(bytecode: &mut [Byte], byte_pos: usize, target: u32) {
+        let byte = &mut bytecode[byte_pos];
         match byte.bytecode() {
             Instruction::JMP | Instruction::JMPF | Instruction::JMPT => {
                 *byte = byte.with_operand_u32(target);
@@ -357,12 +297,12 @@ impl BlockBuilder {
             Instruction::JumpIfMatch => {
                 // Preserve the tag in the upper 16 bits.
                 let tag = (byte.operand_u32() >> 16) as u16;
-                // The target is a 16-bit bytecode offset
-                // (matching the existing `JumpIfMatch` operand
-                // layout documented in `common/src/opcode.rs`).
-                // Panicking on overflow is the right behaviour:
-                // the 15C design explicitly documents the
-                // 65,535-byte ceiling.
+                // The target is a 16-bit bytecode offset (matching
+                // the existing `JumpIfMatch` operand layout
+                // documented in `common/src/opcode.rs`). Panicking
+                // on overflow is the right behaviour: the 15C
+                // design explicitly documents the 65,535-byte
+                // ceiling.
                 let target_u16 = u16::try_from(target).unwrap_or_else(|_| {
                     panic!(
                         "JumpIfMatch target offset {} overflows u16 \
@@ -385,6 +325,7 @@ impl BlockBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::Value;
 
     // ---- helpers ---------------------------------------------------
 
@@ -401,7 +342,7 @@ mod tests {
     /// ids. The ids are unique within a single `BlockBuilder`.
     #[test]
     fn fresh_label_returns_unique_ids() {
-        let mut bb = BlockBuilder::new(0);
+        let mut bb = BlockBuilder::new();
         let a = bb.fresh_label();
         let b = bb.fresh_label();
         let c = bb.fresh_label();
@@ -413,363 +354,320 @@ mod tests {
         assert_eq!(c.id(), 2);
     }
 
-    // ---- 2. bind_label_patches_pending_jump (base 0) --------------
+    // ---- 2. emit_jump_appends_placeholder --------------------------
 
-    /// With `base = 0`, after `emit_jump(Jmp); emit(byte);
-    /// bind_label`, the JMP target should equal `1` (base + 1
-    /// byte emitted = absolute position 1 in the parent
-    /// buffer). This is the simplest absolute-target case.
+    /// `emit_jump(Jmp, &mut bc)` pushes a JMP byte with operand=0
+    /// to `bc` and returns a fresh label.
     #[test]
-    fn bind_label_patches_pending_jump() {
-        let mut bb = BlockBuilder::new(0);
-        let target = bb.fresh_label();
+    fn emit_jump_appends_placeholder() {
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        bc.push(const_int(1));
+        bc.push(const_int(2));
 
-        // Emit a JMP placeholder targeting `target`.
-        bb.emit_jump_to(target, JumpKind::Unconditional);
-        // Push 3 padding bytes (CONSTs).
-        bb.emit(const_int(1));
-        bb.emit(const_int(2));
-        bb.emit(const_int(3));
-        // `target` should bind to absolute position 4
-        // (base 0 + 4 bytes emitted).
-        bb.bind_label(target);
+        let l = bb.emit_jump(JumpKind::Unconditional, &mut bc);
 
-        let result = bb.finalize().expect("all labels bound");
-        // The JMP is at byte 0. Its operand should be 4.
-        assert_eq!(result.len(), 4);
-        assert!(matches!(result[0].bytecode(), Instruction::JMP));
-        assert_eq!(result[0].operand_u32(), 4);
+        // The placeholder was appended.
+        assert_eq!(bc.len(), 3);
+        assert!(matches!(bc[2].bytecode(), Instruction::JMP));
+        assert_eq!(bc[2].operand_u32(), 0, "placeholder operand should be 0");
+        // The returned label is fresh.
+        assert_eq!(l.id(), 0);
     }
 
-    // ---- 2b. bind_label_uses_absolute_base (base > 0) --------------
+    // ---- 3. emit_jump_to_records_position --------------------------
 
-    /// With `base = 100`, after `emit_jump(Jmp); emit(byte);
-    /// bind_label`, the JMP target should equal `101`
-    /// (base 100 + 1 byte emitted). This is the load-bearing
-    /// Phase 16.5 test: confirms targets are absolute, not
-    /// 0-based relative.
+    /// `emit_jump_to(label, Jmp, &mut bc)` records the JMP's
+    /// absolute position in `pending[label.id]`.
     #[test]
-    fn bind_label_uses_absolute_base() {
-        let mut bb = BlockBuilder::new(100);
-        let target = bb.fresh_label();
-
-        bb.emit_jump_to(target, JumpKind::Unconditional);
-        bb.emit(const_int(7));
-        bb.emit(const_int(8));
-        bb.emit(const_int(9));
-        bb.bind_label(target);
-
-        let result = bb.finalize().expect("all labels bound");
-        assert_eq!(result.len(), 4);
-        assert!(matches!(result[0].bytecode(), Instruction::JMP));
-        // 100 (base) + 4 (bytes emitted) = 104
-        assert_eq!(result[0].operand_u32(), 104);
-    }
-
-    // ---- 3. bind_label_twice_panics (AMENDMENT 3) -----------------
-
-    /// AMENDMENT 3: `bind_label` is non-idempotent. Calling
-    /// it twice on the same label MUST panic. This is the
-    /// load-bearing safety check — a non-panicking
-    /// re-binding would silently corrupt jump targets.
-    #[test]
-    fn bind_label_twice_panics() {
-        let mut bb = BlockBuilder::new(0);
+    fn emit_jump_to_records_position() {
+        let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
-        bb.bind_label(l);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bb.bind_label(l);
-        }));
-        assert!(
-            result.is_err(),
-            "bind_label twice on the same label should panic (AMENDMENT 3)"
-        );
+
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+
+        assert_eq!(bc.len(), 3);
+        // All three positions are recorded for `l`.
+        assert!(bb.pending.contains_key(&l.id()));
+        assert_eq!(bb.pending[&l.id()].len(), 3);
+        assert_eq!(bb.pending[&l.id()], &[0, 1, 2]);
     }
 
-    // ---- 4. rebind_label_updates_jump_target (AMENDMENT 3) -------
+    // ---- 4. bind_label_patches_jump --------------------------------
 
-    /// AMENDMENT 3 update case: a label is bound, then
-    /// re-bound via `rebind_label` to a NEW ABSOLUTE position.
-    /// All pending jumps targeting the label should be
-    /// re-patched to the new absolute position.
+    /// After `emit_jump_to(label, Jmp, &mut bc); bind_label(label,
+    /// 100, &mut bc);` the JMP's operand is `100`.
     #[test]
-    fn rebind_label_updates_jump_target() {
-        let mut bb = BlockBuilder::new(0);
-        let target = bb.fresh_label();
+    fn bind_label_patches_jump() {
+        let mut bb = BlockBuilder::new();
+        let l = bb.fresh_label();
 
-        // Emit a JMP placeholder.
-        bb.emit_jump_to(target, JumpKind::Unconditional);
-        bb.emit(const_int(1));
-        // First bind — JMP should target byte 2 (base 0 + 1 JMP + 1 CONST).
-        bb.bind_label(target);
+        let mut bc: Vec<Byte> = Vec::new();
+        bc.push(const_int(1));
+        bc.push(const_int(2));
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bc.push(const_int(3));
+        // The JMP is at position 2; bind it to absolute position
+        // 5 (past the final CONST).
+        bb.bind_label(l, 5, &mut bc);
 
-        // Emit another jump to the SAME label.
-        bb.emit_jump_to(target, JumpKind::JumpIfFalse);
-        bb.emit(const_int(2));
-        // Current absolute position = 4. Rebind to absolute 4
-        // — both jumps now target absolute byte 4.
-        bb.rebind_label(target, 4);
-
-        let result = bb.finalize().expect("all labels bound");
-        assert_eq!(result.len(), 4);
-        assert!(matches!(result[0].bytecode(), Instruction::JMP));
-        assert_eq!(result[0].operand_u32(), 4);
-        assert!(matches!(result[2].bytecode(), Instruction::JMPF));
-        assert_eq!(result[2].operand_u32(), 4);
+        assert!(matches!(bc[2].bytecode(), Instruction::JMP));
+        assert_eq!(bc[2].operand_u32(), 5);
     }
 
-    /// `rebind_label` on an unbound label MUST panic.
+    // ---- 5. bind_label_preserves_jump_if_match_tag -----------------
+
+    /// For `JUMP_IF_MATCH { tag: 5, arity: 1 }`, after
+    /// `bind_label(label, 100, &mut bc)`, the byte's operand has
+    /// tag=5 in the upper 16 bits and target=100 in the lower
+    /// 16 bits. The 16-bit target ceiling (Phase 15D.5 MEDIUM #1)
+    /// is respected — only `u16` is preserved.
     #[test]
-    fn rebind_label_on_unbound_label_panics() {
-        let mut bb = BlockBuilder::new(0);
+    fn bind_label_preserves_jump_if_match_tag() {
+        let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bb.rebind_label(l, 42);
-        }));
-        assert!(
-            result.is_err(),
-            "rebind_label on an unbound label should panic"
-        );
-    }
 
-    // ---- 5. emit_jmp_uses_correct_opcode --------------------------
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump_to(l, JumpKind::JumpIfMatch { tag: 5, arity: 1 }, &mut bc);
+        bb.bind_label(l, 100, &mut bc);
 
-    /// Each `JumpKind` variant emits the corresponding
-    /// `Instruction` opcode. The operand is 0 (placeholder) at
-    /// emit time. With `base = 1`, the bound target is 2 (one
-    /// JMP byte emitted).
-    #[test]
-    fn emit_jmp_uses_correct_opcode() {
-        // JMP
-        let mut bb = BlockBuilder::new(1);
-        let l = bb.fresh_label();
-        bb.emit_jump_to(l, JumpKind::Unconditional);
-        bb.bind_label(l);
-        let r = bb.finalize().unwrap();
-        assert!(matches!(r[0].bytecode(), Instruction::JMP));
-        assert_eq!(r[0].operand_u32(), 2);
-
-        // JMPF
-        let mut bb = BlockBuilder::new(1);
-        let l = bb.fresh_label();
-        bb.emit_jump_to(l, JumpKind::JumpIfFalse);
-        bb.bind_label(l);
-        let r = bb.finalize().unwrap();
-        assert!(matches!(r[0].bytecode(), Instruction::JMPF));
-        assert_eq!(r[0].operand_u32(), 2);
-
-        // JMPT
-        let mut bb = BlockBuilder::new(1);
-        let l = bb.fresh_label();
-        bb.emit_jump_to(l, JumpKind::JumpIfTrue);
-        bb.bind_label(l);
-        let r = bb.finalize().unwrap();
-        assert!(matches!(r[0].bytecode(), Instruction::JMPT));
-        assert_eq!(r[0].operand_u32(), 2);
-    }
-
-    // ---- 6. emit_jump_if_match_preserves_tag ----------------------
-
-    /// For `JumpIfMatch`, the tag (upper 16 bits) is set at
-    /// emit time. The target (lower 16 bits) is patched on
-    /// bind to the absolute offset. After bind, the tag should
-    /// be preserved.
-    #[test]
-    fn emit_jump_if_match_preserves_tag() {
-        let mut bb = BlockBuilder::new(0);
-        let target = bb.fresh_label();
-        // Tag = 0x1234, arity = 99 (arity is discarded).
-        bb.emit_jump_to(target, JumpKind::JumpIfMatch { tag: 0x1234, arity: 99 });
-        bb.emit(const_int(1));
-        // `target` absolute position = base 0 + 2 bytes = 2.
-        bb.bind_label(target);
-
-        let r = bb.finalize().unwrap();
-        assert!(matches!(r[0].bytecode(), Instruction::JumpIfMatch));
-        let operand = r[0].operand_u32();
+        assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
+        let operand = bc[0].operand_u32();
         let tag = (operand >> 16) as u16;
         let target = (operand & 0xFFFF) as u16;
-        assert_eq!(tag, 0x1234, "tag should be preserved");
-        assert_eq!(target, 2, "target should be patched to absolute position 2");
+        assert_eq!(tag, 5, "tag should be preserved");
+        assert_eq!(target, 100, "target should be patched");
     }
 
-    // ---- 7. emit_jump_to_uses_existing_label ---------------------
+    // ---- 6. bind_label_patches_multiple_jumps_to_same_label --------
 
-    /// Multiple jumps to the same label are all patched to
-    /// the same absolute target.
+    /// Multiple `emit_jump_to(label, ...)` calls, then
+    /// `bind_label(label, 100, ...)` patches all of them.
     #[test]
-    fn emit_jump_to_uses_existing_label() {
-        let mut bb = BlockBuilder::new(0);
-        let target = bb.fresh_label();
-        // Three jumps to the same label.
-        bb.emit_jump_to(target, JumpKind::Unconditional);
-        bb.emit(const_int(1));
-        bb.emit_jump_to(target, JumpKind::Unconditional);
-        bb.emit(const_int(2));
-        bb.emit_jump_to(target, JumpKind::Unconditional);
-        bb.emit(const_int(3));
-        // Bind to absolute end = base 0 + 6 bytes = 6.
-        bb.bind_label(target);
+    fn bind_label_patches_multiple_jumps_to_same_label() {
+        let mut bb = BlockBuilder::new();
+        let l = bb.fresh_label();
 
-        let r = bb.finalize().unwrap();
-        // All three JMPs (at bytes 0, 2, 4) should target absolute byte 6.
-        for (i, b) in r.iter().enumerate() {
-            if matches!(b.bytecode(), Instruction::JMP) {
-                assert_eq!(b.operand_u32(), 6, "JMP at byte {} should target 6", i);
-            }
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bc.push(const_int(1));
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bc.push(const_int(2));
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+
+        bb.bind_label(l, 100, &mut bc);
+
+        // All three JMPs (at positions 0, 2, 4) target 100.
+        for pos in [0, 2, 4] {
+            assert!(
+                matches!(bc[pos].bytecode(), Instruction::JMP),
+                "byte at position {} should be JMP", pos
+            );
+            assert_eq!(
+                bc[pos].operand_u32(), 100,
+                "JMP at position {} should target 100", pos
+            );
         }
     }
 
-    // ---- 8. finalize_returns_unbound_label_error -----------------
+    // ---- 7. bind_label_is_idempotent -------------------------------
 
-    /// If any label is allocated but never bound,
-    /// `finalize` returns `Err(BlockError::UnboundLabel(_))`.
+    /// Calling `bind_label` twice with different targets: the
+    /// second call updates the patches to the new target.
+    #[test]
+    fn bind_label_is_idempotent() {
+        let mut bb = BlockBuilder::new();
+        let l = bb.fresh_label();
+
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+
+        bb.bind_label(l, 50, &mut bc);
+        assert_eq!(bc[0].operand_u32(), 50);
+
+        bb.bind_label(l, 200, &mut bc);
+        assert_eq!(bc[0].operand_u32(), 200);
+    }
+
+    // ---- 8. bind_label_only_patches_target_label -------------------
+
+    /// Multiple labels, `bind_label(label_a, 100, ...)` doesn't
+    /// affect jumps targeting `label_b`.
+    #[test]
+    fn bind_label_only_patches_target_label() {
+        let mut bb = BlockBuilder::new();
+        let a = bb.fresh_label();
+        let b = bb.fresh_label();
+
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump_to(a, JumpKind::Unconditional, &mut bc);
+        bc.push(const_int(1));
+        bb.emit_jump_to(b, JumpKind::Unconditional, &mut bc);
+
+        bb.bind_label(a, 100, &mut bc);
+
+        // JMP at position 0 (target A) should be 100.
+        assert_eq!(bc[0].operand_u32(), 100);
+        // JMP at position 2 (target B) should still be 0 (not
+        // patched).
+        assert_eq!(bc[2].operand_u32(), 0);
+    }
+
+    // ---- 9. emit_jump_jmpf_jmpt_use_correct_opcode -----------------
+
+    /// Each `JumpKind` variant produces the right `Instruction`.
+    #[test]
+    fn emit_jump_jmpf_jmpt_use_correct_opcode() {
+        // JMP
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump(JumpKind::Unconditional, &mut bc);
+        assert!(matches!(bc[0].bytecode(), Instruction::JMP));
+
+        // JMPF
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump(JumpKind::JumpIfFalse, &mut bc);
+        assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
+
+        // JMPT
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump(JumpKind::JumpIfTrue, &mut bc);
+        assert!(matches!(bc[0].bytecode(), Instruction::JMPT));
+
+        // JUMP_IF_MATCH
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        bb.emit_jump(JumpKind::JumpIfMatch { tag: 0xABCD, arity: 1 }, &mut bc);
+        assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
+        assert_eq!((bc[0].operand_u32() >> 16) as u16, 0xABCD);
+    }
+
+    // ---- 10. finalize_returns_unbound_label_error ------------------
+
+    /// Emit a jump to a label, never bind, `finalize` returns Err.
     #[test]
     fn finalize_returns_unbound_label_error() {
-        let mut bb = BlockBuilder::new(0);
-        // Allocate two labels; bind only one.
-        let bound_label = bb.fresh_label();
-        let unbound_label = bb.fresh_label();
-
-        bb.emit_jump_to(bound_label, JumpKind::Unconditional);
-        bb.emit_jump_to(unbound_label, JumpKind::Unconditional);
-        bb.bind_label(bound_label);
-        // DON'T bind `unbound_label`.
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        let _l = bb.emit_jump(JumpKind::Unconditional, &mut bc);
+        // Don't bind `_l`.
 
         let result = bb.finalize();
         assert!(result.is_err(), "finalize should fail with unbound label");
         match result {
-            Err(BlockError::UnboundLabel(l)) => {
-                assert_eq!(l, unbound_label);
-            }
+            Err(BlockError::UnboundLabel(_)) => (),
             Ok(_) => panic!("expected error"),
         }
     }
 
-    // ---- 9. finalize_returns_bytecode_in_order -------------------
+    // ---- 11. finalize_succeeds_when_all_labels_bound ---------------
 
-    /// `finalize` succeeds when every allocated label is
-    /// bound.
+    /// Emit a jump to a label, bind it, finalize succeeds.
     #[test]
-    fn finalize_returns_bytecode_in_order() {
-        let mut bb = BlockBuilder::new(0);
-        let end = bb.fresh_label();
-
-        bb.emit(const_int(1));
-        bb.emit_jump_to(end, JumpKind::Unconditional);
-        bb.emit(const_int(2));
-        bb.bind_label(end);
-        bb.emit(const_int(3));
-
-        let r = bb.finalize().expect("all labels bound");
-        // Order: CONST 1, JMP 3, CONST 2, CONST 3.
-        assert_eq!(r.len(), 4);
-        assert!(matches!(r[0].bytecode(), Instruction::CONST));
-        assert!(matches!(r[1].bytecode(), Instruction::JMP));
-        assert_eq!(r[1].operand_u32(), 3);
-        assert!(matches!(r[2].bytecode(), Instruction::CONST));
-        assert!(matches!(r[3].bytecode(), Instruction::CONST));
+    fn finalize_succeeds_when_all_labels_bound() {
+        let mut bb = BlockBuilder::new();
+        let mut bc: Vec<Byte> = Vec::new();
+        let l = bb.emit_jump(JumpKind::Unconditional, &mut bc);
+        bb.bind_label(l, 100, &mut bc);
+        assert!(bb.finalize().is_ok());
     }
 
-    // ---- 10. extend_appends_in_order ------------------------------
+    // ---- 12. integrated_test_with_bytecode --------------------------
 
-    /// `extend` appends the bytes in order. We use a fresh
-    /// `BlockBuilder` per branch and then `extend` the
-    /// child's bytes into the parent — this is the
-    /// composition pattern.
+    /// Simulate a simple if/else using BlockBuilder on an external
+    /// `Vec<Byte>`, verify the JMPF and JMP targets are correct.
+    ///
+    /// Layout produced for `if c { b1 } else { b2 }`:
+    ///   c, JMPF → end, b1, JMP end, b2, [end]
     #[test]
-    fn extend_appends_in_order() {
-        let mut bb = BlockBuilder::new(0);
-        // First child: CONST 1, CONST 2.
-        bb.extend(vec![const_int(1), const_int(2)]);
-        // Second child: CONST 3.
-        bb.extend(vec![const_int(3)]);
-        // Third child: empty.
-        bb.extend(vec![]);
+    fn integrated_test_with_bytecode() {
+        let mut bb = BlockBuilder::new();
+        let end_label = bb.fresh_label();
 
-        let r = bb.finalize().expect("empty finalize ok");
-        assert_eq!(r.len(), 3);
-        for (i, want) in [1, 2, 3].iter().enumerate() {
-            assert!(matches!(r[i].bytecode(), Instruction::CONST));
-            assert_eq!(r[i].constant(), *want as u64);
-        }
+        let mut bc: Vec<Byte> = Vec::new();
+
+        // Emit <cond> (CONST 1).
+        bc.push(const_int(1));
+        // Emit JMPF placeholder → end_label.
+        bb.emit_jump_to(end_label, JumpKind::JumpIfFalse, &mut bc);
+        // Emit <then-body> (CONST 2).
+        bc.push(const_int(2));
+        // Emit JMP → end_label.
+        bb.emit_jump_to(end_label, JumpKind::Unconditional, &mut bc);
+        // Emit <else-body> (CONST 3).
+        bc.push(const_int(3));
+
+        // Bind end_label to current bytecode.len().
+        let end_pos = bc.len() as u32;
+        bb.bind_label(end_label, end_pos, &mut bc);
+
+        // Assert: bytecode has 5 bytes total.
+        assert_eq!(bc.len(), 5);
+        // Byte 0: CONST 1.
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        // Byte 1: JMPF, operand = end_pos (= 5).
+        assert!(matches!(bc[1].bytecode(), Instruction::JMPF));
+        assert_eq!(bc[1].operand_u32(), 5);
+        // Byte 2: CONST 2.
+        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
+        // Byte 3: JMP, operand = end_pos (= 5).
+        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert_eq!(bc[3].operand_u32(), 5);
+        // Byte 4: CONST 3.
+        assert!(matches!(bc[4].bytecode(), Instruction::CONST));
+
+        // Finalize succeeds.
+        assert!(bb.finalize().is_ok());
     }
 
-    // ---- 11. current_position_is_absolute -------------------------
+    // ---- 13. emit_jump_to_after_bind_label_records_new_pending -----
 
-    /// `current_position` returns the absolute position
-    /// (`base + self.bytes.len()`), not just the local
-    /// buffer length. Phase 16.5 production codegen relies
-    /// on this when binding labels to specific positions.
+    /// Emit a jump, bind, then emit another jump targeting the
+    /// SAME label. The second emit appends a new entry to
+    /// `pending`. A subsequent `bind_label` re-patches BOTH
+    /// jumps. This is the load-bearing idempotency case.
     #[test]
-    fn current_position_is_absolute() {
-        let mut bb = BlockBuilder::new(500);
-        assert_eq!(bb.current_position(), 500, "empty builder at base 500");
-        bb.emit(const_int(1));
-        assert_eq!(bb.current_position(), 501);
-        bb.emit(const_int(2));
-        assert_eq!(bb.current_position(), 502);
+    fn emit_jump_to_after_bind_label_records_new_pending() {
+        let mut bb = BlockBuilder::new();
+        let l = bb.fresh_label();
+        let mut bc: Vec<Byte> = Vec::new();
+
+        // First jump.
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bc.push(const_int(1));
+        bb.bind_label(l, 10, &mut bc);
+        // First jump now targets 10.
+        assert_eq!(bc[0].operand_u32(), 10);
+
+        // Second jump (after the first was bound).
+        bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
+        bc.push(const_int(2));
+        // The second jump has placeholder operand 0.
+        assert_eq!(bc[2].operand_u32(), 0);
+
+        // Re-bind — both jumps should now target 20.
+        bb.bind_label(l, 20, &mut bc);
+        assert_eq!(bc[0].operand_u32(), 20);
+        assert_eq!(bc[2].operand_u32(), 20);
     }
 
-    // ---- 12. base_accessor_returns_constructor_value --------------
+    // ---- 14. fresh_label_without_jump_is_fine ----------------------
 
-    /// `base` returns the constructor argument.
+    /// A `fresh_label` call that is never used in a jump is OK
+    /// at `finalize` time (it's an unused label, not an unbound
+    /// one).
     #[test]
-    fn base_accessor_returns_constructor_value() {
-        let bb = BlockBuilder::new(1234);
-        assert_eq!(bb.base(), 1234);
-        let bb = BlockBuilder::new(0);
-        assert_eq!(bb.base(), 0);
-    }
-
-    // ---- 13. finalize_targets_ready_without_relocation -----------
-
-    /// Phase 16.5's whole reason for existing: targets in
-    /// the finalized buffer are correct WITHOUT a
-    /// post-pass. We simulate "appending to a parent
-    /// buffer" by pre-pending non-zero base to all
-    /// expected targets, and verify the targets land at
-    /// the right positions.
-    #[test]
-    fn finalize_targets_ready_without_relocation() {
-        // Simulate appending to a parent buffer at base 1000.
-        let mut bb = BlockBuilder::new(1000);
-        let end = bb.fresh_label();
-
-        bb.emit(const_int(1));
-        bb.emit_jump_to(end, JumpKind::JumpIfFalse);
-        bb.emit(const_int(2));
-        bb.bind_label(end);
-        bb.emit(const_int(3));
-
-        let r = bb.finalize().expect("all labels bound");
-        // JMPF should target absolute position 1003 (1000 + 3),
-        // the position right after the `CONST 2` byte. This is
-        // where the `end` label binds to.
-        assert!(matches!(r[1].bytecode(), Instruction::JMPF));
-        assert_eq!(r[1].operand_u32(), 1003);
-    }
-
-    // ---- 14. jump_if_match_target_uses_absolute_with_base --------
-
-    /// `JumpIfMatch` target is patched to the absolute
-    /// position. With `base = 50` and 3 bytes emitted, the
-    /// target lands at 53.
-    #[test]
-    fn jump_if_match_target_uses_absolute_with_base() {
-        let mut bb = BlockBuilder::new(50);
-        let target = bb.fresh_label();
-        bb.emit_jump_to(target, JumpKind::JumpIfMatch { tag: 0x0042, arity: 1 });
-        bb.emit(const_int(1));
-        bb.emit(const_int(2));
-        bb.bind_label(target);
-
-        let r = bb.finalize().unwrap();
-        assert!(matches!(r[0].bytecode(), Instruction::JumpIfMatch));
-        let operand = r[0].operand_u32();
-        let tag = (operand >> 16) as u16;
-        let tgt = (operand & 0xFFFF) as u16;
-        assert_eq!(tag, 0x0042);
-        assert_eq!(tgt, 53, "JumpIfMatch target = base 50 + 3 bytes");
+    fn fresh_label_without_jump_is_fine() {
+        let mut bb = BlockBuilder::new();
+        let _l = bb.fresh_label(); // never used
+        let mut bc: Vec<Byte> = Vec::new();
+        let l2 = bb.emit_jump(JumpKind::Unconditional, &mut bc);
+        bb.bind_label(l2, 100, &mut bc);
+        assert!(bb.finalize().is_ok());
     }
 }

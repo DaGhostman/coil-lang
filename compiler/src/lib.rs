@@ -1,9 +1,12 @@
+mod block_builder;
 mod pipeline;
 mod typechecking;
 
 use std::{borrow::Borrow, collections::HashMap};
 
-use common::{Byte, Instruction, Interner, Label, Message, Value, likely, unlikely};
+use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, likely, unlikely};
+
+use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind};
 use parser::{
     SimpleSpan,
     ast::{Expression, Output, Pattern},
@@ -532,7 +535,7 @@ impl Compiler {
                 } else {
                     let mut message =
                         Message::error("Unknown function".to_string(), span.into_range());
-                    message.push(Label::new(
+                    message.push(DiagLabel::new(
                         format!("Unable to call unknown function '{}'", n),
                         span.into_range(),
                     ));
@@ -560,7 +563,7 @@ impl Compiler {
                 } else {
                     let mut message =
                         Message::error("Unknown variable".to_string(), span.into_range());
-                    message.push(Label::new(
+                    message.push(DiagLabel::new(
                         format!("Unknown variable '{}'", n),
                         span.into_range(),
                     ));
@@ -568,61 +571,57 @@ impl Compiler {
                 }
             }
             Expression::If(branches) => {
-                // Phase 16.5 bugfix: rewrite the If codegen so the
-                // body comes AFTER the cond + JMPF in `self.bytecode`,
-                // not BEFORE (which is what eager body compilation
-                // does when the body is a `Print`).
+                // Phase 16.6 refactor: rewrite the If codegen using
+                // the placeholder-tracking `BlockBuilder` instead of
+                // manual placeholder-tracking via two `Vec<usize>`s.
+                // The semantics are IDENTICAL to the Phase 16.5
+                // direct-manipulation version (no behavior change) —
+                // only the implementation is cleaner.
                 //
-                // The pre-16.5 implementation eagerly compiled every
-                // branch's body via `self.do_compile(body)` inside the
-                // branch-iteration loop. For bodies whose codegen
-                // emits directly to `self.bytecode` (notably `Print`),
-                // the body's bytes landed in `self.bytecode` BEFORE
-                // the cond + JMPF. The JMPF target formula then
-                // computed an operand that pointed at the START of
-                // the cond (not past the body), because the formula
-                // was a snapshot of `self.bytecode.len()` at the wrong
-                // moment. The VM dutifully jumped back to the start
-                // of the cond and re-evaluated it forever.
-                //
-                // The fix interleaves cond → JMPF → body → (JMP if
-                // not last) per branch, in that order. JMPF and JMP
-                // are emitted as placeholders (operand = 0) and
-                // patched in a final pass once the position of
-                // `end_pos` (and each JMP) is known. This works for
-                // any body shape (Print, nested if, match, etc.)
-                // because the body is compiled AFTER the cond + JMPF
-                // placeholder, so its bytes always land at the right
-                // position in `self.bytecode`.
+                // The key correctness property is that ALL bytes
+                // (including those emitted by `Print`/`Format`
+                // codegen, which targets `self.bytecode` directly)
+                // are appended to the same `self.bytecode` vector,
+                // and `BlockBuilder` tracks the positions of JMPF
+                // and JMP placeholders in that same coordinate
+                // system. This sidesteps the pre-16.5
+                // coordinate-system hazard entirely.
                 //
                 // Layout produced for `if c1 { b1 } else if c2 { b2 } else { b3 }`:
                 //   c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
                 //
-                // Patches:
-                //   JMPF1 → position right after JMP1 (= start of c2)
-                //   JMP1  → end_pos
-                //   JMPF2 → position right after JMP2 (= start of b3)
-                //   JMP2  → end_pos
+                // Bindings (handled by BlockBuilder):
+                //   JMPF1 → start of c2 (= branch_start_labels[0])
+                //   JMP1  → end_label (= end_pos)
+                //   JMPF2 → start of b3 (= branch_start_labels[1])
+                //   JMP2  → end_label (= end_pos)
                 //
                 // Layout for a single-branch `if c { b }`:
                 //   c, JMPF, b, [end]
                 //
-                // Patch: JMPF → end_pos (past b).
-                //
-                // Note: this implementation does NOT use
-                // `BlockBuilder`. The BlockBuilder's contract assumes
-                // child bytecode lands in the BlockBuilder's local
-                // buffer via `bb.extend(child_bc)`. `Print` violates
-                // that contract by emitting directly to
-                // `self.bytecode`, which is why the BlockBuilder-based
-                // approach in the pre-fix spec had the same kind of
-                // bug as the original. The direct-manipulation
-                // approach below sidesteps the contract entirely.
+                // Binding: JMPF → end_label (= end_pos).
 
-                // Positions of JMPF and JMP placeholders to patch
-                // once we know `end_pos`.
-                let mut jmpf_patches: Vec<(usize, bool)> = Vec::new();
-                let mut jmp_patches: Vec<usize> = Vec::new();
+                // Pre-allocate labels for the START of each non-last
+                // branch. These are the targets of the PREVIOUS
+                // branch's JMPF — when we begin emitting branch `i`,
+                // we bind `branch_start_labels[i - 1]` to the
+                // current bytecode position (which is the start of
+                // branch `i`). The last branch's start has no
+                // pre-allocated label (it never serves as a JMPF
+                // target because nothing falls through into it from
+                // an earlier branch — only `else` does, and `else`
+                // has no preceding JMPF in this design).
+                let mut bb = BlockBuilder::new();
+                let end_label = bb.fresh_label();
+                let mut branch_start_labels: Vec<Option<crate::block_builder::Label>> =
+                    Vec::with_capacity(branches.len());
+                for i in 0..branches.len() {
+                    if i + 1 < branches.len() {
+                        branch_start_labels.push(Some(bb.fresh_label()));
+                    } else {
+                        branch_start_labels.push(None);
+                    }
+                }
 
                 for (i, (_, branch)) in branches.iter().enumerate() {
                     let (cond_opt, body) = match branch.borrow() {
@@ -630,27 +629,36 @@ impl Compiler {
                         _ => unreachable!("If branch must be Expression::Branch"),
                     };
 
-                    let is_last = i + 1 == branches.len();
+                    // If this is not the first branch, bind the
+                    // previous branch's pre-allocated start label to
+                    // the CURRENT bytecode position (= the start of
+                    // this branch). This patches the JMPF placeholder
+                    // emitted by the previous iteration.
+                    if i > 0 {
+                        if let Some(prev_label) = branch_start_labels[i - 1] {
+                            let target = self.bytecode.len() as u32;
+                            bb.bind_label(prev_label, target, &mut self.bytecode);
+                        }
+                    }
 
                     // Emit the condition (if any) followed by a JMPF
-                    // placeholder. The placeholder's operand is
-                    // patched AFTER the body is in self.bytecode
-                    // (because we don't know how many bytes the body
-                    // contributes until we compile it).
+                    // placeholder. The JMPF target is the start of
+                    // the NEXT branch (if not the last), or end_label
+                    // (if last). The last branch's start label is
+                    // `None`, so `unwrap_or(end_label)` falls back to
+                    // end_label.
                     //
-                    // Bug #1 fix: the JMPF is emitted UNCONDITIONALLY
-                    // for every branch with a condition, including
-                    // the last branch. The pre-16.5 codegen skipped
-                    // the JMPF for single-branch `if` (because
-                    // `branches.len() == 1` triggered a `branchless`
-                    // flag that gated JMPF emission), which meant
-                    // the single-branch if's body was ALWAYS executed
-                    // regardless of the condition.
+                    // Bug #1 fix (Phase 16.5): the JMPF is emitted
+                    // UNCONDITIONALLY for every branch with a
+                    // condition, including the last branch. The
+                    // pre-16.5 codegen skipped the JMPF for
+                    // single-branch `if`, which meant the body was
+                    // ALWAYS executed regardless of the condition.
                     if let Some(cond) = cond_opt {
                         let cond_bc = self.do_compile(cond);
                         self.bytecode.extend(cond_bc);
-                        self.bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
-                        jmpf_patches.push((self.bytecode.len() - 1, is_last));
+                        let jmpf_target = branch_start_labels[i].unwrap_or(end_label);
+                        bb.emit_jump_to(jmpf_target, BbJumpKind::JumpIfFalse, &mut self.bytecode);
                     }
 
                     // Emit the body AFTER the cond + JMPF so the
@@ -659,57 +667,35 @@ impl Compiler {
                     // self.bytecode, but the bytes are appended here
                     // via the call to `do_compile(body)`.)
                     //
-                    // Bug #2 fix: in the pre-16.5 codegen, the body
-                    // was eagerly compiled BEFORE the cond + JMPF
-                    // landed in self.bytecode, so its bytes appeared
-                    // before the JMPF. The JMPF operand was computed
-                    // relative to a `self.bytecode.len()` snapshot
-                    // that no longer matched the actual layout.
+                    // Bug #2 fix (Phase 16.5): in the pre-16.5
+                    // codegen, the body was eagerly compiled BEFORE
+                    // the cond + JMPF landed in self.bytecode, so
+                    // its bytes appeared before the JMPF. The JMPF
+                    // operand was computed relative to a
+                    // `self.bytecode.len()` snapshot that no longer
+                    // matched the actual layout.
                     let body_bc = self.do_compile(body);
                     self.bytecode.extend(body_bc);
 
                     // Emit a `JMP → end` placeholder for every
                     // branch except the last. The last branch falls
                     // through to `end_pos`.
-                    if !is_last {
-                        self.bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(0));
-                        jmp_patches.push(self.bytecode.len() - 1);
+                    if i + 1 < branches.len() {
+                        bb.emit_jump_to(end_label, BbJumpKind::Unconditional, &mut self.bytecode);
                     }
                 }
 
-                let end_pos = self.bytecode.len();
+                // Bind `end_label` to the current bytecode position
+                // (= past the last branch's body / JMP). This patches
+                // every JMP → end placeholder AND the last JMPF
+                // placeholder (if any).
+                let end_pos = self.bytecode.len() as u32;
+                bb.bind_label(end_label, end_pos, &mut self.bytecode);
 
-                // Patch every `JMP → end` placeholder with the
-                // final `end_pos`.
-                for pos in &jmp_patches {
-                    self.bytecode[*pos] =
-                        Byte::new(Instruction::JMP).with_operand_u32(end_pos as u32);
-                }
-
-                // Patch every JMPF placeholder.
-                //
-                // For the LAST branch with a condition (i.e., the
-                // `else` of a multi-branch chain, OR the only
-                // branch of a single-branch `if`), the JMPF target
-                // is `end_pos` (past the body).
-                //
-                // For a NON-LAST branch with a condition, the JMPF
-                // target is the position RIGHT AFTER the JMP that
-                // skips this branch — which is the start of the
-                // NEXT branch's condition. The JMP for branch `i` is
-                // at `jmp_patches[i]`, so the JMPF target is
-                // `jmp_patches[i] + 1`.
-                let mut jmp_idx = 0;
-                for (jmpf_pos, is_last) in &jmpf_patches {
-                    let target = if *is_last {
-                        end_pos
-                    } else {
-                        jmp_patches[jmp_idx] + 1
-                    };
-                    self.bytecode[*jmpf_pos] =
-                        Byte::new(Instruction::JMPF).with_operand_u32(target as u32);
-                    jmp_idx += 1;
-                }
+                // Validate: every label that had a pending jump must
+                // be bound. (Allocated-but-unused labels are allowed.)
+                bb.finalize()
+                    .expect("BlockBuilder::finalize: all targeted labels bound");
             }
             Expression::Le(lhs, rhs) => {
                 let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
@@ -851,7 +837,7 @@ impl Compiler {
                 if unlikely(self.context.variables.contains(&name.to_string())) {
                     let mut message =
                         Message::error("Variable redeclaration".to_string(), span.into_range());
-                    message.push(Label::new(
+                    message.push(DiagLabel::new(
                         format!("Variable '{}' already declared", name),
                         span.into_range(),
                     ));
@@ -865,7 +851,7 @@ impl Compiler {
                 if self.context.variables.contains(&name) {
                     let mut message =
                         Message::error("Constand redeclaration".to_string(), span.into_range());
-                    message.push(Label::new(
+                    message.push(DiagLabel::new(
                         format!("Constant '{}' already declared", name),
                         span.into_range(),
                     ));
@@ -892,7 +878,7 @@ impl Compiler {
                         } else {
                             let mut message =
                                 Message::error("Assignment error".to_string(), span.into_range());
-                            message.push(Label::new(
+                            message.push(DiagLabel::new(
                                 format!(
                                     "Unable to assign to an already assigned constant '{}'",
                                     name
@@ -916,7 +902,7 @@ impl Compiler {
                 } else {
                     let mut message =
                         Message::error("Undefined variable".to_string(), span.into_range());
-                    message.push(Label::new(
+                    message.push(DiagLabel::new(
                         format!(
                             "Unable to assign to a non-existing variable/constant '{}'",
                             name
@@ -1272,7 +1258,7 @@ impl Compiler {
             _expr => {
                 let mut message =
                     Message::error("Unknown expression".to_string(), span.into_range());
-                message.push(Label::new(
+                message.push(DiagLabel::new(
                     "Unable to compile expression".to_string(),
                     span.into_range(),
                 ));
