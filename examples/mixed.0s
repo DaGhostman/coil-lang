@@ -2,30 +2,31 @@
 // + Record), with a match that dispatches between them.
 //
 // This example demonstrates that Phase 17B supports all three
-// variant shapes in the same enum. The match body is restricted
-// to CONSTANT arm bodies (a literal on each arm) because of a
-// pre-existing codegen limitation: when more than one constructor
-// arm has a binding, the binding slot numbers don't line up with
-// the VM's payload-push positions. See the "Known limitations"
-// section of AGENTS.md for the full discussion.
+// variant shapes in the same enum. The match arms use bindings
+// for each variant's payload; the codegen walks declaration
+// order for record payloads, and the VM stores each binding in
+// its own slot via the Interner.
 //
-// Expected output: 0, 5, 7 (one line per shape).
+// Expected output: 0, 25, 12, 2 (one line per shape).
 enum Shape {
-    Circle,
+    Empty,
     CircleR(int),
     Rect { width: int, height: int },
+    Tri { a: int, b: int, c: int },
 }
 
-fn tag(Shape s) -> int {
+fn area(Shape s) -> int {
     return match s {
-        Shape::Circle => 0,
-        Shape::CircleR => 5,
-        Shape::Rect => 7,
+        Shape::Empty => 0,
+        Shape::CircleR(r) => r * r,
+        Shape::Rect { width, height } => width * height,
+        Shape::Tri { a, b, c } => (a + b + c) / 3,
     };
 }
 
 fn main() {
-    print "%i", tag(Shape::Circle);
-    print "%i", tag(Shape::CircleR(42));
-    print "%i", tag(Shape::Rect { width: 3, height: 4 });
+    print "%i", area(Shape::Empty);
+    print "%i", area(Shape::CircleR(5));
+    print "%i", area(Shape::Rect { width: 3, height: 4 });
+    print "%i", area(Shape::Tri { a: 1, b: 2, c: 3 });
 }
