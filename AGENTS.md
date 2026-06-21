@@ -897,26 +897,180 @@ test pass. (See `compiler/tests/pipeline.rs::tests::fizbuz_runs_to_completion`.)
 `cargo build` produces only the three pre-existing
 parser warnings. No new compiler or machine warnings.
 
-### Anything 16.6+ needs to know
+## PHASE 16.6 — WIRE BLOCKBUILDER INTO PRODUCTION (COMPLETED)
 
-- The If codegen in `compiler/src/lib.rs` now uses
-  direct `self.bytecode` manipulation with deferred
-  patching instead of `BlockBuilder`. If a future
-  phase wants to re-introduce `BlockBuilder` here,
-  it must first refactor `Print` (and any other
-  direct-`self.bytecode` emitter) to compile to a
-  local `Vec<Byte>` so the builder contract is
-  uniform. The 15D `emit_pattern_binding` free
-  function exists for exactly this kind of split —
-  it might be worth mirroring that pattern in
-  `Print`/`Format`.
-- The `Vec<(usize, bool)>` for `jmpf_patches` could
-  be cleaned up to `Vec<{ jmpf_pos: usize, is_last: bool }>`
-  with a named-struct record. Left as-is for now to
-  minimize diff churn.
+### Summary
+
+The `compiler/src/block_builder.rs` primitive introduced in Phase
+16 was committed but **orphaned**: the file was never declared as
+`mod block_builder;` in `lib.rs`, so all 16 of its unit tests were
+silently skipped. Two earlier attempts to wire it into production
+failed because `BlockBuilder` owned a local `Vec<Byte>` with
+absolute `base` offsets — a design that doesn't work when nested
+control flow (`Print`, `if` inside a `match` arm, etc.) emits
+directly to `Compiler::bytecode` mid-emission.
+
+Phase 16.6 refactors `BlockBuilder` to a **placeholder-tracking
+utility with no byte buffer of its own** and uses it in the `If`
+codegen. Semantics are IDENTICAL to the Phase 16.5
+direct-manipulation version — only the implementation is cleaner.
+
+### New `BlockBuilder` design
+
+The pre-16.6 API (own local buffer + `base: u32` + `rebind_label`):
+```rust
+pub struct BlockBuilder { bytes: Vec<Byte>, base: u32, ... }
+impl BlockBuilder {
+    pub fn new(base: u32) -> Self;
+    pub fn extend(&mut self, bytes: Vec<Byte>);
+    pub fn bind_label(&mut self, label: Label);  // PANICS on second call
+    pub fn rebind_label(&mut self, label: Label, new_position: u32);
+    pub fn finalize(self) -> Result<Vec<Byte>, BlockError>;
+}
+```
+
+The 16.6 API (placeholder-tracking only):
+```rust
+pub struct BlockBuilder {
+    pending: BTreeMap<u32, Vec<usize>>,  // label id → bytecode positions
+    bound: BTreeSet<u32>,
+    next_label_id: u32,
+}
+impl BlockBuilder {
+    pub fn new() -> Self;
+    pub fn fresh_label(&mut self) -> Label;
+    pub fn emit_jump(&mut self, kind: JumpKind, bytecode: &mut Vec<Byte>) -> Label;
+    pub fn emit_jump_to(&mut self, target: Label, kind: JumpKind, bytecode: &mut Vec<Byte>);
+    pub fn bind_label(&mut self, label: Label, target: u32, bytecode: &mut [Byte]);
+    pub fn finalize(self) -> Result<(), BlockError>;
+}
+```
+
+### Decisions locked in (during implementation)
+
+1. **No local byte buffer.** All bytes go to an external
+   `Vec<Byte>` (typically `Compiler::bytecode`). Positions
+   recorded in `pending` are absolute positions in that
+   external buffer. There is no coordinate-system conversion,
+   no `relocate` post-pass, and no nested-control-flow hazard.
+2. **`bind_label` is idempotent.** Re-binding re-patches every
+   pending jump. The pre-16.6 non-idempotent design (with a
+   separate `rebind_label`) was over-engineered for the codegen
+   needs — every `emit_jump` is matched by exactly one
+   `bind_label`, and re-binding is the simpler, more flexible
+   contract.
+3. **`finalize` errors only on labels that had pending jumps but
+   were never bound.** A label allocated via `fresh_label` but
+   never targeted by any jump is allowed (it has no effect on
+   the bytecode).
+4. **`emit_jump` is `#[allow(dead_code)]` for now.** The current
+   `If` codegen uses `emit_jump_to` exclusively (each branch's
+   JMPF jumps to a pre-allocated `branch_start_labels[i]` or to
+   `end_label`). `emit_jump` is in the public API for future
+   control-flow emitters (Loop, While).
+5. **Renamed `common::Label` to `DiagLabel` in `lib.rs`.** The
+   new `block_builder::Label` type would otherwise collide with
+   the ariadne diagnostic `Label` from `common`. `pipeline.rs`
+   and `typechecking/` keep the bare `Label` name (they don't
+   reference `block_builder`).
+6. **Last-branch `start` is `None`, not a fresh label.** The last
+   branch never serves as a JMPF target (only `else` does, and
+   `else` has no preceding JMPF in the if/else-if layout). Allocating
+   a label for it would be dead state.
+
+### `If` codegen layout (unchanged from 16.5)
+
+For `if c1 { b1 } else if c2 { b2 } else { b3 }`:
+```
+c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
+```
+
+Bindings (now via BlockBuilder):
+- `JMPF1` → `branch_start_labels[0]` (bound to start of c2 at i=1)
+- `JMP1`  → `end_label` (bound at end to `end_pos`)
+- `JMPF2` → `branch_start_labels[1]` (bound to start of b3 at i=2)
+- `JMP2`  → `end_label` (bound at end to `end_pos`)
+
+For single-branch `if c { b }`:
+```
+c, JMPF, b, [end]
+```
+
+Binding: `JMPF` → `end_label` (bound at end to `end_pos`).
+
+### Test counts (16.6 final)
+
+| Suite | Count | Delta vs 16.5 |
+|-------|-------|--------------|
+| `compiler/src/block_builder.rs::tests` (newly running) | 14 | +14 |
+| All other suites | 301 | 0 |
+| **Total** | **315** | **+14** |
+
+The 16.6 BlockBuilder tests are 14 (down from the pre-16.6
+orphaned 16) because some pre-16.6 tests have no analog in
+the new API:
+
+| Pre-16.6 test | New equivalent |
+|---------------|----------------|
+| `bind_label_uses_absolute_base` | (dropped — no `base` field in new API) |
+| `bind_label_twice_panics` | replaced by `bind_label_is_idempotent` |
+| `rebind_label_updates_jump_target` | replaced by `bind_label_is_idempotent` + `emit_jump_to_after_bind_label_records_new_pending` |
+| `rebind_label_on_unbound_label_panics` | (dropped — `rebind_label` no longer exists) |
+| `base_accessor_returns_constructor_value` | (dropped — no `base` field) |
+| `current_position_is_absolute` | (dropped — caller uses `bytecode.len()` directly) |
+| `extend_appends_in_order` | (dropped — caller uses `bytecode.extend()` directly) |
+| `finalize_returns_bytecode_in_order` | replaced by `finalize_succeeds_when_all_labels_bound` + `integrated_test_with_bytecode` |
+| `finalize_targets_ready_without_relocation` | (dropped — no relocation needed) |
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `compiler/src/block_builder.rs` | rewritten (~775 → ~673 LOC) | New placeholder-tracking API + 14 unit tests |
+| `compiler/src/lib.rs` | +8 LOC (net) | `mod block_builder;` declaration, `DiagLabel` rename, `If` codegen refactor |
+
+### Build status (16.6)
+
+`cargo build --workspace` produces only the three pre-existing
+parser warnings. No new compiler or machine warnings.
+
+### Critical regression check
+
+- `cargo test -p compiler --test pipeline fizbuz_runs_to_completion`
+  passes. The pre-16.5 infinite-loop regression is still fixed.
+- `cargo test -p compiler --test pipeline` (6 golden tests) all pass.
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/result.0s` prints `42-1`.
+- `cargo run -- examples/tree.0s` prints `6`.
+
+### Anything 16.7+ needs to know
+
+- `BlockBuilder` is now wired into production (only the `If`
+  codegen for now). A natural follow-up is to refactor `Loop`'s
+  `Expression::Loop` codegen to use `BlockBuilder` too — the
+  pre-16.6 `Loop` codegen (in `compiler/src/lib.rs`) does its
+  own `JMPF` / `JMP` placeholder math inline.
+- The `Match` codegen (15C) does NOT use `BlockBuilder` (its
+  layout is more complex than the simple forward-jump case).
+  Refactoring `Match` to use `BlockBuilder` would require
+  extending the API (or adding a separate utility for
+  reverse-source-order jump tables).
+- The pre-16.6 `BlockBuilder` had a `rebind_label` panic that
+  was load-bearing for loop back-edges. With the new idempotent
+  `bind_label`, no separate `rebind_label` is needed — just
+  call `bind_label` again with the new target.
+- The 16-bit `JUMP_IF_MATCH` target ceiling (15D.5 MEDIUM #1)
+  is still open and is the next obvious VM target.
 - The `let x = expr;` bug noted at the end of Phase 15D
   is still open and blocks `let`-bound variables.
 - The `Expression::Default` AST variant is still
   reachable from real source as of 15D's `Default`
   codegen arm in `do_compile`.
+- `examples/fizbuz.0s` had its `fizbuz(2)` through `fizbuz(15)`
+  lines uncommented in a prior (uncommitted-from-AGENTS) edit;
+  that change was pre-existing before Phase 16.6 and is unrelated
+  to this work.
 
