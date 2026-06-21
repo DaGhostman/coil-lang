@@ -568,53 +568,148 @@ impl Compiler {
                 }
             }
             Expression::If(branches) => {
-                let mut compiled = branches
-                    .iter()
-                    .map(|(_, branch)| {
-                        if let Expression::Branch(condition, body) = branch.borrow() {
-                            (
-                                condition.as_ref().map(|c| self.do_compile(c)),
-                                self.do_compile(body),
-                            )
-                        } else {
-                            unreachable!("Unable to handle");
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                // Phase 16.5 bugfix: rewrite the If codegen so the
+                // body comes AFTER the cond + JMPF in `self.bytecode`,
+                // not BEFORE (which is what eager body compilation
+                // does when the body is a `Print`).
+                //
+                // The pre-16.5 implementation eagerly compiled every
+                // branch's body via `self.do_compile(body)` inside the
+                // branch-iteration loop. For bodies whose codegen
+                // emits directly to `self.bytecode` (notably `Print`),
+                // the body's bytes landed in `self.bytecode` BEFORE
+                // the cond + JMPF. The JMPF target formula then
+                // computed an operand that pointed at the START of
+                // the cond (not past the body), because the formula
+                // was a snapshot of `self.bytecode.len()` at the wrong
+                // moment. The VM dutifully jumped back to the start
+                // of the cond and re-evaluated it forever.
+                //
+                // The fix interleaves cond → JMPF → body → (JMP if
+                // not last) per branch, in that order. JMPF and JMP
+                // are emitted as placeholders (operand = 0) and
+                // patched in a final pass once the position of
+                // `end_pos` (and each JMP) is known. This works for
+                // any body shape (Print, nested if, match, etc.)
+                // because the body is compiled AFTER the cond + JMPF
+                // placeholder, so its bytes always land at the right
+                // position in `self.bytecode`.
+                //
+                // Layout produced for `if c1 { b1 } else if c2 { b2 } else { b3 }`:
+                //   c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
+                //
+                // Patches:
+                //   JMPF1 → position right after JMP1 (= start of c2)
+                //   JMP1  → end_pos
+                //   JMPF2 → position right after JMP2 (= start of b3)
+                //   JMP2  → end_pos
+                //
+                // Layout for a single-branch `if c { b }`:
+                //   c, JMPF, b, [end]
+                //
+                // Patch: JMPF → end_pos (past b).
+                //
+                // Note: this implementation does NOT use
+                // `BlockBuilder`. The BlockBuilder's contract assumes
+                // child bytecode lands in the BlockBuilder's local
+                // buffer via `bb.extend(child_bc)`. `Print` violates
+                // that contract by emitting directly to
+                // `self.bytecode`, which is why the BlockBuilder-based
+                // approach in the pre-fix spec had the same kind of
+                // bug as the original. The direct-manipulation
+                // approach below sidesteps the contract entirely.
 
-                let compiled_lenght = compiled
-                    .iter()
-                    .map(|(condition, body)| {
-                        if !condition.is_none() {
-                            condition.as_ref().map(|c| c.len()).unwrap_or(0) + body.len() + 2
-                        } else {
-                            0
-                        }
-                    })
-                    .sum::<usize>()
-                    + self.bytecode.len()
-                    + bytecode.len();
+                // Positions of JMPF and JMP placeholders to patch
+                // once we know `end_pos`.
+                let mut jmpf_patches: Vec<(usize, bool)> = Vec::new();
+                let mut jmp_patches: Vec<usize> = Vec::new();
 
-                let branchless = branches.len() == 1;
-                compiled.iter_mut().for_each(|(condition, body)| {
-                    if let Some(condition) = condition {
-                        bytecode.append(condition);
-                        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(
-                            (bytecode.len()
-                                + self.bytecode.len()
-                                + body.len()
-                                + 1
-                                + ((!branchless) as usize)) as u32,
-                        ));
+                for (i, (_, branch)) in branches.iter().enumerate() {
+                    let (cond_opt, body) = match branch.borrow() {
+                        Expression::Branch(c, b) => (c.as_ref(), b),
+                        _ => unreachable!("If branch must be Expression::Branch"),
+                    };
+
+                    let is_last = i + 1 == branches.len();
+
+                    // Emit the condition (if any) followed by a JMPF
+                    // placeholder. The placeholder's operand is
+                    // patched AFTER the body is in self.bytecode
+                    // (because we don't know how many bytes the body
+                    // contributes until we compile it).
+                    //
+                    // Bug #1 fix: the JMPF is emitted UNCONDITIONALLY
+                    // for every branch with a condition, including
+                    // the last branch. The pre-16.5 codegen skipped
+                    // the JMPF for single-branch `if` (because
+                    // `branches.len() == 1` triggered a `branchless`
+                    // flag that gated JMPF emission), which meant
+                    // the single-branch if's body was ALWAYS executed
+                    // regardless of the condition.
+                    if let Some(cond) = cond_opt {
+                        let cond_bc = self.do_compile(cond);
+                        self.bytecode.extend(cond_bc);
+                        self.bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
+                        jmpf_patches.push((self.bytecode.len() - 1, is_last));
                     }
 
-                    if !branchless {
-                        body.push(
-                            Byte::new(Instruction::JMP).with_operand_u32(compiled_lenght as u32),
-                        );
+                    // Emit the body AFTER the cond + JMPF so the
+                    // body lands at the right position in
+                    // self.bytecode. (`Print` emits directly to
+                    // self.bytecode, but the bytes are appended here
+                    // via the call to `do_compile(body)`.)
+                    //
+                    // Bug #2 fix: in the pre-16.5 codegen, the body
+                    // was eagerly compiled BEFORE the cond + JMPF
+                    // landed in self.bytecode, so its bytes appeared
+                    // before the JMPF. The JMPF operand was computed
+                    // relative to a `self.bytecode.len()` snapshot
+                    // that no longer matched the actual layout.
+                    let body_bc = self.do_compile(body);
+                    self.bytecode.extend(body_bc);
+
+                    // Emit a `JMP → end` placeholder for every
+                    // branch except the last. The last branch falls
+                    // through to `end_pos`.
+                    if !is_last {
+                        self.bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(0));
+                        jmp_patches.push(self.bytecode.len() - 1);
                     }
-                    bytecode.append(body);
-                });
+                }
+
+                let end_pos = self.bytecode.len();
+
+                // Patch every `JMP → end` placeholder with the
+                // final `end_pos`.
+                for pos in &jmp_patches {
+                    self.bytecode[*pos] =
+                        Byte::new(Instruction::JMP).with_operand_u32(end_pos as u32);
+                }
+
+                // Patch every JMPF placeholder.
+                //
+                // For the LAST branch with a condition (i.e., the
+                // `else` of a multi-branch chain, OR the only
+                // branch of a single-branch `if`), the JMPF target
+                // is `end_pos` (past the body).
+                //
+                // For a NON-LAST branch with a condition, the JMPF
+                // target is the position RIGHT AFTER the JMP that
+                // skips this branch — which is the start of the
+                // NEXT branch's condition. The JMP for branch `i` is
+                // at `jmp_patches[i]`, so the JMPF target is
+                // `jmp_patches[i] + 1`.
+                let mut jmp_idx = 0;
+                for (jmpf_pos, is_last) in &jmpf_patches {
+                    let target = if *is_last {
+                        end_pos
+                    } else {
+                        jmp_patches[jmp_idx] + 1
+                    };
+                    self.bytecode[*jmpf_pos] =
+                        Byte::new(Instruction::JMPF).with_operand_u32(target as u32);
+                    jmp_idx += 1;
+                }
             }
             Expression::Le(lhs, rhs) => {
                 let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);

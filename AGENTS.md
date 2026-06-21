@@ -757,3 +757,166 @@ common crates are warning-free for the 15D work.
   `STORE x` after the RHS in
   `Expression::Variable`'s codegen.
 
+## PHASE 16.5 — IF CODEGEN BUGFIX (COMPLETED)
+
+### Summary
+
+The `Expression::If` codegen in `compiler/src/lib.rs`
+infinite-looped on any `if` whose body contained a
+`print` (or any other expression whose codegen emits
+directly to `self.bytecode` rather than to a local
+`Vec<Byte>`). The VM was jumping backward into the
+condition on every iteration, never exiting the
+`if`. The pre-existing `examples/fizbuz.0s`
+regression test — `cargo test fizbuz_runs_to_completion`
+— crashed with severe memory pressure before this fix.
+
+The root cause was an interaction between the
+eager-body-emission pattern in `If` and `Print`'s
+direct-to-`self.bytecode` emission: the body's bytes
+landed in `self.bytecode` BEFORE the cond + JMPF, so
+the JMPF target formula (which assumed the body came
+AFTER the cond) computed an operand that pointed back
+at the start of the condition.
+
+### Two-bug diagnosis
+
+**Bug 1 (JMPF conditional on `!is_last`)**: The pre-16.5
+code gated JMPF emission on `if !is_last`. For
+single-branch `if c { b }`, `branches.len() == 1`, so
+`is_last = true`, and **no JMPF was emitted at all**.
+The single-branch if had no skip-the-body path — the
+body was ALWAYS executed.
+
+**Bug 2 (JMPF target = start of cond)**: Even when a
+JMPF was emitted (multi-branch case), the target was
+computed via a formula that depended on `self.bytecode.len()`
+snapshotted at the wrong moment. The body was eagerly
+compiled (via `self.do_compile(body)` inside the
+branch-iteration loop), and `Print`'s codegen pushed
+its bytes to `self.bytecode` BEFORE the cond + JMPF
+were appended. The JMPF target formula saw a stale
+`self.bytecode.len()` (the post-body value) and
+computed an operand equal to `cond_len + 1` bytes
+AFTER `base` — but the actual start of the cond in
+`self.bytecode` was `body_len` bytes after `base`. For
+a `Print` body, `body_len = 6` and `cond_len + 1 = 6`,
+so the JMPF jumped to exactly the start of the cond.
+The VM re-evaluated the condition, found it false
+again, and jumped back to the same byte: infinite loop.
+
+### Fix
+
+The Phase 16.5 fix interleaves the if's bytecode in
+the correct order — `cond, JMPF, body, (JMP if not last)`
+— by appending each piece to `self.bytecode`
+sequentially rather than computing everything in a
+single eager pass. The JMPF and (non-last) JMP are
+emitted as placeholders (operand = 0) and patched in
+a final pass once `end_pos` and each JMP's position
+are known.
+
+#### Layout produced
+
+For `if c1 { b1 } else if c2 { b2 } else { b3 }`:
+
+```
+c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
+```
+
+Patches:
+- JMPF1 → `jmp_patches[0] + 1` (= position right
+  after JMP1 = start of c2)
+- JMP1 → `end_pos`
+- JMPF2 → `jmp_patches[1] + 1` (= position right
+  after JMP2 = start of b3)
+- JMP2 → `end_pos`
+
+For a single-branch `if c { b }`:
+
+```
+c, JMPF, b, [end]
+```
+
+Patch:
+- JMPF → `end_pos` (past b).
+
+### Why NOT `BlockBuilder`
+
+The Phase 16 design note specifies a
+`BlockBuilder`-based If codegen, and the fix was
+initially attempted on top of `BlockBuilder`. The
+attempted fix (which mirrors the production codegen
+in `Match`/`Loop`) failed for the same root reason
+as the original: `BlockBuilder`'s contract assumes
+child bytecode lands in the builder's local buffer
+via `bb.extend(child_bc)`. `Print` violates that
+contract by emitting directly to `self.bytecode`,
+which means the body's bytes are NOT in the
+`BlockBuilder`'s buffer. When the builder's
+`finalize()` patches `end_label` to `base +
+self.bytes.len()`, the position it computes is
+relative to the body's earlier emission, not to the
+cond's emission.
+
+The direct-manipulation approach sidesteps the
+contract entirely. It would be worth revisiting
+`BlockBuilder` once `Print` (and any other
+direct-`self.bytecode` emitter) is refactored to
+compile to a local `Vec<Byte>` so the builder
+contract is uniform. See "Anything 16.6+ needs to
+know" below.
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `compiler/src/lib.rs` | +110 LOC (net) | Direct-manipulation If codegen with deferred JMPF/JMP patching |
+
+### Test counts (16.5 final)
+
+| Suite | Count | Delta vs 15D |
+|-------|-------|--------------|
+| `compiler/src/typechecking/*` (unit) | 231 | 0 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 10 | 0 |
+| `compiler/src/pipeline.rs::tests` (ariadne) | 2 | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 24 | 0 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 4 | 0 |
+| `common` | 2 | 0 |
+| `machine` | 11 | 0 |
+| `parser` | 9 | 0 |
+| doctests | 6 | 0 |
+| **Total** | **299** | **0** |
+
+The 16.5 fix doesn't add new tests; it just makes
+the pre-existing `fizbuz_runs_to_completion` golden
+test pass. (See `compiler/tests/pipeline.rs::tests::fizbuz_runs_to_completion`.)
+
+### Build status (16.5)
+
+`cargo build` produces only the three pre-existing
+parser warnings. No new compiler or machine warnings.
+
+### Anything 16.6+ needs to know
+
+- The If codegen in `compiler/src/lib.rs` now uses
+  direct `self.bytecode` manipulation with deferred
+  patching instead of `BlockBuilder`. If a future
+  phase wants to re-introduce `BlockBuilder` here,
+  it must first refactor `Print` (and any other
+  direct-`self.bytecode` emitter) to compile to a
+  local `Vec<Byte>` so the builder contract is
+  uniform. The 15D `emit_pattern_binding` free
+  function exists for exactly this kind of split —
+  it might be worth mirroring that pattern in
+  `Print`/`Format`.
+- The `Vec<(usize, bool)>` for `jmpf_patches` could
+  be cleaned up to `Vec<{ jmpf_pos: usize, is_last: bool }>`
+  with a named-struct record. Left as-is for now to
+  minimize diff churn.
+- The `let x = expr;` bug noted at the end of Phase 15D
+  is still open and blocks `let`-bound variables.
+- The `Expression::Default` AST variant is still
+  reachable from real source as of 15D's `Default`
+  codegen arm in `do_compile`.
+
