@@ -1639,15 +1639,23 @@ impl Checker {
         //  - Shape mismatch across shapes (tuple vs record / unit vs
         //    others). Reported as "payload shape mismatch" — the
         //    17B red-team amendment #5.
+        //
+        // For record shapes, we skip the arity check and fall
+        // through to the field-by-field check, which gives more
+        // specific diagnostics (missing field `x`, unknown field
+        // `y`, etc.) instead of a generic arity error.
         let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, fields) {
             (EnumVariantPayloadTy::Unit, EnumConstructPayload::Unit) => (true, false),
             (EnumVariantPayloadTy::Tuple(_), EnumConstructPayload::Tuple(args)) => {
                 let want = expected_payload.field_count();
                 (args.len() == want, args.len() != want)
             }
-            (EnumVariantPayloadTy::Record(_), EnumConstructPayload::Record(parts)) => {
-                let want = expected_payload.field_count();
-                (parts.len() == want, parts.len() != want)
+            (EnumVariantPayloadTy::Record(_), EnumConstructPayload::Record(_)) => {
+                // Defer the arity check to the field-by-field
+                // pass below, which produces more specific
+                // diagnostics ("Missing field `x`" instead of
+                // "expects 2 arguments, got 1").
+                (true, false)
             }
             _ => (false, false),
         };
@@ -1988,15 +1996,23 @@ impl Checker {
                 //    15B message).
                 //  - Different shapes (tuple vs record / unit)
                 //    (`payload shape mismatch` — 17B message).
+                //
+                // For record shapes, we skip the arity check
+                // and fall through to the field-by-field check
+                // below, which gives more specific diagnostics
+                // ("Missing field `x`" / "Unknown field `y`")
+                // instead of a generic arity error.
                 let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, payload) {
                     (EnumVariantPayloadTy::Unit, PatternPayload::Unit) => (true, false),
                     (EnumVariantPayloadTy::Tuple(_), PatternPayload::Tuple(parts)) => {
                         let want = expected_payload.field_count();
                         (parts.len() == want, parts.len() != want)
                     }
-                    (EnumVariantPayloadTy::Record(_), PatternPayload::Record(fields)) => {
-                        let want = expected_payload.field_count();
-                        (fields.len() == want, fields.len() != want)
+                    (EnumVariantPayloadTy::Record(_), PatternPayload::Record(_)) => {
+                        // Defer the arity check to the
+                        // field-by-field pass below, which
+                        // produces more specific diagnostics.
+                        (true, false)
                     }
                     _ => (false, false),
                 };
