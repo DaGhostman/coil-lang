@@ -596,3 +596,32 @@ fn example_cfg_smoke_prints_7_and_42() {
     let output = run_example("examples/cfg_smoke.0s");
     assert_eq!(output, "742");
 }
+
+// ============================================================
+//  Phase 1.5: is_straight_line lift — fib.0s regression guard
+// ============================================================
+
+/// Phase 1.5 regression guard — `examples/fib.0s` exercises the
+/// `is_straight_line` lift for `If` / `Branch` / `Loop`.
+///
+/// Before the lift, `fib.0s` was guaranteed to fall back to the
+/// single-pass codegen path (`Expression::If` was flagged as
+/// "not straight-line"). After the lift, `is_straight_line` no
+/// longer short-circuits on `If` — it recurses into each branch's
+/// condition + body. The `fib` function still falls back because
+/// its body contains a recursive `Call` (still flagged), but
+/// `is_straight_line` now exercises a deeper walk into the `if`
+/// body before reaching that decision.
+///
+/// This test is the runtime regression guard: the fib example
+/// must still produce `13` for `fib(7)`. It complements the
+/// pre-existing `example_fib_still_works` test (which already
+/// guards the fib.0s example) by being explicit about the
+/// Phase 1.5 lift scope.
+///
+/// Expected output: `"13"` (the seventh Fibonacci number).
+#[test]
+fn fib_via_lifted_is_straight_line_produces_13() {
+    let output = run_example("examples/fib.0s");
+    assert_eq!(output, "13");
+}

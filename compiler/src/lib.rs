@@ -893,10 +893,10 @@ fn emit_pattern_binding<'compiler>(
 }
 
 /// Walk an [`Expression`] looking for variants that the
-/// multi-pass CFG path (Phase 0.3) cannot fully handle.
+/// multi-pass CFG path (Phase 0.3+) cannot fully handle.
 ///
 /// Returns `true` iff every variant in the subtree is "straight-line"
-/// for the CFG path: no control flow, no operations that depend on
+/// for the CFG path: no operations that depend on
 /// runtime-resolved placeholders the Phase 0.3 linearizer hasn't been
 /// taught to emit (FORMAT/PRINT, call targets, enum tag/arity, field
 /// indices), and no metadata variants that the cfg_builder silently
@@ -904,9 +904,14 @@ fn emit_pattern_binding<'compiler>(
 ///
 /// ## What is flagged as "not straight-line"
 ///
-/// - **Control flow** — `If`, `Branch`, `Loop`, `Match`, nested
-///   `Function`. The cfg_builder panics on these today (Phase 1
-///   work); the linearizer also panics on multi-block terminators.
+/// - **Control flow** — `Match`, nested `Function`. The cfg_builder
+///   handles `If` / `Branch` / `Loop` (Phase 1.1 / 1.2 / 1.3 work),
+///   and the linearizer emits `Jump` / `Branch` / `Switch`
+///   placeholders that are patched in a second pass. Match and
+///   nested Function are deferred: Match requires tag / arity
+///   resolution from the typechecker (a future commit will thread
+///   the checker through `linearize`); nested Function is out of
+///   scope for the CFG builder.
 /// - **Linearizer placeholders** — `Print`, `Format`, `Call`,
 ///   `Construct`, `Access`. The Phase 0.3 linearizer emits these
 ///   with unresolvable placeholders (JMP u32::MAX for calls, tag/arity
@@ -930,27 +935,65 @@ fn emit_pattern_binding<'compiler>(
 /// (`Negate`, `Not`, `Positive`), constants (`Integer`, `Float`,
 /// `Bool`, `String`), `Identifier`, `Return` / `ImplicitReturn`,
 /// `Block`, `Fragment`, `Expr`, `ExprStatement`, `Statement`, `Group`,
-/// and the metadata `Variable`, `Argument`, `Type` variants.
+/// `If` / `Branch` / `Loop` (Phase 1.5 — control flow is now
+/// straight-line-friendly because the linearizer emits multi-block
+/// terminators and patches them in a second pass), and the metadata
+/// `Variable`, `Argument`, `Type` variants.
 ///
-/// ## Phase 0.3 scope
+/// ## Phase 1.5 scope
 ///
-/// The conservative detection ensures the integration does not break
-/// any existing test. Functions that exercise any of the "not
-/// straight-line" variants above fall back to the existing
-/// single-pass path; only purely arithmetic helpers (e.g.,
-/// `examples/const.0s::sum`) use the CFG path today. Lifting these
-/// limitations is Phase 1+ work (the linearizer must learn to emit
-/// `FORMAT`/`PRINT` and resolve call / tag / arity / field-index
-/// placeholders).
+/// This commit lifts the `If` / `Branch` / `Loop` restrictions
+/// from `is_straight_line`. The cfg_builder's `build_if` /
+/// `build_while` already produce multi-block CFGs; the
+/// linearizer's Phase 1.1 / 1.2 work emits `Branch` and `Jump`
+/// placeholders that are patched in a second pass. After this
+/// commit, any function whose body contains ONLY the recursed-into
+/// variants above (plus the metadata `Variable` / `Argument` /
+/// `Type` no-ops) routes through the CFG path; anything with
+/// `Match`, `Print`, `Format`, `Call`, `Construct`, `Access`,
+/// `Assignment`, or nested `Function` falls back to the
+/// existing single-pass path.
+///
+/// The lifting is incremental — `Match` is left flagged for the
+/// tag-resolution work, and the other restrictions remain in
+/// place until their respective codegen paths are ready.
 fn is_straight_line(expr: &parser::ast::Expression) -> bool {
     use parser::ast::Expression;
     match expr {
-        // ---- Control flow (cfg_builder panics) ----
-        Expression::If(_)
-        | Expression::Branch(_, _)
-        | Expression::Loop { .. }
-        | Expression::Match { .. }
-        | Expression::Function { .. } => false,
+        // ---- Control flow: Match and nested Function are still flagged ----
+        //
+        // Match codegen requires tag / arity resolution from the
+        // typechecker's `tag_for` / `arity_for` registry; the
+        // linearizer currently emits `tag = 0` / `arity = 0`
+        // placeholders without resolving them. Nested Function
+        // is out of scope for the cfg_builder.
+        Expression::Match { .. } => false,
+        Expression::Function { .. } => false,
+
+        // ---- Control flow: If / Branch / Loop are recursed into ----
+        //
+        // Phase 1.5 lifts these. The cfg_builder's `build_if` /
+        // `build_while` produce multi-block CFGs; the linearizer's
+        // Phase 1.1 / 1.2 work emits `Branch` / `Jump` placeholders
+        // and patches them in a second pass. Each `If` branch is
+        // an `Expression::Branch(cond, body)`; we recurse into
+        // both. (A standalone `Branch` outside an `If` would panic
+        // the cfg_builder, but `try_compile_function_via_cfg`'s
+        // `catch_unwind` safety net catches that and falls back.)
+        Expression::If(branches) => branches
+            .iter()
+            .all(|b| is_straight_line(b.1.as_ref())),
+        Expression::Branch(cond, body) => {
+            cond.as_ref()
+                .map_or(true, |c| is_straight_line(c.1.as_ref()))
+                && is_straight_line(body.1.as_ref())
+        }
+        Expression::Loop {
+            iterable, body, ..
+        } => {
+            is_straight_line(iterable.1.as_ref())
+                && is_straight_line(body.1.as_ref())
+        }
 
         // ---- Linearizer emits placeholders (not resolved in Phase 0.3) ----
         Expression::Print(_, _) | Expression::Format(_, _) => false,
