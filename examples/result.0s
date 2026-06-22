@@ -1,20 +1,26 @@
 // examples/result.0s — sum-of-sum demonstrating nested match + Result<Option<int>>
 //
-// Two patterns: `Result::Err(_)` (wildcard) and
-// `Result::Ok(Option::Some(v))` (nested constructor with a
-// binding). The 15D codegen's match dispatch tests the
-// outer tag with `JUMP_IF_MATCH` / `UNPACK` but does NOT
-// re-test the inner tag when the outer matches — so two
-// `Result::Ok` arms with different inner patterns would
-// share a single JUMP_IF_MATCH target. We keep the example
-// to one `Result::Ok` arm to avoid that case (the
-// `Option::None` case is exercised by `examples/option.0s`).
+// Three patterns: `Result::Ok(Option::Some(v))` (nested
+// constructor with a binding), `Result::Ok(Option::None)`
+// (nested constructor with Unit), and `Result::Err(_)`
+// (wildcard). Two arms share the outer tag `Result::Ok`,
+// differing on the inner `Option` tag — this exercises the
+// Phase 18A inner-pattern dispatch fix. The test chain in
+// the codegen runs the inner `JUMP_IF_MATCH` for `Some`
+// vs `None` so the right arm body runs based on the
+// runtime inner tag.
 //
-// Each `print` exercises one match arm:
+// Each `print` exercises one match arm at runtime:
 //   - `Result::Ok(Option::Some(42))` → matches the
 //     `Result::Ok(Option::Some(v))` arm, v=42.
 //   - `Result::Err("oops")`           → matches the
 //     wildcard Err arm, returns -1.
+//
+// The `Result::Ok(Option::None)` arm is in the source to
+// force the test chain to be emitted (so the codegen
+// actually generates the inner-pattern dispatch bytecode),
+// but it is not directly tested at runtime here — see
+// `examples/option.0s` for an `Option::None` test case.
 enum Option {
     None,
     Some(int),
@@ -29,6 +35,7 @@ fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
         Result::Ok(Option::Some(v)) => v,
+        Result::Ok(Option::None) => 0,
     };
 }
 
