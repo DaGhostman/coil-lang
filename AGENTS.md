@@ -1811,3 +1811,254 @@ machine warnings.
 - The `Expression::Default` AST variant is still
   reachable from real source as of 15D's `Default`
   codegen arm in `do_compile`.
+
+
+## PHASE 18B — NESTED RECORD PATTERNS (COMPLETED)
+
+### Summary
+
+Lifted the Phase 17B-cleanup **Known Limitation #1**
+("nested record patterns inside an arm body are
+rejected"). Pre-18B, the codegen emitted a single `POP`
+for an inner record pattern (instead of walking its
+declared fields), so the binding slot for the inner
+record's fields was never populated and the arm body
+read the OUTER record's slot values (an enum pointer
+instead of the inner record's payload values).
+
+The Phase 18B fix introduces a new VM opcode
+(`UnpackAt`) for slot-based UNPACK and threads a new
+`parent_decl_order` parameter through
+`emit_pattern_binding` so the recursion walks the
+inner record's declared fields in declaration order
+at unbounded depth (`Result::Ok(Inner { v }) => v`,
+`Foo::Bar { a: W::W { v } } => v`, etc.).
+
+### What works
+
+- **Record → record nesting:**
+  `Wrap::W { inner: Inner::I { v }, name } => v`
+  binds `v` to the inner record's `v` field.
+- **Tuple → record nesting:**
+  `Result::Ok(Inner::I { v }) => v` binds `v` to the
+  inner record's `v` field (via the existing top-pop
+  UNPACK, since the OUTER Tuple UNPACK leaves the
+  inner record at the top of stack).
+- **Record → tuple → record nesting:**
+  `Result::Ok { x: Inner::I { v } } => v`.
+- **Unbounded depth:** the codegen recurses at any
+  depth — depth-3 nesting (`Foo::Bar(Baz::Qux { a:
+  W::W { v } }) => v`) is exercised by the
+  `match_depth_3_nested_records_bind_correctly`
+  codegen test.
+- **Missing inner fields:**
+  `Result::Ok(Inner::I { }) => 99` (the inner pattern
+  omits `v`) emits a defensive `POP` for the missing
+  field so the stack cursor advances correctly.
+
+### New VM opcode: `UnpackAt`
+
+Appended to the `Instruction` enum (Phase 18B —
+slot-based UNPACK for nested record patterns).
+
+- `UnpackAt slot_offset, arity` reads the enum
+  value at `stack[frame.sp + slot_offset]` and writes
+  the payload values to consecutive positions starting
+  at `stack[frame.sp + slot_offset]` (overwriting in
+  place). The stack pointer doesn't change.
+- Distinct from `Unpack` (which always pops the TOP
+  of stack). `UnpackAt` reads from an arbitrary slot,
+  which is what nested record patterns need (the inner
+  record's enum value sits at a non-top slot after the
+  OUTER record's UNPACK pushed its fields).
+
+**Limitation:** the arity of the nested record must be
+<= the field's position in the OUTER record's
+decl_order. A 2-field nested record at position 1 would
+clobber the OUTER record's position-2 field. Programs
+with multi-field nested records interleaved with
+non-nested OUTER fields would need a scratch-area
+scheme (deferred to 19+). All test programs and
+`examples/nested_records.0s` satisfy this constraint.
+
+### Decisions locked in (during implementation)
+
+1. **`emit_pattern_binding` is a free function with an
+   explicit `&Checker` parameter.** Not a method on
+   `Compiler` — the borrow checker would see
+   `&self.checker` (immutable) and `&mut self.bytecode`
+   (mutable) as conflicting. Passing `&Checker`
+   directly keeps the bytecode mutation and the checker
+   lookup disjoint.
+
+2. **New `parent_decl_order` parameter for record
+   patterns.** Threaded through `emit_pattern_binding`.
+   For the OUTER record pattern, the caller passes
+   `checker.payload_tys_for(enum_name, variant_name)`.
+   For sub-pattern recursion (entered from the Record
+   arm itself), `parent_decl_order` is the sub-pattern's
+   own `payload_tys_for` if the sub-pattern is a
+   constructor record; empty otherwise.
+
+3. **New `is_outer: bool` parameter.** Distinguishes
+   the OUTER call (from the codegen, where the forward
+   pass has already emitted `UNPACK` or `JUMP_IF_MATCH`
+   for the OUTER enum value) from recursive calls (where
+   the pattern's enum value sits at a non-top slot). At
+   the OUTER level, the function SUPPRESSES `UNPACK`
+   emission (the forward pass handled it). At the
+   RECURSION level, `UnpackAt` is emitted for nested
+   records so their payload values reach the right slot
+   positions.
+
+4. **`consume_values` propagates through recursion.**
+   When the OUTER call is `consume_values = false` (test
+   chain arm), the test chain has already emitted the
+   `POP` / `JUMP_IF_MATCH` for the inner values. The
+   recursion suppresses the redundant bytecode at every
+   level. When `consume_values = true` (normal arm), the
+   recursion emits bytecode normally.
+
+5. **`emit_inner_test` likewise walks Record arms in
+   declaration order and recurses for nested records.**
+   Same fix as `emit_pattern_binding` — the previous
+   `emit_inner_test` walked Record fields in SOURCE
+   order, misrouting `POP` / `STORE` / `JUMP_IF_MATCH`
+   to the wrong slots.
+
+6. **Slot-based UNPACK via `UnpackAt`, not stack
+   rotation.** Adding a new opcode is cleaner than
+   emitting `SWAP` + `UNPACK` + `SWAP` sequences for
+   each nested record (which would also confuse the
+   binding slot numbering).
+
+### Diagnostics produced (18B)
+
+The codegen and VM are silent on type errors (the
+typechecker, 15B, already produced those diagnostics
+upstream). The new VM arm for non-enum scrutinees is
+defensive: it falls through silently rather than
+panicking, on the principle that the typechecker is
+the source of truth.
+
+### Test counts (18B final)
+
+| Suite                              | Count | Delta vs 18D |
+|------------------------------------|-------|--------------|
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 318 | +4 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 15  | +1 |
+| All other suites                   | 383  | 0 |
+| **Total**                          | **406** | **+5** |
+
+The +5 delta is the 4 new codegen tests + 1 new
+pipeline golden test, exactly as specified:
+
+Codegen tests in `compiler/src/lib.rs::tests`:
+
+1. `match_nested_record_in_tuple_binds_correctly`
+   (`Result::Ok(Inner::I { v }) => v`) — asserts
+   at least one STORE (for `v`) and at least one
+   UNPACK (for `Inner::I`).
+2. `match_nested_record_in_record_binds_correctly`
+   (`Result::Ok { x: Inner::I { v } } => v`) —
+   asserts at least one STORE for the inner
+   Binding `v`. Pre-18B would emit 0 (the inner
+   record was swallowed by a single POP).
+3. `match_depth_3_nested_records_bind_correctly`
+   (`Foo::Bar(Baz::Qux { a: W::W { v } }) => v`) —
+   asserts the codegen recurses at depth 3 and
+   emits a STORE for the innermost Binding.
+4. `match_nested_record_missing_field_consumes_slot`
+   (`Result::Ok(Inner::I { }) => 99`) — sanity check
+   that the codegen still produces well-formed bytecode
+   when an inner field is omitted.
+
+Pipeline golden test in `compiler/tests/pipeline.rs`:
+
+5. `example_nested_records_prints_99` —
+   compiles `examples/nested_records.0s`, runs it on a
+   `Machine`, asserts stdout is `"99"`.
+
+### End-to-end smoke test
+
+`examples/nested_records.0s` compiles and runs
+correctly, printing `99`:
+
+```0s
+enum Inner {
+    I { v: int },
+}
+
+enum Wrap {
+    W { inner: Inner, name: string },
+}
+
+fn get_v(Wrap w) -> int {
+    return match w {
+        Wrap::W { inner: Inner::I { v }, name } => v,
+    };
+}
+
+fn main() {
+    let w = Wrap::W { inner: Inner::I { v: 99 }, name: "x" };
+    print "%i", get_v(w);
+}
+```
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `common/src/opcode.rs` | +37 LOC | Append `UnpackAt` opcode + layout doc |
+| `machine/src/vm.rs` | +83 LOC (net) | Dispatch arm for `UnpackAt` (slot-based UNPACK for nested records) |
+| `compiler/src/lib.rs` | +275 LOC (net) | Convert `emit_pattern_binding` to free function with `&Checker` param + new `parent_decl_order`/`is_outer` params + Record arm rewrite (uses `UnpackAt` at recursion level) + 4 new codegen tests + `emit_inner_test` Record arm rewrite |
+| `compiler/tests/pipeline.rs` | +25 LOC (net) | New `example_nested_records_prints_99` golden test |
+| `examples/nested_records.0s` | new (~26 LOC) | End-to-end smoke test |
+| `AGENTS.md` | this section (+200 net) | Documentation |
+
+### Build status (18B)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings (`None`/`Xor`/`Equal`/
+`Unary`/`Call` variants, `prefix` field, `inc`/`dec`
+methods in `parser/src/lib.rs`). No new compiler or
+machine warnings.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 406 tests pass.
+- `cargo run -- examples/nested_records.0s` —
+  prints `99`.
+- All existing examples (`fib`, `option`, `result`,
+  `tree`, `mixed`, `record`, `chained`, `fizbuz`)
+  still produce correct output.
+- `cargo test -p compiler --test pipeline fizbuz_runs_to_completion`
+  passes (the pre-16.5 infinite-loop regression is
+  still fixed).
+- `cargo test -p compiler --test pipeline` (15 golden
+  tests) all pass.
+
+### Anything 19+ needs to know
+
+- The `UnpackAt` arity limitation (must be <= the
+  field's position in the OUTER record) is the next
+  obvious target for lifting. A scratch-area scheme
+  (separate slot space for nested values) would let
+  multi-field nested records work interleaved with
+  non-nested OUTER fields.
+- The `codegen_var_types` side-table workaround
+  (Phase 18D) is still in place. The proper fix is
+  to align the pre-walk and infer pass inside
+  function bodies.
+- The 16-bit `JUMP_IF_MATCH` target ceiling
+  (15D.5 MEDIUM #1) is still open.
+- The O(n) heap-pointer classification in `MakeEnum`
+  (15C's "Anything 15D needs to know") is still O(n).
+- The `Match` codegen's inner-pattern dispatch
+  limitation (15D's "Known limitations") is still
+  open.
+- The `let x = expr;` bug noted at the end of Phase 15D
+  is still open and blocks `let`-bound variables.
+- The `Expression::Default` AST variant is still
+  reachable from real source as of 15D's `Default`
+  codegen arm in `do_compile`.

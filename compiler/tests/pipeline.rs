@@ -181,6 +181,31 @@ fn example_mixed_prints_zero_circle_square_triangle() {
     assert_eq!(output, "025122");
 }
 
+#[test]
+fn example_chained_prints_42_7() {
+    // Phase 19 golden test — `examples/chained.0s` exercises the
+    // chained field-access fix at runtime.
+    //
+    // The example declares two enums:
+    //   enum Inner { Inner { v: int } }
+    //   enum Outer { Outer { x: Inner, y: int } }
+    // and reads `p.x.v` (chained access) and `p.y` (simple
+    // access). Output: 42 (Inner.v via chained access) and 7
+    // (Outer.y).
+    //
+    // Pre-19, the OUTER `p.x.v` access silently miscompiled:
+    // the codegen indexed the OUTER LoadField against `Outer`
+    // (the outer receiver's enum) instead of `Inner` (the
+    // inner receiver's enum, which actually owns the `v`
+    // field). The defensive `LoadField(0)` fallback read
+    // Outer's `x` slot instead, returning an `Inner` value
+    // where an `int` was expected.
+    //
+    // Expected output: "42" + "7" = "427".
+    let output = run_example("examples/chained.0s");
+    assert_eq!(output, "427");
+}
+
 // ============================================================
 //  Phase 18A: inner-pattern dispatch — golden regression test
 // ============================================================
@@ -328,24 +353,133 @@ fn fizbuz_runs_to_completion() {
     let _ = buf; // suppress unused-variable warning
 }
 
-/// Compile a small inline program that uses a `while` loop
-/// with an `if` body, and assert the resulting bytecode
-/// has the expected control-flow opcodes. This guards
-/// against the nested-control-flow off-by-one that the
-/// Phase 16 self.bytecode-based refactor fixes — without
-/// the fix, the loop's JMPF target would point to the
-/// wrong bytecode position and the program would either
-/// infinite-loop or produce garbage.
+/// Compile a small inline program that uses `let` bindings and
+/// re-assignment, and verifies the resulting bytecode contains the
+/// expected `StorePop` opcodes. The Phase 18E fix changes the
+/// `let x = expr;` codegen from "emit no bytecode for the
+/// variable declaration" to "emit `StorePop slot` after the RHS".
+/// This test is the codegen-side guard for that fix; the
+/// end-to-end behavior is verified by `example_let_reassignment_works`
+/// below.
+#[test]
+fn let_binding_emits_store_pop_in_bytecode() {
+    use common::Instruction;
+    let mut pipeline = Pipeline::new();
+    let src = r#"
+        fn main() {
+            let x = 5;
+            print "%i", x;
+            x = 10;
+            print "%i", x;
+        }
+    "#;
+    let parser = parser::Pratt::default();
+    let ast = parser.parse(src).expect("let-binding program should parse");
+    let bytecode = pipeline.compile_test("", &ast);
+    assert!(!bytecode.is_empty(), "program should produce bytecode");
+
+    // Exactly 2 StorePop — one for `let x = 5;` and one
+    // for `x = 10;` (re-assignment).
+    let store_pop_count = bytecode
+        .iter()
+        .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+        .count();
+    assert_eq!(
+        store_pop_count, 2,
+        "expected exactly 2 StorePop for one let + one re-assignment; got {}",
+        store_pop_count
+    );
+
+    // Zero `STORE` instructions — the codegen never emits
+    // STORE for let-bindings or assignments. STORE is
+    // reserved for match-arm bindings (where it acts as a
+    // no-op for the slot-push contract).
+    let store_count = bytecode
+        .iter()
+        .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+        .count();
+    assert_eq!(
+        store_count, 0,
+        "expected zero STORE instructions for let/assignment; got {}",
+        store_count
+    );
+}
+
+/// Phase 18E end-to-end golden test — `examples/let_test.0s`
+/// exercises the let-bound variable codegen fix at runtime.
 ///
-/// The pre-Phase-16 codegen would have produced an
-/// infinite loop for the `fizbuz.0s` example (which has
-/// two independent `if` blocks in one function). The
-/// nested `if`/`while` structure tested here is the
-/// closest equivalent that we can exercise without
-/// triggering the typechecker's strict mode (the
-/// `print` statement in `fizbuz.0s` flags a typecheck
-/// error because `print` is a native not registered in
-/// the test pipeline).
+/// The example:
+///   let x = 5;     print "%i", x;    // "5"
+///   let y = 10;    print "%i", y;    // "10"
+///   x = 20;        print "%i", x;    // "20"
+///
+/// The combined output is "51020". Pre-18E, the `x = 20;`
+/// re-assignment used the buggy `STORE` (no-op) + `DUPLICATE`,
+/// which didn't update the slot — so `print x` would still
+/// print 10 (the previous value) or push 20 on top of 10
+/// (depending on cursor state). The Phase 18E fix uses
+/// `STORE_POP` which correctly overwrites the slot.
+#[test]
+fn example_let_reassignment_works() {
+    let output = run_example("examples/let_test.0s");
+    assert_eq!(output, "51020");
+}
+
+/// Phase 18E end-to-end golden test — chained let bindings
+/// (`let x = 5; let y = x + 1; print y;`) exercise the
+/// `STORE_POP` cursor-preservation behavior.
+///
+/// Pre-18E: the second `CONST 6; STORE_POP 1;` (where 6 is the
+/// result of `x + 1`) would clobber slot 0 (the value of `x`)
+/// because the post-pop cursor fell back to slot 0's position.
+/// The Phase 18E fix preserves the cursor past slot 0, so slot
+/// 0 keeps `5` and slot 1 gets `6`.
+///
+/// Expected output: "6" (the value of `y`).
+#[test]
+fn example_let_chained_bindings_works() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+
+    let src = r#"
+        fn main() {
+            let x = 5;
+            let y = x + 1;
+            print "%i", y;
+        }
+    "#;
+
+    // Use `compile_test` (not `compile_src`) because the
+    // `print "%i", y;` calls the native `print`, which the
+    // golden pipeline doesn't register (it's only registered
+    // for the in-memory `compile_src` tests). `compile_test`
+    // bypasses the typecheck and emits bytecode directly.
+    let mut pipeline = compiler::Pipeline::new();
+    let parser = parser::Pratt::default();
+    let ast = parser
+        .parse(src)
+        .expect("chained-bindings program should parse");
+    let bytecode = pipeline.compile_test("", &ast);
+
+    let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+    let shared = SharedBuf(std::rc::Rc::clone(&buf));
+    let mut machine = machine::Machine::<128>::default();
+    machine.with_output(shared);
+    machine.run_raw(&bytecode);
+
+    let _ = machine.restore_output();
+    let bytes = std::rc::Rc::try_unwrap(buf)
+        .expect("VM still holds a reference to the buffer")
+        .into_inner();
+    let output = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
+
+    // Suppress unused-variable lint for workspace_root (used in
+    // other tests in this file; kept for symmetry).
+    let _ = workspace_root;
+    assert_eq!(output, "6");
+}
+
 #[test]
 fn nested_if_in_loop_runs_correctly() {
     // The VM doesn't have a `print` native registered
@@ -399,4 +533,28 @@ fn nested_if_in_loop_runs_correctly() {
         "expected at least 1 JMP (loop back-edge); got {}",
         jmp_count
     );
+}
+
+// ============================================================
+//  Phase 18B: nested record patterns — golden regression test
+// ============================================================
+
+/// Phase 18B golden test — `examples/nested_records.0s` exercises
+/// the nested record patterns fix at runtime.
+///
+/// The example declares two record-shaped enums (`Inner` and
+/// `Wrap`) and binds `v` from a record-inside-a-record pattern
+/// (`Wrap::W { inner: Inner::I { v }, name }`).
+///
+/// Pre-18B, the codegen emitted a POP for the inner record
+/// (instead of walking its declared fields), so the body never
+/// saw `v`. The Phase 18B fix lifts this — `emit_pattern_binding`
+/// recurses at unbounded depth, passing the inner record's
+/// declared field order as `parent_decl_order`.
+///
+/// Expected output: `99` (the value of `v`).
+#[test]
+fn example_nested_records_prints_99() {
+    let output = run_example("examples/nested_records.0s");
+    assert_eq!(output, "99");
 }

@@ -5,7 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::Value;
 
 #[repr(u8)]
-#[derive(Debug, Default, Copy, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(compare(PartialEq), derive(Debug), derive(Clone), derive(Copy))]
 pub enum Instruction {
     // -- Special
@@ -71,37 +71,75 @@ pub enum Instruction {
     // the numeric value of `SET` (and every later opcode) and
     // silently corrupt every `.0s` archive ever compiled.
     //
-    // Operand layout (Phase 15C):
+    // Operand layout:
     // - `MAKE_ENUM`:    upper 16 bits = tag, lower 16 bits = arity.
-    // - `JUMP_IF_MATCH`: upper 16 bits = tag, lower 16 bits = target
-    //   offset (in bytecode positions). The payload arity is read
-    //   from the runtime enum object (`ObjEnum::payload.len()`) so
-    //   no separate arity field is needed.
+    // - `JUMP_IF_MATCH`: upper 16 bits = expected tag (16 bits),
+    //   lower 16 bits reserved. The target offset lives in
+    //   `value[31:0]` (a full 32-bit absolute bytecode offset —
+    //   see Phase 18C layout below). The payload arity is read
+    //   from the runtime enum object (`ObjEnum::payload.len()`)
+    //   so no separate arity field is needed.
     // - `UNPACK`:       full u32 = arity (redundant with
     //   `ObjEnum::payload.len()` but kept for symmetry with the
     //   spec; the VM reads it from the enum at runtime).
     //
-    // **KNOWN LIMITATION (Phase 15D, MEDIUM #1)**: the
-    // `JUMP_IF_MATCH` target offset is a 16-bit unsigned
-    // value, so the largest jump target is 65,535 bytes
-    // (0xFFFF). A program whose bytecode exceeds this
-    // would have its `JUMP_IF_MATCH` target silently
-    // truncated by the `with_operands_u16` constructor.
-    // In practice the 15C codegen always patches the
-    // `JUMP_IF_MATCH` placeholder with an absolute offset
-    // computed from `arm_body_offsets[i] as u16`, so any
-    // match arm body past 65,535 bytes is unreachable.
-    // Programs with large arm bodies (e.g., very deep
-    // expression trees in a single arm) would silently
-    // fail to dispatch. The fix is to widen the operand
-    // layout to a full `u32` (matching the regular
-    // `JMP`) and use a separate scratch word for the
-    // tag. That change is deferred to a future phase
-    // because no current test program approaches the
-    // 65,535-byte limit.
+    // JumpIfMatch layout (Phase 18C: 32-bit target):
+    //   operands[31:16] = expected tag (16 bits)
+    //   operands[15:0]  = reserved (write 0)
+    //   value[31:0]     = absolute bytecode target offset (32 bits)
+    //   value[63:32]    = reserved (write 0)
+    //
+    // LoadField layout (Phase 18D):
+    //   operands[15:0]  = field_index (declaration position in the record payload)
+    //   operands[31:16] = reserved (write 0)
+    //
+    // Pops the receiver (an Object::Enum on the stack) and pushes
+    // payload[field_index]. Consumes the receiver (matches UNPACK semantics).
+    //
+    // ---- Phase 18E: let-bound variables ----
+    //
+    // StorePop layout (Phase 18E):
+    //   operands[31:0] = slot_index (absolute offset into the operand-stack/locals area)
+    //
+    // Pops the top of the stack and writes it to `frame.sp + slot_index`.
+    // This is the load-bearing "store the RHS into the let-bound variable"
+    // opcode. Distinct from Instruction::STORE (which is a no-op since
+    // Phase 15D — it confirms match-arm bindings whose values were already
+    // pushed directly into the slot positions by UNPACK / JUMP_IF_MATCH).
     MakeEnum,
     JumpIfMatch,
     Unpack,
+    LoadField,
+    StorePop,
+
+    // ---- Phase 18B: nested record patterns ----
+    //
+    // UNPACK_AT (slot-based UNPACK for nested record patterns):
+    //   operands[15:0]  = slot offset (relative to frame.sp — the
+    //                     position of the enum value to unpack)
+    //   operands[31:16] = arity (redundant with
+    //                     `ObjEnum::payload.len()` but kept for
+    //                     symmetry with the spec; the VM reads the
+    //                     real count from the enum at runtime)
+    //
+    // Reads `stack[frame.sp + slot_offset]` as an enum value and
+    // writes the payload values to consecutive positions starting
+    // at `stack[frame.sp + slot_offset]` (overwriting in place).
+    //
+    // Distinct from `Unpack` which always pops the TOP of the
+    // stack — `UnpackAt` reads from an arbitrary slot, so nested
+    // record patterns (where the inner record's enum value sits
+    // at a non-top slot after the OUTER record's UNPACK pushed
+    // its fields) can be bound to the right slot positions.
+    //
+    // Limitation (Phase 18B spec): the arity of the nested record
+    // must be <= the field's position in the OUTER record's
+    // decl_order. A 2-field nested record at position 1 would
+    // clobber the OUTER record's position-2 field. Programs with
+    // multi-field nested records interleaved with non-nested
+    // OUTER fields would need a scratch-area scheme (deferred to
+    // 19+).
+    UnpackAt,
 }
 
 impl From<u8> for Instruction {
@@ -116,7 +154,7 @@ impl From<Instruction> for u8 {
     }
 }
 
-#[derive(Default, Clone, Copy, Archive, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(compare(PartialEq))]
 pub struct Byte {
     bytecode: Instruction,
@@ -137,6 +175,15 @@ impl Byte {
         self.operands = operand;
 
         self
+    }
+
+    pub fn with_value_u32(mut self, v: u32) -> Self {
+        self.value = v as u64;
+        self
+    }
+
+    pub fn value_u32(&self) -> u32 {
+        self.value as u32
     }
 
     pub fn with_operands_u16(mut self, operands: [u16; 2]) -> Self {
@@ -208,6 +255,15 @@ impl ArchivedByte {
         self.value = (value.raw() as u64).into();
 
         self
+    }
+
+    pub fn with_value_u32(mut self, v: u32) -> Self {
+        self.value = (v as u64).into();
+        self
+    }
+
+    pub fn value_u32(&self) -> u32 {
+        u64::from(self.value) as u32
     }
 
     pub fn with_operands_u16(mut self, operands: [u16; 2]) -> Self {

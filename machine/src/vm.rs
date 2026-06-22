@@ -592,11 +592,7 @@ impl<const S: usize> Machine<S> {
                         // and trigger GC if past the threshold.
                         self.alloc_counter += 1;
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                            Self::gc_collect(
-                                &mut self.heap,
-                                &self.stack,
-                                &mut self.alloc_counter,
-                            );
+                            Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                         }
 
                         self.stack.push(Value::from(obj.addr()));
@@ -639,11 +635,7 @@ impl<const S: usize> Machine<S> {
                     // and trigger GC if past the threshold.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &mut self.alloc_counter,
-                        );
+                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
 
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
@@ -680,11 +672,7 @@ impl<const S: usize> Machine<S> {
                     // and trigger GC if past the threshold.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &mut self.alloc_counter,
-                        );
+                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
 
                     self.stack.push(Value::from(object.addr()));
@@ -778,18 +766,22 @@ impl<const S: usize> Machine<S> {
                     // so the GC traces it correctly.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &mut self.alloc_counter,
-                        );
+                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
 
                     self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::JumpIfMatch => {
-                    // Operands: upper 16 bits = expected tag, lower
-                    // 16 bits = target offset.
+                    // Operands: upper 16 bits = expected tag
+                    // (16 bits). Lower 16 bits reserved.
+                    //
+                    // Phase 18C — target offset is now a full
+                    // 32-bit absolute bytecode offset in
+                    // `value[31:0]` (the pre-18C layout put it
+                    // in the lower 16 bits of `operands`, which
+                    // capped reachable match-arm bodies at
+                    // 65,535 bytes). See `common/src/opcode.rs`
+                    // for the new operand layout.
                     //
                     // Peeks the scrutinee's tag without consuming
                     // it. If the tag matches, pops the scrutinee,
@@ -809,7 +801,7 @@ impl<const S: usize> Machine<S> {
                     // for the rationale.
                     let operands = opcode.operand_u32();
                     let expected_tag = (operands >> 16) as u32;
-                    let target_offset = (operands & 0xFFFF) as usize;
+                    let target_offset = opcode.value_u32() as usize;
 
                     if self.stack.tell() == 0 {
                         // No scrutinee — bail.
@@ -821,14 +813,11 @@ impl<const S: usize> Machine<S> {
                         // (e.g., a type error slipped through), the
                         // match arm is unreachable — fall through
                         // silently.
-                        let obj_enum = Self::find_object_by_addr(
-                            &self.heap,
-                            scrutinee_addr,
-                        )
-                        .and_then(|o| match o {
-                            Object::Enum(e) => Some(e),
-                            _ => None,
-                        });
+                        let obj_enum = Self::find_object_by_addr(&self.heap, scrutinee_addr)
+                            .and_then(|o| match o {
+                                Object::Enum(e) => Some(e),
+                                _ => None,
+                            });
 
                         if let Some(enum_ref) = obj_enum {
                             let enum_ref = enum_ref.as_ref();
@@ -840,9 +829,7 @@ impl<const S: usize> Machine<S> {
                                 for member in &enum_ref.payload {
                                     let value = match member {
                                         Member::Value(v) => *v,
-                                        Member::Object(o) => {
-                                            Value::from(o.addr())
-                                        }
+                                        Member::Object(o) => Value::from(o.addr()),
                                     };
                                     self.stack.push(value);
                                 }
@@ -886,21 +873,18 @@ impl<const S: usize> Machine<S> {
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
-                        let obj_enum =
-                            Self::find_object_by_addr(&self.heap, scrutinee_addr)
-                                .and_then(|o| match o {
-                                    Object::Enum(e) => Some(e),
-                                    _ => None,
-                                });
+                        let obj_enum = Self::find_object_by_addr(&self.heap, scrutinee_addr)
+                            .and_then(|o| match o {
+                                Object::Enum(e) => Some(e),
+                                _ => None,
+                            });
 
                         if let Some(enum_ref) = obj_enum {
                             let enum_ref = enum_ref.as_ref();
                             for member in &enum_ref.payload {
                                 let value = match member {
                                     Member::Value(v) => *v,
-                                    Member::Object(o) => {
-                                        Value::from(o.addr())
-                                    }
+                                    Member::Object(o) => Value::from(o.addr()),
                                 };
                                 self.stack.push(value);
                             }
@@ -908,6 +892,160 @@ impl<const S: usize> Machine<S> {
                         // else: scrutinee is not an enum; silent
                         // fallthrough (defensive — should not
                         // happen if the typechecker is correct).
+                    }
+                }
+                Instruction::LoadField => {
+                    // Operands: lower 16 bits = field_index.
+                    //
+                    // Pops the receiver (Object::Enum) and pushes
+                    // payload[field_index]. Consumes the receiver
+                    // (matches UNPACK semantics — the receiver is
+                    // no longer needed once a single field has been
+                    // extracted).
+                    //
+                    // Phase 18D — the load-field opcode backing the
+                    // field-access expression (e.g., `point.x`).
+                    // Field index is the declaration position of the
+                    // field in the record-shaped variant's payload.
+                    // The 16-bit ceiling supports 65,535 fields per
+                    // record; payloads with more fields are out of
+                    // range and would silently no-op (defensive).
+                    let field_index = (opcode.operand_u32() & 0xFFFF) as usize;
+
+                    if self.stack.tell() == 0 {
+                        // Stack underflow — bail.
+                    } else {
+                        let scrutinee_addr = self.stack.pop().raw() as u64;
+
+                        // Load the enum object. If the receiver
+                        // isn't a heap pointer to an Object::Enum
+                        // (e.g., a type error slipped through), the
+                        // access is unreachable — fall through
+                        // silently.
+                        let obj_enum = Self::find_object_by_addr(&self.heap, scrutinee_addr)
+                            .and_then(|o| match o {
+                                Object::Enum(e) => Some(e),
+                                _ => None,
+                            });
+
+                        if let Some(enum_ref) = obj_enum {
+                            let enum_ref = enum_ref.as_ref();
+                            if let Some(member) = enum_ref.payload.get(field_index) {
+                                let value = match member {
+                                    Member::Value(v) => *v,
+                                    Member::Object(o) => Value::from(o.addr()),
+                                };
+                                self.stack.push(value);
+                            }
+                            // else: field_index out of bounds — silent
+                            // no-op (defensive).
+                        }
+                        // else: receiver is not an enum — silent no-op.
+                    }
+                }
+                Instruction::UnpackAt => {
+                    // Operands: lower 16 bits = slot_offset (relative
+                    // to frame.sp — the position of the enum value to
+                    // unpack). Upper 16 bits = arity (redundant with
+                    // `ObjEnum::payload.len()` but kept for symmetry
+                    // with the spec).
+                    //
+                    // Phase 18B — slot-based UNPACK for nested record
+                    // patterns. The existing `Unpack` always pops the
+                    // TOP of stack, which works for top-level matches
+                    // (where the OUTER record's enum value is at the
+                    // top after the scrutinee-push) but FAILS for
+                    // nested records (where the inner record's enum
+                    // value sits at a non-top slot — pushed there by
+                    // the OUTER record's UNPACK).
+                    //
+                    // `UnpackAt slot, arity` reads the enum value at
+                    // `stack[frame.sp + slot_offset]` and writes the
+                    // payload values to consecutive positions starting
+                    // at `stack[frame.sp + slot_offset]` (overwriting
+                    // in place). The stack pointer doesn't change.
+                    //
+                    // The arity limitation (declared in
+                    // `common/src/opcode.rs`) is that the nested
+                    // record's arity must be <= the slot position in
+                    // the OUTER record — otherwise the write would
+                    // clobber the OUTER record's later fields.
+                    let operands = opcode.operand_u32();
+                    let slot_offset = (operands & 0xFFFF) as usize;
+                    let _arity = (operands >> 16) as usize;
+
+                    let slot = frame.get() + slot_offset;
+                    if slot >= self.stack.tell() {
+                        // Slot is out of bounds — bail (defensive).
+                    } else {
+                        let scrutinee_addr = self.stack[slot].raw() as u64;
+
+                        let obj_enum = Self::find_object_by_addr(&self.heap, scrutinee_addr)
+                            .and_then(|o| match o {
+                                Object::Enum(e) => Some(e),
+                                _ => None,
+                            });
+
+                        if let Some(enum_ref) = obj_enum {
+                            let enum_ref = enum_ref.as_ref();
+                            // Write each payload value into the slot,
+                            // OVERWRITING the source enum value at
+                            // `slot` and the following positions.
+                            for (i, member) in enum_ref.payload.iter().enumerate() {
+                                let value = match member {
+                                    Member::Value(v) => *v,
+                                    Member::Object(o) => Value::from(o.addr()),
+                                };
+                                self.stack[slot + i] = value;
+                            }
+                        }
+                        // else: scrutinee is not an enum — silent
+                        // no-op (defensive; the typechecker should
+                        // have rejected this).
+                    }
+                }
+                Instruction::StorePop => {
+                    // Operands: full u32 = slot_index.
+                    //
+                    // Phase 18E — the load-bearing "store the RHS
+                    // into a let-bound variable" opcode. Pops the
+                    // top of the stack and writes it to
+                    // `frame.sp + slot_index`. The slot position
+                    // overlaps with the locals area (the stack and
+                    // the locals area share memory), so the next
+                    // `LOAD <slot_index>` will read the value.
+                    //
+                    // Distinct from `Instruction::STORE`, which is
+                    // a no-op since Phase 15D (it confirms
+                    // match-arm bindings whose values were already
+                    // pushed directly into the slot positions by
+                    // `UNPACK` / `JUMP_IF_MATCH`). `STORE_POP` is
+                    // the EXPLICIT pop-and-write opcode used by the
+                    // `let x = expr;` codegen.
+                    //
+                    // **Cursor preservation.** A naive
+                    // pop-and-write would let the cursor fall
+                    // back to `slot`, which means the NEXT
+                    // `push` would clobber the slot we just
+                    // wrote (because `push` writes to
+                    // `stack[cursor]`). For example, `let x = 5;
+                    // let y = 10;` would emit
+                    // `CONST 5; STORE_POP 0; CONST 10;
+                    // STORE_POP 1;` and without cursor
+                    // preservation the second `CONST 10` would
+                    // overwrite `stack[0]` (the slot for `x`)
+                    // before `STORE_POP 1` runs.
+                    //
+                    // Fix: after the pop, ensure the cursor is
+                    // at least `slot + 1`. This matches the
+                    // "local is allocated" semantic — once a
+                    // slot has been written, future operand
+                    // pushes go above it.
+                    let slot = frame.get() + opcode.operand_u32() as usize;
+                    let val = self.stack.pop();
+                    self.stack[slot] = val;
+                    if self.stack.tell() < slot + 1 {
+                        self.stack.seek(slot + 1);
                     }
                 }
                 _ => return ExecutionResult::invalid(),
@@ -932,16 +1070,42 @@ mod tests {
     }
 
     /// Build a `JUMP_IF_MATCH` byte with the given expected tag
-    /// and target offset packed into the operand (upper 16
-    /// bits = tag, lower 16 bits = target).
-    fn jump_if_match(tag: u16, target: u16) -> Byte {
-        Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag, target])
+    /// and target offset.
+    ///
+    /// Phase 18C layout: tag in `operands[31:16]`, target in
+    /// `value[31:0]` (a full 32-bit absolute bytecode offset —
+    /// pre-18C the target was a 16-bit value in
+    /// `operands[15:0]`, which capped reachable match-arm
+    /// bodies at 65,535 bytes).
+    fn jump_if_match(tag: u16, target: u32) -> Byte {
+        Byte::new(Instruction::JumpIfMatch)
+            .with_operands_u16([tag, 0])
+            .with_value_u32(target)
     }
 
     /// Build an `UNPACK` byte with the given arity in the
     /// operand.
     fn unpack(arity: u32) -> Byte {
         Byte::new(Instruction::Unpack).with_operand_u32(arity)
+    }
+
+    /// Build a `LOAD_FIELD` byte with the given field index in
+    /// the lower 16 bits of the operand (Phase 18D layout).
+    fn load_field(field_index: u16) -> Byte {
+        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32)
+    }
+
+    /// Build a `STORE_POP` byte with the given slot index in
+    /// the operand (Phase 18E layout).
+    fn store_pop(slot: u32) -> Byte {
+        Byte::new(Instruction::StorePop).with_operand_u32(slot)
+    }
+
+    /// Build a `LOAD` byte that pushes `stack[frame.sp + slot]`
+    /// onto the stack. Used to verify that a value previously
+    /// written by `STORE_POP` is read back correctly.
+    fn load(slot: u32) -> Byte {
+        Byte::new(Instruction::LOAD).with_operand_u32(slot)
     }
 
     /// Build a `CONST` byte that pushes the given `i64` value
@@ -1020,7 +1184,7 @@ mod tests {
             const_int(42),
             make_enum(2, 1),
             // JUMP_IF_MATCH tag=2 target=4
-            jump_if_match(2, 4),
+            jump_if_match(2, 4u32),
             // (Should not reach here on the jump-taken path.)
             const_int(999),
             // HALT at offset 4 (the target).
@@ -1030,6 +1194,44 @@ mod tests {
         // stack is 42.
         let v = vm.pop();
         assert_eq!(v.as_int(), 42, "JUMP_IF_MATCH did not push the payload");
+    }
+
+    /// Phase 18C — verify the wide-target round-trip for
+    /// `JUMP_IF_MATCH`.
+    ///
+    /// Before 18C, `JUMP_IF_MATCH` packed both the tag and the
+    /// target offset into the 32-bit `operands` field (tag in
+    /// upper 16 bits, target in lower 16 bits), which silently
+    /// truncated any target ≥ 65,536 bytes. Phase 18C moves
+    /// the target to a full 32-bit slot in `value[31:0]`, so
+    /// targets up to 2^32 - 1 are now representable.
+    ///
+    /// This test exercises the wide-target layout without
+    /// allocating a 100,000-instruction bytecode sequence:
+    /// we just verify that `with_value_u32` / `value_u32`
+    /// round-trip a target > 65,535 and that the tag stays in
+    /// `operands[31:16]`.
+    #[test]
+    fn jump_if_match_wide_target_round_trips() {
+        let target: u32 = 100_000;
+        let byte = jump_if_match(5, target);
+        assert!(matches!(byte.bytecode(), Instruction::JumpIfMatch));
+        assert_eq!(
+            byte.value_u32(),
+            target,
+            "wide target should round-trip via value_u32"
+        );
+        assert_eq!(
+            byte.operand_u32() >> 16,
+            5,
+            "tag should be preserved in upper 16 bits of operands"
+        );
+        assert_eq!(
+            byte.operand_u32() & 0xFFFF,
+            0,
+            "lower 16 bits of operands should be reserved"
+        );
+        assert!(target > 0xFFFF, "test must exercise wide-target path");
     }
 
     /// Step 4: push an enum with tag=2, then execute
@@ -1044,7 +1246,7 @@ mod tests {
             const_int(42),
             make_enum(2, 1),
             // JUMP_IF_MATCH tag=5 target=4 (won't match; fall through)
-            jump_if_match(5, 4),
+            jump_if_match(5, 4u32),
             // (Should be reached on the fall-through path.)
             const_int(99),
             // Target for the (non-taken) jump at offset 4.
@@ -1083,6 +1285,138 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 10);
     }
 
+    /// Phase 18D — verify `LOAD_FIELD 0` extracts the first
+    /// declared field of an enum's payload.
+    ///
+    /// Build a 3-field enum with declaration-order payload
+    /// `[10, 20, 30]`. Codegen convention: push the fields in
+    /// REVERSE declaration order so the top of the stack holds
+    /// `payload[0]`. `MakeEnum` then pops arity values (top
+    /// first) into the buffer in declaration order. After
+    /// `MakeEnum`, the enum sits on the stack.
+    ///
+    /// `LoadField(0)` should pop the enum and push
+    /// `payload[0] = 10`.
+    #[test]
+    fn load_field_extracts_field_zero() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            // Build enum (tag=0, arity=3) with payload [10, 20, 30]:
+            // Pushed in REVERSE declaration order.
+            const_int(30),
+            const_int(20),
+            const_int(10),
+            make_enum(0, 3),
+            // LoadField(0): pops enum, pushes payload[0] = 10.
+            load_field(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Top of stack should be payload[0] = 10.
+        assert_eq!(vm.pop().as_int(), 10);
+    }
+
+    /// Phase 18D — verify `LOAD_FIELD 2` extracts the third
+    /// declared field (the last one) of an enum's payload.
+    ///
+    /// Same setup as `load_field_extracts_field_zero`, but
+    /// request field index 2. The VM should return
+    /// `payload[2] = 30` without disturbing any other state.
+    #[test]
+    fn load_field_extracts_last_field() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(30),
+            const_int(20),
+            const_int(10),
+            make_enum(0, 3),
+            // LoadField(2): pops enum, pushes payload[2] = 30.
+            load_field(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Top of stack should be payload[2] = 30.
+        assert_eq!(vm.pop().as_int(), 30);
+    }
+
+    /// Phase 18D — verify `LOAD_FIELD` extracts the correct
+    /// field when loading a middle index (1) of a 3-field
+    /// enum's payload.
+    ///
+    /// Loads payload[1] (= 20) from an enum with payload
+    /// `[10, 20, 30]`. Distinct from
+    /// `load_field_extracts_field_zero` and
+    /// `load_field_extracts_last_field`, which exercise the
+    /// boundary indices.
+    #[test]
+    fn load_field_extracts_middle_field() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            // Build enum (tag=0, arity=3) with payload
+            // [10, 20, 30]: pushed in REVERSE declaration order.
+            const_int(30),
+            const_int(20),
+            const_int(10),
+            make_enum(0, 3),
+            // LoadField(1): pops enum, pushes payload[1] = 20.
+            load_field(1),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Top of stack should be payload[1] = 20.
+        assert_eq!(vm.pop().as_int(), 20);
+    }
+
+    /// Phase 18D — verify `LOAD_FIELD` consumes the receiver
+    /// (matches `UNPACK` semantics). After `LoadField`, the
+    /// enum should no longer be on the stack — only the
+    /// extracted field should remain.
+    #[test]
+    fn load_field_consumes_receiver() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // Build enum (tag=0, arity=2) with payload [42, 99].
+            const_int(99),
+            const_int(42),
+            make_enum(0, 2),
+            // LoadField(0): pops enum, pushes payload[0] = 42.
+            load_field(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Only ONE value should be on the stack after
+        // LoadField (the extracted field). The enum itself
+        // should have been consumed.
+        assert_eq!(
+            vm.tell(),
+            1,
+            "LoadField should leave exactly one value on the stack"
+        );
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Phase 18D — verify `LOAD_FIELD` with an out-of-bounds
+    /// field index is a silent no-op (the receiver is consumed
+    /// but nothing is pushed). This matches the defensive
+    /// posture of `UNPACK` and `JUMP_IF_MATCH`.
+    #[test]
+    fn load_field_out_of_bounds_silent_noop() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // Build enum (tag=0, arity=2) with payload [42, 99].
+            const_int(99),
+            const_int(42),
+            make_enum(0, 2),
+            // LoadField(5): field_index 5 is past arity=2. The
+            // VM should consume the enum and push nothing.
+            load_field(5),
+            Byte::new(Instruction::HALT),
+        ]);
+        // After LoadField(5), the stack should be empty
+        // (enum popped, no field pushed).
+        assert_eq!(
+            vm.tell(),
+            0,
+            "out-of-bounds LoadField should leave the stack empty"
+        );
+    }
+
     /// Nested enum GC test: allocate an outer enum with a
     /// payload containing an inner enum (and a string). Trigger
     /// GC and verify both inner enums are preserved.
@@ -1108,17 +1442,13 @@ mod tests {
             Object::Enum,
         );
         // Allocate a string.
-        let (string_obj, _) =
-            heap.alloc(ObjString::from("inner"), Object::String);
+        let (string_obj, _) = heap.alloc(ObjString::from("inner"), Object::String);
         // Allocate an outer enum whose payload contains
         // references to both the inner enum and the string.
         let (outer_obj, _) = heap.alloc(
             ObjEnum {
                 tag: 0,
-                payload: vec![
-                    Member::Object(inner_obj),
-                    Member::Object(string_obj),
-                ],
+                payload: vec![Member::Object(inner_obj), Member::Object(string_obj)],
             },
             Object::Enum,
         );
@@ -1374,5 +1704,131 @@ mod tests {
             .into_inner();
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "hello");
+    }
+
+    // ============================================================
+    //  Phase 18E: StorePop opcode tests
+    // ============================================================
+    //
+    // StorePop is the load-bearing "store the RHS into a let-bound
+    // variable" opcode. Distinct from STORE (which is a no-op since
+    // Phase 15D — it confirms match-arm bindings whose values were
+    // already pushed directly into the slot positions by UNPACK /
+    // JUMP_IF_MATCH).
+    //
+    // The VM's slot layout uses `frame.sp` as the base; the slot
+    // index in the operand is an offset from `frame.sp`. For the
+    // top-level frame, `frame.sp = 0`, so slot 0 is at stack[0].
+    // After `STORE_POP 0`, the value lives at stack[0]; after
+    // `LOAD 0`, it's pushed back onto the stack.
+    //
+    // These tests exercise the canonical patterns the codegen
+    // produces for `let x = expr;` (STORE_POP after the RHS,
+    // followed by LOAD when x is referenced).
+
+    /// Phase 18E — verify `STORE_POP 0` writes the top-of-stack
+    /// value to slot 0 and pops it. After the op, the stack
+    /// height is unchanged (one value popped, one slot
+    /// written). A subsequent `LOAD 0` pushes the stored
+    /// value back.
+    #[test]
+    fn store_pop_writes_value_to_slot_and_pops() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // Push 42 onto the operand stack.
+            const_int(42),
+            // Pop 42, write to slot 0 (= frame.sp + 0 = 0).
+            store_pop(0),
+            // Push slot 0 (= 42) back onto the stack.
+            load(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Top of stack should be 42 — proving both the
+        // write-to-slot and the pop-and-write semantics.
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Phase 18E — verify `STORE_POP` writes to the correct
+    /// slot index. Write a different value to slot 2, then
+    /// `LOAD 2` returns that value (not whatever is at slot 0
+    /// or 1).
+    ///
+    /// This is the critical regression test: a buggy
+    /// implementation that always wrote to slot 0 would
+    /// silently corrupt the slot addressing used by
+    /// multi-binding programs like `let x = 5; let y = 10;
+    /// print x + y;`.
+    #[test]
+    fn store_pop_writes_to_correct_slot_index() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // Push 99, store at slot 0.
+            const_int(99),
+            store_pop(0),
+            // Push 42, store at slot 2.
+            const_int(42),
+            store_pop(2),
+            // Push slot 2 (= 42) — the second binding.
+            load(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Top of stack should be 42 (the value stored at
+        // slot 2). Slot 0 still holds 99.
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Phase 18E — verify `STORE_POP` round-trips through a
+    /// multi-binding let sequence. The canonical pattern:
+    /// `let x = 5; let y = 10;` produces two `STORE_POP`
+    /// instructions (one per binding). After both fire, both
+    /// slots hold the correct value.
+    #[test]
+    fn store_pop_two_bindings_preserves_both_values() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // let x = 5;
+            const_int(5),
+            store_pop(0),
+            // let y = 10;
+            const_int(10),
+            store_pop(1),
+            // read x back
+            load(0),
+            // push y so we can add them
+            load(1),
+            // x + y = 15
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 15);
+    }
+
+    /// Phase 18E — verify `STORE_POP` allows re-assignment by
+    /// overwriting the slot. The `x = 10;` codegen emits
+    /// `CONST 10; STORE_POP <slot>` — the same op as a let,
+    /// because the operand-stack and locals area share memory.
+    /// A buggy implementation that confused `STORE_POP` with
+    /// `STORE` (the no-op) would leave the slot untouched.
+    #[test]
+    fn store_pop_overwrites_existing_slot() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            // let x = 5;
+            const_int(5),
+            store_pop(0),
+            // x = 10;
+            const_int(10),
+            store_pop(0),
+            // read x back
+            load(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        // Should be 10 — the second STORE_POP overwrote the
+        // slot. (Pre-fix this would have left x = 5 because
+        // STORE was a no-op, but x = 10; also emits DUPLICATE
+        // which would push another 10 — net result 5 + 10,
+        // but the first was the original load. The fix makes
+        // the semantics explicit: store-pop-and-overwrite.)
+        assert_eq!(vm.pop().as_int(), 10);
     }
 }

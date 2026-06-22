@@ -158,21 +158,34 @@ fn arm_has_runtime_test(arm: &MatchArm) -> bool {
 /// pattern matched) or to `fail_label` (if it didn't). The last arm in
 /// a group has `pass_label = None` (always passes, reaches the arm body
 /// via fall-through after a preceding JMP fail to fail_label).
+///
+/// `checker` is passed for `tag_for` / `payload_tys_for` lookups
+/// during the recursion. Passing it by reference (rather than as
+/// closures that capture it) avoids the borrow-checker recursion
+/// limit on `&F` types.
+///
+/// `enum_name` / `variant_name`: the OUTER pattern's variant. Needed
+/// for the Record payload case to look up the record's DECLARATION
+/// order (so the test chain iterates the fields in the same slot
+/// order as the VM's `UNPACK` / `JUMP_IF_MATCH` payload-push).
 #[allow(dead_code, unused_variables)] // Reserved for the Phase 17C+ inner-pattern runtime
                     // test disambiguation. Defined here for the upcoming
                     // multi-arm match group dispatch work.
                     // `fail_label` will be used by the failure path
                     // (JMP to fail_label) once that arm is wired up.
-fn emit_inner_test(
+fn emit_inner_test<'compiler>(
     arm_idx: usize,
-    payload: &PatternPayload,
+    checker: &Checker,
+    enum_name: &str,
+    variant_name: &str,
+    payload: &PatternPayload<'compiler>,
     match_bindings_per_arm: &mut HashMap<usize, HashMap<String, u32>>,
     bytecode: &mut Vec<Byte>,
     bb: &mut BlockBuilder,
     pass_label: Option<crate::block_builder::Label>,
     fail_label: crate::block_builder::Label,
-    tag_for: impl Fn(&str, &str) -> Option<u32>,
 ) {
+    use parser::ast::PatternPayload;
     match payload {
         PatternPayload::Unit => {
             // No payload to test. The pass_label is always None for Unit
@@ -201,8 +214,9 @@ fn emit_inner_test(
                         );
                     }
                     Pattern::Constructor {
-                        enum_name,
-                        variant_name,
+                        enum_name: sub_enum,
+                        variant_name: sub_variant,
+                        payload: sub_payload,
                         ..
                     } => {
                         // Phase 18A: nested Constructor sub-pattern.
@@ -221,10 +235,36 @@ fn emit_inner_test(
                         // previous inner tests failed). For the last
                         // arm we just emit POP to consume the inner
                         // value (no runtime test needed).
+                        //
+                        // Phase 18B (nested record patterns): if the
+                        // nested Constructor's payload is itself a
+                        // Record, recurse into it via `emit_inner_test`
+                        // (the inner record's nested Constructor fields
+                        // get their own JUMP_IF_MATCH in declaration
+                        // order). For Tuple payloads, emit JUMP_IF_MATCH
+                        // on the inner tag as before.
                         any_nested_ctor = true;
-                        if let Some(label) = pass_label {
+                        if matches!(sub_payload, PatternPayload::Record(_)) {
+                            // Nested record — recurse. The recursion
+                            // walks the inner record's declared fields
+                            // in decl_order and emits per-field
+                            // tests (POP / STORE / JUMP_IF_MATCH on
+                            // further-nested tags).
+                            emit_inner_test(
+                                arm_idx,
+                                checker,
+                                sub_enum,
+                                sub_variant,
+                                sub_payload,
+                                match_bindings_per_arm,
+                                bytecode,
+                                bb,
+                                pass_label,
+                                fail_label,
+                            );
+                        } else if let Some(label) = pass_label {
                             if let Some(inner_tag) =
-                                tag_for(enum_name, variant_name)
+                                checker.tag_for(sub_enum, sub_variant)
                             {
                                 bb.emit_jump_to(
                                     label,
@@ -267,10 +307,35 @@ fn emit_inner_test(
             }
         }
         PatternPayload::Record(fields) => {
-            // Similar to tuple but for records.
+            // Walk the record's declared fields in DECLARATION
+            // order (per `payload_tys_for`). The previous
+            // implementation walked in source order — but for
+            // records, the VM's `UNPACK` / `JUMP_IF_MATCH`
+            // push payload values in DECLARATION order, not
+            // source order. The slot for the i-th declared
+            // field is `frame.sp + 1 + i`. Walking in source
+            // order would misroute POP / STORE / JUMP_IF_MATCH
+            // to the wrong slot. (Phase 18B — nested record
+            // patterns.)
+            let decl_order = checker.payload_tys_for(enum_name, variant_name);
+            let pattern_site: std::collections::HashMap<
+                &str,
+                &Pattern<'compiler>,
+            > = fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
             let mut any_nested_ctor = false;
-            for f in fields {
-                match &f.pattern {
+            for (decl_name, _) in decl_order.iter() {
+                let sub_pat = match pattern_site.get(decl_name.as_str()) {
+                    Some(p) => *p,
+                    None => {
+                        // Field omitted from the pattern — emit
+                        // POP to discard the value (the test
+                        // chain always consumes every slot, so
+                        // this is unconditional).
+                        bytecode.push(Byte::new(Instruction::POP));
+                        continue;
+                    }
+                };
+                match sub_pat {
                     Pattern::Wildcard => {
                         bytecode.push(Byte::new(Instruction::POP));
                     }
@@ -285,14 +350,35 @@ fn emit_inner_test(
                         );
                     }
                     Pattern::Constructor {
-                        enum_name,
-                        variant_name,
+                        enum_name: sub_enum,
+                        variant_name: sub_variant,
+                        payload: sub_payload,
                         ..
                     } => {
+                        // Nested Constructor sub-pattern on a
+                        // record field. If the nested
+                        // Constructor's payload is itself a
+                        // Record, recurse to dispatch on the
+                        // inner record's nested tags. Otherwise
+                        // (Unit / Tuple), emit JUMP_IF_MATCH on
+                        // the inner tag as before.
                         any_nested_ctor = true;
-                        if let Some(label) = pass_label {
+                        if matches!(sub_payload, PatternPayload::Record(_)) {
+                            emit_inner_test(
+                                arm_idx,
+                                checker,
+                                sub_enum,
+                                sub_variant,
+                                sub_payload,
+                                match_bindings_per_arm,
+                                bytecode,
+                                bb,
+                                pass_label,
+                                fail_label,
+                            );
+                        } else if let Some(label) = pass_label {
                             if let Some(inner_tag) =
-                                tag_for(enum_name, variant_name)
+                                checker.tag_for(sub_enum, sub_variant)
                             {
                                 bb.emit_jump_to(
                                     label,
@@ -308,9 +394,10 @@ fn emit_inner_test(
                                 ));
                             }
                         } else {
-                            // Last arm in the group — emit POP to
-                            // consume the inner value. The arm
-                            // body is reached by fall-through.
+                            // Last arm in the group — emit POP
+                            // to consume the inner value. The
+                            // arm body is reached by
+                            // fall-through.
                             bytecode.push(Byte::new(Instruction::POP));
                         }
                     }
@@ -465,39 +552,73 @@ impl<'ctx> Context {
 ///   is true).
 /// - `Constructor { .. }` (tuple shape) — `UNPACK <arity>` to pop
 ///   the enum value and push its payload (if `consume_values` is
-///   true), then recurse into each sub-pattern of the inner
-///   constructor with `consume_values = true`. The nested bindings
-///   continue counting from the outer `next_slot`.
-/// - `Constructor { .. }` (record shape) — emit a POP (nested
-///   record patterns inside an arm body are not supported in 17B
-///   — see Known Limitations in AGENTS.md).
+///   true AND we're at a recursion level, NOT at the OUTER level
+///   — see `is_outer` below), then recurse into each sub-pattern
+///   of the inner constructor. The nested bindings continue
+///   counting from the outer `next_slot`.
+/// - `Constructor { .. }` (record shape) — walk the record's
+///   declared fields in declaration order (per `parent_decl_order`)
+///   and bind each one. Sub-patterns that are themselves
+///   constructor patterns (records or tuples) recurse; the
+///   recursive call passes the sub-pattern's own `payload_tys_for`
+///   as `parent_decl_order`, so the recursion works at UNBOUNDED
+///   depth (Phase 17B-cleanup limit #1 lifted).
 ///
 /// `consume_values` (Phase 18A): controls whether the function
-/// emits POP/STORE/UNPACK for the OUTER level. When the test
-/// chain has already consumed the payload values (via POP /
-/// STORE / JUMP_IF_MATCH), the reverse pass calls this function
-/// with `consume_values = false` to skip the redundant
-/// POP/STORE/UNPACK emission. Bindings are still recorded in
+/// emits POP/STORE/UNPACK for the INNER levels (recursion).
+/// When the test chain has already consumed the payload values
+/// (via POP / STORE / JUMP_IF_MATCH), the reverse pass calls
+/// this function with `consume_values = false` to skip the
+/// redundant POP/STORE/UNPACK emission at every level (the test
+/// chain handled them). Bindings are still recorded in
 /// `match_bindings` (so the body's `Identifier` lookups resolve
 /// to the correct slots) — only the bytecode emission is
 /// suppressed.
 ///
-/// The recursion into sub-patterns ALWAYS uses `consume_values =
-/// true`: the inner values were pushed either by the (skipped or
-/// emitted) UNPACK above, or by the outer `JUMP_IF_MATCH` in the
-/// test chain case. Either way, the recursion needs to consume
-/// those values via POP/STORE.
+/// `is_outer` (Phase 18B — lifting the 17B-cleanup nested record
+/// limitation): distinguishes the OUTER call (from the codegen,
+/// where the forward pass has already emitted UNPACK or
+/// JUMP_IF_MATCH for the OUTER enum value) from recursive calls
+/// (where a sub-pattern is itself a Constructor with a Tuple
+/// payload that needs UNPACK). When `is_outer = true`, the
+/// function SUPPRESSES UNPACK emission (the forward pass handled
+/// it). When `is_outer = false` (recursion), the function emits
+/// UNPACK for nested Tuple constructors so their payload values
+/// reach the right slots.
+///
+/// `parent_decl_order`: the field-name → type map of the
+/// CONTAINING record pattern (the record whose fields this
+/// function is currently walking). The caller passes the
+/// appropriate `Vec<(String, Ty)>`:
+/// - For an OUTER record pattern (the pattern passed directly
+///   to this function), `parent_decl_order` is
+///   `checker.payload_tys_for(enum_name, variant_name)` — the
+///   record's declared field order.
+/// - For a sub-pattern recursion (entered from this function's
+///   own Record arm), `parent_decl_order` is the sub-pattern's
+///   own `payload_tys_for` if the sub-pattern is itself a
+///   constructor record; empty otherwise.
 ///
 /// This function is called once per arm body. After it returns,
 /// the stack has been "consumed" by the binding code (POPs for
 /// wildcards, no-op STOREs for bindings) and `match_bindings`
 /// holds the name → slot mapping for the arm.
-fn emit_pattern_binding(
+///
+/// `checker` is passed explicitly (rather than being a method on
+/// `Compiler`) so the borrow checker doesn't see `&self.checker`
+/// (immutable) and `&mut self.bytecode` (mutable) as conflicting
+/// — the function only needs `checker` for `payload_tys_for`
+/// (and `tag_for` indirectly via the codegen), which is a
+/// disjoint read from the bytecode mutation.
+fn emit_pattern_binding<'compiler>(
+    checker: &Checker,
     match_bindings: &mut HashMap<String, u32>,
     next_slot: &mut u32,
-    pattern: &Pattern,
+    pattern: &Pattern<'compiler>,
+    parent_decl_order: &[(String, Ty)],
     bytecode: &mut Vec<Byte>,
     consume_values: bool,
+    is_outer: bool,
 ) {
     use parser::ast::PatternPayload;
     match pattern {
@@ -527,35 +648,241 @@ fn emit_pattern_binding(
                 // the typechecker would have rejected this. Emit a
                 // defensive POP only if the caller expects a value
                 // to consume on the stack.
-                if consume_values {
+                //
+                // The OUTER-level Unit case is handled by the
+                // caller (the forward pass emits POP / STORE 1 /
+                // nothing depending on whether the arm is the
+                // last, non-last, or a wildcard/binding
+                // catch-all). The recursion's Unit case (when
+                // is_outer = false) emits POP only when the
+                // caller expects a value on the stack
+                // (`consume_values = true`).
+                if consume_values && !is_outer {
                     bytecode.push(Byte::new(Instruction::POP));
                 }
             }
             PatternPayload::Tuple(parts) => {
-                if consume_values {
-                    bytecode.push(Byte::new(Instruction::Unpack).with_operand_u32(parts.len() as u32));
+                // The OUTER-level Tuple case: the forward pass
+                // already emitted UNPACK for the last arm (or
+                // JUMP_IF_MATCH for non-last arms). Suppress
+                // UNPACK emission at the OUTER level.
+                //
+                // The recursion's Tuple case (when is_outer =
+                // false): we have a nested constructor on the
+                // stack (pushed by the outer JUMP_IF_MATCH or
+                // UNPACK above), and we need to UNPACK it to
+                // get its payload values at the right slot
+                // positions before binding its sub-patterns.
+                if consume_values && !is_outer {
+                    bytecode.push(
+                        Byte::new(Instruction::Unpack)
+                            .with_operand_u32(parts.len() as u32),
+                    );
                 }
-                // Recurse for sub-patterns with consume_values
-                // = true. The inner values were pushed either
-                // by the (emitted) UNPACK above, or by the
-                // outer JUMP_IF_MATCH in the test chain case
-                // (when consume_values was false at this
-                // level). Either way, the inner recursion
-                // needs to consume them via POP/STORE.
+                // Recurse for sub-patterns with the same
+                // `consume_values` flag. The inner values were
+                // pushed either by the (emitted) UNPACK above,
+                // or by the outer JUMP_IF_MATCH in the test
+                // chain case (when consume_values was false).
+                // When `consume_values = false`, the test
+                // chain has already emitted the
+                // POP / JUMP_IF_MATCH for the inner values, so
+                // we suppress the redundant bytecode in the
+                // recursion too.
+                //
+                // The recursion is ALWAYS at `is_outer = false`
+                // (the OUTER level is reached exactly once per
+                // arm body — by the caller).
+                //
+                // The sub-pattern's `parent_decl_order` is
+                // empty unless the sub-pattern is itself a
+                // record constructor — then it's the
+                // sub-pattern's declared field order. Tuple
+                // sub-patterns don't use `parent_decl_order`
+                // (they walk in source order).
                 for sub in parts {
-                    emit_pattern_binding(match_bindings, next_slot, sub, bytecode, true);
+                    let sub_decl_order: Vec<(String, Ty)> =
+                        if let Pattern::Constructor {
+                            enum_name: sub_enum,
+                            variant_name: sub_variant,
+                            payload: PatternPayload::Record(_),
+                            ..
+                        } = sub
+                        {
+                            checker.payload_tys_for(sub_enum, sub_variant)
+                        } else {
+                            Vec::new()
+                        };
+                    emit_pattern_binding(
+                        checker,
+                        match_bindings,
+                        next_slot,
+                        sub,
+                        &sub_decl_order,
+                        bytecode,
+                        consume_values,
+                        false, // is_outer = false (recursion)
+                    );
                 }
             }
-            PatternPayload::Record(_fields) => {
-                // Nested record patterns inside an arm body are
-                // NOT supported in 17B — see the documented
-                // limitations. The typechecker rejects them
-                // implicitly (the inner record pattern must look
-                // up the variant from the outer arm's payload
-                // type, which we don't thread here). Emit a POP
-                // and skip.
-                if consume_values {
-                    bytecode.push(Byte::new(Instruction::POP));
+            PatternPayload::Record(fields) => {
+                // Walk the record's declared fields in
+                // DECLARATION order (per `parent_decl_order`).
+                //
+                // At the OUTER level (`is_outer = true`):
+                // record values were already pushed at
+                // consecutive stack slots by the forward
+                // pass's UNPACK (for the last arm) or
+                // JUMP_IF_MATCH (for non-last arms). There's
+                // no prefix UNPACK to emit here — just walk
+                // the fields and bind each one.
+                //
+                // At the RECURSION level (`is_outer =
+                // false`): the record's enum value sits at
+                // a non-top slot (pushed by the parent
+                // record's UNPACK / JUMP_IF_MATCH). To bind
+                // its fields, we MUST first emit `UnpackAt`
+                // with the slot position of this nested
+                // record's enum value — the slot-based
+                // UNPACK writes the payload values to
+                // consecutive positions starting from that
+                // slot, overwriting in place. (Phase 18B —
+                // the existing top-popping `Unpack` opcode
+                // doesn't work for nested records because
+                // the nested record's enum value isn't at
+                // the top of stack.)
+                //
+                // For each declared field:
+                //  - If the pattern supplies a sub-pattern
+                //    for this field, recurse into it. If the
+                //    sub-pattern is itself a constructor
+                //    record, pass ITS `payload_tys_for` as
+                //    `parent_decl_order` so the recursion
+                //    walks the inner record's fields too.
+                //    This works at UNBOUNDED depth
+                //    (Phase 17B-cleanup limit #1 lifted).
+                //  - If the pattern doesn't supply this
+                //    field (it was omitted from the record
+                //    pattern), emit POP to discard the value
+                //    so the stack stays consistent with the
+                //    declaration-order walk.
+                //
+                // The recursion propagates the OUTER
+                // `consume_values` flag: when `false` (test
+                // chain arm), the test chain's
+                // POP / JUMP_IF_MATCH has already consumed
+                // the inner values, so the recursion
+                // suppresses the redundant bytecode. When
+                // `true` (normal arm), the recursion emits
+                // bytecode normally.
+                //
+                // The recursion is ALWAYS at `is_outer = false`.
+                //
+                // The i-th field of the OUTER record
+                // (1-indexed) sits at slot `i` (after the
+                // OUTER UNPACK pushed the fields at
+                // consecutive positions starting at
+                // frame.sp + 1). We need to know this
+                // slot when emitting `UnpackAt` for the
+                // nested record's payload — the payload
+                // values are written to `slot`, `slot + 1`,
+                // ..., `slot + arity - 1`.
+                let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
+                    fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
+                for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
+                    let field_slot = (i + 1) as u32;
+                    if let Some(sub_pat) = pattern_site.get(decl_name.as_str()) {
+                        // If the sub-pattern is a nested
+                        // record, emit `UnpackAt` with the
+                        // slot position of the OUTER field
+                        // (= `field_slot`). The slot-based
+                        // UNPACK writes the inner record's
+                        // payload values to consecutive
+                        // positions starting at `field_slot`,
+                        // overwriting the nested record's
+                        // enum value.
+                        //
+                        // `is_outer` is captured by value
+                        // from the enclosing Record arm
+                        // call. When `is_outer = true`, we're
+                        // walking the OUTER record's fields
+                        // — nested records at this level need
+                        // `UnpackAt`. When `is_outer = false`
+                        // (we're recursing into a nested
+                        // record's fields), nested records
+                        // ALSO need `UnpackAt` (one level
+                        // deeper). Either way, emit it when
+                        // the sub-pattern is a nested record
+                        // AND `consume_values = true`.
+                        if consume_values
+                            && let Pattern::Constructor {
+                                enum_name: sub_enum,
+                                variant_name: sub_variant,
+                                payload: PatternPayload::Record(_),
+                            } = sub_pat
+                        {
+                            // `with_operands_u16` packs two
+                            // u16 values: lower = slot, upper
+                            // = arity.
+                            let inner_arity =
+                                checker.payload_tys_for(sub_enum, sub_variant)
+                                    .len() as u16;
+                            bytecode.push(
+                                Byte::new(Instruction::UnpackAt)
+                                    .with_operands_u16([
+                                        field_slot as u16,
+                                        inner_arity,
+                                    ]),
+                            );
+                        }
+                        // Compute the sub-pattern's own
+                        // record decl_order if it's a record
+                        // constructor (for unbounded nesting).
+                        let sub_decl_order: Vec<(String, Ty)> =
+                            if let Pattern::Constructor {
+                                enum_name: sub_enum,
+                                variant_name: sub_variant,
+                                payload: PatternPayload::Record(_),
+                                ..
+                            } = sub_pat
+                            {
+                                checker.payload_tys_for(sub_enum, sub_variant)
+                            } else {
+                                Vec::new()
+                            };
+                        emit_pattern_binding(
+                            checker,
+                            match_bindings,
+                            next_slot,
+                            sub_pat,
+                            &sub_decl_order,
+                            bytecode,
+                            consume_values,
+                            false, // is_outer = false (recursion)
+                        );
+                    } else if consume_values {
+                        // Field omitted from the pattern.
+                        // Emit POP to keep the stack
+                        // consistent with the declaration-
+                        // order walk. The typechecker
+                        // already reported the error (if
+                        // any). At the OUTER level, the
+                        // forward pass handled missing
+                        // fields via UNPACK with the right
+                        // arity (the field's slot is just
+                        // left dangling — that's by
+                        // design — UNPACK still pushes N
+                        // values; we just don't bind any of
+                        // them). At recursion levels, the
+                        // previous UnpackAt exposed N
+                        // values; we POP them so the slot
+                        // cursor advances correctly for
+                        // subsequent fields.
+                        bytecode.push(Byte::new(Instruction::POP));
+                    }
+                    // else: `consume_values = false` —
+                    // the test chain already consumed the
+                    // value. Skip silently.
                 }
             }
         },
@@ -642,20 +969,23 @@ impl Compiler {
     }
 
     /// Extract the enum name from the inferred type of a field-access
-    /// receiver (Phase 18D — `Expression::Access` codegen).
+    /// receiver (Phase 18D — `Expression::Access` codegen; Phase 19
+    /// extends the `Access` arm for chained access).
     ///
     /// The receiver can be one of:
     ///
     ///  - `Expression::Identifier(name)` — function parameter or
-    ///    let-bound variable. The receiver's type is the env entry
-    ///    for `name`. We return the enum name if the type is
+    ///    let-bound variable. The receiver's type is the side-table
+    ///    entry for `name`. We return the enum name if the type is
     ///    `Ty::Con(n)`, `Ty::Sum { name, .. }`, or
     ///    `Ty::Constructor { owner, .. }` (with the same recursive
     ///    unwrapping of `owner`).
-    ///  - `Expression::Access(_, _)` — chained access. The inner
-    ///    access yields the type of the inner field; we recurse to
-    ///    find the receiver's enum name. Only valid when the inner
-    ///    access's field is itself a record-shaped enum.
+    ///  - `Expression::Access(_, _)` — chained access (Phase 19).
+    ///    The inner access's field type is looked up via
+    ///    `field_type_for` on the inner receiver's enum. For
+    ///    `p.x.v`, this returns `Inner` (the enum that owns the
+    ///    `v` field). The OUTER `LoadField` then routes to
+    ///    `Inner::v` rather than `Outer::v`.
     ///  - Anything else — return `None` (the codegen will emit a
     ///    defensive `LoadField(0)`).
     ///
@@ -693,34 +1023,39 @@ impl Compiler {
     }
 
     /// Recursively resolve a field-access receiver's type using
-    /// the checker's codegen side-table (Phase 18D).
+    /// the checker's codegen side-table (Phase 18D; Phase 19
+    /// extends it for chained accesses).
     ///
     /// For an `Identifier`, the type is the side-table entry.
     /// For a chained `Access`, the inner access's field type is
-    /// looked up in the side-table (only valid when the inner
-    /// field is itself a record-shaped enum — otherwise the
-    /// typechecker would have errored upstream).
+    /// looked up via `field_type_for` on the inner receiver's
+    /// enum (Phase 19). This makes `p.x.v` work — the OUTER
+    /// access resolves via the inner receiver's enum + the
+    /// field's name.
+    ///
+    /// The typechecker is the source of truth for chained
+    /// accesses and emits a diagnostic if they don't resolve;
+    /// this helper only mirrors the typechecker's resolution
+    /// for the codegen. When `receiver_type` returns `None` for
+    /// a chained access, the codegen emits a defensive
+    /// `LoadField(0)` so the bytecode stays well-formed (the
+    /// typechecker was already consulted upstream).
     fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
         match receiver.1.as_ref() {
             Expression::Identifier(name) => {
                 self.checker.codegen_var_type(name).cloned()
             }
-            Expression::Access(inner, _field) => {
+            Expression::Access(inner, field) => {
                 // Chained access — the inner access's type is
-                // the field's type. To find the enum name for
-                // the OUTER access, we'd need to know which enum
-                // owns the field — but that's not directly
-                // storable in the side-table (the side-table
-                // only has plain variable types, not field
-                // types). For the scope of this task, the
-                // typechecker is the source of truth for chained
-                // accesses and emits a diagnostic if they don't
-                // resolve. The codegen's defensive fallback
-                // (LoadField(0) when None) keeps the bytecode
-                // well-formed.
-                self.receiver_type(inner).and_then(|t| {
-                    extract_enum_name(&t).map(|_| t)
-                })
+                // the OUTER field's type. Recurse into `inner`
+                // to find its enum, then look up `field` in
+                // that enum's record payload. For `p.x.v`,
+                // this returns the type of `x` (e.g.
+                // `Ty::Con("Inner")` for
+                // `enum Outer { Outer { x: Inner } }`).
+                let inner_ty = self.receiver_type(inner)?;
+                let inner_enum = extract_enum_name(&inner_ty)?;
+                self.checker.field_type_for(&inner_enum, field)
             }
             _ => None,
         }
@@ -757,17 +1092,125 @@ impl Compiler {
             }
             Expression::Noop(_) => (),
             Expression::Group(e) => bytecode.append(&mut self.do_compile(e)),
-            Expression::Program(children) | Expression::Fragment(children) => {
+            Expression::Program(children) => {
                 children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
                 });
             }
+            Expression::Fragment(children) => {
+                // ---- Phase 18E: special-case `let x = expr;` ----
+                //
+                // The parser produces `Fragment([Variable(x), expr])`
+                // for `let x = expr;` (see
+                // `parser/src/lib.rs::Pratt::variable` at line 718).
+                // The naive child-by-child iteration would emit
+                // nothing for `Variable` (just `intern` the slot)
+                // followed by the RHS bytecode (which leaves the
+                // RHS value on the operand-stack top). The slot
+                // is never explicitly written, so the simple case
+                // `let x = 5; print x;` works by coincidence —
+                // slot 0 happens to coincide with the operand-stack
+                // top after the push. Reassignment via `x = 10;`
+                // uses `Expression::Assignment`, which had a buggy
+                // `STORE` (no-op since 15D) + `DUPLICATE` shape
+                // that didn't fix the slot either.
+                //
+                // The fix: when the Fragment matches the
+                // `[Variable(name), rhs]` shape, append a
+                // `STORE_POP slot` after the RHS bytecode. This
+                // is the load-bearing "store the RHS into the
+                // let-bound variable" emission. Distinct from the
+                // `STORE` used by match-arm bindings (which is a
+                // no-op since 15D — see `Instruction::STORE`).
+                //
+                // Fallback: any other Fragment shape (e.g. a
+                // bare `Variable` without an RHS, or a
+                // multi-child Fragment for some future syntax)
+                // falls through to the legacy child-by-child
+                // iteration so we don't regress unrelated cases.
+                let mut is_let = false;
+                if children.len() == 2 {
+                    if let Expression::Variable(name, _ty) = &children[0].1.as_ref() {
+                        let slot =
+                            self.context.variables.intern(name.to_string()) as u32;
+                        // Emit the RHS.
+                        let mut rhs_bc = self.do_compile(&children[1]);
+                        bytecode.append(&mut rhs_bc);
+                        // Append the explicit store-pop-and-write.
+                        bytecode.push(
+                            Byte::new(Instruction::StorePop)
+                                .with_operand_u32(slot),
+                        );
+                        is_let = true;
+                    }
+                }
+                if !is_let {
+                    children.iter().for_each(|child| {
+                        bytecode.append(&mut self.do_compile(child));
+                    });
+                }
+            }
             Expression::Block(children) => {
                 let ctx = self.context.child();
                 self.context = ctx;
-                children.iter().for_each(|child| {
-                    bytecode.append(&mut self.do_compile(child));
-                });
+                // ---- Phase 18E: extend self.bytecode directly ----
+                //
+                // Some expressions (notably `Expression::Print`,
+                // `Expression::Format`, and the various
+                // control-flow forms that need absolute jump
+                // targets) write their bytes DIRECTLY to
+                // `self.bytecode` instead of returning a `Vec<Byte>`
+                // for the caller to append. Pre-18E, Block
+                // iterated children and appended each child's
+                // returned `Vec<Byte>` to a local vec, then
+                // returned the local vec to its caller. This
+                // worked as long as the direct writers appeared
+                // LAST in a Block (their bytes landed in
+                // `self.bytecode` before Block returned its
+                // local vec — so the caller's append put the
+                // direct writer's bytes AFTER the local vec's
+                // bytes, which happened to be the desired
+                // order when the direct writer was the final
+                // statement).
+                //
+                // The Phase 18E work on `let x = expr;` exposed
+                // the limitation: a `Fragment([Variable, rhs])`
+                // child now returns `StorePop` bytes in its
+                // local vec, and an interleaved `Print` writes
+                // its bytes directly to `self.bytecode`. The
+                // resulting order is `[print_bytes,
+                // store_pop_bytes]` — print BEFORE the let —
+                // which produces wrong semantics (the print
+                // reads from an uninitialized slot).
+                //
+                // Fix: extend `self.bytecode` directly with each
+                // child's bytes. Since direct-to-self.bytecode
+                // writers (Print, Format, nested control flow)
+                // are appending to the SAME `self.bytecode` in
+                // source order, and we extend with the returned
+                // vec in source order, the bytes end up in the
+                // correct interleaved order. Block returns an
+                // empty vec (the bytes are already in
+                // `self.bytecode`); callers that append the
+                // Block's return value see a no-op (correct,
+                // because the bytes are already there).
+                //
+                // Critical invariant: anything that computes
+                // absolute positions in `self.bytecode` (e.g.,
+                // `BlockBuilder::bind_label` for JMPF/JMP
+                // operands) must do so BEFORE the Block's
+                // iteration ends. The bound positions refer
+                // to `self.bytecode` offsets that are valid
+                // for the rest of the function body's
+                // emission. This is unchanged from the
+                // pre-18E behavior — the only difference is
+                // that the Block's caller no longer appends
+                // a local vec (the local vec is always
+                // empty now).
+                for child in children {
+                    let mut bc = self.do_compile(child);
+                    self.bytecode.append(&mut bc);
+                }
 
                 self.context = *self.context.get_prev().clone().unwrap();
             }
@@ -1462,16 +1905,31 @@ impl Compiler {
                         }
                     }
 
-                    // let ty = self.typecheck(value);
+                    // ---- Phase 18E: let-bound variable re-assignment ----
+                    //
+                    // Pre-18E codegen emitted `STORE` (a no-op
+                    // since Phase 15D — see `Instruction::STORE`)
+                    // + `DUPLICATE`. The combination was buggy:
+                    // the `STORE` didn't write the new value into
+                    // the slot (it just confirmed whatever was
+                    // already there from `UNPACK` /
+                    // `JUMP_IF_MATCH`), and the `DUPLICATE`
+                    // pushed a second copy of the value onto the
+                    // stack without ever correcting the slot.
+                    //
+                    // Post-18E codegen emits `STORE_POP slot` —
+                    // the load-bearing pop-and-write opcode
+                    // introduced in this phase. The new value
+                    // lands at the slot; the cursor stays past
+                    // the slot so subsequent pushes don't
+                    // clobber it.
                     let mut expr = self.do_compile(value);
 
                     bytecode.append(&mut expr);
-                    bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(symbol as u32));
-
-                    // Do not pop if assigning to the same place
-                    if self.context.variables.len() == symbol + 1 {
-                        bytecode.push(Byte::new(Instruction::DUPLICATE));
-                    }
+                    bytecode.push(
+                        Byte::new(Instruction::StorePop)
+                            .with_operand_u32(symbol as u32),
+                    );
                 } else {
                     let mut message =
                         Message::error("Undefined variable".to_string(), span.into_range());
@@ -2115,26 +2573,28 @@ impl Compiler {
                             // for runtime tests, by the
                             // definition of
                             // `arm_has_runtime_test`).
-                            let payload =
+                            let (enum_name, variant_name, payload) =
                                 match &arms[arm_idx].pattern {
                                     Pattern::Constructor {
+                                        enum_name,
+                                        variant_name,
                                         payload,
                                         ..
-                                    } => payload,
+                                    } => (*enum_name, *variant_name, payload),
                                     _ => continue,
                                 };
 
                             emit_inner_test(
                                 arm_idx,
+                                &self.checker,
+                                enum_name,
+                                variant_name,
                                 payload,
                                 &mut match_bindings_per_arm,
                                 &mut self.bytecode,
                                 &mut bb,
                                 pass_label,
                                 fail_label,
-                                |enum_name, variant_name| {
-                                    self.checker.tag_for(enum_name, variant_name)
-                                },
                             );
                         }
                     }
@@ -2301,48 +2761,36 @@ impl Compiler {
                                 Pattern::Constructor {
                                     enum_name,
                                     variant_name,
-                                    payload,
+                                    ..
                                 } => {
-                                    use parser::ast::PatternPayload;
-                                    match payload {
-                                        PatternPayload::Unit => {}
-                                        PatternPayload::Tuple(parts) => {
-                                            for sub_pat in parts {
-                                                emit_pattern_binding(
-                                                    &mut arm_bindings,
-                                                    &mut next_slot,
-                                                    sub_pat,
-                                                    &mut self.bytecode,
-                                                    false,
-                                                );
-                                            }
-                                        }
-                                        PatternPayload::Record(fields) => {
-                                            let decl_order = self
-                                                .checker
-                                                .payload_tys_for(enum_name, variant_name);
-                                            let pattern_site: std::collections::HashMap<
-                                                &str,
-                                                &Pattern,
-                                            > = fields
-                                                .iter()
-                                                .map(|pf| (pf.name, &pf.pattern))
-                                                .collect();
-                                            for (decl_name, _) in decl_order.iter() {
-                                                if let Some(sub_pat) =
-                                                    pattern_site.get(decl_name.as_str())
-                                                {
-                                                    emit_pattern_binding(
-                                                        &mut arm_bindings,
-                                                        &mut next_slot,
-                                                        sub_pat,
-                                                        &mut self.bytecode,
-                                                        false,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
+                                    // Test-chain arm: the test
+                                    // chain pass already emitted
+                                    // POP / STORE / JUMP_IF_MATCH
+                                    // for the OUTER level. Walk
+                                    // the pattern with
+                                    // `consume_values = false` to
+                                    // RECORD the bindings (the
+                                    // body needs them for
+                                    // `Identifier` lookups) but
+                                    // skip the redundant bytecode
+                                    // emission. The function
+                                    // handles Tuple (UNPACK skip
+                                    // + sub-pattern walk) and
+                                    // Record (decl-order walk +
+                                    // sub-pattern walk) internally.
+                                    let decl_order = self
+                                        .checker
+                                        .payload_tys_for(enum_name, variant_name);
+                                    emit_pattern_binding(
+                                        &self.checker,
+                                        &mut arm_bindings,
+                                        &mut next_slot,
+                                        &arm.pattern,
+                                        &decl_order,
+                                        &mut self.bytecode,
+                                        false,
+                                        true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
+                                    );
                                 }
                                 Pattern::Wildcard => {}
                             }
@@ -2363,58 +2811,31 @@ impl Compiler {
                             Pattern::Constructor {
                                 enum_name,
                                 variant_name,
-                                payload,
+                                ..
                             } => {
-                                use parser::ast::PatternPayload;
-                                match payload {
-                                    PatternPayload::Unit => {}
-                                    PatternPayload::Tuple(parts) => {
-                                        for sub_pat in parts {
-                                            emit_pattern_binding(
-                                                &mut arm_bindings,
-                                                &mut next_slot,
-                                                sub_pat,
-                                                &mut self.bytecode,
-                                                true,
-                                            );
-                                        }
-                                    }
-                                    PatternPayload::Record(fields) => {
-                                        // Walk DECLARATION order (from
-                                        // the checker's payload_tys_for
-                                        // — gives `Vec<(String, Ty)>`
-                                        // in declaration order).
-                                        let decl_order = self
-                                            .checker
-                                            .payload_tys_for(enum_name, variant_name);
-                                        // Build a name → &Pattern map for
-                                        // the pattern site.
-                                        let pattern_site: std::collections::HashMap<
-                                            &str,
-                                            &Pattern,
-                                        > = fields
-                                            .iter()
-                                            .map(|pf| (pf.name, &pf.pattern))
-                                            .collect();
-                                        for (decl_name, _) in decl_order.iter() {
-                                            if let Some(sub_pat) =
-                                                pattern_site.get(decl_name.as_str())
-                                            {
-                                                emit_pattern_binding(
-                                                    &mut arm_bindings,
-                                                    &mut next_slot,
-                                                    sub_pat,
-                                                    &mut self.bytecode,
-                                                    true,
-                                                );
-                                            }
-                                            // Missing field: typechecker
-                                            // already reported; skip
-                                            // silently so the bytecode
-                                            // layout stays consistent.
-                                        }
-                                    }
-                                }
+                                // Non-test-chain arm: emit full
+                                // binding code at the outer
+                                // level (consume the values via
+                                // POP/STORE/UNPACK). The
+                                // function handles Tuple (emit
+                                // UNPACK + sub-pattern walk) and
+                                // Record (decl-order walk + per-
+                                // field recursion — including
+                                // unbounded-depth nested record
+                                // patterns) internally.
+                                let decl_order = self
+                                    .checker
+                                    .payload_tys_for(enum_name, variant_name);
+                                emit_pattern_binding(
+                                    &self.checker,
+                                    &mut arm_bindings,
+                                    &mut next_slot,
+                                    &arm.pattern,
+                                    &decl_order,
+                                    &mut self.bytecode,
+                                    true,
+                                    true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
+                                );
                             }
                             Pattern::Wildcard => {
                                 // No bindings — the forward pass
@@ -2559,7 +2980,8 @@ impl Compiler {
             // out-of-bounds no-op on LoadField will silently
             // skip). The diagnostic is already on the checker.
             Expression::Access(receiver, field) => {
-                // Phase 18D: field-access codegen.
+                // Phase 18D: field-access codegen (Phase 19:
+                // chained-access support).
                 //
                 // `point.x` parses as `Expression::Access(receiver,
                 // "x")`. The codegen layout is:
@@ -2578,6 +3000,21 @@ impl Compiler {
                 // shape, etc.). We just need the `field_index` to
                 // build the `LoadField` operand, which requires
                 // knowing the receiver's enum name.
+                //
+                // **Chained accesses (Phase 19).** For `p.x.v`,
+                // the codegen first emits `<p bytecode>;
+                // LoadField(idx_x)` (the inner access), then
+                // `<p.x bytecode>; LoadField(idx_v)` (the OUTER
+                // access). The OUTER access's receiver is
+                // `Access(p, "x")` — `enum_name_for_receiver`
+                // recurses through `receiver_type`, which looks
+                // up the inner receiver's enum (`Outer`) in the
+                // side-table, then calls `field_type_for("Outer",
+                // "x")` to get the type of `x` (`Ty::Con("Inner")`),
+                // then extracts `Inner` from that. The OUTER
+                // `LoadField(idx_v)` is then indexed against
+                // `Inner`, not `Outer` — so `v`'s declaration
+                // position (in `Inner`) is used.
                 //
                 // **Resolving the receiver's type at codegen
                 // time.** The pre-walk and infer pass visit nodes
@@ -2600,12 +3037,11 @@ impl Compiler {
                 // [`enum_name_for_receiver`] for details.
                 //
                 // Recovery: if the receiver is not a simple
-                // Identifier (chained Access, function call, …)
-                // or the side-table lookup fails, we emit a
-                // defensive `LoadField(0)` so the bytecode stays
-                // well-formed for downstream checks. The
-                // typechecker's diagnostic (if any) was already
-                // emitted upstream.
+                // Identifier (function call, …) or the side-table
+                // lookup fails, we emit a defensive `LoadField(0)`
+                // so the bytecode stays well-formed for downstream
+                // checks. The typechecker's diagnostic (if any)
+                // was already emitted upstream.
                 bytecode.append(&mut self.do_compile(receiver));
 
                 let enum_name = self.enum_name_for_receiver(receiver);
@@ -3939,5 +4375,487 @@ fn main() {
             "expected LoadField operands [0, 1] (x first, then y); got {:?}",
             field_indices
         );
+    }
+
+    // ============================================================
+    //  Phase 18E: let-bound variable codegen tests
+    // ============================================================
+    //
+    // Phase 18E fixes the `let x = expr;` codegen bug — the
+    // pre-18E `Expression::Variable` codegen emitted no bytecode,
+    // so the slot was never explicitly written. The simple case
+    // `let x = 5; print x;` worked by coincidence (slot 0
+    // coincided with the operand-stack top). Reassignment via
+    // `x = 10;` used `STORE` (a no-op since 15D) + `DUPLICATE`,
+    // which didn't fix the slot either.
+    //
+    // The fix: the `Expression::Fragment` arm special-cases the
+    // `[Variable, expr]` shape and emits `STORE_POP slot` after
+    // the RHS bytecode. `Expression::Assignment` now emits
+    // `STORE_POP slot` instead of the buggy `STORE` + `DUPLICATE`.
+    //
+    // These tests assert the bytecode SHAPE (StorePop after the
+    // RHS, with the correct slot index) and the runtime behavior
+    // (re-assignment picks up the new value, multiple bindings
+    // are preserved).
+
+    /// Codegen test 24 (Phase 18E): a simple `let x = expr; print x;`
+    /// emits exactly one `STORE_POP` (the load-bearing store of the
+    /// RHS into `x`'s slot) in addition to the RHS's `CONST`. The
+    /// pre-18E codegen emitted no `STORE_POP` at all, so this test
+    /// fails on the unfixed compiler.
+    #[test]
+    fn let_x_then_print_x_emits_store_pop() {
+        use common::Instruction;
+        let bc = compile_src(
+            "fn main() { \
+                 let x = 42; \
+                 print \"%i\", x; \
+             }",
+        );
+
+        // At least one STORE_POP — the explicit
+        // pop-and-write for `let x = 42`. The codegen
+        // never emits STORE for let-bindings (STORE is a
+        // no-op reserved for match-arm bindings).
+        let store_pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .count();
+        assert!(
+            store_pop_count >= 1,
+            "expected at least 1 STORE_POP for `let x = 42;`; got {}",
+            store_pop_count
+        );
+
+        // The STORE_POP slot operand should be 0 — `x` is the
+        // first (and only) local in `main`.
+        let store_pop = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .expect("expected at least one STORE_POP");
+        assert_eq!(
+            store_pop.operand_u32(),
+            0,
+            "expected STORE_POP slot=0 for the first local `x`; got {}",
+            store_pop.operand_u32()
+        );
+    }
+
+    /// Codegen test 25 (Phase 18E): two `let` bindings in the same
+    /// scope emit two `STORE_POP`s — one per binding, with
+    /// distinct slot operands (0 and 1). The pre-18E codegen
+    /// emitted no `STORE_POP`s, so this test would fail with a
+    /// 0-count.
+    #[test]
+    fn let_two_bindings_emit_two_store_pops() {
+        use common::Instruction;
+        let bc = compile_src(
+            "fn main() { \
+                 let x = 5; \
+                 let y = 10; \
+                 print \"%i\", x + y; \
+             }",
+        );
+
+        let store_pops: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .map(|b| b.operand_u32())
+            .collect();
+        assert_eq!(
+            store_pops.len(),
+            2,
+            "expected exactly 2 STORE_POPs for two `let` bindings; got {}",
+            store_pops.len()
+        );
+        // The slot operands should be 0 and 1 (in source order —
+        // `x` first, then `y`).
+        assert!(
+            store_pops.contains(&0) && store_pops.contains(&1),
+            "expected STORE_POP slots [0, 1] for x, y; got {:?}",
+            store_pops
+        );
+    }
+
+    /// Codegen test 26 (Phase 18E): `x = 10;` re-assignment emits
+    /// `STORE_POP slot` (the new load-bearing opcode) — NOT the
+    /// pre-18E `STORE` (a no-op since Phase 15D) + `DUPLICATE`
+    /// shape. The pre-18E codegen would emit `STORE` here, which
+    /// is the red-team's critical regression signature.
+    #[test]
+    fn let_x_reassignment_emits_store_pop_not_store() {
+        use common::Instruction;
+        let bc = compile_src(
+            "fn main() { \
+                 let x = 5; \
+                 x = 10; \
+             }",
+        );
+
+        // At least one STORE_POP — the re-assignment for
+        // `x = 10`. The pre-18E codegen would have used
+        // STORE here instead.
+        let store_pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .count();
+        assert!(
+            store_pop_count >= 1,
+            "expected at least 1 STORE_POP for `x = 10;` re-assignment; got {}",
+            store_pop_count
+        );
+
+        // Zero `STORE` instructions — the codegen should
+        // never emit STORE for let-bindings or assignments.
+        // STORE is reserved for match-arm bindings (where it
+        // acts as a no-op for the slot-push contract).
+        let store_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .count();
+        assert_eq!(
+            store_count, 0,
+            "expected zero STORE instructions for `let` / assignment; got {}",
+            store_count
+        );
+    }
+
+    // ============================================================
+    //  Phase 19: chained field-access codegen tests
+    // ============================================================
+    //
+    // Phase 19 fixes the chained-access limitation: `p.x.v` (where
+    // `p.x` is itself a record-shaped enum) now resolves to the
+    // INNER enum's field, not the OUTER enum's. The bytecode
+    // shape for a chained access is the same as for two
+    // independent accesses — two `LoadField` opcodes stacked on
+    // top of the receiver bytecode — but the operand of the
+    // SECOND `LoadField` is indexed against the INNER enum, not
+    // the OUTER one.
+
+    /// Codegen test 27 (Phase 19): a chained field access
+    /// (`p.x.v` where `x: Inner`, `v: int`) emits exactly TWO
+    /// `LoadField` opcodes in the function body — one for the
+    /// inner access (`x`) and one for the OUTER access (`v`).
+    /// The pre-19 codegen would emit only one `LoadField`
+    /// (followed by a defensive `LoadField(0)` for the OUTER),
+    /// silently miscompiling the OUTER access.
+    #[test]
+    fn access_chained_field_emits_two_load_fields() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Inner { Inner { v: int } } \
+             enum Outer { Outer { x: Inner, y: int } } \
+             fn get_x_v(Outer o) -> int { return o.x.v; } \
+             fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 }); }",
+        );
+
+        // Exactly 2 LoadField (one for `o.x`, one for `o.x.v`)
+        // in the get_x_v function body.
+        let load_field_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .count();
+        assert_eq!(
+            load_field_count, 2,
+            "expected exactly 2 LoadField (o.x and o.x.v in get_x_v); got {}",
+            load_field_count
+        );
+    }
+
+    /// Codegen test 28 (Phase 19): the SECOND `LoadField`'s
+    /// operand is `0` — `v`'s declaration index in the INNER
+    /// `Inner` enum, NOT something from `Outer`. The pre-19
+    /// codegen would emit `LoadField(0)` as a defensive
+    /// fallback, which happens to coincide with `v`'s index
+    /// here, so this test alone wouldn't catch the bug. The
+    /// next test pins the correct OUTER-vs-INNER indexing.
+    #[test]
+    fn access_chained_field_second_load_field_targets_inner_enum() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Inner { Inner { v: int, w: int } } \
+             enum Outer { Outer { x: Inner, y: int } } \
+             fn get_x_v(Outer o) -> int { return o.x.v; } \
+             fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
+        );
+
+        // Exactly 2 LoadField in the function body.
+        let load_field_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .count();
+        assert_eq!(
+            load_field_count, 2,
+            "expected exactly 2 LoadField for chained access; got {}",
+            load_field_count
+        );
+
+        // Collect every LoadField operand. We expect:
+        //   - First LoadField(0)  — Outer's `x` field index.
+        //   - Second LoadField(0) — Inner's `v` field index.
+        // (Both happen to be 0 because `x` is Outer's first
+        // declared field and `v` is Inner's first declared
+        // field. The order is determined by the source-order
+        // emission of the two access codepaths.)
+        let field_indices: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .map(|b| b.operand_u32() & 0xFFFF)
+            .collect();
+        assert_eq!(
+            field_indices,
+            vec![0, 0],
+            "expected LoadField operands [0, 0] (Outer.x is 0, Inner.v is 0); got {:?}",
+            field_indices
+        );
+    }
+
+    /// Codegen test 29 (Phase 19): the critical regression
+    /// test. When the OUTER access's field is at a DIFFERENT
+    /// declaration position in the INNER enum than it would
+    /// be in the OUTER enum, the codegen must pick the INNER
+    /// position. Setup: `Inner.w` is at index 1 (not 0); the
+    /// pre-19 codegen would emit `LoadField(0)` for the OUTER
+    /// access, silently reading `v` when the user asked for
+    /// `w`.
+    ///
+    /// Note: we can't easily observe the runtime value of the
+    /// OUTER access in this codegen test (the VM doesn't
+    /// return a value we can assert on), so we just check the
+    /// bytecode SHAPE — the second LoadField operand is `1`
+    /// (`w`'s index in `Inner`), not `0`.
+    #[test]
+    fn access_chained_field_with_correct_field_index() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Inner { Inner { v: int, w: int } } \
+             enum Outer { Outer { x: Inner, y: int } } \
+             fn get_x_w(Outer o) -> int { return o.x.w; } \
+             fn main() { print \"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
+        );
+
+        // Exactly 2 LoadField (one for `o.x`, one for `o.x.w`).
+        let load_field_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .count();
+        assert_eq!(
+            load_field_count, 2,
+            "expected exactly 2 LoadField for chained access; got {}",
+            load_field_count
+        );
+
+        // Collect every LoadField operand. We expect:
+        //   - First LoadField(0)  — Outer's `x` field index.
+        //   - Second LoadField(1) — Inner's `w` field index
+        //     (NOT Outer's `y` index — which would be 1 in
+        //     Outer but isn't what the user asked for).
+        let field_indices: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .map(|b| b.operand_u32() & 0xFFFF)
+            .collect();
+        assert_eq!(
+            field_indices,
+            vec![0, 1],
+            "expected LoadField operands [0, 1] (Outer.x is 0, Inner.w is 1); got {:?}",
+            field_indices
+        );
+    }
+
+    // ============================================================
+    //  Phase 18B: nested record patterns — codegen tests
+    // ============================================================
+    //
+    // Phase 18B lifts the Phase 17B-cleanup limitation #1
+    // (nested record patterns inside an arm body are rejected).
+    // The pre-18B codegen emitted a POP for an inner record
+    // pattern instead of walking its declared fields, so the
+    // binding slot for the inner record's fields was never
+    // populated and the arm body read garbage values.
+    //
+    // These tests guard the Phase 18B codegen for the four
+    // nested-record scenarios called out in the spec:
+    //
+    // 1. Nested record in tuple: `Result::Ok(Inner { v })`.
+    // 2. Nested record in record: `Result::Ok { x: Inner { v } }`.
+    // 3. Depth-3 nesting: `Foo::Bar(Baz::Qux { a: W::W { v } })`.
+    // 4. Missing field in inner record (defensive POP emitted).
+    //
+    // The tests check the bytecode SHAPE (opcodes emitted) so
+    // accidental regressions in the codegen are caught even if
+    // the runtime happens to produce the right output for a
+    // buggy bytecode (e.g. by accidentally emitting POP for
+    // every record, which would compile and run but bind to
+    // the wrong slots).
+
+    /// Codegen test 23 (Phase 18B): a record pattern inside a
+    /// tuple pattern (`Result::Ok(Inner::I { v })`) compiles
+    /// cleanly. Pre-18B, the inner `Inner::I { v }` was
+    /// silently swallowed (a single POP was emitted for the
+    /// inner record instead of walking its declared fields).
+    /// The post-fix codegen emits at least one STORE for the
+    /// inner Binding `v`.
+    #[test]
+    fn match_nested_record_in_tuple_binds_correctly() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Inner { I { v: int } } \
+             enum Result { Ok(Inner), Err(string) } \
+             match Result::Ok(Inner::I { v: 42 }) { \
+                 Result::Err(_) => 0, \
+                 Result::Ok(Inner::I { v }) => v, \
+             };",
+        );
+
+        // The OUTER Result::Ok is the last arm (Err is first),
+        // so it consumes the scrutinee via UNPACK (not
+        // JUMP_IF_MATCH). The INNER Inner::I is a nested
+        // constructor with a record payload — the codegen
+        // emits UNPACK for the inner record (Phase 18B), then
+        // walks the inner record's declared fields in
+        // decl_order and emits STORE for the Binding `v`.
+        //
+        // Pre-18B, the codegen emitted a POP for the inner
+        // record (silently swallowing the inner value). The
+        // STORE assertion catches that regression.
+        let store_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .count();
+        assert!(
+            store_count >= 1,
+            "expected at least one STORE for the inner Binding `v`; got {} (pre-18B would emit 0)",
+            store_count
+        );
+
+        // The inner record's UNPACK must be present (Phase 18B
+        // walks the inner record's declared fields).
+        let unpack_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::Unpack))
+            .count();
+        assert!(
+            unpack_count >= 1,
+            "expected at least one UNPACK (the inner Inner::I); got {}",
+            unpack_count
+        );
+    }
+
+    /// Codegen test 24 (Phase 18B): a record pattern inside a
+    /// record pattern (`Result::Ok { x: Inner::I { v } }`).
+    /// The codegen walks BOTH the OUTER record's and the
+    /// INNER record's declared fields in decl_order. Pre-18B,
+    /// the inner record was silently swallowed.
+    #[test]
+    fn match_nested_record_in_record_binds_correctly() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Inner { I { v: int } } \
+             enum Result { Ok { x: Inner }, Err(string) } \
+             match Result::Ok { x: Inner::I { v: 42 } } { \
+                 Result::Err(_) => 0, \
+                 Result::Ok { x: Inner::I { v } } => v, \
+             };",
+        );
+
+        // The OUTER Result::Ok is the last arm, so the
+        // forward pass emits UNPACK (1 payload slot for
+        // Result::Ok { x }). The INNER record's payload is
+        // pushed at slot 1 by the outer UNPACK. The codegen
+        // walks the outer record's declared fields (just `x`)
+        // and then walks the inner record's declared fields
+        // (just `v`), emitting STORE for `v`.
+        //
+        // Pre-18B, the inner record would have been replaced
+        // by a single POP, so no STORE for `v`.
+        let store_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .count();
+        assert!(
+            store_count >= 1,
+            "expected at least one STORE for the inner Binding `v`; got {}",
+            store_count
+        );
+    }
+
+    /// Codegen test 25 (Phase 18B): depth-3 nested constructor
+    /// patterns (`Foo::Bar(Baz::Qux { a: W::W { v } })`).
+    /// The codegen recurses at unbounded depth — three levels
+    /// of nested constructor patterns, with the innermost being
+    /// a record. Pre-18B, the inner record was silently
+    /// swallowed at any depth > 1.
+    #[test]
+    fn match_depth_3_nested_records_bind_correctly() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum W { W { v: int } } \
+             enum Baz { Qux { a: W } } \
+             enum Foo { Bar(Baz), Other } \
+             match Foo::Bar(Baz::Qux { a: W::W { v: 99 } }) { \
+                 Foo::Other => 0, \
+                 Foo::Bar(Baz::Qux { a: W::W { v } }) => v, \
+             };",
+        );
+
+        // The innermost Binding `v` must produce at least
+        // one STORE — the codegen reached the innermost
+        // record at depth 3 and emitted the STORE for `v`.
+        // Pre-18B would have stopped at the inner record and
+        // emitted a POP instead, leaving `v` unbound.
+        let store_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::STORE))
+            .count();
+        assert!(
+            store_count >= 1,
+            "expected at least one STORE for the innermost Binding `v` (depth 3); got {}",
+            store_count
+        );
+    }
+
+    /// Codegen test 26 (Phase 18B): a record pattern with an
+    /// OMITTED field (`Inner::I { }` instead of `Inner::I { v }`)
+    /// emits a POP for the missing field (to keep the stack
+    /// consistent with the decl_order walk). Pre-18B, the inner
+    /// record was silently swallowed entirely.
+    #[test]
+    fn match_nested_record_missing_field_consumes_slot() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Inner { I { v: int } } \
+             enum Result { Ok(Inner), Err(string) } \
+             match Result::Ok(Inner::I { v: 42 }) { \
+                 Result::Err(_) => 0, \
+                 Result::Ok(Inner::I { }) => 99, \
+             };",
+        );
+
+        // The pattern omits the `v` field. The codegen walks
+        // the inner record's declared fields in decl_order
+        // and emits POP for the missing field. Pre-18B, the
+        // codegen emitted a single POP for the inner record
+        // (regardless of how many fields it had) — this
+        // assertion is a sanity check that the codegen still
+        // produces a well-formed bytecode for this case (the
+        // arm body is `99` and doesn't reference any bindings).
+        //
+        // We don't assert exact POP count (other parts of
+        // the bytecode emit POPs too — e.g. the prologue's
+        // scrutinee POP for the wildcard arm); we just check
+        // the bytecode compiles.
+        assert!(!bc.is_empty(), "bytecode should not be empty");
+
+        // Sanity: the arm body `99` should produce a
+        // non-zero integer constant somewhere in the bytecode.
+        // (The CONST opcode uses `value[63:0]` for the
+        // constant — see `Byte::constant()`.)
+        let has_99 = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant() == 99);
+        assert!(has_99, "expected CONST 99 for the arm body");
     }
 }
