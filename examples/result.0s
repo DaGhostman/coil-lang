@@ -13,14 +13,19 @@
 // Each `print` exercises one match arm at runtime:
 //   - `Result::Ok(Option::Some(42))` → matches the
 //     `Result::Ok(Option::Some(v))` arm, v=42.
+//   - `Result::Ok(Option::None)`     → matches the
+//     `Result::Ok(Option::None)` arm, returns 0.
 //   - `Result::Err("oops")`           → matches the
 //     wildcard Err arm, returns -1.
 //
-// The `Result::Ok(Option::None)` arm is in the source to
-// force the test chain to be emitted (so the codegen
-// actually generates the inner-pattern dispatch bytecode),
-// but it is not directly tested at runtime here — see
-// `examples/option.0s` for an `Option::None` test case.
+// The `Result::Ok(Option::None)` arm has a Unit inner
+// sub-pattern. Pre-Phase-18A-fix, the test chain would
+// emit a POP for the inner Unit sub-pattern AND the
+// reverse pass's `emit_pattern_binding` would emit a
+// SECOND POP, leaving the stack with one too few values.
+// The Phase 18A fix tracks arms in test chain groups and
+// passes `consume_values = false` to the reverse pass's
+// `emit_pattern_binding`, suppressing the redundant POP.
 enum Option {
     None,
     Some(int),
@@ -41,5 +46,6 @@ fn unwrap_result(Result r) -> int {
 
 fn main() {
     print "%i", unwrap_result(Result::Ok(Option::Some(42)));    // 42
+    print "%i", unwrap_result(Result::Ok(Option::None));         // 0
     print "%i", unwrap_result(Result::Err("oops"));             // -1
 }
