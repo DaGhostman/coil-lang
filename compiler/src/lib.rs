@@ -1,4 +1,5 @@
 mod block_builder;
+pub mod cfg;
 mod pipeline;
 mod typechecking;
 
