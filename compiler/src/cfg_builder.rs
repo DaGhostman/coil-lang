@@ -269,9 +269,39 @@ impl Builder {
             ),
         };
 
+        self.build_function_from_parts(name, args.1.as_ref(), body.1.as_ref())
+    }
+
+    /// Build a CFG [`Function`] from the function's `name`, `args`,
+    /// and `body` directly, without requiring an
+    /// [`Expression::Function`] wrapper.
+    ///
+    /// ## Phase 0.3 integration
+    ///
+    /// The compiler's [`do_compile`](crate::Compiler::do_compile) uses
+    /// this entry point to integrate the CFG path with the existing
+    /// single-pass codegen. It destructures the original
+    /// `Expression::Function` arm and forwards the fields directly,
+    /// avoiding the cost of cloning `args` and `body` to synthesize a
+    /// new `Expression::Function` wrapper.
+    ///
+    /// `args` is expected to be an [`Expression::Fragment`] of
+    /// [`Expression::Argument`] children; `body` is the function body
+    /// (typically an [`Expression::Block`]).
+    ///
+    /// The semantics are IDENTICAL to [`Builder::build_function`]
+    /// when called on an `Expression::Function` with the same fields.
+    /// Splitting the entry point is purely a convenience for the
+    /// codegen integration.
+    pub fn build_function_from_parts<'a>(
+        &mut self,
+        name: &'a str,
+        args: &Expression<'a>,
+        body: &Expression<'a>,
+    ) -> Function {
         // 1. Extract parameters from `args`. `args` is a
         //    `Fragment` of `Argument(ty, name)` nodes.
-        if let Expression::Fragment(children) = args.1.as_ref() {
+        if let Expression::Fragment(children) = args {
             for (i, child) in children.iter().enumerate() {
                 if let Expression::Argument(_ty, param_name) = child.1.as_ref() {
                     let v = self.fresh_value();
@@ -317,8 +347,7 @@ impl Builder {
         //    The body's return value (if any) is accumulated in
         //    `self.return_value` via the Return / ImplicitReturn
         //    arms.
-        let body_inner = body.1.as_ref();
-        self.build_expression(body_inner);
+        self.build_expression(body);
 
         // 5. Set the entry block's terminator. If the body hit a
         //    `Return` or `ImplicitReturn`, use that value;
