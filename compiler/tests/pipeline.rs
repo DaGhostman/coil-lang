@@ -558,3 +558,41 @@ fn example_nested_records_prints_99() {
     let output = run_example("examples/nested_records.0s");
     assert_eq!(output, "99");
 }
+
+// ============================================================
+//  Phase 0.4: CFG path integration — golden regression test
+// ============================================================
+
+/// Phase 0.4 golden test — `examples/cfg_smoke.0s` exercises
+/// the multi-pass CFG path (`cfg_builder` + `linearize`) at
+/// runtime.
+///
+/// The example declares two straight-line arithmetic helpers
+/// (`add` and `double`) and a `main` that prints both results.
+/// The conservative [`is_straight_line`](../../compiler/src/lib.rs)
+/// detector in the compiler routes `add` and `double` through
+/// the new CFG path; `main` falls back to the existing
+/// single-pass path because it contains `Print` and `Call`
+/// (both flagged as "not straight-line" by the detector).
+///
+/// Verified in debug builds by the
+/// `[cfg-path] function \`add\` compiled via CFG (4 bytes)`
+/// and `[cfg-path] function \`double\` compiled via CFG
+/// (4 bytes)` log lines emitted from
+/// `try_compile_function_via_cfg`. Each CFG-path function
+/// produces 4 bytes: `LOAD 0, LOAD 1, ADD/ADDF, RETURN`.
+///
+/// The pre-Phase-0.4 codegen would have produced the same
+/// 4 bytes for these helpers via the existing single-pass
+/// path, so the test guards against any future regression
+/// where the CFG path produces wrong bytecode (e.g.,
+/// operand order swapped, missing `RETURN`, or partial
+/// evaluation of the arithmetic expression).
+///
+/// Expected output (two `print "%u"` statements, no
+/// trailing newline): `"7"` (3+4) + `"42"` (21×2) = `"742"`.
+#[test]
+fn example_cfg_smoke_prints_7_and_42() {
+    let output = run_example("examples/cfg_smoke.0s");
+    assert_eq!(output, "742");
+}

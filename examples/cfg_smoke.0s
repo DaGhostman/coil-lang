@@ -1,0 +1,27 @@
+// Straight-line arithmetic helpers used to exercise the
+// multi-pass CFG path (Phase 0.4).
+//
+// Both `add` and `double` are pure straight-line functions
+// (no control flow, no Print/Format/Call/Construct/Access,
+// no Assignment/Defer) — the conservative
+// [`is_straight_line`](../../compiler/src/lib.rs) detector
+// in the compiler routes them through the cfg_builder +
+// linearize pipeline. `main` calls into both helpers and
+// prints the results, exercising the fallback single-pass
+// path for the print statement and the call site itself.
+//
+// Expected output (two print statements, no trailing
+// newline): "7" (3+4) + "42" (21*2) = "742".
+
+fn add(int a, int b) -> int {
+    return a + b;
+}
+
+fn double(int x) -> int {
+    return x * 2;
+}
+
+fn main() {
+    print "%u", add(3, 4);
+    print "%u", double(21);
+}
