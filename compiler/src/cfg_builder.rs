@@ -3,10 +3,11 @@
 //! Walks a typed AST and produces a CFG [`Function`]. Phase 0.2a
 //! scope: **straight-line expressions only**. Control flow
 //! ([`Expression::If`], [`Expression::Loop`], [`Expression::Match`],
-//! [`Expression::Branch`]) is deferred to Phase 1, when the builder
-//! will learn to split blocks, allocate fresh block IDs, and emit
-//! [`Terminator::Branch`] / [`Terminator::Switch`] instead of the
-//! trivial [`Terminator::Return`] produced today.
+//! [`Expression::Branch`]) is handled by the Phase 1.x refactor:
+//! the builder now splits blocks, allocates fresh block IDs, and
+//! emits [`Terminator::Branch`] / [`Terminator::Jump`] /
+//! [`Terminator::Switch`] instead of the trivial
+//! [`Terminator::Return`] produced for straight-line code.
 //!
 //! ## Design
 //!
@@ -72,26 +73,55 @@
 //! Variants not listed are no-ops (return `None`) or panics
 //! (control-flow variants, which are explicit Phase 1 work).
 //!
-//! ## Deferred to Phase 1
+//! ## Deferred to Phase 1+
 //!
-//! - `If`, `Branch` — need `Terminator::Branch` and split blocks.
-//! - `Loop` — need a back-edge and `Terminator::Branch`.
-//! - `Match` — need `Terminator::Switch` and per-arm blocks.
-//! - Multi-block predecessors — `fill_predecessors` is structured to
-//!   handle this but is trivial for the single-block case produced
-//!   today.
+//! - `Expression::Match` pattern bindings (e.g., `Some(v) => v`
+//!   binding `v` to the scrutinee's first payload). Phase 1.3
+//!   accepts `Constructor` patterns but does not emit binding
+//!   code; the body sees whatever the scrutinee evaluation
+//!   produced. Full binding support is Phase 1.4+ work.
 
 use std::collections::HashMap;
 
-// `MatchArm` and `Pattern` are imported for Phase 1 work
-// (`Expression::Match` arm) that's deferred; silencing the
-// unused-import warning keeps the Phase 0.2a diff minimal.
-#[allow(unused_imports)]
 use parser::ast::{Expression, MatchArm, Output, Pattern};
 
 use crate::cfg::{
     BinOpKind, Block, BlockId, Function, Inst, Terminator, TypeRef, UnaryOpKind, ValueId,
 };
+
+/// Compute a placeholder tag for a `(enum_name, variant_name)`
+/// pair using FNV-1a 32-bit hashing.
+///
+/// This is a **Phase 1.3 placeholder**. The real tag resolution
+/// comes from the typechecker's `tag_for` helper (see
+/// `compiler/src/typechecking/infer.rs`), which uses
+/// source-declaration order. The FNV-1a hash is deterministic
+/// and 32-bit but does NOT match the real tag values; it's only
+/// used to populate the `cases` vector with non-zero placeholder
+/// tags so the Switch terminator is well-formed. The linearizer
+/// (Phase 1.3+ codegen) will replace these with real tags.
+///
+/// Collisions are possible across different enum/variant
+/// combinations but are extremely unlikely for typical program
+/// sizes (the hash space is 2^32). The linearizer's
+/// post-processing handles any collisions in the real
+/// implementation.
+fn hash_variant(enum_name: &str, variant_name: &str) -> u32 {
+    let mut hash: u32 = 2166136261; // FNV-1a 32-bit offset basis
+    for byte in enum_name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619); // FNV-1a 32-bit prime
+    }
+    for byte in b"::".iter().copied() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    for byte in variant_name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
 
 /// Builds a CFG [`Function`] by walking a typed AST.
 ///
@@ -823,12 +853,13 @@ impl Builder {
 
             // ---- Phase 1: control flow ----
             //
-            // `If` (Phase 1.0) and `Loop` (Phase 1.1) are the
-            // control-flow variants currently implemented. Both
-            // produce multi-block CFGs with `Branch` / `Jump`
-            // terminators — see the `build_if` and `build_while`
-            // helpers below for the block structure. `Match`
-            // remains deferred to Phase 1.3.
+            // `If` (Phase 1.0), `Loop` (Phase 1.1), and `Match`
+            // (Phase 1.3) are the control-flow variants
+            // currently implemented. All produce multi-block
+            // CFGs with `Branch` / `Jump` / `Switch` terminators
+            // — see the `build_if`, `build_while`, and
+            // `build_match` helpers below for the block
+            // structure.
             //
             // `Branch` is a helper variant that ONLY appears as a
             // child of `If`. If it appears at the top level (out
@@ -852,10 +883,9 @@ impl Builder {
                 iterable,
                 body,
             } => self.build_while(iterable.1.as_ref(), body.1.as_ref()),
-            Expression::Match { .. } => panic!(
-                "cfg_builder::build_expression: `match` is not \
-                 implemented in Phase 1.1 (deferred to Phase 1.3+)"
-            ),
+            Expression::Match { scrutinee, arms } => {
+                self.build_match(scrutinee.1.as_ref(), arms)
+            }
 
             // ---- Function-in-function ----
             //
@@ -1258,6 +1288,241 @@ impl Builder {
         None
     }
 
+    /// Build a multi-block CFG for a `match` expression
+    /// ([`Expression::Match`]). Each arm's body becomes its own
+    /// basic block; the current (entry) block is terminated with
+    /// a [`Terminator::Switch`]; all arms Jump to a fresh join
+    /// block where execution continues after the match.
+    ///
+    /// ## Block structure
+    ///
+    /// For `match scrutinee { Arm0 => body0, Arm1 => body1 }`:
+    ///
+    /// ```text
+    /// [match_block]     ...evaluate scrutinee...
+    ///                   Switch scrutinee → [(tag0, arm0_block)],
+    ///                                   default: arm1_block
+    ///
+    /// [arm0_block]      ...body0...
+    ///                   Jump join_block
+    ///
+    /// [arm1_block]      ...body1...
+    ///                   Jump join_block     (default arm — last arm)
+    ///
+    /// [join_block]      ...continuation...
+    /// ```
+    ///
+    /// For an N-arm match, there are N+2 blocks (match_block,
+    /// N arm_blocks, join_block). The LAST arm is ALWAYS the
+    /// `default` target of the Switch — this matches the
+    /// existing single-pass codegen's "last arm is reached by
+    /// fall-through" behavior (see `compiler/src/lib.rs`'s Match
+    /// arm, line 2373).
+    ///
+    /// ## Block ID assignment
+    ///
+    /// `self.blocks` is a `Vec<Block>` indexed by `BlockId`. We
+    /// allocate and push blocks in `BlockId` order so that
+    /// `self.blocks[i].id == BlockId(i)`. This is what makes
+    /// `self.current_block_mut()` correct (it indexes
+    /// `self.blocks[self.current.index()]`).
+    ///
+    /// Block ID assignment for a 2-arm match:
+    ///
+    /// | BlockId | Role                          |
+    /// |---------|-------------------------------|
+    /// | 0       | match_block (entry, already pushed) |
+    /// | 1       | arm_0                         |
+    /// | 2       | arm_1 (default — last arm)    |
+    /// | 3       | join_block                    |
+    ///
+    /// For an N-arm match, arm_blocks get BlockIds 1..=N and
+    /// join_block gets BlockId N+1.
+    ///
+    /// ## Pattern support (Phase 1.3)
+    ///
+    /// - `Constructor(Enum::Variant(args))` — non-last arms
+    ///   become Switch cases (tag from `hash_variant`, a
+    ///   placeholder; the linearizer resolves real tags via the
+    ///   typechecker's `tag_for` helper in a future phase).
+    ///   Last-arm constructors are accepted but their tag is
+    ///   silently dropped (the Switch's default catches them).
+    /// - `Wildcard` — must be the LAST arm (the default). Wildcard
+    ///   as a non-last arm is malformed and panics.
+    /// - `Binding` — must be the LAST arm (the default). Binding
+    ///   as a non-last arm is malformed and panics.
+    /// - Nested constructor patterns (`Some(Some(v))`, record
+    ///   patterns, etc.) — accepted but the payload binding is
+    ///   silently dropped. Phase 1.4+ will emit binding code.
+    ///
+    /// ## Value handling
+    ///
+    /// Returns `None`. Match expressions as values would require
+    /// phi-nodes at the join (the value depends on which arm
+    /// was taken); SSA-lite punts on this. Users can use
+    /// let-bindings or statement-form `match` to handle values.
+    ///
+    /// ## Phase 1.3 limitations
+    ///
+    /// - Returns in arm bodies are tracked via
+    ///   `self.return_value` but the arm's terminator is still
+    ///   overwritten with `Jump(join_block)`. Same known
+    ///   limitation as `build_if`'s branches and `build_while`'s
+    ///   body. Phase 1.4+ can lift this.
+    /// - Tag resolution is placeholder (FNV-1a hash, not real
+    ///   position-based tags from the typechecker). The linearizer
+    ///   needs the typechecker's enum registry to produce real
+    ///   tags.
+    /// - Constructor pattern bindings (`Some(v) => ...`) are
+    ///   silently dropped. Phase 1.4+ will emit binding code.
+    fn build_match<'a>(
+        &mut self,
+        scrutinee: &Expression<'a>,
+        arms: &[MatchArm<'a>],
+    ) -> Option<ValueId> {
+        // Defensive: empty Match is malformed (the parser doesn't
+        // produce one). No-op to keep the builder non-panicking
+        // for malformed ASTs.
+        if arms.is_empty() {
+            return None;
+        }
+
+        // 1. Allocate blocks for each arm and the join. We push
+        //    them in source order so BlockId assignment is
+        //    predictable: arm_blocks get BlockIds 1..=N, join
+        //    gets BlockId N+1.
+        let arm_blocks: Vec<BlockId> =
+            arms.iter().map(|_| self.fresh_block()).collect();
+        let join_block = self.fresh_block();
+
+        // Push the arm blocks (in source order), then the join
+        // block. After this loop, `self.blocks[i].id ==
+        // BlockId(i)` holds for the new blocks (the entry
+        // block at BlockId(0) was already pushed by
+        // `build_function_from_parts`).
+        for ab in &arm_blocks {
+            self.blocks.push(Block::new(*ab));
+        }
+        self.blocks.push(Block::new(join_block));
+
+        // 2. Evaluate the scrutinee in the current block (the
+        //    entry block — `self.current` is unchanged from
+        //    `build_function_from_parts`'s assignment). If the
+        //    scrutinee fails to produce a value (defensive
+        //    recovery — the typechecker should ensure the
+        //    scrutinee has a value), substitute a fresh ValueId.
+        //    The linearizer may emit undefined-value diagnostics
+        //    in this corner case.
+        let scrut_v = self
+            .build_expression(scrutinee)
+            .unwrap_or_else(|| self.fresh_value());
+
+        // 3. Classify each arm's pattern into a Switch case or
+        //    default.
+        //
+        //    Phase 1.3 strategy:
+        //    - Non-last arms: must be `Constructor` → Switch case
+        //      with a placeholder FNV-1a tag. `Wildcard` or
+        //      `Binding` in a non-last position is malformed and
+        //      panics.
+        //    - Last arm: always the default, regardless of its
+        //      pattern (`Constructor`, `Wildcard`, or `Binding`).
+        //      For `Constructor` last arms, the tag is dropped
+        //      (the Switch's default catches any non-matching
+        //      tag, including the last arm's own tag).
+        let mut cases: Vec<(u32, BlockId)> = Vec::new();
+
+        for (i, arm) in arms.iter().enumerate() {
+            let arm_block = arm_blocks[i];
+            let is_last = i + 1 == arms.len();
+
+            match &arm.pattern {
+                Pattern::Wildcard => {
+                    if !is_last {
+                        panic!(
+                            "cfg_builder::build_match: Wildcard \
+                             pattern must be the LAST arm (got \
+                             arm {})",
+                            i
+                        );
+                    }
+                    // Wildcard as last arm → default (no case
+                    // needed).
+                }
+                Pattern::Binding { .. } => {
+                    if !is_last {
+                        panic!(
+                            "cfg_builder::build_match: Binding \
+                             pattern must be the LAST arm (got \
+                             arm {})",
+                            i
+                        );
+                    }
+                    // Binding as last arm → default (no case
+                    // needed). Note: actually binding `name` to
+                    // the scrutinee requires `STORE` code, which
+                    // is Phase 1.4+ work. For Phase 1.3, the
+                    // binding is accepted but the binding code
+                    // is silently dropped.
+                }
+                Pattern::Constructor {
+                    enum_name,
+                    variant_name,
+                    payload: _,
+                } => {
+                    if !is_last {
+                        let tag = hash_variant(enum_name, variant_name);
+                        cases.push((tag, arm_block));
+                    }
+                    // Constructor as last arm → default (no case
+                    // needed). The tag is dropped; the Switch's
+                    // default catches this arm's tag at runtime.
+                    // Note: this means runtime dispatch would
+                    // incorrectly route the last arm's tag to
+                    // the default block (it IS the default, so
+                    // this is correct in this simple scheme).
+                }
+            }
+        }
+
+        let last_arm_block = arm_blocks[arms.len() - 1];
+
+        // 4. Set the Switch terminator on the current block
+        //    (the match_block / entry block). The previous
+        //    `Unreachable` placeholder terminator is overwritten.
+        self.current_block_mut().terminator = Terminator::Switch {
+            scrutinee: scrut_v,
+            cases,
+            default: last_arm_block,
+        };
+
+        // 5. Build each arm's body in its own block.
+        //
+        //    TODO (Phase 1.4+): emit pattern-binding code
+        //    (e.g., `STORE` for `Some(v) => v`'s `v` binding).
+        //    For Phase 1.3 we accept `Constructor` patterns but
+        //    do not emit binding code; the body sees whatever
+        //    the scrutinee evaluation produced (the runtime
+        //    semantics are not yet correct for constructor
+        //    pattern bindings — Phase 1.4+ will fix this).
+        for (i, arm) in arms.iter().enumerate() {
+            let arm_block = arm_blocks[i];
+            self.current = arm_block;
+            let _body_value = self.build_expression(arm.body.1.as_ref());
+            self.current_block_mut().terminator =
+                Terminator::Jump(join_block);
+        }
+
+        // 6. Continue in the join block. Subsequent code
+        //    (anything after the match in the parent block)
+        //    lands here.
+        self.current = join_block;
+
+        // Match expressions as values return None (phi-node
+        // deferral).
+        None
+    }
+
     /// Fill in the `predecessors` field of every block by walking
     /// each block's terminator. For Phase 0.2a this is trivial
     /// (single block with `Terminator::Return` has no successors),
@@ -1539,6 +1804,60 @@ mod tests {
             identifier: None,
             iterable: e(cond),
             body: e(body),
+        }
+    }
+
+    /// Build a `match` AST node: `match scrutinee { pat => body, ... }`.
+    /// Wraps the scrutinee in an `Output` and produces the
+    /// `Expression::Match` variant. The arms are pre-built via
+    /// [`match_arm`].
+    fn match_expr(
+        scrutinee: Expression<'static>,
+        arms: Vec<MatchArm<'static>>,
+    ) -> Expression<'static> {
+        Expression::Match {
+            scrutinee: e(scrutinee),
+            arms,
+        }
+    }
+
+    /// Build a single `MatchArm` AST node: `pattern => body`. The
+    /// body is wrapped in an `Output`.
+    fn match_arm(
+        pattern: Pattern<'static>,
+        body: Expression<'static>,
+    ) -> MatchArm<'static> {
+        MatchArm {
+            pattern,
+            body: e(body),
+        }
+    }
+
+    /// Build a wildcard pattern `_`.
+    fn wildcard_pattern() -> Pattern<'static> {
+        Pattern::Wildcard
+    }
+
+    /// Build a binding pattern `name`. The name is stored but the
+    /// binding code (Phase 1.4+) is not yet emitted by the
+    /// builder.
+    fn binding_pattern(name: &'static str) -> Pattern<'static> {
+        Pattern::Binding { name }
+    }
+
+    /// Build a constructor pattern `EnumName::VariantName` with a
+    /// `Unit` payload. Tuple and Record payloads are deferred
+    /// (Phase 1.4+); this helper covers the common case
+    /// `Option::None` / `Option::Some` (used as a Unit pattern
+    /// for these tests since we don't bind the payload).
+    fn constructor_pattern(
+        enum_name: &'static str,
+        variant_name: &'static str,
+    ) -> Pattern<'static> {
+        Pattern::Constructor {
+            enum_name,
+            variant_name,
+            payload: parser::ast::PatternPayload::Unit,
         }
     }
 
@@ -3065,5 +3384,520 @@ mod tests {
             vec![header_id],
             "exit block should have header as sole predecessor"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Match expressions (Phase 1.3)
+    //
+    // The builder produces a multi-block CFG with a `Switch`
+    // terminator on the entry block. Each arm gets its own
+    // block; the last arm is the Switch's `default` target; all
+    // arms Jump to a join block.
+    //
+    // Pattern support for Phase 1.3:
+    //   - `Constructor(Enum::Variant(args))` — non-last arms
+    //     become Switch cases (tag from placeholder FNV-1a
+    //     hash). Last-arm constructors become the default.
+    //   - `Wildcard` — must be the LAST arm (default).
+    //   - `Binding` — must be the LAST arm (default). Binding
+    //     code is silently dropped (Phase 1.4+).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_match_two_arms_produces_four_blocks() {
+        // `fn f(int x) -> int {
+        //     match x { Some => return 1; None => return 0; }
+        // }`
+        //
+        // Block structure for a 2-arm match:
+        //   0 (match_block):  Param(x → v0), Switch scrutinee=v0,
+        //                     [Some_tag → arm_0], default=arm_1
+        //   1 (arm_0):        Const(1) → v1, Jump(3)
+        //   2 (arm_1, default): Const(0) → v2, Jump(3)
+        //   3 (join):         Return(None)
+        //
+        // Note: the scrutinee `x` is just an Identifier lookup,
+        // so no extra instruction is emitted for it. The Switch's
+        // scrutinee operand is the existing v0.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        constructor_pattern("Option", "Some"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // 4 blocks: match + arm_0 + arm_1 (default) + join.
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks for 2-arm match, got {}",
+            cfg.blocks.len()
+        );
+
+        // BlockId roles (assigned in push order):
+        //   0 = match_block, 1 = arm_0, 2 = arm_1 (default),
+        //   3 = join_block.
+        assert_eq!(cfg.blocks[0].id, BlockId(0), "match_block id");
+        assert_eq!(cfg.blocks[1].id, BlockId(1), "arm_0 id");
+        assert_eq!(cfg.blocks[2].id, BlockId(2), "arm_1 id");
+        assert_eq!(cfg.blocks[3].id, BlockId(3), "join_block id");
+    }
+
+    #[test]
+    fn build_match_uses_switch_terminator_with_one_case() {
+        // 2-arm match with constructor patterns. The Switch
+        // terminator should have:
+        //   - cases = [(Some_tag, arm_0)]
+        //   - default = arm_1 (the last arm)
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        constructor_pattern("Option", "Some"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Find the match block (the one with Switch terminator).
+        let match_block = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Switch { .. }))
+            .expect("expected a Switch terminator on the match block");
+
+        // match_block should be BlockId(0) (the entry).
+        assert_eq!(
+            match_block.id,
+            BlockId(0),
+            "match_block should be the entry (BlockId 0)"
+        );
+
+        match &match_block.terminator {
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+            } => {
+                // The scrutinee is `x`, which is the Param
+                // (ValueId(0)).
+                assert_eq!(
+                    *scrutinee, ValueId(0),
+                    "scrutinee should be x's ValueId (v0)"
+                );
+                // Exactly one case (the first arm — Some).
+                assert_eq!(
+                    cases.len(),
+                    1,
+                    "expected 1 case (first arm only)"
+                );
+                // The case target should be arm_0 (BlockId(1)).
+                assert_eq!(
+                    cases[0].1,
+                    BlockId(1),
+                    "first case target should be arm_0 (BlockId 1)"
+                );
+                // The default should be arm_1 (BlockId(2)) —
+                // the last arm.
+                assert_eq!(
+                    *default,
+                    BlockId(2),
+                    "default should be arm_1 (BlockId 2)"
+                );
+            }
+            other => panic!(
+                "expected Switch terminator on match block, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn build_match_arms_end_with_jump_to_join() {
+        // After the Switch, both arm blocks should end with
+        // Jump(join_block) — the canonical threaded-code layout.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        constructor_pattern("Option", "Some"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // arm_0 (BlockId 1) and arm_1 (BlockId 2) should both
+        // Jump to join_block (BlockId 3).
+        assert!(
+            matches!(&cfg.blocks[1].terminator, Terminator::Jump(bb) if *bb == BlockId(3)),
+            "arm_0 should Jump to join_block (BlockId 3), got {:?}",
+            cfg.blocks[1].terminator
+        );
+        assert!(
+            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(3)),
+            "arm_1 should Jump to join_block (BlockId 3), got {:?}",
+            cfg.blocks[2].terminator
+        );
+
+        // Join block (BlockId 3) should have Return terminator
+        // (no continuation code after the match).
+        assert!(
+            matches!(&cfg.blocks[3].terminator, Terminator::Return(_)),
+            "join_block should have Return terminator, got {:?}",
+            cfg.blocks[3].terminator
+        );
+    }
+
+    #[test]
+    fn build_match_wildcard_as_last_arm_is_default() {
+        // `match x { Some(_) => return 1; _ => return 0; }`
+        //
+        // Block structure:
+        //   0 (match_block):  Param(x → v0), Switch scrutinee=v0,
+        //                     [Some_tag → arm_0], default=arm_1
+        //   1 (arm_0):        Const(1) → v1, Jump(3)
+        //   2 (arm_1, _):     Const(0) → v2, Jump(3)
+        //   3 (join):         Return(None)
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        constructor_pattern("Option", "Some"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        wildcard_pattern(),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // 4 blocks: match + arm_0 + wildcard_arm + join.
+        assert_eq!(cfg.blocks.len(), 4);
+
+        // Switch should have 1 case (Some) and the default
+        // should be the wildcard arm (BlockId(2)).
+        let match_block = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Switch { .. }))
+            .unwrap();
+        match &match_block.terminator {
+            Terminator::Switch { cases, default, .. } => {
+                assert_eq!(
+                    cases.len(),
+                    1,
+                    "expected 1 case (the Some arm)"
+                );
+                assert_eq!(
+                    *default,
+                    BlockId(2),
+                    "default should be the wildcard arm (BlockId 2)"
+                );
+            }
+            other => panic!("expected Switch terminator, got {:?}", other),
+        }
+
+        // The wildcard arm should be BlockId(2) and should
+        // contain Const(0) (the `return 0` body).
+        let wildcard_arm = &cfg.blocks[2];
+        assert!(
+            wildcard_arm
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Const { value: 0, .. })),
+            "wildcard arm should contain Const(0)"
+        );
+    }
+
+    #[test]
+    fn build_match_single_arm_has_no_cases() {
+        // `fn f(int x) -> int { match x { _ => return 0; } }`
+        //
+        // A single Wildcard arm — the degenerate case. The Switch
+        // has 0 cases (no constructor arms) and the default is
+        // the single arm.
+        //
+        // Block structure:
+        //   0 (match_block):  Param(x → v0), Switch scrutinee=v0,
+        //                     [], default=arm_0
+        //   1 (arm_0, _):     Const(0) → v1, Jump(2)
+        //   2 (join):         Return(None)
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![match_arm(
+                    wildcard_pattern(),
+                    block(vec![stmt(ret(int(0)))]),
+                )],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // 3 blocks: match + arm_0 + join.
+        assert_eq!(
+            cfg.blocks.len(),
+            3,
+            "expected 3 blocks for single-arm match, got {}",
+            cfg.blocks.len()
+        );
+
+        // Switch has 0 cases and default is arm_0 (BlockId(1)).
+        match &cfg.blocks[0].terminator {
+            Terminator::Switch { cases, default, .. } => {
+                assert_eq!(
+                    cases.len(),
+                    0,
+                    "expected 0 cases for single Wildcard arm"
+                );
+                assert_eq!(
+                    *default,
+                    BlockId(1),
+                    "default should be the single arm (BlockId 1)"
+                );
+            }
+            other => panic!("expected Switch terminator, got {:?}", other),
+        }
+
+        // arm_0 Jumps to join_block (BlockId(2)).
+        assert!(
+            matches!(&cfg.blocks[1].terminator, Terminator::Jump(bb) if *bb == BlockId(2)),
+            "arm_0 should Jump to join_block (BlockId 2)"
+        );
+    }
+
+    #[test]
+    fn build_match_predecessors_are_filled_correctly() {
+        // 2-arm match: the predecessor pass should fill:
+        //   match_block (0): []      (entry, no predecessors)
+        //   arm_0 (1):        [0]     (Switch case target)
+        //   arm_1 (2):        [0]     (Switch default target)
+        //   join_block (3):   [1, 2]  (both arms Jump to join)
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        constructor_pattern("Option", "Some"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // match_block has no predecessors.
+        assert!(
+            cfg.blocks[0].predecessors.is_empty(),
+            "match_block should have no predecessors"
+        );
+
+        // arm_0 has match_block as sole predecessor (Switch case).
+        assert_eq!(
+            cfg.blocks[1].predecessors,
+            vec![BlockId(0)],
+            "arm_0 should have match_block as sole predecessor"
+        );
+
+        // arm_1 has match_block as sole predecessor (Switch default).
+        assert_eq!(
+            cfg.blocks[2].predecessors,
+            vec![BlockId(0)],
+            "arm_1 should have match_block as sole predecessor"
+        );
+
+        // join_block has arm_0 AND arm_1 as predecessors. Order
+        // is not guaranteed; compare via a sorted copy.
+        let mut join_preds = cfg.blocks[3].predecessors.clone();
+        join_preds.sort_by_key(|b| b.0);
+        assert_eq!(
+            join_preds,
+            vec![BlockId(1), BlockId(2)],
+            "join_block should have arm_0 + arm_1 as predecessors"
+        );
+    }
+
+    #[test]
+    fn build_match_scrutinee_evaluation_lands_in_match_block() {
+        // `fn f(int x) -> int {
+        //     match x + 1 { Some => return 1; None => return 0; }
+        // }`
+        //
+        // The scrutinee is `x + 1` — a binary expression. Its
+        // evaluation should land in the match_block (BlockId(0))
+        // as two instructions: `Const(1)` (v1) and
+        // `BinOp(Add, v2, v0, v1)`. The Switch's scrutinee
+        // operand should reference v2 (the Add's result).
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                add(ident("x"), int(1)),
+                vec![
+                    match_arm(
+                        constructor_pattern("Option", "Some"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // The match_block should contain Param + Const + BinOp
+        // (the scrutinee evaluation).
+        let match_block = &cfg.blocks[0];
+
+        // Param(x → v0).
+        let has_param = match_block
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::Param { dst: ValueId(0), index: 0 }));
+        assert!(has_param, "match_block should contain Param(x → v0)");
+
+        // Const(1) → v1.
+        let has_const_1 = match_block
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::Const { dst: ValueId(1), value: 1 }));
+        assert!(has_const_1, "match_block should contain Const(1)");
+
+        // BinOp(Add, v2, v0, v1).
+        let has_add = match_block.insts.iter().any(|i| matches!(
+            i,
+            Inst::BinOp {
+                op: BinOpKind::Add,
+                dst: ValueId(2),
+                lhs: ValueId(0),
+                rhs: ValueId(1),
+            }
+        ));
+        assert!(has_add, "match_block should contain BinOp(Add, v2, v0, v1)");
+
+        // Switch's scrutinee operand should be v2 (the Add's result).
+        match &match_block.terminator {
+            Terminator::Switch { scrutinee, .. } => {
+                assert_eq!(
+                    *scrutinee,
+                    ValueId(2),
+                    "Switch's scrutinee should be the Add's ValueId (v2)"
+                );
+            }
+            other => panic!("expected Switch terminator, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Wildcard pattern must be the LAST arm")]
+    fn build_match_wildcard_as_non_last_arm_panics() {
+        // `match x { _ => 1, None => 0 }` — Wildcard is NOT the
+        // last arm. The builder should panic.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        wildcard_pattern(),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let _ = builder.build_function(&func);
+    }
+
+    #[test]
+    #[should_panic(expected = "Binding pattern must be the LAST arm")]
+    fn build_match_binding_as_non_last_arm_panics() {
+        // `match x { y => 1, None => 0 }` — Binding is NOT the
+        // last arm. The builder should panic.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(match_expr(
+                ident("x"),
+                vec![
+                    match_arm(
+                        binding_pattern("y"),
+                        block(vec![stmt(ret(int(1)))]),
+                    ),
+                    match_arm(
+                        constructor_pattern("Option", "None"),
+                        block(vec![stmt(ret(int(0)))]),
+                    ),
+                ],
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let _ = builder.build_function(&func);
     }
 }
