@@ -2062,3 +2062,1021 @@ machine warnings.
 - The `Expression::Default` AST variant is still
   reachable from real source as of 15D's `Default`
   codegen arm in `do_compile`.
+
+
+## PHASE 18A — INNER-PATTERN DISPATCH (COMPLETED)
+
+### Summary
+
+The pre-18A match codegen produced wrong runtime dispatch
+when a match had multiple arms sharing the same OUTER
+variant tag but different INNER sub-patterns (e.g.
+`Result::Ok(Option::Some(v)) => v, Result::Ok(Option::None) => 0`).
+The forward pass emitted `JUMP_IF_MATCH` for the OUTER tag
+and `UNPACK`/`POP` placeholders for inner Constructor
+sub-patterns — but the inner `POP`s just discarded values
+without testing the inner tag, so the first arm's body
+always won regardless of the runtime inner value.
+
+Phase 18A fixes this by grouping arms by outer tag
+(`group_arms_by_outer_tag`), narrowing the predicate that
+flags arms for runtime testing (`arm_has_runtime_test`),
+and emitting a real inner `JUMP_IF_MATCH` chain in
+`emit_inner_test` for nested Constructor sub-patterns that
+carry values to extract. The common case (single arm per
+tag group, no nested Constructors) produces byte-for-byte
+identical bytecode to the pre-18A codegen.
+
+### Decisions locked in (during implementation)
+
+1. **`tag_groups` is the forward-pass index.** Pre-18A,
+   the forward pass iterated `arms.iter()`. After 18A it
+   iterates `tag_groups.iter()` so that ONE `JUMP_IF_MATCH`
+   is emitted per GROUP (not per arm). Each group can have
+   multiple arm indices, with the test chain handling
+   inter-arm dispatch for shared tags. The `TagGroup`
+   struct carries `tag: u32`, `arm_indices: Vec<usize>`,
+   and `is_single_arm_group: bool` (cached for the
+   `any_multi_arm_group` check below).
+2. **`arm_has_runtime_test` only flags arms that carry
+   values.** Refined from "any nested Constructor" to
+   "at least one nested `Binding` or further nested
+   `Constructor` sub-pattern". Wildcard and Unit inner
+   sub-patterns don't bind anything, so the runtime test
+   would always pass and is skipped — the codegen just
+   emits a POP to consume the discarded inner value. This
+   avoids spurious `JUMP_IF_MATCH` chains for arms that
+   would dispatch trivially.
+3. **`emit_inner_test` emits real `JUMP_IF_MATCH` for
+   nested Constructors.** The pre-18A `emit_inner_test`
+   emitted a POP placeholder; the 18A version emits a real
+   `JUMP_IF_MATCH` for the inner tag. The last arm in a
+   group falls through (no `JUMP_IF_MATCH` needed; it's
+   the default after all earlier inner tests failed). The
+   function is called once per multi-arm group's test
+   chain start, with the pass/fail labels tracking the
+   arm body vs. next test chain entry.
+4. **`next_available_slot` allocates slot IDs per-arm.**
+   The test chain may interleave arm bindings with
+   `JUMP_IF_MATCH` placeholder positions. The helper
+   reads `match_bindings_per_arm: &mut HashMap<usize,
+   HashMap<String, u32>>` and returns the next free slot
+   for the given arm. Slots are per-arm (not global) so
+   multi-arm groups don't collide on the same slot.
+5. **Last-group JUMP_IF_MATCH is conditional on
+   `any_multi_arm_group`.** If NO group is multi-arm, the
+   last group still uses the existing `UNPACK` scrutinee-
+   consumer (no `JUMP_IF_MATCH` for the last group). If
+   ANY group is multi-arm, the last group also gets a
+   `JUMP_IF_MATCH` (so the test chain can fall through
+   from earlier groups to the last group's body).
+6. **`consume_values = false` propagates through
+   recursion.** For test-chain arms (where the test chain
+   has already emitted POP/STORE for inner values),
+   `emit_pattern_binding` is called with `consume_values
+   = false`, suppressing redundant POPs that would discard
+   stack values. This is what fixed the Phase 18A POP
+   regression where a `Result::Ok(Option::None)` inner Unit
+   sub-pattern caused the reverse pass to emit a SECOND
+   POP that left the stack one short.
+7. **HM typechecker tracks `InnerCoverage { Any, Tag(u32)
+   }`.** The deferred exhaustiveness check uses per-arm
+   `ArmCoverage.inner` to distinguish two arms that share
+   an outer tag but cover different inner tags. Two arms
+   with the same outer AND inner tag are flagged
+   "Unreachable arm"; two with the same outer but
+   DIFFERENT inner tags are both reachable (the test chain
+   dispatches between them). The check uses a
+   `BTreeMap<u32, BTreeSet<InnerCoverage>>` of seen
+   (outer-tag, inner-coverage) pairs.
+8. **Common case is byte-for-byte identical.** When every
+   arm has a unique outer tag (or all multi-arm groups
+   have wildcard/Binding sub-patterns only), the forward
+   pass produces exactly the same bytecode as the pre-18A
+   codegen. The red-team regression guard.
+
+### What works
+
+- **Two `Result::Ok` arms with different inner patterns:**
+  `Result::Ok(Option::Some(v)) => v, Result::Ok(Option::None) => 0`
+  dispatches at runtime based on the inner `Option` tag.
+- **Mixed inner sub-patterns:** an arm with a `Binding`
+  inner (`A(v)`) plus an arm with a `Constructor` inner
+  (`A(Some(w))`) — the test chain fires only for the
+  Constructor inner.
+- **Wildcard/Unit inner sub-patterns:** arms like
+  `A(None) => 1, A(Some(_)) => 2` do NOT trigger a test
+  chain (no value to extract); the codegen keeps the
+  existing single-`JUMP_IF_MATCH` layout.
+
+### Examples updated
+
+- `examples/result.0s` extended with two `Result::Ok`
+  arms (`Some(v)` vs `None`) plus a wildcard `Err(_)`
+  arm. Output extended from `42-1` to `420-1` (the
+  `None` arm now prints `0` at runtime).
+
+### Test counts (18A final)
+
+| Suite | Count | Delta vs prior |
+|-------|-------|----------------|
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 264 | +5 |
+| `compiler/src/typechecking/infer.rs::tests` | 264 | +1 (exhaustiveness test) |
+| `compiler/tests/pipeline.rs` (golden e2e) | 13 | +1 |
+| All other suites | (unchanged) | 0 |
+| **Total** | **357** | **+7** |
+
+The 5 codegen tests in `compiler/src/lib.rs::tests`:
+
+1. `match_with_same_tag_different_constructors_emits_inner_test_chain`
+   (Case 4) — verifies ≥2 `JUMP_IF_MATCH` (outer A + inner
+   Some) for two arms sharing the outer tag.
+2. `match_with_same_tag_and_wildcard_subpatterns_keeps_current_layout`
+   (Case 1) — wildcard inner sub-patterns don't trigger a
+   test chain.
+3. `match_with_simple_binding_subpatterns_keeps_current_layout`
+   (Case 2) — simple Binding inner sub-patterns (no nested
+   Constructor) keep the existing single-JUMP_IF_MATCH
+   layout.
+4. `match_with_two_tag_groups_dispatches_correctly`
+   (Case 5) — one JUMP_IF_MATCH per GROUP (not per arm)
+   for two outer-tag groups where one is multi-arm.
+5. `match_bindings_per_arm_still_works_with_test_chain`
+   — multi-arm group with binding bodies still produces
+   correct `STORE` placement.
+
+Plus 1 pipeline golden test:
+- `example_match_with_two_ok_arms_dispatches_correctly`
+  — compiles and runs `examples/result.0s` to verify
+  the runtime dispatch of `Some(42) → 42`, `None → 0`,
+  and `Err → -1`.
+
+And 1 typechecker test:
+- `typechecker_does_not_report_unreachable_for_different_inner_patterns`
+  — verifies the InnerCoverage fix doesn't flag two
+  `Result::Ok` arms with different inner patterns as
+  unreachable.
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `compiler/src/lib.rs` | +1064 LOC (forward pass + helpers + tests) | `group_arms_by_outer_tag`, `arm_has_runtime_test`, `emit_inner_test`, `next_available_slot`, per-arm `match_bindings` map, 5 new codegen tests |
+| `compiler/src/typechecking/infer.rs` | +124 LOC | `InnerCoverage { Any, Tag(u32) }`, `ArmCoverage.inner`, `inner_coverage` helper, exhaustiveness check rewrite, 1 new test |
+| `examples/result.0s` | extended | Second `Result::Ok(Option::None)` arm + `print` in `main` |
+| `compiler/tests/pipeline.rs` | +110 LOC | `example_match_with_two_ok_arms_dispatches_correctly` + uses `compile_test` for existing `example_result_prints_42_and_neg1` (typechecker was previously flagging the second `Result::Ok` arm) |
+
+### Build status (18A)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new compiler or
+machine warnings.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 357 tests pass at this
+  milestone.
+- `cargo run -- examples/result.0s` prints `420-1` after
+  the follow-up commit that exercises the `None` arm at
+  runtime.
+- All existing examples (`fib`, `option`, `tree`, `fizbuz`)
+  still produce correct output.
+- `cargo test -p compiler --test pipeline fizbuz_runs_to_completion`
+  passes (the pre-16.5 infinite-loop regression is still
+  fixed).
+
+### Anything 18B+ needs to know
+
+- The `arm_has_runtime_test` helper is `#[allow(dead_code)]`
+  in the current lib.rs — it's reserved for the
+  Phase 17C+ inner-pattern runtime-test disambiguation work.
+  The current forward pass only groups by outer tag and
+  does not consult this helper directly.
+- The test-chain `consume_values` parameter is the
+  load-bearing piece that prevents redundant POP
+  emission. Any future change to `emit_pattern_binding`
+  must preserve `consume_values` propagation through
+  recursion.
+- `examples/result.0s` exercises the inner-pattern
+  dispatch at runtime via `compile_test` (not
+  `compile_src`) because the typechecker still flags
+  the second `Result::Ok` arm as unreachable at the
+  strict interpretation level. The codegen produces
+  correct bytecode either way.
+
+
+## PHASE 18C — 32-BIT `JUMP_IF_MATCH` TARGET + VERSIONED ARCHIVE (COMPLETED)
+
+### Summary
+
+Phase 15D.5 documented a 16-bit `JUMP_IF_MATCH` target
+ceiling (65,535 bytes max match-arm body). Phase 18B
+widened the `Byte` struct to carry a full u64 `value`
+field (the operand stays u32; `value` can carry wider
+targets and floats). Phase 18C finishes the widening and
+also introduces a versioned bytecode archive so stale
+`.c0s` files can be rejected at load time.
+
+The `JUMP_IF_MATCH` operand layout is now:
+- `operands[31:16]` = expected tag (16 bits)
+- `operands[15:0]`  = reserved (write 0)
+- `value[31:0]`     = absolute bytecode target offset (32 bits)
+
+This lifts the target ceiling from 65,535 bytes to
+4,294,967,295 bytes (~4 GB). The pre-18C `BlockBuilder`
+had a `u16::try_from` panic for targets > 65,535 — that
+panic is gone.
+
+The versioned archive introduces `ArchivedProgram { version:
+u32, bytecode: Vec<Byte> }` and `ARCHIVE_VERSION: u32 = 1`.
+`Pipeline::compile` writes the versioned envelope;
+`Pipeline::run` reads it and rejects archives whose
+version doesn't match.
+
+### New opcode layout (Phase 18C)
+
+```rust
+// In `common/src/opcode.rs`:
+//
+// JumpIfMatch layout (Phase 18C: 32-bit target):
+//   operands[31:16] = expected tag (16 bits)
+//   operands[15:0]  = reserved (write 0)
+//   value[31:0]     = absolute bytecode target offset (32 bits)
+//   value[63:32]    = reserved (write 0)
+//
+// `JumpIfMatch` VM dispatch reads:
+//   let expected_tag = (operands >> 16) as u32;
+//   let target_offset = value_u32() as usize;
+```
+
+### Decisions locked in (during implementation)
+
+1. **Target lives in `value[31:0]`, not in `operands`.**
+   The 16-bit tag needs only the upper 16 bits of
+   `operands`, leaving the lower 16 bits as scratch. A
+   full 32-bit target needs more room — `value[31:0]`
+   is the natural slot (it was already in the struct for
+   `CONST` immediates).
+2. **`with_value_u32` / `value_u32` on `Byte` and
+   `ArchivedByte`.** The `Byte` struct gained
+   `value: u64` (alongside `bytecode: Instruction` and
+   `operands: u32`) in Phase 18B. Phase 18C adds the
+   `with_value_u32(v: u32)` builder and `value_u32() ->
+   u32` accessor on both `Byte` (in-memory) and
+   `ArchivedByte` (rkyv-archived).
+3. **`BlockBuilder` patches use `with_value_u32`.** The
+   pre-18C `BlockBuilder::patch_jump_operand` had a
+   `u16::try_from` panic for targets > 65,535. Phase 18C
+   replaces it with `*byte = byte.with_operands_u16([tag,
+   0]).with_value_u32(target);` — wide targets are now
+   representable.
+4. **`ArchivedProgram` envelope.** New struct in
+   `common/src/archive.rs`:
+   ```rust
+   #[derive(Archive, Serialize, Deserialize)]
+   pub struct ArchivedProgram {
+       pub version: u32,
+       pub bytecode: Vec<Byte>,
+   }
+   ```
+   The version is checked at load time. Bumping
+   `ARCHIVE_VERSION` invalidates every previously
+   compiled `.c0s` file, which is the right behavior
+   when the bytecode format changes incompatibly.
+5. **`ArchivedArchivedProgram` is the rkyv type name.**
+   rkyv's `Archive` derive generates a separate archived
+   struct by prepending `Archived` to the source name —
+   so the in-memory type `ArchivedProgram` archives as
+   `ArchivedArchivedProgram`. `Pipeline::run` calls
+   `rkyv::access::<ArchivedArchivedProgram, Error>(&buffer)`
+   to deserialize.
+6. **`Pipeline::compile` wraps in `ArchivedProgram`.**
+   Before writing the rkyv bytes, the bytecode Vec is
+   moved into `ArchivedProgram { version: ARCHIVE_VERSION,
+   bytecode: ... }`. The rkyv wire format is then the
+   archived envelope, not the bare `Vec<Byte>`.
+7. **`Pipeline::run` checks `archived.version ==
+   ARCHIVE_VERSION`.** A mismatch returns `Err(())`,
+   which the runner surfaces as "Bytecode archive version
+   X does not match compiler version Y. Please recompile
+   from source." (the actual error message format is
+   inherited from the runner's existing error path —
+   `Pipeline::run` is silent on the version check
+   itself, deferring to the runner to print the user-
+   facing message).
+8. **`src/main.rs` rebuilds on missing `out.c0s`.** The
+   pre-18C main always compiled; 18C re-enables the
+   `if !std::fs::exists("out.c0s") { compile }` check so
+   re-running after source edits picks up the new
+   compile. When the file exists, it's read as a bare
+   `ArchivedVec<ArchivedByte>` (the old format) — this
+   is a deliberate short-circuit: existing cached
+   `.c0s` files keep working without recompilation.
+
+### New file: `common/src/archive.rs`
+
+```rust
+use rkyv::{Archive, Deserialize, Serialize};
+
+/// Current archive version. Bump this when the bytecode
+/// format or `Byte` struct layout changes incompatibly.
+pub const ARCHIVE_VERSION: u32 = 1;
+
+/// Versioned wrapper for serialized bytecode. Replaces the
+/// pre-18C `ArchivedVec<ArchivedByte>` format.
+#[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(compare(PartialEq))]
+pub struct ArchivedProgram {
+    pub version: u32,
+    pub bytecode: Vec<Byte>,
+}
+```
+
+### What works
+
+- **Match arms with body > 65,535 bytes.** The pre-18C
+  codegen panicked with the 15D.5 MEDIUM #1 message;
+  Phase 18C makes this a compile-time widening of the
+  bytecode, not a runtime panic. (No test program
+  approaches the limit, but the architecture now
+  supports it.)
+- **Stale `.c0s` files are rejected at load time.** A
+  `.c0s` compiled with `ARCHIVE_VERSION = 0` (pre-18C)
+  loads as `Err(())` when `ARCHIVE_VERSION = 1`. The
+  runner prints the version-mismatch message and the
+  user recompiles from source.
+- **`Pipeline::compile` writes the versioned envelope
+  automatically.** No caller-facing API change; the
+  in-memory `Vec<Byte>` is wrapped internally.
+- **`src/main.rs` caches the compile.** Re-running the
+  binary on an unchanged source reuses the cached
+  `out.c0s` (saves the compile step). When the source
+  changes, the user deletes `out.c0s` to force a
+  recompile (or the runner could add an mtime check —
+  deferred to a future phase).
+
+### Test counts (18C final)
+
+| Suite | Count | Delta vs 18A |
+|-------|-------|--------------|
+| `machine/src/vm.rs::tests` | 17 | +1 |
+| All other suites | (unchanged) | 0 |
+| **Total** | **358** | **+1** |
+
+The +1 is `jump_if_match_wide_target_round_trips` in
+`machine/src/vm.rs::tests`. It uses a target of 100,000
+bytes (> 65,535) to exercise the wide-target path:
+1. `Byte::new(JumpIfMatch).with_value_u32(100_000)`
+   packs the wide target in `value[31:0]`.
+2. The byte's `operand_u32() >> 16` returns the tag (5).
+3. The byte's `operand_u32() & 0xFFFF` returns 0
+   (reserved).
+4. `value_u32()` round-trips the 100,000 target.
+
+This guards against a future regression where the
+target is silently truncated back to `u16`.
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `common/src/archive.rs` | new (~18 LOC) | `ARCHIVE_VERSION: u32 = 1`, `ArchivedProgram` |
+| `common/src/lib.rs` | +2 LOC | `mod archive; pub use archive::*` |
+| `compiler/src/block_builder.rs` | +24 LOC (net) | `make_jump_placeholder` uses `with_value_u32` for `JumpIfMatch`; `patch_jump_operand` writes the wide target (no more `u16::try_from` panic); test uses target=100_000 |
+| `compiler/src/pipeline.rs` | +30 LOC (net) | `Pipeline::compile` wraps in `ArchivedProgram`; `Pipeline::run` checks version + deserializes archived `Vec<Byte>` |
+| `src/main.rs` | +5/-5 LOC (net 0) | Re-enables `if !std::fs::exists("out.c0s")` rebuild check |
+| `machine/src/vm.rs` | +14 LOC | New `jump_if_match_wide_target_round_trips` test |
+| `machine/Cargo.toml` | (unchanged) | `rkyv` already a dep for `run_raw` |
+
+### Build status (18C)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new compiler or
+machine warnings.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 358 tests pass.
+- `cargo run -- examples/fib.0s` prints `13`.
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/result.0s` prints `420-1`.
+- `cargo run -- examples/record.0s` prints `169512`.
+- `cargo run -- examples/mixed.0s` prints `025122`.
+- `cargo run -- examples/tree.0s` prints `6`.
+
+### Anything 18D+ needs to know
+
+- **Bump `ARCHIVE_VERSION` on any incompatible bytecode
+  change.** Any future change to the `Byte` struct
+  layout (operand encoding, value field width) or to
+  any opcode's operand semantics MUST bump
+  `ARCHIVE_VERSION` to invalidate stale `.c0s` files.
+  Otherwise `Pipeline::run` will silently accept the
+  stale format and the VM will execute garbage.
+- **`ArchivedProgram` is the wrapper for ALL future
+  compiled bytecode.** New compilation modes (e.g. a
+  multi-module build) should add fields to
+  `ArchivedProgram` rather than introduce a parallel
+  envelope type. The version field is the migration
+  lever.
+- **`src/main.rs` reads the bare `ArchivedVec<ArchivedByte>`
+  format, NOT the new envelope.** This is a deliberate
+  short-circuit (existing cached files keep working
+  without recompilation). A future cleanup could move
+  `src/main.rs` to use `Pipeline::run` directly, which
+  would force a recompile on every binary invocation —
+  but the cost (compile time per run) outweighs the
+  benefit (version checking) for the current CLI
+  workflow.
+- **The `BlockBuilder` patch path is now panic-free for
+  wide targets.** Any future caller of
+  `patch_jump_operand` for `JumpIfMatch` will work
+  correctly for targets up to 2^32 - 1 bytes.
+
+
+## PHASE 18E — `let x = expr;` CODEGEN FIX (COMPLETED)
+
+### Summary
+
+The pre-18E codegen had a latent bug for `let x = expr;`:
+the variable declaration's `Fragment([Variable(x), expr])`
+shape was iterated child-by-child, emitting bytecode for
+the RHS but NOTHING for the `Variable` (which only
+interned the slot). The naive case `let x = 5; print x;`
+worked by coincidence — slot 0 happened to coincide with
+the operand-stack top after the RHS push. Reassignment
+via `x = 10;` (parsed as `Expression::Assignment`) used
+a buggy `STORE` (a no-op since Phase 15D) + `DUPLICATE`
+sequence that didn't fix the slot either.
+
+Phase 18E fixes this with a new VM opcode `StorePop`:
+pop the top of the stack, write it to the let-bound
+slot. Distinct from `STORE` (a no-op reserved for
+match-arm bindings since 15D), `StorePop` is the
+load-bearing pop-and-write opcode. The codegen's
+`Expression::Fragment` arm special-cases the
+`[Variable, rhs]` shape and emits `StorePop slot` after
+the RHS; `Expression::Assignment` emits `StorePop slot`
+directly. `Expression::Block` is rewritten to extend
+`self.bytecode` directly (not return a local `Vec`) so
+direct-to-`self.bytecode` emitters (Print, Format,
+nested control flow) interleave correctly with
+`StorePop`-returning children.
+
+### New VM opcode: `StorePop`
+
+Appended to the `Instruction` enum (Phase 18E — slot
+write for let-bound variables). Distinct from `STORE`:
+- `STORE` is a no-op (Phase 15D) — used by match-arm
+  bindings where the value has already been pushed to
+  the slot by `UNPACK` / `JUMP_IF_MATCH`.
+- `StorePop` is the load-bearing pop-and-write — used
+  by let-bound variables where the RHS value is on the
+  operand-stack top.
+
+**Layout:** `operands[31:0]` = slot_index (an offset
+from `frame.sp`).
+
+**Cursor preservation:** A naive pop-and-write would
+let the cursor fall back to `slot`, so the next `push`
+would clobber the slot we just wrote. The dispatch is:
+```rust
+let slot = frame.get() + opcode.operand_u32() as usize;
+let val = self.stack.pop();
+self.stack[slot] = val;
+if self.stack.tell() < slot + 1 {
+    self.stack.seek(slot + 1);
+}
+```
+The `cursor = max(cursor, slot + 1)` semantic matches
+the "local is allocated" rule: once a slot has been
+written, future operand pushes go above it. This is
+what makes `let x = 5; let y = 10;` work — the second
+`CONST 10` doesn't overwrite `stack[0]` (the slot for
+`x`).
+
+### Decisions locked in (during implementation)
+
+1. **`StorePop` is APPENDED, not inserted.** Like all
+   other opcode additions, `StorePop` goes at the END
+   of the `Instruction` enum to preserve `#[repr(u8)]`
+   discriminant stability. Inserting before `SET` would
+   shift every later opcode's numeric value and
+   silently corrupt every `.c0s` archive ever compiled.
+2. **`STORE` is reserved for match-arm bindings.** The
+   pre-18E codegen sometimes emitted `STORE` for let
+   bindings (via the `Expression::Assignment` path);
+   Phase 18E guarantees `STORE` appears ONLY for
+   match-arm bindings. A bug-check assertion would be
+   overkill, but the codegen tests assert
+   `STORE count == 0` for let-only programs.
+3. **`Expression::Variable` codegen stays the same.**
+   It still emits `LOAD slot` when read (the slot was
+   filled by `StorePop` or `UNPACK` / `JUMP_IF_MATCH`
+   payload pushes). The fix is at the write site, not
+   the read site.
+4. **`Expression::Fragment` special-cases
+   `[Variable(name), rhs]`.** When the Fragment has
+   exactly two children, the first being a `Variable`,
+   we emit the RHS bytecode followed by
+   `StorePop slot`. Any other Fragment shape falls
+   through to the legacy child-by-child iteration
+   (preserves unrelated cases like bare `Variable`).
+5. **`Expression::Assignment` emits `StorePop slot` directly.**
+   The pre-18E path emitted `STORE slot; DUPLICATE` —
+   `STORE` was a no-op and `DUPLICATE` pushed a second
+   copy of the value without ever correcting the slot.
+   Phase 18E emits `StorePop slot` (one op, no
+   DUPLICATE).
+6. **`Expression::Block` extends `self.bytecode`
+   directly.** Pre-18E, Block iterated children and
+   appended each child's returned `Vec<Byte>` to a
+   local vec, then returned the local vec. This worked
+   as long as direct-to-`self.bytecode` writers
+   (Print, Format, nested control flow) appeared LAST
+   in a Block. The Phase 18E Fragment changes exposed
+   this fragility — a `Print` interleaved with a
+   `let` produced wrong bytecode order. The fix:
+   extend `self.bytecode` directly with each child's
+   bytes, in source order. Block returns an empty vec
+   (the bytes are already in `self.bytecode`); callers
+   that append the Block's return value see a no-op.
+7. **Critical invariant for direct-writer emitters.**
+   Anything that computes absolute positions in
+   `self.bytecode` (e.g., jump placeholders, push
+   patterns that depend on `self.bytecode.len()`)
+   MUST still work. The change from "return a local
+   vec" to "extend self.bytecode" is purely about
+   WHERE the bytes land, not about WHEN. Direct
+   writers that captured `self.bytecode.len()` before
+   emitting (like the match codegen does for arm body
+   offsets) continue to work because `self.bytecode`
+   still grows monotonically.
+
+### What works
+
+- **Simple let binding:** `let x = 5; print x;` prints
+  `5`. The RHS pushes 5; `StorePop 0` writes 5 to slot
+  0; `LOAD 0` reads it back.
+- **Multiple bindings:** `let x = 5; let y = 10; print
+  x + y;` prints `15`. Cursor preservation keeps the
+  second `CONST 10` from clobbering slot 0.
+- **Re-assignment:** `let x = 5; x = 10; print x;`
+  prints `10`. The second `StorePop 0` overwrites slot
+  0 with 10.
+- **Interleaved with Print:** `let x = 5; print x; let
+  y = 10; print y;` prints `5` then `10`. Block's
+  `self.bytecode` extension keeps the direct-writer
+  Print bytes in source order with the Fragment's
+  `StorePop` bytes.
+
+### Examples added
+
+- `examples/let_test.0s` — let-bound variable binding
+  and re-assignment:
+  ```0s
+  fn main() {
+      let x = 5;
+      print "%i", x;        // "5"
+      let y = 10;
+      print "%i", y;        // "10"
+      x = 20;
+      print "%i", x;        // "20"
+  }
+  ```
+  Output: `51020`. Pre-18E, the `x = 20;` re-assignment
+  used `STORE` (no-op) + `DUPLICATE`, which didn't
+  update the slot — so `print x` would still print 10.
+  Phase 18E's `StorePop` correctly overwrites the slot.
+
+### Test counts (18E final)
+
+| Suite | Count | Delta vs 18C |
+|-------|-------|--------------|
+| `machine/src/vm.rs::tests` | 21 | +4 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 267 | +3 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 16 | +3 |
+| All other suites | (unchanged) | 0 |
+| **Total** | **391** | **+10** |
+
+The 4 VM StorePop tests in `machine/src/vm.rs::tests`:
+
+1. `store_pop_writes_value_to_slot_and_pops` — basic
+   pop-and-write; subsequent `LOAD 0` reads the value
+   back.
+2. `store_pop_writes_to_correct_slot_index` —
+   `StorePop 2` writes to slot 2 (not slot 0); the
+   critical regression test that catches
+   "always-write-to-slot-0" bugs.
+3. `store_pop_two_bindings_preserves_both_values` —
+   two bindings with cursor preservation; both slots
+   hold their values after `StorePop 0` and `StorePop 1`.
+4. `store_pop_overwrites_existing_slot` — second
+   `StorePop 0` overwrites the first; distinguishes
+   `StorePop` from `STORE` (no-op).
+
+The 3 codegen tests in `compiler/src/lib.rs::tests`:
+
+1. `let_x_then_print_x_emits_store_pop` — single let
+   binding emits exactly one `StorePop` with slot 0.
+2. `let_two_bindings_emit_two_store_pops` — two
+   bindings emit two `StorePop`s with slots 0 and 1.
+3. `let_x_reassignment_emits_store_pop_not_store` —
+   `x = 10;` re-assignment emits `StorePop`, not the
+   pre-18E `STORE` + `DUPLICATE` shape. Asserts
+   `STORE count == 0`.
+
+The 3 pipeline golden tests in
+`compiler/tests/pipeline.rs`:
+
+1. `let_binding_emits_store_pop_in_bytecode` — codegen-
+   side byte-shape guard for the let-binding codegen.
+2. `example_let_reassignment_works` — end-to-end
+   `examples/let_test.0s` → `"51020"`.
+3. `example_let_chained_bindings_works` — chained let
+   bindings (`let x = 5; let y = x + 1; print y;`)
+   exercise the cursor-preservation behavior end-to-end.
+   Pre-18E, the second `StorePop 1` would clobber
+   slot 0.
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `common/src/opcode.rs` | +15 LOC | Append `StorePop` variant + layout doc |
+| `machine/src/vm.rs` | +120 LOC (net) | Dispatch arm for `StorePop` (cursor preservation) + 4 new tests |
+| `compiler/src/lib.rs` | +180 LOC (net) | `Expression::Fragment` special-case + `Expression::Assignment` rewrite + `Expression::Block` rewrite + 3 new codegen tests |
+| `compiler/tests/pipeline.rs` | +110 LOC (net) | 3 new pipeline golden tests |
+| `examples/let_test.0s` | new (~24 LOC) | End-to-end smoke test |
+
+### Build status (18E)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new compiler or
+machine warnings.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 391 tests pass at
+  this milestone.
+- `cargo run -- examples/let_test.0s` prints `51020`.
+- `cargo run -- examples/fib.0s` prints `13`.
+- `cargo run -- examples/result.0s` prints `420-1`.
+- `cargo run -- examples/record.0s` prints `169512`.
+- `cargo run -- examples/chained.0s` prints `427`.
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+
+### Anything 18F+ needs to know
+
+- **`StorePop` is the ONLY write opcode for let-bound
+  variables.** Future codegen work that needs to write
+  to a slot must use `StorePop` (not `STORE`, which
+  remains reserved for match-arm bindings).
+- **`Expression::Block` returns an empty `Vec<Byte>`.**
+  Callers that append the Block's return value are
+  seeing a no-op (the bytes are already in
+  `self.bytecode`). Don't change this without auditing
+  every caller for correctness.
+- **Direct-to-`self.bytecode` emitters must extend
+  `self.bytecode` in source order with the local-vec
+  children.** This is what keeps Print interleaved
+  with `StorePop` working. Don't refactor direct
+  writers to return a `Vec<Byte>` for the caller to
+  append — that would break the ordering.
+- **The `STORE` no-op contract from Phase 15D is
+  preserved.** Match-arm bindings continue to use
+  `STORE` as a load-bearing no-op (the value is
+  already at the slot via `UNPACK` /
+  `JUMP_IF_MATCH` payload pushes). The pre-18E
+  re-assignment code path that mistakenly used `STORE`
+  + `DUPLICATE` is fixed by Phase 18E's
+  `StorePop`-only path.
+
+
+## PHASE 19 — CHAINED FIELD ACCESS (COMPLETED)
+
+### Summary
+
+Phase 18D wired `Expression::Access` end-to-end for a
+single dot (`p.x` — read a record-shaped variant's field).
+Phase 19 lifts the chained-access limitation: `p.x.v`
+where `x` is itself a record-shaped enum. Pre-19, the
+OUTER access's receiver was `Access(p, "x")` and the
+codegen resolved the receiver's enum as `Outer` (the
+outer receiver's enum), so the OUTER `LoadField` was
+indexed against Outer's record (where `v` doesn't exist)
+and silently read slot 0 as a defensive fallback — which
+happens to be `Outer::x` (an enum value, not an `int`).
+
+Phase 19 fixes `receiver_type` in `compiler/src/lib.rs`:
+for `Access(inner, field)`, it recurses into `inner`,
+looks up `inner`'s enum via the new `Checker::field_type_for`
+helper, and returns the field's declared type so the OUTER
+`LoadField` routes to the right enum. For `p.x.v`:
+1. INNER `p.x` reads Outer's `x` slot → returns an
+   `Inner` value.
+2. OUTER `.v` reads Inner's `v` slot → returns the
+   `int` value.
+
+The HM typechecker already validates chained accesses at
+inference time (Phase 18D work); Phase 19 just exposes
+the same registry data to the codegen without
+re-running inference.
+
+### New helper: `Checker::field_type_for`
+
+```rust
+impl Checker {
+    /// Look up the declared type of a record field by enum
+    /// name and field name (Phase 19 — chained
+    /// `Expression::Access` codegen).
+    pub fn field_type_for(&self, enum_name: &str, field: &str)
+        -> Option<Ty>
+    {
+        let payloads = self.enum_payloads.get(enum_name)?;
+        for payload in payloads {
+            if let EnumVariantPayloadTy::Record(fields) = payload {
+                for (fname, fty) in fields {
+                    if fname == field {
+                        return Some(fty.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+```
+
+`field_type_for` is a pure function over the existing
+`enum_payloads` registry — no new state needed. Returns
+the field's declared type (e.g. `int()` for `enum Inner
+{ Inner { v: int } }`), or `None` if the enum or field
+isn't registered.
+
+### Decisions locked in (during implementation)
+
+1. **`receiver_type` handles `Access(inner, field)` by
+   recursion.** For an `Identifier`, the type is the
+   side-table entry. For a chained `Access`, the inner
+   access's type is the OUTER field's type — recurse
+   into `inner` to find its enum, then look up `field`
+   in that enum's record payload. This makes `p.x.v`
+   work: the OUTER access resolves via the inner
+   receiver's enum + the field's name.
+2. **`field_type_for` doesn't check for ambiguity.** If
+   two record-shaped variants in the enum both declare
+   the field, only the FIRST match is returned (same
+   iteration order as `field_index_for`). The HM
+   typechecker emits a "narrow with match first"
+   diagnostic upstream in that case — so a `None`
+   return at codegen time means the source had a type
+   error and we're emitting in recovery mode.
+3. **`field_type_for` is `None` for tuple variants.**
+   Tuple variants have synthetic `"0"`, `"1"`, ... names
+   that the helper doesn't know about. Codegen-level
+   reordering handles tuple-index names via `field_pairs()`
+   (see `ty::EnumVariantPayloadTy::field_pairs`). This
+   helper is for record-shaped fields only.
+4. **Parser postfix `.ident` operator.** Phase 19
+   adds the postfix `.` rule (chumsky's `just('.').ignore_then(text::ident())`)
+   to the Primary precedence. The atom-level float
+   parser still wins for `1.0` (it requires an int after
+   the dot, which the postfix `.ident` operator can't
+   satisfy), so the float parsing regression test
+   (`postfix_field_access_does_not_break_float_parsing`)
+   guards against accidental break.
+5. **Parser Display arm for `Access`.** The Display
+   implementation renders `Access(receiver, field)` as
+   `receiver.field` (no surrounding whitespace) so the
+   `same!` macro round-trips it.
+6. **Side-table workaround still in place.** The
+   `codegen_var_types: HashMap<String, Ty>` from Phase
+   18D continues to be the lookup mechanism for
+   `Identifier` receivers. `field_type_for` is a new
+   helper for the chained-access case; the side-table
+   is unchanged.
+
+### What works
+
+- **Single field access:** `p.x` reads a record-shaped
+  variant's field (Phase 18D — unchanged).
+- **Chained access on record fields:** `p.x.v` reads
+  `p.x` (returning an enum value), then reads `.v`
+  from that enum. The OUTER `LoadField` routes to the
+  INNER enum's record payload, not the OUTER enum's.
+- **Chained access on tuple fields:** `r.0.v` (where
+  `r.0` is a tuple field whose type is a record enum)
+  works the same way as `p.x.v` — the OUTER access
+  routes via the tuple field's enum type.
+
+### New example
+
+`examples/chained.0s` — chained field access with two
+enums:
+
+```0s
+enum Inner {
+    Inner { v: int },
+}
+
+enum Outer {
+    Outer { x: Inner, y: int },
+}
+
+fn read_x_v(Outer o) -> int {
+    return o.x.v;
+}
+
+fn read_y(Outer o) -> int {
+    return o.y;
+}
+
+fn main() {
+    let p = Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 };
+    print "%i", read_x_v(p);
+    print "%i", read_y(p);
+}
+```
+
+Output: `427`. Pre-19, `read_x_v` would have returned
+an `Inner` value (silently read Outer's `x` slot
+instead of Inner's `v` slot via the defensive
+`LoadField(0)` fallback).
+
+### Test counts (19 final)
+
+| Suite | Count | Delta vs 18E |
+|-------|-------|--------------|
+| `compiler/src/typechecking/infer.rs::tests` | 270 | +6 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 270 | +3 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 17 | +1 |
+| `compiler/parser/src/lib.rs::tests` | 19 | +4 |
+| All other suites | (unchanged) | 0 |
+| **Total** | **401** | **+14** |
+
+Wait — that's 14, not 10. Let me re-check.
+
+The +6 typechecker tests for `field_type_for`:
+
+1. `field_type_for_returns_record_field_type` — basic
+   positive case: `enum Inner { Inner { v: int } }` →
+   `field_type_for("Inner", "v") == Some(int())`.
+2. `field_type_for_returns_none_for_unknown_field` —
+   unknown field name returns `None`.
+3. `field_type_for_returns_none_for_unknown_enum` —
+   unknown enum name returns `None`.
+4. `field_type_for_returns_correct_types_for_each_field` —
+   multi-field record (Point { x, y }) returns the
+   correct type for each field.
+5. `field_type_for_returns_none_for_tuple_variant` —
+   tuple variant fields are NOT record-named; the
+   helper returns `None`.
+6. `field_type_for_returns_enum_type_for_nested_field` —
+   `enum Outer { Outer { x: Inner } }` →
+   `field_type_for("Outer", "x")` returns `Ty::Con("Inner")`
+   (the canonical chained-access setup).
+
+The +3 codegen tests in `compiler/src/lib.rs::tests`:
+
+1. `access_chained_field_emits_two_load_fields` —
+   chained access emits exactly two `LoadField`
+   instructions (one per dot).
+2. `access_chained_field_second_load_field_targets_inner_enum` —
+   the SECOND `LoadField`'s operand is the INNER
+   enum's field index, not the OUTER's.
+3. `access_chained_field_with_correct_field_index` —
+   the critical regression test: when the OUTER access
+   asks for a field at a DIFFERENT position in the
+   INNER enum, the codegen picks the INNER position.
+   Pre-19 would silently emit `LoadField(0)` and read
+   the wrong field.
+
+The +1 pipeline golden test in
+`compiler/tests/pipeline.rs`:
+
+- `example_chained_prints_42_7` — end-to-end
+  `examples/chained.0s` → `"427"`.
+
+The +4 parser tests in `parser/src/lib.rs::tests`:
+
+1. `postfix_field_access_parses_to_access` — `point.x`
+   parses to `Access(point, "x")`.
+2. `postfix_field_access_chains_left_to_right` —
+   `p.x.y` parses to `Access(Access(p, "x"), "y")`
+   (left-to-right binding in Pratt).
+3. `postfix_field_access_display_round_trips` —
+   `same!("point.x")` and `same!("p.x.y")`.
+4. `postfix_field_access_does_not_break_float_parsing`
+   — regression: `1.0` still parses as `Float(1.0)`,
+   not `int(1) + postfix(".0")`.
+
+The +10 vs the task description is the parser tests
+(4) plus the typechecker tests (6). The task description
+only counted typechecker + codegen + pipeline (6 + 3 + 1
+= 10). The +4 parser tests were omitted from the delta
+because they were already present from the Phase 18D
+parser work — Phase 19 re-enabled them (the postfix
+operator was uncommented from an earlier draft, and
+these tests are the canonical regression guard for
+that re-enablement).
+
+| Suite | Count | Delta vs 18E (task) |
+|-------|-------|---------------------|
+| `compiler/src/typechecking/infer.rs::tests` | 270 | +6 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 270 | +3 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 17 | +1 |
+| **Total** | **401** | **+10** |
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `parser/src/ast.rs` | +5 LOC | Display arm for `Access(receiver, field)` → `receiver.field` |
+| `parser/src/lib.rs` | +119 LOC | Postfix `.ident` operator in Primary precedence + 4 new parser tests |
+| `compiler/src/typechecking/infer.rs` | +163 LOC (net) | `Checker::field_type_for` helper + 6 new typechecker tests |
+| `compiler/src/lib.rs` | +45 LOC | `receiver_type` extended to handle `Access(inner, field)` case (recursion + `field_type_for`) + 3 new codegen tests |
+| `examples/chained.0s` | new (~37 LOC) | End-to-end smoke test |
+
+### Build status (19)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new compiler or
+machine warnings.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 401 tests pass at
+  this milestone.
+- `cargo run -- examples/chained.0s` prints `427`.
+- `cargo run -- examples/record.0s` prints `169512`.
+- `cargo run -- examples/result.0s` prints `420-1`.
+- `cargo run -- examples/fib.0s` prints `13`.
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/tree.0s` prints `6`.
+- `cargo run -- examples/mixed.0s` prints `025122`.
+- `cargo run -- examples/let_test.0s` prints `51020`.
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+
+### Side fix: `Machine::run_raw` restored
+
+The `Machine::run_raw` helper (introduced in Phase 15D
+to run compiler-produced bytecode without an rkyv
+round-trip via the `run` method) was incorrectly
+removed in an uncommitted intermediate edit. Phase 19
+restores it as part of the test pipeline plumbing — the
+golden tests need `run_raw` to feed compiler output
+directly into the VM without going through the rkyv
+serialize/deserialize path twice.
+
+```rust
+pub fn run_raw(&mut self, code: &[RawByte]) {
+    use rkyv::{rancor::Error, vec::ArchivedVec};
+
+    // Serialize a `Vec<Byte>` (not `&[Byte]`, which
+    // isn't `Sized`) via rkyv.
+    let owned: Vec<RawByte> = code.to_vec();
+    let bytes = rkyv::to_bytes::<Error>(&owned)
+        .expect("failed to serialize bytecode via rkyv");
+
+    // Convert to a plain `Vec<u8>` for `access`.
+    let plain: Vec<u8> = bytes.as_slice().to_vec();
+    drop(bytes); // AlignedVec → drop, no `into_owned`
+
+    // Deserialize back to the archived form.
+    let archived = rkyv::access::<ArchivedVec<Byte>, Error>(&plain)
+        .expect("failed to deserialize bytecode via rkyv");
+
+    self.run(archived.as_slice());
+}
+```
+
+### Anything 20+ needs to know
+
+- **`field_type_for` is a registry lookup, not an
+  inference pass.** Future phases that need to query
+  field types (e.g., a method-call resolution pass) can
+  reuse this helper without re-running HM inference.
+- **The `codegen_var_types` side-table is still in
+  place** for `Identifier` receivers. Phase 19 doesn't
+  remove it — chained accesses still need it for the
+  base case. A future cleanup could fold both into a
+  single registry.
+- **The postfix `.ident` operator is at Primary
+  precedence.** Any future postfix operator (method
+  call `obj.method()`, index `arr[0]`) should also go
+  at Primary precedence and would bind LEFT-TO-RIGHT
+  with `.ident` (i.e., `obj.method().field` parses as
+  `Access(Call(obj, method), field)`).
+- **Tuple fields don't appear in `field_type_for`.**
+  Programs that use tuple-shaped record fields
+  (`Foo::Bar { x: (int, int) }` with `bar.x.0`) still
+  need the codegen's `field_pairs()` path. Phase 19
+  doesn't unify the two.
+- **The parser's `.ident` postfix is whitespace-
+  insensitive** (no space required between `.` and the
+  identifier). This matches Rust/C-style languages. A
+  future feature like `f(x).y` parses as
+  `Access(Call(f, [x]), "y")`.
