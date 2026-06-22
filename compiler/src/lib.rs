@@ -1,5 +1,6 @@
 mod block_builder;
 pub mod cfg;
+mod cfg_builder;
 mod pipeline;
 mod typechecking;
 
