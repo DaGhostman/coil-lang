@@ -892,4 +892,989 @@ impl Builder {
     }
 }
 
-// (End of file.)
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the straight-line CFG builder.
+    //!
+    //! ## Construction approach
+    //!
+    //! AST `Expression<'expr>` nodes are constructed directly using
+    //! `'static` lifetimes. All string literals are `&'static str`,
+    //! and `Output<'static>` tuples are built with helper functions
+    //! (`e`, `ident`, `int`, etc.) at the top of this module. No
+    //! `Box::leak` is used — `'static` is sufficient because every
+    //! test function has a string-literal source it can borrow from
+    //! for the lifetime of the program.
+    //!
+    //! This mirrors the lifetime pattern that production code will
+    //! see (the parser produces `Expression<'src>` borrowed from the
+    //! source string), and avoids the parser entirely so the tests
+    //! exercise the builder in isolation.
+    //!
+    //! `SimpleSpan` is constructed directly via its public fields
+    //! (`start`, `end`, `context`) — see the chumsky source for the
+    //! struct definition.
+
+    use super::*;
+    use crate::cfg::{BinOpKind, BlockId, ValueId};
+    use parser::SimpleSpan;
+    use parser::ast::Expression;
+
+    // -----------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------
+
+    /// Zero-width span with unit context — the placeholder span used
+    /// by every helper-built `Output`. The CFG builder ignores span
+    /// contents for non-diagnostic code paths, so a uniform placeholder
+    /// is fine.
+    fn span() -> SimpleSpan {
+        SimpleSpan {
+            start: 0,
+            end: 0,
+            context: (),
+        }
+    }
+
+    /// Wrap an `Expression` in the `Output` tuple shape the builder
+    /// expects: `(span, Box<Expression>)`.
+    fn e(inner: Expression<'static>) -> Output<'static> {
+        (span(), Box::new(inner))
+    }
+
+    fn ident(name: &'static str) -> Expression<'static> {
+        Expression::Identifier(name)
+    }
+
+    fn int(n: i64) -> Expression<'static> {
+        Expression::Integer(n)
+    }
+
+    fn float(f: f64) -> Expression<'static> {
+        Expression::Float(f)
+    }
+
+    fn bool_lit(b: bool) -> Expression<'static> {
+        Expression::Bool(b)
+    }
+
+    fn string_lit(s: &'static str) -> Expression<'static> {
+        Expression::String(s)
+    }
+
+    fn add(lhs: Expression<'static>, rhs: Expression<'static>) -> Expression<'static> {
+        Expression::Add(e(lhs), e(rhs))
+    }
+
+    fn mul(lhs: Expression<'static>, rhs: Expression<'static>) -> Expression<'static> {
+        Expression::Mul(e(lhs), e(rhs))
+    }
+
+    fn div(lhs: Expression<'static>, rhs: Expression<'static>) -> Expression<'static> {
+        Expression::Div(e(lhs), e(rhs))
+    }
+
+    /// `let name = rhs;` — produces the Fragment shape that the parser
+    /// emits. The builder's special-case at `build_expression`'s
+    /// `Fragment` arm treats `Fragment([Variable(name), rhs])` as a
+    /// let-binding.
+    fn let_binding(name: &'static str, rhs: Expression<'static>) -> Expression<'static> {
+        Expression::Fragment(vec![e(Expression::Variable(name, None)), e(rhs)])
+    }
+
+    /// Wrap an inner expression in `Statement(...)` — matches what the
+    /// parser produces for `expr;` and `let x = ...;` and `return ...;`.
+    fn stmt(inner: Expression<'static>) -> Expression<'static> {
+        Expression::Statement(e(inner))
+    }
+
+    /// A body-shaped block: `Block([stmt, stmt, ...])`.
+    fn block(children: Vec<Expression<'static>>) -> Expression<'static> {
+        Expression::Block(children.into_iter().map(e).collect())
+    }
+
+    /// `return expr;`
+    fn ret(inner: Expression<'static>) -> Expression<'static> {
+        Expression::Return(e(inner))
+    }
+
+    /// One function parameter: `Argument(ty, name)`.
+    fn argument(ty: &'static str, name: &'static str) -> Expression<'static> {
+        Expression::Argument(ty, name)
+    }
+
+    /// Build a complete `Expression::Function`. The `returns` field is
+    /// ignored by the builder (it defaults to `TypeRef::Unknown`) but
+    /// is parameterized for realism — most tests use `Some("int")`.
+    fn function(
+        name: &'static str,
+        args: Vec<(&'static str, &'static str)>,
+        returns: Option<&'static str>,
+        body: Expression<'static>,
+    ) -> Expression<'static> {
+        let args_vec: Vec<Output<'static>> = args
+            .into_iter()
+            .map(|(ty, arg_name)| e(argument(ty, arg_name)))
+            .collect();
+        Expression::Function {
+            name,
+            args: e(Expression::Fragment(args_vec)),
+            returns,
+            body: e(body),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Basic expressions: constants
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_int_constant_produces_const_inst() {
+        // `fn f() -> int { return 42; }`
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(ret(int(42)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(cfg.blocks.len(), 1, "expected single block");
+        let blk = &cfg.blocks[0];
+
+        // Exactly one Const(42) instruction.
+        let consts: Vec<_> = blk
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Const { dst, value } => Some((*dst, *value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            consts.len(),
+            1,
+            "expected 1 Const inst, got {:?}",
+            blk.insts
+        );
+        assert_eq!(consts[0], (ValueId(0), 42));
+
+        // Terminator is Return(Some(v0)).
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(0)),
+            "expected Return(Some(v0)), got {:?}",
+            blk.terminator
+        );
+    }
+
+    #[test]
+    fn build_float_constant_produces_constf_inst() {
+        // `fn f() -> float { return 3.14; }`
+        let func = function(
+            "f",
+            vec![],
+            Some("float"),
+            block(vec![stmt(ret(float(3.14)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        let has_constf = blk
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::ConstF { value, .. } if (*value - 3.14).abs() < 1e-9));
+        assert!(
+            has_constf,
+            "expected ConstF(3.14) in {:?}",
+            blk.insts
+        );
+        assert!(matches!(blk.terminator, Terminator::Return(Some(_))));
+    }
+
+    #[test]
+    fn build_bool_constant_produces_constbool_inst() {
+        // `fn f() -> bool { return true; }`
+        let func = function(
+            "f",
+            vec![],
+            Some("bool"),
+            block(vec![stmt(ret(bool_lit(true)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        let has_constbool = blk.insts.iter().any(|i| matches!(
+            i,
+            Inst::ConstBool { value: true, .. }
+        ));
+        assert!(
+            has_constbool,
+            "expected ConstBool(true) in {:?}",
+            blk.insts
+        );
+        assert!(matches!(blk.terminator, Terminator::Return(Some(_))));
+    }
+
+    #[test]
+    fn build_string_constant_produces_conststring_inst() {
+        // `fn f() -> string { return "hello"; }`
+        let func = function(
+            "f",
+            vec![],
+            Some("string"),
+            block(vec![stmt(ret(string_lit("hello")))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        let has_conststring = blk.insts.iter().any(|i| matches!(
+            i,
+            Inst::ConstString { value, .. } if value == "hello"
+        ));
+        assert!(
+            has_conststring,
+            "expected ConstString(\"hello\") in {:?}",
+            blk.insts
+        );
+        assert!(matches!(blk.terminator, Terminator::Return(Some(_))));
+    }
+
+    // -----------------------------------------------------------------
+    // Identifier lookup: function params
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_identifier_param_lookup() {
+        // `fn f(int x) -> int { return x; }`
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(ret(ident("x")))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // Exactly one Param (index 0, dst v0).
+        let params: Vec<_> = blk
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Param { dst, index } => Some((*dst, *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(params.len(), 1, "expected 1 Param inst");
+        assert_eq!(params[0], (ValueId(0), 0));
+
+        // No other insts (Identifier lookups don't emit insts).
+        assert_eq!(
+            blk.insts.len(),
+            1,
+            "expected only the Param inst, got {:?}",
+            blk.insts
+        );
+
+        // Terminator is Return(Some(v0)) — the param's ValueId.
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(0)),
+            "expected Return(Some(v0)), got {:?}",
+            blk.terminator
+        );
+
+        // params list has one entry: (v0, "x").
+        assert_eq!(cfg.params, vec![(ValueId(0), "x".to_string())]);
+    }
+
+    // -----------------------------------------------------------------
+    // Binary expressions
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_add_produces_binop_inst() {
+        // `fn f(int a, int b) -> int { return a + b; }`
+        let func = function(
+            "f",
+            vec![("int", "a"), ("int", "b")],
+            Some("int"),
+            block(vec![stmt(ret(add(ident("a"), ident("b"))))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // 2 Param + 1 BinOp(Add) = 3 insts.
+        assert_eq!(blk.insts.len(), 3, "insts: {:?}", blk.insts);
+
+        // First two are Params (a → v0, b → v1).
+        match &blk.insts[0] {
+            Inst::Param { dst, index } => {
+                assert_eq!(*dst, ValueId(0));
+                assert_eq!(*index, 0);
+            }
+            other => panic!("expected Param, got {:?}", other),
+        }
+        match &blk.insts[1] {
+            Inst::Param { dst, index } => {
+                assert_eq!(*dst, ValueId(1));
+                assert_eq!(*index, 1);
+            }
+            other => panic!("expected Param, got {:?}", other),
+        }
+
+        // Third is BinOp(Add, v2, v0, v1).
+        match &blk.insts[2] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Add);
+                assert_eq!(*dst, ValueId(2));
+                assert_eq!(*lhs, ValueId(0));
+                assert_eq!(*rhs, ValueId(1));
+            }
+            other => panic!("expected BinOp(Add), got {:?}", other),
+        }
+
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(2)),
+            "expected Return(Some(v2)), got {:?}",
+            blk.terminator
+        );
+    }
+
+    #[test]
+    fn build_nested_binary_uses_correct_ssa_order() {
+        // `fn f(int a, int b, int c) -> int { return a + b * c; }`
+        //
+        // The parser's Pratt precedence puts `*` higher than `+`, so
+        // this parses as `Add(a, Mul(b, c))`. The builder walks the
+        // AST in pre-order, so the Mul is built BEFORE the Add:
+        //
+        //   Params: a → v0, b → v1, c → v2
+        //   Mul:    v3 = b * c
+        //   Add:    v4 = a + v3
+        //
+        // The Mul's ValueId is freshly minted before the Add's, even
+        // though it's nested under the Add — the walk is
+        // left-then-right-then-self.
+        let func = function(
+            "f",
+            vec![("int", "a"), ("int", "b"), ("int", "c")],
+            Some("int"),
+            block(vec![stmt(ret(add(ident("a"), mul(ident("b"), ident("c")))))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // 3 Params + 1 Mul + 1 Add = 5 insts.
+        assert_eq!(blk.insts.len(), 5, "insts: {:?}", blk.insts);
+
+        // Inst 3 (after the 3 Params) is the Mul.
+        match &blk.insts[3] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Mul);
+                assert_eq!(*dst, ValueId(3));
+                assert_eq!(*lhs, ValueId(1), "lhs should be b's v1");
+                assert_eq!(*rhs, ValueId(2), "rhs should be c's v2");
+            }
+            other => panic!("expected BinOp(Mul), got {:?}", other),
+        }
+
+        // Inst 4 is the Add, using the Mul's result as its rhs.
+        match &blk.insts[4] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Add);
+                assert_eq!(*dst, ValueId(4));
+                assert_eq!(*lhs, ValueId(0), "lhs should be a's v0");
+                assert_eq!(*rhs, ValueId(3), "rhs should be the Mul's v3");
+            }
+            other => panic!("expected BinOp(Add), got {:?}", other),
+        }
+
+        // Terminator returns the Add's result (v4).
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(4)),
+            "expected Return(Some(v4)), got {:?}",
+            blk.terminator
+        );
+
+        // SSA values used: v0..=v4 — exactly 5 distinct ValueIds.
+        let mut seen = std::collections::HashSet::new();
+        for inst in &blk.insts {
+            let vids: Vec<ValueId> = match inst {
+                Inst::Param { dst, .. } => vec![*dst],
+                Inst::Const { dst, .. } => vec![*dst],
+                Inst::BinOp { dst, lhs, rhs, .. } => vec![*dst, *lhs, *rhs],
+                _ => vec![],
+            };
+            for v in vids {
+                seen.insert(v);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "expected 5 distinct SSA values, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn build_division_produces_div_inst() {
+        // `fn f(int a, int b) -> int { return a / b; }`
+        let func = function(
+            "f",
+            vec![("int", "a"), ("int", "b")],
+            Some("int"),
+            block(vec![stmt(ret(div(ident("a"), ident("b"))))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // Find the BinOp and check its op kind.
+        let binop_op = blk.insts.iter().find_map(|i| match i {
+            Inst::BinOp { op, .. } => Some(*op),
+            _ => None,
+        });
+        assert_eq!(
+            binop_op,
+            Some(BinOpKind::Div),
+            "expected BinOp(Div) in {:?}",
+            blk.insts
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Let bindings
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_let_binding_creates_local() {
+        // `fn f(int x) -> int { let y = x; return y; }`
+        //
+        // The let-binding's RHS is just an identifier lookup, so the
+        // block emits:
+        //   Param(v0, 0)  -- x
+        //   (no inst for let, but locals["y"] = v0)
+        //   (no inst for return y, just terminator Return(Some(v0)))
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![
+                stmt(let_binding("y", ident("x"))),
+                stmt(ret(ident("y"))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // Only the Param — no other insts (let-bindings and
+        // Identifier lookups don't emit instructions).
+        assert_eq!(
+            blk.insts.len(),
+            1,
+            "expected only the Param, got {:?}",
+            blk.insts
+        );
+        assert!(matches!(
+            blk.insts[0],
+            Inst::Param {
+                dst: ValueId(0),
+                index: 0,
+            }
+        ));
+
+        // Return references the same v0 (y resolves to x's ValueId).
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(0)),
+            "expected Return(Some(v0)) — `y` should share x's ValueId"
+        );
+    }
+
+    #[test]
+    fn build_let_binding_with_expression() {
+        // `fn f(int x) -> int { let y = x + 1; return y; }`
+        //
+        // Block emits:
+        //   Param(v0, 0)  -- x
+        //   Const(v1, 1)
+        //   BinOp(Add, v2, v0, v1)
+        //   (no inst for return y; terminator uses v2)
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![
+                stmt(let_binding("y", add(ident("x"), int(1)))),
+                stmt(ret(ident("y"))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // 3 insts: Param, Const, BinOp.
+        assert_eq!(blk.insts.len(), 3, "insts: {:?}", blk.insts);
+
+        // Inst 1 is Const(1).
+        match &blk.insts[1] {
+            Inst::Const { dst, value } => {
+                assert_eq!(*dst, ValueId(1));
+                assert_eq!(*value, 1);
+            }
+            other => panic!("expected Const(1), got {:?}", other),
+        }
+
+        // Inst 2 is BinOp(Add, v2, v0, v1).
+        match &blk.insts[2] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Add);
+                assert_eq!(*dst, ValueId(2));
+                assert_eq!(*lhs, ValueId(0));
+                assert_eq!(*rhs, ValueId(1));
+            }
+            other => panic!("expected BinOp(Add), got {:?}", other),
+        }
+
+        // Return references v2 (y's ValueId).
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(2)),
+            "expected Return(Some(v2))"
+        );
+    }
+
+    #[test]
+    fn build_multiple_let_bindings() {
+        // `fn f(int x) -> int { let a = x; let b = a + 1; return b; }`
+        //
+        // Emits:
+        //   Param(v0, 0)  -- x
+        //   Const(v1, 1)
+        //   BinOp(Add, v2, v0, v1)  -- a+1, where a = x = v0
+        //
+        // locals["a"] = v0  (first let)
+        // locals["b"] = v2  (second let)
+        //
+        // Return(Some(v2)) — b's ValueId.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![
+                stmt(let_binding("a", ident("x"))),
+                stmt(let_binding("b", add(ident("a"), int(1)))),
+                stmt(ret(ident("b"))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // 3 insts: Param + Const + BinOp.
+        assert_eq!(blk.insts.len(), 3, "insts: {:?}", blk.insts);
+
+        // Last inst is the Add (a + 1).
+        match &blk.insts[2] {
+            Inst::BinOp { dst, .. } => assert_eq!(*dst, ValueId(2)),
+            other => panic!("expected BinOp, got {:?}", other),
+        }
+
+        // Return references v2 (b = a+1).
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(2)),
+            "expected Return(Some(v2))"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Return variants
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_return_with_value() {
+        // `fn f() -> int { return 42; }`
+        //
+        // The Return arm sets `return_value = Some(v0)`; the
+        // terminator is emitted at the end of `build_function`.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(ret(int(42)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // Exactly one Const (the literal 42).
+        let const_count = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Const { .. }))
+            .count();
+        assert_eq!(const_count, 1);
+
+        // Terminator: Return(Some(v0)).
+        match &blk.terminator {
+            Terminator::Return(Some(v)) => assert_eq!(*v, ValueId(0)),
+            other => panic!("expected Return(Some(v0)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_return_without_value() {
+        // `fn f() { let y = 5; }`
+        //
+        // No explicit Return / ImplicitReturn — the body's last child
+        // is a let-binding (Statement wrapping Fragment), which
+        // returns None. So `return_value` stays None and the
+        // terminator is `Return(None)` — the function returns unit.
+        //
+        // Note: the body still emits the Const(5) inst for the
+        // let-binding's RHS; only the RETURN value is absent.
+        let func = function(
+            "f",
+            vec![],
+            None,
+            block(vec![stmt(let_binding("y", int(5)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // The RHS emits a Const(5) inst.
+        let has_const_5 = blk.insts.iter().any(|i| matches!(
+            i,
+            Inst::Const { value: 5, .. }
+        ));
+        assert!(has_const_5, "expected Const(5) in {:?}", blk.insts);
+
+        // Terminator is Return(None) — no explicit return.
+        assert!(
+            matches!(blk.terminator, Terminator::Return(None)),
+            "expected Return(None), got {:?}",
+            blk.terminator
+        );
+
+        // Function has no params.
+        assert!(cfg.params.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Block structure
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_simple_function_has_one_block() {
+        // The simplest possible function — a single block, one Const,
+        // one Return. No control flow, no let bindings.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(ret(int(0)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(cfg.blocks.len(), 1, "expected exactly one block");
+        assert_eq!(cfg.entry, BlockId(0));
+    }
+
+    #[test]
+    fn build_function_with_let_then_return_has_correct_inst_count() {
+        // `fn f(int x) -> int { let y = x + 1; return y; }`
+        //
+        // Inst count: Param(x) + Const(1) + BinOp(Add) = 3 insts.
+        // The let-binding and the return statement are NOT insts
+        // (let-binding registers a local; return sets return_value).
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![
+                stmt(let_binding("y", add(ident("x"), int(1)))),
+                stmt(ret(ident("y"))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        assert_eq!(blk.insts.len(), 3, "insts: {:?}", blk.insts);
+
+        // Sanity: exactly one of each.
+        let n_params = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Param { .. }))
+            .count();
+        let n_consts = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Const { .. }))
+            .count();
+        let n_binops = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::BinOp { .. }))
+            .count();
+        assert_eq!(n_params, 1);
+        assert_eq!(n_consts, 1);
+        assert_eq!(n_binops, 1);
+    }
+
+    #[test]
+    fn predecessors_field_is_empty_for_single_block_function() {
+        // Single-block functions have no predecessors (no other
+        // block can transfer control to them). The fill_predecessors
+        // pass must produce an empty `predecessors` Vec.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(ret(ident("x")))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        assert!(
+            blk.predecessors.is_empty(),
+            "single-block function should have empty predecessors, got {:?}",
+            blk.predecessors
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Integration: end-to-end simple functions
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_double_function_returns_x_times_2() {
+        // `fn double(int x) -> int { return x * 2; }`
+        //
+        // Expected CFG:
+        //   - 1 block
+        //   - 3 instructions: Param(x → v0, index 0),
+        //                     Const(2 → v1),
+        //                     BinOp(Mul, v2, v0, v1)
+        //   - 1 terminator: Return(Some(v2))
+        //   - 1 param: (v0, "x")
+        //   - 3 SSA values total (v0, v1, v2)
+        let func = function(
+            "double",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![stmt(ret(mul(ident("x"), int(2))))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // 1 block.
+        assert_eq!(cfg.blocks.len(), 1, "expected 1 block");
+        let blk = &cfg.blocks[0];
+
+        // 3 insts.
+        assert_eq!(
+            blk.insts.len(),
+            3,
+            "expected 3 insts (Param + Const + BinOp), got {:?}",
+            blk.insts
+        );
+
+        // Verify each inst exactly.
+        match &blk.insts[0] {
+            Inst::Param { dst, index } => {
+                assert_eq!(*dst, ValueId(0));
+                assert_eq!(*index, 0);
+            }
+            other => panic!("inst 0: expected Param, got {:?}", other),
+        }
+        match &blk.insts[1] {
+            Inst::Const { dst, value } => {
+                assert_eq!(*dst, ValueId(1));
+                assert_eq!(*value, 2);
+            }
+            other => panic!("inst 1: expected Const(2), got {:?}", other),
+        }
+        match &blk.insts[2] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Mul);
+                assert_eq!(*dst, ValueId(2));
+                assert_eq!(*lhs, ValueId(0));
+                assert_eq!(*rhs, ValueId(1));
+            }
+            other => panic!("inst 2: expected BinOp(Mul), got {:?}", other),
+        }
+
+        // Terminator: Return(Some(v2)).
+        match &blk.terminator {
+            Terminator::Return(Some(v)) => assert_eq!(*v, ValueId(2)),
+            other => panic!("expected Return(Some(v2)), got {:?}", other),
+        }
+
+        // 1 param: (v0, "x").
+        assert_eq!(cfg.params, vec![(ValueId(0), "x".to_string())]);
+        assert_eq!(cfg.name, "double");
+
+        // 3 SSA values: v0 (Param), v1 (Const), v2 (BinOp).
+        let mut seen = std::collections::HashSet::new();
+        for inst in &blk.insts {
+            for v in match inst {
+                Inst::Param { dst, .. } => vec![*dst],
+                Inst::Const { dst, .. } => vec![*dst],
+                Inst::BinOp { dst, lhs, rhs, .. } => {
+                    vec![*dst, *lhs, *rhs]
+                }
+                _ => vec![],
+            } {
+                seen.insert(v);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "expected 3 distinct SSA values, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn build_let_chain_function() {
+        // `fn f(int x) -> int { let y = x + 1; let z = y * 2; return z; }`
+        //
+        // Emits (in order):
+        //   Param(v0, 0)  -- x
+        //   Const(v1, 1)
+        //   BinOp(Add, v2, v0, v1)   -- y = x + 1
+        //   Const(v3, 2)
+        //   BinOp(Mul, v4, v2, v3)   -- z = y * 2
+        //   terminator Return(Some(v4))   -- z = v4
+        //
+        // locals["y"] = v2, locals["z"] = v4. Neither let-binding nor
+        // return emits an instruction.
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![
+                stmt(let_binding("y", add(ident("x"), int(1)))),
+                stmt(let_binding("z", mul(ident("y"), int(2)))),
+                stmt(ret(ident("z"))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // 5 insts.
+        assert_eq!(
+            blk.insts.len(),
+            5,
+            "expected 5 insts, got {:?}",
+            blk.insts
+        );
+
+        // Inst 0: Param(x → v0).
+        match &blk.insts[0] {
+            Inst::Param { dst, index } => {
+                assert_eq!(*dst, ValueId(0));
+                assert_eq!(*index, 0);
+            }
+            other => panic!("inst 0: expected Param, got {:?}", other),
+        }
+
+        // Inst 1: Const(1 → v1).
+        match &blk.insts[1] {
+            Inst::Const { dst, value } => {
+                assert_eq!(*dst, ValueId(1));
+                assert_eq!(*value, 1);
+            }
+            other => panic!("inst 1: expected Const(1), got {:?}", other),
+        }
+
+        // Inst 2: BinOp(Add, v2, v0, v1) — the first let-binding's RHS.
+        match &blk.insts[2] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Add);
+                assert_eq!(*dst, ValueId(2));
+                assert_eq!(*lhs, ValueId(0));
+                assert_eq!(*rhs, ValueId(1));
+            }
+            other => panic!("inst 2: expected BinOp(Add), got {:?}", other),
+        }
+
+        // Inst 3: Const(2 → v3).
+        match &blk.insts[3] {
+            Inst::Const { dst, value } => {
+                assert_eq!(*dst, ValueId(3));
+                assert_eq!(*value, 2);
+            }
+            other => panic!("inst 3: expected Const(2), got {:?}", other),
+        }
+
+        // Inst 4: BinOp(Mul, v4, v2, v3) — the second let-binding's RHS,
+        // using the first let-binding's ValueId as the lhs.
+        match &blk.insts[4] {
+            Inst::BinOp {
+                op,
+                dst,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(*op, BinOpKind::Mul);
+                assert_eq!(*dst, ValueId(4));
+                assert_eq!(
+                    *lhs, ValueId(2),
+                    "lhs should be y's ValueId (v2)"
+                );
+                assert_eq!(*rhs, ValueId(3));
+            }
+            other => panic!("inst 4: expected BinOp(Mul), got {:?}", other),
+        }
+
+        // Terminator: Return(Some(v4)) — z's ValueId.
+        match &blk.terminator {
+            Terminator::Return(Some(v)) => assert_eq!(*v, ValueId(4)),
+            other => panic!("expected Return(Some(v4)), got {:?}", other),
+        }
+    }
+}
