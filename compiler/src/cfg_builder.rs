@@ -975,21 +975,33 @@ impl Builder {
     /// `self.current_block_mut()` correct (it indexes
     /// `self.blocks[self.current.index()]`).
     ///
-    /// Block ID assignment:
+    /// **Critical invariant for the linearizer:** the block
+    /// immediately following a `Branch` terminator's block in
+    /// declaration order MUST be the Branch's `true_bb` (the
+    /// `then` block). The linearizer emits a `JMPF` for each
+    /// `Branch`; the `JMPF` jumps to `false_bb` when the
+    /// condition is false and falls through to the NEXT block
+    /// in declaration order when the condition is true. If the
+    /// next block isn't `true_bb`, the `then` body is silently
+    /// skipped at runtime.
     ///
-    /// | BlockId | Role                     |
-    /// |---------|--------------------------|
-    /// | 0       | entry (already pushed)   |
-    /// | 1       | join_block               |
-    /// | 2       | then_0                   |
-    /// | 3       | false_target_0 (= next branch's cond / else) |
-    /// | 4       | then_1                   |
-    /// | 5       | false_target_1 (= next branch's cond / else) |
-    /// | ...     | (etc.)                   |
+    /// Block ID assignment (the then-block comes IMMEDIATELY
+    /// after the Branch's block, the false_target / next-branch
+    /// cond eval block comes after, and `join_block` comes last):
+    ///
+    /// | BlockId | Role                                                |
+    /// |---------|-----------------------------------------------------|
+    /// | 0       | entry (already pushed)                              |
+    /// | 1       | then_0 (Branch's true_bb; reached by JMPF fall-through) |
+    /// | 2       | false_target_0 (= next branch's cond / else block) |
+    /// | 3       | then_1 (false_target_0's Branch true_bb)            |
+    /// | 4       | false_target_1 (= next branch's cond / else block) |
+    /// | ...     | (etc.)                                              |
+    /// | N       | join_block (last; target of every Jump-to-join)     |
     ///
     /// For `if cond { body }` (no else): the Branch's false arm
     /// points at `join_block` directly (no separate false_target
-    /// is allocated).
+    /// is allocated), and the push order is `[entry, then, join]`.
     ///
     /// ## Value handling
     ///
@@ -1027,14 +1039,18 @@ impl Builder {
 
         let num_branches = branches.len();
 
-        // Allocate and push the join_block FIRST so its
-        // BlockId (= 1) is in the canonical "lowest index after
-        // entry" position. The join's CONTENTS are filled later
-        // (by the body's continuation code), but its INDEX must
-        // be stable so that the Branch / Jump targets can be
-        // resolved via `self.blocks[BlockId(1).index()]`.
-        let join_block = self.fresh_block();
-        self.blocks.push(Block::new(join_block));
+        // Phase 1.5 fix: defer the `Jump(join_block)` terminators
+        // until `join_block` is finally allocated. The pre-1.5
+        // code allocated `join_block` first and pushed it at
+        // index 1, which made the linearizer's JMPF fall-through
+        // land on `join_block` instead of `then_block` (the
+        // wrong code path at runtime).
+        //
+        // We track every block that needs a `Jump(join_block)`
+        // terminator here and patch them all in one shot after
+        // `join_block` is allocated at the end of the loop.
+        let mut blocks_needing_jump_to_join: Vec<BlockId> = Vec::new();
+        let mut pending_join_block: Option<BlockId> = None;
 
         for (i, branch_output) in branches.iter().enumerate() {
             let branch_expr = branch_output.1.as_ref();
@@ -1058,32 +1074,58 @@ impl Builder {
                         .build_expression(cond_output.1.as_ref())
                         .unwrap_or_else(|| self.fresh_value());
 
-                    // Push then_block (BlockId 2, 4, ...).
+                    // Push then_block IMMEDIATELY so it becomes
+                    // the next block in declaration order — this
+                    // is the linearizer's JMPF fall-through
+                    // target (the Branch's true_bb).
                     let then_block = self.fresh_block();
                     self.blocks.push(Block::new(then_block));
 
-                    // Push false_target if not last.
+                    // Allocate and push the false_target next.
                     //
-                    // For the last branch with cond=Some, the
-                    // false arm goes directly to join_block (no
-                    // else branch — fall through to the join).
+                    // For the last branch with cond=Some (no
+                    // else), the false arm goes directly to
+                    // `join_block` — we allocate `join_block`
+                    // here and push it as the false_target. The
+                    // push order becomes
+                    // `[entry, then, join]`.
                     //
                     // For non-last branches, push a fresh
-                    // false_target (BlockId 3, 5, ...) — this
-                    // becomes either the next branch's cond
-                    // evaluation block, or (if the next branch
-                    // has cond=None) the else block where the
-                    // body's code goes.
+                    // false_target where either the next
+                    // branch's cond is evaluated (chained
+                    // else-if) or the else's body lives (when
+                    // the next branch has cond=None). The push
+                    // order becomes `[entry, then, false_target,
+                    // ...]`.
                     let false_target = if is_last {
-                        join_block
+                        // false_target IS the join_block.
+                        // Allocate and push it now so its
+                        // BlockId (= then_block+1) lines up
+                        // with its Vec index. The linearizer's
+                        // JMPF will jump to this offset when
+                        // the condition is false.
+                        let jb = self.fresh_block();
+                        self.blocks.push(Block::new(jb));
+                        pending_join_block = Some(jb);
+                        jb
                     } else {
+                        // false_target is a separate block
+                        // (next branch's cond eval / else
+                        // body). Allocate and push it so its
+                        // BlockId lines up with its Vec index.
                         let ft = self.fresh_block();
                         self.blocks.push(Block::new(ft));
                         ft
                     };
 
                     // Set the current block's terminator to
-                    // Branch.
+                    // `Branch`. The current block is the
+                    // previous iteration's false_target
+                    // (chained else-if case) or the entry
+                    // (first iteration case). The next block
+                    // after it in declaration order is
+                    // `then_block`, which is what the linearizer
+                    // requires for the JMPF fall-through.
                     self.current_block_mut().terminator =
                         Terminator::Branch {
                             cond: cond_v,
@@ -1091,23 +1133,23 @@ impl Builder {
                             false_bb: false_target,
                         };
 
-                    // Switch to then_block, build body, set
-                    // Jump(join_block).
+                    // Switch to then_block, build body, defer
+                    // its Jump(join_block) terminator (we don't
+                    // know join_block's BlockId yet for the
+                    // non-last cases).
                     self.current = then_block;
                     let _then_value =
                         self.build_expression(body.1.as_ref());
-                    self.current_block_mut().terminator =
-                        Terminator::Jump(join_block);
+                    blocks_needing_jump_to_join.push(then_block);
 
                     // Advance current to false_target for the
                     // next iteration. If false_target IS
                     // join_block (last branch with cond=Some,
-                    // no else), we don't advance — the body's
-                    // continuation code will land in join_block
-                    // after the loop ends.
-                    if !is_last {
-                        self.current = false_target;
-                    }
+                    // no else), `current` is now the join_block
+                    // and the loop ends with current pointing
+                    // at the right place — no further advance
+                    // needed.
+                    self.current = false_target;
                 }
                 None => {
                     // Else branch (no condition). The current
@@ -1127,14 +1169,35 @@ impl Builder {
                         );
                     }
 
+                    // Build the body in the current block
+                    // (the previous iteration's false_target
+                    // — which becomes the else block).
                     let _body_value =
                         self.build_expression(body.1.as_ref());
-                    self.current_block_mut().terminator =
-                        Terminator::Jump(join_block);
-                    // No advance — there should be no more
-                    // branches.
+                    blocks_needing_jump_to_join.push(self.current);
+
+                    // Allocate and push `join_block` LAST so
+                    // its BlockId (= current count of blocks)
+                    // lines up with its Vec index. This is
+                    // the block every preceding Jump will
+                    // target.
+                    let jb = self.fresh_block();
+                    self.blocks.push(Block::new(jb));
+                    pending_join_block = Some(jb);
                 }
             }
+        }
+
+        // Patch every deferred Jump-to-join terminator now that
+        // `join_block` is allocated. The terminator's target is
+        // the same join_block for every block in the list.
+        let join_block = pending_join_block.expect(
+            "cfg_builder::build_if: join_block must be \
+             allocated by the end of the loop",
+        );
+        for bb in blocks_needing_jump_to_join {
+            self.blocks[bb.index()].terminator =
+                Terminator::Jump(join_block);
         }
 
         // After all branches, set self.current to the
@@ -2726,14 +2789,19 @@ mod tests {
     fn build_if_single_branch_produces_three_blocks() {
         // `fn f() -> int { if true { return 1; } return 0; }`
         //
-        // Block structure:
-        //   0 (entry):  ConstBool(true) → v0,  Branch(v0, 2, 1)
-        //   1 (join):   Const(0) → v1,         Return(Some(v1))
-        //   2 (then):   Const(1) → v2,          Jump(1)
+        // Block structure (Phase 1.5 fix — then_block comes
+        // IMMEDIATELY after entry so the linearizer's JMPF
+        // fall-through lands on it):
+        //   0 (entry):      ConstBool(true) → v0,  Branch(v0, 1, 2)
+        //   1 (then_block): Const(1) → v1,          Jump(2)
+        //   2 (join):       Const(0) → v2,          Return(Some(v2))
         //
-        // Branch's true target is the then_block (BlockId(2));
-        // Branch's false target is the join_block (BlockId(1))
-        // because there's no else.
+        // Branch's true target is the then_block (BlockId(1));
+        // Branch's false target is the join_block (BlockId(2))
+        // because there's no else. The then_block sits at
+        // Vec index 1 (the block right after entry), which is
+        // what the linearizer's "true_bb is reached by
+        // fall-through" contract requires.
         let func = function(
             "f",
             vec![],
@@ -2768,20 +2836,42 @@ mod tests {
                 let _ = cond;
                 assert_eq!(
                     *true_bb,
-                    BlockId(2),
-                    "Branch.true_bb should be then_block"
+                    BlockId(1),
+                    "Branch.true_bb should be then_block (BlockId 1, \
+                     immediately after entry — the JMPF fall-through target)"
                 );
                 assert_eq!(
                     *false_bb,
-                    BlockId(1),
+                    BlockId(2),
                     "Branch.false_bb should be join_block (no else)"
                 );
             }
             other => panic!("entry should have Branch terminator, got {:?}", other),
         }
 
-        // Block 1 (join): Const(0) followed by Return(Some(...)).
-        let join = &cfg.blocks[1];
+        // Block 1 (then_block): Const(1) followed by Jump(2).
+        let then_block = &cfg.blocks[1];
+        assert!(
+            then_block
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Const { value: 1, .. })),
+            "then_block should contain Const(1) (the `return 1` body)"
+        );
+        match &then_block.terminator {
+            Terminator::Jump(bb) => assert_eq!(
+                *bb,
+                BlockId(2),
+                "then_block should Jump to join_block (BlockId 2)"
+            ),
+            other => panic!(
+                "then_block should have Jump(2) terminator, got {:?}",
+                other
+            ),
+        }
+
+        // Block 2 (join): Const(0) followed by Return(Some(...)).
+        let join = &cfg.blocks[2];
         assert!(
             join.insts
                 .iter()
@@ -2793,44 +2883,24 @@ mod tests {
             "join should have Return(Some(_)) terminator, got {:?}",
             join.terminator
         );
-
-        // Block 2 (then_block): Const(1) followed by Jump(1).
-        let then_block = &cfg.blocks[2];
-        assert!(
-            then_block
-                .insts
-                .iter()
-                .any(|i| matches!(i, Inst::Const { value: 1, .. })),
-            "then_block should contain Const(1) (the `return 1` body)"
-        );
-        match &then_block.terminator {
-            Terminator::Jump(bb) => assert_eq!(
-                *bb,
-                BlockId(1),
-                "then_block should Jump to join_block"
-            ),
-            other => panic!(
-                "then_block should have Jump(1) terminator, got {:?}",
-                other
-            ),
-        }
     }
 
     #[test]
     fn build_if_else_produces_four_blocks() {
         // `fn f() -> int { if c { return 1; } else { return 2; } }`
         //
-        // Block structure:
-        //   0 (entry):    Cond(c) → v0,  Branch(v0, 2, 3)
-        //   1 (join):     Return(None)   (no continuation after the if)
-        //   2 (then):     Const(1) → v1, Jump(1)
-        //   3 (else):     Const(2) → v2, Jump(1)
+        // Block structure (Phase 1.5 fix — then_block comes
+        // IMMEDIATELY after entry):
+        //   0 (entry):      Cond(c) → v0,  Branch(v0, 1, 2)
+        //   1 (then_block): Const(1) → v1, Jump(3)
+        //   2 (else_block): Const(2) → v2, Jump(3)
+        //   3 (join):       Return(None)   (no continuation after the if)
         //
         // For multi-branch `If`, each branch's body is its own
-        // block. The Branch's false target is a fresh
-        // "fallthrough" block (which becomes the next branch's
-        // entry, or the else block for the last cond=Some
-        // branch).
+        // block. The Branch's true target (then_block) sits at
+        // Vec index 1 (immediately after entry), which is the
+        // JMPF fall-through target. The Branch's false target
+        // (else_block) is the next block at Vec index 2.
         let func = function(
             "f",
             vec![],
@@ -2854,33 +2924,38 @@ mod tests {
         // Entry: Branch with true → then_block, false → else_block.
         match &cfg.blocks[0].terminator {
             Terminator::Branch { true_bb, false_bb, .. } => {
-                assert_eq!(*true_bb, BlockId(2));
+                assert_eq!(
+                    *true_bb,
+                    BlockId(1),
+                    "Branch.true_bb should be then_block (BlockId 1)"
+                );
                 assert_eq!(
                     *false_bb,
-                    BlockId(3),
-                    "Branch.false_bb should be the else block"
+                    BlockId(2),
+                    "Branch.false_bb should be the else block (BlockId 2)"
                 );
             }
             other => panic!("expected Branch terminator, got {:?}", other),
         }
 
-        // Then block and else block both Jump to join_block.
+        // Then block and else block both Jump to join_block
+        // (BlockId(3)).
         assert!(
-            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
-            "then_block should Jump to join_block"
+            matches!(&cfg.blocks[1].terminator, Terminator::Jump(bb) if *bb == BlockId(3)),
+            "then_block should Jump to join_block (BlockId 3)"
         );
         assert!(
-            matches!(&cfg.blocks[3].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
-            "else_block should Jump to join_block"
+            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(3)),
+            "else_block should Jump to join_block (BlockId 3)"
         );
 
-        // Join block (BlockId(1)) has Return terminator (the body
-        // was just the if; no instructions after, so default
-        // Return(None)).
+        // Join block (BlockId(3)) has Return terminator (the
+        // body was just the if; no instructions after, so
+        // default Return(None)).
         assert!(
-            matches!(&cfg.blocks[1].terminator, Terminator::Return(_)),
+            matches!(&cfg.blocks[3].terminator, Terminator::Return(_)),
             "join block should have Return terminator, got {:?}",
-            cfg.blocks[1].terminator
+            cfg.blocks[3].terminator
         );
     }
 
@@ -2892,18 +2967,21 @@ mod tests {
         //      else { return 3; }
         //  }`
         //
-        // Block structure:
-        //   0 (entry):       Cond(c1) → v0,  Branch(v0, 3, 2)
-        //   1 (join):        Return(None)
-        //   2 (false_0):     Cond(c2) → v1,  Branch(v1, 4, 5)
-        //   3 (then_0):      Const(1),      Jump(1)
-        //   4 (then_1):      Const(2),      Jump(1)
-        //   5 (else):        Const(3),      Jump(1)
+        // Block structure (Phase 1.5 fix — then_block always
+        // comes IMMEDIATELY after the Branch's block; the
+        // false_target (= next-branch cond eval / else block)
+        // comes after that, and join_block comes last):
+        //   0 (entry):            Cond(c1) → v0,  Branch(v0, 1, 2)
+        //   1 (then_0):           Const(1),      Jump(5)
+        //   2 (false_target_0):   Cond(c2) → v1,  Branch(v1, 3, 4)
+        //   3 (then_1):           Const(2),      Jump(5)
+        //   4 (false_target_1 /   Const(3),      Jump(5)
+        //       else):
+        //   5 (join):             Return(None)
         //
         // Note: the block indices interleave with construction
-        // order. false_0 is allocated before then_1 because the
-        // Branch in entry needs false_0 first. BlockId(0) is
-        // always entry.
+        // order. The push order is
+        // `[entry, then_0, false_target_0, then_1, false_target_1, join]`.
         let func = function(
             "f",
             vec![],
@@ -2927,63 +3005,59 @@ mod tests {
         );
 
         // Entry (BlockId(0)): Branch with true → then_0
-        // (BlockId(2)), false → false_0 (BlockId(3)).
-        //
-        // The push order is: entry, join, then_0, false_0,
-        // then_1, false_1. BlockIds 2 and 3 are then_0 and
-        // false_0 respectively.
+        // (BlockId(1)), false → false_target_0 (BlockId(2)).
         match &cfg.blocks[0].terminator {
             Terminator::Branch { true_bb, false_bb, .. } => {
                 assert_eq!(
                     *true_bb,
-                    BlockId(2),
-                    "entry's Branch.true_bb should be then_0 (BlockId 2)"
+                    BlockId(1),
+                    "entry's Branch.true_bb should be then_0 (BlockId 1)"
                 );
                 assert_eq!(
                     *false_bb,
-                    BlockId(3),
-                    "entry's Branch.false_bb should be false_0 (BlockId 3)"
+                    BlockId(2),
+                    "entry's Branch.false_bb should be false_target_0 (BlockId 2)"
                 );
             }
             other => panic!("entry should have Branch terminator, got {:?}", other),
         }
 
-        // false_0 (BlockId(3)): Branch with true → then_1
-        // (BlockId(4)), false → else (BlockId(5)).
-        match &cfg.blocks[3].terminator {
+        // false_target_0 (BlockId(2)): Branch with true → then_1
+        // (BlockId(3)), false → else (BlockId(4)).
+        match &cfg.blocks[2].terminator {
             Terminator::Branch { true_bb, false_bb, .. } => {
                 assert_eq!(
                     *true_bb,
-                    BlockId(4),
-                    "false_0's Branch.true_bb should be then_1 (BlockId 4)"
+                    BlockId(3),
+                    "false_target_0's Branch.true_bb should be then_1 (BlockId 3)"
                 );
                 assert_eq!(
                     *false_bb,
-                    BlockId(5),
-                    "false_0's Branch.false_bb should be else (BlockId 5)"
+                    BlockId(4),
+                    "false_target_0's Branch.false_bb should be else (BlockId 4)"
                 );
             }
-            other => panic!("false_0 should have Branch terminator, got {:?}", other),
+            other => panic!("false_target_0 should have Branch terminator, got {:?}", other),
         }
 
-        // All three body blocks (2, 4, 5) Jump to join_block
-        // (BlockId(1)).
+        // All three body blocks (1, 3, 4) Jump to join_block
+        // (BlockId(5)).
         assert!(
-            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
-            "then_0 (BlockId 2) should Jump to join_block (BlockId 1)"
+            matches!(&cfg.blocks[1].terminator, Terminator::Jump(bb) if *bb == BlockId(5)),
+            "then_0 (BlockId 1) should Jump to join_block (BlockId 5)"
         );
         assert!(
-            matches!(&cfg.blocks[4].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
-            "then_1 (BlockId 4) should Jump to join_block (BlockId 1)"
+            matches!(&cfg.blocks[3].terminator, Terminator::Jump(bb) if *bb == BlockId(5)),
+            "then_1 (BlockId 3) should Jump to join_block (BlockId 5)"
         );
         assert!(
-            matches!(&cfg.blocks[5].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
-            "else (BlockId 5) should Jump to join_block (BlockId 1)"
+            matches!(&cfg.blocks[4].terminator, Terminator::Jump(bb) if *bb == BlockId(5)),
+            "else (BlockId 4) should Jump to join_block (BlockId 5)"
         );
 
-        // Join block (BlockId(1)): Return terminator.
+        // Join block (BlockId(5)): Return terminator.
         assert!(
-            matches!(&cfg.blocks[1].terminator, Terminator::Return(_)),
+            matches!(&cfg.blocks[5].terminator, Terminator::Return(_)),
             "join block should have Return terminator"
         );
     }
@@ -2992,12 +3066,13 @@ mod tests {
     fn build_if_predecessors_are_filled_correctly() {
         // `fn f() -> int { if true { return 1; } else { return 2; } }`
         //
-        // Block IDs: 0 (entry), 1 (join), 2 (then), 3 (else).
-        // Expected predecessors:
+        // Block IDs (Phase 1.5 fix — then_block is at index 1,
+        // immediately after entry, so the linearizer's JMPF
+        // fall-through lands on it):
         //   entry (0):  []
-        //   join (1):   [then(2), else(3)]  (each Jumps to join)
-        //   then (2):   [entry(0)]            (entry's Branch true)
-        //   else (3):   [entry(0)]            (entry's Branch false)
+        //   then  (1):  [entry(0)]            (entry's Branch true)
+        //   else  (2):  [entry(0)]            (entry's Branch false)
+        //   join  (3):  [then(1), else(2)]    (each Jumps to join)
         let func = function(
             "f",
             vec![],
@@ -3022,12 +3097,12 @@ mod tests {
         // predecessor (the Branch terminator's true / false
         // targets).
         assert_eq!(
-            cfg.blocks[2].predecessors,
+            cfg.blocks[1].predecessors,
             vec![BlockId(0)],
             "then_block should have entry as predecessor"
         );
         assert_eq!(
-            cfg.blocks[3].predecessors,
+            cfg.blocks[2].predecessors,
             vec![BlockId(0)],
             "else_block should have entry as predecessor"
         );
@@ -3036,11 +3111,11 @@ mod tests {
         // Jump targets join). Order is not guaranteed; compare
         // via a sorted copy (BlockId doesn't derive Ord, so use
         // sort_by_key).
-        let mut join_preds = cfg.blocks[1].predecessors.clone();
+        let mut join_preds = cfg.blocks[3].predecessors.clone();
         join_preds.sort_by_key(|b| b.0);
         assert_eq!(
             join_preds,
-            vec![BlockId(2), BlockId(3)],
+            vec![BlockId(1), BlockId(2)],
             "join should have then + else as predecessors"
         );
     }
