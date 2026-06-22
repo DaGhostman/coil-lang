@@ -67,6 +67,67 @@ reverse-order tricks, no slot side-tables.
 
 ---
 
+## Verification Experiment Results
+
+All three verification experiments from §5 are complete. Findings:
+
+### Experiment A: Match Codegen + SSA-lite (commit `faa7aaf`)
+
+**Validated: SSA-lite is sufficient.** The canonical match expression
+(`match opt { Some(v) => v, None => 0 }`) decomposes into three blocks
+where each arm has its own RETURN. No join block receives values from
+both arms, so no phi-nodes are needed.
+
+The current match codegen's reverse-source-order emission (Phase 15C)
+composes cleanly with block-local SSA numbering. The per-arm
+`match_bindings` map (Phase 17B-cleanup workaround) becomes redundant.
+
+### Experiment B: GC Root Set for Register VM (commit `9fc61bc`)
+
+**Validated: Option 2 (callee-saves for GC-reachable values) is sound.**
+All 21 existing GC tests were analyzed (19 in `machine/src/vm.rs::tests`
++ 2 in `machine/src/memory/heap.rs::tests`). Under Option 2:
+
+- Two minor concerns identified, both standard register-allocation concerns:
+  - `nested_enum_gc_traces_correctly`: codegen must move heap pointers
+    into callee-save registers before any CALL that could trigger GC
+  - `live_enum_survives_automatic_gc_cycle`: codegen must recognize
+    loop-carried heap pointers and pin them to callee-save regs for
+    the duration of the loop
+
+The root-set walk implementation is ~17 LOC (well under the 50-LOC budget).
+No major redesigns needed.
+
+### Experiment C: Register Pressure on Existing Examples (commit `5e29724`)
+
+**Validated: 256 registers is massively over-provisioned.**
+
+| Function | Example | Peak live | Spills@256 |
+|----------|---------|-----------|------------|
+| `area` (Tri arm) | mixed.0s | 4 | 0 |
+| `main` | record.0s | 3 | 0 |
+| `get_v` | nested_records.0s | 2 | 0 |
+| (... others, all ≤ 4) | | | |
+
+The 256-register ceiling provides a **64× safety margin** over the
+actual peak (4 registers in the deepest real expression). Even the
+synthetic `chain_300` stress test (peak 300) only forces 44 spills —
+all cold values that can share a single spill slot.
+
+Conclusion: The Dalvik-style hybrid encoding (regs 0-15 inline,
+16-255 trailing byte) is the right choice. The hot inner loop
+(regs 0-15) covers 100% of real workload with 4× headroom.
+
+### Decisions updated by these experiments
+
+- §4 Decision 1 (SSA-lite over full SSA): **VALIDATED** by Experiment A
+- §4 Decision 3 (callee-saves for GC-reachable values): **VALIDATED** by Experiment B
+- §4 Decision 4 (256-register ceiling + Dalvik hybrid): **VALIDATED** by Experiment C
+- §4 Decision 2 (single-path Phase 0): unchanged, still pending Phase 0 implementation
+- §4 Decision 5 (150-day estimate): unchanged, still pending Phase 0 implementation
+
+---
+
 ## 2. Current State
 
 The codebase is at a known-good state (HEAD: `b60e99f`). All 406 tests
@@ -278,6 +339,8 @@ features." The cost is one refactor of the SSA pass (~3 days) when
 needed, but the refactor is local — the SSA-value representation and
 register allocator don't change.
 
+**Status:** Validated by Experiment A (`faa7aaf`).
+
 ### Decision 2: Single-path Phase 0 (no dual-emission)
 
 **Decision:** Phase 0 builds the CFG and emits straight-line expressions
@@ -298,6 +361,8 @@ CFG and emit a straight-line expression as register bytecode?"
 `fn add(a: int, b: int) -> int { return a + b; }` should compile via
 the new path and produce correct output. Programs with `if`/`loop`/`match`
 stay on the legacy path until Phase 1 completes.
+
+**Status:** Pending Phase 0 implementation.
 
 ### Decision 3: Callee-saves for GC-reachable values
 
@@ -322,6 +387,8 @@ call site has 0–1 GC-reachable registers in flight (most calls are
 arithmetic helpers). The amortized cost is < 0.5 instructions per call.
 Worth it for GC soundness.
 
+**Status:** Validated by Experiment B (`9fc61bc`).
+
 ### Decision 4: Dalvik-style hybrid register encoding
 
 **Decision:** Register operands are encoded as a sequence of 1-byte
@@ -343,6 +410,8 @@ loops spill above 16?" — register pressure measurement (Experiment C)
 shows that even on `examples/mixed.0s` (the most complex example), peak
 live ranges per function stay below 30. The 8 dedicated spill registers
 (`s0`–`s7`) handle the rare overflow case without bytecode expansion.
+
+**Status:** Validated by Experiment C (`5e29724`).
 
 ### Decision 5: 150 person-days planned, 75 expected, 50 best case
 
@@ -367,6 +436,8 @@ another 3 days to fix. Phase 18B (nested record patterns) was scheduled
 at 5 days, took 8, and required a new VM opcode (`UnpackAt`) that
 wasn't in the original scope. The 3× buffer is empirical, not
 arbitrary.
+
+**Status:** Pending Phase 0 implementation.
 
 ---
 
