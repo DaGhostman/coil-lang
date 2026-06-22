@@ -1,8 +1,7 @@
 //! Linearizer: convert a CFG `Function` into stack-based bytecode.
 //!
-//! Phase 1.1 scope: multi-block CFG linearization (control flow).
-//! Handles `Jump` and `Branch` terminators with back-patching.
-//! `Switch` (match) terminators are deferred to Phase 1.3.
+//! Phase 1.3 scope: multi-block CFG linearization with full
+//! control-flow support (`Jump`, `Branch`, `Switch`).
 //!
 //! See [`MULTI_PASS_REFACTOR_PLAN.md`](../MULTI_PASS_REFACTOR_PLAN.md)
 //! §3 for the high-level design.
@@ -11,9 +10,10 @@
 //!
 //! Walks a CFG [`Function`] block-by-block in declaration order
 //! and emits one [`common::Byte`] per instruction. Block-local
-//! terminators (`Jump`, `Branch`) are emitted as placeholders
-//! with operand `0` and patched in a second pass once every
-//! block's offset is known.
+//! terminators (`Jump`, `Branch`, `Switch`) are emitted as
+//! placeholders with operand `0` (and `value[31:0] = 0` for
+//! `Switch`'s wide target) and patched in a second pass once
+//! every block's offset is known.
 //!
 //! The emitted bytecode is the existing stack-based form (no
 //! register allocator yet — that's Phase 3).
@@ -25,15 +25,16 @@
 //!    instructions, then emit a placeholder for its terminator.
 //!    Record every block's offset (start byte position) in
 //!    `block_offsets`. For terminators that need patching
-//!    (`Jump`, `Branch`), record the placeholder's byte
+//!    (`Jump`, `Branch`, `Switch`), record the placeholder's byte
 //!    position and its target [`BlockId`] for the second pass.
 //! 2. **Pass 2 — patch**: walk the recorded patches and write
 //!    the actual target offset (`block_offsets[target.index()]`
-//!    as `u32`) into each placeholder's operand.
+//!    as `u32`) into each placeholder's operand (or `value[31:0]`
+//!    for `Switch`'s wide target).
 //!
 //! Declaration order is sufficient for straight-line if-else
-//! (no loops, no back-edges). RPO will be needed for Phase 1.2
-//! (While loops) when back-edges become possible.
+//! (no loops, no back-edges). RPO will be needed for Phase 1.4
+//! (loops) when back-edges become possible.
 //!
 //! # Branch terminator layout
 //!
@@ -47,6 +48,44 @@
 //! false_target, where the Branch's true_bb is `then` and the
 //! next declaration-order block IS `then`).
 //!
+//! # Switch terminator layout (Phase 1.3)
+//!
+//! `Terminator::Switch { scrutinee, cases, default }` emits a
+//! cascade of `JUMP_IF_MATCH` placeholders (one per case) plus
+//! a single trailing `UNPACK` for the default arm. The
+//! `JUMP_IF_MATCH` jumps to its target arm block on a tag
+//! match; on a miss it falls through to the next
+//! `JUMP_IF_MATCH` (or to the `UNPACK` after the last case).
+//!
+//! Layout for `match x { A => body_a, B => body_b, C => body_c }`
+//! with 3 arms (2 cases + default):
+//!
+//! ```text
+//! [match_block]      JUMP_IF_MATCH tag_A → arm_a_block
+//!                    JUMP_IF_MATCH tag_B → arm_b_block
+//!                    UNPACK arity_C         (default arm — fall-through)
+//! [arm_a_block]      body_a
+//!                    JMP join_block
+//! [arm_b_block]      body_b
+//!                    JMP join_block
+//! [arm_c_block]      body_c   ← reached by UNPACK fall-through
+//!                    JMP join_block
+//! [join_block]       ...
+//! ```
+//!
+//! This is the **simplified forward emission** layout. The
+//! existing single-pass codegen (Phase 15C) uses a more
+//! efficient **reverse-source-order** layout (arm bodies
+//! emitted in reverse, then the JUMP_IF_MATCH cascade after
+//! them). For Phase 1.3 we use forward emission — simpler to
+//! implement and correct; the optimization to reverse
+//! emission is a future enhancement.
+//!
+//! The `JUMP_IF_MATCH` opcode's tag is encoded in
+//! `operands[31:16]` (16 bits) and the target offset is in
+//! `value[31:0]` (32 bits, after Phase 18C's widening). The
+//! target is wide enough for any realistic match arm body.
+//!
 //! # What this linearizer does NOT do
 //!
 //! - **SSA value tracking.** The linearizer does NOT track which
@@ -55,10 +94,10 @@
 //!   immediately consumed in source order (the stack-top
 //!   invariant). Phase 3 will add real register allocation.
 //!
-//! - **Switch terminator linearization.** `Switch` (match
-//!   expression) is deferred to Phase 1.3. The current
-//!   `cfg_builder` does not produce `Switch` (the only `Switch`
-//!   producer would be Match codegen, which lands in 1.3).
+//! - **Constructor pattern binding code.** The `cfg_builder`
+//!   accepts `Some(v) => ...`-style patterns but does NOT emit
+//!   `STORE` / `POP` instructions to bind `v` from the
+//!   scrutinee payload. Phase 1.4+ will add the binding code.
 //!
 //! - **Call target resolution.** Function call targets are
 //!   resolved by the existing pipeline (see `compiler/src/lib.rs`),
@@ -66,20 +105,23 @@
 //!   that the upstream patch step fills in.
 //!
 //! - **Reverse Post-Order (RPO) block ordering.** Declaration
-//!   order is fine for if-else without back-edges. Phase 1.2
-//!   (While loops) will need RPO.
+//!   order is fine for if-else and Switch without back-edges.
+//!   Phase 1.4 (loops) will need RPO.
 //!
 //! # Operand conventions
 //!
 //! [`common::Byte`] has two operand fields:
 //! - `operands: u32` — small immediates (slot offsets, arities,
 //!   tags, jump targets). Set via [`common::Byte::with_operand_u32`].
-//! - `value: u64` — full-width immediates (i64/f64 constants).
-//!   Set via [`common::Byte::new_with_value`].
+//! - `value: u64` — full-width immediates (i64/f64 constants
+//!   AND wide `JUMP_IF_MATCH` targets). Set via
+//!   [`common::Byte::new_with_value`] or
+//!   [`common::Byte::with_value_u32`].
 //!
 //! Constants (`Inst::Const`, `Inst::ConstF`, `Inst::ConstBool`)
 //! use `value`; everything else uses `operands`. Jump targets
-//! use `operands`.
+//! for `JMP` / `JMPF` use `operands`; the `JUMP_IF_MATCH`
+//! target uses `value[31:0]` (Phase 18C's wide target).
 
 use common::{Byte, Instruction, Value};
 
@@ -89,14 +131,12 @@ use crate::cfg::{
 
 /// Linearize a CFG [`Function`] into stack-based bytecode.
 ///
-/// # Phase 1.1 scope
+/// # Phase 1.3 scope
 ///
-/// - **Multi-block CFGs** (control flow with `Jump` and
-///   `Branch` terminators) are supported via declaration-order
-///   emission + back-patching. See module docs for the
-///   algorithm.
-/// - **`Switch` terminators panic** — they are deferred to
-///   Phase 1.3 (Match codegen).
+/// - **Multi-block CFGs** (control flow with `Jump`, `Branch`,
+///   and `Switch` terminators) are supported via declaration-
+///   order emission + back-patching. See module docs for the
+///   algorithm and the `Switch` layout.
 /// - **Sequential instruction emission.** SSA values are NOT
 ///   tracked — the linearizer assumes each value is at the
 ///   expected stack position (stack-top invariant for
@@ -136,7 +176,7 @@ pub fn linearize(cfg: &Function) -> Vec<Byte> {
 
         // Emit terminator placeholder; record patch positions
         // for terminators that need them.
-        emit_terminator_placeholder(&block.terminator, &mut bytecode, &mut patches, &cfg.name);
+        emit_terminator_placeholder(&block.terminator, &mut bytecode, &mut patches);
     }
 
     // Pass 2: patch terminator placeholders with the actual
@@ -286,15 +326,13 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
 /// Emit a CFG [`Terminator`] as a placeholder, and record any
 /// patch position for the second pass.
 ///
-/// Terminators that encode a jump target (`Jump`, `Branch`)
-/// emit a placeholder with operand `0` and append a
-/// [`TerminatorPatch`] to `patches` so the second pass can fill
-/// in the real target offset. Terminators with no jump target
-/// (`Return`, `Unreachable`) emit their final bytecode directly.
-///
-/// `fn_name` is used in the `Switch` panic message (the only
-/// panicking terminator at this stage) so the diagnostic
-/// includes the function context.
+/// Terminators that encode a jump target (`Jump`, `Branch`,
+/// `Switch`) emit a placeholder with operand `0` (and
+/// `value[31:0] = 0` for `Switch`'s wide target) and append
+/// one or more [`TerminatorPatch`]es to `patches` so the second
+/// pass can fill in the real target offset. Terminators with
+/// no jump target (`Return`, `Unreachable`) emit their final
+/// bytecode directly.
 ///
 /// `#[allow(dead_code)]` — see `linearize` for the rationale.
 #[allow(dead_code)]
@@ -302,7 +340,6 @@ fn emit_terminator_placeholder(
     term: &Terminator,
     bc: &mut Vec<Byte>,
     patches: &mut Vec<TerminatorPatch>,
-    fn_name: &str,
 ) {
     match term {
         Terminator::Jump(target) => {
@@ -346,22 +383,52 @@ fn emit_terminator_placeholder(
             // `compiler/src/lib.rs::Default for Compiler`).
             bc.push(Byte::new(Instruction::HALT));
         }
-        Terminator::Switch { .. } => {
-            // Phase 1.1 deferred: Switch linearization (the
-            // JUMP_IF_MATCH + UNPACK cascade) is Phase 1.3 (Match
-            // codegen). The current `cfg_builder` does not produce
-            // `Switch` (it panics on `Expression::Match`), so this
-            // panic is defensive — it would only fire if a future
-            // builder addition produces a Switch without the
-            // linearizer having learned to handle it.
-            panic!(
-                "Phase 1.1 linearizer: `Switch` (match) terminator \
-                 linearization is deferred to Phase 1.3 (Match \
-                 codegen). Function `{}` contains a Switch \
-                 terminator; current sources produce only Jump / \
-                 Branch / Return control flow at the CFG level.",
-                fn_name
-            );
+        Terminator::Switch {
+            scrutinee: _,
+            cases,
+            default: _,
+        } => {
+            // Phase 1.3: Switch terminator linearization.
+            //
+            // Emit a JUMP_IF_MATCH placeholder for each case
+            // (in `cases` order) and a single trailing UNPACK
+            // for the default arm. Each JUMP_IF_MATCH
+            // placeholder records its own patch entry (with
+            // tag and target BlockId); the UNPACK doesn't
+            // need patching — it falls through to the NEXT
+            // block in declaration order, which is the
+            // default arm block (the cfg_builder pushes arm
+            // blocks in source order so the LAST arm is the
+            // default and comes immediately after the
+            // match_block).
+            //
+            // JumpIfMatch layout (see `common/src/opcode.rs`,
+            // Phase 18C):
+            //   operands[31:16] = expected tag (16 bits)
+            //   operands[15:0]  = reserved (write 0)
+            //   value[31:0]     = absolute bytecode target
+            //
+            // We mask the tag to 16 bits so a malformed
+            // placeholder doesn't silently truncate.
+            for (tag, target) in cases {
+                let pos = bc.len();
+                let byte = Byte::new(Instruction::JumpIfMatch)
+                    .with_operand_u32((*tag & 0xFFFF) << 16)
+                    .with_value_u32(0);
+                bc.push(byte);
+                patches.push(TerminatorPatch {
+                    kind: PatchKind::SwitchCase {
+                        tag: *tag,
+                        target: *target,
+                    },
+                    pos,
+                });
+            }
+            // Emit UNPACK for the default arm. The arity is a
+            // placeholder (the VM reads the real arity from
+            // `ObjEnum::payload.len()` at runtime, so 0 is
+            // safe).
+            bc.push(Byte::new(Instruction::Unpack).with_operand_u32(0));
         }
     }
 }
@@ -369,10 +436,11 @@ fn emit_terminator_placeholder(
 /// Patch a single terminator placeholder with its real target
 /// offset, looked up from `block_offsets`.
 ///
-/// Only `Jump` and `Branch` placeholders are recorded (see
-/// [`emit_terminator_placeholder`]); `Return` and `Unreachable`
-/// emit their final form directly and never appear in the
-/// patches list.
+/// `Jump`, `Branch`, and `SwitchCase` placeholders are recorded
+/// (see [`emit_terminator_placeholder`]); `Return` and
+/// `Unreachable` emit their final form directly and never
+/// appear in the patches list. Each `Switch` case gets its own
+/// `SwitchCase` patch entry.
 ///
 /// `#[allow(dead_code)]` — see `linearize` for the rationale.
 #[allow(dead_code)]
@@ -396,6 +464,19 @@ fn patch_terminator(
             let offset = block_offsets[false_bb.index()] as u32;
             bc[patch.pos] =
                 Byte::new(Instruction::JMPF).with_operand_u32(offset);
+        }
+        PatchKind::SwitchCase { tag, target } => {
+            // The JUMP_IF_MATCH's tag (operands[31:16]) is
+            // preserved; we patch value[31:0] with the target
+            // block's offset. operands[15:0] is reserved (0).
+            //
+            // Phase 18C widened the target to a full 32-bit
+            // value field, so this can address any target in
+            // the bytecode.
+            let offset = block_offsets[target.index()] as u32;
+            bc[patch.pos] = Byte::new(Instruction::JumpIfMatch)
+                .with_operand_u32((tag & 0xFFFF) << 16)
+                .with_value_u32(offset);
         }
     }
 }
@@ -427,6 +508,16 @@ enum PatchKind {
     /// needed).
     Branch {
         false_bb: crate::cfg::BlockId,
+    },
+    /// `Terminator::Switch` per-case placeholder — patches the
+    /// JUMP_IF_MATCH's `value[31:0]` with
+    /// `block_offsets[target.index()]`. The tag is preserved in
+    /// `operands[31:16]`. Each `Switch` case gets its own
+    /// `SwitchCase` patch entry (the Switch terminator emits N
+    /// case placeholders + 1 UNPACK).
+    SwitchCase {
+        tag: u32,
+        target: crate::cfg::BlockId,
     },
 }
 
@@ -1276,26 +1367,285 @@ mod tests {
         );
     }
 
+    // ============================================================
+    // Switch terminator (Phase 1.3 — Match codegen)
+    // ============================================================
+
     #[test]
-    #[should_panic(expected = "Switch")]
-    fn linearize_switch_terminator_panics() {
-        // Phase 1.1: Switch linearization is deferred to
-        // Phase 1.3 (Match codegen). The linearizer panics
-        // honestly with the function name in the message.
-        let mut block = Block::new(BlockId(0));
-        block.terminator = Terminator::Switch {
+    fn linearize_switch_with_two_cases_and_default_emits_cascade() {
+        // Phase 1.3: Switch linearization emits a cascade of
+        // JUMP_IF_MATCH placeholders (one per case) followed by
+        // a single UNPACK for the default arm.
+        //
+        // Build a 5-block function (canonical 3-arm match):
+        //   b0 (match):   Switch → [(10, b1), (20, b2)], default b3
+        //   b1 (arm_a):   CONST 100, Jump → b4
+        //   b2 (arm_b):   CONST 200, Jump → b4
+        //   b3 (default): CONST 300, Jump → b4
+        //   b4 (join):    Return
+        //
+        // Expected bytecode layout:
+        //   [b0 @ 0]      JUMP_IF_MATCH tag=10, target=b1 (offset 3)
+        //                 JUMP_IF_MATCH tag=20, target=b2 (offset 5)
+        //                 UNPACK arity=0
+        //   [b1 @ 3]      CONST 100, JMP → b4 (offset 9)
+        //   [b2 @ 5]      CONST 200, JMP → b4 (offset 9)
+        //   [b3 @ 7]      CONST 300, JMP → b4 (offset 9)
+        //   [b4 @ 9]      RETURN
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Switch {
             scrutinee: ValueId(0),
-            cases: vec![(1, BlockId(1))],
-            default: BlockId(2),
-        };
+            cases: vec![(10, BlockId(1)), (20, BlockId(2))],
+            default: BlockId(3),
+        });
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 100 });
+        b1.terminator = Terminator::Jump(BlockId(4));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 200 });
+        b2.terminator = Terminator::Jump(BlockId(4));
+        let mut b3 = Block::new(BlockId(3));
+        b3.insts.push(Inst::Const { dst, value: 300 });
+        b3.terminator = Terminator::Jump(BlockId(4));
+        let b4 = Block::new(BlockId(4)).with_terminator(Terminator::Return(Some(dst)));
         let f = Function {
             name: "match_fn".to_string(),
             params: vec![],
-            return_ty: TypeRef::Unit,
-            blocks: vec![block, Block::new(BlockId(1)), Block::new(BlockId(2))],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2, b3, b4],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let bc = linearize(&f);
+        // b0 emits 3 bytes; b1, b2, b3 each emit 2; b4 emits 1.
+        assert_eq!(bc.len(), 10, "expected 10 bytes, got {:?}", bc);
+
+        // b0 @ offset 0: JUMP_IF_MATCH tag=10, target=b1 (offset 3).
+        assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
+        assert_eq!(bc[0].operand_u16(0), 10, "upper 16 bits = tag");
+        assert_eq!(bc[0].operand_u16(1), 0, "lower 16 bits = reserved");
+        assert_eq!(bc[0].value_u32(), 3, "value[31:0] = target offset");
+
+        // b0 @ offset 1: JUMP_IF_MATCH tag=20, target=b2 (offset 5).
+        assert!(matches!(bc[1].bytecode(), Instruction::JumpIfMatch));
+        assert_eq!(bc[1].operand_u16(0), 20);
+        assert_eq!(bc[1].value_u32(), 5, "value[31:0] = target offset");
+
+        // b0 @ offset 2: UNPACK for default arm.
+        assert!(matches!(bc[2].bytecode(), Instruction::Unpack));
+
+        // b1 (arm_a) @ offset 3: CONST 100.
+        assert!(matches!(bc[3].bytecode(), Instruction::CONST));
+        assert_eq!(bc[3].value_u32(), 100);
+
+        // b1 @ offset 4: JMP → b4 (offset 9).
+        assert!(matches!(bc[4].bytecode(), Instruction::JMP));
+        assert_eq!(bc[4].operand_u32(), 9);
+
+        // b2 (arm_b) @ offset 5: CONST 200.
+        assert!(matches!(bc[5].bytecode(), Instruction::CONST));
+        assert_eq!(bc[5].value_u32(), 200);
+
+        // b2 @ offset 6: JMP → b4 (offset 9).
+        assert!(matches!(bc[6].bytecode(), Instruction::JMP));
+        assert_eq!(bc[6].operand_u32(), 9);
+
+        // b3 (default) @ offset 7: CONST 300.
+        assert!(matches!(bc[7].bytecode(), Instruction::CONST));
+        assert_eq!(bc[7].value_u32(), 300);
+
+        // b3 @ offset 8: JMP → b4 (offset 9).
+        assert!(matches!(bc[8].bytecode(), Instruction::JMP));
+        assert_eq!(bc[8].operand_u32(), 9);
+
+        // b4 (join) @ offset 9: RETURN.
+        assert!(matches!(bc[9].bytecode(), Instruction::RETURN));
+    }
+
+    #[test]
+    fn linearize_switch_with_single_case_emits_one_jump_if_match_then_unpack() {
+        // Degenerate case: 1 case + default. The Switch emits
+        // exactly one JUMP_IF_MATCH followed by an UNPACK. The
+        // JUMP_IF_MATCH's tag is encoded in operands[31:16] and
+        // the target offset is patched into value[31:0].
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![(42, BlockId(1))],
+            default: BlockId(2),
+        });
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 1 });
+        b1.terminator = Terminator::Jump(BlockId(3));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 2 });
+        b2.terminator = Terminator::Jump(BlockId(3));
+        let b3 = Block::new(BlockId(3)).with_terminator(Terminator::Return(Some(dst)));
+        let f = Function {
+            name: "single_case".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2, b3],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f);
+        // b0: JUMP_IF_MATCH (1) + UNPACK (1) = 2 bytes
+        // b1: CONST (1) + JMP (1) = 2 bytes
+        // b2: CONST (1) + JMP (1) = 2 bytes
+        // b3: RETURN (1) = 1 byte
+        // Total: 7 bytes
+        assert_eq!(bc.len(), 7);
+        assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
+        assert_eq!(bc[0].operand_u16(0), 42, "tag in upper 16 bits");
+        assert_eq!(
+            bc[0].value_u32(),
+            2,
+            "target offset points to arm_a (block 1 starts at offset 2)"
+        );
+        assert!(matches!(bc[1].bytecode(), Instruction::Unpack));
+        // b1 (arm_a) @ offset 2
+        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
+        assert_eq!(bc[2].value_u32(), 1);
+        // b2 (default) @ offset 4 — UNPACK falls through to here
+        assert!(matches!(bc[4].bytecode(), Instruction::CONST));
+        assert_eq!(bc[4].value_u32(), 2);
+    }
+
+    #[test]
+    fn linearize_switch_with_zero_cases_emits_only_unpack() {
+        // Degenerate case: 0 cases + default (e.g. `match x {
+        // _ => 0 }`). The Switch emits ONLY an UNPACK (no
+        // JUMP_IF_MATCH placeholders) and falls through to the
+        // default arm block.
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![],
+            default: BlockId(1),
+        });
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 99 });
+        b1.terminator = Terminator::Jump(BlockId(2));
+        let b2 = Block::new(BlockId(2)).with_terminator(Terminator::Return(Some(dst)));
+        let f = Function {
+            name: "only_default".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f);
+        // b0: UNPACK (1) = 1 byte
+        // b1: CONST (1) + JMP (1) = 2 bytes
+        // b2: RETURN (1) = 1 byte
+        // Total: 4 bytes
+        assert_eq!(bc.len(), 4);
+        // No JUMP_IF_MATCH anywhere.
+        let has_jump_if_match = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::JumpIfMatch));
+        assert!(
+            !has_jump_if_match,
+            "zero-case Switch should not emit JUMP_IF_MATCH"
+        );
+        assert!(matches!(bc[0].bytecode(), Instruction::Unpack));
+        assert!(matches!(bc[1].bytecode(), Instruction::CONST));
+        assert_eq!(bc[1].value_u32(), 99);
+        assert!(matches!(bc[2].bytecode(), Instruction::JMP));
+        assert!(matches!(bc[3].bytecode(), Instruction::RETURN));
+    }
+
+    #[test]
+    fn linearize_switch_jump_if_match_target_is_wide_value_field() {
+        // Regression guard: Phase 18C widened the JUMP_IF_MATCH
+        // target from 16-bit to 32-bit (lives in `value[31:0]`,
+        // not in `operands`). A buggy linearizer that used
+        // `with_operand_u32` for the target would silently
+        // truncate wide targets.
+        //
+        // We can't easily reach a 65,535-byte target in a unit
+        // test (it would require a giant function), so we verify
+        // the byte's `value_u32()` accessor returns the patched
+        // target and `operand_u16(0)` (the tag's slot) is
+        // independent of the target.
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![(0xABCD, BlockId(1))],
+            default: BlockId(2),
+        });
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 0 });
+        b1.terminator = Terminator::Jump(BlockId(3));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 0 });
+        b2.terminator = Terminator::Jump(BlockId(3));
+        let b3 = Block::new(BlockId(3)).with_terminator(Terminator::Return(Some(dst)));
+        let f = Function {
+            name: "wide_target".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2, b3],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f);
+        let jim = &bc[0];
+        // Tag in operands[31:16].
+        assert_eq!(
+            jim.operand_u16(0),
+            0xABCD,
+            "tag must be in upper 16 bits of operands"
+        );
+        // Reserved (write 0) in operands[15:0].
+        assert_eq!(jim.operand_u16(1), 0);
+        // Target in value[31:0] — independent of the tag.
+        assert_eq!(
+            jim.value_u32(),
+            2,
+            "target offset must be in value[31:0] (not in operands)"
+        );
+    }
+
+    #[test]
+    fn linearize_switch_does_not_emit_jump_after_unpack() {
+        // The default arm is reached by FALL-THROUGH from the
+        // UNPACK, not by a separate JMP. If the linearizer
+        // emitted a stray JMP after the UNPACK, the default
+        // block would be unreachable. The bytecode length and
+        // instruction layout guard against this regression.
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![(1, BlockId(1)), (2, BlockId(2))],
+            default: BlockId(3),
+        });
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 10 });
+        b1.terminator = Terminator::Jump(BlockId(4));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 20 });
+        b2.terminator = Terminator::Jump(BlockId(4));
+        let mut b3 = Block::new(BlockId(3));
+        b3.insts.push(Inst::Const { dst, value: 30 });
+        b3.terminator = Terminator::Jump(BlockId(4));
+        let b4 = Block::new(BlockId(4)).with_terminator(Terminator::Return(Some(dst)));
+        let f = Function {
+            name: "no_jump_after_unpack".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2, b3, b4],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f);
+        // The Switch emits: JUMP_IF_MATCH (1) + JUMP_IF_MATCH (1) + UNPACK (1) = 3 bytes
+        // The default block follows immediately at offset 3.
+        assert_eq!(bc.len(), 10);
+        assert!(matches!(bc[2].bytecode(), Instruction::Unpack));
+        // The next byte after UNPACK must be the default block's
+        // first instruction, NOT a JMP.
+        assert!(
+            matches!(bc[3].bytecode(), Instruction::CONST),
+            "UNPACK must fall through to default block (CONST expected at offset 3)"
+        );
     }
 
     // ============================================================
@@ -1334,58 +1684,6 @@ mod tests {
         assert_eq!(bc[1].value_u32(), 3);
         assert!(matches!(bc[2].bytecode(), Instruction::ADD));
         assert!(matches!(bc[3].bytecode(), Instruction::RETURN));
-    }
-
-    #[test]
-    fn linearize_function_name_appears_in_switch_panic_message() {
-        // Phase 1.1: Switch linearization is deferred, so a
-        // CFG containing a Switch terminator panics with a
-        // diagnostic that includes the function name. This
-        // test guards against a future regression that
-        // forgets to include the function name in the panic
-        // message (a common pitfall when refactoring).
-        let mut b0 = Block::new(BlockId(0));
-        b0.terminator = Terminator::Switch {
-            scrutinee: ValueId(0),
-            cases: vec![(1, BlockId(1))],
-            default: BlockId(2),
-        };
-        let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(None));
-        let b2 = Block::new(BlockId(2)).with_terminator(Terminator::Return(None));
-        let f = Function {
-            name: "my_special_fn".to_string(),
-            params: vec![],
-            return_ty: TypeRef::Unit,
-            blocks: vec![b0, b1, b2],
-            entry: BlockId(0),
-        };
-        let result = std::panic::catch_unwind(|| linearize(&f));
-        match result {
-            Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&'static str>() {
-                    s.to_string()
-                } else {
-                    String::from("<unknown panic payload>")
-                };
-                assert!(
-                    msg.contains("my_special_fn"),
-                    "panic message should include function name: {}",
-                    msg
-                );
-                assert!(
-                    msg.contains("Switch"),
-                    "panic message should mention the Switch \
-                     terminator that's being deferred: {}",
-                    msg
-                );
-            }
-            Ok(_) => panic!(
-                "expected linearize to panic on Switch terminator \
-                 (deferred to Phase 1.3)"
-            ),
-        }
     }
 
     #[test]
