@@ -3080,3 +3080,340 @@ pub fn run_raw(&mut self, code: &[RawByte]) {
   identifier). This matches Rust/C-style languages. A
   future feature like `f(x).y` parses as
   `Access(Call(f, [x]), "y")`.
+
+## PHASE 20 — CFG FOUNDATION (COMPLETED)
+
+### Summary
+
+Phase 0 (renumbered to Phase 20 to fit the existing PHASE
+naming scheme) establishes the **Control Flow Graph (CFG)
+foundation** for the multi-pass refactor described in
+`MULTI_PASS_REFACTOR_PLAN.md`. Three verification
+experiments validated the key architectural decisions
+BEFORE any production code was written. The CFG path is
+now live for straight-line functions; control flow
+remains on the legacy single-pass path.
+
+The architecture is **additive** — the OLD single-pass
+codegen is preserved as a safety net for any CFG-builder
+bug. `git revert` of any Phase 20 commit reverts cleanly;
+no code is permanently deleted.
+
+Detailed design lives in
+[`MULTI_PASS_REFACTOR_PLAN.md`](./MULTI_PASS_REFACTOR_PLAN.md).
+
+### Verification experiments (before any code)
+
+| Experiment | Question | Result | Commit |
+|---|---|---|---|
+| **A** | Does SSA-lite compose with match codegen? | YES — no phis needed for canonical match | `faa7aaf` |
+| **B** | Does GC root set translate to register VM? | YES — Option 2 (callee-saves for GC-reachable values) is sound | `9fc61bc` |
+| **C** | Is 256 registers enough for existing examples? | YES — peak live count is 4 (64× safety margin) | `5e29724` |
+
+All three decisions in `MULTI_PASS_REFACTOR_PLAN.md` §4
+are now marked as validated. The experiments are
+prototype code under `experiments/` — not part of the
+production build, but documented for future reference
+(see `experiments/README.md`).
+
+### New modules
+
+| File | Purpose | LOC |
+|---|---|---|
+| `compiler/src/cfg.rs` | CFG type definitions (`BlockId`, `ValueId`, `Inst`, `Terminator`, `Block`, `Function`, `TypeRef`) | ~517 |
+| `compiler/src/cfg_builder.rs` | AST → CFG builder for straight-line expressions | ~894 |
+| `compiler/src/linearize.rs` | CFG → bytecode linearizer for straight-line functions | ~1064 |
+| `experiments/match_ssa_lite/` | Experiment A prototype | ~200 |
+| `experiments/gc_root_set/` | Experiment B analysis + prototype | ~400 |
+| `experiments/regalloc_pressure/` | Experiment C prototype + measurements | ~600 |
+
+### Sub-phases
+
+#### Phase 0.1a — CFG type definitions (`1e689eb`)
+
+Added `compiler/src/cfg.rs` with foundational types:
+- `BlockId`, `ValueId` — typed identifiers with
+  `INVALID` sentinels.
+- `Inst` — instruction kinds (`Const`, `BinOp`, `Call`,
+  `LoadField`, `MakeEnum`, `LoadArg`, `StorePop`, etc.).
+- `BinOpKind`, `UnaryOpKind` — operator enums.
+- `Terminator` — `Jump`, `Branch`, `Switch`, `Return`,
+  `Unreachable`.
+- `Block` — `id + insts + terminator + predecessors`.
+- `Function` — `name + params + return_ty + blocks + entry`.
+- `TypeRef` — placeholder type info (codegen
+  side-tables still provide full type info; `TypeRef`
+  is a forward-compatible anchor for the future).
+
+The module is `pub mod cfg` so Phase 1+ code can
+consume the types. No `cfg_builder` or `linearize` use
+of the types yet — Phase 20 only adds the definitions.
+
+#### Phase 0.1b — CFG unit tests (`62b48db`)
+
+42 unit tests covering constructors, equality, hashing,
+and Display for all public types. Locks in the
+serialization format used by `cfg_builder` and
+`linearize`.
+
+#### Phase 0.2a — CFG builder for straight-line (`3edfd44`)
+
+Added `compiler/src/cfg_builder.rs` with a `Builder`
+struct that walks the typed AST and produces a CFG.
+Handles all 71 `Expression` variants:
+
+- 34 substantive (Constant, Identifier, Binary, Unary,
+  Call, Access, Construct, Block, Fragment, Print,
+  Format, Return, Assignment).
+- 32 silent no-ops (top-level / metadata variants).
+- 5 panic variants (If, Branch, Loop, Match, nested
+  Function — Phase 1+ work; panic is honest, not
+  silent).
+
+Single-block functions only — multi-block is Phase 1+.
+The builder produces a CFG whose entry block holds the
+function's entire body in straight-line instruction
+order, terminated by `Terminator::Return`.
+
+#### Phase 0.2b — CFG builder unit tests (`7956736`)
+
+18 unit tests covering constant/identifier/binary/
+let-binding/return/block-structure handling, plus 2
+integration tests that build a CFG for a small function
+and verify the resulting `Function` shape.
+
+#### Phase 0.3a — CFG → bytecode linearizer (`0af3d43`)
+
+Added `compiler/src/linearize.rs` with `linearize()`
+that converts a single-block CFG `Function` into
+`Vec<Byte>`. Maps each `Inst` variant to its bytecode
+equivalent. 27 unit tests including exhaustive
+`BinOpKind` / `UnaryOpKind` coverage.
+
+**VM gaps discovered:** `EqF`, `NeqF`, `NegF` opcodes
+are referenced by the linearizer but do NOT exist in the
+current VM. These panic honestly in `map_binop` /
+`map_unaryop`. Fixing them is a separate concern (the
+linearizer currently excludes them from the
+straight-line detection via the conservative
+`is_straight_line` function — see Phase 0.3b below).
+
+#### Phase 0.3b — Integration with fallback (`5701415`)
+
+Modified `Compiler::do_compile` to try the CFG path
+first for straight-line functions.
+- Added `is_straight_line()` — walks the AST looking
+  for control-flow + linearizer-gap variants (`If`,
+  `Branch`, `Loop`, `Match`, `Print`, `Format`, `Call`,
+  `Construct`, `Access`, `Assignment`, etc.).
+- Added `try_compile_function_via_cfg()` — uses
+  `catch_unwind` for panic recovery so a buggy CFG
+  path falls back to the single-pass path instead of
+  aborting the compile.
+- Integrated into `Expression::Function` arm with
+  fallback to the existing single-pass path.
+
+The integration is purely additive; no existing code
+was deleted. The OLD single-pass path remains
+authoritative for everything the CFG path doesn't
+handle.
+
+#### Phase 0.4 — End-to-end test (`dcafd50`)
+
+Created `examples/cfg_smoke.0s` with two straight-line
+functions (`add`, `double`) plus a `main` that calls
+them. Added a pipeline golden test verifying the
+output is `"742"`. This is the canonical end-to-end
+test for the CFG path.
+
+```0s
+fn add(int a, int b) -> int {
+    return a + b;
+}
+
+fn double(int x) -> int {
+    return x * 2;
+}
+
+fn main() {
+    print "%u", add(3, 4);
+    print "%u", double(21);
+}
+```
+
+Output: `742` (the `add`/`double` calls go through the
+CFG path; the `print` statements fall back to the
+single-pass path).
+
+### Decisions locked in (Phase 20)
+
+1. **SSA-lite over full SSA.** Validated by Experiment
+   A — no current join points need phis. Promote to
+   full SSA when exceptions/async land. The
+   `cfg_builder` mints a fresh `ValueId` per
+   instruction (no version counters, no dominance
+   queries).
+2. **Callee-saves for GC-reachable values.** Validated
+   by Experiment B — root-set walk is simple (scan
+   callee-saves + current live regs). Phase 2 will
+   implement the actual register-VM GC.
+3. **256-register ceiling + Dalvik-style hybrid
+   encoding.** Validated by Experiment C — peak live
+   count is 4 across all real examples (64× safety
+   margin). The `Register` type is a `u8` with the
+   upper bit flagging wide encodings (16-bit registers
+   for any future hot function).
+4. **Single-path Phase 20.** CFG path is additive; the
+   OLD single-pass path remains the safety net for any
+   CFG-builder bug. Removal of the OLD path is deferred
+   to after Phase 4 (register VM) lands and the new path
+   has full coverage.
+5. **Conservative `is_straight_line` detection.** Flags
+   more variants than strictly necessary (`Print`,
+   `Format`, `Call`, `Construct`, `Access`,
+   `Assignment`, etc.) to ensure correctness. Lifting
+   these limitations is Phase 1+ work — the
+   linearizer must learn to emit `PRINT` / `FORMAT` and
+   resolve call/tag/arity/field-index placeholders.
+6. **`catch_unwind` for panic recovery.** The
+   `try_compile_function_via_cfg` wrapper catches any
+   panic from the CFG path and falls back. This makes
+   the CFG path opt-in by predicate, opt-out by panic
+   — a defensive posture consistent with the rest of
+   the compiler.
+7. **`TypeRef` as a placeholder.** The CFG carries a
+   `TypeRef` (currently an enum with `Unknown`,
+   `Int`, `Float`, `Bool`, `String`, `Named(name)`)
+   but the linearizer does NOT consult it. Codegen
+   side-tables (existing in `compiler/src/lib.rs`)
+   still provide full type info. `TypeRef` exists as
+   a forward-compatible anchor for Phase 4's
+   register-VM type-aware register allocation.
+
+### Known limitations (Phase 20)
+
+- **Linearizer gaps**: `EqF`, `NeqF`, `NegF` opcodes do
+  not exist in the VM. The linearizer panics honestly
+  on these. Fixing requires adding the opcodes to
+  `common/src/opcode.rs` and the VM. Deferred to
+  Phase 1+ as a small standalone commit.
+- **Conservative straight-line detection**: many
+  functions that COULD use the CFG path don't because
+  `is_straight_line` flags `Print`/`Format`/`Call`/
+  `Construct`/`Access`/`Assignment` etc. Lifting these
+  limitations is Phase 1+ work — the linearizer must
+  learn to emit `PRINT` / `FORMAT` and resolve
+  call/tag/arity/field-index placeholders.
+- **Single-block functions only**: the linearizer
+  panics on multi-block functions (control flow).
+  Multi-block linearization is Phase 1.
+- **Naive SSA value → stack tracking**: the
+  linearizer assumes SSA values are at expected stack
+  positions (which works for straight-line code where
+  each value is consumed immediately). A real
+  linearizer tracks where each value lives and emits
+  the appropriate `LOAD` / `STORE_POP` instructions.
+  Deferred to Phase 1.
+
+### Test counts (Phase 20 final)
+
+| Suite | Count | Delta vs Phase 19 |
+|---|---|---|
+| `compiler/src/cfg.rs::tests` | 42 | +42 (new) |
+| `compiler/src/cfg_builder.rs::tests` | 18 | +18 (new) |
+| `compiler/src/linearize.rs::tests` | 27 | +27 (new) |
+| `compiler/tests/pipeline.rs` (golden e2e) | 15 | +1 (`cfg_smoke`) |
+| All other suites | 392 | 0 |
+| **Total** | **494** | **+88** |
+
+### Files added (Phase 20)
+
+| File | Net change | Purpose |
+|---|---|---|
+| `MULTI_PASS_REFACTOR_PLAN.md` | new (~600 LOC) | 5-phase roadmap + 3 verification experiments |
+| `experiments/README.md` | new (~150 LOC) | Experiments directory documentation |
+| `experiments/match_ssa_lite/` | new (~200 LOC) | Experiment A prototype |
+| `experiments/gc_root_set/` | new (~400 LOC) | Experiment B analysis + prototype |
+| `experiments/regalloc_pressure/` | new (~600 LOC) | Experiment C prototype + measurements |
+| `compiler/src/cfg.rs` | new (~1023 LOC) | CFG type definitions + 42 unit tests |
+| `compiler/src/cfg_builder.rs` | new (~1908 LOC) | CFG builder for straight-line + 18 unit tests |
+| `compiler/src/linearize.rs` | new (~1064 LOC) | CFG-to-bytecode linearizer + 27 unit tests |
+| `examples/cfg_smoke.0s` | new (~26 LOC) | End-to-end smoke test for CFG path |
+| `compiler/src/lib.rs` | +3 LOC | Module declarations (`pub mod cfg;`, `mod cfg_builder;`, `mod linearize;`) + integration glue |
+| `AGENTS.md` | this section | Documentation |
+
+Total: ~5800 new LOC across 11 files (new modules + tests
++ examples + docs). The bulk is in the three new
+compiler modules, which include their tests inline.
+
+### Build status (Phase 20)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings (`None` / `Xor` / `Equal` /
+`Unary` / `Call` variants, `prefix` field, `inc` / `dec`
+methods in `parser/src/lib.rs`). No new compiler,
+machine, or common warnings. The new modules are
+warning-free.
+
+### Critical regression check
+
+- `cargo test --workspace` — all 494 tests pass at this
+  milestone.
+- `cargo run -- examples/cfg_smoke.0s` prints `742`
+  (the canonical CFG-path end-to-end check).
+- `cargo run -- examples/fib.0s` prints `13`
+  (control flow still uses the single-pass path).
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/result.0s` prints `420-1`.
+- `cargo run -- examples/record.0s` prints `169512`.
+- `cargo run -- examples/mixed.0s` prints `025122`.
+- `cargo run -- examples/let_test.0s` prints `51020`.
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+- All 401 prior-phase tests still pass — the CFG path
+  is additive, not a rewrite.
+
+### Anything 21+ needs to know
+
+- The CFG module (`compiler/src/cfg.rs`) is the
+  foundation for all control-flow work. Phase 21 (the
+  next phase) will add `If`, `Loop`, `Match` codegen
+  by:
+  1. Extending `cfg_builder` to handle control-flow
+     variants (currently they `panic!`).
+  2. Extending `linearize` to handle multi-block CFGs
+     (currently it `panic!`s on anything but a single
+     block).
+  3. Replacing `BlockBuilder` placeholder tracking
+     with explicit CFG block emission. The
+     `BlockBuilder` primitive can stay for ad-hoc
+     jumps but should not be the only control-flow
+     mechanism.
+- The 3 VM gaps (`EqF`, `NeqF`, `NegF`) should be
+  addressed alongside Phase 21, or as a separate small
+  commit before Phase 21. They're small (each is a
+  single-opcode addition with a VM dispatch arm) and
+  unblock the linearizer's full operator coverage.
+- The `is_straight_line` detector can be lifted
+  incrementally as the linearizer learns new opcodes.
+  Each lift should be a separate commit with its own
+  pipeline test (golden test for one new expression
+  variant through the CFG path).
+- The conservative detection ensures rollback is
+  trivial: `git revert` of any Phase 20 commit reverts
+  cleanly. No code is permanently deleted.
+- **`TypeRef` is a placeholder.** It currently has no
+  semantic effect. A future phase can replace the
+  `TypeRef::Unknown` arms with concrete types without
+  touching the linearizer's call sites.
+- **The `experiments/` directory is documented but
+  excluded from the production build.** The three
+  experiment crates are self-contained and can be
+  built with `cargo build --manifest-path
+  experiments/<name>/Cargo.toml` if anyone wants to
+  re-validate the conclusions.
+- **Module visibility**: `cfg.rs` is `pub mod cfg;`
+  (visible to integration tests); `cfg_builder.rs`
+  and `linearize.rs` are private (`mod cfg_builder;` /
+  `mod linearize;`). Phase 21+ will make them public
+  when external consumers need them.
