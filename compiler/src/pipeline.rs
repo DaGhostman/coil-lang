@@ -7,9 +7,12 @@ use std::{
 };
 
 use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
-use common::{ArchivedByte, Byte, Instruction, Interner, Message, MessageKind};
+use common::{
+    ArchivedArchivedProgram, ArchivedProgram, ARCHIVE_VERSION, Byte, Instruction, Interner, Message,
+    MessageKind,
+};
 use parser::{Pratt, SimpleSpan, ast::Expression};
-use rkyv::{rancor::Error, vec::ArchivedVec};
+use rkyv::rancor::Error;
 
 use crate::Compiler;
 
@@ -155,9 +158,17 @@ impl Pipeline {
                 .with_operand_u32(self.compiler.get_function("main") as u32);
         }
 
+        // Wrap the bytecode in the versioned `ArchivedProgram` envelope
+        // so that older `.c0s` files can be rejected at load time via
+        // `version` mismatch (see `Pipeline::run`).
+        let program = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            bytecode: self.bytecode,
+        };
+
         let mut out = File::create(output).expect("Unable to open output file");
         out.write(
-            rkyv::to_bytes::<rkyv::rancor::Error>(&self.bytecode)
+            rkyv::to_bytes::<rkyv::rancor::Error>(&program)
                 .unwrap()
                 .as_slice(),
         )
@@ -237,14 +248,32 @@ impl Pipeline {
         let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");
 
-        let _ = rkyv::access::<ArchivedVec<ArchivedByte>, Error>(&buffer)
+        // Access the archived envelope. Note: `ArchivedProgram` is the
+        // SERIALIZABLE struct; rkyv's `Archive` derive generates a
+        // separate archived struct named `ArchivedArchivedProgram`
+        // (the derive just prepends `Archived` to the source name),
+        // which is the type `rkyv::access` expects.
+        let archived = rkyv::access::<ArchivedArchivedProgram, Error>(&buffer)
             .expect("Unable to decode rkyv binary");
+
+        // Reject archives whose format doesn't match the in-tree
+        // bytecode layout. `ARCHIVE_VERSION` is bumped whenever
+        // `Byte` or any opcode changes incompatibly.
+        if archived.version != ARCHIVE_VERSION {
+            return Err(());
+        }
 
         if self.failed {
             return Err(());
         }
 
-        Ok(self.bytecode)
+        // Deserialize the archived `ArchivedVec<ArchivedByte>` back
+        // into an owned `Vec<Byte>` for the VM. rkyv's `Deserialize`
+        // impl for `ArchivedVec` handles the deep copy.
+        let bytecode = rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode)
+            .expect("Unable to deserialize bytecode");
+
+        Ok(bytecode)
     }
 }
 

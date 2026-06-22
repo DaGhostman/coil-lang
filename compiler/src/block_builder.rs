@@ -275,11 +275,15 @@ impl BlockBuilder {
                 Byte::new(Instruction::JMPT).with_operand_u32(0)
             }
             JumpKind::JumpIfMatch { tag, .. } => {
-                // Upper 16 bits = tag, lower 16 bits = target
-                // (placeholder = 0; patched on bind_label).
+                // Phase 18C: tag in operands[31:16], 32-bit target
+                // in value[31:0]. Placeholder target = 0 (will be
+                // patched by patch_jump_operand).
+                //
                 // `arity` is intentionally discarded — the VM
                 // reads the real arity from the enum at runtime.
-                Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag as u16, 0])
+                Byte::new(Instruction::JumpIfMatch)
+                    .with_operands_u16([tag as u16, 0])
+                    .with_value_u32(0)
             }
         }
     }
@@ -295,23 +299,12 @@ impl BlockBuilder {
                 *byte = byte.with_operand_u32(target);
             }
             Instruction::JumpIfMatch => {
-                // Preserve the tag in the upper 16 bits.
+                // Phase 18C: tag is preserved in operands[31:16];
+                // 32-bit target now lives in value[31:0]. The
+                // pre-18C u16::try_from panic is gone — wide
+                // targets (> 65,535 bytes) are now supported.
                 let tag = (byte.operand_u32() >> 16) as u16;
-                // The target is a 16-bit bytecode offset (matching
-                // the existing `JumpIfMatch` operand layout
-                // documented in `common/src/opcode.rs`). Panicking
-                // on overflow is the right behaviour: the 15C
-                // design explicitly documents the 65,535-byte
-                // ceiling.
-                let target_u16 = u16::try_from(target).unwrap_or_else(|_| {
-                    panic!(
-                        "JumpIfMatch target offset {} overflows u16 \
-                         (Phase 15D.5 MEDIUM #1: the JUMP_IF_MATCH \
-                         operand layout caps targets at 65,535 bytes)",
-                        target
-                    )
-                });
-                *byte = byte.with_operands_u16([tag, target_u16]);
+                *byte = byte.with_operands_u16([tag, 0]).with_value_u32(target);
             }
             other => panic!(
                 "BlockBuilder: patch_jump_operand called on non-jump \
@@ -421,10 +414,12 @@ mod tests {
     // ---- 5. bind_label_preserves_jump_if_match_tag -----------------
 
     /// For `JUMP_IF_MATCH { tag: 5, arity: 1 }`, after
-    /// `bind_label(label, 100, &mut bc)`, the byte's operand has
-    /// tag=5 in the upper 16 bits and target=100 in the lower
-    /// 16 bits. The 16-bit target ceiling (Phase 15D.5 MEDIUM #1)
-    /// is respected — only `u16` is preserved.
+    /// `bind_label(label, 100_000, &mut bc)`, the byte's
+    /// `operands` have tag=5 in the upper 16 bits (lower 16
+    /// bits reserved) and `value[31:0]` is the patched 32-bit
+    /// target. Phase 18C widened the target from 16 bits to
+    /// 32 bits — this test uses a target > 65,535 to exercise
+    /// the wide-target path.
     #[test]
     fn bind_label_preserves_jump_if_match_tag() {
         let mut bb = BlockBuilder::new();
@@ -432,14 +427,24 @@ mod tests {
 
         let mut bc: Vec<Byte> = Vec::new();
         bb.emit_jump_to(l, JumpKind::JumpIfMatch { tag: 5, arity: 1 }, &mut bc);
-        bb.bind_label(l, 100, &mut bc);
+        bb.bind_label(l, 100_000, &mut bc);
 
         assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
         let operand = bc[0].operand_u32();
         let tag = (operand >> 16) as u16;
-        let target = (operand & 0xFFFF) as u16;
-        assert_eq!(tag, 5, "tag should be preserved");
-        assert_eq!(target, 100, "target should be patched");
+        assert_eq!(tag, 5, "tag should be preserved in upper 16 bits");
+        assert_eq!(
+            operand & 0xFFFF,
+            0,
+            "lower 16 bits of operands should be reserved"
+        );
+        let target = bc[0].value_u32();
+        assert!(
+            target > 0xFFFF,
+            "test must exercise wide-target path (target={})",
+            target
+        );
+        assert_eq!(target, 100_000, "target should be patched");
     }
 
     // ---- 6. bind_label_patches_multiple_jumps_to_same_label --------

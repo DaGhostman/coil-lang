@@ -1,3 +1,4 @@
+mod archive;
 mod array_vec;
 mod interner;
 mod opcode;
@@ -5,6 +6,7 @@ mod value;
 mod message;
 mod seekable_iter;
 
+pub use archive::*;
 pub use array_vec::*;
 pub use interner::*;
 pub use opcode::*;

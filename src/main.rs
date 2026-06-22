@@ -9,11 +9,11 @@ fn main() {
     let argc = std::env::args().collect::<Vec<_>>();
     let filename = argc[1].clone();
 
-    // if !std::fs::exists("out.c0s").expect("Unable to determine if file exists") {
-    let pipeline = Pipeline::new();
+    if !std::fs::exists("out.c0s").expect("Unable to determine if file exists") {
+        let pipeline = Pipeline::new();
 
-    pipeline.compile(filename, "out.c0s".to_string());
-    // }
+        pipeline.compile(filename, "out.c0s".to_string());
+    }
 
     let mut f = std::fs::File::open("out.c0s").expect("Unable to find file");
     let mut buffer = Vec::with_capacity(1024);
