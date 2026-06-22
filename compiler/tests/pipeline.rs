@@ -89,8 +89,8 @@ fn example_option_prints_42() {
 
 #[test]
 fn example_result_prints_42_and_neg1() {
-    // Two `print "%i"` statements (no trailing newline) →
-    // concatenated output: "42" + "-1" = "42-1".
+    // Three `print "%i"` statements (no trailing newline) →
+    // concatenated output: "42" + "0" + "-1" = "420-1".
     //
     // Phase 18A: `examples/result.0s` was extended to two
     // `Result::Ok` arms (so the codegen emits the inner-pattern
@@ -100,6 +100,15 @@ fn example_result_prints_42_and_neg1() {
     // inner pattern distinction. We use `compile_test` (not
     // `compile_src`) to bypass the typecheck, mirroring the
     // `fizbuz_runs_to_completion` approach.
+    //
+    // Phase 18A (POP-quirk fix): the example now exercises
+    // the None case at runtime (`print` for the second `Result::Ok`
+    // arm). The pre-fix codegen would have emitted a redundant
+    // POP in the reverse pass for the inner Unit sub-pattern,
+    // silently discarding a stack value (the runtime would still
+    // produce the right output here, but the codegen is more
+    // correct with the fix). See `compiler/src/lib.rs`
+    // `emit_pattern_binding` for the `consume_values` parameter.
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -127,7 +136,7 @@ fn example_result_prints_42_and_neg1() {
         .into_inner();
     let output = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
 
-    assert_eq!(output, "42-1");
+    assert_eq!(output, "420-1");
 }
 
 #[test]
@@ -145,10 +154,17 @@ fn example_fib_still_works() {
 }
 
 #[test]
-fn example_record_prints_169() {
-    // The record-shape example: distance² from origin (5² + 12² = 169).
+fn example_record_prints_169_5_12() {
+    // The record-shape example demonstrates BOTH access styles:
+    //   - Pattern destructuring: distance_squared matches the
+    //     record pattern and binds `x, y`.
+    //   - Field access (Phase 18D): x_coord and y_coord read the
+    //     record's fields via `p.x` and `p.y`.
+    //
+    // Output: 169 (5² + 12², from distance_squared), 5 (from
+    // x_coord), 12 (from y_coord).
     let output = run_example("examples/record.0s");
-    assert_eq!(output, "169");
+    assert_eq!(output, "169512");
 }
 
 #[test]
@@ -232,10 +248,15 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
         .into_inner();
     let output = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
 
-    // The example only exercises Some(42) and Err at runtime; the
-    // None arm is in the source to force the codegen to emit the
-    // inner-pattern dispatch bytecode.
-    assert_eq!(output, "42-1");
+    // The example now exercises Some(42), None, and Err at
+    // runtime. The pre-Phase-18A codegen would have emitted a
+    // redundant POP in the reverse pass for the inner Unit
+    // sub-pattern (`Result::Ok(Option::None)`), silently
+    // discarding a stack value. The Phase 18A fix
+    // (`consume_values = false` for test chain arms) prevents
+    // the redundant emission. The runtime output is now
+    // "420-1" (42, 0, -1) — all three arms exercised.
+    assert_eq!(output, "420-1");
 }
 
 // ============================================================

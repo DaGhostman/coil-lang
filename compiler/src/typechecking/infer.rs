@@ -96,6 +96,15 @@ pub struct Checker {
     /// bytecode emitter (Phase 9) via [`lookup_at`](Self::lookup_at).
     cache: std::collections::HashMap<NodeId, Ty>,
 
+    /// Side-table of variable name → inferred type. Populated
+    /// during `infer_function` (function arguments) and
+    /// `infer_fragment` (let-bindings). Used by the codegen to
+    /// resolve a field-access receiver's type when the infer cache
+    /// is misaligned with the pre-walk's ID table inside function
+    /// bodies (Phase 18D — `Expression::Access` codegen). Cleared
+    /// by `check_program`.
+    codegen_var_types: std::collections::HashMap<String, Ty>,
+
     // ---- Sum-type tables (Phase 15B) ----
     //
     // We keep four parallel data structures for sum types. The `Vec`
@@ -207,6 +216,7 @@ impl Checker {
             ids: IdTable::new(),
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
+            codegen_var_types: std::collections::HashMap::new(),
             enums: BTreeMap::new(),
             enum_tags: BTreeMap::new(),
             enum_payloads: BTreeMap::new(),
@@ -230,6 +240,7 @@ impl Checker {
         self.ids = IdTable::new();
         self.next_id_idx = 0;
         self.cache.clear();
+        self.codegen_var_types.clear();
         self.enums.clear();
         self.enum_tags.clear();
         self.enum_payloads.clear();
@@ -791,6 +802,12 @@ impl Checker {
                     };
                     self.env
                         .insert_top(name.to_string(), Scheme::mono(var_ty.clone()));
+                    // Phase 18D: record the let-bound variable's
+                    // declared type in the codegen side-table so
+                    // the codegen can resolve `name`'s type
+                    // without depending on the infer cache or env.
+                    self.codegen_var_types
+                        .insert(name.to_string(), var_ty.clone());
                     last_ty = unit_ty();
 
                     // Try to consume the next sibling as the initializer.
@@ -814,7 +831,10 @@ impl Checker {
                         None => Ty::Var(self.counter.fresh()),
                     };
                     if let Expression::Identifier(n) = name.1.as_ref() {
-                        self.env.insert_top(n.to_string(), Scheme::mono(var_ty));
+                        self.env.insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
+                        // Phase 18D: same codegen side-table as
+                        // let-bound variables above.
+                        self.codegen_var_types.insert(n.to_string(), var_ty);
                     }
                     last_ty = unit_ty();
                 }
@@ -1197,6 +1217,12 @@ impl Checker {
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
+            // Phase 18D: also record in the codegen side-table so
+            // the codegen can resolve `arg_name`'s type without
+            // depending on the (potentially popped) env or the
+            // (misaligned) infer cache.
+            self.codegen_var_types
+                .insert(arg_name.clone(), arg_ty.clone());
         }
         let _ = self.infer(body);
         self.env.pop();
@@ -2579,6 +2605,96 @@ impl Checker {
             Some(payload) => payload.field_pairs(),
             None => Vec::new(),
         }
+    }
+
+    /// Look up the field declaration index for `field` in
+    /// `enum_name`'s UNIQUE record-shaped variant (Phase 18D —
+    /// `Expression::Access` codegen).
+    ///
+    /// Returns `Some((variant_name, field_index))` if exactly one
+    /// variant of the enum declares a record-shaped payload
+    /// containing `field`; returns `None` otherwise.
+    ///
+    /// The HM typechecker (see
+    /// [`access_field_in_sum`](Self::access_field_in_sum))
+    /// rejects source programs where the field isn't uniquely
+    /// declared across the enum's variants — it emits "narrow
+    /// with match first" for the multi-variant case and "type
+    /// has no field `X`" for the zero-variant case. So a `None`
+    /// return at codegen time means the source had a type error
+    /// and we're emitting in recovery mode (the codegen will
+    /// emit a defensive `LoadField(0)` so the bytecode stays
+    /// well-formed for downstream checks).
+    ///
+    /// `field_index` is the declaration-position index of the
+    /// field in the variant's record payload — the same value
+    /// the VM reads from `LoadField`'s lower 16 operand bits.
+    pub fn field_index_for(&self, enum_name: &str, field: &str) -> Option<(String, u16)> {
+        let payloads = self.enum_payloads.get(enum_name)?;
+        let names = self.enums.get(enum_name)?;
+        for (i, payload) in payloads.iter().enumerate() {
+            if let EnumVariantPayloadTy::Record(fields) = payload {
+                for (j, (fname, _)) in fields.iter().enumerate() {
+                    if fname == field {
+                        let variant_name = names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("variant_{}", i));
+                        return Some((variant_name, j as u16));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up a variable's declared type from the codegen side-table
+    /// (Phase 18D — `Expression::Access` codegen helper).
+    ///
+    /// The side-table is populated during `infer_function` (function
+    /// arguments) and `infer_fragment` (let-bindings), and survives
+    /// `infer_function`'s env-pop so the codegen can resolve a
+    /// field-access receiver's type after `check_program` returns.
+    ///
+    /// Returns `None` for unknown variables and for type variables
+    /// that the typechecker never resolved (in practice: never —
+    /// function arg types are always `parse_type_name_str` results,
+    /// and let-bound types are resolved by the typechecker before
+    /// this map is queried).
+    pub fn codegen_var_type(&self, name: &str) -> Option<&Ty> {
+        self.codegen_var_types.get(name)
+    }
+
+    /// Compute the inferred type of an expression WITHOUT touching the
+    /// per-node cache or the `next_id_idx` counter (Phase 18D —
+    /// `Expression::Access` codegen helper).
+    ///
+    /// The codegen uses this to resolve a field-access receiver's
+    /// type when the infer cache is unavailable (e.g., the infer
+    /// pass skipped some nodes like a function's `args`, leaving
+    /// the cache misaligned with the pre-walk's ID table — see the
+    /// comment in `compiler/src/lib.rs::do_compile`'s `Expression::Access`
+    /// arm for details).
+    ///
+    /// Side-effects of calling this:
+    ///  - `self.subst` may be extended (type variables may be bound).
+    ///  - `self.env` is read but not modified.
+    ///  - The cache and `next_id_idx` are NOT touched.
+    ///
+    /// This is essentially `infer_inner` exposed at the API
+    /// boundary. Because we don't insert into the cache, the
+    /// expression's inferred type isn't reusable by other codegen
+    /// arms that rely on `lookup_at` — but for our purposes (the
+    /// Access codegen just needs the receiver's type to look up
+    /// the field index), that's fine.
+    pub fn infer_for_codegen(&mut self, expr: &Output) -> Ty {
+        let saved_idx = self.next_id_idx;
+        let ty = self.infer_inner(expr);
+        self.next_id_idx = saved_idx;
+        // Don't insert into cache — the ID we restored might be
+        // wrong for this AST node, and overwriting a correct entry
+        // would be worse than skipping this insertion.
+        ty
     }
 
     /// Type-check a field-access expression (Phase 18D).

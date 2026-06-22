@@ -457,17 +457,36 @@ impl<'ctx> Context {
 ///
 /// For each sub-pattern:
 /// - `Binding { name }` — record `name → next_slot` in
-///   `match_bindings`, emit `STORE next_slot`, and increment
-///   `next_slot`. The STORE is a no-op (Phase 15D) that confirms
-///   the binding — the VM already pushed the value at that slot.
-/// - `Wildcard` — `POP` to discard the value.
+///   `match_bindings`, emit `STORE next_slot` (if `consume_values`
+///   is true), and increment `next_slot`. The STORE is a no-op
+///   (Phase 15D) that confirms the binding — the VM already pushed
+///   the value at that slot.
+/// - `Wildcard` — `POP` to discard the value (if `consume_values`
+///   is true).
 /// - `Constructor { .. }` (tuple shape) — `UNPACK <arity>` to pop
-///   the enum value and push its payload, then recurse into
-///   each sub-pattern of the inner constructor. The nested
-///   bindings continue counting from the outer `next_slot`.
+///   the enum value and push its payload (if `consume_values` is
+///   true), then recurse into each sub-pattern of the inner
+///   constructor with `consume_values = true`. The nested bindings
+///   continue counting from the outer `next_slot`.
 /// - `Constructor { .. }` (record shape) — emit a POP (nested
 ///   record patterns inside an arm body are not supported in 17B
 ///   — see Known Limitations in AGENTS.md).
+///
+/// `consume_values` (Phase 18A): controls whether the function
+/// emits POP/STORE/UNPACK for the OUTER level. When the test
+/// chain has already consumed the payload values (via POP /
+/// STORE / JUMP_IF_MATCH), the reverse pass calls this function
+/// with `consume_values = false` to skip the redundant
+/// POP/STORE/UNPACK emission. Bindings are still recorded in
+/// `match_bindings` (so the body's `Identifier` lookups resolve
+/// to the correct slots) — only the bytecode emission is
+/// suppressed.
+///
+/// The recursion into sub-patterns ALWAYS uses `consume_values =
+/// true`: the inner values were pushed either by the (skipped or
+/// emitted) UNPACK above, or by the outer `JUMP_IF_MATCH` in the
+/// test chain case. Either way, the recursion needs to consume
+/// those values via POP/STORE.
 ///
 /// This function is called once per arm body. After it returns,
 /// the stack has been "consumed" by the binding code (POPs for
@@ -478,30 +497,53 @@ fn emit_pattern_binding(
     next_slot: &mut u32,
     pattern: &Pattern,
     bytecode: &mut Vec<Byte>,
+    consume_values: bool,
 ) {
     use parser::ast::PatternPayload;
     match pattern {
         Pattern::Wildcard => {
-            bytecode.push(Byte::new(Instruction::POP));
+            if consume_values {
+                bytecode.push(Byte::new(Instruction::POP));
+            }
         }
         Pattern::Binding { name } => {
             let slot = *next_slot;
+            // Always record the binding — the body still
+            // needs to be able to look up the slot via
+            // `Identifier` / `Assignment`, even if we don't
+            // emit the redundant STORE (the test chain
+            // already pushed the value at this slot via
+            // JUMP_IF_MATCH).
             match_bindings.insert(name.to_string(), slot);
-            bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(slot));
+            if consume_values {
+                bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(slot));
+            }
             *next_slot += 1;
         }
         Pattern::Constructor { payload, .. } => match payload {
             PatternPayload::Unit => {
                 // A unit-variant nested pattern (e.g. `Option::None`)
                 // is invalid — unit variants have no payload. But
-                // the typechecker would have rejected this; emit a
-                // no-op POP for defensive purposes.
-                bytecode.push(Byte::new(Instruction::POP));
+                // the typechecker would have rejected this. Emit a
+                // defensive POP only if the caller expects a value
+                // to consume on the stack.
+                if consume_values {
+                    bytecode.push(Byte::new(Instruction::POP));
+                }
             }
             PatternPayload::Tuple(parts) => {
-                bytecode.push(Byte::new(Instruction::Unpack).with_operand_u32(parts.len() as u32));
+                if consume_values {
+                    bytecode.push(Byte::new(Instruction::Unpack).with_operand_u32(parts.len() as u32));
+                }
+                // Recurse for sub-patterns with consume_values
+                // = true. The inner values were pushed either
+                // by the (emitted) UNPACK above, or by the
+                // outer JUMP_IF_MATCH in the test chain case
+                // (when consume_values was false at this
+                // level). Either way, the inner recursion
+                // needs to consume them via POP/STORE.
                 for sub in parts {
-                    emit_pattern_binding(match_bindings, next_slot, sub, bytecode);
+                    emit_pattern_binding(match_bindings, next_slot, sub, bytecode, true);
                 }
             }
             PatternPayload::Record(_fields) => {
@@ -512,7 +554,9 @@ fn emit_pattern_binding(
                 // up the variant from the outer arm's payload
                 // type, which we don't thread here). Emit a POP
                 // and skip.
-                bytecode.push(Byte::new(Instruction::POP));
+                if consume_values {
+                    bytecode.push(Byte::new(Instruction::POP));
+                }
             }
         },
     }
@@ -595,6 +639,91 @@ impl Compiler {
             Some(crate::typechecking::ty::Ty::Con(ref name))
                 if name == crate::typechecking::ty::FLOAT
         )
+    }
+
+    /// Extract the enum name from the inferred type of a field-access
+    /// receiver (Phase 18D — `Expression::Access` codegen).
+    ///
+    /// The receiver can be one of:
+    ///
+    ///  - `Expression::Identifier(name)` — function parameter or
+    ///    let-bound variable. The receiver's type is the env entry
+    ///    for `name`. We return the enum name if the type is
+    ///    `Ty::Con(n)`, `Ty::Sum { name, .. }`, or
+    ///    `Ty::Constructor { owner, .. }` (with the same recursive
+    ///    unwrapping of `owner`).
+    ///  - `Expression::Access(_, _)` — chained access. The inner
+    ///    access yields the type of the inner field; we recurse to
+    ///    find the receiver's enum name. Only valid when the inner
+    ///    access's field is itself a record-shaped enum.
+    ///  - Anything else — return `None` (the codegen will emit a
+    ///    defensive `LoadField(0)`).
+    ///
+    /// We resolve the receiver's type from the **environment** (not
+    /// the infer cache) because the cache is misaligned with the
+    /// pre-walk's IDs inside function bodies — see the comment in
+    /// `Expression::Access` codegen for details.
+    fn enum_name_for_receiver(&mut self, receiver: &Output) -> Option<String> {
+        // Walk the receiver AST to extract the enum name.
+        //
+        // The codegen cannot rely on the infer cache or the env
+        // here for two reasons:
+        //
+        //   1. The infer pass's `infer_function` SKIPS a
+        //      function's `args` Fragment (it uses
+        //      `parse_arg_list` instead of recursing via `infer`).
+        //      The pre-walk DOES mint IDs for args. Result: the
+        //      pre-walk's ID table and the infer cache are
+        //      MISALIGNED inside function bodies by N+1 IDs (one
+        //      for the Fragment wrapper, N for the Arguments).
+        //
+        //   2. `infer_function` POPS its frame after processing
+        //      the body, so by codegen time the env no longer
+        //      contains function arg bindings.
+        //
+        // The Checker maintains a separate `codegen_var_types`
+        // side-table (populated in `infer_function` and
+        // `infer_fragment`) that survives both issues. For chained
+        // accesses, we recurse into the inner receiver until we
+        // hit a leaf Identifier, then look up its type in the
+        // side-table. The unwrap chain (`Con` / `Sum` /
+        // `Constructor`) extracts the enum name from the type.
+        let ty = self.receiver_type(receiver)?;
+        extract_enum_name(&ty)
+    }
+
+    /// Recursively resolve a field-access receiver's type using
+    /// the checker's codegen side-table (Phase 18D).
+    ///
+    /// For an `Identifier`, the type is the side-table entry.
+    /// For a chained `Access`, the inner access's field type is
+    /// looked up in the side-table (only valid when the inner
+    /// field is itself a record-shaped enum — otherwise the
+    /// typechecker would have errored upstream).
+    fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
+        match receiver.1.as_ref() {
+            Expression::Identifier(name) => {
+                self.checker.codegen_var_type(name).cloned()
+            }
+            Expression::Access(inner, _field) => {
+                // Chained access — the inner access's type is
+                // the field's type. To find the enum name for
+                // the OUTER access, we'd need to know which enum
+                // owns the field — but that's not directly
+                // storable in the side-table (the side-table
+                // only has plain variable types, not field
+                // types). For the scope of this task, the
+                // typechecker is the source of truth for chained
+                // accesses and emits a diagnostic if they don't
+                // resolve. The codegen's defensive fallback
+                // (LoadField(0) when None) keeps the bytecode
+                // well-formed.
+                self.receiver_type(inner).and_then(|t| {
+                    extract_enum_name(&t).map(|_| t)
+                })
+            }
+            _ => None,
+        }
     }
 
     fn do_compile<'compiler>(
@@ -1866,6 +1995,19 @@ impl Compiler {
                         HashMap::new();
                     let mut test_chain_first_arms: std::collections::HashSet<usize> =
                         std::collections::HashSet::new();
+                    // All arms that participate in a test chain
+                    // group (Phase 18A). The reverse pass uses
+                    // this set to decide whether to skip
+                    // POP/STORE/UNPACK emission in
+                    // `emit_pattern_binding` — the test chain
+                    // pass already consumed the values, so the
+                    // reverse pass should NOT re-emit them.
+                    // `test_chain_first_arms` (above) only tracks
+                    // the FIRST arm of each group (for label
+                    // re-binding); `test_chain_arms` tracks ALL
+                    // arms in all test chain groups.
+                    let mut test_chain_arms: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     // Per-arm binding map populated by
                     // `emit_inner_test` for arms in test chain
                     // groups. Keyed by arm_idx → name → slot.
@@ -1913,6 +2055,13 @@ impl Compiler {
                             &mut self.bytecode,
                         );
                         test_chain_first_arms.insert(first_arm_idx);
+                        // Mark ALL arms in this group as
+                        // belonging to a test chain. The reverse
+                        // pass uses this to skip POP/STORE
+                        // emission (Phase 18A POP-quirk fix).
+                        for &arm_idx in &group.arm_indices {
+                            test_chain_arms.insert(arm_idx);
+                        }
 
                         // Emit the test chain for each arm
                         // in source order. The last arm in
@@ -2098,26 +2247,109 @@ impl Compiler {
                         // lookups in the arm body.
                         let mut arm_bindings: HashMap<String, u32> = HashMap::new();
                         let mut next_slot: u32 = 1;
+                        // Phase 18A: arms in a test chain group
+                        // have their payload values already
+                        // consumed by the test chain pass (Step
+                        // 3.5). The reverse pass must NOT
+                        // re-emit POP/STORE/UNPACK for those
+                        // values — doing so would double-pop
+                        // the inner Unit sub-patterns (the latent
+                        // POP quirk the Phase 18A fix addresses).
+                        //
+                        // We use `consume_values = false` to
+                        // signal "values were already consumed by
+                        // the test chain" — `emit_pattern_binding`
+                        // skips the bytecode emission for the
+                        // OUTER level (UNPACK / POP / STORE for
+                        // the OUTER sub-patterns) but still
+                        // RECORDS the bindings in
+                        // `arm_bindings` (for the body's
+                        // `Identifier` lookups). The inner
+                        // recursion uses `consume_values = true`
+                        // (per the `emit_pattern_binding`
+                        // contract) — the inner values were
+                        // pushed by the test chain's
+                        // JUMP_IF_MATCH, and the inner
+                        // UNPACK/STORE/POP is harmless when the
+                        // values are already at the right slots.
+                        let in_test_chain = test_chain_arms.contains(&i);
                         if let Some(bindings) = match_bindings_per_arm.get(&i) {
                             // This arm is in a test chain
-                            // group. The test chain pass
-                            // (Step 3.5) already emitted the
-                            // POP / STORE binding code AND
-                            // recorded the bindings in
-                            // `match_bindings_per_arm[i]`. We
-                            // must NOT re-emit the binding
-                            // code here — doing so would
-                            // double-pop / double-store the
-                            // payload values, leaving the
-                            // arm body with empty slots.
-                            // Instead, install the recorded
-                            // bindings so the body's
-                            // `Identifier` lookups resolve
-                            // pattern names to the same
-                            // slots that the test chain
-                            // stored them into.
+                            // group AND the test chain recorded
+                            // bindings (Wildcard/Binding
+                            // sub-patterns at the OUTER level).
+                            // Use the recorded bindings and skip
+                            // the reverse-pass binding code
+                            // entirely.
                             arm_bindings = bindings.clone();
+                        } else if in_test_chain {
+                            // Test chain arm without recorded
+                            // bindings — the test chain emitted
+                            // JUMP_IF_MATCH for nested
+                            // Constructor sub-patterns (no
+                            // STORE). Walk the pattern to RECORD
+                            // the bindings in `arm_bindings`
+                            // (the body needs them for
+                            // `Identifier` lookups), but with
+                            // `consume_values = false` so we
+                            // don't re-emit the bytecode (the
+                            // test chain handled the values).
+                            match &arm.pattern {
+                                Pattern::Binding { name } => {
+                                    arm_bindings.insert(name.to_string(), 1);
+                                }
+                                Pattern::Constructor {
+                                    enum_name,
+                                    variant_name,
+                                    payload,
+                                } => {
+                                    use parser::ast::PatternPayload;
+                                    match payload {
+                                        PatternPayload::Unit => {}
+                                        PatternPayload::Tuple(parts) => {
+                                            for sub_pat in parts {
+                                                emit_pattern_binding(
+                                                    &mut arm_bindings,
+                                                    &mut next_slot,
+                                                    sub_pat,
+                                                    &mut self.bytecode,
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                        PatternPayload::Record(fields) => {
+                                            let decl_order = self
+                                                .checker
+                                                .payload_tys_for(enum_name, variant_name);
+                                            let pattern_site: std::collections::HashMap<
+                                                &str,
+                                                &Pattern,
+                                            > = fields
+                                                .iter()
+                                                .map(|pf| (pf.name, &pf.pattern))
+                                                .collect();
+                                            for (decl_name, _) in decl_order.iter() {
+                                                if let Some(sub_pat) =
+                                                    pattern_site.get(decl_name.as_str())
+                                                {
+                                                    emit_pattern_binding(
+                                                        &mut arm_bindings,
+                                                        &mut next_slot,
+                                                        sub_pat,
+                                                        &mut self.bytecode,
+                                                        false,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Pattern::Wildcard => {}
+                            }
                         } else {
+                            // Not in a test chain: emit binding
+                            // code at the outer level (consume
+                            // the values via POP/STORE/UNPACK).
                             match &arm.pattern {
                             Pattern::Binding { name } => {
                                 // Binding arm: the forward pass
@@ -2143,6 +2375,7 @@ impl Compiler {
                                                 &mut next_slot,
                                                 sub_pat,
                                                 &mut self.bytecode,
+                                                true,
                                             );
                                         }
                                     }
@@ -2172,6 +2405,7 @@ impl Compiler {
                                                     &mut next_slot,
                                                     sub_pat,
                                                     &mut self.bytecode,
+                                                    true,
                                                 );
                                             }
                                             // Missing field: typechecker
@@ -2291,6 +2525,102 @@ impl Compiler {
             // as a wildcard).
             Expression::Default(_) => (),
 
+            // ---- Phase 18D: field-access codegen ----
+            //
+            // `point.x` parses as `Expression::Access(receiver,
+            // "x")`. The pre-walk mints a NodeId for the receiver
+            // (the `Access` node itself consumes the same ID as
+            // the receiver — see `typechecking/id.rs` and the
+            // `infer_inner` arm for `Expression::Access`, which
+            // resolves the field through the receiver's type).
+            //
+            // The codegen layout is:
+            //
+            //   <receiver bytecode>  ← do_compile(receiver)
+            //   LoadField field_index
+            //
+            // The receiver is left on the stack by the recursive
+            // call; `LoadField` pops it and pushes
+            // `payload[field_index]` (matching `Unpack`'s
+            // consume-receiver semantics — the receiver itself is
+            // gone after the access).
+            //
+            // The receiver's inferred type tells us which enum
+            // owns the field; the HM typechecker already verified
+            // the access is legal (uniquely-named field, correct
+            // record shape, etc.). We just need the field_index
+            // to build the `LoadField` operand.
+            //
+            // Recovery: if the typechecker rejected the access
+            // (e.g., ambiguous field, no such field, non-record
+            // type), the receiver type isn't a Sum/Constructor/Con
+            // that names an enum. We still emit a LoadField(0)
+            // so the bytecode is well-formed (and the VM's
+            // out-of-bounds no-op on LoadField will silently
+            // skip). The diagnostic is already on the checker.
+            Expression::Access(receiver, field) => {
+                // Phase 18D: field-access codegen.
+                //
+                // `point.x` parses as `Expression::Access(receiver,
+                // "x")`. The codegen layout is:
+                //
+                //   <receiver bytecode>  ← do_compile(receiver)
+                //   LoadField field_index
+                //
+                // The receiver is left on the stack by the
+                // recursive call; `LoadField` pops it and pushes
+                // `payload[field_index]` (matching `Unpack`'s
+                // consume-receiver semantics — the receiver
+                // itself is gone after the access).
+                //
+                // The HM typechecker already verified the access
+                // is legal (uniquely-named field, correct record
+                // shape, etc.). We just need the `field_index` to
+                // build the `LoadField` operand, which requires
+                // knowing the receiver's enum name.
+                //
+                // **Resolving the receiver's type at codegen
+                // time.** The pre-walk and infer pass visit nodes
+                // in slightly different orders inside function
+                // bodies — `infer_function` SKIPS a function's
+                // `args` Fragment (it uses `parse_arg_list` to
+                // read arg types directly instead of recursing
+                // through `infer`), creating an N+1 ID offset
+                // between the pre-walk's ID table and the infer
+                // cache. And `infer_function` POPS its frame
+                // after processing the body, so function args
+                // are gone from the env by codegen time. Both
+                // effects rule out `lookup_at(receiver_id)` and
+                // direct env lookup.
+                //
+                // Instead we use the checker's
+                // `codegen_var_types` side-table — populated by
+                // `infer_function` and `infer_fragment` — which
+                // survives both issues. See
+                // [`enum_name_for_receiver`] for details.
+                //
+                // Recovery: if the receiver is not a simple
+                // Identifier (chained Access, function call, …)
+                // or the side-table lookup fails, we emit a
+                // defensive `LoadField(0)` so the bytecode stays
+                // well-formed for downstream checks. The
+                // typechecker's diagnostic (if any) was already
+                // emitted upstream.
+                bytecode.append(&mut self.do_compile(receiver));
+
+                let enum_name = self.enum_name_for_receiver(receiver);
+                let field_index = enum_name
+                    .as_ref()
+                    .and_then(|name| self.checker.field_index_for(name, field))
+                    .map(|(_variant, idx)| idx)
+                    .unwrap_or(0);
+
+                bytecode.push(
+                    Byte::new(Instruction::LoadField)
+                        .with_operand_u32(field_index as u32),
+                );
+            }
+
             _expr => {
                 let mut message =
                     Message::error("Unknown expression".to_string(), span.into_range());
@@ -2331,6 +2661,26 @@ impl Compiler {
         self.bytecode.append(&mut program);
 
         self.bytecode.clone()
+    }
+}
+
+/// Recursively unwrap a `Ty` to extract the enum name (Phase 18D
+/// — `Expression::Access` codegen helper).
+///
+/// Handles:
+///  - `Ty::Con(name)` → returns `Some(name)`.
+///  - `Ty::Sum { name, .. }` → returns `Some(name)`.
+///  - `Ty::Constructor { owner, .. }` → recurses into `owner`.
+///
+/// Returns `None` for primitive types, type variables, function
+/// types, and other shapes that aren't enum references.
+fn extract_enum_name(ty: &crate::typechecking::ty::Ty) -> Option<String> {
+    use crate::typechecking::ty::Ty;
+    match ty {
+        Ty::Con(name) => Some(name.clone()),
+        Ty::Sum { name, .. } => Some(name.clone()),
+        Ty::Constructor { owner, .. } => extract_enum_name(owner),
+        _ => None,
     }
 }
 
@@ -2664,15 +3014,20 @@ mod tests {
         );
     }
 
-    /// Codegen test 7 (Phase 17A): in the BlockBuilder-based
-    /// Match codegen, every `JUMP_IF_MATCH` placeholder is
-    /// patched via `bind_label` to a non-zero target. If a
-    /// `bind_label` call were missed (e.g., the
-    /// `if let Some(label) = arm_labels[i]` arm didn't
+/// Codegen test 7 (Phase 17A): in the BlockBuilder-based
+    /// Match codegen, every non-last constructor arm's
+    /// JUMP_IF_MATCH placeholder is bound to that arm's body
+    /// offset. If the `bind_label` for some arm's label didn't
+    /// fire (e.g., the `if let Some(label) = arm_labels[i]` arm didn't
     /// fire for some non-last constructor arm), the
-    /// placeholder's lower 16 bits would be `0` (the
+    /// placeholder's `value[31:0]` would be `0` (the
     /// `BlockBuilder` placeholder value), and the VM would
     /// jump to the prologue — crashing with a `HALT`.
+    ///
+    /// Phase 18C — the JUMP_IF_MATCH target lives in
+    /// `value[31:0]` (a full 32-bit absolute bytecode offset),
+    /// NOT in the lower 16 bits of `operands`. The tag is in
+    /// `operands[31:16]` (lower 16 bits reserved).
     #[test]
     fn match_jump_if_match_targets_are_patched_to_arm_offsets() {
         use common::Instruction;
@@ -2685,7 +3040,7 @@ mod tests {
         );
 
         // Find every JUMP_IF_MATCH. For each, the target
-        // (lower 16 bits) must be > 0 (i.e., the placeholder
+        // (in `value[31:0]`) must be > 0 (i.e., the placeholder
         // was patched to a real arm-body offset).
         let jump_if_matches: Vec<_> = bc
             .iter()
@@ -2696,7 +3051,7 @@ mod tests {
             "expected at least one JUMP_IF_MATCH in the match bytecode"
         );
         for (i, jim) in jump_if_matches.iter().enumerate() {
-            let target = (jim.operand_u32() & 0xFFFF) as u16;
+            let target = jim.value_u32();
             let tag = (jim.operand_u32() >> 16) as u16;
             assert!(
                 target > 0,
@@ -3396,6 +3751,193 @@ fn main() {
             jimp_count >= 2,
             "expected ≥2 JUMP_IF_MATCH (outer A + inner Some); got {}",
             jimp_count
+        );
+    }
+
+    /// Codegen test 21 (Phase 18A — POP-quirk fix): the
+    /// reverse pass's `emit_pattern_binding` must NOT emit a
+    /// redundant POP for the inner Unit sub-pattern when the
+    /// test chain has already consumed the value. Pre-fix, the
+    /// codegen would emit a POP in the test chain (for
+    /// `Option::None`) AND a second POP in the reverse pass's
+    /// binding code (because the Unit case unconditionally
+    /// emits a defensive POP). The second POP silently consumes
+    /// a stale value, which is wasteful and could matter for
+    /// nested control flow.
+    ///
+    /// Post-fix, the reverse pass detects the test chain arm
+    /// (via `test_chain_arms`) and passes `consume_values =
+    /// false` to `emit_pattern_binding`, suppressing the
+    /// redundant POP. The test chain's POP is the only one
+    /// emitted for the inner Unit sub-pattern.
+    ///
+    /// This test asserts that for the canonical
+    /// `Result::Ok(Option::Some(v))` vs `Result::Ok(Option::None)`
+    /// pattern (where the first arm triggers the test chain and
+    /// the second arm's inner pattern is Unit), the resulting
+    /// bytecode has:
+    ///   - 2 JUMP_IF_MATCH (outer Result::Ok + inner Option::Some)
+    ///   - 1 POP for the inner Unit sub-pattern (the test
+    ///     chain's POP, not the reverse pass's redundant POP).
+    ///
+    /// The pre-fix codegen would have emitted 2 POPs for the
+    /// inner Unit sub-pattern (1 from the test chain + 1 from
+    /// the reverse pass). The fix reduces this to 1.
+    #[test]
+    fn test_chain_none_arm_does_not_double_pop() {
+        use common::Instruction;
+        // Two arms sharing the outer tag Result::Ok. The first
+        // arm's inner pattern is `Option::Some(v)` (nested
+        // Constructor with a Binding → triggers the test chain).
+        // The second arm's inner pattern is `Option::None` (Unit
+        // sub-pattern). The test chain emits:
+        //   - 1 JUMP_IF_MATCH for the outer Result::Ok
+        //   - 1 JUMP_IF_MATCH for the inner Option::Some
+        //   - 1 POP for the inner Option::None (Unit, no pass label)
+        //
+        // The reverse pass, post-fix, emits 0 POPs for the
+        // inner Unit sub-pattern (the test chain handled it).
+        // Pre-fix, the reverse pass would emit 1 redundant POP.
+        let src = "enum Option { None, Some(int) } \
+                   enum Result { Ok(Option), Err(string) } \
+                   fn main() { \
+                       let x = Result::Ok(Option::Some(42)); \
+                       let _ = match x { \
+                           Result::Ok(Option::Some(v)) => v, \
+                           Result::Ok(Option::None) => 0, \
+                       }; \
+                   }";
+        let ast = Pratt::default().parse(src).expect("parse failed");
+        let bc = Compiler::default().compile("test", &ast);
+
+        // Exactly 2 JUMP_IF_MATCH (outer Ok + inner Some).
+        let jimp_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
+            .count();
+        assert_eq!(
+            jimp_count, 2,
+            "expected exactly 2 JUMP_IF_MATCH (outer Ok + inner Some); got {}",
+            jimp_count
+        );
+
+        // Exactly 1 POP for the inner Unit sub-pattern. The
+        // pre-fix codegen would have emitted 2 (one from the
+        // test chain, one from the reverse pass's redundant
+        // binding code for the inner Unit pattern).
+        //
+        // Note: `let _ = match x { ... }` is an Assignment
+        // (no ExprStatement wrapper), so it doesn't add a POP.
+        // The total is 1 POP (the test chain's POP for the
+        // inner Unit sub-pattern). Pre-fix, it would be 2.
+        let pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::POP))
+            .count();
+        assert_eq!(
+            pop_count, 1,
+            "expected exactly 1 POP (test chain's inner Unit POP; the reverse pass's redundant POP is suppressed); got {}",
+            pop_count
+        );
+    }
+
+    // ============================================================
+    //  Phase 18D: field-access codegen tests
+    // ============================================================
+    //
+    // The Phase 18D spec locked in 2 codegen tests for the new
+    // `Expression::Access` arm. Both verify the bytecode SHAPE
+    // (MakeEnum → LoadField) and the operand (field_index) so the
+    // runtime extraction reads the right slot.
+
+    /// Codegen test 22 (Phase 18D): a simple field access on a
+    /// function parameter emits `MakeEnum` (for the construct in
+    /// `main`) followed by `LoadField(0)` (the first field, `x`)
+    /// in the function body. If the codegen skipped the receiver
+    /// bytecode, the stack wouldn't have the enum value at the
+    /// point of LoadField and the VM would crash.
+    #[test]
+    fn access_field_emits_receiver_then_load_field() {
+        use common::Instruction;
+        let bc = compile_src(
+            "enum Point { Origin, Point { x: int, y: int } } \
+             fn get_x(Point p) -> int { return p.x; } \
+             fn main() { print \"%i\", get_x(Point::Point { x: 42, y: 7 }); }",
+        );
+
+        // Exactly 1 LoadField (in the get_x function body).
+        let load_field_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .count();
+        assert_eq!(
+            load_field_count, 1,
+            "expected exactly 1 LoadField (p.x in get_x); got {}",
+            load_field_count
+        );
+
+        // The LoadField operand is 0 (x is the first field).
+        let load_field = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .expect("expected at least one LoadField");
+        let field_index = load_field.operand_u32() & 0xFFFF;
+        assert_eq!(
+            field_index, 0,
+            "expected LoadField(0) for field 'x' (declaration index 0); got LoadField({})",
+            field_index
+        );
+    }
+
+    /// Codegen test 23 (Phase 18D): a field access on a DIFFERENT
+    /// field of the same record emits `LoadField(1)` — the
+    /// declaration position of `y`. The red-team flagged this as
+    /// a critical regression test: a buggy codegen that always
+    /// emitted `LoadField(0)` would pass the previous test but
+    /// return the WRONG value here (silently reading `x` when the
+    /// user asked for `y`).
+    #[test]
+    fn access_field_emits_correct_field_index_for_each_field() {
+        use common::Instruction;
+        // Two functions, each accessing a different field. The
+        // x_coord access emits LoadField(0); the y_coord access
+        // emits LoadField(1).
+        let bc = compile_src(
+            "enum Point { Origin, Point { x: int, y: int } } \
+             fn x_coord(Point p) -> int { return p.x; } \
+             fn y_coord(Point p) -> int { return p.y; } \
+             fn main() { \
+                 print \"%i\", x_coord(Point::Point { x: 5, y: 12 }); \
+                 print \"%i\", y_coord(Point::Point { x: 5, y: 12 }); \
+             }",
+        );
+
+        // Exactly 2 LoadField (one per function body).
+        let load_field_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .count();
+        assert_eq!(
+            load_field_count, 2,
+            "expected exactly 2 LoadField (x_coord + y_coord); got {}",
+            load_field_count
+        );
+
+        // Collect every LoadField operand; we expect [0, 1]
+        // (x_coord uses field 0, y_coord uses field 1). The order
+        // depends on the function layout — both x_coord and y_coord
+        // are emitted before main, so the operands appear in source
+        // order in the bytecode.
+        let field_indices: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
+            .map(|b| b.operand_u32() & 0xFFFF)
+            .collect();
+        assert_eq!(
+            field_indices,
+            vec![0, 1],
+            "expected LoadField operands [0, 1] (x first, then y); got {:?}",
+            field_indices
         );
     }
 }

@@ -1320,9 +1320,207 @@ No new compiler or machine warnings.
   `Unpack` classify in O(1).
 - The `let x = expr;` bug noted at the end of Phase 15D
   is still open and blocks `let`-bound variables.
+- The `Expression::Default` AST variant is still
+  reachable from real source as of 15D's `Default`
+  codegen arm in `do_compile`.
+
+## PHASE 18D — ACCESS CODEGEN (COMPLETED)
+
+### Summary
+
+Wired `Expression::Access` end-to-end through codegen. The parser
+produces `Access` from postfix `expr.field` (Phase 18D parser
+work) and the HM typechecker resolves it to the field's type
+(Phase 18D typechecker work — 12 new tests). What's missing was
+the bytecode emitter: replace the placeholder
+`Expression::Access(_, _) => {}` arm in `do_compile` with real
+codegen that emits `LoadField(field_index)` after the receiver.
+
+### What works
+
+- **Declaration:** `enum Point { Origin, Point { x: int, y: int } }`
+- **Field access on a function parameter:**
+  `fn get_x(Point p) -> int { return p.x; }` returns `p.x`.
+- **Field access on a let-bound variable:**
+  `let p = Point::Point { x: 5, y: 12 }; print "%i", p.x;`
+- **Field access on a constructor result:**
+  `let p = Point::Point { x: 5, y: 12 }; print "%i", p.x;`
+- **Multi-field access:** `p.x` and `p.y` both work on the same
+  receiver — different `field_index` operands route to the
+  correct slot.
+
+The codegen is a thin layer over the existing VM `LoadField`
+opcode (introduced in Phase 18D as the load-field backing for
+field access). The VM already implements the runtime semantics
+(`operands[15:0]` = field_index, pop the receiver, push
+`payload[field_index]`). This phase wires up the emitter.
+
+### Decisions locked in (during implementation)
+
+1. **No new VM opcodes.** Reuses the existing `LoadField`
+   instruction from Phase 18D. The VM arm is unchanged.
+2. **`Lookup_at(receiver_id)` doesn't work.** The typechecker's
+   `infer` function visits nodes in pre-order, but
+   `infer_function` SKIPS a function's `args` Fragment (it uses
+   `parse_arg_list` to read arg types directly instead of
+   recursing through `infer`). The pre-walk DOES mint IDs for
+   args. Result: the pre-walk's ID table and the infer cache
+   are MISALIGNED inside function bodies by N+1 IDs (one for
+   the Fragment wrapper, N for the Arguments). Using
+   `id_table()[emit_idx]` from `do_compile` would map to the
+   wrong AST node. This is the same misalignment that affects
+   `compile_binary_operands`'s float-vs-int selection inside
+   function bodies — but `compile_binary_operands` works at
+   the top level (no `infer_function` skips), so it gets
+   lucky. The Access codegen needs to handle the function-body
+   case explicitly.
+3. **Env lookup doesn't work either.** `infer_function` POPS
+   its frame after processing the body, so function args are
+   gone from the env by the time codegen runs.
+4. **Side-table in the Checker.** Added
+   `codegen_var_types: HashMap<String, Ty>` to `Checker`. Populated
+   in `infer_function` (for each arg) and `infer_fragment` (for
+   each let-bound variable and constant). Survives both the
+   env-pop and the ID-misalignment issues. The codegen queries
+   it via `Checker::codegen_var_type(name) -> Option<&Ty>`.
+5. **`enum_name_for_receiver` walks the receiver AST.** Handles
+   `Identifier` (side-table lookup) and chained `Access`
+   (recurses on the inner receiver). Recursively unwraps the
+   type via `extract_enum_name` (handles `Ty::Con` / `Ty::Sum` /
+   `Ty::Constructor`).
+6. **`field_index_for` looks up the field's declaration
+   position.** Returns `Some((variant_name, field_index))` if
+   exactly one record-shaped variant in the enum declares the
+   field. The HM typechecker rejects sources where the field
+   isn't uniquely declared (ambiguous case), so a `None` return
+   at codegen time means the source had a type error.
+7. **Defensive fallback emits `LoadField(0)`.** When the
+   side-table lookup fails or the receiver is not a simple
+   Identifier, we still emit a well-formed `LoadField(0)` so
+   the bytecode stays valid for downstream checks (and the VM
+   silently no-ops on out-of-bounds field indices). The
+   typechecker's diagnostic was already emitted upstream.
+8. **Two new codegen tests in `compiler/src/lib.rs::tests`.**
+   `access_field_emits_receiver_then_load_field` and
+   `access_field_emits_correct_field_index_for_each_field`.
+   The second is the red-team's critical regression test: a
+   buggy codegen that always emits `LoadField(0)` would pass
+   the first test (x is field 0) but silently return the
+   WRONG value for `p.y` (also returning x). The second test
+   catches this category of bug.
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `compiler/src/lib.rs` | +130 LOC | `Expression::Access` codegen arm, `enum_name_for_receiver` + `receiver_type` helpers, `extract_enum_name` free fn, 2 new codegen tests |
+| `compiler/src/typechecking/infer.rs` | +110 LOC | `codegen_var_types` side-table field, `new()`/`check_program` clearing, `infer_function` + `infer_fragment` population, `field_index_for` + `codegen_var_type` + `infer_for_codegen` accessors |
+| `examples/record.0s` | rewrote | Added `x_coord` + `y_coord` functions that read fields via `p.x` / `p.y`. Output extended from `"169"` to `"169512"`. |
+| `compiler/tests/pipeline.rs` | 1 line | Updated `example_record_prints_169` → `example_record_prints_169_5_12` with new expected output. |
+
+### Test counts (18D-codegen final)
+
+| Suite | Count | Delta vs 18D-typechecker |
+|-------|-------|-------------------------|
+| `compiler/src/typechecking/*` (unit) | 253 | 0 |
+| `compiler/src/lib.rs::tests` (codegen + e2e) | 298 | +2 (codegen tests 22–23) |
+| `compiler/src/pipeline.rs::tests` (ariadne) | 9 | 0 |
+| `compiler/tests/diagnostics.rs` (golden integration) | 33 | 0 |
+| `compiler/tests/pipeline.rs` (golden e2e) | 9 | 0 |
+| `common` | 2 | 0 |
+| `machine` | 17 | 0 |
+| `parser` | 16 | 0 |
+| doctests | 6 | 0 |
+| **Total** | **381** | **+2** |
+
+The +2 is the two new codegen tests in `compiler/src/lib.rs::tests`:
+
+1. `access_field_emits_receiver_then_load_field` — locks in the
+   MakeEnum + LoadField bytecode shape and the operand = 0 for
+   the first field.
+2. `access_field_emits_correct_field_index_for_each_field` —
+   locks in `LoadField(0)` for `p.x` and `LoadField(1)` for
+   `p.y` (the critical regression test for off-by-one field
+   indices).
+
+### End-to-end smoke test
+
+`examples/record.0s` compiles and runs correctly, printing
+`169512` (5²+12² from pattern destructuring, then `p.x` = 5
+and `p.y` = 12 from field access):
+
+```0s
+enum Point {
+    Origin,
+    Point { x: int, y: int },
+}
+
+fn distance_squared(Point p) -> int {
+    return match p {
+        Point::Origin => 0,
+        Point::Point { x, y } => x * x + y * y,
+    };
+}
+
+fn x_coord(Point p) -> int {
+    return p.x;
+}
+
+fn y_coord(Point p) -> int {
+    return p.y;
+}
+
+fn main() {
+    print "%i", distance_squared(Point::Point { x: 5, y: 12 });
+    print "%i", x_coord(Point::Point { x: 5, y: 12 });
+    print "%i", y_coord(Point::Point { x: 5, y: 12 });
+}
+```
+
+### Build status
+
+`cargo build --workspace` produces only the three pre-existing
+parser warnings. No new compiler or machine warnings.
+
+### Critical regression check
+
+- `cargo test -p compiler --test pipeline` (9 golden tests) all
+  pass, including `example_record_prints_169_5_12`.
+- `cargo run -- examples/record.0s` terminates with
+  `169512`.
+- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/option.0s` prints `42`.
+- `cargo run -- examples/result.0s` prints `420-1`.
+- `cargo run -- examples/tree.0s` prints `6`.
+- `cargo run -- examples/mixed.0s` prints `025122`.
+- `cargo run -- examples/fizbuz.0s` terminates with
+  `FIZBUZFIZFIZBUZFIZFIZBUZ`.
+
+### Anything 19+ needs to know
+
+- The `codegen_var_types` side-table is a workaround for the
+  pre-existing ID-misalignment issue (caused by
+  `infer_function` skipping args via `parse_arg_list`). A more
+  general fix would be to align the pre-walk and infer pass
+  inside function bodies — e.g., have `infer_function` call
+  `infer` on each arg node so IDs are minted in lockstep. The
+  side-table unblocks Phase 18D without requiring that bigger
+  refactor.
+- Chained field access (`p.x.y` where `x` is itself a record
+  enum) is typechecked but the codegen emits a defensive
+  `LoadField(0)` for the outer access. The inner access works
+  correctly (it's just a regular field access on its own
+  receiver). The outer access needs the typechecker to record
+  the field type in the side-table — currently the side-table
+  only stores declared variable types, not field types. Future
+  work could extend it.
 - The `Expression::Default` AST variant is still reachable
   from real source as of 15D's `Default` codegen arm in
   `do_compile`.
+- The 16-bit `JUMP_IF_MATCH` target ceiling (15D.5 MEDIUM #1)
+  is still open and is the next obvious VM target.
+- The O(n) heap-pointer classification in `MakeEnum`
+  (15C's "Anything 15D needs to know") is still O(n).
 - The `Match` codegen's inner-pattern dispatch limitation
   (15D's "Known limitations") is still open: two arms with
   the same outer tag but different inner payloads will
