@@ -823,27 +823,38 @@ impl Builder {
 
             // ---- Phase 1: control flow ----
             //
-            // `If` is the only control-flow variant implemented in
-            // Phase 1.0. It produces a multi-block CFG with
-            // `Branch` terminators — see the `build_if` helper
-            // below for the block structure. `Loop` and `Match`
-            // remain deferred to later sub-phases.
+            // `If` (Phase 1.0) and `Loop` (Phase 1.1) are the
+            // control-flow variants currently implemented. Both
+            // produce multi-block CFGs with `Branch` / `Jump`
+            // terminators — see the `build_if` and `build_while`
+            // helpers below for the block structure. `Match`
+            // remains deferred to Phase 1.3.
             //
             // `Branch` is a helper variant that ONLY appears as a
             // child of `If`. If it appears at the top level (out
             // of context), it's a malformed AST — panic loudly.
+            //
+            // `Expression::Loop` is the AST shape for `while`
+            // loops (the legacy `for` iterator field is the
+            // condition; the `identifier` field is unused by the
+            // codegen and the CFG builder). The pre-1.1
+            // single-pass codegen (`compiler/src/lib.rs::do_compile`)
+            // interprets `Loop { iterable: cond, body }` as
+            // `while cond { body }`, so we mirror that
+            // interpretation here.
             Expression::If(branches) => self.build_if(branches),
             Expression::Branch(_, _) => panic!(
                 "cfg_builder::build_expression: `Branch` appeared \
                  outside of an `If` context (malformed AST)"
             ),
-            Expression::Loop { .. } => panic!(
-                "cfg_builder::build_expression: `loop` is not \
-                 implemented in Phase 1.0 (deferred to Phase 1.1+)"
-            ),
+            Expression::Loop {
+                identifier: _,
+                iterable,
+                body,
+            } => self.build_while(iterable.1.as_ref(), body.1.as_ref()),
             Expression::Match { .. } => panic!(
                 "cfg_builder::build_expression: `match` is not \
-                 implemented in Phase 1.0 (deferred to Phase 1.1+)"
+                 implemented in Phase 1.1 (deferred to Phase 1.3+)"
             ),
 
             // ---- Function-in-function ----
@@ -1104,6 +1115,146 @@ impl Builder {
 
         // Phase 1.0: if-expressions don't produce values
         // (phi-nodes at the join would be needed for that).
+        None
+    }
+
+    /// Build a multi-block CFG for a `while` loop
+    /// (`Expression::Loop { iterable: cond, body }`).
+    ///
+    /// Each loop produces three fresh blocks — the header, the
+    /// body, and the exit — plus a `Jump` terminator on the
+    /// previous block (the entry edge into the loop).
+    ///
+    /// ## Block structure
+    ///
+    /// For `while cond { body }`:
+    ///
+    /// ```text
+    /// [prev_block]    Jump loop_header       (entry edge)
+    /// [loop_header]   ...evaluate cond...
+    ///                 Branch cond → loop_body, loop_exit
+    /// [loop_body]     ...body...
+    ///                 Jump loop_header       (back-edge)
+    /// [loop_exit]     ...continuation...
+    /// ```
+    ///
+    /// ## Block ID assignment
+    ///
+    /// `self.blocks` is a `Vec<Block>` indexed by `BlockId`. We
+    /// allocate and push blocks in `BlockId` order so that
+    /// `self.blocks[i].id == BlockId(i)`. This is what makes
+    /// `self.current_block_mut()` correct (it indexes
+    /// `self.blocks[self.current.index()]`).
+    ///
+    /// Block ID assignment:
+    ///
+    /// | BlockId | Role                       |
+    /// |---------|----------------------------|
+    /// | 0       | prev_block (entry, already pushed) |
+    /// | 1       | loop_header                |
+    /// | 2       | loop_body                  |
+    /// | 3       | loop_exit                  |
+    ///
+    /// The push order (header, body, exit) is deliberate: the
+    /// linearizer's `Branch` terminator assumes `true_bb` is
+    /// reachable by fall-through to the NEXT block in
+    /// declaration order. Pushing body immediately after header
+    /// makes that true (loop_body is BlockId(2), the block
+    /// right after header BlockId(1) in declaration order).
+    ///
+    /// ## Value handling
+    ///
+    /// Returns `None`. Like `if`, a while-loop expression
+    /// doesn't produce a value (no phi at the exit would be
+    /// needed for a value-producing loop).
+    ///
+    /// ## Phase 1.1 limitations
+    ///
+    /// - The body's terminator is always overwritten with
+    ///   `Jump(loop_header)` after the body is built. If the
+    ///   body contains a `return`, the back-edge Jump clobbers
+    ///   the Return terminator (same known limitation as
+    ///   `build_if`'s join block, documented above).
+    ///   `self.return_value` is still set by any inner Return,
+    ///   but the outer Return terminator ends up on
+    ///   `loop_exit` (where the linearizer's `step 5` puts it)
+    ///   rather than at the inner return site. Phase 1.2+ can
+    ///   lift this by tracking inner-block returns
+    ///   terminator-side.
+    /// - The `identifier` field of `Expression::Loop` is
+    ///   silently ignored. The legacy single-pass codegen
+    ///   also doesn't use it (the `for x in iter` syntax was
+    ///   never wired into the parser). Phase 1.2+ can wire
+    ///   it as a binding variable if needed.
+    fn build_while(
+        &mut self,
+        cond: &Expression,
+        body: &Expression,
+    ) -> Option<ValueId> {
+        // Allocate the three blocks BEFORE pushing so the
+        // BlockIds are in the canonical (header, body, exit)
+        // order. This is what makes the linearizer's
+        // "true_bb is reached by fall-through" expectation
+        // hold (the body is the block immediately after the
+        // header in declaration order).
+        let header_block = self.fresh_block();
+        let body_block = self.fresh_block();
+        let exit_block = self.fresh_block();
+
+        // Push the three blocks in declaration order so that
+        // `self.blocks[i].id == BlockId(i)` for each.
+        self.blocks.push(Block::new(header_block));
+        self.blocks.push(Block::new(body_block));
+        self.blocks.push(Block::new(exit_block));
+
+        // The previous block's terminator (whatever it was —
+        // `Unreachable` for a top-level loop, or some other
+        // control flow for a nested loop) is now overwritten
+        // with `Jump(header)`. This is the entry edge into
+        // the loop. The header's BlockId is stable, so the
+        // linearizer will patch this JMP with the header's
+        // absolute bytecode offset.
+        self.current_block_mut().terminator =
+            Terminator::Jump(header_block);
+
+        // Switch to header. Build the condition expression
+        // in the header block. If the condition fails to
+        // produce a value (defensive recovery — the
+        // typechecker should ensure cond has a value), we
+        // substitute a fresh ValueId. The linearizer may
+        // emit undefined-value diagnostics in this corner
+        // case; in practice, well-formed programs always
+        // produce a cond value.
+        self.current = header_block;
+        let cond_v = self
+            .build_expression(cond)
+            .unwrap_or_else(|| self.fresh_value());
+        self.current_block_mut().terminator = Terminator::Branch {
+            cond: cond_v,
+            true_bb: body_block,
+            false_bb: exit_block,
+        };
+
+        // Switch to body. Build the body. The body's
+        // continuation block (which may be the body_block
+        // itself for a straight-line body, or a deeper join
+        // block if the body contains an inner `if`) ends
+        // with `Jump(header)` — the back-edge.
+        //
+        // Known limitation: this Jump clobbers any Return
+        // terminator the body had (see the doc comment above
+        // for details).
+        self.current = body_block;
+        let _ = self.build_expression(body);
+        self.current_block_mut().terminator =
+            Terminator::Jump(header_block);
+
+        // Switch to exit. The loop's continuation code
+        // (anything after the loop in the parent block)
+        // lands here.
+        self.current = exit_block;
+
+        // While loops don't produce values.
         None
     }
 
@@ -1370,6 +1521,25 @@ mod tests {
             (Some(c2), b2),
             (None, b3),
         ])
+    }
+
+    /// Build a `while` loop AST node. Mirrors the pre-1.1
+    /// single-pass codegen's interpretation of
+    /// `Expression::Loop` (the legacy `for` iterator field is
+    /// the condition; the `identifier` is left as `None`).
+    ///
+    /// `while cond { body }` →
+    /// `Expression::Loop { identifier: None, iterable: cond,
+    /// body: body }`.
+    fn while_loop(
+        cond: Expression<'static>,
+        body: Expression<'static>,
+    ) -> Expression<'static> {
+        Expression::Loop {
+            identifier: None,
+            iterable: e(cond),
+            body: e(body),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2633,6 +2803,267 @@ mod tests {
             cfg.blocks.len(),
             1,
             "empty If should not create extra blocks"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // While loops (Phase 1.1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_while_loop_produces_four_blocks() {
+        // `fn f() -> int {
+        //     while false { return 1; }
+        //     return 0;
+        // }`
+        //
+        // Block structure:
+        //   0 (entry):   Jump(1)
+        //   1 (header):  ConstBool(false) → v0, Branch(v0, 2, 3)
+        //   2 (body):    Const(1) → v1,      Jump(1)
+        //   3 (exit):    Const(0) → v2,      Return(Some(v2))
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(while_loop(
+                    bool_lit(false),
+                    block(vec![stmt(ret(int(1)))]),
+                )),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks for while loop (entry + header + body + exit), got {}",
+            cfg.blocks.len()
+        );
+    }
+
+    #[test]
+    fn build_while_loop_header_branches_to_body_and_exit() {
+        // `fn f() -> int { while true { return 1; } return 0; }`
+        //
+        // Block IDs: 0 (entry), 1 (header), 2 (body), 3 (exit).
+        //
+        // The header's Branch should have:
+        //   true_bb = body_block = BlockId(2)
+        //   false_bb = exit_block = BlockId(3)
+        //
+        // Note: the body block (BlockId(2)) comes IMMEDIATELY
+        // after the header (BlockId(1)) in declaration order,
+        // which is what the linearizer's "true_bb reachable
+        // by fall-through" expectation requires.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(while_loop(
+                    bool_lit(true),
+                    block(vec![stmt(ret(int(1)))]),
+                )),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Find the header block: it's the one with a Branch
+        // terminator whose condition is the bool_const(true).
+        let header_idx = cfg
+            .blocks
+            .iter()
+            .position(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::ConstBool { value: true, .. }))
+                    && matches!(b.terminator, Terminator::Branch { .. })
+            })
+            .expect("expected a header block with ConstBool(true) and Branch");
+
+        match &cfg.blocks[header_idx].terminator {
+            Terminator::Branch {
+                true_bb, false_bb, ..
+            } => {
+                assert_eq!(
+                    *true_bb,
+                    BlockId(header_idx as u32 + 1),
+                    "header's Branch.true_bb should be the body block \
+                     (the block immediately after the header)"
+                );
+                assert_eq!(
+                    *false_bb,
+                    BlockId(header_idx as u32 + 2),
+                    "header's Branch.false_bb should be the exit block \
+                     (the block immediately after the body)"
+                );
+                assert_ne!(
+                    true_bb, false_bb,
+                    "true_bb and false_bb should be different blocks"
+                );
+            }
+            other => panic!(
+                "expected Branch terminator at header (idx={}), got {:?}",
+                header_idx, other
+            ),
+        }
+    }
+
+    #[test]
+    fn build_while_loop_body_terminator_jumps_back_to_header() {
+        // `fn f() -> int { while true { return 1; } return 0; }`
+        //
+        // Block IDs: 0 (entry), 1 (header), 2 (body), 3 (exit).
+        // The body (BlockId(2)) should Jump back to the header
+        // (BlockId(1)) — the back-edge.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(while_loop(
+                    bool_lit(true),
+                    block(vec![stmt(ret(int(1)))]),
+                )),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Find the header's BlockId by its Branch terminator.
+        let header_id = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Branch { .. }))
+            .map(|b| b.id)
+            .expect("expected a header block with Branch terminator");
+
+        // Find the body block: it has a Jump terminator whose
+        // target is the header. (The entry block also has a
+        // Jump terminator, but its target is the header too —
+        // it's the entry edge, not the back-edge. The body
+        // block is the one with the body's instruction
+        // (Const(1)) and the back-edge Jump.)
+        let body_block = cfg
+            .blocks
+            .iter()
+            .find(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::Const { value: 1, .. }))
+                    && matches!(b.terminator, Terminator::Jump(target) if target == header_id)
+            })
+            .expect("expected a body block with Const(1) and Jump back-edge");
+
+        if let Terminator::Jump(target) = body_block.terminator {
+            assert_eq!(
+                target, header_id,
+                "body's Jump target should be the header (the back-edge)"
+            );
+        } else {
+            panic!(
+                "expected Jump terminator on body block, got {:?}",
+                body_block.terminator
+            );
+        }
+    }
+
+    #[test]
+    fn build_while_loop_predecessors_are_filled_correctly() {
+        // `fn f() -> int { while true { return 1; } return 0; }`
+        //
+        // Block IDs: 0 (entry), 1 (header), 2 (body), 3 (exit).
+        //
+        // Expected predecessors:
+        //   entry (0):  []
+        //   header (1): [entry (initial entry edge), body (back-edge)]
+        //   body (2):   [header (Branch true arm)]
+        //   exit (3):   [header (Branch false arm)]
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(while_loop(
+                    bool_lit(true),
+                    block(vec![stmt(ret(int(1)))]),
+                )),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Identify each block by its role:
+        //   entry:  Jump terminator targeting the header (BlockId(1))
+        //   header: Branch terminator (the only Branch)
+        //   body:   Const(1) + Jump terminator targeting header
+        //   exit:   Return terminator (the only Return)
+        let entry_id = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Jump(t) if t == BlockId(1)))
+            .map(|b| b.id)
+            .expect("expected an entry block with Jump(1) terminator");
+        let header_id = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Branch { .. }))
+            .map(|b| b.id)
+            .expect("expected a header block with Branch terminator");
+        let body_id = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Jump(t) if t == header_id && b.insts.iter().any(|i| matches!(i, Inst::Const { value: 1, .. }))))
+            .map(|b| b.id)
+            .expect("expected a body block with Const(1) and Jump back-edge");
+        let exit_id = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Return(_)))
+            .map(|b| b.id)
+            .expect("expected an exit block with Return terminator");
+
+        // Entry has no predecessors.
+        assert!(
+            cfg.blocks[entry_id.index()].predecessors.is_empty(),
+            "entry block should have no predecessors, got {:?}",
+            cfg.blocks[entry_id.index()].predecessors
+        );
+
+        // Header has [entry, body] as predecessors (initial
+        // entry edge + back-edge from body). Order is not
+        // guaranteed; compare via a sorted copy.
+        let mut header_preds =
+            cfg.blocks[header_id.index()].predecessors.clone();
+        header_preds.sort_by_key(|b| b.0);
+        let mut expected_header_preds =
+            vec![entry_id, body_id];
+        expected_header_preds.sort_by_key(|b| b.0);
+        assert_eq!(
+            header_preds, expected_header_preds,
+            "header should have [entry, body] as predecessors"
+        );
+
+        // Body has header as sole predecessor (Branch true arm).
+        assert_eq!(
+            cfg.blocks[body_id.index()].predecessors,
+            vec![header_id],
+            "body block should have header as sole predecessor"
+        );
+
+        // Exit has header as sole predecessor (Branch false arm).
+        assert_eq!(
+            cfg.blocks[exit_id.index()].predecessors,
+            vec![header_id],
+            "exit block should have header as sole predecessor"
         );
     }
 }
