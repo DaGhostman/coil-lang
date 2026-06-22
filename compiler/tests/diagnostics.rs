@@ -429,3 +429,74 @@ fn mixed_shape_enum_with_match_uses_correct_shape() {
         msgs
     );
 }
+
+// ---- Phase 18D: field-access diagnostics ----
+
+#[test]
+fn access_field_on_non_record_produces_helpful_message() {
+    // `1.x` — the receiver is `int`, not a sum. The diagnostic
+    // should mention the field and explain what types support
+    // field access.
+    let (_ty, msgs) = check("1.x;");
+    assert!(
+        msgs.iter().any(|m| m.contains("Cannot access field")),
+        "expected 'Cannot access field' in messages, got: {:?}",
+        msgs
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("`x`")),
+        "expected the field name `x` in messages, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn access_unknown_field_lists_known_fields_in_help() {
+    // `p.z` where Point's only record-shaped variant declares
+    // `x` and `y`. The diagnostic should list `x` and `y` in
+    // its help text so the user sees what's available.
+    //
+    // The diagnostics golden-test helper returns message
+    // strings (not the full `Message` struct), so we drive the
+    // typechecker manually to inspect both the message and its
+    // help hint.
+    let src = "enum Point { Origin, Point { x: int, y: int } } \
+               let p = Point::Point { x: 1, y: 2 }; \
+               p.z;";
+    let ast = Pratt::default().parse(src).expect("parse failed");
+    let mut c = Checker::new();
+    let _ty = c.check_program(&ast);
+    let msgs = c.take_messages();
+    let no_field = msgs
+        .iter()
+        .find(|m| m.message().contains("no field `z`"))
+        .expect("expected 'no field `z`' diagnostic");
+    let help = no_field
+        .help()
+        .as_ref()
+        .expect("expected help hint on no-field diagnostic");
+    assert!(
+        help.contains("`x`") && help.contains("`y`"),
+        "expected help to list `x` and `y`, got: {:?}",
+        help
+    );
+}
+
+#[test]
+fn access_field_ambiguous_across_variants_suggests_match() {
+    // Two record-shaped variants both declare `x`. When the
+    // receiver is annotated as the bare enum name (a function
+    // parameter here), the typechecker resolves it through the
+    // enum registry to a `Ty::Sum` — and the field is
+    // ambiguous because TWO variants carry it. The diagnostic
+    // must tell the user to narrow with a `match`.
+    let (_ty, msgs) = check(
+        "enum Two { A { x: int, y: int }, B { x: string, z: int } } \
+         fn get_x(Two p) -> int { return p.x; }",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("narrow with match first")),
+        "expected 'narrow with match first' diagnostic, got: {:?}",
+        msgs
+    );
+}
