@@ -349,15 +349,44 @@ impl Builder {
         //    arms.
         self.build_expression(body);
 
-        // 5. Set the entry block's terminator. If the body hit a
-        //    `Return` or `ImplicitReturn`, use that value;
-        //    otherwise default to `Return(None)` (i.e., the
-        //    function returns unit).
+        // 5. Set the terminator for the function body's
+        //    continuation point. For Phase 0.2a (straight-line
+        //    code), `self.current` is still the entry block — we
+        //    overwrite its `Unreachable` terminator with `Return`.
+        //    For Phase 1.0+ (multi-block control flow), the
+        //    body's continuation may have moved `self.current` to
+        //    a join block (after an `if`); in that case we set
+        //    the join block's terminator and LEAVE the entry
+        //    block's terminator alone (it was set to `Branch` by
+        //    `build_if` and is authoritative).
+        //
+        //    The two invariants are:
+        //    - The current block (join block, or entry block in
+        //      the straight-line case) always ends in `Return`.
+        //    - The entry block is only overwritten when its
+        //      terminator is still `Unreachable` — i.e., the body
+        //      was straight-line and step 1's `self.current`
+        //      assignment IS the entry block.
         let term = match self.return_value {
             Some(v) => Terminator::Return(Some(v)),
             None => Terminator::Return(None),
         };
-        self.current_block_mut().terminator = term;
+        self.current_block_mut().terminator = term.clone();
+
+        let entry_block = &mut self.blocks[entry.index()];
+        if matches!(entry_block.terminator, Terminator::Unreachable) {
+            // Straight-line body — the entry block was the
+            // current block in step 1, and step 1 already set
+            // it to `term`. The condition is true only if the
+            // body emitted NO instructions that advanced the
+            // current block (e.g., a no-op body), in which case
+            // we redundantly set the same terminator. Safe.
+            entry_block.terminator = term;
+        }
+        // Otherwise: the entry block's terminator was set by
+        // `build_if` to `Branch` (or by some future control-
+        // flow helper to `Jump` / `Switch`). The Branch is the
+        // authoritative control transfer; do not overwrite.
 
         // 6. Assemble the Function. `blocks` is moved out of the
         //    builder and the predecessors are filled in by
@@ -794,25 +823,27 @@ impl Builder {
 
             // ---- Phase 1: control flow ----
             //
-            // These variants require multi-block CFGs and Branch
-            // / Switch terminators. Phase 0.2a panics on them so
-            // the missing functionality is loud (rather than
-            // silently producing incorrect bytecode).
-            Expression::If(_) => panic!(
-                "cfg_builder::build_expression: `if` is not implemented \
-                 in Phase 0.2a (deferred to Phase 1)"
-            ),
+            // `If` is the only control-flow variant implemented in
+            // Phase 1.0. It produces a multi-block CFG with
+            // `Branch` terminators — see the `build_if` helper
+            // below for the block structure. `Loop` and `Match`
+            // remain deferred to later sub-phases.
+            //
+            // `Branch` is a helper variant that ONLY appears as a
+            // child of `If`. If it appears at the top level (out
+            // of context), it's a malformed AST — panic loudly.
+            Expression::If(branches) => self.build_if(branches),
             Expression::Branch(_, _) => panic!(
-                "cfg_builder::build_expression: `if` branch is not \
-                 implemented in Phase 0.2a (deferred to Phase 1)"
+                "cfg_builder::build_expression: `Branch` appeared \
+                 outside of an `If` context (malformed AST)"
             ),
             Expression::Loop { .. } => panic!(
                 "cfg_builder::build_expression: `loop` is not \
-                 implemented in Phase 0.2a (deferred to Phase 1)"
+                 implemented in Phase 1.0 (deferred to Phase 1.1+)"
             ),
             Expression::Match { .. } => panic!(
                 "cfg_builder::build_expression: `match` is not \
-                 implemented in Phase 0.2a (deferred to Phase 1)"
+                 implemented in Phase 1.0 (deferred to Phase 1.1+)"
             ),
 
             // ---- Function-in-function ----
@@ -853,6 +884,227 @@ impl Builder {
             rhs: rhs_v,
         });
         Some(dst)
+    }
+
+    /// Build a multi-block CFG for an `if` (or `if/else if/else`)
+    /// expression.
+    ///
+    /// Each branch's body becomes its own basic block, joined at
+    /// a fresh `join_block` where execution continues after the
+    /// `if`.
+    ///
+    /// ## Block structure
+    ///
+    /// For `if cond { then_branch } else { else_branch }`:
+    ///
+    /// ```text
+    /// [entry]
+    ///   ...
+    ///   cond = ...
+    ///   Branch cond_v → then_block, else_block
+    ///
+    /// [then_block]
+    ///   ...then_branch body...
+    ///   Jump join_block
+    ///
+    /// [else_block]
+    ///   ...else_branch body...
+    ///   Jump join_block
+    ///
+    /// [join_block]
+    ///   ...continuation...
+    /// ```
+    ///
+    /// For `if cond { then_branch }` (no `else`), the `Branch`
+    /// terminator's false arm points directly at `join_block` —
+    /// no separate else block is allocated.
+    ///
+    /// For `if c1 { b1 } else if c2 { b2 } else { b3 }`, the
+    /// false arm of branch 0's `Branch` points at a fresh
+    /// fallthrough block where `c2` is evaluated, and the false
+    /// arm of branch 1's `Branch` points at the else block (the
+    /// last branch, with `cond = None`, executes its body
+    /// unconditionally in its current block).
+    ///
+    /// ## Block ID assignment
+    ///
+    /// `self.blocks` is a `Vec<Block>` indexed by `BlockId`. We
+    /// allocate and push blocks in `BlockId` order so that
+    /// `self.blocks[i].id == BlockId(i)`. This is what makes
+    /// `self.current_block_mut()` correct (it indexes
+    /// `self.blocks[self.current.index()]`).
+    ///
+    /// Block ID assignment:
+    ///
+    /// | BlockId | Role                     |
+    /// |---------|--------------------------|
+    /// | 0       | entry (already pushed)   |
+    /// | 1       | join_block               |
+    /// | 2       | then_0                   |
+    /// | 3       | false_target_0 (= next branch's cond / else) |
+    /// | 4       | then_1                   |
+    /// | 5       | false_target_1 (= next branch's cond / else) |
+    /// | ...     | (etc.)                   |
+    ///
+    /// For `if cond { body }` (no else): the Branch's false arm
+    /// points at `join_block` directly (no separate false_target
+    /// is allocated).
+    ///
+    /// ## Value handling
+    ///
+    /// Returns `None`. If-expressions as values require phi-nodes
+    /// at the join (the value depends on which branch was taken);
+    /// SSA-lite punts on this. Users can use let-bindings or
+    /// statement-form `if` to handle values.
+    ///
+    /// ## Phase 1.0 limitations
+    ///
+    /// - Returns in nested blocks are tracked via
+    ///   `self.return_value` but the terminator of the nested
+    ///   block is still set to `Jump(join_block)`. The
+    ///   `return_value` accumulator reflects the LAST return
+    ///   encountered (which may be inside a nested block), and
+    ///   the join block's terminator uses that value. Proper
+    ///   handling of returns in nested blocks is Phase 1.1+
+    ///   work.
+    /// - The condition's `ValueId` is obtained from
+    ///   `build_expression`. If it returns `None` (defensive
+    ///   recovery — the typechecker should ensure the cond has
+    ///   a value), we substitute a fresh `ValueId`. The
+    ///   linearizer may emit undefined-value diagnostics in this
+    ///   corner case; in practice, well-formed programs always
+    ///   produce a cond value.
+    fn build_if<'a>(&mut self, branches: &'a [Output<'a>]) -> Option<ValueId> {
+        // Defensive: an empty `If` produces no CFG. This
+        // shouldn't happen for well-formed ASTs (the parser
+        // always wraps `if cond { body }` in a single-branch
+        // `If`), but we no-op rather than panic to keep the
+        // builder non-panicking for malformed ASTs.
+        if branches.is_empty() {
+            return None;
+        }
+
+        let num_branches = branches.len();
+
+        // Allocate and push the join_block FIRST so its
+        // BlockId (= 1) is in the canonical "lowest index after
+        // entry" position. The join's CONTENTS are filled later
+        // (by the body's continuation code), but its INDEX must
+        // be stable so that the Branch / Jump targets can be
+        // resolved via `self.blocks[BlockId(1).index()]`.
+        let join_block = self.fresh_block();
+        self.blocks.push(Block::new(join_block));
+
+        for (i, branch_output) in branches.iter().enumerate() {
+            let branch_expr = branch_output.1.as_ref();
+            let (cond_opt, body) = match branch_expr {
+                Expression::Branch(c, b) => (c.as_ref(), b),
+                other => panic!(
+                    "cfg_builder::build_if: If branch must be \
+                     Expression::Branch, got {:?}",
+                    other
+                ),
+            };
+
+            let is_last = i + 1 == num_branches;
+
+            match cond_opt {
+                Some(cond_output) => {
+                    // Branch with a condition. Build cond in the
+                    // CURRENT block (which is either the entry,
+                    // or the previous iteration's false_target).
+                    let cond_v = self
+                        .build_expression(cond_output.1.as_ref())
+                        .unwrap_or_else(|| self.fresh_value());
+
+                    // Push then_block (BlockId 2, 4, ...).
+                    let then_block = self.fresh_block();
+                    self.blocks.push(Block::new(then_block));
+
+                    // Push false_target if not last.
+                    //
+                    // For the last branch with cond=Some, the
+                    // false arm goes directly to join_block (no
+                    // else branch — fall through to the join).
+                    //
+                    // For non-last branches, push a fresh
+                    // false_target (BlockId 3, 5, ...) — this
+                    // becomes either the next branch's cond
+                    // evaluation block, or (if the next branch
+                    // has cond=None) the else block where the
+                    // body's code goes.
+                    let false_target = if is_last {
+                        join_block
+                    } else {
+                        let ft = self.fresh_block();
+                        self.blocks.push(Block::new(ft));
+                        ft
+                    };
+
+                    // Set the current block's terminator to
+                    // Branch.
+                    self.current_block_mut().terminator =
+                        Terminator::Branch {
+                            cond: cond_v,
+                            true_bb: then_block,
+                            false_bb: false_target,
+                        };
+
+                    // Switch to then_block, build body, set
+                    // Jump(join_block).
+                    self.current = then_block;
+                    let _then_value =
+                        self.build_expression(body.1.as_ref());
+                    self.current_block_mut().terminator =
+                        Terminator::Jump(join_block);
+
+                    // Advance current to false_target for the
+                    // next iteration. If false_target IS
+                    // join_block (last branch with cond=Some,
+                    // no else), we don't advance — the body's
+                    // continuation code will land in join_block
+                    // after the loop ends.
+                    if !is_last {
+                        self.current = false_target;
+                    }
+                }
+                None => {
+                    // Else branch (no condition). The current
+                    // block (which was the previous iteration's
+                    // false_target) IS where the body goes.
+                    //
+                    // Defensive: `cond = None` should only
+                    // appear in the LAST branch (i.e., the
+                    // `else` of an `if c { b } else { e }`).
+                    // If it appears earlier, the AST is
+                    // malformed.
+                    if !is_last {
+                        panic!(
+                            "cfg_builder::build_if: `else` \
+                             branch (cond=None) is not the \
+                             last branch — malformed AST"
+                        );
+                    }
+
+                    let _body_value =
+                        self.build_expression(body.1.as_ref());
+                    self.current_block_mut().terminator =
+                        Terminator::Jump(join_block);
+                    // No advance — there should be no more
+                    // branches.
+                }
+            }
+        }
+
+        // After all branches, set self.current to the
+        // join_block. The body's continuation code (anything
+        // after the if in the parent block) will land in
+        // join_block.
+        self.current = join_block;
+
+        // Phase 1.0: if-expressions don't produce values
+        // (phi-nodes at the join would be needed for that).
+        None
     }
 
     /// Fill in the `predecessors` field of every block by walking
@@ -1051,6 +1303,73 @@ mod tests {
             returns,
             body: e(body),
         }
+    }
+
+    /// Build a single `Branch` AST node: `Branch(Option<Output>,
+    /// Output)`. The `cond` is `None` for an `else` branch.
+    /// `cond` of `None` produces `Branch(None, body)` (the else
+    /// form).
+    fn branch(
+        cond: Option<Expression<'static>>,
+        body: Expression<'static>,
+    ) -> Expression<'static> {
+        Expression::Branch(cond.map(e), e(body))
+    }
+
+    /// Build an `if` (or `if/else if/else`) AST node from a
+    /// sequence of `(Option<cond>, body)` pairs.
+    ///
+    /// Each pair becomes an `Expression::Branch`. The last pair
+    /// SHOULD have `cond = None` (representing `else`); a non-
+    /// last `cond = None` is malformed and would panic at
+    /// `build_if` time.
+    fn if_expr(
+        branches: Vec<(Option<Expression<'static>>, Expression<'static>)>,
+    ) -> Expression<'static> {
+        let branches_out: Vec<Output<'static>> = branches
+            .into_iter()
+            .map(|(cond, body)| e(branch(cond, body)))
+            .collect();
+        Expression::If(branches_out)
+    }
+
+    /// Convenience for `if cond { body }` — single branch with a
+    /// condition, no else.
+    fn if_single(
+        cond: Expression<'static>,
+        body: Expression<'static>,
+    ) -> Expression<'static> {
+        if_expr(vec![(Some(cond), body)])
+    }
+
+    /// Convenience for `if cond { then_b } else { else_b }` — two
+    /// branches, the second with no condition (the else).
+    fn if_else(
+        cond: Expression<'static>,
+        then_b: Expression<'static>,
+        else_b: Expression<'static>,
+    ) -> Expression<'static> {
+        if_expr(vec![
+            (Some(cond), then_b),
+            (None, else_b),
+        ])
+    }
+
+    /// Convenience for
+    /// `if c1 { b1 } else if c2 { b2 } else { b3 }` — three
+    /// branches.
+    fn if_else_if_else(
+        c1: Expression<'static>,
+        b1: Expression<'static>,
+        c2: Expression<'static>,
+        b2: Expression<'static>,
+        b3: Expression<'static>,
+    ) -> Expression<'static> {
+        if_expr(vec![
+            (Some(c1), b1),
+            (Some(c2), b2),
+            (None, b3),
+        ])
     }
 
     // -----------------------------------------------------------------
@@ -1905,5 +2224,415 @@ mod tests {
             Terminator::Return(Some(v)) => assert_eq!(*v, ValueId(4)),
             other => panic!("expected Return(Some(v4)), got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 1.0: control-flow expressions — `if` / `if/else` /
+    // `if/else if/else`. Each branch's body becomes its own basic
+    // block; the entry block's terminator becomes `Branch`; the
+    // join block is reached by `Jump` from each branch's body.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_if_single_branch_produces_three_blocks() {
+        // `fn f() -> int { if true { return 1; } return 0; }`
+        //
+        // Block structure:
+        //   0 (entry):  ConstBool(true) → v0,  Branch(v0, 2, 1)
+        //   1 (join):   Const(0) → v1,         Return(Some(v1))
+        //   2 (then):   Const(1) → v2,          Jump(1)
+        //
+        // Branch's true target is the then_block (BlockId(2));
+        // Branch's false target is the join_block (BlockId(1))
+        // because there's no else.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(if_single(bool_lit(true), block(vec![stmt(ret(int(1)))]))),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            3,
+            "expected 3 blocks (entry + then + join), got {}",
+            cfg.blocks.len()
+        );
+
+        // Block 0 (entry): ConstBool(true) followed by Branch.
+        let entry = &cfg.blocks[0];
+        let has_constbool = entry
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::ConstBool { value: true, .. }));
+        assert!(has_constbool, "entry should contain ConstBool(true)");
+        match &entry.terminator {
+            Terminator::Branch { cond, true_bb, false_bb } => {
+                // cond is the ValueId from ConstBool(true); we
+                // don't pin it to a specific number (depends on
+                // the param block setup), but it must be Some.
+                let _ = cond;
+                assert_eq!(
+                    *true_bb,
+                    BlockId(2),
+                    "Branch.true_bb should be then_block"
+                );
+                assert_eq!(
+                    *false_bb,
+                    BlockId(1),
+                    "Branch.false_bb should be join_block (no else)"
+                );
+            }
+            other => panic!("entry should have Branch terminator, got {:?}", other),
+        }
+
+        // Block 1 (join): Const(0) followed by Return(Some(...)).
+        let join = &cfg.blocks[1];
+        assert!(
+            join.insts
+                .iter()
+                .any(|i| matches!(i, Inst::Const { value: 0, .. })),
+            "join should contain Const(0) (the `return 0` after the if)"
+        );
+        assert!(
+            matches!(join.terminator, Terminator::Return(Some(_))),
+            "join should have Return(Some(_)) terminator, got {:?}",
+            join.terminator
+        );
+
+        // Block 2 (then_block): Const(1) followed by Jump(1).
+        let then_block = &cfg.blocks[2];
+        assert!(
+            then_block
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Const { value: 1, .. })),
+            "then_block should contain Const(1) (the `return 1` body)"
+        );
+        match &then_block.terminator {
+            Terminator::Jump(bb) => assert_eq!(
+                *bb,
+                BlockId(1),
+                "then_block should Jump to join_block"
+            ),
+            other => panic!(
+                "then_block should have Jump(1) terminator, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn build_if_else_produces_four_blocks() {
+        // `fn f() -> int { if c { return 1; } else { return 2; } }`
+        //
+        // Block structure:
+        //   0 (entry):    Cond(c) → v0,  Branch(v0, 2, 3)
+        //   1 (join):     Return(None)   (no continuation after the if)
+        //   2 (then):     Const(1) → v1, Jump(1)
+        //   3 (else):     Const(2) → v2, Jump(1)
+        //
+        // For multi-branch `If`, each branch's body is its own
+        // block. The Branch's false target is a fresh
+        // "fallthrough" block (which becomes the next branch's
+        // entry, or the else block for the last cond=Some
+        // branch).
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(if_else(
+                bool_lit(true),
+                block(vec![stmt(ret(int(1)))]),
+                block(vec![stmt(ret(int(2)))]),
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks (entry + then + else + join), got {}",
+            cfg.blocks.len()
+        );
+
+        // Entry: Branch with true → then_block, false → else_block.
+        match &cfg.blocks[0].terminator {
+            Terminator::Branch { true_bb, false_bb, .. } => {
+                assert_eq!(*true_bb, BlockId(2));
+                assert_eq!(
+                    *false_bb,
+                    BlockId(3),
+                    "Branch.false_bb should be the else block"
+                );
+            }
+            other => panic!("expected Branch terminator, got {:?}", other),
+        }
+
+        // Then block and else block both Jump to join_block.
+        assert!(
+            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
+            "then_block should Jump to join_block"
+        );
+        assert!(
+            matches!(&cfg.blocks[3].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
+            "else_block should Jump to join_block"
+        );
+
+        // Join block (BlockId(1)) has Return terminator (the body
+        // was just the if; no instructions after, so default
+        // Return(None)).
+        assert!(
+            matches!(&cfg.blocks[1].terminator, Terminator::Return(_)),
+            "join block should have Return terminator, got {:?}",
+            cfg.blocks[1].terminator
+        );
+    }
+
+    #[test]
+    fn build_if_else_if_else_produces_six_blocks() {
+        // `fn f() -> int {
+        //      if c1 { return 1; }
+        //      else if c2 { return 2; }
+        //      else { return 3; }
+        //  }`
+        //
+        // Block structure:
+        //   0 (entry):       Cond(c1) → v0,  Branch(v0, 3, 2)
+        //   1 (join):        Return(None)
+        //   2 (false_0):     Cond(c2) → v1,  Branch(v1, 4, 5)
+        //   3 (then_0):      Const(1),      Jump(1)
+        //   4 (then_1):      Const(2),      Jump(1)
+        //   5 (else):        Const(3),      Jump(1)
+        //
+        // Note: the block indices interleave with construction
+        // order. false_0 is allocated before then_1 because the
+        // Branch in entry needs false_0 first. BlockId(0) is
+        // always entry.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(if_else_if_else(
+                bool_lit(true),
+                block(vec![stmt(ret(int(1)))]),
+                bool_lit(false),
+                block(vec![stmt(ret(int(2)))]),
+                block(vec![stmt(ret(int(3)))]),
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            6,
+            "expected 6 blocks for if-elseif-else, got {}",
+            cfg.blocks.len()
+        );
+
+        // Entry (BlockId(0)): Branch with true → then_0
+        // (BlockId(2)), false → false_0 (BlockId(3)).
+        //
+        // The push order is: entry, join, then_0, false_0,
+        // then_1, false_1. BlockIds 2 and 3 are then_0 and
+        // false_0 respectively.
+        match &cfg.blocks[0].terminator {
+            Terminator::Branch { true_bb, false_bb, .. } => {
+                assert_eq!(
+                    *true_bb,
+                    BlockId(2),
+                    "entry's Branch.true_bb should be then_0 (BlockId 2)"
+                );
+                assert_eq!(
+                    *false_bb,
+                    BlockId(3),
+                    "entry's Branch.false_bb should be false_0 (BlockId 3)"
+                );
+            }
+            other => panic!("entry should have Branch terminator, got {:?}", other),
+        }
+
+        // false_0 (BlockId(3)): Branch with true → then_1
+        // (BlockId(4)), false → else (BlockId(5)).
+        match &cfg.blocks[3].terminator {
+            Terminator::Branch { true_bb, false_bb, .. } => {
+                assert_eq!(
+                    *true_bb,
+                    BlockId(4),
+                    "false_0's Branch.true_bb should be then_1 (BlockId 4)"
+                );
+                assert_eq!(
+                    *false_bb,
+                    BlockId(5),
+                    "false_0's Branch.false_bb should be else (BlockId 5)"
+                );
+            }
+            other => panic!("false_0 should have Branch terminator, got {:?}", other),
+        }
+
+        // All three body blocks (2, 4, 5) Jump to join_block
+        // (BlockId(1)).
+        assert!(
+            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
+            "then_0 (BlockId 2) should Jump to join_block (BlockId 1)"
+        );
+        assert!(
+            matches!(&cfg.blocks[4].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
+            "then_1 (BlockId 4) should Jump to join_block (BlockId 1)"
+        );
+        assert!(
+            matches!(&cfg.blocks[5].terminator, Terminator::Jump(bb) if *bb == BlockId(1)),
+            "else (BlockId 5) should Jump to join_block (BlockId 1)"
+        );
+
+        // Join block (BlockId(1)): Return terminator.
+        assert!(
+            matches!(&cfg.blocks[1].terminator, Terminator::Return(_)),
+            "join block should have Return terminator"
+        );
+    }
+
+    #[test]
+    fn build_if_predecessors_are_filled_correctly() {
+        // `fn f() -> int { if true { return 1; } else { return 2; } }`
+        //
+        // Block IDs: 0 (entry), 1 (join), 2 (then), 3 (else).
+        // Expected predecessors:
+        //   entry (0):  []
+        //   join (1):   [then(2), else(3)]  (each Jumps to join)
+        //   then (2):   [entry(0)]            (entry's Branch true)
+        //   else (3):   [entry(0)]            (entry's Branch false)
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(if_else(
+                bool_lit(true),
+                block(vec![stmt(ret(int(1)))]),
+                block(vec![stmt(ret(int(2)))]),
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Entry has no predecessors.
+        assert!(
+            cfg.blocks[0].predecessors.is_empty(),
+            "entry block should have no predecessors, got {:?}",
+            cfg.blocks[0].predecessors
+        );
+
+        // Then and else blocks each have entry as their sole
+        // predecessor (the Branch terminator's true / false
+        // targets).
+        assert_eq!(
+            cfg.blocks[2].predecessors,
+            vec![BlockId(0)],
+            "then_block should have entry as predecessor"
+        );
+        assert_eq!(
+            cfg.blocks[3].predecessors,
+            vec![BlockId(0)],
+            "else_block should have entry as predecessor"
+        );
+
+        // Join block has then AND else as predecessors (each
+        // Jump targets join). Order is not guaranteed; compare
+        // via a sorted copy (BlockId doesn't derive Ord, so use
+        // sort_by_key).
+        let mut join_preds = cfg.blocks[1].predecessors.clone();
+        join_preds.sort_by_key(|b| b.0);
+        assert_eq!(
+            join_preds,
+            vec![BlockId(2), BlockId(3)],
+            "join should have then + else as predecessors"
+        );
+    }
+
+    #[test]
+    fn build_if_join_block_continues_with_subsequent_code() {
+        // `fn f() -> int {
+        //      if true { return 1; }
+        //      return 0;
+        //  }`
+        //
+        // After the if, the join_block contains the `return 0`.
+        // The join_block's terminator is Return(Some(v)) where v
+        // is the ValueId for `0`.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(if_single(bool_lit(true), block(vec![stmt(ret(int(1)))]))),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Find the join block: it's the one with `Const(0)` AND
+        // `Return(Some(_))` terminator.
+        let join_idx = cfg
+            .blocks
+            .iter()
+            .position(|b| {
+                b.insts.iter().any(|i| matches!(i, Inst::Const { value: 0, .. }))
+                    && matches!(b.terminator, Terminator::Return(Some(_)))
+            })
+            .expect("expected a join block with Const(0) and Return");
+
+        let join = &cfg.blocks[join_idx];
+        let ret_value = match &join.terminator {
+            Terminator::Return(Some(v)) => *v,
+            other => panic!("expected Return(Some(_)) at join, got {:?}", other),
+        };
+        // The ret_value should match the ValueId of the Const(0).
+        let const_zero_vid = join
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Const { dst, value: 0 } => Some(*dst),
+                _ => None,
+            })
+            .expect("expected Const(0) in join block");
+        assert_eq!(
+            ret_value, const_zero_vid,
+            "Return value should be the ValueId of Const(0)"
+        );
+    }
+
+    #[test]
+    fn build_if_empty_branches_noops() {
+        // An empty `If` is malformed (the parser doesn't
+        // produce one) but the builder should be defensive and
+        // not panic — it should no-op, leaving the current
+        // block unchanged.
+        //
+        // We construct an empty If directly via the helper and
+        // verify the resulting CFG has only the entry block
+        // (no Join, no extra blocks).
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(Expression::If(Vec::new()))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // Just the entry block — empty If produces no CFG.
+        assert_eq!(
+            cfg.blocks.len(),
+            1,
+            "empty If should not create extra blocks"
+        );
     }
 }
