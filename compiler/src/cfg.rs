@@ -515,3 +515,509 @@ impl fmt::Display for Function {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // =================================================================
+    // BlockId
+    // =================================================================
+
+    #[test]
+    fn block_id_new_creates_typed_id() {
+        assert_eq!(BlockId::new(42).0, 42);
+        assert_eq!(BlockId::new(0).0, 0);
+    }
+
+    #[test]
+    fn block_id_invalid_sentinel() {
+        assert_eq!(BlockId::INVALID.0, u32::MAX);
+    }
+
+    #[test]
+    fn block_id_equality() {
+        let a = BlockId::new(7);
+        let b = BlockId::new(7);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn block_id_inequality() {
+        let a = BlockId::new(7);
+        let b = BlockId::new(8);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn block_id_hash_consistent_with_eq() {
+        let mut set = HashSet::new();
+        set.insert(BlockId::new(5));
+        assert!(set.contains(&BlockId::new(5)));
+        assert!(!set.contains(&BlockId::new(6)));
+    }
+
+    #[test]
+    fn block_id_display() {
+        assert_eq!(format!("{}", BlockId(5)), "bb5");
+        assert_eq!(format!("{}", BlockId::new(0)), "bb0");
+        assert_eq!(format!("{}", BlockId::new(42)), "bb42");
+        assert_eq!(format!("{}", BlockId::INVALID), "bb4294967295");
+    }
+
+    // =================================================================
+    // ValueId
+    // =================================================================
+
+    #[test]
+    fn value_id_new_creates_typed_id() {
+        assert_eq!(ValueId::new(42).0, 42);
+        assert_eq!(ValueId::new(0).0, 0);
+    }
+
+    #[test]
+    fn value_id_invalid_sentinel() {
+        assert_eq!(ValueId::INVALID.0, u32::MAX);
+    }
+
+    #[test]
+    fn value_id_equality() {
+        let a = ValueId::new(7);
+        let b = ValueId::new(7);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn value_id_hash_consistent_with_eq() {
+        let mut set = HashSet::new();
+        set.insert(ValueId::new(5));
+        assert!(set.contains(&ValueId::new(5)));
+        assert!(!set.contains(&ValueId::new(6)));
+    }
+
+    #[test]
+    fn value_id_display() {
+        assert_eq!(format!("{}", ValueId(7)), "v7");
+        assert_eq!(format!("{}", ValueId::new(0)), "v0");
+        assert_eq!(format!("{}", ValueId::new(123)), "v123");
+    }
+
+    // =================================================================
+    // TypeRef
+    // =================================================================
+
+    #[test]
+    fn type_ref_equality() {
+        assert_eq!(TypeRef::Int, TypeRef::Int);
+        assert_eq!(TypeRef::Float, TypeRef::Float);
+        assert_eq!(TypeRef::Bool, TypeRef::Bool);
+        assert_eq!(TypeRef::String, TypeRef::String);
+        assert_eq!(TypeRef::Unit, TypeRef::Unit);
+        assert_eq!(TypeRef::Unknown, TypeRef::Unknown);
+        assert_eq!(TypeRef::Named(42), TypeRef::Named(42));
+    }
+
+    #[test]
+    fn type_ref_inequality() {
+        assert_ne!(TypeRef::Int, TypeRef::Float);
+        assert_ne!(TypeRef::Int, TypeRef::Unknown);
+        assert_ne!(TypeRef::Named(1), TypeRef::Named(2));
+        assert_ne!(TypeRef::Bool, TypeRef::Int);
+        assert_ne!(TypeRef::Unit, TypeRef::Named(0));
+    }
+
+    #[test]
+    fn type_ref_clone() {
+        let a = TypeRef::Named(99);
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let c = TypeRef::Float;
+        let d = c.clone();
+        assert_eq!(c, d);
+    }
+
+    // =================================================================
+    // Inst
+    // =================================================================
+
+    #[test]
+    fn inst_const_i64_display() {
+        let inst = Inst::Const {
+            dst: ValueId(0),
+            value: 42,
+        };
+        assert_eq!(format!("{}", inst), "v0 = const.i64 42");
+    }
+
+    #[test]
+    fn inst_const_f64_display() {
+        let inst = Inst::ConstF {
+            dst: ValueId(1),
+            value: 3.14,
+        };
+        assert_eq!(format!("{}", inst), "v1 = const.f64 3.14");
+    }
+
+    #[test]
+    fn inst_const_bool_display() {
+        let inst = Inst::ConstBool {
+            dst: ValueId(2),
+            value: true,
+        };
+        assert_eq!(format!("{}", inst), "v2 = const.bool true");
+    }
+
+    #[test]
+    fn inst_const_string_display() {
+        let inst = Inst::ConstString {
+            dst: ValueId(3),
+            value: "hello".to_string(),
+        };
+        assert_eq!(format!("{}", inst), "v3 = const.string \"hello\"");
+    }
+
+    #[test]
+    fn inst_param_display() {
+        let inst = Inst::Param {
+            dst: ValueId(1),
+            index: 0,
+        };
+        assert_eq!(format!("{}", inst), "v1 = param 0");
+    }
+
+    #[test]
+    fn inst_binop_add_display() {
+        let inst = Inst::BinOp {
+            op: BinOpKind::Add,
+            dst: ValueId(2),
+            lhs: ValueId(0),
+            rhs: ValueId(1),
+        };
+        assert_eq!(format!("{}", inst), "v2 = + v0 v1");
+    }
+
+    #[test]
+    fn inst_unaryop_neg_display() {
+        let inst = Inst::UnaryOp {
+            op: UnaryOpKind::Neg,
+            dst: ValueId(1),
+            src: ValueId(0),
+        };
+        assert_eq!(format!("{}", inst), "v1 = - v0");
+    }
+
+    #[test]
+    fn inst_call_display() {
+        let inst = Inst::Call {
+            dst: Some(ValueId(3)),
+            callee: ValueId(0),
+            args: vec![ValueId(1), ValueId(2)],
+        };
+        assert_eq!(format!("{}", inst), "v3 = v0(v1, v2)");
+    }
+
+    #[test]
+    fn inst_load_field_display() {
+        let inst = Inst::LoadField {
+            dst: ValueId(1),
+            src: ValueId(0),
+            field_index: 2,
+        };
+        assert_eq!(format!("{}", inst), "v1 = v0.field[2]");
+    }
+
+    #[test]
+    fn inst_unpack_display() {
+        let inst = Inst::Unpack {
+            dst: vec![ValueId(1), ValueId(2)],
+            scrutinee: ValueId(0),
+        };
+        assert_eq!(format!("{}", inst), "(v1, v2) = unpack v0");
+    }
+
+    #[test]
+    fn inst_make_enum_display() {
+        let inst = Inst::MakeEnum {
+            dst: ValueId(0),
+            tag: 1,
+            payload: vec![ValueId(1), ValueId(2)],
+        };
+        assert_eq!(format!("{}", inst), "v0 = make_enum tag=1 [v1, v2]");
+    }
+
+    // =================================================================
+    // BinOpKind
+    // =================================================================
+
+    #[test]
+    fn binop_int_arithmetic_display() {
+        assert_eq!(format!("{}", BinOpKind::Add), "+");
+        assert_eq!(format!("{}", BinOpKind::Sub), "-");
+        assert_eq!(format!("{}", BinOpKind::Mul), "*");
+        assert_eq!(format!("{}", BinOpKind::Div), "/");
+        assert_eq!(format!("{}", BinOpKind::Mod), "%");
+    }
+
+    #[test]
+    fn binop_float_arithmetic_display() {
+        assert_eq!(format!("{}", BinOpKind::AddF), "+f");
+        assert_eq!(format!("{}", BinOpKind::SubF), "-f");
+        assert_eq!(format!("{}", BinOpKind::MulF), "*f");
+        assert_eq!(format!("{}", BinOpKind::DivF), "/f");
+        assert_eq!(format!("{}", BinOpKind::ModF), "%f");
+    }
+
+    #[test]
+    fn binop_comparison_display() {
+        assert_eq!(format!("{}", BinOpKind::Eq), "==");
+        assert_eq!(format!("{}", BinOpKind::Neq), "!=");
+        assert_eq!(format!("{}", BinOpKind::Lt), "<");
+        assert_eq!(format!("{}", BinOpKind::Le), "<=");
+        assert_eq!(format!("{}", BinOpKind::Gt), ">");
+        assert_eq!(format!("{}", BinOpKind::Ge), ">=");
+    }
+
+    #[test]
+    fn binop_logical_display() {
+        assert_eq!(format!("{}", BinOpKind::And), "and");
+        assert_eq!(format!("{}", BinOpKind::Or), "or");
+    }
+
+    #[test]
+    fn binop_bitwise_display() {
+        assert_eq!(format!("{}", BinOpKind::Shl), "shl");
+        assert_eq!(format!("{}", BinOpKind::Shr), "shr");
+        assert_eq!(format!("{}", BinOpKind::Xor), "xor");
+    }
+
+    // =================================================================
+    // UnaryOpKind
+    // =================================================================
+
+    #[test]
+    fn unaryop_display() {
+        assert_eq!(format!("{}", UnaryOpKind::Neg), "-");
+        assert_eq!(format!("{}", UnaryOpKind::NegF), "-f");
+        assert_eq!(format!("{}", UnaryOpKind::Not), "!");
+    }
+
+    // =================================================================
+    // Terminator
+    // =================================================================
+
+    #[test]
+    fn terminator_jump_display() {
+        let t = Terminator::Jump(BlockId(1));
+        assert_eq!(format!("{}", t), "jump bb1");
+    }
+
+    #[test]
+    fn terminator_branch_display() {
+        let t = Terminator::Branch {
+            cond: ValueId(0),
+            true_bb: BlockId(1),
+            false_bb: BlockId(2),
+        };
+        assert_eq!(format!("{}", t), "branch v0, bb1, bb2");
+    }
+
+    #[test]
+    fn terminator_switch_display() {
+        let t = Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![(1, BlockId(1)), (2, BlockId(2))],
+            default: BlockId(3),
+        };
+        assert_eq!(format!("{}", t), "switch v0 [1 -> bb1, 2 -> bb2] default bb3");
+    }
+
+    #[test]
+    fn terminator_return_display() {
+        let none = Terminator::Return(None);
+        assert_eq!(format!("{}", none), "return");
+
+        let some = Terminator::Return(Some(ValueId(5)));
+        assert_eq!(format!("{}", some), "return v5");
+    }
+
+    #[test]
+    fn terminator_unreachable_display() {
+        let t = Terminator::Unreachable;
+        assert_eq!(format!("{}", t), "unreachable");
+    }
+
+    // =================================================================
+    // Block
+    // =================================================================
+
+    #[test]
+    fn block_new_is_unreachable() {
+        let b = Block::new(BlockId(0));
+        assert!(b.insts.is_empty());
+        assert!(matches!(b.terminator, Terminator::Unreachable));
+        assert!(b.predecessors.is_empty());
+        assert_eq!(b.id, BlockId(0));
+    }
+
+    #[test]
+    fn block_with_terminator_sets_terminator() {
+        let b = Block::new(BlockId(0)).with_terminator(Terminator::Jump(BlockId(1)));
+        assert!(matches!(
+            b.terminator,
+            Terminator::Jump(target) if target == BlockId(1)
+        ));
+        // Other fields are unchanged.
+        assert!(b.insts.is_empty());
+        assert!(b.predecessors.is_empty());
+        assert_eq!(b.id, BlockId(0));
+    }
+
+    #[test]
+    fn block_display_includes_id_and_insts_and_terminator() {
+        let b = Block {
+            id: BlockId(0),
+            insts: vec![Inst::Const {
+                dst: ValueId(0),
+                value: 5,
+            }],
+            terminator: Terminator::Return(Some(ValueId(0))),
+            predecessors: vec![],
+        };
+        let s = format!("{}", b);
+        assert!(s.contains("bb0:"), "missing block id: {:?}", s);
+        assert!(s.contains("v0 = const.i64 5"), "missing inst: {:?}", s);
+        assert!(s.contains("return v0"), "missing terminator: {:?}", s);
+    }
+
+    // =================================================================
+    // Function
+    // =================================================================
+
+    #[test]
+    fn function_new_with_empty_blocks() {
+        let f = Function {
+            name: "empty_fn".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        assert_eq!(f.name, "empty_fn");
+        assert_eq!(f.params.len(), 0);
+        assert_eq!(f.return_ty, TypeRef::Unit);
+        assert_eq!(f.blocks.len(), 0);
+        assert_eq!(f.entry, BlockId(0));
+    }
+
+    #[test]
+    fn function_display_includes_name_params_entry_blocks() {
+        let f = Function {
+            name: "my_fn".to_string(),
+            params: vec![(ValueId(0), "x".to_string())],
+            return_ty: TypeRef::Int,
+            blocks: vec![Block::new(BlockId(0))],
+            entry: BlockId(0),
+        };
+        let s = format!("{}", f);
+        assert!(s.contains("my_fn"), "missing name: {:?}", s);
+        assert!(s.contains("x: v0"), "missing param: {:?}", s);
+        assert!(s.contains("entry: bb0"), "missing entry: {:?}", s);
+        assert!(s.contains("int"), "missing return type: {:?}", s);
+        assert!(s.contains("bb0:"), "missing block: {:?}", s);
+    }
+
+    // =================================================================
+    // Integration: canonical unwrap_or_zero function
+    // =================================================================
+
+    #[test]
+    fn canonical_unwrap_or_zero_function() {
+        let opt = ValueId::new(0);
+        let v = ValueId::new(1);
+        let zero = ValueId::new(2);
+
+        let dispatch = Block::new(BlockId::new(0)).with_terminator(Terminator::Switch {
+            scrutinee: opt,
+            cases: vec![(1, BlockId::new(1))], // Some -> bb1
+            default: BlockId::new(2),          // None (default) -> bb2
+        });
+        let some_arm = Block {
+            id: BlockId::new(1),
+            insts: vec![Inst::Unpack {
+                dst: vec![v],
+                scrutinee: opt,
+            }],
+            terminator: Terminator::Return(Some(v)),
+            predecessors: vec![BlockId::new(0)],
+        };
+        let none_arm = Block {
+            id: BlockId::new(2),
+            insts: vec![Inst::Const {
+                dst: zero,
+                value: 0,
+            }],
+            terminator: Terminator::Return(Some(zero)),
+            predecessors: vec![BlockId::new(0)],
+        };
+
+        let func = Function {
+            name: "unwrap_or_zero".to_string(),
+            params: vec![(opt, "opt".to_string())],
+            return_ty: TypeRef::Int,
+            blocks: vec![dispatch, some_arm, none_arm],
+            entry: BlockId::new(0),
+        };
+
+        // 3 blocks: dispatch + Some arm + None arm.
+        assert_eq!(func.blocks.len(), 3);
+
+        // Each arm has 1 inst + 1 Return terminator.
+        assert_eq!(func.blocks[1].insts.len(), 1);
+        assert!(matches!(func.blocks[1].terminator, Terminator::Return(_)));
+        assert_eq!(func.blocks[2].insts.len(), 1);
+        assert!(matches!(func.blocks[2].terminator, Terminator::Return(_)));
+
+        // Dispatch block: 0 insts, Switch terminator.
+        assert_eq!(func.blocks[0].insts.len(), 0);
+        assert!(matches!(func.blocks[0].terminator, Terminator::Switch { .. }));
+
+        let displayed = format!("{}", func);
+        assert!(
+            displayed.contains("unwrap_or_zero"),
+            "missing name: {}",
+            displayed
+        );
+        assert!(
+            displayed.contains("entry: bb0"),
+            "missing entry: {}",
+            displayed
+        );
+        assert!(
+            displayed.contains("opt"),
+            "missing param name: {}",
+            displayed
+        );
+        assert!(
+            displayed.contains("switch"),
+            "missing switch terminator: {}",
+            displayed
+        );
+        assert!(
+            displayed.contains("unpack"),
+            "missing unpack inst: {}",
+            displayed
+        );
+        assert!(
+            displayed.contains("const.i64 0"),
+            "missing const 0: {}",
+            displayed
+        );
+        assert!(
+            displayed.contains("return"),
+            "missing return: {}",
+            displayed
+        );
+    }
+}
