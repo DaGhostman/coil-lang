@@ -1,19 +1,51 @@
 //! Linearizer: convert a CFG `Function` into stack-based bytecode.
 //!
-//! Phase 0.3a scope: straight-line functions only — single block,
-//! sequential instructions. Multi-block CFGs (control flow) are
-//! deferred to Phase 1 (the linearizer panics on multi-block
-//! functions for now).
+//! Phase 1.1 scope: multi-block CFG linearization (control flow).
+//! Handles `Jump` and `Branch` terminators with back-patching.
+//! `Switch` (match) terminators are deferred to Phase 1.3.
 //!
 //! See [`MULTI_PASS_REFACTOR_PLAN.md`](../MULTI_PASS_REFACTOR_PLAN.md)
 //! §3 for the high-level design.
 //!
 //! # What this linearizer does
 //!
-//! Walks a CFG [`Function`] block-by-block and emits one
-//! [`common::Byte`] per instruction. The emitted bytecode is the
-//! existing stack-based form (no register allocator yet — that's
-//! Phase 3).
+//! Walks a CFG [`Function`] block-by-block in declaration order
+//! and emits one [`common::Byte`] per instruction. Block-local
+//! terminators (`Jump`, `Branch`) are emitted as placeholders
+//! with operand `0` and patched in a second pass once every
+//! block's offset is known.
+//!
+//! The emitted bytecode is the existing stack-based form (no
+//! register allocator yet — that's Phase 3).
+//!
+//! # Algorithm (two-pass declaration-order linearization)
+//!
+//! 1. **Pass 1 — emit**: walk `cfg.blocks` in declaration order
+//!    (index 0, 1, 2, ...). For each block, emit its
+//!    instructions, then emit a placeholder for its terminator.
+//!    Record every block's offset (start byte position) in
+//!    `block_offsets`. For terminators that need patching
+//!    (`Jump`, `Branch`), record the placeholder's byte
+//!    position and its target [`BlockId`] for the second pass.
+//! 2. **Pass 2 — patch**: walk the recorded patches and write
+//!    the actual target offset (`block_offsets[target.index()]`
+//!    as `u32`) into each placeholder's operand.
+//!
+//! Declaration order is sufficient for straight-line if-else
+//! (no loops, no back-edges). RPO will be needed for Phase 1.2
+//! (While loops) when back-edges become possible.
+//!
+//! # Branch terminator layout
+//!
+//! `Terminator::Branch { true_bb, false_bb, .. }` emits a single
+//! `JMPF` placeholder. The `JMPF` jumps to `false_bb` when the
+//! condition is false; when true, control falls through to the
+//! NEXT block in declaration order. This means the block layout
+//! must put the "true" arm immediately after the Branch's
+//! block. The [`crate::cfg_builder::Builder::build_if`] method
+//! already produces this layout (entry → join → then →
+//! false_target, where the Branch's true_bb is `then` and the
+//! next declaration-order block IS `then`).
 //!
 //! # What this linearizer does NOT do
 //!
@@ -21,28 +53,33 @@
 //!   stack slot holds which SSA [`ValueId`]. For straight-line
 //!   code, this works because each value is produced and
 //!   immediately consumed in source order (the stack-top
-//!   invariant). Phase 0.4 will discover what breaks in this
-//!   simplification and fix it incrementally.
+//!   invariant). Phase 3 will add real register allocation.
 //!
-//! - **Multi-block linearization.** Panics if `cfg.blocks.len() > 1`.
-//!   Control-flow terminators (`Jump`, `Branch`, `Switch`) also
-//!   panic. Phase 1 will add the multi-block pass.
+//! - **Switch terminator linearization.** `Switch` (match
+//!   expression) is deferred to Phase 1.3. The current
+//!   `cfg_builder` does not produce `Switch` (the only `Switch`
+//!   producer would be Match codegen, which lands in 1.3).
 //!
 //! - **Call target resolution.** Function call targets are
 //!   resolved by the existing pipeline (see `compiler/src/lib.rs`),
 //!   not here. The linearizer emits a `JMP u32::MAX` placeholder
 //!   that the upstream patch step fills in.
 //!
+//! - **Reverse Post-Order (RPO) block ordering.** Declaration
+//!   order is fine for if-else without back-edges. Phase 1.2
+//!   (While loops) will need RPO.
+//!
 //! # Operand conventions
 //!
 //! [`common::Byte`] has two operand fields:
 //! - `operands: u32` — small immediates (slot offsets, arities,
-//!   tags). Set via [`common::Byte::with_operand_u32`].
+//!   tags, jump targets). Set via [`common::Byte::with_operand_u32`].
 //! - `value: u64` — full-width immediates (i64/f64 constants).
 //!   Set via [`common::Byte::new_with_value`].
 //!
 //! Constants (`Inst::Const`, `Inst::ConstF`, `Inst::ConstBool`)
-//! use `value`; everything else uses `operands`.
+//! use `value`; everything else uses `operands`. Jump targets
+//! use `operands`.
 
 use common::{Byte, Instruction, Value};
 
@@ -52,49 +89,63 @@ use crate::cfg::{
 
 /// Linearize a CFG [`Function`] into stack-based bytecode.
 ///
-/// # Phase 0.3a scope
+/// # Phase 1.1 scope
 ///
-/// - **Single-block functions only.** Multi-block CFGs panic
-///   (Phase 1 will add the multi-block linearization).
+/// - **Multi-block CFGs** (control flow with `Jump` and
+///   `Branch` terminators) are supported via declaration-order
+///   emission + back-patching. See module docs for the
+///   algorithm.
+/// - **`Switch` terminators panic** — they are deferred to
+///   Phase 1.3 (Match codegen).
 /// - **Sequential instruction emission.** SSA values are NOT
 ///   tracked — the linearizer assumes each value is at the
 ///   expected stack position (stack-top invariant for
-///   straight-line code).
+///   straight-line code and for the single straight-line
+///   segments within each block).
 /// - **Call target is a placeholder.** `JMP u32::MAX`; the
 ///   upstream pipeline patches it after linearization.
 ///
 /// # Returns
 ///
 /// A `Vec<Byte>` of bytecode instructions. The vector is empty
-/// for an empty block (an unreachable terminator with no
-/// instructions).
+/// for a function with no blocks (defensive — well-formed CFGs
+/// always have at least the entry block).
 ///
 /// `#[allow(dead_code)]` — this module is wired into the
-/// pipeline in Phase 0.4; until then the compiler can't see
-/// external callers, and Rust's dead-code lint would otherwise
-/// flag the entry point and its helpers (same pattern as
-/// `cfg_builder`).
+/// pipeline via `try_compile_function_via_cfg`; until the CFG
+/// path is exercised by the test suite for control-flow
+/// functions, Rust's dead-code lint would otherwise flag the
+/// entry point and its helpers.
 #[allow(dead_code)]
 pub fn linearize(cfg: &Function) -> Vec<Byte> {
-    assert_eq!(
-        cfg.blocks.len(),
-        1,
-        "Phase 0.3a: multi-block CFG not yet supported. \
-         Function `{}` has {} blocks; control flow is Phase 1.",
-        cfg.name,
-        cfg.blocks.len()
-    );
-
-    let block = &cfg.blocks[0];
     let mut bytecode = Vec::new();
+    let mut block_offsets: Vec<usize> = Vec::with_capacity(cfg.blocks.len());
+    let mut patches: Vec<TerminatorPatch> = Vec::new();
 
-    // Emit instructions in order.
-    for inst in &block.insts {
-        emit_inst(inst, &mut bytecode);
+    // Pass 1: walk blocks in declaration order, emit
+    // instructions and terminator placeholders. Track each
+    // block's offset (start position in the bytecode) and
+    // every terminator placeholder that needs patching.
+    for block in &cfg.blocks {
+        block_offsets.push(bytecode.len());
+
+        // Emit straight-line instructions.
+        for inst in &block.insts {
+            emit_inst(inst, &mut bytecode);
+        }
+
+        // Emit terminator placeholder; record patch positions
+        // for terminators that need them.
+        emit_terminator_placeholder(&block.terminator, &mut bytecode, &mut patches, &cfg.name);
     }
 
-    // Emit terminator.
-    emit_terminator(&block.terminator, &mut bytecode);
+    // Pass 2: patch terminator placeholders with the actual
+    // target byte offsets. Block offsets are now stable (no
+    // more bytecode emission), so `block_offsets[target.index()]`
+    // is the correct absolute offset.
+    for patch in &patches {
+        patch_terminator(patch, &block_offsets, &mut bytecode);
+    }
 
     bytecode
 }
@@ -232,20 +283,61 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
     }
 }
 
-/// Emit a CFG [`Terminator`] as one or more bytecode instructions.
+/// Emit a CFG [`Terminator`] as a placeholder, and record any
+/// patch position for the second pass.
+///
+/// Terminators that encode a jump target (`Jump`, `Branch`)
+/// emit a placeholder with operand `0` and append a
+/// [`TerminatorPatch`] to `patches` so the second pass can fill
+/// in the real target offset. Terminators with no jump target
+/// (`Return`, `Unreachable`) emit their final bytecode directly.
+///
+/// `fn_name` is used in the `Switch` panic message (the only
+/// panicking terminator at this stage) so the diagnostic
+/// includes the function context.
 ///
 /// `#[allow(dead_code)]` — see `linearize` for the rationale.
 #[allow(dead_code)]
-fn emit_terminator(term: &Terminator, bc: &mut Vec<Byte>) {
+fn emit_terminator_placeholder(
+    term: &Terminator,
+    bc: &mut Vec<Byte>,
+    patches: &mut Vec<TerminatorPatch>,
+    fn_name: &str,
+) {
     match term {
-        Terminator::Return(None) => {
-            // Unit return — nothing on the stack.
-            bc.push(Byte::new(Instruction::RETURN));
+        Terminator::Jump(target) => {
+            // Unconditional jump. Emit JMP placeholder and
+            // record the patch.
+            let pos = bc.len();
+            bc.push(Byte::new(Instruction::JMP).with_operand_u32(0));
+            patches.push(TerminatorPatch {
+                kind: PatchKind::Jump(*target),
+                pos,
+            });
         }
-        Terminator::Return(Some(_)) => {
-            // Value return — the value should already be on the
-            // stack from the prior instruction (stack-top
-            // invariant). RETURN pops it and returns it.
+        Terminator::Branch {
+            cond: _,
+            true_bb: _,
+            false_bb,
+        } => {
+            // Conditional branch. We emit a single `JMPF`
+            // placeholder that, when patched, jumps to
+            // `false_bb`. The `true_bb` is reached by
+            // FALL-THROUGH from the JMPF — i.e., the block
+            // immediately following the Branch's block in
+            // declaration order must be `true_bb`'s block (this
+            // is what `cfg_builder::build_if` produces).
+            let pos = bc.len();
+            bc.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
+            patches.push(TerminatorPatch {
+                kind: PatchKind::Branch {
+                    false_bb: *false_bb,
+                },
+                pos,
+            });
+        }
+        Terminator::Return(_) => {
+            // Unit or value return — no patch needed.
             bc.push(Byte::new(Instruction::RETURN));
         }
         Terminator::Unreachable => {
@@ -254,16 +346,88 @@ fn emit_terminator(term: &Terminator, bc: &mut Vec<Byte>) {
             // `compiler/src/lib.rs::Default for Compiler`).
             bc.push(Byte::new(Instruction::HALT));
         }
-        // Multi-block terminators: panic for Phase 0.3a. Phase 1
-        // will wire Jump/Branch/Switch into the multi-block
-        // linearization pass.
-        other => panic!(
-            "Phase 0.3a: control-flow terminator `{}` not yet supported \
-             (only Return and Unreachable are allowed in single-block \
-             functions; control flow is Phase 1)",
-            other
-        ),
+        Terminator::Switch { .. } => {
+            // Phase 1.1 deferred: Switch linearization (the
+            // JUMP_IF_MATCH + UNPACK cascade) is Phase 1.3 (Match
+            // codegen). The current `cfg_builder` does not produce
+            // `Switch` (it panics on `Expression::Match`), so this
+            // panic is defensive — it would only fire if a future
+            // builder addition produces a Switch without the
+            // linearizer having learned to handle it.
+            panic!(
+                "Phase 1.1 linearizer: `Switch` (match) terminator \
+                 linearization is deferred to Phase 1.3 (Match \
+                 codegen). Function `{}` contains a Switch \
+                 terminator; current sources produce only Jump / \
+                 Branch / Return control flow at the CFG level.",
+                fn_name
+            );
+        }
     }
+}
+
+/// Patch a single terminator placeholder with its real target
+/// offset, looked up from `block_offsets`.
+///
+/// Only `Jump` and `Branch` placeholders are recorded (see
+/// [`emit_terminator_placeholder`]); `Return` and `Unreachable`
+/// emit their final form directly and never appear in the
+/// patches list.
+///
+/// `#[allow(dead_code)]` — see `linearize` for the rationale.
+#[allow(dead_code)]
+fn patch_terminator(
+    patch: &TerminatorPatch,
+    block_offsets: &[usize],
+    bc: &mut Vec<Byte>,
+) {
+    match patch.kind {
+        PatchKind::Jump(target) => {
+            // Look up the target block's offset in the
+            // bytecode and write it into the JMP's operand.
+            let offset = block_offsets[target.index()] as u32;
+            bc[patch.pos] =
+                Byte::new(Instruction::JMP).with_operand_u32(offset);
+        }
+        PatchKind::Branch { false_bb } => {
+            // The JMPF jumps to `false_bb` when the condition
+            // is false. The `true_bb` is reached by fall-through
+            // to the next block in declaration order.
+            let offset = block_offsets[false_bb.index()] as u32;
+            bc[patch.pos] =
+                Byte::new(Instruction::JMPF).with_operand_u32(offset);
+        }
+    }
+}
+
+/// Record of a single terminator placeholder's position and the
+/// target it should be patched with. See
+/// [`emit_terminator_placeholder`] for emission; see
+/// [`patch_terminator`] for patching.
+#[derive(Debug, Clone, Copy)]
+struct TerminatorPatch {
+    /// What kind of terminator placeholder this is.
+    kind: PatchKind,
+    /// Absolute byte position of the placeholder's first byte
+    /// in the bytecode Vec.
+    pos: usize,
+}
+
+/// Discriminant for [`TerminatorPatch`]: which terminator
+/// variant this placeholder belongs to, plus the target(s)
+/// needed for patching.
+#[derive(Debug, Clone, Copy)]
+enum PatchKind {
+    /// `Terminator::Jump(target)` — patches the JMP's operand
+    /// with `block_offsets[target.index()]`.
+    Jump(crate::cfg::BlockId),
+    /// `Terminator::Branch { false_bb, .. }` — patches the JMPF's
+    /// operand with `block_offsets[false_bb.index()]`. The
+    /// `true_bb` is reached by fall-through (no patching
+    /// needed).
+    Branch {
+        false_bb: crate::cfg::BlockId,
+    },
 }
 
 /// Map a CFG [`BinOpKind`] to the corresponding stack-based
@@ -400,9 +564,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "multi-block CFG not yet supported")]
-    fn linearize_multi_block_function_panics() {
-        // Two blocks — dispatch + return. Phase 0.3a must panic.
+    fn linearize_multi_block_with_jump_succeeds_and_patches_target() {
+        // Phase 1.1: multi-block CFGs no longer panic. The
+        // Jump terminator's placeholder is patched with the
+        // target block's offset in the second pass.
         let dst = ValueId(0);
         let mut b0 = Block::new(BlockId(0));
         b0.insts.push(Inst::Const { dst, value: 1 });
@@ -415,7 +580,23 @@ mod tests {
             blocks: vec![b0, b1],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let bc = linearize(&f);
+        // Block 0 emits: CONST (1 byte) + JMP (1 byte) = 2 bytes
+        // Block 1 emits: RETURN (1 byte) = 1 byte
+        // Total: 3 bytes.
+        assert_eq!(bc.len(), 3);
+        // Block 0 layout.
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        assert_eq!(bc[0].value_u32(), 1);
+        assert!(matches!(bc[1].bytecode(), Instruction::JMP));
+        // The JMP's operand is the offset of block 1 = 2.
+        assert_eq!(
+            bc[1].operand_u32(),
+            2,
+            "JMP should target the offset of the second block"
+        );
+        // Block 1 layout.
+        assert!(matches!(bc[2].bytecode(), Instruction::RETURN));
     }
 
     // ============================================================
@@ -933,42 +1114,174 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "control-flow terminator")]
-    fn linearize_jump_terminator_panics() {
-        let mut block = Block::new(BlockId(0));
-        block.terminator = Terminator::Jump(BlockId(1));
+    fn linearize_jump_terminator_patches_target_in_multi_block() {
+        // Phase 1.1: `Jump(target)` is now supported. The
+        // linearizer emits a JMP placeholder in pass 1, then
+        // patches the operand with the target block's offset
+        // in pass 2.
+        //
+        // Build a 3-block function: b0 JMP b1, b1 JMP b2,
+        // b2 RETURN. b1 is reached only via the first JMP, so
+        // its jump target must be patched to b2's offset.
+        let dst = ValueId(0);
+        let mut b0 = Block::new(BlockId(0));
+        b0.insts.push(Inst::Const { dst, value: 1 });
+        b0.terminator = Terminator::Jump(BlockId(1));
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 2 });
+        b1.terminator = Terminator::Jump(BlockId(2));
+        let b2 = Block::new(BlockId(2)).with_terminator(Terminator::Return(Some(dst)));
         let f = Function {
-            name: "f".to_string(),
+            name: "chain".to_string(),
             params: vec![],
-            return_ty: TypeRef::Unit,
-            blocks: vec![block],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let bc = linearize(&f);
+        // Block 0: CONST + JMP = 2 bytes (offset 0, 1)
+        // Block 1: CONST + JMP = 2 bytes (offset 2, 3)
+        // Block 2: RETURN = 1 byte (offset 4)
+        assert_eq!(bc.len(), 5);
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        assert!(matches!(bc[1].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[1].operand_u32(),
+            2,
+            "first JMP targets b1 (offset 2)"
+        );
+        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
+        assert_eq!(bc[2].value_u32(), 2);
+        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[3].operand_u32(),
+            4,
+            "second JMP targets b2 (offset 4)"
+        );
+        assert!(matches!(bc[4].bytecode(), Instruction::RETURN));
     }
 
     #[test]
-    #[should_panic(expected = "control-flow terminator")]
-    fn linearize_branch_terminator_panics() {
-        let mut block = Block::new(BlockId(0));
-        block.terminator = Terminator::Branch {
+    fn linearize_branch_terminator_patches_jmpf_to_false_target() {
+        // Phase 1.1: `Branch { true_bb, false_bb, .. }` is now
+        // supported. The linearizer emits a JMPF placeholder
+        // that, when patched, jumps to `false_bb` when the
+        // condition is false. The `true_bb` is reached by
+        // FALL-THROUGH to the next block in declaration order.
+        //
+        // Build a 4-block function (canonical if/else layout):
+        //   b0 (entry):  no insts, Branch → (true=b2, false=b3)
+        //   b1 (join):  no insts, Return
+        //   b2 (then):  CONST 1, Jump → b1
+        //   b3 (else):  CONST 2, Jump → b1
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Branch {
             cond: ValueId(0),
-            true_bb: BlockId(1),
-            false_bb: BlockId(2),
-        };
+            true_bb: BlockId(2),
+            false_bb: BlockId(3),
+        });
+        let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(None));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 1 });
+        b2.terminator = Terminator::Jump(BlockId(1));
+        let mut b3 = Block::new(BlockId(3));
+        b3.insts.push(Inst::Const { dst, value: 2 });
+        b3.terminator = Terminator::Jump(BlockId(1));
         let f = Function {
-            name: "f".to_string(),
+            name: "if_else".to_string(),
             params: vec![],
             return_ty: TypeRef::Unit,
-            blocks: vec![block],
+            blocks: vec![b0, b1, b2, b3],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let bc = linearize(&f);
+        // Bytecode layout in declaration order:
+        //   [b0 @ 0]      JMPF → b3 (offset 4)
+        //   [b1 @ 1]      RETURN
+        //   [b2 @ 2]      CONST 1, JMP → b1 (offset 1)
+        //   [b3 @ 4]      CONST 2, JMP → b1 (offset 1)
+        assert_eq!(bc.len(), 6, "expected 6 bytes, got {:?}", bc);
+        // b0's JMPF (offset 0) → b3 (offset 4).
+        assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
+        assert_eq!(
+            bc[0].operand_u32(),
+            4,
+            "JMPF should jump to else block (b3) when false"
+        );
+        // b1's RETURN (offset 1).
+        assert!(matches!(bc[1].bytecode(), Instruction::RETURN));
+        // b2's CONST (offset 2) and JMP (offset 3) → b1 (offset 1).
+        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
+        assert_eq!(bc[2].value_u32(), 1);
+        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[3].operand_u32(),
+            1,
+            "JMP at end of then should target join (b1)"
+        );
+        // b3's CONST (offset 4) and JMP (offset 5) → b1 (offset 1).
+        assert!(matches!(bc[4].bytecode(), Instruction::CONST));
+        assert_eq!(bc[4].value_u32(), 2);
+        assert!(matches!(bc[5].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[5].operand_u32(),
+            1,
+            "JMP at end of else should target join (b1)"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "control-flow terminator")]
+    fn linearize_branch_with_false_going_to_join_patches_jmpf_correctly() {
+        // Canonical `if cond { body }; return j;` (no else
+        // branch): the Branch's false arm points DIRECTLY at
+        // the join_block. The linearizer must patch the JMPF
+        // to the join_block's offset.
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Branch {
+            cond: ValueId(0),
+            true_bb: BlockId(2),
+            false_bb: BlockId(1), // false arm → join_block directly
+        });
+        let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(None));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 7 });
+        b2.terminator = Terminator::Jump(BlockId(1));
+        let f = Function {
+            name: "if_no_else".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![b0, b1, b2],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f);
+        // Layout:
+        //   [b0 @ 0]      JMPF → b1 (offset 1)
+        //   [b1 @ 1]      RETURN
+        //   [b2 @ 2]      CONST 7, JMP → b1 (offset 1)
+        assert_eq!(bc.len(), 4);
+        assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
+        assert_eq!(
+            bc[0].operand_u32(),
+            1,
+            "JMPF in no-else case targets join_block (b1)"
+        );
+        assert!(matches!(bc[1].bytecode(), Instruction::RETURN));
+        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
+        assert_eq!(bc[2].value_u32(), 7);
+        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[3].operand_u32(),
+            1,
+            "JMP at end of then_block also targets join_block (b1)"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Switch")]
     fn linearize_switch_terminator_panics() {
+        // Phase 1.1: Switch linearization is deferred to
+        // Phase 1.3 (Match codegen). The linearizer panics
+        // honestly with the function name in the message.
         let mut block = Block::new(BlockId(0));
         block.terminator = Terminator::Switch {
             scrutinee: ValueId(0),
@@ -976,10 +1289,10 @@ mod tests {
             default: BlockId(2),
         };
         let f = Function {
-            name: "f".to_string(),
+            name: "match_fn".to_string(),
             params: vec![],
             return_ty: TypeRef::Unit,
-            blocks: vec![block],
+            blocks: vec![block, Block::new(BlockId(1)), Block::new(BlockId(2))],
             entry: BlockId(0),
         };
         let _ = linearize(&f);
@@ -1024,18 +1337,26 @@ mod tests {
     }
 
     #[test]
-    fn linearize_function_name_appears_in_panic_message() {
-        // Build a multi-block function and assert the panic message
-        // includes the function name. Catches the
-        // "panic forgot the name" regression.
+    fn linearize_function_name_appears_in_switch_panic_message() {
+        // Phase 1.1: Switch linearization is deferred, so a
+        // CFG containing a Switch terminator panics with a
+        // diagnostic that includes the function name. This
+        // test guards against a future regression that
+        // forgets to include the function name in the panic
+        // message (a common pitfall when refactoring).
         let mut b0 = Block::new(BlockId(0));
-        b0.terminator = Terminator::Jump(BlockId(1));
+        b0.terminator = Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![(1, BlockId(1))],
+            default: BlockId(2),
+        };
         let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(None));
+        let b2 = Block::new(BlockId(2)).with_terminator(Terminator::Return(None));
         let f = Function {
             name: "my_special_fn".to_string(),
             params: vec![],
             return_ty: TypeRef::Unit,
-            blocks: vec![b0, b1],
+            blocks: vec![b0, b1, b2],
             entry: BlockId(0),
         };
         let result = std::panic::catch_unwind(|| linearize(&f));
@@ -1054,12 +1375,32 @@ mod tests {
                     msg
                 );
                 assert!(
-                    msg.contains("2 blocks"),
-                    "panic message should include block count: {}",
+                    msg.contains("Switch"),
+                    "panic message should mention the Switch \
+                     terminator that's being deferred: {}",
                     msg
                 );
             }
-            Ok(_) => panic!("expected linearize to panic on multi-block function"),
+            Ok(_) => panic!(
+                "expected linearize to panic on Switch terminator \
+                 (deferred to Phase 1.3)"
+            ),
         }
+    }
+
+    #[test]
+    fn linearize_empty_function_emits_no_bytecode() {
+        // Defensive edge case: a function with zero blocks
+        // (shouldn't occur for well-formed CFGs, but the
+        // linearizer must not panic on it).
+        let f = Function {
+            name: "empty".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![],
+            entry: BlockId::INVALID,
+        };
+        let bc = linearize(&f);
+        assert!(bc.is_empty(), "empty function should emit 0 bytes");
     }
 }
