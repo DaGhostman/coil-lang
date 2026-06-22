@@ -146,6 +146,22 @@ struct PendingExhaustive {
     match_range: Range<usize>,
 }
 
+/// What the inner pattern covers (only meaningful for Constructor
+/// arms). For the codegen's test chain (which inspects only the
+/// FIRST inner pattern), this captures the first non-trivial
+/// inner pattern's tag.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum InnerCoverage {
+    /// No inner pattern to test (Unit payload, or Wildcard/Binding
+    /// which always match).
+    Any,
+    /// The inner pattern is a Constructor with the given tag.
+    /// Multiple inner tags across multiple arms of the same outer
+    /// tag are all reachable; two arms with the same outer AND
+    /// same inner tag are still duplicates.
+    Tag(u32),
+}
+
 /// Per-arm coverage info, captured at the match site.
 #[derive(Debug, Clone)]
 struct ArmCoverage {
@@ -153,6 +169,10 @@ struct ArmCoverage {
     /// pattern. `None` for wildcards, bindings, and irrefutable
     /// catches.
     tag: Option<u32>,
+    /// The inner pattern's coverage, when this arm's pattern is a
+    /// Constructor with a payload. See [`InnerCoverage`]. For
+    /// non-constructor arms this is [`InnerCoverage::Any`].
+    inner: InnerCoverage,
     /// True if the arm was a wildcard (`_`) or a binding (`name`).
     /// Such arms cover all remaining cases (Rust-style).
     is_catchall: bool,
@@ -2143,31 +2163,71 @@ impl Checker {
         }
     }
 
+    /// Inspect the first non-trivial sub-pattern of a payload and
+    /// report which inner tag (if any) it tests. Two arms of the
+    /// same outer tag are reachable as long as their inner coverage
+    /// differs — e.g. `Result::Ok(Option::Some(v))` and
+    /// `Result::Ok(Option::None)` are two distinct reachable arms.
+    /// The codegen's inner `JUMP_IF_MATCH` test chain guarantees
+    /// this at runtime; the typechecker just needs to stay out of
+    /// the way.
+    fn inner_coverage(
+        payload: &parser::ast::PatternPayload<'_>,
+        enum_tags: &BTreeMap<String, BTreeMap<String, u32>>,
+    ) -> InnerCoverage {
+        use parser::ast::PatternPayload;
+        let first = match payload {
+            PatternPayload::Unit => return InnerCoverage::Any,
+            PatternPayload::Tuple(parts) => parts.first(),
+            PatternPayload::Record(fields) => fields.first().map(|f| &f.pattern),
+        };
+        let Some(first) = first else {
+            return InnerCoverage::Any;
+        };
+        match first {
+            Pattern::Wildcard | Pattern::Binding { .. } => InnerCoverage::Any,
+            Pattern::Constructor {
+                enum_name,
+                variant_name,
+                ..
+            } => enum_tags
+                .get(enum_name.to_string().as_str())
+                .and_then(|t| t.get(variant_name.to_string().as_str()).copied())
+                .map(InnerCoverage::Tag)
+                .unwrap_or(InnerCoverage::Any),
+        }
+    }
+
     /// Capture per-arm coverage info for the deferred
     /// exhaustiveness check.
     fn arm_coverage(&self, pattern: &Pattern, range: &Range<usize>) -> ArmCoverage {
         match pattern {
             Pattern::Wildcard => ArmCoverage {
                 tag: None,
+                inner: InnerCoverage::Any,
                 is_catchall: true,
                 range: range.clone(),
             },
             Pattern::Binding { .. } => ArmCoverage {
                 tag: None,
+                inner: InnerCoverage::Any,
                 is_catchall: true,
                 range: range.clone(),
             },
             Pattern::Constructor {
                 enum_name,
                 variant_name,
+                payload,
                 ..
             } => {
                 let tag = self
                     .enum_tags
                     .get(enum_name.to_string().as_str())
                     .and_then(|t| t.get(variant_name.to_string().as_str()).copied());
+                let inner = Self::inner_coverage(payload, &self.enum_tags);
                 ArmCoverage {
                     tag,
+                    inner,
                     is_catchall: false,
                     range: range.clone(),
                 }
@@ -2196,17 +2256,25 @@ impl Checker {
         // post-pass are visible.
         let resolved = apply_ty_prune(&self.subst, &pending.scrutinee_ty);
 
-        // Track which tags have been seen and whether a
-        // catch-all (wildcard / binding) is present. A catch-all
-        // suppresses the non-exhaustive error (Rust semantics).
-        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        // Track which (outer tag, inner coverage) pairs have been
+        // seen and whether a catch-all (wildcard / binding) is
+        // present. Two arms with the same outer tag but DIFFERENT
+        // inner coverage (e.g. `Result::Ok(Option::Some(v))` vs
+        // `Result::Ok(Option::None)`) are both reachable — the
+        // codegen's inner `JUMP_IF_MATCH` chain dispatches between
+        // them at runtime. Only when both the outer tag AND the
+        // inner coverage match an earlier arm is the arm truly
+        // unreachable.
+        let mut seen: BTreeMap<u32, BTreeSet<InnerCoverage>> = BTreeMap::new();
         let mut has_catchall = false;
         for arm in &pending.arms {
             if arm.is_catchall {
                 has_catchall = true;
             } else if let Some(t) = arm.tag {
-                if !seen.insert(t) {
-                    // Duplicate tag — this arm is unreachable.
+                let inner_seen = seen.entry(t).or_default();
+                if !inner_seen.insert(arm.inner.clone()) {
+                    // Duplicate (tag, inner coverage) — this arm
+                    // is unreachable.
                     self.messages.push(Message::error(
                         "Unreachable arm: this pattern is matched by an earlier arm".to_string(),
                         arm.range.clone(),
@@ -2232,7 +2300,11 @@ impl Checker {
         };
 
         if let Ty::Sum { variants, .. } = sum_ty {
-            let covered: BTreeSet<u32> = seen;
+            // An outer tag is "covered" for the purpose of the
+            // non-exhaustive check if any arm with that tag
+            // exists. The inner coverage only matters for the
+            // duplicate-arm check above.
+            let covered: BTreeSet<u32> = seen.into_keys().collect();
             let missing: Vec<String> = variants
                 .iter()
                 .enumerate()
@@ -3838,5 +3910,41 @@ mod tests {
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    // ---- Inner-pattern reachability ----
+
+    #[test]
+    fn typechecker_does_not_report_unreachable_for_different_inner_patterns() {
+        // Two Result::Ok arms with different inner patterns (Some vs None)
+        // should both be considered reachable. The codegen (Phase 18A)
+        // emits an inner JUMP_IF_MATCH test chain, so the second arm IS
+        // reachable at runtime.
+        let src = r#"
+        enum Option { None, Some(int) }
+        enum Result { Ok(Option), Err(string) }
+        fn unwrap(Result r) -> int {
+            return match r {
+                Result::Ok(Option::Some(v)) => v,
+                Result::Ok(Option::None) => 0,
+                Result::Err(_) => -1,
+            };
+        }
+        fn main() {
+            print "%i", unwrap(Result::Ok(Option::Some(42)));
+        }
+        "#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        let unreachable: Vec<String> = msgs
+            .iter()
+            .filter(|m| m.message().contains("Unreachable arm"))
+            .map(|m| m.message().to_string())
+            .collect();
+        assert!(
+            unreachable.is_empty(),
+            "Typechecker should NOT report unreachable arm for different inner patterns, got: {:?}",
+            unreachable
+        );
     }
 }
