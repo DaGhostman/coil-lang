@@ -1,0 +1,11 @@
+[package]
+name = "match_ssa_lite"
+version = "0.1.0"
+edition = "2021"
+description = "Experiment A: Validate SSA-lite composes with match codegen"
+
+[workspace]  # empty [workspace] table — opt OUT of any parent workspace
+
+[[bin]]
+name = "match_ssa_lite"
+path = "src/main.rs"
