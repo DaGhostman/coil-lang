@@ -328,6 +328,25 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     },
                 ),
+                // Field access: `expr.identifier` — a postfix
+                // operator at Primary precedence. The operator is
+                // `.ident` with NO surrounding whitespace required
+                // (mirroring Rust/C-style languages); the ident
+                // immediately follows the dot.
+                //
+                // Note: `1.0` is still parsed as a float by the
+                // atom-level float parser (which requires an int
+                // after the dot), so `1.x` falls through to
+                // int + postfix `.x`. This is acceptable for the
+                // 18D feature surface; only record-shaped enum
+                // payloads need field access.
+                postfix(
+                    Precedence::Primary as u16,
+                    just('.').ignore_then(text::ident()),
+                    |lhs, field, e| {
+                        (e.span(), Box::new(Expression::Access(lhs, field)))
+                    },
+                ),
             ))
         })
         .map_with(output!(Expr))
@@ -1611,6 +1630,106 @@ mod tests {
             }
             other => panic!("expected Match, got {:?}", other),
         }
+    }
+
+    // ============================================================
+    //  Phase 18D tests — postfix field access
+    // ============================================================
+
+    #[test]
+    fn postfix_field_access_parses_to_access() {
+        // `point.x` should parse to `Access(point, "x")` at the
+        // top level (modulo the `Expression::Expr` wrapper that
+        // the recursive expr() rule always inserts).
+        let ast = expr_ast!("point.x");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Access(receiver, field) => {
+                // Receiver is `point` (possibly wrapped in Expr
+                // by the recursive rule — strip it for the
+                // assertion).
+                let recv_inner = match receiver.1.as_ref() {
+                    Expression::Expr(e) => e.1.as_ref(),
+                    other => other,
+                };
+                match recv_inner {
+                    Expression::Identifier(n) => assert_eq!(*n, "point"),
+                    other => panic!("expected Identifier(point), got {:?}", other),
+                }
+                assert_eq!(field, "x");
+            }
+            other => panic!("expected Access, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn postfix_field_access_chains_left_to_right() {
+        // `p.x.y` should parse as `Access(Access(p, "x"), "y")` —
+        // the outermost access is the LAST `.y`, with `.x` as the
+        // inner receiver. Postfix combinators bind left-to-right
+        // in a Pratt parser.
+        let ast = expr_ast!("p.x.y");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Access(outer_receiver, outer_field) => {
+                assert_eq!(outer_field, "y");
+                match outer_receiver.1.as_ref() {
+                    Expression::Access(inner_receiver, inner_field) => {
+                        assert_eq!(*inner_field, "x");
+                        // Innermost receiver: `p` (Identifier,
+                        // possibly wrapped in Expr).
+                        let recv_inner = match inner_receiver.1.as_ref() {
+                            Expression::Expr(e) => e.1.as_ref(),
+                            other => other,
+                        };
+                        match recv_inner {
+                            Expression::Identifier(n) => assert_eq!(*n, "p"),
+                            other => panic!(
+                                "expected Identifier(p), got {:?}",
+                                other
+                            ),
+                        }
+                    }
+                    other => panic!(
+                        "expected Access(p, x) as outer receiver, got {:?}",
+                        other
+                    ),
+                }
+            }
+            other => panic!("expected Access(p.x, y), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn postfix_field_access_display_round_trips() {
+        // The Display arm for `Access` produces `receiver.field`,
+        // which should round-trip via the `same!` macro.
+        same!("point.x");
+        same!("p.x.y");
+    }
+
+    #[test]
+    fn postfix_field_access_does_not_break_float_parsing() {
+        // Regression: `1.0` must still parse as a Float atom, not
+        // as `int(1) + postfix('.0')`. The float parser requires
+        // an int after the dot, which the field-access postfix
+        // operator (which requires an ident) cannot satisfy.
+        let ast = expr_ast!("1.0");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, Expression::Float(_)),
+            "expected Float(1.0), got {:?}",
+            inner
+        );
     }
 }
 

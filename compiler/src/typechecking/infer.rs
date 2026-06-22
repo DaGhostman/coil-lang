@@ -2648,6 +2648,45 @@ impl Checker {
         None
     }
 
+    /// Look up the declared type of a record field by enum name and
+    /// field name (Phase 19 — chained `Expression::Access` codegen).
+    ///
+    /// Returns `Some(Ty)` if exactly one record-shaped variant in
+    /// the enum declares the field; `None` otherwise. The returned
+    /// `Ty` is the field's declared type (e.g. `int` for
+    /// `enum Inner { Inner { v: int } }`).
+    ///
+    /// The codegen's `receiver_type` arm uses this to resolve
+    /// chained accesses like `p.x.v` where `p.x` is itself a
+    /// record-shaped enum: after looking up the inner receiver's
+    /// enum, it looks up the OUTER field's type in that enum. The
+    /// typechecker already verifies the chain at HM inference
+    /// time (see `access_field_in_sum`); this helper just exposes
+    /// the same registry data to the codegen without re-running
+    /// inference.
+    ///
+    /// Note: this helper does NOT check that the field is
+    /// unambiguously declared. If two record-shaped variants in
+    /// the enum both declare the field, only the FIRST match is
+    /// returned (same iteration order as `field_index_for`). The
+    /// HM typechecker would have emitted a "narrow with match
+    /// first" diagnostic upstream in that case — so a `None`
+    /// return at codegen time means the source had a type error
+    /// and we're emitting in recovery mode.
+    pub fn field_type_for(&self, enum_name: &str, field: &str) -> Option<Ty> {
+        let payloads = self.enum_payloads.get(enum_name)?;
+        for payload in payloads {
+            if let EnumVariantPayloadTy::Record(fields) = payload {
+                for (fname, fty) in fields {
+                    if fname == field {
+                        return Some(fty.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Look up a variable's declared type from the codegen side-table
     /// (Phase 18D — `Expression::Access` codegen helper).
     ///
@@ -4502,5 +4541,129 @@ mod tests {
             "expected at least one 'Cannot access field' diagnostic from outer access, got: {:?}",
             msgs
         );
+    }
+
+    // ============================================================
+    //  Phase 19: field_type_for helper tests
+    // ============================================================
+    //
+    // The `field_type_for` helper is the codegen-side complement
+    // to `field_index_for`. It's queried by `receiver_type` when
+    // resolving chained accesses (`p.x.v`). The helper reads from
+    // the same `enum_payloads` registry that `field_index_for`
+    // reads from — so the tests below verify the data plumbing,
+    // not the HM inference logic itself (that's already covered
+    // by `access_field_*` tests above).
+
+    /// `field_type_for` returns the declared type of a record
+    /// field. Setup: `enum Inner { Inner { v: int } }`. The
+    /// helper should resolve `"v"` to `int()`.
+    #[test]
+    fn field_type_for_returns_record_field_type() {
+        let src = "enum Inner { Inner { v: int } }";
+        let (c, _) = check(src);
+        assert_eq!(
+            c.field_type_for("Inner", "v"),
+            Some(int()),
+            "expected field 'v' on Inner to resolve to int()"
+        );
+    }
+
+    /// `field_type_for` returns `None` when the field name isn't
+    /// declared by any record-shaped variant in the enum. Setup:
+    /// `enum Inner { Inner { v: int } }`. Asking for `"missing"`
+    /// should yield `None` — the codegen's defensive `LoadField(0)`
+    /// fallback handles this case.
+    #[test]
+    fn field_type_for_returns_none_for_unknown_field() {
+        let src = "enum Inner { Inner { v: int } }";
+        let (c, _) = check(src);
+        assert_eq!(
+            c.field_type_for("Inner", "missing"),
+            None,
+            "expected field 'missing' on Inner to resolve to None"
+        );
+    }
+
+    /// `field_type_for` returns `None` when the enum name isn't
+    /// registered at all. This is the "type error already emitted
+    /// upstream" case — the codegen falls back to `LoadField(0)`.
+    #[test]
+    fn field_type_for_returns_none_for_unknown_enum() {
+        let (c, _) = check("enum Inner { Inner { v: int } }");
+        assert_eq!(
+            c.field_type_for("Missing", "v"),
+            None,
+            "expected field lookup on unregistered enum to resolve to None"
+        );
+    }
+
+    /// `field_type_for` returns the correct type for each named
+    /// field in a record with multiple fields. The test pins the
+    /// helper's return value to the DECLARED type of each field
+    /// (not just "any non-None"), so a future refactor that swaps
+    /// types by mistake would be caught.
+    #[test]
+    fn field_type_for_returns_correct_types_for_each_field() {
+        let src = "enum Point { Origin, Point { x: int, y: int } }";
+        let (c, _) = check(src);
+        assert_eq!(c.field_type_for("Point", "x"), Some(int()));
+        assert_eq!(c.field_type_for("Point", "y"), Some(int()));
+    }
+
+    /// `field_type_for` returns `None` for fields declared on a
+    /// Unit or Tuple variant (not a Record variant). Setup:
+    /// `enum T { Wrap(int, int) }`. Asking for `"0"` (the
+    /// synthetic tuple-index name) — the helper doesn't know
+    /// about synthetic names, only declared record field names.
+    /// So it returns `None`. (Codegen-level reordering handles
+    /// tuple-index names via `field_pairs()` — see
+    /// `ty::EnumVariantPayloadTy::field_pairs`.)
+    #[test]
+    fn field_type_for_returns_none_for_tuple_variant() {
+        let src = "enum T { Wrap(int, int) }";
+        let (c, _) = check(src);
+        assert_eq!(
+            c.field_type_for("T", "0"),
+            None,
+            "tuple variants don't have named record fields"
+        );
+    }
+
+    /// `field_type_for` returns the correct type even when the
+    /// field is itself an enum type (e.g., `Inner` here). This
+    /// is the canonical Phase 19 chained-access setup:
+    /// `enum Outer { Outer { x: Inner } }`. The helper resolves
+    /// `"x"` to `Ty::Con("Inner")`.
+    #[test]
+    fn field_type_for_returns_enum_type_for_nested_field() {
+        let src = "enum Inner { Inner { v: int } } \
+                   enum Outer { Outer { x: Inner, y: int } }";
+        let (c, _) = check(src);
+        // The exact `Ty` shape depends on the typechecker's
+        // enum resolution (it could be `Ty::Con("Inner")` or
+        // `Ty::Sum { name: "Inner", .. }`). The codegen's
+        // `extract_enum_name` handles both shapes via
+        // `extract_enum_name(&t).map(|_| t)`. We don't pin the
+        // exact Ty here — we just verify the helper returns
+        // *something* (not `None`) and that it's an enum
+        // reference. Use `extract_enum_name` from the codegen
+        // crate's perspective: the name should be "Inner".
+        let result = c.field_type_for("Outer", "x");
+        assert!(
+            result.is_some(),
+            "expected field 'x' on Outer to resolve to an enum type"
+        );
+        // Verify the type can be unwrapped to "Inner" via the
+        // same logic `enum_name_for_receiver` uses.
+        let result_ty = result.unwrap();
+        match &result_ty {
+            Ty::Con(name) => assert_eq!(name, "Inner"),
+            Ty::Sum { name, .. } => assert_eq!(name, "Inner"),
+            other => panic!(
+                "expected Ty::Con(\"Inner\") or Ty::Sum {{ name: \"Inner\", .. }}, got {:?}",
+                other
+            ),
+        }
     }
 }

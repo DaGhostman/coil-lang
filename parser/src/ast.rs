@@ -507,6 +507,11 @@ impl<'a> Display for Expression<'a> {
                     .join(", ");
                 write!(f, "match {} {{ {} }}", scrutinee.1, as_str)
             }
+            // Field access: `receiver.field` — printed tight (no
+            // surrounding whitespace) to match how it parses.
+            Self::Access(receiver, field) => {
+                write!(f, "{}.{}", receiver.1, field)
+            }
             e => todo!("Missing rest of nodes: {}", e),
         }
     }
