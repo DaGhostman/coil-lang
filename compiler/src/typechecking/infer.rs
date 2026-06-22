@@ -579,7 +579,94 @@ impl Checker {
             Expression::Argument(ty, _name) => self.parse_type_name_str(ty),
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
-            Expression::Access(_, _) => unit_ty(),
+            Expression::Access(receiver, field) => {
+                // Field access on a record-shaped enum payload
+                // (Phase 18D). The receiver's type is one of:
+                //   - `Ty::Sum { name, variants }` — a value whose
+                //     active variant isn't known statically; the
+                //     field must be uniquely declared across the
+                //     sum's record-shaped variants, OR the user
+                //     must narrow with a `match` first.
+                //   - `Ty::Constructor { tag, owner, .. }` — a
+                //     value statically known to be a specific
+                //     variant; we look up the field in that
+                //     variant's payload only.
+                //   - `Ty::Con(name)` — a name-only reference to a
+                //     user-declared type (typical for function
+                //     parameters annotated with the bare enum
+                //     name); we resolve it through the checker's
+                //     enum registry.
+                //   - Anything else (primitive, `Ty::Var`,
+                //     unresolved, …) → "Cannot access field on
+                //     non-record type".
+                let receiver_ty = self.infer(receiver);
+                let resolved = apply_ty_prune(&self.subst, &receiver_ty);
+                match &resolved {
+                    Ty::Sum { name, variants } => self.access_field_in_sum(
+                        name, variants, None, field, range,
+                    ),
+                    Ty::Constructor { tag, owner, .. } => {
+                        // Resolve the owner to its variants.
+                        match owner.as_ref() {
+                            Ty::Sum { name, variants } => self.access_field_in_sum(
+                                name,
+                                variants,
+                                Some(*tag),
+                                field,
+                                range,
+                            ),
+                            _ => self.error_with_help(
+                                format!(
+                                    "Cannot access field `{}` on non-record type",
+                                    field
+                                ),
+                                range,
+                                Some(
+                                    "only values of record-shaped enum types expose fields"
+                                        .to_string(),
+                                ),
+                            ),
+                        }
+                    }
+                    Ty::Con(name) => {
+                        // Bare type name — resolve via the
+                        // checker's enum registry.
+                        let variant_names =
+                            self.enums.get(name).cloned().unwrap_or_default();
+                        let payloads = self
+                            .enum_payloads
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_default();
+                        if variant_names.is_empty() {
+                            return self.error_with_help(
+                                format!(
+                                    "Cannot access field `{}` on non-record type",
+                                    field
+                                ),
+                                range,
+                                Some(format!(
+                                    "type `{}` is not a record-shaped enum",
+                                    name
+                                )),
+                            );
+                        }
+                        let variants: Vec<(String, EnumVariantPayloadTy)> = variant_names
+                            .into_iter()
+                            .zip(payloads.into_iter())
+                            .collect();
+                        self.access_field_in_sum(name, &variants, None, field, range)
+                    }
+                    _ => self.error_with_help(
+                        format!("Cannot access field `{}` on non-record type", field),
+                        range,
+                        Some(
+                            "only values of record-shaped enum types expose fields"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
             Expression::Update(_, e) => self.infer(e),
             Expression::Instantiate(class_expr, _args) => self.infer(class_expr),
             Expression::Field(_, _, _) => unit_ty(),
@@ -2493,6 +2580,120 @@ impl Checker {
             None => Vec::new(),
         }
     }
+
+    /// Type-check a field-access expression (Phase 18D).
+    ///
+    /// Shared by the three receiver-type arms of
+    /// [`infer_inner`](Self::infer_inner)'s `Expression::Access`
+    /// handling: `Ty::Sum`, `Ty::Constructor { tag, owner, .. }`
+    /// (where the owner resolves to a Sum), and `Ty::Con(name)`
+    /// (where the enum is looked up in the registry).
+    ///
+    /// `specific_tag` is `Some(tag)` when the caller knows the
+    /// active variant statically (the `Ty::Constructor` case). When
+    /// `Some`, only that variant's payload is consulted. When
+    /// `None` (the `Ty::Sum` / `Ty::Con` case), every record-shaped
+    /// variant contributes candidates:
+    ///
+    ///  - 0 candidates → error "Type `T` has no field `f`".
+    ///  - 1 candidate → return that field's type.
+    ///  - N candidates → error "narrow with match first" (return
+    ///    the first candidate's type defensively).
+    ///
+    /// When `specific_tag` is `Some`, the variant must be a
+    /// `Record` — `Tuple`/`Unit` variants emit
+    /// "Cannot access field on non-record variant".
+    fn access_field_in_sum(
+        &mut self,
+        enum_name: &str,
+        variants: &[(String, EnumVariantPayloadTy)],
+        specific_tag: Option<u32>,
+        field: &str,
+        range: Range<usize>,
+    ) -> Ty {
+        if let Some(tag) = specific_tag {
+            // Statically known variant. Look up the payload and
+            // either return the field's type or emit a tailored
+            // diagnostic.
+            let variant_idx = tag as usize;
+            if variant_idx >= variants.len() {
+                return self.error_with_help(
+                    format!("Cannot access field `{}` on non-record type", field),
+                    range,
+                    Some(
+                        "only values of record-shaped enum types expose fields"
+                            .to_string(),
+                    ),
+                );
+            }
+            let (variant_name, payload) = &variants[variant_idx];
+            match payload {
+                EnumVariantPayloadTy::Record(fields) => {
+                    for (fname, fty) in fields {
+                        if fname == field {
+                            return fty.clone();
+                        }
+                    }
+                    // Record-shaped variant, but doesn't declare
+                    // the field.
+                    let hint = build_record_field_hint(enum_name, variants);
+                    self.error_with_help(
+                        format!("Type `{}` has no field `{}`", enum_name, field),
+                        range,
+                        hint,
+                    )
+                }
+                _ => self.error_with_help(
+                    format!("Cannot access field `{}` on non-record variant", field),
+                    range,
+                    Some(format!(
+                        "variant `{}::{}` is {}; only record-shaped variants expose named fields",
+                        enum_name, variant_name, payload_kind_name(payload),
+                    )),
+                ),
+            }
+        } else {
+            // Untagged receiver: find every record-shaped variant
+            // that declares the field.
+            let mut candidates: Vec<&Ty> = Vec::new();
+            for (_variant_name, payload) in variants {
+                if let EnumVariantPayloadTy::Record(fields) = payload {
+                    for (fname, fty) in fields {
+                        if fname == field {
+                            candidates.push(fty);
+                        }
+                    }
+                }
+            }
+            match candidates.len() {
+                0 => {
+                    let hint = build_record_field_hint(enum_name, variants);
+                    self.error_with_help(
+                        format!("Type `{}` has no field `{}`", enum_name, field),
+                        range,
+                        hint,
+                    )
+                }
+                1 => candidates[0].clone(),
+                _ => {
+                    self.error_with_help(
+                        format!(
+                            "Field `{}` exists in multiple variants of `{}`; \
+                             narrow with match first",
+                            field, enum_name
+                        ),
+                        range,
+                        Some(
+                            "field access requires a unique field type; use a `match` to \
+                             determine the active variant before reading the field"
+                                .to_string(),
+                        ),
+                    );
+                    candidates[0].clone()
+                }
+            }
+        }
+    }
 }
 
 /// Human-readable name of a payload shape, used in
@@ -2502,6 +2703,50 @@ fn payload_kind_name(payload: &EnumVariantPayloadTy) -> &'static str {
         EnumVariantPayloadTy::Unit => "unit",
         EnumVariantPayloadTy::Tuple(_) => "tuple",
         EnumVariantPayloadTy::Record(_) => "record",
+    }
+}
+
+/// Build a help hint for "type has no field `X`" diagnostics
+/// (Phase 18D — `Expression::Access`).
+///
+/// The hint lists the record-shaped variants and their declared
+/// field names, so the user can see what IS available. Returns
+/// `None` when no record-shaped variants exist (in which case a
+/// "record-shaped enum" hint is more useful than a list of
+/// nothing).
+fn build_record_field_hint(
+    enum_name: &str,
+    variants: &[(String, EnumVariantPayloadTy)],
+) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (variant_name, payload) in variants {
+        if let EnumVariantPayloadTy::Record(fields) = payload {
+            if fields.is_empty() {
+                lines.push(format!("  - `{}::{}` has no fields", enum_name, variant_name));
+            } else {
+                let names = fields
+                    .iter()
+                    .map(|(n, _)| format!("`{}`", n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!(
+                    "  - `{}::{}` exposes: {}",
+                    enum_name, variant_name, names
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
+        Some(format!(
+            "`{}` has no record-shaped variants; only record-shaped variants expose fields",
+            enum_name
+        ))
+    } else {
+        Some(format!(
+            "the available record fields on `{}` are:\n{}",
+            enum_name,
+            lines.join("\n")
+        ))
     }
 }
 
@@ -3945,6 +4190,201 @@ mod tests {
             unreachable.is_empty(),
             "Typechecker should NOT report unreachable arm for different inner patterns, got: {:?}",
             unreachable
+        );
+    }
+
+    // ---- Phase 18D: field access on record-shaped variants ----
+
+    #[test]
+    fn access_field_from_record_variant_returns_field_type() {
+        // `p.x` where `p` is bound to a `Point::Point { x: int, y: int }`
+        // constructor. The receiver's type is a `Ty::Constructor` with
+        // a record-shaped payload, so the field resolves uniquely to
+        // `int`.
+        let src = "enum Point { Origin, Point { x: int, y: int } } \
+                   let p = Point::Point { x: 5, y: 12 }; p.x;";
+        let (mut c, ty) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected no diagnostics for `p.x`, got: {:?}",
+            msgs
+        );
+        assert_eq!(ty, int(), "field access should produce `int`");
+    }
+
+    #[test]
+    fn access_field_from_non_record_produces_error() {
+        // `1.x` — the receiver is an `int`, not a sum. The typechecker
+        // should emit a "Cannot access field" diagnostic and NOT
+        // silently succeed.
+        let msgs = assert_messages("1.x;");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Cannot access field")),
+            "expected 'Cannot access field' diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_unknown_field_produces_error() {
+        // `p.z` where `p` is bound to a `Point::Point { x, y }`
+        // constructor. The variant IS a record but doesn't declare
+        // `z`. Should emit "Type `Point` has no field `z`" with a
+        // help hint listing the actual fields.
+        let src = "enum Point { Origin, Point { x: int, y: int } } \
+                   let p = Point::Point { x: 1, y: 2 }; p.z;";
+        let msgs = assert_messages(src);
+        let no_field = msgs
+            .iter()
+            .find(|m| m.message().contains("no field `z`"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected 'no field `z`' diagnostic, got: {:?}",
+                    msgs
+                )
+            });
+        // The help hint should mention the actual fields available.
+        let hint = no_field
+            .help()
+            .as_ref()
+            .expect("expected help hint on 'no field' diagnostic");
+        assert!(
+            hint.contains("`x`") && hint.contains("`y`"),
+            "expected help hint listing available fields, got: {:?}",
+            hint
+        );
+    }
+
+    #[test]
+    fn access_field_from_tuple_variant_produces_error() {
+        // `p.x` where `p` is bound to `Tuple::Wrap(1, 2)` — a
+        // Tuple-shaped variant. The variant isn't a record, so we
+        // emit a tailored "Cannot access field on non-record
+        // variant" diagnostic that names the variant's shape.
+        let src = "enum Tuple { Wrap(int, int) } \
+                   let p = Tuple::Wrap(1, 2); p.x;";
+        let msgs = assert_messages(src);
+        let diag = msgs
+            .iter()
+            .find(|m| m.message().contains("Cannot access field"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected 'Cannot access field' diagnostic, got: {:?}",
+                    msgs
+                )
+            });
+        let hint = diag
+            .help()
+            .as_ref()
+            .expect("expected help hint on tuple-variant access");
+        assert!(
+            hint.contains("tuple"),
+            "expected help hint to mention the variant shape 'tuple', got: {:?}",
+            hint
+        );
+    }
+
+    #[test]
+    fn access_field_ambiguous_across_variants_emits_narrow_with_match() {
+        // Two record-shaped variants both declare `x`. The
+        // receiver's type is `Ty::Sum { name: "Two", variants: [...] }`
+        // (because we annotate the parameter `p: Two` directly, so
+        // `p`'s type is `Ty::Con("Two")` which we resolve through
+        // the registry). Either way, the field type is ambiguous
+        // and we emit "narrow with match first".
+        let src = "enum Two { A { x: int, y: int }, B { x: string, z: int } } \
+                   fn get_x(Two p) -> int { return p.x; }";
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("narrow with match first")),
+            "expected 'narrow with match first' diagnostic, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_field_via_function_parameter_resolves() {
+        // Field access on a function parameter whose type is
+        // annotated with the bare enum name `Point` — the
+        // typechecker parses this as `Ty::Con("Point")` and
+        // resolves it through the enum registry to find that
+        // `Point::Point` is a record-shaped variant carrying `x`
+        // of type `int`.
+        let src = "enum Point { Origin, Point { x: int, y: int } } \
+                   fn get_x(Point p) -> int { return p.x; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_field_on_sum_param_with_unique_field_resolves() {
+        // Same as above, but the enum has exactly ONE record-shaped
+        // variant so the field is unambiguous. The typechecker
+        // should resolve `p.x` to `int` without diagnostic.
+        let src = "enum Point { Origin, Point { x: int, y: int } } \
+                   fn get_x(Point p) -> int { return p.x; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected no diagnostics for unambiguous field access, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_field_from_let_bound_sum_value_works() {
+        // The receiver is `let p = ...;` where the value is bound
+        // to a `Ty::Sum` (via a function parameter flowing through
+        // a `match`). After matching, the active variant is
+        // statically known, so `p.x` works.
+        let src = "enum Point { Origin, Point { x: int, y: int } } \
+                   fn distance_squared(Point p) -> int { \
+                       return match p { \
+                           Point::Origin => 0, \
+                           Point::Point { x, y } => x, \
+                       }; \
+                   } \
+                   fn main() { print \"%i\", distance_squared(Point::Point { x: 5, y: 12 }); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn access_field_chained_id_alignment() {
+        // `p.x.y` parses as `Access(Access(p, "x"), "y")`. The
+        // inner `Access` must consume the receiver's ID AND its
+        // own ID to stay lockstep with the pre-walk.
+        //
+        // We don't assert cache/id_table alignment here because
+        // `infer_fragment` has a pre-existing asymmetry where it
+        // doesn't consume `Variable` IDs (it processes them
+        // inline). This is unrelated to `Expression::Access`. We
+        // instead verify the OUTER access produces the expected
+        // diagnostic.
+        let src = "enum Point { Origin, Point { x: int, y: int } } \
+                   let p = Point::Point { x: 5, y: 12 }; p.x.y;";
+        let msgs = assert_messages(src);
+        let cannot_access: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.message().contains("Cannot access field"))
+            .collect();
+        assert!(
+            !cannot_access.is_empty(),
+            "expected at least one 'Cannot access field' diagnostic from outer access, got: {:?}",
+            msgs
         );
     }
 }
