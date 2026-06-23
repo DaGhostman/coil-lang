@@ -1250,7 +1250,17 @@ impl Compiler {
         };
 
         // 4. Linearize the CFG to bytecode.
-        let bytecode = crate::linearize::linearize(&cfg);
+        //
+        // The linearizer records block offsets RELATIVE TO the
+        // start of this function's bytecode, but the VM reads
+        // jump operands as ABSOLUTE offsets in the program
+        // bytecode. We pass `self.bytecode.len()` as the
+        // `base_offset` so the linearizer adds it to every jump
+        // target, producing operands that the VM interprets
+        // correctly when the function's bytecode is appended
+        // to the program at the current offset.
+        let base_offset = self.bytecode.len() as u32;
+        let bytecode = crate::linearize::linearize(&cfg, base_offset);
 
         // 5. Debug-mode instrumentation: log which functions used
         //    the CFG path. Useful for verifying the routing without

@@ -131,6 +131,19 @@ use crate::cfg::{
 
 /// Linearize a CFG [`Function`] into stack-based bytecode.
 ///
+/// `base_offset` is the offset where this function's bytecode
+/// will be placed in the program. All jump targets (`JMP`,
+/// `JMPF`, `JUMP_IF_MATCH`) are computed relative to the start
+/// of the function's bytecode, then `base_offset` is added so
+/// they are **absolute** offsets in the program. The VM reads
+/// jump operands as absolute offsets, so without this addition
+/// jumps would land in the wrong place when the function is
+/// appended at a non-zero program offset.
+///
+/// Pass `0` for `base_offset` if the linearized bytecode will
+/// be placed at the start of the program (or in isolation, e.g.
+/// in unit tests).
+///
 /// # Phase 1.3 scope
 ///
 /// - **Multi-block CFGs** (control flow with `Jump`, `Branch`,
@@ -157,15 +170,16 @@ use crate::cfg::{
 /// functions, Rust's dead-code lint would otherwise flag the
 /// entry point and its helpers.
 #[allow(dead_code)]
-pub fn linearize(cfg: &Function) -> Vec<Byte> {
+pub fn linearize(cfg: &Function, base_offset: u32) -> Vec<Byte> {
     let mut bytecode = Vec::new();
     let mut block_offsets: Vec<usize> = Vec::with_capacity(cfg.blocks.len());
     let mut patches: Vec<TerminatorPatch> = Vec::new();
 
     // Pass 1: walk blocks in declaration order, emit
     // instructions and terminator placeholders. Track each
-    // block's offset (start position in the bytecode) and
-    // every terminator placeholder that needs patching.
+    // block's offset RELATIVE TO THE START OF THIS FUNCTION'S
+    // BYTECODE (i.e., relative to `base_offset`). The actual
+    // jump operand is `base_offset + block_offsets[i]`.
     for block in &cfg.blocks {
         block_offsets.push(bytecode.len());
 
@@ -180,11 +194,12 @@ pub fn linearize(cfg: &Function) -> Vec<Byte> {
     }
 
     // Pass 2: patch terminator placeholders with the actual
-    // target byte offsets. Block offsets are now stable (no
-    // more bytecode emission), so `block_offsets[target.index()]`
-    // is the correct absolute offset.
+    // absolute target byte offsets. Block offsets are now
+    // stable (no more bytecode emission), so
+    // `base_offset + block_offsets[target.index()]` is the
+    // correct absolute offset in the program bytecode.
     for patch in &patches {
-        patch_terminator(patch, &block_offsets, &mut bytecode);
+        patch_terminator(patch, &block_offsets, base_offset, &mut bytecode);
     }
 
     bytecode
@@ -434,7 +449,9 @@ fn emit_terminator_placeholder(
 }
 
 /// Patch a single terminator placeholder with its real target
-/// offset, looked up from `block_offsets`.
+/// offset, looked up from `block_offsets` and added to
+/// `base_offset` to produce the **absolute** program-bytecode
+/// offset.
 ///
 /// `Jump`, `Branch`, and `SwitchCase` placeholders are recorded
 /// (see [`emit_terminator_placeholder`]); `Return` and
@@ -447,13 +464,17 @@ fn emit_terminator_placeholder(
 fn patch_terminator(
     patch: &TerminatorPatch,
     block_offsets: &[usize],
+    base_offset: u32,
     bc: &mut Vec<Byte>,
 ) {
     match patch.kind {
         PatchKind::Jump(target) => {
-            // Look up the target block's offset in the
-            // bytecode and write it into the JMP's operand.
-            let offset = block_offsets[target.index()] as u32;
+            // Look up the target block's RELATIVE offset in
+            // the bytecode and add `base_offset` to make it
+            // absolute. Write the absolute offset into the
+            // JMP's operand — the VM reads jump operands as
+            // absolute offsets in the program bytecode.
+            let offset = base_offset + block_offsets[target.index()] as u32;
             bc[patch.pos] =
                 Byte::new(Instruction::JMP).with_operand_u32(offset);
         }
@@ -461,19 +482,20 @@ fn patch_terminator(
             // The JMPF jumps to `false_bb` when the condition
             // is false. The `true_bb` is reached by fall-through
             // to the next block in declaration order.
-            let offset = block_offsets[false_bb.index()] as u32;
+            let offset = base_offset + block_offsets[false_bb.index()] as u32;
             bc[patch.pos] =
                 Byte::new(Instruction::JMPF).with_operand_u32(offset);
         }
         PatchKind::SwitchCase { tag, target } => {
             // The JUMP_IF_MATCH's tag (operands[31:16]) is
             // preserved; we patch value[31:0] with the target
-            // block's offset. operands[15:0] is reserved (0).
+            // block's absolute offset. operands[15:0] is
+            // reserved (0).
             //
             // Phase 18C widened the target to a full 32-bit
             // value field, so this can address any target in
             // the bytecode.
-            let offset = block_offsets[target.index()] as u32;
+            let offset = base_offset + block_offsets[target.index()] as u32;
             bc[patch.pos] = Byte::new(Instruction::JumpIfMatch)
                 .with_operand_u32((tag & 0xFFFF) << 16)
                 .with_value_u32(offset);
@@ -649,7 +671,7 @@ mod tests {
     #[test]
     fn linearize_empty_block_emits_only_return() {
         let f = fn_returning_unit("empty");
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 1, "expected one byte (RETURN), got {:?}", bc);
         assert!(matches!(bc[0].bytecode(), Instruction::RETURN));
     }
@@ -671,7 +693,7 @@ mod tests {
             blocks: vec![b0, b1],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // Block 0 emits: CONST (1 byte) + JMP (1 byte) = 2 bytes
         // Block 1 emits: RETURN (1 byte) = 1 byte
         // Total: 3 bytes.
@@ -697,7 +719,7 @@ mod tests {
     #[test]
     fn linearize_const_int_emits_const_with_value() {
         let f = fn_returning_const("one", 42);
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         assert_eq!(bc[0].value_u32(), 42, "value field carries the int");
@@ -707,7 +729,7 @@ mod tests {
     #[test]
     fn linearize_const_negative_int_emits_const_with_value() {
         let f = fn_returning_const("neg", -7);
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         // -7 as u32 (two's complement) is 0xFFFFFFF9.
@@ -727,7 +749,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         assert_eq!(bc[0].value_u32(), 1);
@@ -746,7 +768,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert_eq!(bc[0].value_u32(), 0);
     }
@@ -764,7 +786,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         // The value field carries the f64 bits.
@@ -787,7 +809,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // 3 DATA bytes + 1 STRING byte + 1 RETURN = 5.
         assert_eq!(bc.len(), 5);
         // First three are DATA, last of the prefix is STRING.
@@ -822,7 +844,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::LOAD));
         assert_eq!(bc[0].operand_u32(), 2, "LOAD operand is the slot index");
@@ -850,7 +872,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::ADD));
     }
@@ -906,7 +928,7 @@ mod tests {
                 blocks: vec![block],
                 entry: BlockId(0),
             };
-            let bc = linearize(&f);
+            let bc = linearize(&f, 0);
             assert_eq!(bc.len(), 2);
             assert_eq!(
                 bc[0].bytecode(),
@@ -937,7 +959,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let _ = linearize(&f, 0);
     }
 
     #[test]
@@ -959,7 +981,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let _ = linearize(&f, 0);
     }
 
     // ============================================================
@@ -992,7 +1014,7 @@ mod tests {
                 blocks: vec![block],
                 entry: BlockId(0),
             };
-            let bc = linearize(&f);
+            let bc = linearize(&f, 0);
             assert_eq!(bc.len(), 2);
             assert_eq!(
                 bc[0].bytecode(),
@@ -1022,7 +1044,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let _ = linearize(&f);
+        let _ = linearize(&f, 0);
     }
 
     // ============================================================
@@ -1047,7 +1069,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 3, "CALL + JMP + RETURN");
         assert!(matches!(bc[0].bytecode(), Instruction::CALL));
         assert_eq!(bc[0].operand_u32(), 2, "CALL operand is the arity");
@@ -1074,7 +1096,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc[0].operand_u32(), 0, "CALL operand is the arity (0)");
     }
 
@@ -1099,7 +1121,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::LoadField));
         assert_eq!(bc[0].operand_u32(), 3);
@@ -1126,7 +1148,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::MakeEnum));
         // operands[31:16] = tag, operands[15:0] = arity.
@@ -1152,7 +1174,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         let operand = bc[0].operand_u32();
         assert_eq!(operand >> 16, 0x0007);
         assert_eq!(operand & 0xFFFF, 0);
@@ -1179,7 +1201,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 2);
         assert!(matches!(bc[0].bytecode(), Instruction::Unpack));
     }
@@ -1199,7 +1221,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 1);
         assert!(matches!(bc[0].bytecode(), Instruction::HALT));
     }
@@ -1229,7 +1251,7 @@ mod tests {
             blocks: vec![b0, b1, b2],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // Block 0: CONST + JMP = 2 bytes (offset 0, 1)
         // Block 1: CONST + JMP = 2 bytes (offset 2, 3)
         // Block 2: RETURN = 1 byte (offset 4)
@@ -1285,7 +1307,7 @@ mod tests {
             blocks: vec![b0, b1, b2, b3],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // Bytecode layout in declaration order:
         //   [b0 @ 0]      JMPF → b3 (offset 4)
         //   [b1 @ 1]      RETURN
@@ -1344,7 +1366,7 @@ mod tests {
             blocks: vec![b0, b1, b2],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // Layout:
         //   [b0 @ 0]      JMPF → b1 (offset 1)
         //   [b1 @ 1]      RETURN
@@ -1415,7 +1437,7 @@ mod tests {
             blocks: vec![b0, b1, b2, b3, b4],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // b0 emits 3 bytes; b1, b2, b3 each emit 2; b4 emits 1.
         assert_eq!(bc.len(), 10, "expected 10 bytes, got {:?}", bc);
 
@@ -1487,7 +1509,7 @@ mod tests {
             blocks: vec![b0, b1, b2, b3],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // b0: JUMP_IF_MATCH (1) + UNPACK (1) = 2 bytes
         // b1: CONST (1) + JMP (1) = 2 bytes
         // b2: CONST (1) + JMP (1) = 2 bytes
@@ -1533,7 +1555,7 @@ mod tests {
             blocks: vec![b0, b1, b2],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // b0: UNPACK (1) = 1 byte
         // b1: CONST (1) + JMP (1) = 2 bytes
         // b2: RETURN (1) = 1 byte
@@ -1587,7 +1609,7 @@ mod tests {
             blocks: vec![b0, b1, b2, b3],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         let jim = &bc[0];
         // Tag in operands[31:16].
         assert_eq!(
@@ -1635,7 +1657,7 @@ mod tests {
             blocks: vec![b0, b1, b2, b3, b4],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         // The Switch emits: JUMP_IF_MATCH (1) + JUMP_IF_MATCH (1) + UNPACK (1) = 3 bytes
         // The default block follows immediately at offset 3.
         assert_eq!(bc.len(), 10);
@@ -1676,7 +1698,7 @@ mod tests {
             blocks: vec![block],
             entry: BlockId(0),
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert_eq!(bc.len(), 4);
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         assert_eq!(bc[0].value_u32(), 5);
@@ -1698,7 +1720,196 @@ mod tests {
             blocks: vec![],
             entry: BlockId::INVALID,
         };
-        let bc = linearize(&f);
+        let bc = linearize(&f, 0);
         assert!(bc.is_empty(), "empty function should emit 0 bytes");
+    }
+
+    // ============================================================
+    // base_offset (absolute jump targets)
+    // ============================================================
+
+    #[test]
+    fn linearize_with_zero_base_offset_emits_relative_targets() {
+        // Regression: linearize(&f, 0) must produce the SAME
+        // operand values as the pre-base-offset linearize(&f).
+        // (The pre-base-offset linearizer implicitly used
+        // base_offset=0, so behavior for base_offset=0 must be
+        // unchanged.)
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Branch {
+            cond: ValueId(0),
+            true_bb: BlockId(2),
+            false_bb: BlockId(3),
+        });
+        let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(None));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 1 });
+        b2.terminator = Terminator::Jump(BlockId(1));
+        let mut b3 = Block::new(BlockId(3));
+        b3.insts.push(Inst::Const { dst, value: 2 });
+        b3.terminator = Terminator::Jump(BlockId(1));
+        let f = Function {
+            name: "if_else".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![b0, b1, b2, b3],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f, 0);
+        // Layout (same as
+        // linearize_branch_terminator_patches_jmpf_to_false_target):
+        //   [b0 @ 0]      JMPF → b3 (offset 4)
+        //   [b1 @ 1]      RETURN
+        //   [b2 @ 2]      CONST 1, JMP → b1 (offset 1)
+        //   [b3 @ 4]      CONST 2, JMP → b1 (offset 1)
+        assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
+        assert_eq!(bc[0].operand_u32(), 4);
+        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert_eq!(bc[3].operand_u32(), 1);
+        assert!(matches!(bc[5].bytecode(), Instruction::JMP));
+        assert_eq!(bc[5].operand_u32(), 1);
+    }
+
+    #[test]
+    fn linearize_branch_with_nonzero_base_offset_patches_absolute_target() {
+        // Build a 4-block if/else function (canonical layout) and
+        // linearize it with base_offset = 100. The JMPF and JMP
+        // operands must be 100 + (relative offset), i.e. 104, 101,
+        // and 101 — not the bare relative offsets (4, 1, 1).
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Branch {
+            cond: ValueId(0),
+            true_bb: BlockId(2),
+            false_bb: BlockId(3),
+        });
+        let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(None));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 1 });
+        b2.terminator = Terminator::Jump(BlockId(1));
+        let mut b3 = Block::new(BlockId(3));
+        b3.insts.push(Inst::Const { dst, value: 2 });
+        b3.terminator = Terminator::Jump(BlockId(1));
+        let f = Function {
+            name: "if_else_offset".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![b0, b1, b2, b3],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f, 100);
+        // Block offsets are unchanged (relative to the function
+        // start) — they're 4, 1, 1 in declaration order. With
+        // base_offset=100, the operands are 104, 101, 101.
+        assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
+        assert_eq!(
+            bc[0].operand_u32(),
+            104,
+            "JMPF must target absolute offset (100 + 4)"
+        );
+        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[3].operand_u32(),
+            101,
+            "then-block JMP must target absolute offset (100 + 1)"
+        );
+        assert!(matches!(bc[5].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[5].operand_u32(),
+            101,
+            "else-block JMP must target absolute offset (100 + 1)"
+        );
+    }
+
+    #[test]
+    fn linearize_jump_with_nonzero_base_offset_patches_absolute_target() {
+        // Build a 2-block function (b0 JMP b1, b1 RETURN) and
+        // linearize with base_offset = 50. The JMP's operand must
+        // be 50 + 2 = 52, not the bare relative offset of 2.
+        let dst = ValueId(0);
+        let mut b0 = Block::new(BlockId(0));
+        b0.insts.push(Inst::Const { dst, value: 1 });
+        b0.terminator = Terminator::Jump(BlockId(1));
+        let b1 = Block::new(BlockId(1)).with_terminator(Terminator::Return(Some(dst)));
+        let f = Function {
+            name: "jump_offset".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f, 50);
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        assert_eq!(bc[0].value_u32(), 1);
+        assert!(matches!(bc[1].bytecode(), Instruction::JMP));
+        assert_eq!(
+            bc[1].operand_u32(),
+            52,
+            "JMP must target absolute offset (50 + 2)"
+        );
+        assert!(matches!(bc[2].bytecode(), Instruction::RETURN));
+    }
+
+    #[test]
+    fn linearize_switch_with_nonzero_base_offset_patches_absolute_target() {
+        // Build a 5-block 3-arm match function (see
+        // linearize_switch_with_two_cases_and_default_emits_cascade)
+        // and linearize with base_offset = 1000. Each JUMP_IF_MATCH's
+        // value[31:0] must be 1000 + (relative target offset), and
+        // each trailing JMP must be 1000 + (join offset).
+        let dst = ValueId(0);
+        let b0 = Block::new(BlockId(0)).with_terminator(Terminator::Switch {
+            scrutinee: ValueId(0),
+            cases: vec![(10, BlockId(1)), (20, BlockId(2))],
+            default: BlockId(3),
+        });
+        let mut b1 = Block::new(BlockId(1));
+        b1.insts.push(Inst::Const { dst, value: 100 });
+        b1.terminator = Terminator::Jump(BlockId(4));
+        let mut b2 = Block::new(BlockId(2));
+        b2.insts.push(Inst::Const { dst, value: 200 });
+        b2.terminator = Terminator::Jump(BlockId(4));
+        let mut b3 = Block::new(BlockId(3));
+        b3.insts.push(Inst::Const { dst, value: 300 });
+        b3.terminator = Terminator::Jump(BlockId(4));
+        let b4 = Block::new(BlockId(4)).with_terminator(Terminator::Return(Some(dst)));
+        let f = Function {
+            name: "match_offset".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Int,
+            blocks: vec![b0, b1, b2, b3, b4],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f, 1000);
+        // Layout (same as
+        // linearize_switch_with_two_cases_and_default_emits_cascade):
+        //   [b0 @ 0]      JUMP_IF_MATCH tag=10 → b1 (rel=3) → abs=1003
+        //                 JUMP_IF_MATCH tag=20 → b2 (rel=5) → abs=1005
+        //                 UNPACK arity=0
+        //   [b1 @ 3]      CONST 100, JMP → b4 (rel=9) → abs=1009
+        //   [b2 @ 5]      CONST 200, JMP → b4 (rel=9) → abs=1009
+        //   [b3 @ 7]      CONST 300, JMP → b4 (rel=9) → abs=1009
+        //   [b4 @ 9]      RETURN
+        assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
+        assert_eq!(bc[0].operand_u16(0), 10);
+        assert_eq!(
+            bc[0].value_u32(),
+            1003,
+            "JUMP_IF_MATCH must target absolute offset (1000 + 3)"
+        );
+        assert!(matches!(bc[1].bytecode(), Instruction::JumpIfMatch));
+        assert_eq!(bc[1].operand_u16(0), 20);
+        assert_eq!(
+            bc[1].value_u32(),
+            1005,
+            "JUMP_IF_MATCH must target absolute offset (1000 + 5)"
+        );
+        // Trailing JMPs in arm blocks all target the join block
+        // (rel offset 9 → abs 1009).
+        assert!(matches!(bc[4].bytecode(), Instruction::JMP));
+        assert_eq!(bc[4].operand_u32(), 1009);
+        assert!(matches!(bc[6].bytecode(), Instruction::JMP));
+        assert_eq!(bc[6].operand_u32(), 1009);
+        assert!(matches!(bc[8].bytecode(), Instruction::JMP));
+        assert_eq!(bc[8].operand_u32(), 1009);
     }
 }
