@@ -233,24 +233,41 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
             ));
         }
         Inst::ConstString { dst: _, value } => {
-            // STRING + DATA sequence: emit one DATA byte per char
-            // first, then insert STRING with the char count at the
-            // front. Matches the existing `Expression::String`
-            // codegen (see `compiler/src/lib.rs` ~line 1827).
+            // STRING + DATA sequence: emit STRING first, then the
+            // DATA chars that STRING will read at runtime.
             //
-            // NOTE: this is a placeholder for Phase 0.3a. The real
-            // string emission includes UTF-8 encoding and heap
-            // allocation via `INIT`. The existing codegen handles
-            // that; for Phase 0.4 we'll decide whether the
-            // linearizer needs to emit the same allocation sequence
-            // or whether the upstream pipeline rewrites the
-            // linearized form to add the allocation.
+            // The VM's `Instruction::STRING` handler reads the
+            // NEXT `length` bytes via `code.next()` and pushes
+            // a string onto the stack. The bytes it reads are
+            // expected to be `DATA` instructions. So the
+            // bytecode order is:
+            //
+            //   [N]    STRING length
+            //   [N+1]  DATA char_0
+            //   [N+2]  DATA char_1
+            //   ...
+            //   [N+length] DATA char_(length-1)
+            //
+            // This matches the existing single-pass codegen
+            // (see `compiler/src/lib.rs::Expression::String`,
+            // which inserts STRING at idx and then pushes DATA
+            // chars after it).
+            //
+            // Phase 1.6: the pre-Phase-1.6 linearizer emitted
+            // the bytes in the OPPOSITE order (DATA chars first,
+            // then STRING) — this passed the unit test (which
+            // only checked byte shape, not runtime behavior) but
+            // BROKE at runtime: STRING would read the following
+            // instruction's bytes (e.g., PRINT, RETURN) as DATA
+            // chars, silently producing a corrupted string.
+            // Exposed by `examples/print_literal.0s`, which is
+            // the first CFG-path example to use a string literal.
             let chars: Vec<char> = value.chars().collect();
             let count = chars.len() as u32;
+            bc.push(Byte::new(Instruction::STRING).with_operand_u32(count));
             for c in chars {
                 bc.push(Byte::new(Instruction::DATA).with_operand_u32(c as u32));
             }
-            bc.push(Byte::new(Instruction::STRING).with_operand_u32(count));
         }
         Inst::Param { dst: _, index } => {
             // LOAD reads from `stack[frame.sp + operand]`. The
@@ -335,6 +352,27 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
                 Byte::new(Instruction::MakeEnum).with_operand_u32(tag_shifted | arity),
             );
         }
+        Inst::Print { args: _ } => {
+            // PRINT pops the format string (and any params in
+            // Phase 2+) from the stack and prints the formatted
+            // output. For Phase 1.6, the linearizer assumes the
+            // format string is already on the stack top — the
+            // typical case for `print "literal";` (no format
+            // specifiers, no params).
+            //
+            // The args Vec is ignored here: the linearizer
+            // doesn't need to know how many params are present
+            // for the simple case (just emit PRINT, which pops
+            // one value). The `is_straight_line` lift in
+            // `compiler/src/lib.rs` ensures only the no-params
+            // case routes through the CFG path. Format
+            // specifiers (`%i`, `%f`, etc.) still fall back to
+            // the single-pass path which emits `FORMAT` +
+            // `PRINT`.
+            //
+            // No operands needed — PRINT is a no-operand opcode.
+            bc.push(Byte::new(Instruction::PRINT));
+        }
     }
 }
 
@@ -388,9 +426,63 @@ fn emit_terminator_placeholder(
                 pos,
             });
         }
-        Terminator::Return(_) => {
-            // Unit or value return — no patch needed.
-            bc.push(Byte::new(Instruction::RETURN));
+        Terminator::Return(ret) => {
+            // Unit (void) return — push a default value (0) before
+            // RETURN so the VM has something to pop. The existing
+            // single-pass codegen does the same (see
+            // `compiler/src/lib.rs::Expression::Function` post-
+            // processing around `if !matches!(... Instruction::RETURN)`).
+            //
+            // Phase 1.6: this fix is required for void functions
+            // (e.g., `print "hello";` without an explicit
+            // `return ...;`) to round-trip through the CFG path.
+            // Before this fix, the linearizer emitted just
+            // `RETURN`, leaving the stack empty — the VM's
+            // `ExecutionOutcome::RETURN` handler would panic with
+            // `assertion failed: self.cursor > 0` in
+            // `machine/src/memory/stack.rs`.
+            //
+            // Value-returning functions have the return value
+            // already on the stack (pushed by the preceding
+            // `Inst`), so we just emit `RETURN`.
+            //
+            // Phase 1.6 caveat: the cfg_builder's Identifier-of-
+            // param fast path (see `cfg_builder.rs::Expression::Return`)
+            // also uses `Return(None)` for value-returning
+            // functions — but it pushes an `Inst::Param` first,
+            // which loads the value onto the stack. We detect
+            // this case by checking the LAST emitted instruction:
+            // if it's `LOAD` (the bytecode for `Inst::Param`),
+            // the value is on the stack and we don't push CONST 0.
+            // Otherwise (void function, or print-only function
+            // where the last inst consumed the stack top), we
+            // push CONST 0 to give the VM something to pop.
+            match ret {
+                Some(_) => {
+                    // Value-returning function with explicit
+                    // value — the value is already on the stack.
+                    bc.push(Byte::new(Instruction::RETURN));
+                }
+                None => {
+                    let last_is_param_load = matches!(
+                        bc.last().map(|b| b.bytecode()),
+                        Some(Instruction::LOAD)
+                    );
+                    if last_is_param_load {
+                        // Phase 1.6 fast path: the preceding
+                        // Param pushed the value. RETURN pops it.
+                        bc.push(Byte::new(Instruction::RETURN));
+                    } else {
+                        // Void return — push a default value
+                        // (CONST 0) so RETURN has something to pop.
+                        bc.push(Byte::new_with_value(
+                            Instruction::CONST,
+                            Value::default().raw() as _,
+                        ));
+                        bc.push(Byte::new(Instruction::RETURN));
+                    }
+                }
+            }
         }
         Terminator::Unreachable => {
             // `HALT` is the canonical "unreachable" terminator
@@ -670,10 +762,17 @@ mod tests {
 
     #[test]
     fn linearize_empty_block_emits_only_return() {
+        // Phase 1.6: a void return (`Return(None)`) now emits
+        // `CONST 0` + `RETURN` — matching the single-pass
+        // codegen's behavior (see `compiler/src/lib.rs::Expression::Function`).
+        // The CONST 0 is the implicit "void" value that the VM's
+        // RETURN handler pops.
         let f = fn_returning_unit("empty");
         let bc = linearize(&f, 0);
-        assert_eq!(bc.len(), 1, "expected one byte (RETURN), got {:?}", bc);
-        assert!(matches!(bc[0].bytecode(), Instruction::RETURN));
+        assert_eq!(bc.len(), 2, "expected two bytes (CONST 0 + RETURN), got {:?}", bc);
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        assert_eq!(bc[0].value_u32(), 0);
+        assert!(matches!(bc[1].bytecode(), Instruction::RETURN));
     }
 
     #[test]
@@ -795,6 +894,21 @@ mod tests {
 
     #[test]
     fn linearize_const_string_emits_string_then_data() {
+        // Phase 1.6: the bytecode order is STRING first, then
+        // DATA chars. The VM's `Instruction::STRING` handler
+        // reads the FOLLOWING bytes via `code.next()` and
+        // pushes a string onto the stack. So the layout is:
+        //
+        //   [0] STRING 3
+        //   [1] DATA 'a'
+        //   [2] DATA 'b'
+        //   [3] DATA 'c'
+        //   [4] RETURN
+        //
+        // Pre-Phase-1.6, the linearizer emitted DATA first
+        // and STRING last — which passed the byte-shape check
+        // but BROKE at runtime (STRING would read the
+        // following instructions as DATA chars).
         let dst = ValueId(0);
         let mut block = Block::new(BlockId(0));
         block.insts.push(Inst::ConstString {
@@ -810,20 +924,69 @@ mod tests {
             entry: BlockId(0),
         };
         let bc = linearize(&f, 0);
-        // 3 DATA bytes + 1 STRING byte + 1 RETURN = 5.
+        // 1 STRING + 3 DATA + 1 RETURN = 5.
         assert_eq!(bc.len(), 5);
-        // First three are DATA, last of the prefix is STRING.
-        for (i, byte) in bc.iter().take(3).enumerate() {
+        // First byte is STRING.
+        assert!(matches!(bc[0].bytecode(), Instruction::STRING));
+        assert_eq!(bc[0].operand_u32(), 3, "STRING operand is char count");
+        // Next three are DATA.
+        for (i, byte) in bc.iter().skip(1).take(3).enumerate() {
             assert!(
                 matches!(byte.bytecode(), Instruction::DATA),
                 "byte {} should be DATA, got {:?}",
-                i,
+                i + 1,
                 byte.bytecode()
             );
         }
-        assert!(matches!(bc[3].bytecode(), Instruction::STRING));
-        assert_eq!(bc[3].operand_u32(), 3, "STRING operand is char count");
+        // Last byte is RETURN.
         assert!(matches!(bc[4].bytecode(), Instruction::RETURN));
+    }
+
+    #[test]
+    fn linearize_print_emits_print_after_const_string() {
+        // Phase 1.6: `Inst::Print` emits a single `PRINT` opcode
+        // (no operands). The cfg_builder is expected to push
+        // `Inst::ConstString` first (which emits STRING +
+        // DATA chars in that order, matching the existing
+        // single-pass codegen) so the string is on the stack
+        // when PRINT runs.
+        //
+        // Bytecode layout:
+        //   [0] STRING 2
+        //   [1] DATA 'h'
+        //   [2] DATA 'i'
+        //   [3] PRINT
+        //   [4] CONST 0  (implicit void return — Phase 1.6 fix)
+        //   [5] RETURN
+        let fmt = ValueId(0);
+        let mut block = Block::new(BlockId(0));
+        block.insts.push(Inst::ConstString {
+            dst: fmt,
+            value: "hi".to_string(),
+        });
+        block.insts.push(Inst::Print { args: vec![fmt] });
+        block.terminator = Terminator::Return(None);
+        let f = Function {
+            name: "p".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![block],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f, 0);
+        assert_eq!(bc.len(), 6, "expected 6 bytes, got {:?}", bc);
+        // STRING first.
+        assert!(matches!(bc[0].bytecode(), Instruction::STRING));
+        assert_eq!(bc[0].operand_u32(), 2);
+        // DATA chars follow STRING.
+        assert!(matches!(bc[1].bytecode(), Instruction::DATA));
+        assert!(matches!(bc[2].bytecode(), Instruction::DATA));
+        // PRINT.
+        assert!(matches!(bc[3].bytecode(), Instruction::PRINT));
+        // Void return: CONST 0 + RETURN.
+        assert!(matches!(bc[4].bytecode(), Instruction::CONST));
+        assert_eq!(bc[4].value_u32(), 0);
+        assert!(matches!(bc[5].bytecode(), Instruction::RETURN));
     }
 
     // ============================================================
@@ -1309,35 +1472,41 @@ mod tests {
         };
         let bc = linearize(&f, 0);
         // Bytecode layout in declaration order:
-        //   [b0 @ 0]      JMPF → b3 (offset 4)
-        //   [b1 @ 1]      RETURN
-        //   [b2 @ 2]      CONST 1, JMP → b1 (offset 1)
-        //   [b3 @ 4]      CONST 2, JMP → b1 (offset 1)
-        assert_eq!(bc.len(), 6, "expected 6 bytes, got {:?}", bc);
-        // b0's JMPF (offset 0) → b3 (offset 4).
+        //   [b0 @ 0]      JMPF → b3 (offset 5)
+        //   [b1 @ 1]      CONST 0 (implicit void), RETURN
+        //   [b2 @ 3]      CONST 1, JMP → b1 (offset 1)
+        //   [b3 @ 5]      CONST 2, JMP → b1 (offset 1)
+        //
+        // Phase 1.6: b1 now emits 2 bytes (CONST 0 + RETURN)
+        // instead of 1 (RETURN only). The JMPF's target shifts
+        // by 1 byte (from offset 4 to offset 5).
+        assert_eq!(bc.len(), 7, "expected 7 bytes, got {:?}", bc);
+        // b0's JMPF (offset 0) → b3 (offset 5).
         assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
         assert_eq!(
             bc[0].operand_u32(),
-            4,
+            5,
             "JMPF should jump to else block (b3) when false"
         );
-        // b1's RETURN (offset 1).
-        assert!(matches!(bc[1].bytecode(), Instruction::RETURN));
-        // b2's CONST (offset 2) and JMP (offset 3) → b1 (offset 1).
-        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
-        assert_eq!(bc[2].value_u32(), 1);
-        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        // b1's CONST 0 + RETURN (offsets 1, 2).
+        assert!(matches!(bc[1].bytecode(), Instruction::CONST));
+        assert_eq!(bc[1].value_u32(), 0);
+        assert!(matches!(bc[2].bytecode(), Instruction::RETURN));
+        // b2's CONST (offset 3) and JMP (offset 4) → b1 (offset 1).
+        assert!(matches!(bc[3].bytecode(), Instruction::CONST));
+        assert_eq!(bc[3].value_u32(), 1);
+        assert!(matches!(bc[4].bytecode(), Instruction::JMP));
         assert_eq!(
-            bc[3].operand_u32(),
+            bc[4].operand_u32(),
             1,
             "JMP at end of then should target join (b1)"
         );
-        // b3's CONST (offset 4) and JMP (offset 5) → b1 (offset 1).
-        assert!(matches!(bc[4].bytecode(), Instruction::CONST));
-        assert_eq!(bc[4].value_u32(), 2);
-        assert!(matches!(bc[5].bytecode(), Instruction::JMP));
+        // b3's CONST (offset 5) and JMP (offset 6) → b1 (offset 1).
+        assert!(matches!(bc[5].bytecode(), Instruction::CONST));
+        assert_eq!(bc[5].value_u32(), 2);
+        assert!(matches!(bc[6].bytecode(), Instruction::JMP));
         assert_eq!(
-            bc[5].operand_u32(),
+            bc[6].operand_u32(),
             1,
             "JMP at end of else should target join (b1)"
         );
@@ -1367,23 +1536,25 @@ mod tests {
             entry: BlockId(0),
         };
         let bc = linearize(&f, 0);
-        // Layout:
+        // Layout (Phase 1.6 — void return now emits CONST 0 + RETURN):
         //   [b0 @ 0]      JMPF → b1 (offset 1)
-        //   [b1 @ 1]      RETURN
-        //   [b2 @ 2]      CONST 7, JMP → b1 (offset 1)
-        assert_eq!(bc.len(), 4);
+        //   [b1 @ 1]      CONST 0, RETURN
+        //   [b2 @ 3]      CONST 7, JMP → b1 (offset 1)
+        assert_eq!(bc.len(), 5);
         assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
         assert_eq!(
             bc[0].operand_u32(),
             1,
             "JMPF in no-else case targets join_block (b1)"
         );
-        assert!(matches!(bc[1].bytecode(), Instruction::RETURN));
-        assert!(matches!(bc[2].bytecode(), Instruction::CONST));
-        assert_eq!(bc[2].value_u32(), 7);
-        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert!(matches!(bc[1].bytecode(), Instruction::CONST));
+        assert_eq!(bc[1].value_u32(), 0);
+        assert!(matches!(bc[2].bytecode(), Instruction::RETURN));
+        assert!(matches!(bc[3].bytecode(), Instruction::CONST));
+        assert_eq!(bc[3].value_u32(), 7);
+        assert!(matches!(bc[4].bytecode(), Instruction::JMP));
         assert_eq!(
-            bc[3].operand_u32(),
+            bc[4].operand_u32(),
             1,
             "JMP at end of then_block also targets join_block (b1)"
         );
@@ -1756,18 +1927,18 @@ mod tests {
             entry: BlockId(0),
         };
         let bc = linearize(&f, 0);
-        // Layout (same as
-        // linearize_branch_terminator_patches_jmpf_to_false_target):
-        //   [b0 @ 0]      JMPF → b3 (offset 4)
-        //   [b1 @ 1]      RETURN
-        //   [b2 @ 2]      CONST 1, JMP → b1 (offset 1)
-        //   [b3 @ 4]      CONST 2, JMP → b1 (offset 1)
+        // Layout (Phase 1.6 — void return now emits CONST 0 + RETURN,
+        // shifts every subsequent offset by +1):
+        //   [b0 @ 0]      JMPF → b3 (offset 5)
+        //   [b1 @ 1]      CONST 0, RETURN
+        //   [b2 @ 3]      CONST 1, JMP → b1 (offset 1)
+        //   [b3 @ 5]      CONST 2, JMP → b1 (offset 1)
         assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
-        assert_eq!(bc[0].operand_u32(), 4);
-        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
-        assert_eq!(bc[3].operand_u32(), 1);
-        assert!(matches!(bc[5].bytecode(), Instruction::JMP));
-        assert_eq!(bc[5].operand_u32(), 1);
+        assert_eq!(bc[0].operand_u32(), 5);
+        assert!(matches!(bc[4].bytecode(), Instruction::JMP));
+        assert_eq!(bc[4].operand_u32(), 1);
+        assert!(matches!(bc[6].bytecode(), Instruction::JMP));
+        assert_eq!(bc[6].operand_u32(), 1);
     }
 
     #[test]
@@ -1797,24 +1968,27 @@ mod tests {
             entry: BlockId(0),
         };
         let bc = linearize(&f, 100);
-        // Block offsets are unchanged (relative to the function
-        // start) — they're 4, 1, 1 in declaration order. With
-        // base_offset=100, the operands are 104, 101, 101.
+        // Block offsets (Phase 1.6 — void return adds +1 byte):
+        //   [b0 @ 0]      JMPF → b3 (relative offset 5)
+        //   [b1 @ 1]      CONST 0, RETURN
+        //   [b2 @ 3]      CONST 1, JMP → b1 (relative offset 1)
+        //   [b3 @ 5]      CONST 2, JMP → b1 (relative offset 1)
+        // With base_offset=100, the operands are 105, 101, 101.
         assert!(matches!(bc[0].bytecode(), Instruction::JMPF));
         assert_eq!(
             bc[0].operand_u32(),
-            104,
-            "JMPF must target absolute offset (100 + 4)"
+            105,
+            "JMPF must target absolute offset (100 + 5)"
         );
-        assert!(matches!(bc[3].bytecode(), Instruction::JMP));
+        assert!(matches!(bc[4].bytecode(), Instruction::JMP));
         assert_eq!(
-            bc[3].operand_u32(),
+            bc[4].operand_u32(),
             101,
             "then-block JMP must target absolute offset (100 + 1)"
         );
-        assert!(matches!(bc[5].bytecode(), Instruction::JMP));
+        assert!(matches!(bc[6].bytecode(), Instruction::JMP));
         assert_eq!(
-            bc[5].operand_u32(),
+            bc[6].operand_u32(),
             101,
             "else-block JMP must target absolute offset (100 + 1)"
         );

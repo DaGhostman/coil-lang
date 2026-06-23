@@ -181,6 +181,23 @@ pub enum Inst {
         tag: u32,
         payload: Vec<ValueId>,
     },
+    /// Print: `print(args[0], args[1], ..., args[n])`.
+    ///
+    /// `args[0]` is the format string; the remaining elements are
+    /// the parameters to format. The linearizer is responsible
+    /// for emitting the matching bytecode (`PRINT` for the
+    /// simple case of just a format string with no params;
+    /// `FORMAT` + `PRINT` for the full case with format
+    /// specifiers — the latter is not yet implemented in Phase 1.6).
+    ///
+    /// Phase 1.6 supports only the no-params case. The
+    /// `is_straight_line` lift in `compiler/src/lib.rs` only
+    /// allows `print "literal";` through the CFG path — programs
+    /// with format specifiers (`print "%i", x;`) still fall
+    /// back to the single-pass codegen.
+    Print {
+        args: Vec<ValueId>,
+    },
 }
 
 /// Binary operators.
@@ -367,6 +384,14 @@ impl fmt::Display for Inst {
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "{} = make_enum tag={} [{}]", dst, tag, payload_str)
+            }
+            Inst::Print { args } => {
+                let args_str = args
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "print({})", args_str)
             }
         }
     }
@@ -745,6 +770,26 @@ mod tests {
             payload: vec![ValueId(1), ValueId(2)],
         };
         assert_eq!(format!("{}", inst), "v0 = make_enum tag=1 [v1, v2]");
+    }
+
+    #[test]
+    fn inst_print_simple_display() {
+        // `print "hello";` — single arg, the format string. The
+        // Phase 1.6 simple case.
+        let inst = Inst::Print {
+            args: vec![ValueId(0)],
+        };
+        assert_eq!(format!("{}", inst), "print(v0)");
+    }
+
+    #[test]
+    fn inst_print_with_format_specifier_args_display() {
+        // `print "%i", x;` — Phase 1.6 builds this but the
+        // linearizer doesn't handle it yet. Display still works.
+        let inst = Inst::Print {
+            args: vec![ValueId(0), ValueId(1)],
+        };
+        assert_eq!(format!("{}", inst), "print(v0, v1)");
     }
 
     // =================================================================

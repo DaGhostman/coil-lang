@@ -683,3 +683,39 @@ fn example_control_flow_smoke_prints_7_5_2_neg_5() {
     let output = run_example("examples/control_flow_smoke.0s");
     assert_eq!(output, "752-5");
 }
+
+// ============================================================
+//  Phase 1.6: Inst::Print linearization + is_straight_line lift
+// ============================================================
+
+/// Phase 1.6 regression guard — `examples/print_literal.0s`
+/// exercises the linearizer's new `Inst::Print` arm.
+///
+/// Before Phase 1.6, the linearizer had no `Inst::Print` arm
+/// (the variant didn't exist), and `is_straight_line` returned
+/// `false` for any `Expression::Print`. So `main` (which
+/// contains `print "hello";`) always fell back to the
+/// single-pass codegen path.
+///
+/// Phase 1.6 adds:
+///   1. `Inst::Print { args: Vec<ValueId> }` variant on the
+///      CFG `Inst` enum (in `compiler/src/cfg.rs`).
+///   2. `cfg_builder` push of `Inst::Print` after building
+///      the format string's `ConstString` (and any params).
+///   3. `linearizer` arm that emits `Byte::new(Instruction::PRINT)`
+///      for `Inst::Print`.
+///   4. `is_straight_line` lift: `Expression::Print(fmt, params)`
+///      is now straight-line when `fmt` is a constant string
+///      and `params` is empty (no format specifiers).
+///   5. Linearizer's `Terminator::Return(None)` fix: void
+///      functions (no explicit `return ...;`) now emit
+///      `CONST 0 + RETURN` instead of bare `RETURN`, matching
+///      the single-pass codegen's behavior.
+///
+/// Expected output: `"hello"` (a single `print "hello";`
+/// statement, no trailing newline).
+#[test]
+fn example_print_literal_via_cfg_path_prints_hello() {
+    let output = run_example("examples/print_literal.0s");
+    assert_eq!(output, "hello");
+}

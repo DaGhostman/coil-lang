@@ -996,7 +996,30 @@ fn is_straight_line(expr: &parser::ast::Expression) -> bool {
         }
 
         // ---- Linearizer emits placeholders (not resolved in Phase 0.3) ----
-        Expression::Print(_, _) | Expression::Format(_, _) => false,
+        //
+        // Print is lifted for the SIMPLE case only: `print
+        // "literal";` — a constant string format with no params
+        // (no format specifiers, no values). The cfg_builder
+        // pushes `Inst::Print { args: [fmt] }` and the
+        // linearizer emits a single `PRINT` opcode after the
+        // format string's `STRING` push.
+        //
+        // `print "%i", x;` (format specifier + value) is NOT
+        // lifted — it still falls back to the single-pass
+        // codegen, which emits `FORMAT` + `PRINT`. Lifting the
+        // format-specifier case requires the linearizer to
+        // emit `FORMAT` (with arity = params.len()) and the
+        // builder to compute/push the format string and
+        // arguments. Deferred to a future phase.
+        //
+        // Format (without the trailing PRINT) is left at
+        // `false` — the single-pass codegen path is the
+        // canonical emitter for `format` expressions.
+        Expression::Print(fmt, params) => {
+            matches!(fmt.1.as_ref(), Expression::String(_))
+                && params.as_ref().map_or(true, |p| p.is_empty())
+        }
+        Expression::Format(_, _) => false,
         Expression::Call { .. } => false,
         Expression::Construct { .. } => false,
         Expression::Access(_, _) => false,

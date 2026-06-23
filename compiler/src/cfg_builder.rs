@@ -744,23 +744,31 @@ impl Builder {
 
             // ---- Print ----
             //
-            // Build the format string and each param. The actual
-            // print instruction (`FORMAT` + `PRINT` in the
-            // existing VM) is the linearizer's job (Phase 3) —
-            // for Phase 0.2a, we just emit the side-effecting
-            // values and trust the linearizer to wrap them in the
-            // right opcodes.
+            // Build the format string and each param. The first
+            // arg is the format string itself (a `ConstString`
+            // SSA value pushed by the String-literal arm above).
+            // The actual print instruction (`PRINT` for the
+            // simple case in Phase 1.6) is the linearizer's job.
             //
-            // Returns `None` because Print is a statement, not an
-            // expression (the printed value is the side effect,
-            // not a SSA result).
+            // Phase 1.6 supports only `print "literal";` — the
+            // `is_straight_line` lift in `compiler/src/lib.rs`
+            // gates Print from the CFG path when the format is
+            // a constant string with no params. Format
+            // specifiers (`%i`, `%f`, etc.) fall back to the
+            // single-pass path.
+            //
+            // Returns `None` because Print is a statement, not
+            // an expression (the printed value is the side
+            // effect, not a SSA result).
             Expression::Print(fmt, params) => {
-                let _fmt_value = self.build_expression(fmt.1.as_ref());
+                let fmt_value = self.build_expression(fmt.1.as_ref())?;
+                let mut args = vec![fmt_value];
                 if let Some(items) = params {
                     for p in items {
-                        let _ = self.build_expression(p.1.as_ref());
+                        args.push(self.build_expression(p.1.as_ref())?);
                     }
                 }
+                self.current_block_mut().insts.push(Inst::Print { args });
                 None
             }
 
