@@ -489,16 +489,58 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("if")
-            .ignore_then(self.expr())
-            .then(self.block(stmt))
-            .map_with(|(cond, body), e| {
-                let branch: Output = (
-                    e.span(),
-                    Box::new(Expression::Branch(Some(cond), body)),
-                );
-                (e.span(), Box::new(Expression::If(vec![branch])))
-            })
+        // Phase 1 (else support): wrap in `recursive` so the
+        // `else if` branch can call back into the if-parser itself.
+        // The `else` clause is optional:
+        //
+        //   - absent      → single-branch If
+        //   - `else { .. }` → two-branch If (then-branch + else-branch
+        //                    with `cond = None`)
+        //   - `else if ..` → flatten the inner If's branches into ours,
+        //                    so `if c1 {b1} else if c2 {b2} else {b3}`
+        //                    becomes a 3-branch If.
+        recursive(|if_parser| {
+            keyword!("if")
+                .ignore_then(self.expr())
+                .then(self.block(stmt.clone()))
+                .then(
+                    keyword!("else")
+                        .ignore_then(choice((
+                            // `else { body }` — a Block.
+                            self.block(stmt.clone()),
+                            // `else if ...` — recurse into the if-parser.
+                            if_parser,
+                        )))
+                        .or_not(),
+                )
+                .map_with(|((cond, body), else_clause), e| {
+                    let then_branch: Output = (
+                        e.span(),
+                        Box::new(Expression::Branch(Some(cond), body)),
+                    );
+                    let mut branches: Vec<Output> = vec![then_branch];
+                    if let Some(else_output) = else_clause {
+                        match else_output.1.as_ref() {
+                            // `else if c2 {b2} [else {b3} ...]` — the
+                            // inner `if_parser` returned a fully-
+                            // formed If whose branches we flatten
+                            // into ours.
+                            Expression::If(more_branches) => {
+                                branches.extend(more_branches.iter().cloned());
+                            }
+                            // `else { body }` — a Block. Wrap as the
+                            // terminal Branch(None, body).
+                            _ => {
+                                branches.push((
+                                    e.span(),
+                                    Box::new(Expression::Branch(None, else_output)),
+                                ));
+                            }
+                        }
+                    }
+                    (e.span(), Box::new(Expression::If(branches)))
+                })
+        })
     }
 
     fn print(
@@ -1729,6 +1771,207 @@ mod tests {
             matches!(inner, Expression::Float(_)),
             "expected Float(1.0), got {:?}",
             inner
+        );
+    }
+
+    // ============================================================
+    //  Phase 1 tests — `else` keyword support for if expressions
+    // ============================================================
+
+    /// Walk an if-block body (a `Block(Vec<Statement>)`) out of the
+    /// standard `Function { body: Block([Statement(If(...))]) }`
+    /// wrapper produced by parsing a `fn main() { ... }` decl.
+    /// Returns the inner `If` AST.
+    ///
+    /// Inlined (rather than calling `decl_ast!`) because that macro
+    /// requires a literal token-tree for its `$case:literal` matcher
+    /// — passing a `&str` variable is rejected.
+    fn unwrap_fn_if(src: &str) -> Expression<'_> {
+        let ast = Pratt::default()
+            .declaration()
+            .parse(src)
+            .into_result()
+            .expect("parse failed")
+            .1
+            .as_ref()
+            .clone();
+        // Top: Function { ..., body: Block([...]) }
+        let fn_body = match ast {
+            Expression::Function { body, .. } => body,
+            other => panic!("expected Function decl, got {:?}", other),
+        };
+        let stmts = match fn_body.1.as_ref() {
+            Expression::Block(stmts) => stmts.clone(),
+            other => panic!("expected Block body, got {:?}", other),
+        };
+        assert_eq!(stmts.len(), 1, "expected exactly one stmt in body");
+        let inner = stmts.into_iter().next().unwrap();
+        let inner_stmt = match inner.1.as_ref() {
+            Expression::Statement(s) => s.1.as_ref().clone(),
+            other => other.clone(),
+        };
+        let if_ast = match inner_stmt {
+            Expression::If(branches) => Expression::If(branches),
+            other => panic!("expected If, got {:?}", other),
+        };
+        if_ast
+    }
+
+    #[test]
+    fn parse_if_without_else_still_works() {
+        // Regression: pre-Phase-1 single-branch if must still parse
+        // to exactly one Branch(Some(cond), body) inside the If.
+        let src = "fn main() { if 1 > 0 { return 1; } }";
+        match unwrap_fn_if(src) {
+            Expression::If(branches) => {
+                assert_eq!(branches.len(), 1, "single-branch if has 1 branch");
+                let (cond_opt, _) = match branches[0].1.as_ref() {
+                    Expression::Branch(c, b) => (c.clone(), b.clone()),
+                    other => panic!("expected Branch, got {:?}", other),
+                };
+                assert!(
+                    cond_opt.is_some(),
+                    "the lone if-branch's cond must be Some(_), not None"
+                );
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_if_with_else_single_branch() {
+        // `if c { b } else { eb }` → two branches; the second has
+        // `cond = None` (terminal else).
+        let src = "fn main() { if 1 > 0 { return 1; } else { return 0; } }";
+        match unwrap_fn_if(src) {
+            Expression::If(branches) => {
+                assert_eq!(branches.len(), 2, "if/else has 2 branches");
+                // First branch: Some(cond)
+                let (cond_opt, _) = match branches[0].1.as_ref() {
+                    Expression::Branch(c, b) => (c.clone(), b.clone()),
+                    other => panic!("expected Branch at index 0, got {:?}", other),
+                };
+                assert!(
+                    cond_opt.is_some(),
+                    "first if-branch's cond must be Some(_)"
+                );
+                // Second branch: None (the terminal else)
+                let (cond_opt, _) = match branches[1].1.as_ref() {
+                    Expression::Branch(c, b) => (c.clone(), b.clone()),
+                    other => panic!("expected Branch at index 1, got {:?}", other),
+                };
+                assert!(
+                    cond_opt.is_none(),
+                    "else-branch's cond must be None"
+                );
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_if_else_if_no_final_else() {
+        // `if c1 { b1 } else if c2 { b2 }` → two branches, both with
+        // Some(cond). The else-if gets flattened into the outer If.
+        let src = "fn main() { if 1 > 0 { return 1; } else if 1 < 0 { return 2; } }";
+        match unwrap_fn_if(src) {
+            Expression::If(branches) => {
+                assert_eq!(branches.len(), 2, "if/else-if has 2 branches");
+                for (i, branch) in branches.iter().enumerate() {
+                    let (cond_opt, _) = match branch.1.as_ref() {
+                        Expression::Branch(c, b) => (c.clone(), b.clone()),
+                        other => panic!("expected Branch at index {}, got {:?}", i, other),
+                    };
+                    assert!(
+                        cond_opt.is_some(),
+                        "branch #{} cond must be Some(_) (no terminal else)",
+                        i
+                    );
+                }
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_if_else_if_single_else() {
+        // `if c1 { b1 } else if c2 { b2 } else { b3 }` → three branches.
+        // Branch 0: Some(c1), Branch 1: Some(c2), Branch 2: None.
+        let src = "fn main() { if 1 > 0 { return 1; } else if 1 < 0 { return 2; } else { return 3; } }";
+        match unwrap_fn_if(src) {
+            Expression::If(branches) => {
+                assert_eq!(branches.len(), 3, "if/else-if/else has 3 branches");
+                // First two: Some(cond)
+                for i in 0..2 {
+                    let (cond_opt, _) = match branches[i].1.as_ref() {
+                        Expression::Branch(c, b) => (c.clone(), b.clone()),
+                        other => panic!("expected Branch at index {}, got {:?}", i, other),
+                    };
+                    assert!(
+                        cond_opt.is_some(),
+                        "branch #{} cond must be Some(_)",
+                        i
+                    );
+                }
+                // Last: None (terminal else)
+                let (cond_opt, _) = match branches[2].1.as_ref() {
+                    Expression::Branch(c, b) => (c.clone(), b.clone()),
+                    other => panic!("expected Branch at index 2, got {:?}", other),
+                };
+                assert!(
+                    cond_opt.is_none(),
+                    "terminal else-branch's cond must be None"
+                );
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_if_else_chain_deep() {
+        // `if c1 else if c2 else if c3 else` — four branches, all
+        // `Some` except the last. Verifies the recursive flattening
+        // works at depth ≥ 2.
+        let src = "fn main() { if 1 > 0 { return 1; } else if 1 < 0 { return 2; } else if 1 == 0 { return 3; } else { return 4; } }";
+        match unwrap_fn_if(src) {
+            Expression::If(branches) => {
+                assert_eq!(branches.len(), 4, "if/else-if/else-if/else has 4 branches");
+                for i in 0..3 {
+                    let (cond_opt, _) = match branches[i].1.as_ref() {
+                        Expression::Branch(c, b) => (c.clone(), b.clone()),
+                        other => panic!("expected Branch at index {}, got {:?}", i, other),
+                    };
+                    assert!(
+                        cond_opt.is_some(),
+                        "branch #{} cond must be Some(_)",
+                        i
+                    );
+                }
+                let (cond_opt, _) = match branches[3].1.as_ref() {
+                    Expression::Branch(c, b) => (c.clone(), b.clone()),
+                    other => panic!("expected Branch at index 3, got {:?}", other),
+                };
+                assert!(
+                    cond_opt.is_none(),
+                    "terminal else-branch's cond must be None"
+                );
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_if_with_dangling_else_fails() {
+        // Regression: `else` with no following body must NOT silently
+        // parse. The `.or_not()` only catches the case where the
+        // whole `else` keyword is absent — once `else` is committed,
+        // the choice must match either a Block or another if-parser.
+        let src = "fn main() { if 1 > 0 { return 1; } else }";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        assert!(
+            result.is_err(),
+            "expected parse to fail for dangling else, got {:?}",
+            result
         );
     }
 }
