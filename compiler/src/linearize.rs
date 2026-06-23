@@ -352,26 +352,56 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
                 Byte::new(Instruction::MakeEnum).with_operand_u32(tag_shifted | arity),
             );
         }
-        Inst::Print { args: _ } => {
+        Inst::Print { args } => {
             // PRINT pops the format string (and any params in
-            // Phase 2+) from the stack and prints the formatted
-            // output. For Phase 1.6, the linearizer assumes the
-            // format string is already on the stack top — the
-            // typical case for `print "literal";` (no format
-            // specifiers, no params).
+            // the format-specifier case) from the stack and
+            // prints the formatted output.
             //
-            // The args Vec is ignored here: the linearizer
-            // doesn't need to know how many params are present
-            // for the simple case (just emit PRINT, which pops
-            // one value). The `is_straight_line` lift in
-            // `compiler/src/lib.rs` ensures only the no-params
-            // case routes through the CFG path. Format
-            // specifiers (`%i`, `%f`, etc.) still fall back to
-            // the single-pass path which emits `FORMAT` +
-            // `PRINT`.
+            // Two cases:
             //
-            // No operands needed — PRINT is a no-operand opcode.
-            bc.push(Byte::new(Instruction::PRINT));
+            //   1. `args.len() == 1` — `print "literal";`. The
+            //      stack top holds the format string. Emit a
+            //      single `PRINT` opcode (no operands). This is
+            //      the simple case from the previous Phase 1.6
+            //      fix.
+            //
+            //   2. `args.len() > 1` — `print "%i", x;`. The
+            //      stack holds (top to bottom): `param_0,
+            //      param_1, ..., param_(N-1), format_string`.
+            //      The cfg_builder pushes the format string
+            //      FIRST (via `ConstString`) and the params
+            //      AFTER (in source order), so the resulting
+            //      stack matches the single-pass codegen's
+            //      layout exactly: params stacked on top of the
+            //      format string. Emit `FORMAT(N)` to pop the
+            //      N+1 values, then `PRINT` to print the
+            //      resulting formatted string.
+            //
+            // Format specifiers in the format string consume
+            // params in REVERSE source order (this is the
+            // existing single-pass codegen's quirk — see
+            // `machine/src/vm.rs`'s `Instruction::FORMAT`
+            // dispatch: `params.pop()` returns the LAST-pushed
+            // param first). For the common `%i` with one arg
+            // case this is fine. Multi-arg / multi-specifier
+            // cases would need a `format!`-style API to
+            // reverse the specifiers; deferred to a future
+            // phase.
+            if args.len() == 1 {
+                // Simple case: no format specifiers, just a
+                // literal format string. Emit a single PRINT.
+                bc.push(Byte::new(Instruction::PRINT));
+            } else {
+                // Format-specifier case: emit FORMAT with
+                // `params_count = args.len() - 1` (args[0] is
+                // the format string, args[1..] are the
+                // params), then PRINT.
+                let params_count = (args.len() - 1) as u32;
+                bc.push(
+                    Byte::new(Instruction::FORMAT).with_operand_u32(params_count),
+                );
+                bc.push(Byte::new(Instruction::PRINT));
+            }
         }
     }
 }
@@ -987,6 +1017,75 @@ mod tests {
         assert!(matches!(bc[4].bytecode(), Instruction::CONST));
         assert_eq!(bc[4].value_u32(), 0);
         assert!(matches!(bc[5].bytecode(), Instruction::RETURN));
+    }
+
+    #[test]
+    fn linearize_print_with_format_arg_emits_format_then_print() {
+        // Phase 1.6: `print "%i", x;` — the linearizer's
+        // `Inst::Print` arm must emit `FORMAT(1)` (pops 2
+        // values: the format string and the one param) followed
+        // by `PRINT` (pops the formatted string and prints it).
+        //
+        // The cfg_builder pushes the format string FIRST (via
+        // `build_expression(fmt)`) and the params AFTER (via
+        // `build_expression` for each param in source order),
+        // so the stack at the time of `Inst::Print` is (top to
+        // bottom): `param_0, format_string`. This matches the
+        // single-pass codegen's stack layout (format at the
+        // bottom, params stacked on top).
+        //
+        // Bytecode layout for `print "%i", 42;` (after the
+        // cfg_builder builds the format string and the param):
+        //   [0] CONST 42       (push 42 — the param)
+        //   [1] STRING 2       (push "%i" — the format string)
+        //   [2] DATA '%'
+        //   [3] DATA 'i'
+        //   [4] FORMAT 1       (pop 2 values, format them)
+        //   [5] PRINT          (print the formatted string)
+        //   [6] CONST 0        (implicit void return)
+        //   [7] RETURN
+        let fmt = ValueId(0);
+        let arg = ValueId(1);
+        let mut block = Block::new(BlockId(0));
+        block.insts.push(Inst::Const { dst: arg, value: 42 });
+        block.insts.push(Inst::ConstString {
+            dst: fmt,
+            value: "%i".to_string(),
+        });
+        block.insts.push(Inst::Print {
+            args: vec![fmt, arg],
+        });
+        block.terminator = Terminator::Return(None);
+        let f = Function {
+            name: "p".to_string(),
+            params: vec![],
+            return_ty: TypeRef::Unit,
+            blocks: vec![block],
+            entry: BlockId(0),
+        };
+        let bc = linearize(&f, 0);
+        assert_eq!(bc.len(), 8, "expected 8 bytes, got {:?}", bc);
+        // CONST 42.
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        // STRING 2.
+        assert!(matches!(bc[1].bytecode(), Instruction::STRING));
+        assert_eq!(bc[1].operand_u32(), 2);
+        // DATA chars.
+        assert!(matches!(bc[2].bytecode(), Instruction::DATA));
+        assert!(matches!(bc[3].bytecode(), Instruction::DATA));
+        // FORMAT 1 — pops 2 values, formats them.
+        assert!(matches!(bc[4].bytecode(), Instruction::FORMAT));
+        assert_eq!(
+            bc[4].operand_u32(),
+            1,
+            "FORMAT operand is params_count (1 for one arg)"
+        );
+        // PRINT.
+        assert!(matches!(bc[5].bytecode(), Instruction::PRINT));
+        // Void return: CONST 0 + RETURN.
+        assert!(matches!(bc[6].bytecode(), Instruction::CONST));
+        assert_eq!(bc[6].value_u32(), 0);
+        assert!(matches!(bc[7].bytecode(), Instruction::RETURN));
     }
 
     // ============================================================

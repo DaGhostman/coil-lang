@@ -997,27 +997,53 @@ fn is_straight_line(expr: &parser::ast::Expression) -> bool {
 
         // ---- Linearizer emits placeholders (not resolved in Phase 0.3) ----
         //
-        // Print is lifted for the SIMPLE case only: `print
-        // "literal";` — a constant string format with no params
-        // (no format specifiers, no values). The cfg_builder
-        // pushes `Inst::Print { args: [fmt] }` and the
-        // linearizer emits a single `PRINT` opcode after the
-        // format string's `STRING` push.
+        // Print is lifted for two cases:
         //
-        // `print "%i", x;` (format specifier + value) is NOT
-        // lifted — it still falls back to the single-pass
-        // codegen, which emits `FORMAT` + `PRINT`. Lifting the
-        // format-specifier case requires the linearizer to
-        // emit `FORMAT` (with arity = params.len()) and the
-        // builder to compute/push the format string and
-        // arguments. Deferred to a future phase.
+        //   1. `print "literal";` — a constant string format
+        //      with no params. The cfg_builder pushes
+        //      `Inst::Print { args: [fmt] }` and the linearizer
+        //      emits a single `PRINT` opcode after the format
+        //      string's `STRING` push. (Phase 1.6 simple case.)
+        //
+        //   2. `print "%i", 42;` — a constant string format with
+        //      literal-constant params (Integer, Float, String,
+        //      Bool). The cfg_builder pushes the format string
+        //      first (via `ConstString`), then each param's
+        //      `Const` (or `ConstString` for string params), then
+        //      `Inst::Print { args: [fmt, param_0, ...] }`. The
+        //      linearizer emits `FORMAT(N)` followed by `PRINT`,
+        //      matching the single-pass codegen's stack layout
+        //      (params stacked on top of the format string).
+        //
+        // Identifier params (e.g. `let y = 1; print "%i", y;`)
+        // are NOT lifted — the CFG path has no "reload" mechanism
+        // for SSA values that are already on the stack from a
+        // prior inst (e.g. the BinOp that produced `y`). The
+        // value sits below the format string after the
+        // `ConstString` push, so the FORMAT opcode would pop
+        // them in the wrong order. Identifier params fall back
+        // to the single-pass codegen path, which handles them
+        // correctly via `do_compile`'s recursive emission.
+        // Lifting Identifier params requires either a
+        // `Reload`-style CFG instruction (deferred to a future
+        // phase) or a stack-position-tracking linearizer.
         //
         // Format (without the trailing PRINT) is left at
         // `false` — the single-pass codegen path is the
         // canonical emitter for `format` expressions.
         Expression::Print(fmt, params) => {
             matches!(fmt.1.as_ref(), Expression::String(_))
-                && params.as_ref().map_or(true, |p| p.is_empty())
+                && params.as_ref().map_or(true, |p| {
+                    p.iter().all(|arg| {
+                        matches!(
+                            arg.1.as_ref(),
+                            Expression::Integer(_)
+                                | Expression::Float(_)
+                                | Expression::String(_)
+                                | Expression::Bool(_)
+                        )
+                    })
+                })
         }
         Expression::Format(_, _) => false,
         Expression::Call { .. } => false,
@@ -4784,14 +4810,25 @@ fn main() {
     /// RHS into `x`'s slot) in addition to the RHS's `CONST`. The
     /// pre-18E codegen emitted no `STORE_POP` at all, so this test
     /// fails on the unfixed compiler.
+    ///
+    /// Phase 1.6 (Format lift) caveat: the print param must be a
+    /// Call (`double(x)`) so the function falls back to the
+    /// single-pass codegen. `Expression::Call` is still flagged
+    /// as not-straight-line in `is_straight_line`, so the Call
+    /// forces the fallback. Without this, `print "%i", x;` would
+    /// route through the CFG path (which uses SSA-style locals
+    /// resolution instead of `STORE_POP`), and the assertion
+    /// would be vacuously true (0 STORE_POPs found, but for a
+    /// different reason).
     #[test]
     fn let_x_then_print_x_emits_store_pop() {
         use common::Instruction;
         let bc = compile_src(
             "fn main() { \
                  let x = 42; \
-                 print \"%i\", x; \
-             }",
+                 print \"%i\", double(x); \
+             } \
+             fn double(int y) -> int { return y * 2; }",
         );
 
         // At least one STORE_POP — the explicit
@@ -4827,6 +4864,16 @@ fn main() {
     /// distinct slot operands (0 and 1). The pre-18E codegen
     /// emitted no `STORE_POP`s, so this test would fail with a
     /// 0-count.
+    ///
+    /// Phase 1.6 (Format lift) caveat: the print param must be
+    /// a Call (`double(x + y)`) so the function falls back to
+    /// the single-pass codegen. `Expression::Call` is still
+    /// flagged as not-straight-line in `is_straight_line`, so
+    /// the Call forces the fallback. Without this,
+    /// `print "%i", x + y;` would route through the CFG path
+    /// (which uses SSA-style locals resolution instead of
+    /// `STORE_POP`), and the assertion would be vacuously
+    /// true.
     #[test]
     fn let_two_bindings_emit_two_store_pops() {
         use common::Instruction;
@@ -4834,8 +4881,9 @@ fn main() {
             "fn main() { \
                  let x = 5; \
                  let y = 10; \
-                 print \"%i\", x + y; \
-             }",
+                 print \"%i\", double(x + y); \
+             } \
+             fn double(int z) -> int { return z * 2; }",
         );
 
         let store_pops: Vec<u32> = bc

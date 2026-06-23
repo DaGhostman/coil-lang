@@ -719,3 +719,53 @@ fn example_print_literal_via_cfg_path_prints_hello() {
     let output = run_example("examples/print_literal.0s");
     assert_eq!(output, "hello");
 }
+
+// ============================================================
+//  Phase 1.6: FORMAT-linearization for `print "%i", x;`
+// ============================================================
+
+/// Phase 1.6 golden test — `examples/format_literal.0s`
+/// exercises the linearizer's new FORMAT-then-PRINT emission
+/// for `print "%i", x;` (format specifier + value).
+///
+/// Before this fix, the linearizer's `Inst::Print` arm only
+/// handled the no-params case (`print "literal";`), so
+/// `print "%i", 42;` could not route through the CFG path
+/// (the `is_straight_line` detector returned `false` for any
+/// `Expression::Print` with non-empty params). The single-pass
+/// codegen was the canonical emitter for the format-specifier
+/// case.
+///
+/// Phase 1.6 (Format lift) adds:
+///   1. Linearizer's `Inst::Print` arm emits
+///      `FORMAT(args.len() - 1)` followed by `PRINT` for
+///      the multi-arg case. The stack layout (params on top
+///      of the format string) matches the single-pass
+///      codegen's layout exactly, so the VM's `FORMAT`
+///      dispatch sees the same operands in the same order.
+///   2. `is_straight_line` lift: `Expression::Print(fmt,
+///      params)` is now straight-line when the format string
+///      is a constant string AND every param is a literal
+///      constant (Integer, Float, String, Bool). This covers
+///      `print "%i", 42;` (the canonical use case). Identifier
+///      params (e.g. `let y = 1; print "%i", y;`) are NOT
+///      lifted — the CFG path has no "reload" mechanism for
+///      SSA values that are already on the stack from a prior
+///      inst; lifting them requires either a `Reload`-style
+///      CFG instruction or a stack-position-tracking
+///      linearizer (deferred to a future phase).
+///
+/// Documented limitation: multi-specifier / multi-arg format
+/// strings (`print "%i %i", a, b;`) may produce unexpected
+/// output because the VM's `FORMAT` opcode consumes params
+/// in REVERSE source order (this is the existing single-pass
+/// quirk, not a new regression). Fixing the specifier order
+/// is deferred to a future phase.
+///
+/// Expected output: `"42"` (one `print "%i", 42;` statement,
+/// no trailing newline).
+#[test]
+fn example_format_literal_via_cfg_path_prints_int() {
+    let output = run_example("examples/format_literal.0s");
+    assert_eq!(output, "42");
+}
