@@ -263,6 +263,32 @@ impl Builder {
         &mut self.blocks[id.index()]
     }
 
+    /// Look up the slot index for a function parameter by name.
+    /// Returns the parameter's position in `param_list` (0..arity),
+    /// or `None` if the name isn't a parameter.
+    ///
+    /// Phase 1.6: used by [`Builder::build_expression`]'s
+    /// `Expression::Return` Identifier-of-param arm to emit a
+    /// fresh `Inst::Param { dst, index }` in the current block
+    /// before a `Terminator::Return(None)`. The slot index is the
+    /// `Inst::Param.index` operand, which the linearizer
+    /// translates directly into a `LOAD <slot>` opcode.
+    ///
+    /// Locals are deliberately NOT supported by this helper —
+    /// locals don't have a known stack slot at codegen time
+    /// (they live in the SSA value's stack position from the
+    /// last write). Supporting locals would require a real
+    /// register allocator; deferred to a future phase.
+    #[allow(dead_code)]
+    fn lookup_param_slot_index(&self, name: &str) -> Option<u16> {
+        for (i, (_vid, param_name)) in self.param_list.iter().enumerate() {
+            if param_name == name {
+                return Some(i as u16);
+            }
+        }
+        None
+    }
+
     /// Build the CFG for a function declaration. The argument is
     /// the [`Expression::Function`] node; we destructure it inline.
     ///
@@ -775,8 +801,85 @@ impl Builder {
             // `Terminator::Unreachable` (see those functions) so
             // any block that already has a Return terminator is
             // left alone.
+            //
+            // Phase 1.6 fix — Identifier returns for params:
+            // when the return value is a simple `Identifier(name)`
+            // referring to a known function parameter, emit a
+            // fresh `Inst::Param { dst: v_new, index: param_index }`
+            // in the current block BEFORE the Return. The
+            // linearizer translates that into `LOAD <slot>` +
+            // `RETURN`, so the bare `RETURN` (emitted for
+            // `Return(None)`) pops the correct value. Without
+            // this, the pre-1.6 code emitted `Terminator::Return(
+            // Some(ssa_value))` with no preceding instruction in
+            // the current block; the linearizer emits only bare
+            // `RETURN` regardless of the SSA value (the linearizer
+            // doesn't track SSA value locations yet), so it pops
+            // whatever's on the stack top. For a child block (an
+            // if/else branch) where the parent didn't push the
+            // value, the stack may be empty by the time the
+            // branch's Return is reached — `RETURN` pops garbage.
+            //
+            // Documented limitation (NOT fixed in this commit):
+            // complex return values like `return a + b;` or
+            // `return local_var;` in a child block are NOT fixed
+            // here. The builder's `build_expression` doesn't track
+            // where intermediate SSA values are stored on the
+            // stack, so we can't reload them. A real register
+            // allocator would close this gap; deferred to a
+            // future phase. For now, only Identifier-returns of
+            // PARAMETERS are fixed — locals and complex
+            // expressions fall through to the original (still
+            // potentially buggy) behavior.
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
-                let v = self.build_expression(expr.1.as_ref());
+                let return_expr_ref = expr.1.as_ref();
+
+                // Phase 1.6: Identifier-of-param fast path. If the
+                // return value is a bare identifier referring to a
+                // known parameter, emit a fresh Param instruction
+                // in the current block. The terminator becomes
+                // `Return(None)` — the linearizer will emit
+                // `LOAD <slot>` (from the Param) followed by bare
+                // `RETURN`, which correctly pops the just-loaded
+                // value.
+                //
+                // We deliberately do NOT update `self.return_value`
+                // here — `build_function_from_parts`'s final-step
+                // terminator derivation (line 426-440) reads
+                // `return_value` to decide between `Return(Some(_))`
+                // and `Return(None)`. Leaving `return_value` as
+                // `None` ensures the final derivation picks
+                // `Return(None)`, preserving the fast-path
+                // terminator we just set.
+                //
+                // The parser wraps the return's expression in
+                // `Expression::Expr(...)`, so we unwrap that
+                // wrapper before pattern-matching on Identifier.
+                // Bare `Expression::Identifier(...)` is also
+                // accepted (e.g., when the cfg_builder is invoked
+                // from unit tests that build the AST manually).
+                let inner_expr = match return_expr_ref {
+                    Expression::Expr(inner) => inner.1.as_ref(),
+                    other => other,
+                };
+                if let Expression::Identifier(name) = inner_expr {
+                    if let Some(slot_index) = self.lookup_param_slot_index(*name) {
+                        let new_ssa = self.fresh_value();
+                        self.current_block_mut().insts.push(Inst::Param {
+                            dst: new_ssa,
+                            index: slot_index,
+                        });
+                        self.current_block_mut().terminator =
+                            Terminator::Return(None);
+                        return None;
+                    }
+                }
+
+                // Fallback: original behavior for constants,
+                // binary expressions, locals, etc. May be
+                // incorrect for child blocks — see documented
+                // limitation above.
+                let v = self.build_expression(return_expr_ref);
                 self.return_value = v;
                 self.current_block_mut().terminator = match v {
                     Some(val) => Terminator::Return(Some(val)),
@@ -1772,6 +1875,10 @@ mod tests {
         Expression::Div(e(lhs), e(rhs))
     }
 
+    fn gt(lhs: Expression<'static>, rhs: Expression<'static>) -> Expression<'static> {
+        Expression::Gt(e(lhs), e(rhs))
+    }
+
     /// `let name = rhs;` — produces the Fragment shape that the parser
     /// emits. The builder's special-case at `build_expression`'s
     /// `Fragment` arm treats `Fragment([Variable(name), rhs])` as a
@@ -2088,6 +2195,22 @@ mod tests {
     #[test]
     fn build_identifier_param_lookup() {
         // `fn f(int x) -> int { return x; }`
+        //
+        // Phase 1.6: the Return arm's Identifier-of-param fast
+        // path emits a fresh `Inst::Param { dst: v1, index: 0 }`
+        // in the entry block so the value is on the stack top
+        // when the linearizer emits bare `RETURN` for
+        // `Return(None)`. The original `Inst::Param { dst: v0,
+        // index: 0 }` from `build_function` is still present
+        // (it binds `x`'s SSA value for downstream uses). Net
+        // effect: two `Inst::Param { index: 0 }` instructions,
+        // both loading slot 0; the linearizer emits `LOAD 0,
+        // LOAD 0, RETURN` (the second LOAD is wasted but
+        // harmless — the value is correctly on the stack top).
+        //
+        // Pre-1.6 this test asserted exactly 1 Param and
+        // `Return(Some(v0))`. After the fast path, the block has
+        // 2 Params and `Return(None)`.
         let func = function(
             "f",
             vec![("int", "x")],
@@ -2098,7 +2221,9 @@ mod tests {
         let cfg = builder.build_function(&func);
         let blk = &cfg.blocks[0];
 
-        // Exactly one Param (index 0, dst v0).
+        // Two Params — both load slot 0 (one from
+        // `build_function`, one from the Return arm's fast
+        // path).
         let params: Vec<_> = blk
             .insts
             .iter()
@@ -2107,26 +2232,266 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(params.len(), 1, "expected 1 Param inst");
+        assert_eq!(params.len(), 2, "expected 2 Param insts");
         assert_eq!(params[0], (ValueId(0), 0));
+        assert_eq!(params[1], (ValueId(1), 0));
 
-        // No other insts (Identifier lookups don't emit insts).
+        // No other insts (Identifier lookups don't emit
+        // additional insts).
         assert_eq!(
             blk.insts.len(),
-            1,
-            "expected only the Param inst, got {:?}",
+            2,
+            "expected only the two Param insts, got {:?}",
             blk.insts
         );
 
-        // Terminator is Return(Some(v0)) — the param's ValueId.
+        // Terminator is Return(None) — the fast path
+        // materializes the value on the stack via the second
+        // Param, so the linearizer's bare RETURN pops the
+        // correct value.
         assert!(
-            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(0)),
-            "expected Return(Some(v0)), got {:?}",
+            matches!(blk.terminator, Terminator::Return(None)),
+            "expected Return(None), got {:?}",
             blk.terminator
         );
 
-        // params list has one entry: (v0, "x").
+        // params list has one entry: (v0, "x") — only the
+        // original Param is registered in the function's
+        // signature; the fast-path Param is anonymous and only
+        // exists to push the value.
         assert_eq!(cfg.params, vec![(ValueId(0), "x".to_string())]);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 1.6: Identifier-of-param return fast path
+    //
+    // These tests verify the fix for Linearizer bug 2:
+    // `Terminator::Return(Some(ValueId))` emitted bare `RETURN`,
+    // which popped whatever was on the stack. For child blocks
+    // (if/else branches) the stack could be empty by the time
+    // the Return was reached, so RETURN popped garbage.
+    //
+    // The fix: when the return value is a bare Identifier
+    // referring to a known parameter, emit a fresh
+    // `Inst::Param { dst, index }` in the current block. The
+    // linearizer translates that into `LOAD <slot>` followed by
+    // `RETURN`, correctly returning the parameter's value.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_return_param_in_if_branch_emits_param_in_branch_block() {
+        // `fn max(int a, int b) -> int { if a > b { return a; } else { return b; } }`
+        //
+        // The fast path should emit a Param instruction in EACH
+        // branch block (then_block for `a`, false_target for
+        // `b`) so the linearizer's bare RETURN pops the correct
+        // value. Pre-1.6 each branch's Return was
+        // `Terminator::Return(Some(v0_or_v1))` with no
+        // preceding instruction, so the linearizer emitted bare
+        // RETURN — popping whatever (typically garbage) was on
+        // the stack.
+        //
+        // Expected block structure for `if a > b { return a; } else { return b; }`:
+        //   0 (entry):      Param(v0, 0), Param(v1, 1), BinOp(Gt, v2, v0, v1)
+        //                   terminator: Branch { cond: v2, true_bb: 1, false_bb: 2 }
+        //   1 (then_block): Param(v3, 0)  <- NEW: fast-path Param for `a`
+        //                   terminator: Return(None)
+        //   2 (else_block): Param(v4, 1)  <- NEW: fast-path Param for `b`
+        //                   terminator: Return(None)
+        //   3 (join_block): terminator: Return(None) (no value to return —
+        //                       neither branch falls through to join_block)
+        let func = function(
+            "max",
+            vec![("int", "a"), ("int", "b")],
+            Some("int"),
+            block(vec![stmt(if_else(
+                gt(ident("a"), ident("b")),
+                block(vec![stmt(ret(ident("a")))]),
+                block(vec![stmt(ret(ident("b")))]),
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        // 4 blocks: entry, then, else, join.
+        assert_eq!(cfg.blocks.len(), 4, "expected 4 blocks, got {}", cfg.blocks.len());
+
+        // Block 1 (then_block): single Param for `a` (index 0),
+        // Return(None) terminator.
+        let then_block = &cfg.blocks[1];
+        let then_params: Vec<_> = then_block
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Param { dst, index } => Some((*dst, *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            then_params.len(),
+            1,
+            "then_block should have 1 Param, got {:?}",
+            then_block.insts
+        );
+        assert_eq!(then_params[0], (ValueId(3), 0), "then_block Param should load slot 0 (param `a`)");
+        assert!(
+            matches!(then_block.terminator, Terminator::Return(None)),
+            "then_block terminator should be Return(None), got {:?}",
+            then_block.terminator
+        );
+
+        // Block 2 (else_block): single Param for `b` (index 1),
+        // Return(None) terminator.
+        let else_block = &cfg.blocks[2];
+        let else_params: Vec<_> = else_block
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Param { dst, index } => Some((*dst, *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            else_params.len(),
+            1,
+            "else_block should have 1 Param, got {:?}",
+            else_block.insts
+        );
+        assert_eq!(else_params[0], (ValueId(4), 1), "else_block Param should load slot 1 (param `b`)");
+        assert!(
+            matches!(else_block.terminator, Terminator::Return(None)),
+            "else_block terminator should be Return(None), got {:?}",
+            else_block.terminator
+        );
+
+        // Block 3 (join_block): no params (the fast path's
+        // terminator overwrite is conditional on
+        // Terminator::Unreachable; build_if already set the
+        // entry's Branch terminator, so the join block's
+        // terminator stays at Return(None) from the final-step
+        // derivation).
+        let join_block = &cfg.blocks[3];
+        assert!(
+            matches!(join_block.terminator, Terminator::Return(None)),
+            "join_block terminator should be Return(None), got {:?}",
+            join_block.terminator
+        );
+    }
+
+    #[test]
+    fn build_return_local_identifier_does_not_use_fast_path() {
+        // `fn f(int x) -> int { let y = x; return y; }`
+        //
+        // Locals are NOT supported by the fast path — they
+        // don't have a known stack slot. The Return arm should
+        // fall through to the original behavior:
+        // `build_expression(Identifier("y"))` returns
+        // `Some(locals["y"])` (which equals `params["x"]` =
+        // `v0`), and the terminator is `Return(Some(v0))`.
+        //
+        // This test guards against future regressions where the
+        // fast path accidentally extends to locals (which would
+        // be incorrect without a register allocator).
+        let func = function(
+            "f",
+            vec![("int", "x")],
+            Some("int"),
+            block(vec![
+                stmt(let_binding("y", ident("x"))),
+                stmt(ret(ident("y"))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // Only the original Param (x → v0); no fast-path Param
+        // for the local `y`.
+        let params: Vec<_> = blk
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Param { dst, index } => Some((*dst, *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            params.len(),
+            1,
+            "expected only the original Param (locals shouldn't trigger fast path), got {:?}",
+            params
+        );
+        assert_eq!(params[0], (ValueId(0), 0));
+
+        // Terminator is the original `Return(Some(v0))` — the
+        // local's SSA value shares v0 with the parameter
+        // (because `let y = x;` resolves `x` to v0 and stores
+        // it in `locals["y"]`).
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(0)),
+            "expected Return(Some(v0)) for local return, got {:?}",
+            blk.terminator
+        );
+    }
+
+    #[test]
+    fn build_return_binary_expression_does_not_use_fast_path() {
+        // `fn f(int a, int b) -> int { return a + b; }`
+        //
+        // Binary expressions are NOT supported by the fast path
+        // — the intermediate BinOp result's stack slot isn't
+        // known to the builder (it would require a register
+        // allocator). The Return arm should fall through to the
+        // original behavior.
+        //
+        // This is the documented limitation: complex return
+        // values in child blocks are still buggy. The unit test
+        // here only verifies that the entry-block case produces
+        // the expected CFG (BinOp in the entry block,
+        // `Return(Some(v_binop))`).
+        let func = function(
+            "f",
+            vec![("int", "a"), ("int", "b")],
+            Some("int"),
+            block(vec![stmt(ret(add(ident("a"), ident("b"))))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+        let blk = &cfg.blocks[0];
+
+        // 2 Params (a, b) + 1 BinOp = 3 insts. NO fast-path
+        // Param — the binary expression doesn't trigger it.
+        let params: Vec<_> = blk
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Param { dst, index } => Some((*dst, *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            params.len(),
+            2,
+            "expected 2 Params (no fast-path Param for BinOp), got {:?}",
+            params
+        );
+        assert_eq!(params[0], (ValueId(0), 0));
+        assert_eq!(params[1], (ValueId(1), 1));
+
+        // One BinOp inst.
+        let binops = blk
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::BinOp { .. }))
+            .count();
+        assert_eq!(binops, 1, "expected 1 BinOp inst");
+
+        // Terminator: Return(Some(v2)) — the BinOp's ValueId.
+        assert!(
+            matches!(blk.terminator, Terminator::Return(Some(v)) if v == ValueId(2)),
+            "expected Return(Some(v2)) for binary return, got {:?}",
+            blk.terminator
+        );
     }
 
     // -----------------------------------------------------------------
