@@ -764,9 +764,24 @@ impl Builder {
             // the CFG — the existing codegen's distinction (RETURN
             // vs no-RETURN) is a bytecode-emission concern, not a
             // CFG-structure concern.
+            //
+            // We also set the CURRENT block's terminator to
+            // `Terminator::Return`. Without this, `build_if` /
+            // `build_while`'s post-loop would silently overwrite
+            // the Return with `Jump(join_block)` / `Jump(header)`
+            // when the return is inside an `if` branch / `while`
+            // body, converting early returns into fall-throughs.
+            // The post-loop is now conditional on
+            // `Terminator::Unreachable` (see those functions) so
+            // any block that already has a Return terminator is
+            // left alone.
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
                 let v = self.build_expression(expr.1.as_ref());
                 self.return_value = v;
+                self.current_block_mut().terminator = match v {
+                    Some(val) => Terminator::Return(Some(val)),
+                    None => Terminator::Return(None),
+                };
                 None
             }
 
@@ -1191,13 +1206,25 @@ impl Builder {
         // Patch every deferred Jump-to-join terminator now that
         // `join_block` is allocated. The terminator's target is
         // the same join_block for every block in the list.
+        //
+        // Phase 1.6 fix: only overwrite a block's terminator if
+        // it is still `Terminator::Unreachable`. A block whose
+        // body contained a `return` statement now has
+        // `Terminator::Return(...)` (set by the Return arm in
+        // `build_expression`); the unconditional overwrite would
+        // silently convert the early return into a fall-through
+        // to `join_block`. The Return terminator is the
+        // authoritative control transfer for that block, so it
+        // is left alone.
         let join_block = pending_join_block.expect(
             "cfg_builder::build_if: join_block must be \
              allocated by the end of the loop",
         );
         for bb in blocks_needing_jump_to_join {
-            self.blocks[bb.index()].terminator =
-                Terminator::Jump(join_block);
+            let block = &mut self.blocks[bb.index()];
+            if matches!(block.terminator, Terminator::Unreachable) {
+                block.terminator = Terminator::Jump(join_block);
+            }
         }
 
         // After all branches, set self.current to the
@@ -1334,13 +1361,24 @@ impl Builder {
         // block if the body contains an inner `if`) ends
         // with `Jump(header)` — the back-edge.
         //
-        // Known limitation: this Jump clobbers any Return
-        // terminator the body had (see the doc comment above
-        // for details).
+        // Phase 1.6 fix: only overwrite the terminator if it
+        // is still `Terminator::Unreachable`. A body that
+        // contained a `return` statement now has
+        // `Terminator::Return(...)` (set by the Return arm in
+        // `build_expression`); the unconditional overwrite
+        // would silently convert the early return into a
+        // back-edge to the header. The Return terminator is
+        // the authoritative control transfer for that block,
+        // so it is left alone.
         self.current = body_block;
         let _ = self.build_expression(body);
-        self.current_block_mut().terminator =
-            Terminator::Jump(header_block);
+        if matches!(
+            self.current_block_mut().terminator,
+            Terminator::Unreachable
+        ) {
+            self.current_block_mut().terminator =
+                Terminator::Jump(header_block);
+        }
 
         // Switch to exit. The loop's continuation code
         // (anything after the loop in the parent block)
@@ -2787,7 +2825,13 @@ mod tests {
 
     #[test]
     fn build_if_single_branch_produces_three_blocks() {
-        // `fn f() -> int { if true { return 1; } return 0; }`
+        // `fn f() -> int { if true { 1; } return 0; }`
+        //
+        // The if-body uses a bare integer statement (`1;`) so the
+        // then_block has no Return terminator — this test is about
+        // the build_if BLOCK STRUCTURE, not early-return semantics.
+        // The early-return case is covered by
+        // `build_if_then_block_with_return_keeps_return_terminator`.
         //
         // Block structure (Phase 1.5 fix — then_block comes
         // IMMEDIATELY after entry so the linearizer's JMPF
@@ -2807,7 +2851,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(if_single(bool_lit(true), block(vec![stmt(ret(int(1)))]))),
+                stmt(if_single(bool_lit(true), block(vec![stmt(int(1))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -2856,7 +2900,7 @@ mod tests {
                 .insts
                 .iter()
                 .any(|i| matches!(i, Inst::Const { value: 1, .. })),
-            "then_block should contain Const(1) (the `return 1` body)"
+            "then_block should contain Const(1) (the `1;` body)"
         );
         match &then_block.terminator {
             Terminator::Jump(bb) => assert_eq!(
@@ -2887,7 +2931,14 @@ mod tests {
 
     #[test]
     fn build_if_else_produces_four_blocks() {
-        // `fn f() -> int { if c { return 1; } else { return 2; } }`
+        // `fn f() -> int { if c { 1; } else { 2; } }`
+        //
+        // The if-body and else-body use bare integer statements
+        // (`1;`, `2;`) so neither block has a Return terminator —
+        // this test is about the build_if BLOCK STRUCTURE, not
+        // early-return semantics. The early-return case is
+        // covered by
+        // `build_if_then_block_with_return_keeps_return_terminator`.
         //
         // Block structure (Phase 1.5 fix — then_block comes
         // IMMEDIATELY after entry):
@@ -2907,8 +2958,8 @@ mod tests {
             Some("int"),
             block(vec![stmt(if_else(
                 bool_lit(true),
-                block(vec![stmt(ret(int(1)))]),
-                block(vec![stmt(ret(int(2)))]),
+                block(vec![stmt(int(1))]),
+                block(vec![stmt(int(2))]),
             ))]),
         );
         let mut builder = Builder::new();
@@ -2962,10 +3013,17 @@ mod tests {
     #[test]
     fn build_if_else_if_else_produces_six_blocks() {
         // `fn f() -> int {
-        //      if c1 { return 1; }
-        //      else if c2 { return 2; }
-        //      else { return 3; }
+        //      if c1 { 1; }
+        //      else if c2 { 2; }
+        //      else { 3; }
         //  }`
+        //
+        // The branch bodies use bare integer statements
+        // (`1;`, `2;`, `3;`) so no branch has a Return
+        // terminator — this test is about the build_if BLOCK
+        // STRUCTURE, not early-return semantics. The
+        // early-return case is covered by
+        // `build_if_then_block_with_return_keeps_return_terminator`.
         //
         // Block structure (Phase 1.5 fix — then_block always
         // comes IMMEDIATELY after the Branch's block; the
@@ -2988,10 +3046,10 @@ mod tests {
             Some("int"),
             block(vec![stmt(if_else_if_else(
                 bool_lit(true),
-                block(vec![stmt(ret(int(1)))]),
+                block(vec![stmt(int(1))]),
                 bool_lit(false),
-                block(vec![stmt(ret(int(2)))]),
-                block(vec![stmt(ret(int(3)))]),
+                block(vec![stmt(int(2))]),
+                block(vec![stmt(int(3))]),
             ))]),
         );
         let mut builder = Builder::new();
@@ -3064,7 +3122,14 @@ mod tests {
 
     #[test]
     fn build_if_predecessors_are_filled_correctly() {
-        // `fn f() -> int { if true { return 1; } else { return 2; } }`
+        // `fn f() -> int { if true { 1; } else { 2; } }`
+        //
+        // The branch bodies use bare integer statements so
+        // neither branch has a Return terminator — this test
+        // is about the build_if predecessors (which require
+        // each branch to Jump to join, not Return). The
+        // early-return case is covered by
+        // `build_if_then_block_with_return_keeps_return_terminator`.
         //
         // Block IDs (Phase 1.5 fix — then_block is at index 1,
         // immediately after entry, so the linearizer's JMPF
@@ -3079,8 +3144,8 @@ mod tests {
             Some("int"),
             block(vec![stmt(if_else(
                 bool_lit(true),
-                block(vec![stmt(ret(int(1)))]),
-                block(vec![stmt(ret(int(2)))]),
+                block(vec![stmt(int(1))]),
+                block(vec![stmt(int(2))]),
             ))]),
         );
         let mut builder = Builder::new();
@@ -3311,7 +3376,14 @@ mod tests {
 
     #[test]
     fn build_while_loop_body_terminator_jumps_back_to_header() {
-        // `fn f() -> int { while true { return 1; } return 0; }`
+        // `fn f() -> int { while true { 1; } return 0; }`
+        //
+        // The body uses a bare integer statement (`1;`) so the
+        // body block has no Return terminator — this test is
+        // about the build_while BLOCK STRUCTURE (the back-edge
+        // Jump), not early-return semantics. The early-return
+        // case is covered by
+        // `build_while_body_with_return_keeps_return_terminator`.
         //
         // Block IDs: 0 (entry), 1 (header), 2 (body), 3 (exit).
         // The body (BlockId(2)) should Jump back to the header
@@ -3323,7 +3395,7 @@ mod tests {
             block(vec![
                 stmt(while_loop(
                     bool_lit(true),
-                    block(vec![stmt(ret(int(1)))]),
+                    block(vec![stmt(int(1))]),
                 )),
                 stmt(ret(int(0))),
             ]),
@@ -3371,7 +3443,14 @@ mod tests {
 
     #[test]
     fn build_while_loop_predecessors_are_filled_correctly() {
-        // `fn f() -> int { while true { return 1; } return 0; }`
+        // `fn f() -> int { while true { 1; } return 0; }`
+        //
+        // The body uses a bare integer statement (`1;`) so the
+        // body block has no Return terminator — this test is
+        // about the build_while predecessors (which require the
+        // body to Jump back to the header, not Return). The
+        // early-return case is covered by
+        // `build_while_body_with_return_keeps_return_terminator`.
         //
         // Block IDs: 0 (entry), 1 (header), 2 (body), 3 (exit).
         //
@@ -3387,7 +3466,7 @@ mod tests {
             block(vec![
                 stmt(while_loop(
                     bool_lit(true),
-                    block(vec![stmt(ret(int(1)))]),
+                    block(vec![stmt(int(1))]),
                 )),
                 stmt(ret(int(0))),
             ]),
@@ -3458,6 +3537,297 @@ mod tests {
             cfg.blocks[exit_id.index()].predecessors,
             vec![header_id],
             "exit block should have header as sole predecessor"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 1.6: early-return preservation.
+    //
+    // Before Phase 1.6, `Expression::Return` only set
+    // `self.return_value`; the current block's terminator stayed
+    // `Unreachable`. The post-loop in `build_if` /
+    // `build_while` then unconditionally overwrote the block's
+    // terminator with `Jump(join_block)` / `Jump(header_block)`,
+    // silently converting early returns into fall-throughs.
+    //
+    // Phase 1.6 fixes both halves of the bug:
+    //   1. `Expression::Return` now sets the current block's
+    //      terminator to `Terminator::Return`.
+    //   2. The post-loop is conditional on
+    //      `Terminator::Unreachable`, so blocks with a Return
+    //      terminator are left alone.
+    //
+    // The tests below verify both halves end-to-end.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_if_then_block_with_return_keeps_return_terminator() {
+        // `fn f() -> int { if c { return 1; } else { return 2; } }`
+        //
+        // Both the then_block and the else_block contain a
+        // `return` statement. After Phase 1.6, both blocks should
+        // have `Terminator::Return(...)` instead of being
+        // overwritten with `Jump(join_block)`.
+        //
+        // Block structure:
+        //   0 (entry):      Cond(c) → v0,  Branch(v0, 1, 2)
+        //   1 (then_block): Const(1) → v1, Return(Some(v1))
+        //   2 (else_block): Const(2) → v2, Return(Some(v2))
+        //   3 (join):       Return(None)  (no continuation)
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(if_else(
+                bool_lit(true),
+                block(vec![stmt(ret(int(1)))]),
+                block(vec![stmt(ret(int(2)))]),
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks (entry + then + else + join), got {}",
+            cfg.blocks.len()
+        );
+
+        // then_block (BlockId 1) keeps its Return terminator.
+        assert!(
+            matches!(&cfg.blocks[1].terminator, Terminator::Return(Some(_))),
+            "then_block should have Return(Some(_)) terminator, got {:?}",
+            cfg.blocks[1].terminator
+        );
+
+        // else_block (BlockId 2) keeps its Return terminator.
+        assert!(
+            matches!(&cfg.blocks[2].terminator, Terminator::Return(Some(_))),
+            "else_block should have Return(Some(_)) terminator, got {:?}",
+            cfg.blocks[2].terminator
+        );
+
+        // join_block (BlockId 3) has Return (no continuation).
+        assert!(
+            matches!(&cfg.blocks[3].terminator, Terminator::Return(_)),
+            "join block should have Return terminator, got {:?}",
+            cfg.blocks[3].terminator
+        );
+    }
+
+    #[test]
+    fn build_if_with_only_one_return_keeps_other_as_jump() {
+        // `fn f() -> int { if c { return 1; } else { 2; } }`
+        //
+        // Mixed case: only one branch has a `return`. After
+        // Phase 1.6, the branch with the return keeps its Return
+        // terminator; the branch without falls through to
+        // join_block via the post-loop's Jump(join) patch.
+        //
+        // Block structure:
+        //   0 (entry):      Cond(c) → v0,  Branch(v0, 1, 2)
+        //   1 (then_block): Const(1) → v1, Return(Some(v1))
+        //   2 (else_block): Const(2) → v2, Jump(3)
+        //   3 (join):       Return(None)  (no continuation)
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(if_else(
+                bool_lit(true),
+                block(vec![stmt(ret(int(1)))]),
+                block(vec![stmt(int(2))]),
+            ))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks (entry + then + else + join), got {}",
+            cfg.blocks.len()
+        );
+
+        // then_block has Return (early return inside the branch).
+        assert!(
+            matches!(&cfg.blocks[1].terminator, Terminator::Return(Some(_))),
+            "then_block should have Return(Some(_)) terminator, got {:?}",
+            cfg.blocks[1].terminator
+        );
+
+        // else_block falls through to join_block via Jump.
+        assert!(
+            matches!(&cfg.blocks[2].terminator, Terminator::Jump(bb) if *bb == BlockId(3)),
+            "else_block should have Jump(3) terminator, got {:?}",
+            cfg.blocks[2].terminator
+        );
+
+        // join_block has Return (no continuation after the if).
+        assert!(
+            matches!(&cfg.blocks[3].terminator, Terminator::Return(_)),
+            "join block should have Return terminator, got {:?}",
+            cfg.blocks[3].terminator
+        );
+    }
+
+    #[test]
+    fn build_while_body_with_return_keeps_return_terminator() {
+        // `fn f() -> int { while c { return 1; } return 0; }`
+        //
+        // The body contains a `return`. After Phase 1.6, the
+        // body block keeps its Return terminator instead of
+        // being overwritten with `Jump(header)`. The back-edge
+        // Jump is no longer emitted for that block.
+        //
+        // Block structure:
+        //   0 (entry):   Jump(1)
+        //   1 (header):  ConstBool(c) → v0, Branch(v0, 2, 3)
+        //   2 (body):    Const(1) → v1,     Return(Some(v1))
+        //   3 (exit):    Const(0) → v2,     Return(Some(v2))
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(while_loop(
+                    bool_lit(true),
+                    block(vec![stmt(ret(int(1)))]),
+                )),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks (entry + header + body + exit), got {}",
+            cfg.blocks.len()
+        );
+
+        // Find the body block: it's the one with Const(1) AND
+        // Return (not Jump back-edge).
+        let body_block = cfg
+            .blocks
+            .iter()
+            .find(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::Const { value: 1, .. }))
+                    && matches!(b.terminator, Terminator::Return(_))
+            })
+            .expect("expected a body block with Const(1) and Return");
+
+        assert!(
+            matches!(body_block.terminator, Terminator::Return(Some(_))),
+            "body block should have Return(Some(_)) terminator (early return), got {:?}",
+            body_block.terminator
+        );
+    }
+
+    #[test]
+    fn build_while_body_with_no_return_keeps_back_edge_jump() {
+        // `fn f() -> int { while c { 1; } return 0; }`
+        //
+        // Regression check: the body has NO `return`. After
+        // Phase 1.6, the body block should still have
+        // `Jump(header)` (the back-edge). The conditional
+        // post-loop must NOT clobber the Jump.
+        //
+        // Block structure:
+        //   0 (entry):   Jump(1)
+        //   1 (header):  ConstBool(c) → v0, Branch(v0, 2, 3)
+        //   2 (body):    Const(1) → v1,     Jump(1)  ← back-edge
+        //   3 (exit):    Const(0) → v2,     Return(Some(v2))
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![
+                stmt(while_loop(
+                    bool_lit(true),
+                    block(vec![stmt(int(1))]),
+                )),
+                stmt(ret(int(0))),
+            ]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks (entry + header + body + exit), got {}",
+            cfg.blocks.len()
+        );
+
+        // Find the header's BlockId by its Branch terminator.
+        let header_id = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::Branch { .. }))
+            .map(|b| b.id)
+            .expect("expected a header block with Branch terminator");
+
+        // The body block must have Jump(header) — the back-edge.
+        let body_block = cfg
+            .blocks
+            .iter()
+            .find(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::Const { value: 1, .. }))
+                    && matches!(&b.terminator, Terminator::Jump(target) if *target == header_id)
+            })
+            .expect("expected a body block with Const(1) and Jump back-edge");
+
+        if let Terminator::Jump(target) = body_block.terminator {
+            assert_eq!(
+                target, header_id,
+                "body's Jump target should be the header (the back-edge)"
+            );
+        } else {
+            panic!(
+                "expected Jump terminator on body block, got {:?}",
+                body_block.terminator
+            );
+        }
+    }
+
+    #[test]
+    fn build_function_level_return_sets_entry_block_terminator() {
+        // `fn f() -> int { return 42; }`
+        //
+        // Phase 1.6 fix: Expression::Return now sets the
+        // current block's terminator to Return. For a
+        // function-level return, the current block IS the entry
+        // block, so the entry block's terminator should be
+        // Return(Some(v42)) — not overwritten later.
+        let func = function(
+            "f",
+            vec![],
+            Some("int"),
+            block(vec![stmt(ret(int(42)))]),
+        );
+        let mut builder = Builder::new();
+        let cfg = builder.build_function(&func);
+
+        assert_eq!(
+            cfg.blocks.len(),
+            1,
+            "function-level return should produce 1 block"
+        );
+
+        // Entry block should have Return(Some(v0)) — the
+        // ValueId of Const(42).
+        let entry = &cfg.blocks[0];
+        assert!(
+            matches!(&entry.terminator, Terminator::Return(Some(v)) if *v == ValueId(0)),
+            "entry block should have Return(Some(v0)) terminator, got {:?}",
+            entry.terminator
         );
     }
 
