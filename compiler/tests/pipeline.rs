@@ -625,3 +625,61 @@ fn fib_via_lifted_is_straight_line_produces_13() {
     let output = run_example("examples/fib.0s");
     assert_eq!(output, "13");
 }
+
+// ============================================================
+//  Phase 1.6: control-flow smoke (mixed-path regression)
+// ============================================================
+
+/// Phase 1.6 regression test — `examples/control_flow_smoke.0s`
+/// exercises the mixed-path integration between the
+/// legacy single-pass codegen path and the multi-pass CFG
+/// path.
+///
+/// The example declares three control-flow helpers (`max`,
+/// `abs_diff`, `min`) whose bodies are pure `if/else`
+/// expressions with `return` in both branches. Each helper
+/// carries a self-recursive call inside its branches (never
+/// invoked, since both branches return before reaching the
+/// call). The recursive call trips the
+/// [`is_straight_line`](../../compiler/src/lib.rs) detector's
+/// `Expression::Call => false` arm, forcing each helper
+/// onto the single-pass codegen path.
+///
+/// `main` always falls back to single-pass because it
+/// contains `Print` and `Call` (still flagged as
+/// "not straight-line"). The mixed-path integration —
+///
+///   single-pass helpers (`max`, `abs_diff`, `min`)
+///     called from
+///   single-pass `main`
+///
+/// — is what this test verifies.
+///
+/// This is a REGRESSION test, not a CFG-path verification.
+/// The CFG path has two open linearizer bugs that prevent
+/// it from producing correct bytecode for control-flow
+/// functions (deferred to a future commit):
+///
+///   1. `block_offsets` are relative to the per-function
+///      linearized buffer, but the VM reads them as
+///      absolute offsets.
+///   2. `Terminator::Return(Some(ValueId))` doesn't emit
+///      `LOAD` before `RETURN`.
+///
+/// Once both bugs are fixed, the recursive calls in this
+/// example can be removed — each helper will then
+/// exercise the CFG path end-to-end.
+///
+/// Expected output (four `print "%i"` statements, no
+/// trailing newline):
+///   - `max(3, 7)` returns 7 (3 > 7 is false, return b)
+///   - `abs_diff(10, 5)` returns 5 (10 > 5 is true, return a - b)
+///   - `min(8, 2)` returns 2 (8 < 2 is false, return b)
+///   - `max(-5, -10)` returns -5 (-5 > -10 is true, return a)
+///
+/// Concatenated: "7" + "5" + "2" + "-5" = "752-5".
+#[test]
+fn example_control_flow_smoke_prints_7_5_2_neg_5() {
+    let output = run_example("examples/control_flow_smoke.0s");
+    assert_eq!(output, "752-5");
+}
