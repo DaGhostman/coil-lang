@@ -207,6 +207,8 @@ impl BlockBuilder {
 
     /// Emit a jump placeholder with a FRESHLY ALLOCATED label as
     /// the target. The caller must later `bind_label` the returned
+    /// label to set the target. See [`BlockBuilder::emit_jump_to`]
+    /// for the more flexible variant.
     /// label. Equivalent to
     /// `let l = self.fresh_label(); self.emit_jump_to(l, kind, bytecode); l`.
     #[allow(dead_code)] // Not used by the current If codegen; reserved for future

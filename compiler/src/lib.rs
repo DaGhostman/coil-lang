@@ -2383,10 +2383,13 @@ impl Compiler {
                 let top_label = bb.fresh_label();
                 let exit_label = bb.fresh_label();
 
-                // Bind top_label to the current position (start of
-                // the loop). The back-edge JMP at the end of the
-                // body will be patched to point here.
-                bb.bind_label(top_label, self.bytecode.len() as u32, &mut self.bytecode);
+                // The top_label must be bound AFTER the back-edge
+                // JMP is emitted (so the JMP's position is in
+                // `pending[top_label]` and `bind_label` can patch
+                // it). The exit_label is bound AFTER the body
+                // (so the JMPF's position is in `pending[exit_label]`
+                // and `bind_label` can patch it).
+                let top_label_target = self.bytecode.len() as u32;
 
                 // Emit the iterable (the condition expression).
                 // Borrow-checker note: same as the body case
@@ -2399,11 +2402,6 @@ impl Compiler {
                 // When the condition is false, the JMPF skips past
                 // the body to exit the loop.
                 bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
-
-                // Bind exit_label to the current position (start
-                // of the body in the bytecode). This patches the
-                // JMPF placeholder.
-                bb.bind_label(exit_label, self.bytecode.len() as u32, &mut self.bytecode);
 
                 // Emit the body. The body is a `Block` (a
                 // sequence of statements) — `do_compile` handles
@@ -2421,10 +2419,22 @@ impl Compiler {
                 let body_bc = self.do_compile(body);
                 self.bytecode.extend(body_bc);
 
+                // Bind exit_label to the END of the body (the
+                // current bytecode position, which is right after
+                // the body). This patches the JMPF placeholder
+                // to skip past the body when the condition is
+                // false.
+                let exit_label_target = self.bytecode.len() as u32;
+                bb.bind_label(exit_label, exit_label_target, &mut self.bytecode);
+
                 // Emit the back-edge JMP → top_label. When the
                 // body finishes, control jumps back to the top of
                 // the loop (where `top_label` was bound).
                 bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+                // NOW bind top_label (after the back-edge JMP was
+                // emitted, so the JMP's position is in `pending`).
+                bb.bind_label(top_label, top_label_target, &mut self.bytecode);
 
                 // Validate: every label that had a pending jump is
                 // bound. (Both `top_label` and `exit_label` were
