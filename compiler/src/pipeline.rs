@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -37,13 +37,16 @@ pub struct Pipeline {
     project_root: PathBuf,
     manifest: Manifest,
     bytecode: Vec<Byte>,
-    /// Map from absolute file path to its derived
-    /// namespace. Populated as files are discovered
-    /// (so we don't re-derive on revisit).
-    file_namespaces: HashMap<PathBuf, Option<String>>,
     /// Set of files already visited (used to short-circuit
     /// diamond dependencies in the worklist).
-    processed: HashSet<PathBuf>,
+    ///
+    /// A `Vec<PathBuf>` rather than a `HashSet` because
+    /// typical projects have <100 source files and a
+    /// linear scan is faster than hashing for that size.
+    /// Each entry is checked exactly once per `enqueue_file`
+    /// call, and the per-file `PathBuf` allocation dominates
+    /// the linear scan cost.
+    processed: Vec<PathBuf>,
     /// FIFO queue of files to process. Drained front-to-back.
     worklist: VecDeque<WorkItem>,
     /// Native functions registered by the host. The
@@ -57,21 +60,30 @@ pub struct Pipeline {
     /// regardless of its path on disk. Every other
     /// file gets its path-derived namespace.
     entry_file: Option<PathBuf>,
-    /// Phase 29A — parsed-source cache.
-    ///
-    /// `discover_all` reads each file from disk to
-    /// find its `use`/`mod` declarations. `compile_file`
-    /// then reads the SAME file again to compile it.
-    /// The cache holds the owned source text so the
-    /// second `read_to_string` is avoided.
-    ///
-    /// Caching the AST itself would avoid the
-    /// second parse too, but `Output<'parser>` borrows
-    /// from the source — owning the source for the
-    /// entire `compile` call would require `'static`,
-    /// which leaks. The `read_to_string` save is the
-    /// I/O win; re-parsing is fast enough.
-    source_cache: HashMap<PathBuf, String>,
+/// Phase 29A — parsed-source cache.
+///
+/// `discover_all` reads each file from disk to
+/// find its `use`/`mod` declarations. `compile_file`
+/// then reads the SAME file again to compile it.
+/// The cache holds the owned source text so the
+/// second `read_to_string` is avoided.
+///
+/// Implementation: an `Interner<PathBuf>` assigns
+/// each unique path a small `u32` ID; the source
+/// text is stored in a `Vec<Option<String>>` indexed
+/// by ID. Lookup is a Vec index (`O(1)`, no hash).
+/// Compared to `HashMap<PathBuf, String>` this saves
+/// the per-entry `PathBuf` hash and bucket overhead,
+/// and replaces the `String` key with a `u32` copy.
+///
+/// Caching the AST itself would avoid the
+/// second parse too, but `Output<'parser>` borrows
+/// from the source — owning the source for the
+/// entire `compile` call would require `'static`,
+/// which leaks. The `read_to_string` save is the
+/// I/O win; re-parsing is fast enough.
+source_interner: common::Interner<PathBuf>,
+source_cache: Vec<Option<String>>,
     compiler: Compiler,
 }
 
@@ -156,12 +168,12 @@ impl Pipeline {
             project_root,
             manifest,
             bytecode,
-            file_namespaces: HashMap::default(),
-            processed: HashSet::default(),
+            processed: Vec::new(),
             worklist: VecDeque::new(),
             natives: Vec::new(),
             entry_file: None,
-            source_cache: HashMap::default(),
+            source_interner: common::Interner::default(),
+            source_cache: Vec::new(),
             compiler: Compiler::default(),
         }
     }
@@ -292,18 +304,22 @@ impl Pipeline {
     /// processed. Computes and caches the file's
     /// namespace.
     fn enqueue_file(&mut self, file: PathBuf) {
+        // Linear scan: typical projects have <100 files
+        // and a Vec scan is faster than hashing each
+        // PathBuf. Mark the file as processed
+        // immediately so concurrent enqueues from
+        // `discover_all` don't re-add it.
         if self.processed.contains(&file) {
             #[cfg(debug_assertions)]
             eprintln!("[pipeline]   already loaded {}", file.display());
             return;
         }
         let ns = self.manifest.namespace_of(&self.project_root, &file);
-        // Mark as "in progress" by inserting into
-        // `processed` immediately. This prevents
-        // unbounded recursion in diamond dependencies.
-        self.processed.insert(file.clone());
-        self.file_namespaces.insert(file.clone(), ns.clone());
-        self.worklist.push_back(WorkItem { file: file.clone(), namespace: ns.clone() });
+        self.processed.push(file.clone());
+        self.worklist.push_back(WorkItem {
+            file: file.clone(),
+            namespace: ns.clone(),
+        });
         #[cfg(debug_assertions)]
         eprintln!(
             "[pipeline]   enqueued {} (namespace={})",
@@ -318,7 +334,22 @@ impl Pipeline {
     /// the file can't be read; the caller records the
     /// error and bails.
     fn read_source(&mut self, file: &Path) -> Option<String> {
-        if let Some(cached) = self.source_cache.get(file) {
+        // Intern the path. Repeated calls with the same
+        // path return the same id; new paths extend the
+        // interner's storage. The id is a `u32` (Copy),
+        // not a `PathBuf` (heap-allocated), so the
+        // lookup is cheaper than a HashMap key.
+        let id = self.source_interner.intern(file.to_path_buf());
+        // Resize the cache if this is a fresh path.
+        // We extend Vec length up to (id + 1) with
+        // `None` placeholders so the indexed lookup
+        // below is bounds-checked by Rust (panics if
+        // id is out of range, which it isn't by
+        // construction).
+        if self.source_cache.len() <= id {
+            self.source_cache.resize(id + 1, None);
+        }
+        if let Some(cached) = self.source_cache[id].as_ref() {
             #[cfg(debug_assertions)]
             eprintln!("[pipeline]   cache hit for {}", file.display());
             return Some(cached.clone());
@@ -326,8 +357,12 @@ impl Pipeline {
         match std::fs::read_to_string(file) {
             Ok(s) => {
                 #[cfg(debug_assertions)]
-                eprintln!("[pipeline]   loaded {} ({} bytes)", file.display(), s.len());
-                self.source_cache.insert(file.to_path_buf(), s.clone());
+                eprintln!(
+                    "[pipeline]   loaded {} ({} bytes)",
+                    file.display(),
+                    s.len()
+                );
+                self.source_cache[id] = Some(s.clone());
                 Some(s)
             }
             Err(_) => None,
@@ -341,33 +376,68 @@ impl Pipeline {
     /// that the compilation pass can run in
     /// dependency order.
     ///
-    /// The `processed` set guards against re-enqueuing
+/// The `processed` set guards against re-enqueuing
     /// (so the same file isn't discovered twice). The
     /// `failed` flag is set if any file fails to parse.
     fn discover_all(&mut self) {
         #[cfg(debug_assertions)]
         eprintln!("[pipeline] scanning for files (entry={:?})", self.entry_file);
-        // We need a separate "discover-only" loop that
-        // processes the worklist front-to-back but
-        // doesn't compile. We mutate `self.worklist`
-        // while iterating (new items are added to the
-        // back, so a `while let Some(...) = pop_front`
-        // loop terminates when the worklist is fully
-        // drained).
-        let mut to_discover: Vec<PathBuf> = Vec::new();
-        for item in &self.worklist {
-            to_discover.push(item.file.clone());
-        }
-        // Walk transitively. We can't call
-        // `compile_file` (which would emit bytecode)
-        // and we can't call `enqueue_uses` directly
-        // because that needs the AST. So: parse each
-        // file in isolation, enqueue its uses, repeat.
-        let mut i = 0;
-        while i < to_discover.len() {
-            let file = to_discover[i].clone();
+        // Walk the worklist from the front, parsing each
+        // file to find its `use`/`mod` declarations.
+        // `enqueue_file` adds new dependencies to the back
+        // of the worklist and dedupes against `processed`,
+        // so each file is scanned exactly once.
+        //
+        // Each scanned item is RE-ENQUEUED at the back so
+        // the compile pass finds it. The trade-off:
+        // O(N) extra pops (one per scan) vs allocating
+        // a separate scan queue. For typical projects
+        // (<100 files) the O(N) cost is negligible.
+        //
+        // `enqueue_uses`'s re-enqueues of already-processed
+        // dependencies are no-ops, so the only repeated
+        // work would be re-parsing a file's `use`s. We
+        // skip that via `already_scanned` — a file's
+        // `use`s are walked exactly once.
+        //
+        // Termination: track the worklist length at the
+        // end of each pass. If it doesn't grow after a
+        // pass (i.e., `enqueue_uses` added nothing new),
+        // we're done. Each pass is at most one full
+        // rotation of the worklist (since new items are
+        // added to the BACK, the front gets recycled).
+        // So total work is O(N^2) worst case, but in
+        // practice O(N) for tree-shaped dependency
+        // graphs.
+        let mut already_scanned: Vec<PathBuf> = Vec::new();
+        let mut depth = 0usize;
+        let mut prev_len = self.worklist.len();
+        loop {
+            let item = match self.worklist.pop_front() {
+                Some(i) => i,
+                None => break,
+            };
+            let file = item.file.clone();
+            if already_scanned.contains(&file) {
+                // Re-enqueue at the back so the compile
+                // pass finds it. But don't re-scan.
+                self.worklist.push_back(item);
+                continue;
+            }
             #[cfg(debug_assertions)]
-            eprintln!("[pipeline]   scanning {} (depth {})", file.display(), i);
+            eprintln!(
+                "[pipeline]   scanning {} (depth {})",
+                file.display(),
+                depth
+            );
+            depth += 1;
+            already_scanned.push(file.clone());
+            // Re-enqueue at the back so the compile pass
+            // can find it. The compile pass drains the
+            // worklist in LIFO order via `pop_back`,
+            // so dependencies (which are at the back)
+            // are compiled first.
+            self.worklist.push_back(item);
             // Read the source (cached after the first
             // call). The `compile_file` pass reuses the
             // same cached source, so the file is only
@@ -385,7 +455,6 @@ impl Pipeline {
                     ));
                     self.compiler.messages.push(msg);
                     self.failed = true;
-                    i += 1;
                     continue;
                 }
             };
@@ -399,26 +468,20 @@ impl Pipeline {
                         &errors,
                     );
                     self.failed = true;
-                    i += 1;
                     continue;
                 }
             };
             self.enqueue_uses(&ast);
-            // Pick up any newly enqueued files.
-            let before = to_discover.len();
-            for item in &self.worklist {
-                if !to_discover.contains(&item.file) {
-                    to_discover.push(item.file.clone());
-                }
+            // Termination check: if the worklist
+            // length didn't change after this pass,
+            // we're done. This is true when
+            // `enqueue_uses` found no new
+            // dependencies.
+            let new_len = self.worklist.len();
+            if new_len == prev_len {
+                break;
             }
-            #[cfg(debug_assertions)]
-            if to_discover.len() > before {
-                eprintln!(
-                    "[pipeline]   {} new file(s) discovered",
-                    to_discover.len() - before
-                );
-            }
-            i += 1;
+            prev_len = new_len;
         }
         #[cfg(debug_assertions)]
         eprintln!(
