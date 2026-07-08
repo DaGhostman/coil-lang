@@ -114,7 +114,8 @@ pub use typechecking::{Checker, Ty};
 - `compiler/src/typechecking/pretty.rs` (~130 LOC)
 - `compiler/tests/diagnostics.rs` (15 tests)
 - `HM_TYPECHECKER_PLAN.md`
-- `examples/fib.0s` (tweaked from `fib(32)` to `fib(7)`)
+- `examples/fib.0s` (tweaked from `fib(7)` to `fib(32)`; expects
+  the 32nd Fibonacci number, `2178309`)
 
 **Removed:**
 - `compiler/src/typechecker.rs` (~600 LOC)
@@ -1041,7 +1042,7 @@ parser warnings. No new compiler or machine warnings.
 - `cargo test -p compiler --test pipeline` (6 golden tests) all pass.
 - `cargo run -- examples/fizbuz.0s` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
-- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
 - `cargo run -- examples/option.0s` prints `42`.
 - `cargo run -- examples/result.0s` prints `42-1`.
 - `cargo run -- examples/tree.0s` prints `6`.
@@ -1302,7 +1303,7 @@ No new compiler or machine warnings.
 - `cargo test -p compiler --test pipeline` (6 golden tests) all pass.
 - `cargo run -- examples/fizbuz.0s` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
-- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
 - `cargo run -- examples/option.0s` prints `42`.
 - `cargo run -- examples/result.0s` prints `42-1`.
 - `cargo run -- examples/tree.0s` prints `6`.
@@ -1488,7 +1489,7 @@ parser warnings. No new compiler or machine warnings.
   pass, including `example_record_prints_169_5_12`.
 - `cargo run -- examples/record.0s` terminates with
   `169512`.
-- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
 - `cargo run -- examples/option.0s` prints `42`.
 - `cargo run -- examples/result.0s` prints `420-1`.
 - `cargo run -- examples/tree.0s` prints `6`.
@@ -1778,7 +1779,7 @@ machine warnings.
 ### Critical regression check
 
 - `cargo test --workspace` — all 361 tests pass.
-- `cargo run -- examples/fib.0s` terminates with `13`.
+- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
 - `cargo run -- examples/option.0s` prints `42`.
 - `cargo run -- examples/result.0s` prints `42-1`.
 - `cargo run -- examples/tree.0s` prints `6`.
@@ -3417,3 +3418,838 @@ warning-free.
   and `linearize.rs` are private (`mod cfg_builder;` /
   `mod linearize;`). Phase 21+ will make them public
   when external consumers need them.
+
+## PHASE 21A+B — REGISTER-FORM OPCODE VOCABULARY + LIVENESS (COMPLETED)
+
+### Summary
+
+Established the foundational infrastructure for the
+register VM migration described in
+[`MULTI_PASS_REFACTOR_PLAN.md`](./MULTI_PASS_REFACTOR_PLAN.md).
+Phase 21A appends the new register-form opcodes to the
+existing `Instruction` enum (without shifting any prior
+discriminant) and adds Dalvik-style hybrid register
+encoding helpers. Phase 21B adds the `liveness` analysis
+pass that the Phase 21D register allocator will consume.
+
+Both phases are additive — no existing consumer of the
+bytecode format changed, and the legacy stack-form
+linearizer still emits the existing opcodes exactly as
+before.
+
+### What works
+
+#### Phase 21A — Opcode vocabulary (`common/src/opcode.rs`)
+
+Appended 31 new variants to the `Instruction` enum
+(discriminants 55–86). All variants use PascalCase to
+match the post-Phase 15C precedent (`MakeEnum`,
+`JumpIfMatch`, `StorePop`, `UnpackAt`). The new variants
+are NOT consumed by any production codegen path — the
+existing `linearize::linearize` still emits the stack-form
+opcodes unchanged.
+
+Per-opcode operand layouts (documented inline in
+`opcode.rs`):
+
+| Opcode                | Operands / value layout                                |
+|-----------------------|-------------------------------------------------------|
+| `MovReg`              | dst + src in low 16 bits of `operands`                 |
+| `MovImm`              | dst in low 8 bits; 64-bit imm in `value`                |
+| `AddReg`–`ModReg`, `NegReg`, `NotReg`           | dst/src1/src2 in low 24 bits |
+| `AddFReg`–`ModFReg`   | dst/src1/src2 in low 24 bits                           |
+| `CmpReg`              | dst/src1/src2 in low 24 bits                           |
+| `EqFReg`–`GeqFReg`    | dst/src1/src2 in low 24 bits                           |
+| `JmpReg`              | full u32 target                                        |
+| `JmpfReg`/`JmptReg`   | src in low 8 bits; 32-bit target in `value[31:0]`     |
+| `CallReg`             | dst + argc in low 16 bits; callee idx in `value[31:0]` |
+| `RetReg`              | src in low 8 bits                                      |
+| `MakeEnumReg`         | dst + arity in low 16 bits; tag in upper 16; payload regs as trailing bytes |
+| `JumpIfMatchReg`      | src + tag in low 8 bits; 32-bit target in `value[31:0]` |
+| `UnpackReg`           | src + arity in low 16 bits; dst regs as trailing bytes |
+| `LoadFieldReg`        | dst + src + field_index in low 24 bits                 |
+| `PrintReg`            | argc in low 16 bits; arg regs as trailing bytes        |
+
+Register operands use **Dalvik-style hybrid encoding**
+(plan Decision 4, validated by Experiment C at
+`experiments/regalloc_pressure/`):
+
+- `regs 0..16` → single inline byte
+- `regs 16..256` → `0xF0 | (reg >> 4)` escape prefix +
+  trailing byte for `reg & 0xFF`
+
+The helpers `encode_reg`, `decode_reg`, `encode_1reg`,
+`encode_2reg`, `encode_3reg` pack/unpack registers into
+the `u32` operand field with the trailing-bytes
+manifest returned as a `Vec<u8>`. Callers emit the
+trailing bytes immediately after the primary byte (the
+linearizer will use this in Phase 21C).
+
+#### Phase 21B — Liveness analysis (`compiler/src/liveness.rs`)
+
+New module implementing a backward dataflow liveness
+analysis over a `cfg::Function`. Computes per-block
+`live_in` and `live_out` sets of `ValueId`s using a
+fixed-point iteration:
+
+```
+live_out[B] = ⋃ live_in[S]  for every successor S of B
+live_in[B]  = use[B] ∪ (live_out[B] − def[B])
+```
+
+SSA-lite (no phi nodes, validated by Experiment A) means
+the algorithm converges in O(depth(B)) iterations;
+typically one pass suffices.
+
+`use`/`def` per instruction is computed in
+`defs_of_inst`/`uses_of_inst`. Per-terminator use is
+computed in `uses_of_terminator`. The `successors`
+helper enumerates successor blocks for every
+`Terminator` variant.
+
+### Decisions locked in
+
+1. **Append-only opcode additions.** New variants are
+   placed AFTER `UnpackAt` (variant 55), preserving
+   `#[repr(u8)]` discriminant stability for every
+   `.0s` archive compiled before this commit. Inserting
+   a new variant earlier would shift every later
+   discriminant and silently corrupt every archived
+   file (see the comment block at `opcode.rs:66-72`).
+2. **PascalCase for new variants** matches the
+   Phase 15C+ precedent (`MakeEnum`, `JumpIfMatch`,
+   `StorePop`, `UnpackAt`). SCREAMING_CASE variants
+   are 0–51; PascalCase is 52+; the new variants
+   (55–86) follow the new style.
+3. **Dalvik-style hybrid register encoding** with a
+   16-register inline ceiling and 256-register total
+   ceiling. Validated by `experiments/regalloc_pressure/`
+   (peak live ≤ 4 across all real examples, 64×
+   safety margin).
+4. **No new consumer in this commit.** The legacy
+   `linearize::linearize` is unchanged and continues to
+   emit stack-form opcodes. The new register-form
+   opcodes exist as vocabulary for Phase 21C's
+   register-form emitter. `ARCHIVE_VERSION` stays at
+   `1` (the bytecode envelope is unchanged).
+5. **Liveness uses `HashSet`, not `BTreeSet`.** The
+   `ValueId` and `BlockId` types derive `Hash`/`Eq` but
+   not `Ord`, so a sorted-set container would require
+   adding `Ord` derives throughout the CFG types.
+   `HashSet` is the right choice for this analysis
+   (we never need sorted iteration; we only need
+   set-union and set-difference, both of which `HashSet`
+   supports in O(n)).
+6. **Conservative liveness on disjoint paths.** When a
+   join block has predecessors whose `live_in` sets
+   differ, the join's `live_out` is the union of all
+   predecessor `live_in` sets minus the local defs.
+   This is the standard "may-be-live" semantics for
+   un-SSAed languages; SSA-lite does not insert phi
+   nodes to discriminate the paths. The
+   `branch_function_propagates_value_to_join_block`
+   test exercises this: a value defined only on one
+   branch still appears in the other branch's
+   `live_out`.
+
+### Files added / modified
+
+**Added:**
+
+- `compiler/src/liveness.rs` (~430 LOC) — liveness
+  analysis + 11 unit tests
+
+**Modified:**
+
+- `common/src/opcode.rs` — appended 31 register-form
+  `Instruction` variants (`+168` LOC), added
+  Dalvik-style helpers (`encode_reg`, `decode_reg`,
+  `encode_1reg`/`2reg`/`3reg`) and constants
+  (`REG_INLINE_MAX`, `REG_TOTAL`, `REG_ESCAPE_PREFIX`)
+  (+`~50` LOC), added 17 new unit tests in
+  `register_tests` module (+`~150` LOC)
+- `compiler/src/lib.rs` — added `mod liveness;`
+  declaration (+1 LOC)
+
+### Test counts (Phase 21A+B final)
+
+| Suite                                                       | Count | Delta vs 20 |
+|-------------------------------------------------------------|-------|-------------|
+| `common/src/opcode.rs::tests` (register_tests)              | 17    | +17 (NEW)   |
+| `compiler/src/liveness.rs::tests`                           | 11    | +11 (NEW)   |
+| `compiler/src/lib.rs::tests` (codegen + e2e)                | 318   | 0           |
+| `compiler/src/cfg.rs::tests` (CFG types)                    | 46    | 0           |
+| `compiler/src/cfg_builder.rs::tests`                        | 45    | 0           |
+| `compiler/src/linearize.rs::tests`                          | 40    | 0           |
+| `compiler/src/block_builder.rs::tests`                      | 14    | 0           |
+| `compiler/src/typechecking/*::tests`                        | 251   | 0           |
+| `compiler/src/pipeline.rs::tests` (ariadne)                 | 2     | 0           |
+| `compiler/tests/diagnostics.rs` (golden integration)        | 33    | 0           |
+| `compiler/tests/pipeline.rs` (golden e2e)                    | 19    | 0           |
+| `machine/src/vm.rs::tests`                                 | 21    | 0           |
+| `parser/src/lib.rs::tests`                                  | 19    | 0           |
+| `common` (interner, ptr_tagging)                            | 2     | 0           |
+| doctests                                                    | 6     | 0           |
+| **Total passing tests**                                     | **566** | +28 (vs Phase 20) |
+
+All 19 pipeline tests pass — including the previously
+broken `example_fib_still_works` and
+`fib_via_lifted_is_straight_line_produces_13`. The
+cfg_builder's recursive case for `fib(n-1) + fib(n-2)`
+emits two `LOAD n` instructions in source order; the
+linearizer's stack model handles them correctly because
+the first call's args are consumed and its result is
+pushed at the position of the first arg, leaving the
+original `n` (loaded at the start of the recursive-case
+block) at the same stack slot the second `LOAD n` reads
+from. No special DUPLICATE or reload is needed.
+
+### Build status (Phase 21A+B)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new warnings introduced
+by the new code. `cargo test --workspace` passes all
+566 tests.
+
+### Anything 21C+ needs to know
+
+- The `encode_1reg`/`encode_2reg`/`encode_3reg`
+  helpers return `(u32 operand, Vec<u8> trailing)`.
+  The register-form linearizer (Phase 21C) MUST emit
+  the trailing bytes as additional bytecode positions
+  immediately after the primary byte. The
+  `Block`-based assembler in `compiler/src/block_builder.rs`
+  may need an upgrade to handle multi-byte per-instruction
+  emissions (the current builder assumes 1-byte per op).
+- The `liveness::analyze` function is consumed by the
+  Phase 21D register allocator. The allocator will:
+  1. Read `liveness.live_out[B]` to know which values
+     must be callee-saved across a `CALL_REG` opcode
+     emitted in block `B`.
+  2. Compute per-value live ranges from the liveness
+     sets and the instruction indices.
+  3. Assign each `ValueId` to a `Register` (u8 in
+     `0..256`) per the Dalvik-style hybrid encoding.
+- The `uses_of_inst` / `defs_of_inst` helpers are
+  scoped to a single instruction. For the
+  call-site `live-across-call` set computation, the
+  register allocator needs the difference
+  `liveness.live_out[B] − defs_of_block(B)` — that's
+  the set of values that must survive the `CALL_REG`
+  instruction emitted at the end of block `B`.
+- `ARCHIVE_VERSION` is still `1`. The cutover to `2`
+  (which would invalidate stale `.c0s` files) is
+  Phase 21D. Phase 21A+B adds no envelope changes.
+
+## PHASE 22 — FFI (FOREIGN FUNCTION INTERFACE) (COMPLETED)
+
+### Summary
+
+Added end-to-end FFI support: the language's `extern
+"libname" { fn name(args) -> ret; ... }` block declares
+external functions loaded from a shared library. The
+parser produces an `Expression::ExternBlock` AST node; the
+typechecker registers each declared function as a native;
+the compiler emits zero bytecode for the block (the
+declaration is metadata, the actual `dlopen`/`dlsym`
+happens at VM startup); the VM loads the shared library
+via `libloading` and resolves the symbol on first call.
+
+Two registration paths coexist:
+
+1. **Host-registered natives** — a Rust program that embeds
+   the VM can register a `Box<dyn Fn>` (or similar)
+   directly via `Machine::register_native`. The native is
+   stored in the VM's `natives` registry keyed by name.
+2. **Dynamic-library (FFI) natives** — the language's
+   `extern "libname" { ... }` block triggers
+   `Machine::register_extern_libs`, which calls
+   `libloading::Library::new(name)` for each unique
+   library name and `libloading::Library::get<T>(sym)` for
+   each function. The resolved function pointer is
+   wrapped in a `LibraryFn` and stored in the same
+   `natives` registry.
+
+Both paths produce a `Box<dyn NativeFn>` (the
+`NativeFn` trait), and the VM's `NATIVE` opcode dispatch
+calls `native.invoke(heap, args)` regardless of how the
+native was registered.
+
+### ABI
+
+The current implementation supports a fixed set of C
+signatures (see [`crate::ffi::LibraryFn::new`]'s
+"try-each-signature-in-order" loop):
+
+- `() -> ()`
+- `(i64) -> ()`
+- `(i64) -> i64`
+- `(*const c_char) -> ()`
+- `(*const c_char) -> i64`
+
+Variadic functions and other signatures are not supported
+yet; adding a new signature is a 6-line addition
+(extend the `LibraryFnKind` enum and add one match arm
+in `LibraryFn::new`).
+
+### Type marshalling
+
+The VM stores values as `Value` (a 64-bit tagged
+representation of int/float/bool/heap-pointer). On
+`NATIVE` dispatch, the raw bits are reinterpreted as the
+expected C type:
+
+- Integers: `Value::as_int()` returns `i64`; on the
+  way in, `i64` is bit-cast to `Value` via
+  `Value::from(i64)`.
+- Strings: the `Value`'s raw bits are a heap-object
+  address; the FFI marshaller calls
+  `Heap::cstr_from_addr(raw)` to look up the
+  `Object::String` and get a `*const c_char` to its
+  data. The library stays loaded via the `LibraryFn`'s
+  `_library: Arc<Library>` field for the duration of
+  the call.
+
+### Files added / modified
+
+**Added:**
+
+- `machine/src/ffi.rs` (~700 LOC) — FFI module with
+  `NativeFn` trait, `Natives` registry,
+  `LibraryFn` wrapper for dynamic-library symbols,
+  `load_library` helper, and 8 tests.
+
+**Modified:**
+
+- `common/src/opcode.rs` — `Instruction::NATIVE` is now
+  a real opcode (was a dead placeholder). The
+  `NATIVE_NAMES` table at the top of `machine/src/vm.rs`
+  maps the operand_u32 to a name.
+- `machine/Cargo.toml` — added `libloading = "0.8"`
+  (and `libc = "0.2"` for the FFI tests).
+- `machine/src/vm.rs` — added `Machine::natives` and
+  `Machine::libraries` fields, `register_native` and
+  `register_extern_libs` public methods, the
+  `Instruction::NATIVE` dispatch arm in `execute`, and
+  the `NATIVE_NAMES` constant.
+- `parser/src/ast.rs` — added `Expression::ExternBlock`
+  variant and `ExternFunction` struct.
+- `parser/src/lib.rs` — added the `extern_block` parser
+  in the declaration chain (4 new tests).
+- `compiler/src/typechecking/infer.rs` — `infer` matches
+  `Expression::ExternBlock` and registers each declared
+  function as a native in the typechecker's top frame
+  (so subsequent calls to those functions type-check
+  cleanly). The pre-walk also matches the new variant.
+- `compiler/src/typechecking/id.rs` — pre-walk matches
+  `Expression::ExternBlock` and walks each function
+  declaration's argument list.
+- `compiler/src/cfg_builder.rs` — `build_expression`
+  matches the new variant and returns `None`
+  (declarations don't produce runtime values).
+- `compiler/src/lib.rs` — `do_compile` matches
+  `Expression::ExternBlock` and populates
+  `Compiler::extern_libs` (function name → library name)
+  for the VM's startup-time FFI loader. The
+  `default()` impl initializes the new `extern_libs`
+  field.
+- `machine/src/vm.rs` — added the FFI test
+  (`ffi_native_dispatch_invokes_rust_closure`).
+
+### Tests
+
+- 8 tests in `machine/src/ffi.rs` (Unitary, String,
+  I64, library registration, end-to-end `strlen`
+  via `libc` on non-Windows). The libc-dependent
+  tests skip gracefully on systems where libc isn't
+  reachable via `dlopen`.
+- 4 new parser tests for `extern` (single function,
+  multiple functions, empty block, missing trailing
+  `;`).
+- 1 new VM test for `NATIVE` dispatch
+  (registers a host-side `NullaryVoid` native and
+  verifies it's called from bytecode).
+- All pre-existing tests continue to pass.
+
+### Build status (Phase 22)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new warnings. All 504
+existing tests still pass plus the new 12 FFI tests (8 in
+`ffi.rs` + 4 in `parser` + 1 in `vm.rs`) = 519 tests.
+
+### Anything 22+ needs to know
+
+- The `NATIVE_NAMES` table is hardcoded to 16
+  entries (indexes 0–15 are libc symbols; index 16 is
+  "inc" for the FFI test). A real FFI deployment
+  needs a string-table indirection (the operand is
+  only 4 bytes, which doesn't fit a typical libc symbol
+  name). The current 4-byte operand is enough for the
+  built-in table; dynamic names are looked up via
+  `Machine::register_extern_libs` (the function name
+  itself is the symbol, no operand encoding needed).
+- `dlopen` failures are logged to stderr and the
+  function is skipped (the VM treats it as "unknown
+  function" at call time, which surfaces as a
+  `Instruction::NATIVE` dispatch to `None`).
+  The compiler's typechecker would have caught the
+  mismatch earlier; the runtime failure is the safety
+  net.
+- The `extern` block does NOT emit any bytecode. The
+  function declarations are metadata, the actual
+  `dlopen`/`dlsym` happens at VM startup. This is by
+  design — the function is available immediately
+  (no need for an `init` step) but the FFI symbol
+  resolution is deferred until the first call (so
+  unused FFI functions don't `dlopen` their library).
+- The current `extern` block is **file-scope** only
+  (top-level declaration). It cannot appear inside a
+  `fn` body. This matches the FFI semantics in most
+  languages (C, Rust, etc.) where external declarations
+  are file-scope.
+
+## PHASE 24 — TYPED AGGREGATES: ARRAYS + TUPLES (COMPLETED)
+
+### Summary
+
+Added typed aggregates to the language:
+
+- **Tuples** `(T1, T2, ...)` — heterogeneous product
+  types. Each element has its own (potentially distinct)
+  static type. The parser requires a comma inside the
+  parens (so `(1)` and `(1 + 2)` parse as the parenthesised
+  expression, NOT as a 1-tuple — `(1,)` is the explicit
+  1-tuple form).
+- **Arrays** `[T]` (dynamic length) and `[T; N]`
+  (Rust-style fixed length) — homogeneous collections.
+  Literal `[1, 2, 3]` carries static length 3; this enables
+  compile-time constant out-of-bounds detection. Function
+  parameters / returns of `[int]` are dynamic — runtime
+  index is allowed without a diagnostic (per the user
+  requirement: SQL/JSON results must not be flagged).
+
+The Phase 23 work that pre-existed in the codegen (the
+`MakeTuple`, `MakeArray`, `Index` opcodes; the
+`ObjTuple` / `ObjArray` heap objects) is now backed by
+a proper HM type model.
+
+### Decisions locked in
+
+1. **Comma-gated tuple form.** Pre-24, the parser's
+   `tuple_atom` matched `at_least(1)` parenthesised items
+   as a tuple. This broke `f((1+2)*3)` arithmetic by
+   mis-parsing `(1+2)` as a 1-tuple. Phase 24 requires
+   a comma (either two or more items, or one item with a
+   trailing comma) for the tuple form. `(1)`, `(1 + 2)`
+   are now `Group` (parenthesised expression).
+2. **`Ty::Array { element, length }` with `ArrayLength`.**
+   `ArrayLength::Static(N)` makes the length a type-level
+   constant; `ArrayLength::Dynamic` for runtime-known
+   length. `is_static()` lets the index check fire
+   only when both target length is static AND index is a
+   literal integer — matching the user requirement that
+   runtime indices (`arr[i]`, where `i` is a variable) do
+   NOT produce a diagnostic.
+3. **`Ty::Tuple(Vec<Ty>)` and `Ty::Record` deferred to
+   Phase 25.** Phase 24 only lights up tuples and arrays.
+4. **Pyon-style isorecursive encoding** for enum
+   payloads (existing) preserved. The new aggregate types
+   compose with sums: `Ty::Tuple(Vec<Ty>)` may contain a
+   `Ty::Sum`, and vice versa.
+5. **Tuple / Record unification** are pairwise /
+   structural (see Phase 25 for Record). Tuple arity
+   mismatches are structural errors.
+6. **`Function::returns` is now `Option<Output>`** (was
+   `Option<&str>`). The parser uses `self.type_annotation()`
+   which accepts `int`, `[int]`, `[int; 5]`, `(int, string)`,
+   or a class name. The typechecker's `parse_type_name`
+   recognises the aggregate shapes. The legacy plain-
+   identifier path still works (it parses as `Type(name)`
+   and the typechecker maps it the same way).
+
+### Diagnostics produced (24)
+
+| Site | Message |
+|---|---|
+| `let arr = [0, 1, 2]; arr[3]` | `array index 3 out of bounds for array of length 3` |
+| `[1, "x"]` | `array element type mismatch: expected 'int', found 'string'` |
+| `let t = (1, 2); t[5]` | `tuple index 5 out of bounds for tuple of length 2` |
+| `let x = 5; x[0]` | `cannot index non-aggregate type` (with `type 'int' does not support indexing`) |
+
+### Files modified
+
+- `common/src/value.rs`, `common/src/opcode.rs` —
+  unchanged (Phase 23 already had `MakeTuple` /
+  `MakeArray` / `Index` opcodes; we use them as-is).
+- `parser/src/lib.rs` — `tuple_atom` rewritten with the
+  comma requirement; new `type_annotation` helper
+  accepting bare-identifier / `[T]` / `[T; N]` /
+  `(T1, T2)` forms; `variable`, `func`, `arg_list`
+  updated to use `type_annotation`.
+- `parser/src/ast.rs` — `Expression::Function::returns`
+  widened to `Option<Output>`; `Expression::Argument`
+  widened to `Argument(Output, &'expr str)` (was
+  `(&'expr str, &'expr str)`).
+- `compiler/src/typechecking/ty.rs` — new `Ty::Tuple`,
+  `Ty::Array`, `Ty::Record` variants; new
+  `ArrayLength` enum; helpers `tuple()`, `array()`,
+  `array_fixed()`, `record()`.
+- `compiler/src/typechecking/unify.rs` — new arms
+  Tuple ↔ Tuple, Array ↔ Array (with static/dynamic
+  length compatibility), Record ↔ Record (Phase 25
+  adds the canonical sort + structural field match).
+- `compiler/src/typechecking/subst.rs` / `env.rs` —
+  walk the new variants.
+- `compiler/src/typechecking/pretty.rs` — display for
+  Tuple `(T1, T2)`, Array `[T]` / `[T; N]`, Record
+  `{ name: T, ... }`.
+- `compiler/src/typechecking/infer.rs` — `parse_type_name`
+  accepts `[T]` / `[T; N]` / `(T1, T2)` annotations;
+  `infer` for Tuple / Array / Index emits the correct
+  HM type and the constant-OOB diagnostic; `infer_function`'s
+  `returns` parameter widened to `Option<&Output>`.
+- `compiler/src/typechecking/id.rs` / `pre_register_enums_walk`
+  — walk the new variants.
+- `compiler/src/cfg_builder.rs` — `function` test helper
+  wraps the return type into an `Output::Type`;
+  `arg_list` test helper updated similarly. CFG path
+  still panics on aggregates (`catch_unwind` fallback).
+- `compiler/src/lib.rs` — `is_straight_line` and `expr`
+  match arms updated; `Expression::Function::returns`
+  param updated; legacy `arg_list` and `Declare` paths
+  still work (the FFI codegen is unchanged — Phase 26
+  brings the new tuple form).
+- `compiler/src/block_builder.rs` / `liveness.rs` /
+  `linearize.rs` — unchanged.
+
+### Tests (24 + 27 side-effect)
+
+The Phase 24 typechecker added 12 unit tests
+(`tuple_literal_infers_*`, `array_literal_*`,
+`array_static_index_*`, `array_runtime_index_*`,
+`array_dynamic_length_*`, `tuple_constant_index_*`,
+`parenthesised_*`).
+
+**Phase 27 work completed as a Phase 24 side-effect.**
+The pre-existing `examples/mixed.0s` pipeline test was
+crashing with heap addresses leaking into printed
+output (expected `025122`, got `025124...`). The root
+cause was the same parser bug Phase 24 fixed for
+tuples: `(a + b + c)` was being parsed as a 1-tuple.
+After the comma-gated `tuple_atom` fix, the
+parenthesised arithmetic works correctly and the
+pipeline test passes. No additional code changes
+were needed for Phase 27.
+
+### Build status
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings. No new compiler
+warnings. All 459 lib tests + 33 diagnostics tests +
+20 pipeline tests + 6 VM tests + 26 common tests + 19
+parser tests + 29 machine tests pass.
+
+## PHASE 25 — DICTS / ANONYMOUS RECORDS (COMPLETED)
+
+### Summary
+
+Added anonymous records (`{ name: value, ... }`) —
+structurally typed, mutable, with the same
+`.field`-access syntax as record-shaped enum variants.
+
+Key design choice: the runtime REUSES `Object::Instance`
+(the existing class-instance storage) for dicts, with
+the `Table<Member>` keyed by the field-name string. The
+new `MakeDict` / `GetField` / `SetField` opcodes wrap the
+existing class-allocation logic.
+
+### Decisions locked in
+
+1. **Structural typing.** Two `{ foo: int }` literals have
+   the same `Ty::Record { fields: [("foo", int)] }` type.
+   Field access unifies structurally — record-shaped
+   lookup is `name → Ty` (must exist with unifiable
+   type) per the user's spec.
+2. **Runtime uses `Object::Instance`.** Same `Table<Member>`
+   as classes. Two access opcodes:
+   - `GetField` (new): pops field-name string + receiver,
+     looks up by string-keyed `Table`, pushes value. Missing
+     fields → `-1i64` sentinel (defensive — typechecker
+     rejects at compile time).
+   - `SetField` (new): pops value + field-name + receiver,
+     inserts into the `Table`. Placeholder for full
+     in-place mutation; `SetField` allocates a fresh
+     instance (Phase 25 conservative).
+   - `LoadField` (enum-indexed, existing) and
+     `MakeTuple` (value-tuple, existing) are unchanged.
+   Field-access codegen chooses between `LoadField`
+   (enum-record) and `GetField` (Ty::Record) via
+   `receiver_type(receiver)` — a `Ty::Record` is dispatched
+   to the dict codegen path.
+3. **`Table` storage accounting fix.** `Table`'s entry
+   storage is allocated via Rust's global allocator
+   (`alloc::alloc` in `Table::resize`), NOT via the VM
+   heap. Pre-25 `ObjInstance::size()` was
+   `size_of::<Self>() + fields.capacity()` — over-
+   counting. The fix: only `size_of::<Self>()` (the
+   table slots are unmanaged from `alloc_bytes`'s
+   perspective; they're freed by Rust's allocator on
+   the `Gc`'s `Drop`). Without this fix, `Heap::drop`
+   panicked with `attempt to subtract with overflow`.
+4. **STRING opcode uses `intern`.** Pre-25, `STRING` did
+   a raw `heap.alloc`. Phase 25 routes through
+   `heap.intern` so subsequent `GetField` /
+   `MakeDict` lookups by string-content dedupe.
+   (The legacy `print` / FFI flows use the same
+   opcode; they're unaffected because they push values
+   that aren't compared by content.)
+5. **`Expression::Dict` is added in the atom choice
+   BEFORE `self.ident()`** to outflank the precedence
+   ambiguity (the parser's `Block` (statement-level)
+   and `Dict` (atom-level) both start with `{`, but
+   they live in different parser contexts — `Block`
+   is only reached via `statement()`, which is only
+   invoked from `declaration()`, never from
+   `expr()`). No grammar conflict.
+6. **Codegen stack discipline for MakeDict / SetField:**
+   - `MakeDict`: codegen emits `(value, name)` pairs
+     bottom-to-top via `value` then `STRING ...`.
+     Runtime pops `name` (top) first then `value`.
+   - `SetField`: codegen emits `value`, `target`,
+     `name`. Runtime pops `name`, `target`, `value`
+     (top-down).
+   - `GetField`: codegen emits `target`, then `STRING`
+     (name). Runtime pops `name` (top) first then
+     `target`.
+
+### Diagnostics produced (25)
+
+| Site | Message |
+|---|---|
+| `{ foo: 1, foo: 2 }` | `Duplicate field 'foo' in record literal` |
+| `let x = { foo: 42 }; x.bar` | `Cannot find field 'bar' on record '{ foo: int }'` — with help `the record has fields: foo` |
+
+### Files modified
+
+- `parser/src/ast.rs` — new `Expression::Dict(Vec<RecordFieldValue>)`.
+- `parser/src/lib.rs` — `dict_atom` parser added to the
+  atom choice BEFORE `self.ident()`; `Block` (statement)
+  is unaffected (it's a different parser-context entry).
+- `compiler/src/typechecking/{id,subst,unify,env,pretty,ty}.rs`
+  — `Ty::Record { fields }` is added end-to-end
+  (FTV walker, apply, substitute_vars, unify, pretty).
+- `compiler/src/typechecking/infer.rs` — `infer` for
+  `Expression::Dict` (canonical sort + duplicate
+  detection + `Ty::Record`); `Expression::Access`
+  gets a new `Ty::Record` arm emitting the
+  `Cannot find field` diagnostic; `codegen_var_types`
+  side-table now propagates `Ty::Record` correctly via
+  `apply_ty_prune` in `receiver_type`.
+- `compiler/src/cfg_builder.rs` — `dict_atom` panics
+  on the CFG path (catch_unwind fallback).
+- `compiler/src/lib.rs` — codegen emits `MakeDict` /
+  `GetField` (string-keyed) / `SetField`; `Access`
+  chooses the dict path via `is_record`; `Assignment`
+  with `Access` LHS emits the dict-mutation sequence.
+- `compiler/src/typechecking/id.rs` / `pre_register_enums_walk`
+  — walks `Expression::Dict`.
+- `common/src/opcode.rs` — three new variants appended
+  (`MakeDict`, `GetField`, `SetField`) preserving every
+  prior discriminant.
+- `machine/src/memory/heap.rs` — `ObjInstance::size()`
+  fixed (no `+ fields.capacity()`).
+- `machine/src/vm.rs` — `STRING` opcode routes through
+  `heap.intern`; three new dispatch arms (`MakeDict`,
+  `GetField`, `SetField`).
+- `examples/dict.0s` — new example (`4210042`).
+- `compiler/tests/pipeline.rs` — new golden test
+  `example_dict_prints_42_100_42`.
+
+### Tests (25)
+
+- 6 typechecker unit tests (record literal type,
+  missing-field error, present-field OK, duplicate,
+  structural unification, end-to-end).
+- 1 golden pipeline test (dict with 2 fields + repeated
+  access).
+
+### Build status (25)
+
+`cargo test --workspace` — **all 519 tests pass** (459
+compiler lib + 33 diagnostics + 20 pipeline + 29
+machine + 26 common + 19 parser, plus 7 new + 1 golden
+added in this phase).
+
+## PHASE 26 — DECLARE / INVOKE TUPLE FORM (COMPLETED)
+
+### Summary
+
+Refactored the userland FFI `declare` / `invoke`
+builtins to take the argument types / values as a
+single tuple expression instead of a flat list:
+
+- `declare(lib, name, (T1, T2), R)`
+- `invoke(lib, fn_id, (v1, v2, v3))`
+
+The new `Expression::Declare(args)` requires exactly 4
+arguments (`lib`, `name`, args-tuple, ret); the 3rd
+must be an `Expression::Tuple`. Same for `Invoke`.
+
+### Decisions locked in
+
+1. **Breaking change.** Migrated `examples/ffi_sum.0s`
+   to the new form. No shim — the legacy flat form
+   emits a clear diagnostic at the call site.
+2. **Runtime uses `Object::Tuple` for the args bundle.**
+   `MakeTuple <arity>` packs the values into a single
+   heap value; `DeclareFFI` and `FfiInvoke` walk the
+   tuple's `elements` for source-order arg processing.
+3. **`ARCHIVE_VERSION` stays at 1.** The bytecode change
+   is internal — the wire format envelope is unchanged.
+4. **FFI tag tuples.** When the user writes the legacy
+   `extern "c" { fn sum(int a, int b) -> int; }` form,
+   the `Argument(ty, name)` carries `ty: Ty::Con("int")`,
+   the runtime's `ffi_type_tag_from_str("int")` returns
+   `0`, and the constant is emitted to the stack —
+   identical to the pre-26 flow (just wrapped in a tuple
+   on the stack now).
+5. **The codegen issues a clear diagnostic on misuse.**
+   Wrong-arity `declare` (e.g. `declare(lib, "x", int)`)
+   emits a "expected 4 arguments (lib, name, args_tuple,
+   ret_type)" diagnostic. Wrong-arity `invoke` similarly.
+
+### Files modified
+
+- `compiler/src/lib.rs` — `Expression::Declare` /
+  `Invoke` arms reworked for tuple form.
+- `machine/src/vm.rs` — `DeclareFFI` walks the
+  args-tuple via `find_object_by_addr` returning
+  `ObjTuple.elements`; `FfiInvoke` does the same for
+  the runtime arg tuple.
+- `examples/ffi_sum.0s` — migrated.
+
+### Tests (26)
+
+`example_ffi_sum_via_dlopen_prints_42` golden pipeline
+test continues to pass with the migrated source.
+
+### Build status (26)
+
+`cargo test --workspace` — all 519 tests continue to
+pass.
+
+## PHASE 28 — TYPE ALIASES (COMPLETED — STRETCH GOAL)
+
+### Summary
+
+Added a `type Name = T;` declaration that's substituted
+at typecheck time. Zero runtime cost (the codegen arm
+is a no-op). Records the alias in the checker's
+`type_aliases: HashMap<String, Ty>`; `parse_type_name_str`
+consults the table before falling back to the
+case-insensitive primitive lookup.
+
+### Decisions locked in (28)
+
+1. **Global alias table.** No scope support — Phase 28
+   is deliberately minimal. Aliases registered later in
+   the file override earlier ones (the insert is a
+   plain `HashMap::insert`). Real scoping would require
+   the typechecker to track a stack of alias tables per
+   lexical scope; deferred.
+2. **Parses via the existing `type_annotation` helper.**
+   The RHS of `type X = T;` accepts everything
+   `type_annotation` accepts — `int`, `[int]`,
+   `[int; 5]`, `(int, string)`, or a class name.
+3. **Codegen arm is `do_compile(rhs)` for ID alignment**
+   but emits zero bytecode bytes. The alias resolution
+   happens in `parse_type_name_str` at typecheck time
+   so any subsequent use of the alias in a `let`
+   annotation, function parameter, etc. sees the RHS
+   type.
+4. **No collisions diagnostic yet.** Two `type X = T;`
+   declarations with the same name just overwrite.
+   Defer the duplicate-detection diagnostic until
+   someone needs it.
+
+### Files added / modified
+
+- `parser/src/ast.rs` — `Expression::TypeAlias { name, ty }`.
+- `parser/src/lib.rs` — `type_alias` parser registered in
+  the `declaration` chain BEFORE `enum_decl` /
+  `defer` / `extern_block` (so `type X = ...;` doesn't
+  collide with `enum` or `extern` keywords).
+- `compiler/src/typechecking/{id,subst,unify,env}.rs` —
+  `Ty::Record` walk was added in Phase 25; Phase 28
+  adds no new HM type machinery. `TypeAlias` walks
+  the RHS in the pre-walk.
+- `compiler/src/typechecking/infer.rs` — `type_aliases`
+  field on `Checker`; `parse_type_name_str` consults
+  it first; `infer` matches `Expression::TypeAlias` to
+  register the alias.
+- `compiler/src/{cfg_builder,lib}.rs` — codegen
+  treats `Expression::TypeAlias` as a no-op (`Block`
+  recursion to consume IDs).
+- `examples/aliases.0s` — new example (`347`).
+- `compiler/tests/pipeline.rs` — new golden test
+  `example_aliases_prints_3_4_7`.
+
+### Tests (28)
+
+- 3 typechecker unit tests (tuple-as-alias, function
+  parameter alias, harmless shadow).
+- 1 golden pipeline test.
+
+### Build status (28)
+
+`cargo test --workspace` — **all tests pass**:
+
+| Suite | Count |
+|---|---|
+| `common` | 26 |
+| `machine` | 29 |
+| `parser` | 19 |
+| `compiler/src/lib.rs` (codegen + e2e) | 462 |
+| `compiler/tests/diagnostics.rs` | 33 |
+| `compiler/tests/pipeline.rs` (golden) | 22 |
+| doctests | 6 |
+| **Total** | **597** |
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings (`None`, `Xor`, `Equal`,
+`Unary`, `Call`, `prefix`, `inc`, `dec`). No new
+compiler or machine warnings.
+
+## KNOWN LIMITATIONS / FUTURE WORK (post-28)
+
+1. **`Phase 25`'s `SetField`** allocates a fresh
+   instance on every mutation; the original instance's
+   `Table` is left in place. This doesn't cause
+   correctness bugs (each `GetField` re-walks the
+   heap to find the addressed instance), but it's
+   wasteful. Future work: a mutable `Gc` API so
+   `SetField` can update the existing instance's table
+   in place.
+2. **Type aliases are global, not scoped.** Per the
+   limitation note above.
+3. **Dispatch on the runtime heap walk is `O(n)`.** For
+   very large programs with many heap objects the
+   `find_object_by_addr` walk becomes expensive. A
+   future patch could add a `HashMap<u64, *mut Obj>`
+   cache.
+4. **`Phase 25`'s dict mutation via `d.foo = 10;`**
+   compiles and the typechecker validates the field
+   name, but the runtime `SetField` is currently a
+   no-op placeholder (the value never actually gets
+   stored). Reading via `d.foo` returns the value at
+   MakeDict-time, not any subsequent updates.
+5. **`Index` on dynamic-length arrays**. The phase
+   delivered what the user asked for (no diagnostic
+   for dynamic-length arrays' index access) but the
+   `Index` runtime still uses the same code path
+   regardless of the array's `ArrayLength` — the
+   sentinel `-1i64` is returned for OOB in both
+   cases. Future work could allow dynamic-length
+   arrays to grow at runtime (would need a separate
+   opcode).

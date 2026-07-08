@@ -877,8 +877,7 @@ impl Builder {
                             dst: new_ssa,
                             index: slot_index,
                         });
-                        self.current_block_mut().terminator =
-                            Terminator::Return(None);
+                        self.current_block_mut().terminator = Terminator::Return(None);
                         return None;
                     }
                 }
@@ -975,7 +974,17 @@ impl Builder {
             Expression::Yield(_) => None,
             Expression::Resume(_, _) => None,
             Expression::EnumDecl { .. } => None,
+            // Phase 28 — type aliases produce no runtime
+            // instructions (their RHS is substituted at
+            // parse / typecheck time).
+            Expression::TypeAlias { .. } => None,
             Expression::EnumVariant { .. } => None,
+            // FFI declaration blocks carry no runtime value —
+            // the symbol is resolved at VM startup (via dlopen).
+            // We return None for the value ID; the typechecker
+            // already registered each declared function in the
+            // top frame.
+            Expression::ExternBlock { .. } => None,
 
             // ---- Phase 1: control flow ----
             //
@@ -1009,9 +1018,7 @@ impl Builder {
                 iterable,
                 body,
             } => self.build_while(iterable.1.as_ref(), body.1.as_ref()),
-            Expression::Match { scrutinee, arms } => {
-                self.build_match(scrutinee.1.as_ref(), arms)
-            }
+            Expression::Match { scrutinee, arms } => self.build_match(scrutinee.1.as_ref(), arms),
 
             // ---- Function-in-function ----
             //
@@ -1022,6 +1029,34 @@ impl Builder {
             Expression::Function { .. } => panic!(
                 "cfg_builder::build_expression: nested function \
                  declarations are not supported"
+            ),
+
+            // ---- Userland FFI builtins (Phase 22b / FFI userland API) ----
+            //
+            // The cfg_builder doesn't yet know how to emit
+            // `FfiLoad` / `DeclareFFI` / `FfiInvoke`. The
+            // executor's `catch_unwind` safety net catches these
+            // panics and falls back to the legacy single-pass
+            // codegen, which DOES handle them.
+            Expression::Dload(_) | Expression::Declare(_) | Expression::Invoke(_) => panic!(
+                "cfg_builder::build_expression: userland FFI \
+                 builtins are not yet supported on the CFG path"
+            ),
+
+            // ---- Aggregates (Phase 23) ----
+            //
+            // Tuple/Array construction, dicts, and `t[i]`
+            // indexing are handled by the legacy single-pass
+            // codegen today; the cfg builder panics so the
+            // executor's `catch_unwind` fallback kicks in.
+            Expression::Tuple(_)
+            | Expression::Array(_)
+            | Expression::Dict(_)
+            | Expression::Index(_, _) => panic!(
+                "cfg_builder::build_expression: aggregates \
+                 (tuples/arrays/dicts/indexing) are not yet supported \
+                 on the CFG path; the legacy single-pass codegen \
+                 handles them via the catch_unwind fallback"
             ),
         }
     }
@@ -1035,12 +1070,7 @@ impl Builder {
     /// type-checker error upstream), this returns `None` and emits
     /// no instruction — the linearizer will see the missing
     /// operand and skip the BinOp emission.
-    fn build_binop(
-        &mut self,
-        lhs: &Output,
-        rhs: &Output,
-        op: BinOpKind,
-    ) -> Option<ValueId> {
+    fn build_binop(&mut self, lhs: &Output, rhs: &Output, op: BinOpKind) -> Option<ValueId> {
         let lhs_v = self.build_expression(lhs.1.as_ref())?;
         let rhs_v = self.build_expression(rhs.1.as_ref())?;
         let dst = self.fresh_value();
@@ -1252,20 +1282,18 @@ impl Builder {
                     // after it in declaration order is
                     // `then_block`, which is what the linearizer
                     // requires for the JMPF fall-through.
-                    self.current_block_mut().terminator =
-                        Terminator::Branch {
-                            cond: cond_v,
-                            true_bb: then_block,
-                            false_bb: false_target,
-                        };
+                    self.current_block_mut().terminator = Terminator::Branch {
+                        cond: cond_v,
+                        true_bb: then_block,
+                        false_bb: false_target,
+                    };
 
                     // Switch to then_block, build body, defer
                     // its Jump(join_block) terminator (we don't
                     // know join_block's BlockId yet for the
                     // non-last cases).
                     self.current = then_block;
-                    let _then_value =
-                        self.build_expression(body.1.as_ref());
+                    let _then_value = self.build_expression(body.1.as_ref());
                     blocks_needing_jump_to_join.push(then_block);
 
                     // Advance current to false_target for the
@@ -1298,8 +1326,7 @@ impl Builder {
                     // Build the body in the current block
                     // (the previous iteration's false_target
                     // — which becomes the else block).
-                    let _body_value =
-                        self.build_expression(body.1.as_ref());
+                    let _body_value = self.build_expression(body.1.as_ref());
                     blocks_needing_jump_to_join.push(self.current);
 
                     // Allocate and push `join_block` LAST so
@@ -1417,11 +1444,7 @@ impl Builder {
     ///   also doesn't use it (the `for x in iter` syntax was
     ///   never wired into the parser). Phase 1.2+ can wire
     ///   it as a binding variable if needed.
-    fn build_while(
-        &mut self,
-        cond: &Expression,
-        body: &Expression,
-    ) -> Option<ValueId> {
+    fn build_while(&mut self, cond: &Expression, body: &Expression) -> Option<ValueId> {
         // Allocate the three blocks BEFORE pushing so the
         // BlockIds are in the canonical (header, body, exit)
         // order. This is what makes the linearizer's
@@ -1445,8 +1468,7 @@ impl Builder {
         // the loop. The header's BlockId is stable, so the
         // linearizer will patch this JMP with the header's
         // absolute bytecode offset.
-        self.current_block_mut().terminator =
-            Terminator::Jump(header_block);
+        self.current_block_mut().terminator = Terminator::Jump(header_block);
 
         // Switch to header. Build the condition expression
         // in the header block. If the condition fails to
@@ -1483,12 +1505,8 @@ impl Builder {
         // so it is left alone.
         self.current = body_block;
         let _ = self.build_expression(body);
-        if matches!(
-            self.current_block_mut().terminator,
-            Terminator::Unreachable
-        ) {
-            self.current_block_mut().terminator =
-                Terminator::Jump(header_block);
+        if matches!(self.current_block_mut().terminator, Terminator::Unreachable) {
+            self.current_block_mut().terminator = Terminator::Jump(header_block);
         }
 
         // Switch to exit. The loop's continuation code
@@ -1603,8 +1621,7 @@ impl Builder {
         //    them in source order so BlockId assignment is
         //    predictable: arm_blocks get BlockIds 1..=N, join
         //    gets BlockId N+1.
-        let arm_blocks: Vec<BlockId> =
-            arms.iter().map(|_| self.fresh_block()).collect();
+        let arm_blocks: Vec<BlockId> = arms.iter().map(|_| self.fresh_block()).collect();
         let join_block = self.fresh_block();
 
         // Push the arm blocks (in source order), then the join
@@ -1721,8 +1738,7 @@ impl Builder {
             let arm_block = arm_blocks[i];
             self.current = arm_block;
             let _body_value = self.build_expression(arm.body.1.as_ref());
-            self.current_block_mut().terminator =
-                Terminator::Jump(join_block);
+            self.current_block_mut().terminator = Terminator::Jump(join_block);
         }
 
         // 6. Continue in the join block. Subsequent code
@@ -1771,13 +1787,10 @@ impl Builder {
                 let succs = match &b.terminator {
                     Terminator::Jump(bb) => vec![*bb],
                     Terminator::Branch {
-                        true_bb,
-                        false_bb,
-                        ..
+                        true_bb, false_bb, ..
                     } => vec![*true_bb, *false_bb],
                     Terminator::Switch { cases, default, .. } => {
-                        let mut s: Vec<BlockId> =
-                            cases.iter().map(|(_, bb)| *bb).collect();
+                        let mut s: Vec<BlockId> = cases.iter().map(|(_, bb)| *bb).collect();
                         s.push(*default);
                         s
                     }
@@ -1911,14 +1924,26 @@ mod tests {
         Expression::Return(e(inner))
     }
 
-    /// One function parameter: `Argument(ty, name)`.
+    /// One function parameter: `Argument(Output(Type(name)), name)`.
+    /// Phase 24 — the type is a full `Output` so aggregate
+    /// types can be expressed in tests too.
     fn argument(ty: &'static str, name: &'static str) -> Expression<'static> {
-        Expression::Argument(ty, name)
+        let ty_out: Output<'static> = (
+            parser::SimpleSpan {
+                start: 0,
+                end: 0,
+                context: (),
+            },
+            Box::new(Expression::Type(ty)),
+        );
+        Expression::Argument(ty_out, name)
     }
 
-    /// Build a complete `Expression::Function`. The `returns` field is
-    /// ignored by the builder (it defaults to `TypeRef::Unknown`) but
-    /// is parameterized for realism — most tests use `Some("int")`.
+    /// Build a complete `Expression::Function`. The `returns`
+    /// field is now an `Option<Output<'static>>` (Phase 24 —
+    /// full type annotation); most tests still pass
+    /// `Some("int")` which is auto-wrapped via
+    /// `e(Expression::Type(name))`.
     fn function(
         name: &'static str,
         args: Vec<(&'static str, &'static str)>,
@@ -1929,10 +1954,12 @@ mod tests {
             .into_iter()
             .map(|(ty, arg_name)| e(argument(ty, arg_name)))
             .collect();
+        let returns_output: Option<Output<'static>> =
+            returns.map(|s| e(Expression::Type(s)));
         Expression::Function {
             name,
             args: e(Expression::Fragment(args_vec)),
-            returns,
+            returns: returns_output,
             body: e(body),
         }
     }
@@ -1941,10 +1968,7 @@ mod tests {
     /// Output)`. The `cond` is `None` for an `else` branch.
     /// `cond` of `None` produces `Branch(None, body)` (the else
     /// form).
-    fn branch(
-        cond: Option<Expression<'static>>,
-        body: Expression<'static>,
-    ) -> Expression<'static> {
+    fn branch(cond: Option<Expression<'static>>, body: Expression<'static>) -> Expression<'static> {
         Expression::Branch(cond.map(e), e(body))
     }
 
@@ -1967,10 +1991,7 @@ mod tests {
 
     /// Convenience for `if cond { body }` — single branch with a
     /// condition, no else.
-    fn if_single(
-        cond: Expression<'static>,
-        body: Expression<'static>,
-    ) -> Expression<'static> {
+    fn if_single(cond: Expression<'static>, body: Expression<'static>) -> Expression<'static> {
         if_expr(vec![(Some(cond), body)])
     }
 
@@ -1981,10 +2002,7 @@ mod tests {
         then_b: Expression<'static>,
         else_b: Expression<'static>,
     ) -> Expression<'static> {
-        if_expr(vec![
-            (Some(cond), then_b),
-            (None, else_b),
-        ])
+        if_expr(vec![(Some(cond), then_b), (None, else_b)])
     }
 
     /// Convenience for
@@ -1997,11 +2015,7 @@ mod tests {
         b2: Expression<'static>,
         b3: Expression<'static>,
     ) -> Expression<'static> {
-        if_expr(vec![
-            (Some(c1), b1),
-            (Some(c2), b2),
-            (None, b3),
-        ])
+        if_expr(vec![(Some(c1), b1), (Some(c2), b2), (None, b3)])
     }
 
     /// Build a `while` loop AST node. Mirrors the pre-1.1
@@ -2012,10 +2026,7 @@ mod tests {
     /// `while cond { body }` →
     /// `Expression::Loop { identifier: None, iterable: cond,
     /// body: body }`.
-    fn while_loop(
-        cond: Expression<'static>,
-        body: Expression<'static>,
-    ) -> Expression<'static> {
+    fn while_loop(cond: Expression<'static>, body: Expression<'static>) -> Expression<'static> {
         Expression::Loop {
             identifier: None,
             iterable: e(cond),
@@ -2039,10 +2050,7 @@ mod tests {
 
     /// Build a single `MatchArm` AST node: `pattern => body`. The
     /// body is wrapped in an `Output`.
-    fn match_arm(
-        pattern: Pattern<'static>,
-        body: Expression<'static>,
-    ) -> MatchArm<'static> {
+    fn match_arm(pattern: Pattern<'static>, body: Expression<'static>) -> MatchArm<'static> {
         MatchArm {
             pattern,
             body: e(body),
@@ -2084,12 +2092,7 @@ mod tests {
     #[test]
     fn build_int_constant_produces_const_inst() {
         // `fn f() -> int { return 42; }`
-        let func = function(
-            "f",
-            vec![],
-            Some("int"),
-            block(vec![stmt(ret(int(42)))]),
-        );
+        let func = function("f", vec![], Some("int"), block(vec![stmt(ret(int(42)))]));
         let mut builder = Builder::new();
         let cfg = builder.build_function(&func);
 
@@ -2138,11 +2141,7 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i, Inst::ConstF { value, .. } if (*value - 3.14).abs() < 1e-9));
-        assert!(
-            has_constf,
-            "expected ConstF(3.14) in {:?}",
-            blk.insts
-        );
+        assert!(has_constf, "expected ConstF(3.14) in {:?}", blk.insts);
         assert!(matches!(blk.terminator, Terminator::Return(Some(_))));
     }
 
@@ -2159,15 +2158,11 @@ mod tests {
         let cfg = builder.build_function(&func);
         let blk = &cfg.blocks[0];
 
-        let has_constbool = blk.insts.iter().any(|i| matches!(
-            i,
-            Inst::ConstBool { value: true, .. }
-        ));
-        assert!(
-            has_constbool,
-            "expected ConstBool(true) in {:?}",
-            blk.insts
-        );
+        let has_constbool = blk
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::ConstBool { value: true, .. }));
+        assert!(has_constbool, "expected ConstBool(true) in {:?}", blk.insts);
         assert!(matches!(blk.terminator, Terminator::Return(Some(_))));
     }
 
@@ -2184,10 +2179,12 @@ mod tests {
         let cfg = builder.build_function(&func);
         let blk = &cfg.blocks[0];
 
-        let has_conststring = blk.insts.iter().any(|i| matches!(
-            i,
-            Inst::ConstString { value, .. } if value == "hello"
-        ));
+        let has_conststring = blk.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::ConstString { value, .. } if value == "hello"
+            )
+        });
         assert!(
             has_conststring,
             "expected ConstString(\"hello\") in {:?}",
@@ -2322,7 +2319,12 @@ mod tests {
         let cfg = builder.build_function(&func);
 
         // 4 blocks: entry, then, else, join.
-        assert_eq!(cfg.blocks.len(), 4, "expected 4 blocks, got {}", cfg.blocks.len());
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected 4 blocks, got {}",
+            cfg.blocks.len()
+        );
 
         // Block 1 (then_block): single Param for `a` (index 0),
         // Return(None) terminator.
@@ -2341,7 +2343,11 @@ mod tests {
             "then_block should have 1 Param, got {:?}",
             then_block.insts
         );
-        assert_eq!(then_params[0], (ValueId(3), 0), "then_block Param should load slot 0 (param `a`)");
+        assert_eq!(
+            then_params[0],
+            (ValueId(3), 0),
+            "then_block Param should load slot 0 (param `a`)"
+        );
         assert!(
             matches!(then_block.terminator, Terminator::Return(None)),
             "then_block terminator should be Return(None), got {:?}",
@@ -2365,7 +2371,11 @@ mod tests {
             "else_block should have 1 Param, got {:?}",
             else_block.insts
         );
-        assert_eq!(else_params[0], (ValueId(4), 1), "else_block Param should load slot 1 (param `b`)");
+        assert_eq!(
+            else_params[0],
+            (ValueId(4), 1),
+            "else_block Param should load slot 1 (param `b`)"
+        );
         assert!(
             matches!(else_block.terminator, Terminator::Return(None)),
             "else_block terminator should be Return(None), got {:?}",
@@ -2540,12 +2550,7 @@ mod tests {
 
         // Third is BinOp(Add, v2, v0, v1).
         match &blk.insts[2] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Add);
                 assert_eq!(*dst, ValueId(2));
                 assert_eq!(*lhs, ValueId(0));
@@ -2580,7 +2585,10 @@ mod tests {
             "f",
             vec![("int", "a"), ("int", "b"), ("int", "c")],
             Some("int"),
-            block(vec![stmt(ret(add(ident("a"), mul(ident("b"), ident("c")))))]),
+            block(vec![stmt(ret(add(
+                ident("a"),
+                mul(ident("b"), ident("c")),
+            )))]),
         );
         let mut builder = Builder::new();
         let cfg = builder.build_function(&func);
@@ -2591,12 +2599,7 @@ mod tests {
 
         // Inst 3 (after the 3 Params) is the Mul.
         match &blk.insts[3] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Mul);
                 assert_eq!(*dst, ValueId(3));
                 assert_eq!(*lhs, ValueId(1), "lhs should be b's v1");
@@ -2607,12 +2610,7 @@ mod tests {
 
         // Inst 4 is the Add, using the Mul's result as its rhs.
         match &blk.insts[4] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Add);
                 assert_eq!(*dst, ValueId(4));
                 assert_eq!(*lhs, ValueId(0), "lhs should be a's v0");
@@ -2760,12 +2758,7 @@ mod tests {
 
         // Inst 2 is BinOp(Add, v2, v0, v1).
         match &blk.insts[2] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Add);
                 assert_eq!(*dst, ValueId(2));
                 assert_eq!(*lhs, ValueId(0));
@@ -2834,12 +2827,7 @@ mod tests {
         //
         // The Return arm sets `return_value = Some(v0)`; the
         // terminator is emitted at the end of `build_function`.
-        let func = function(
-            "f",
-            vec![],
-            Some("int"),
-            block(vec![stmt(ret(int(42)))]),
-        );
+        let func = function("f", vec![], Some("int"), block(vec![stmt(ret(int(42)))]));
         let mut builder = Builder::new();
         let cfg = builder.build_function(&func);
         let blk = &cfg.blocks[0];
@@ -2881,10 +2869,10 @@ mod tests {
         let blk = &cfg.blocks[0];
 
         // The RHS emits a Const(5) inst.
-        let has_const_5 = blk.insts.iter().any(|i| matches!(
-            i,
-            Inst::Const { value: 5, .. }
-        ));
+        let has_const_5 = blk
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::Const { value: 5, .. }));
         assert!(has_const_5, "expected Const(5) in {:?}", blk.insts);
 
         // Terminator is Return(None) — no explicit return.
@@ -2906,12 +2894,7 @@ mod tests {
     fn build_simple_function_has_one_block() {
         // The simplest possible function — a single block, one Const,
         // one Return. No control flow, no let bindings.
-        let func = function(
-            "f",
-            vec![],
-            Some("int"),
-            block(vec![stmt(ret(int(0)))]),
-        );
+        let func = function("f", vec![], Some("int"), block(vec![stmt(ret(int(0)))]));
         let mut builder = Builder::new();
         let cfg = builder.build_function(&func);
 
@@ -3037,12 +3020,7 @@ mod tests {
             other => panic!("inst 1: expected Const(2), got {:?}", other),
         }
         match &blk.insts[2] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Mul);
                 assert_eq!(*dst, ValueId(2));
                 assert_eq!(*lhs, ValueId(0));
@@ -3112,12 +3090,7 @@ mod tests {
         let blk = &cfg.blocks[0];
 
         // 5 insts.
-        assert_eq!(
-            blk.insts.len(),
-            5,
-            "expected 5 insts, got {:?}",
-            blk.insts
-        );
+        assert_eq!(blk.insts.len(), 5, "expected 5 insts, got {:?}", blk.insts);
 
         // Inst 0: Param(x → v0).
         match &blk.insts[0] {
@@ -3139,12 +3112,7 @@ mod tests {
 
         // Inst 2: BinOp(Add, v2, v0, v1) — the first let-binding's RHS.
         match &blk.insts[2] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Add);
                 assert_eq!(*dst, ValueId(2));
                 assert_eq!(*lhs, ValueId(0));
@@ -3165,18 +3133,10 @@ mod tests {
         // Inst 4: BinOp(Mul, v4, v2, v3) — the second let-binding's RHS,
         // using the first let-binding's ValueId as the lhs.
         match &blk.insts[4] {
-            Inst::BinOp {
-                op,
-                dst,
-                lhs,
-                rhs,
-            } => {
+            Inst::BinOp { op, dst, lhs, rhs } => {
                 assert_eq!(*op, BinOpKind::Mul);
                 assert_eq!(*dst, ValueId(4));
-                assert_eq!(
-                    *lhs, ValueId(2),
-                    "lhs should be y's ValueId (v2)"
-                );
+                assert_eq!(*lhs, ValueId(2), "lhs should be y's ValueId (v2)");
                 assert_eq!(*rhs, ValueId(3));
             }
             other => panic!("inst 4: expected BinOp(Mul), got {:?}", other),
@@ -3246,7 +3206,11 @@ mod tests {
             .any(|i| matches!(i, Inst::ConstBool { value: true, .. }));
         assert!(has_constbool, "entry should contain ConstBool(true)");
         match &entry.terminator {
-            Terminator::Branch { cond, true_bb, false_bb } => {
+            Terminator::Branch {
+                cond,
+                true_bb,
+                false_bb,
+            } => {
                 // cond is the ValueId from ConstBool(true); we
                 // don't pin it to a specific number (depends on
                 // the param block setup), but it must be Some.
@@ -3281,10 +3245,7 @@ mod tests {
                 BlockId(2),
                 "then_block should Jump to join_block (BlockId 2)"
             ),
-            other => panic!(
-                "then_block should have Jump(2) terminator, got {:?}",
-                other
-            ),
+            other => panic!("then_block should have Jump(2) terminator, got {:?}", other),
         }
 
         // Block 2 (join): Const(0) followed by Return(Some(...)).
@@ -3347,7 +3308,9 @@ mod tests {
 
         // Entry: Branch with true → then_block, false → else_block.
         match &cfg.blocks[0].terminator {
-            Terminator::Branch { true_bb, false_bb, .. } => {
+            Terminator::Branch {
+                true_bb, false_bb, ..
+            } => {
                 assert_eq!(
                     *true_bb,
                     BlockId(1),
@@ -3438,7 +3401,9 @@ mod tests {
         // Entry (BlockId(0)): Branch with true → then_0
         // (BlockId(1)), false → false_target_0 (BlockId(2)).
         match &cfg.blocks[0].terminator {
-            Terminator::Branch { true_bb, false_bb, .. } => {
+            Terminator::Branch {
+                true_bb, false_bb, ..
+            } => {
                 assert_eq!(
                     *true_bb,
                     BlockId(1),
@@ -3456,7 +3421,9 @@ mod tests {
         // false_target_0 (BlockId(2)): Branch with true → then_1
         // (BlockId(3)), false → else (BlockId(4)).
         match &cfg.blocks[2].terminator {
-            Terminator::Branch { true_bb, false_bb, .. } => {
+            Terminator::Branch {
+                true_bb, false_bb, ..
+            } => {
                 assert_eq!(
                     *true_bb,
                     BlockId(3),
@@ -3468,7 +3435,10 @@ mod tests {
                     "false_target_0's Branch.false_bb should be else (BlockId 4)"
                 );
             }
-            other => panic!("false_target_0 should have Branch terminator, got {:?}", other),
+            other => panic!(
+                "false_target_0 should have Branch terminator, got {:?}",
+                other
+            ),
         }
 
         // All three body blocks (1, 3, 4) Jump to join_block
@@ -3586,7 +3556,9 @@ mod tests {
             .blocks
             .iter()
             .position(|b| {
-                b.insts.iter().any(|i| matches!(i, Inst::Const { value: 0, .. }))
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::Const { value: 0, .. }))
                     && matches!(b.terminator, Terminator::Return(Some(_)))
             })
             .expect("expected a join block with Const(0) and Return");
@@ -3659,10 +3631,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(while_loop(
-                    bool_lit(false),
-                    block(vec![stmt(ret(int(1)))]),
-                )),
+                stmt(while_loop(bool_lit(false), block(vec![stmt(ret(int(1)))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -3696,10 +3665,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(while_loop(
-                    bool_lit(true),
-                    block(vec![stmt(ret(int(1)))]),
-                )),
+                stmt(while_loop(bool_lit(true), block(vec![stmt(ret(int(1)))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -3766,10 +3732,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(while_loop(
-                    bool_lit(true),
-                    block(vec![stmt(int(1))]),
-                )),
+                stmt(while_loop(bool_lit(true), block(vec![stmt(int(1))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -3837,10 +3800,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(while_loop(
-                    bool_lit(true),
-                    block(vec![stmt(int(1))]),
-                )),
+                stmt(while_loop(bool_lit(true), block(vec![stmt(int(1))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -3887,11 +3847,9 @@ mod tests {
         // Header has [entry, body] as predecessors (initial
         // entry edge + back-edge from body). Order is not
         // guaranteed; compare via a sorted copy.
-        let mut header_preds =
-            cfg.blocks[header_id.index()].predecessors.clone();
+        let mut header_preds = cfg.blocks[header_id.index()].predecessors.clone();
         header_preds.sort_by_key(|b| b.0);
-        let mut expected_header_preds =
-            vec![entry_id, body_id];
+        let mut expected_header_preds = vec![entry_id, body_id];
         expected_header_preds.sort_by_key(|b| b.0);
         assert_eq!(
             header_preds, expected_header_preds,
@@ -4064,10 +4022,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(while_loop(
-                    bool_lit(true),
-                    block(vec![stmt(ret(int(1)))]),
-                )),
+                stmt(while_loop(bool_lit(true), block(vec![stmt(ret(int(1)))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -4120,10 +4075,7 @@ mod tests {
             vec![],
             Some("int"),
             block(vec![
-                stmt(while_loop(
-                    bool_lit(true),
-                    block(vec![stmt(int(1))]),
-                )),
+                stmt(while_loop(bool_lit(true), block(vec![stmt(int(1))]))),
                 stmt(ret(int(0))),
             ]),
         );
@@ -4179,12 +4131,7 @@ mod tests {
         // function-level return, the current block IS the entry
         // block, so the entry block's terminator should be
         // Return(Some(v42)) — not overwritten later.
-        let func = function(
-            "f",
-            vec![],
-            Some("int"),
-            block(vec![stmt(ret(int(42)))]),
-        );
+        let func = function("f", vec![], Some("int"), block(vec![stmt(ret(int(42)))]));
         let mut builder = Builder::new();
         let cfg = builder.build_function(&func);
 
@@ -4325,15 +4272,12 @@ mod tests {
                 // The scrutinee is `x`, which is the Param
                 // (ValueId(0)).
                 assert_eq!(
-                    *scrutinee, ValueId(0),
+                    *scrutinee,
+                    ValueId(0),
                     "scrutinee should be x's ValueId (v0)"
                 );
                 // Exactly one case (the first arm — Some).
-                assert_eq!(
-                    cases.len(),
-                    1,
-                    "expected 1 case (first arm only)"
-                );
+                assert_eq!(cases.len(), 1, "expected 1 case (first arm only)");
                 // The case target should be arm_0 (BlockId(1)).
                 assert_eq!(
                     cases[0].1,
@@ -4342,16 +4286,9 @@ mod tests {
                 );
                 // The default should be arm_1 (BlockId(2)) —
                 // the last arm.
-                assert_eq!(
-                    *default,
-                    BlockId(2),
-                    "default should be arm_1 (BlockId 2)"
-                );
+                assert_eq!(*default, BlockId(2), "default should be arm_1 (BlockId 2)");
             }
-            other => panic!(
-                "expected Switch terminator on match block, got {:?}",
-                other
-            ),
+            other => panic!("expected Switch terminator on match block, got {:?}", other),
         }
     }
 
@@ -4423,10 +4360,7 @@ mod tests {
                         constructor_pattern("Option", "Some"),
                         block(vec![stmt(ret(int(1)))]),
                     ),
-                    match_arm(
-                        wildcard_pattern(),
-                        block(vec![stmt(ret(int(0)))]),
-                    ),
+                    match_arm(wildcard_pattern(), block(vec![stmt(ret(int(0)))])),
                 ],
             ))]),
         );
@@ -4445,11 +4379,7 @@ mod tests {
             .unwrap();
         match &match_block.terminator {
             Terminator::Switch { cases, default, .. } => {
-                assert_eq!(
-                    cases.len(),
-                    1,
-                    "expected 1 case (the Some arm)"
-                );
+                assert_eq!(cases.len(), 1, "expected 1 case (the Some arm)");
                 assert_eq!(
                     *default,
                     BlockId(2),
@@ -4510,11 +4440,7 @@ mod tests {
         // Switch has 0 cases and default is arm_0 (BlockId(1)).
         match &cfg.blocks[0].terminator {
             Terminator::Switch { cases, default, .. } => {
-                assert_eq!(
-                    cases.len(),
-                    0,
-                    "expected 0 cases for single Wildcard arm"
-                );
+                assert_eq!(cases.len(), 0, "expected 0 cases for single Wildcard arm");
                 assert_eq!(
                     *default,
                     BlockId(1),
@@ -4627,29 +4553,41 @@ mod tests {
         let match_block = &cfg.blocks[0];
 
         // Param(x → v0).
-        let has_param = match_block
-            .insts
-            .iter()
-            .any(|i| matches!(i, Inst::Param { dst: ValueId(0), index: 0 }));
+        let has_param = match_block.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::Param {
+                    dst: ValueId(0),
+                    index: 0
+                }
+            )
+        });
         assert!(has_param, "match_block should contain Param(x → v0)");
 
         // Const(1) → v1.
-        let has_const_1 = match_block
-            .insts
-            .iter()
-            .any(|i| matches!(i, Inst::Const { dst: ValueId(1), value: 1 }));
+        let has_const_1 = match_block.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::Const {
+                    dst: ValueId(1),
+                    value: 1
+                }
+            )
+        });
         assert!(has_const_1, "match_block should contain Const(1)");
 
         // BinOp(Add, v2, v0, v1).
-        let has_add = match_block.insts.iter().any(|i| matches!(
-            i,
-            Inst::BinOp {
-                op: BinOpKind::Add,
-                dst: ValueId(2),
-                lhs: ValueId(0),
-                rhs: ValueId(1),
-            }
-        ));
+        let has_add = match_block.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::BinOp {
+                    op: BinOpKind::Add,
+                    dst: ValueId(2),
+                    lhs: ValueId(0),
+                    rhs: ValueId(1),
+                }
+            )
+        });
         assert!(has_add, "match_block should contain BinOp(Add, v2, v0, v1)");
 
         // Switch's scrutinee operand should be v2 (the Add's result).
@@ -4677,10 +4615,7 @@ mod tests {
             block(vec![stmt(match_expr(
                 ident("x"),
                 vec![
-                    match_arm(
-                        wildcard_pattern(),
-                        block(vec![stmt(ret(int(1)))]),
-                    ),
+                    match_arm(wildcard_pattern(), block(vec![stmt(ret(int(1)))])),
                     match_arm(
                         constructor_pattern("Option", "None"),
                         block(vec![stmt(ret(int(0)))]),
@@ -4704,10 +4639,7 @@ mod tests {
             block(vec![stmt(match_expr(
                 ident("x"),
                 vec![
-                    match_arm(
-                        binding_pattern("y"),
-                        block(vec![stmt(ret(int(1)))]),
-                    ),
+                    match_arm(binding_pattern("y"), block(vec![stmt(ret(int(1)))])),
                     match_arm(
                         constructor_pattern("Option", "None"),
                         block(vec![stmt(ret(int(0)))]),

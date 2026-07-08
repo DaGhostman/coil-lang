@@ -8,8 +8,8 @@ use std::{
 
 use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
 use common::{
-    ArchivedArchivedProgram, ArchivedProgram, ARCHIVE_VERSION, Byte, Instruction, Interner, Message,
-    MessageKind,
+    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Interner,
+    Message, MessageKind,
 };
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use rkyv::rancor::Error;
@@ -153,9 +153,24 @@ impl Pipeline {
     pub fn compile(mut self, filename: String, output: String) {
         self.process(filename, String::default());
 
-        if let Some(byte) = self.bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.get_function("main") as u32);
+        // Patch the JMP. If the source had at least one
+        // `extern` block, jump to `program_start_offset`
+        // (right after the prologue) so the extern's dload +
+        // declare bytecode runs before main. Otherwise jump
+        // straight to `main` (the patch below does this
+        // automatically because in the no-extern case
+        // `program_start_offset == main_offset` — the
+        // prologue was 3 bytes and main started right after).
+        if self.compiler.has_extern_block() {
+            if let Some(byte) = self.bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(self.compiler.program_start_offset());
+            }
+        } else {
+            if let Some(byte) = self.bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(self.compiler.get_function("main") as u32);
+            }
         }
 
         // Wrap the bytecode in the versioned `ArchivedProgram` envelope
@@ -205,13 +220,21 @@ impl Pipeline {
         let mut bytecode = self.compiler.compile(module, ast);
 
         // Patch the JMP at offset 1 (the second prologue
-        // instruction) to jump to the user's `main`
-        // function. Mirrors the patching logic in
-        // `compile_src` but is exposed for tests that
-        // bypass the typecheck-message check.
-        let main_offset = self.compiler.get_function("main") as u32;
-        if let Some(byte) = bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset);
+        // instruction). If `extern` blocks were emitted,
+        // jump to `program_start_offset` so they run first;
+        // otherwise jump straight to `main`.
+        if self.compiler.has_extern_block() {
+            if let Some(byte) = bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(self.compiler.program_start_offset());
+            }
+        } else if let Some(&main_offset) =
+            self.compiler.functions.get("main")
+        {
+            if let Some(byte) = bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(main_offset as u32);
+            }
         }
 
         bytecode
@@ -230,17 +253,35 @@ impl Pipeline {
             return Err(());
         }
 
-        // Patch the JMP at offset 1 (the second prologue
-        // instruction) to jump to the user's `main`
-        // function. We patch the returned `bytecode` Vec
-        // (not `self.compiler.bytecode`, which is a
-        // separate clone).
-        if let Some(byte) = bytecode.get_mut(1) {
-            *byte = Byte::new(Instruction::JMP)
-                .with_operand_u32(self.compiler.get_function("main") as u32);
+        // Patch the JMP at offset 1. If `extern` blocks
+        // were emitted, jump to `program_start_offset` so
+        // they run first; otherwise jump to `main`.
+        if self.compiler.has_extern_block() {
+            if let Some(byte) = bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(self.compiler.program_start_offset());
+            }
+        } else if let Some(&main_offset) =
+            self.compiler.functions.get("main")
+        {
+            if let Some(byte) = bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(main_offset as u32);
+            }
         }
 
         Ok(bytecode)
+    }
+
+    /// Borrow the FFI library map populated by the last
+    /// `compile` (or `compile_test`) call. Each entry maps a
+    /// function name declared in an `extern "libname" { ... }`
+    /// block to the library short name (`"sum"`, `"c"`, ...).
+    /// The test runner passes this map to
+    /// `Machine::register_extern_libs` so the VM loads
+    /// the libraries and binds the symbols at startup.
+    pub fn extern_libs(&self) -> &std::collections::HashMap<String, String> {
+        self.compiler.extern_libs()
     }
 
     pub fn run(self, filename: String) -> Result<Vec<Byte>, ()> {

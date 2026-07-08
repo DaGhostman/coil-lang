@@ -33,8 +33,8 @@
 //! (Phase 4) tracks which expression caused a unification failure and
 //! attaches the span at the diagnostic layer (Phase 8).
 
-use super::subst::{apply_ty, compose, Subst};
-use super::ty::{ftv_ty, Ty, TyVarId};
+use super::subst::{Subst, apply_ty, compose};
+use super::ty::{Ty, TyVarId, ftv_ty};
 
 /// Failure modes for unification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +165,16 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // variant declared as record), with the payload types
         // themselves unifiable. Sums of different names are always
         // distinct.
-        (Ty::Sum { name: a, variants: av }, Ty::Sum { name: b, variants: bv }) if a == b => {
+        (
+            Ty::Sum {
+                name: a,
+                variants: av,
+            },
+            Ty::Sum {
+                name: b,
+                variants: bv,
+            },
+        ) if a == b => {
             if av.len() != bv.len() {
                 return Err(UnifyError::Mismatch {
                     left: Ty::Sum {
@@ -275,8 +284,16 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // is also a Constructor — both have the same tag when
         // the pattern matches.
         (
-            Ty::Constructor { owner: o1, tag: t1, arity: a1 },
-            Ty::Constructor { owner: o2, tag: t2, arity: a2 },
+            Ty::Constructor {
+                owner: o1,
+                tag: t1,
+                arity: a1,
+            },
+            Ty::Constructor {
+                owner: o2,
+                tag: t2,
+                arity: a2,
+            },
         ) => {
             if t1 != t2 || a1 != a2 {
                 return Err(UnifyError::Mismatch {
@@ -298,6 +315,90 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // Type variable on either side: bind, with occurs check.
         (Ty::Var(v), t) => bind_var(subst, v, t),
         (t, Ty::Var(v)) => bind_var(subst, v, t),
+
+        // ---- Phase 24: aggregate types ----
+        //
+        // Tuple: same arity; pairwise unify.
+        (Ty::Tuple(tys1), Ty::Tuple(tys2)) => {
+            if tys1.len() != tys2.len() {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Tuple(tys1),
+                    right: Ty::Tuple(tys2),
+                });
+            }
+            let mut current = subst.clone();
+            for (a, b) in tys1.iter().zip(tys2.iter()) {
+                current = unify_with(&current, a, b)?;
+            }
+            Ok(current)
+        }
+        //
+        // Array: same element type (with static-vs-dynamic length
+        // compatibility — dynamic lengths unify to the more-specific
+        // side; Static(N) vs Static(M) for N != M is a Mismatch;
+        // Static(N) vs Dynamic unifies to Static(N)).
+        (
+            Ty::Array {
+                element: e1,
+                length: l1,
+            },
+            Ty::Array {
+                element: e2,
+                length: l2,
+            },
+        ) => {
+            let len_compatible = matches!(
+                (l1, l2),
+                (super::ty::ArrayLength::Dynamic, _)
+                    | (_, super::ty::ArrayLength::Dynamic)
+                    | (super::ty::ArrayLength::Static(_), super::ty::ArrayLength::Static(_))
+            );
+            if !len_compatible {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Array {
+                        element: e1,
+                        length: l1,
+                    },
+                    right: Ty::Array {
+                        element: e2,
+                        length: l2,
+                    },
+                });
+            }
+            unify_with(subst, e1.as_ref(), e2.as_ref())
+        }
+        //
+        // Record: structurally-equal field sets unify. Fields are
+        // matched by name (not by position). Records with different
+        // field sets are a Mismatch (the user must explicitly
+        // restructure with `match` or namespace).
+        (Ty::Record { fields: f1 }, Ty::Record { fields: f2 }) => {
+            if f1.len() != f2.len() {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Record { fields: f1 },
+                    right: Ty::Record { fields: f2 },
+                });
+            }
+            // Sort both lists by field name for canonical comparison
+            // (the typechecker canonically sorts on construction).
+            let mut s1 = f1.clone();
+            let mut s2 = f2.clone();
+            s1.sort_by(|a, b| a.0.cmp(&b.0));
+            s2.sort_by(|a, b| a.0.cmp(&b.0));
+            let names_eq = s1.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                == s2.iter().map(|(n, _)| n).collect::<Vec<_>>();
+            if !names_eq {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Record { fields: f1 },
+                    right: Ty::Record { fields: f2 },
+                });
+            }
+            let mut current = subst.clone();
+            for ((_, t1), (_, t2)) in s1.iter().zip(s2.iter()) {
+                current = unify_with(&current, t1, t2)?;
+            }
+            Ok(current)
+        }
 
         // Anything else: the constructors are incompatible.
         (left, right) => Err(UnifyError::Mismatch { left, right }),
@@ -324,7 +425,7 @@ fn bind_var(subst: &Subst, var: TyVarId, ty: Ty) -> Result<Subst, UnifyError> {
 mod tests {
     use super::*;
     use crate::typechecking::subst::apply_ty_prune;
-    use crate::typechecking::ty::{boolean, float, int, list, string, EnumVariantPayloadTy};
+    use crate::typechecking::ty::{EnumVariantPayloadTy, boolean, float, int, list, string};
 
     fn v(i: u32) -> Ty {
         Ty::Var(TyVarId(i))
@@ -563,13 +664,19 @@ mod tests {
     #[test]
     fn result_is_idempotent_simple() {
         let s = unify(&fun(v(0), v(1)), &fun(int(), boolean())).unwrap();
-        assert!(is_idempotent(&s), "substitution should be idempotent: {s:?}");
+        assert!(
+            is_idempotent(&s),
+            "substitution should be idempotent: {s:?}"
+        );
     }
 
     #[test]
     fn result_is_idempotent_nested_fun() {
         let s = unify(&v(0), &fun(v(1), v(2))).unwrap();
-        assert!(is_idempotent(&s), "substitution should be idempotent: {s:?}");
+        assert!(
+            is_idempotent(&s),
+            "substitution should be idempotent: {s:?}"
+        );
     }
 
     #[test]
@@ -577,7 +684,10 @@ mod tests {
         let s1 = unify(&v(2), &v(0)).unwrap();
         let s2 = unify_with(&s1, &v(0), &v(1)).unwrap();
         let s3 = unify_with(&s2, &v(1), &int()).unwrap();
-        assert!(is_idempotent(&s3), "substitution should be idempotent: {s3:?}");
+        assert!(
+            is_idempotent(&s3),
+            "substitution should be idempotent: {s3:?}"
+        );
     }
 
     // ---- Sum / Constructor unification ----
@@ -603,8 +713,20 @@ mod tests {
     #[test]
     fn unify_same_name_empty_sums_succeeds() {
         // enum E { A, B }  ~  enum E { A, B }  → identity.
-        let s1 = sum("E", vec![("A", EnumVariantPayloadTy::Unit), ("B", EnumVariantPayloadTy::Unit)]);
-        let s2 = sum("E", vec![("A", EnumVariantPayloadTy::Unit), ("B", EnumVariantPayloadTy::Unit)]);
+        let s1 = sum(
+            "E",
+            vec![
+                ("A", EnumVariantPayloadTy::Unit),
+                ("B", EnumVariantPayloadTy::Unit),
+            ],
+        );
+        let s2 = sum(
+            "E",
+            vec![
+                ("A", EnumVariantPayloadTy::Unit),
+                ("B", EnumVariantPayloadTy::Unit),
+            ],
+        );
         assert!(unify(&s1, &s2).is_ok());
     }
 
@@ -632,14 +754,8 @@ mod tests {
     fn unify_sums_with_polymorphic_payload_binds_vars() {
         // enum E { A } with payload α  ~  enum E { A } with payload int
         // → α = int.
-        let s1 = sum(
-            "E",
-            vec![("A", EnumVariantPayloadTy::Tuple(vec![v(0)]))],
-        );
-        let s2 = sum(
-            "E",
-            vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))],
-        );
+        let s1 = sum("E", vec![("A", EnumVariantPayloadTy::Tuple(vec![v(0)]))]);
+        let s2 = sum("E", vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))]);
         let s = unify(&s1, &s2).unwrap();
         assert_eq!(apply_ty(&s, &v(0)), int());
     }
@@ -694,10 +810,7 @@ mod tests {
 
     #[test]
     fn unify_sums_with_different_payload_arity_is_mismatch() {
-        let s1 = sum(
-            "E",
-            vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))],
-        );
+        let s1 = sum("E", vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))]);
         let s2 = sum(
             "E",
             vec![("A", EnumVariantPayloadTy::Tuple(vec![int(), int()]))],
@@ -741,10 +854,7 @@ mod tests {
         // vs `A { x: int }` (record). These MUST NOT unify — the
         // shape discriminates them, even though the field count
         // matches.
-        let s1 = sum(
-            "E",
-            vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))],
-        );
+        let s1 = sum("E", vec![("A", EnumVariantPayloadTy::Tuple(vec![int()]))]);
         let s2 = sum(
             "E",
             vec![(

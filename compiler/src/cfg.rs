@@ -110,30 +110,15 @@ impl fmt::Display for ValueId {
 #[derive(Debug, Clone)]
 pub enum Inst {
     /// Push an integer constant: `dst = value`.
-    Const {
-        dst: ValueId,
-        value: i64,
-    },
+    Const { dst: ValueId, value: i64 },
     /// Push a floating-point constant: `dst = value`.
-    ConstF {
-        dst: ValueId,
-        value: f64,
-    },
+    ConstF { dst: ValueId, value: f64 },
     /// Push a boolean constant: `dst = value`.
-    ConstBool {
-        dst: ValueId,
-        value: bool,
-    },
+    ConstBool { dst: ValueId, value: bool },
     /// Push a string constant: `dst = value`.
-    ConstString {
-        dst: ValueId,
-        value: String,
-    },
+    ConstString { dst: ValueId, value: String },
     /// Reference a function parameter: `dst = params[index]`.
-    Param {
-        dst: ValueId,
-        index: u16,
-    },
+    Param { dst: ValueId, index: u16 },
     /// Binary operation: `dst = lhs OP rhs`.
     BinOp {
         op: BinOpKind,
@@ -195,9 +180,7 @@ pub enum Inst {
     /// allows `print "literal";` through the CFG path — programs
     /// with format specifiers (`print "%i", x;`) still fall
     /// back to the single-pass codegen.
-    Print {
-        args: Vec<ValueId>,
-    },
+    Print { args: Vec<ValueId> },
 }
 
 /// Binary operators.
@@ -366,7 +349,11 @@ impl fmt::Display for Inst {
                     .join(", ");
                 write!(f, "{}{}({})", dst_str, callee, args_str)
             }
-            Inst::LoadField { dst, src, field_index } => {
+            Inst::LoadField {
+                dst,
+                src,
+                field_index,
+            } => {
                 write!(f, "{} = {}.field[{}]", dst, src, field_index)
             }
             Inst::Unpack { dst, scrutinee } => {
@@ -447,10 +434,18 @@ impl fmt::Display for Terminator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Terminator::Jump(bb) => write!(f, "jump {}", bb),
-            Terminator::Branch { cond, true_bb, false_bb } => {
+            Terminator::Branch {
+                cond,
+                true_bb,
+                false_bb,
+            } => {
                 write!(f, "branch {}, {}, {}", cond, true_bb, false_bb)
             }
-            Terminator::Switch { scrutinee, cases, default } => {
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+            } => {
                 write!(f, "switch {} [", scrutinee)?;
                 for (i, (tag, bb)) in cases.iter().enumerate() {
                     if i > 0 {
@@ -875,7 +870,10 @@ mod tests {
             cases: vec![(1, BlockId(1)), (2, BlockId(2))],
             default: BlockId(3),
         };
-        assert_eq!(format!("{}", t), "switch v0 [1 -> bb1, 2 -> bb2] default bb3");
+        assert_eq!(
+            format!("{}", t),
+            "switch v0 [1 -> bb1, 2 -> bb2] default bb3"
+        );
     }
 
     #[test]
@@ -1026,7 +1024,10 @@ mod tests {
 
         // Dispatch block: 0 insts, Switch terminator.
         assert_eq!(func.blocks[0].insts.len(), 0);
-        assert!(matches!(func.blocks[0].terminator, Terminator::Switch { .. }));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Switch { .. }
+        ));
 
         let displayed = format!("{}", func);
         assert!(

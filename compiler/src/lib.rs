@@ -5,7 +5,10 @@ mod linearize;
 mod pipeline;
 mod typechecking;
 
-use std::{borrow::Borrow, collections::HashMap};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+};
 
 use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, likely, unlikely};
 
@@ -60,6 +63,29 @@ struct TagGroup {
 /// `checker.tag_for(enum_name, variant_name)`. If the typechecker
 /// has no record of the variant, the arm is bucketed under the
 /// sentinel — same fallback as Wildcard / Binding.
+/// Map a `&str` source-level FFI type name to the integer
+/// tag the runtime's [`Instruction::DeclareFFI`] reads. The
+/// mapping must match the canonical `enum FFIType` ordering
+/// in user-written source AND the `FfiType` Rust enum in
+/// the machine crate.
+///
+/// Returns `None` for unknown names so the call site can
+/// emit a diagnostic. The Phase 22b userland API embeds
+/// `FFIType::X` enum constructors and decodes the runtime
+/// tag back via `Machine::ffi_type_from_tag` (an internal
+/// helper in `vm.rs`). `extern` blocks use this
+/// `ffi_type_tag_from_str` instead, since the user's `fn
+/// name(int a) -> float` form doesn't go through the enum.
+fn ffi_type_tag_from_str(name: &str) -> Option<u32> {
+    match name {
+        "int" => Some(0),
+        "float" => Some(1),
+        "string" => Some(2),
+        "void" => Some(3),
+        _ => None,
+    }
+}
+
 fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup> {
     let mut groups: Vec<TagGroup> = Vec::new();
     let mut tag_to_idx: HashMap<u32, usize> = HashMap::new();
@@ -469,6 +495,32 @@ pub struct Compiler {
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
     native: HashMap<String, usize>,
+    /// Phase 22b: compile-time FFI table populated by the
+    /// `Expression::ExternBlock` codegen. Maps each function
+    /// name declared by an `extern` block to the SHORT
+    /// library name (so the test runner / pipeline can
+    /// register them via `Machine::register_extern_libs` at
+    /// VM startup). Multiple functions in one block share an
+    /// entry.
+    extern_libs: HashMap<String, String>,
+    /// Phase 22b: runtime-emit FFI metadata for `extern` blocks.
+    /// Maps the library short name to the let-slot holding
+    /// the library handle that the runtime's `FfiLoad`
+    /// pushed. Multiple functions in one block share this
+    /// slot; different blocks load their library independently.
+    extern_runtime_libs: HashMap<String, u32>,
+    /// Phase 22b: per-function binding for the runtime FFI
+    /// path. Maps the source-level function name to the
+    /// (lib_slot, fn_id_slot) where `fn_id_slot` holds the
+    /// function id returned by the runtime's `DeclareFFI`
+    /// opcode. A call site that finds `name` here emits
+    /// `invoke(lib, fn_id, args)` instead of the regular
+    /// user-function `CALL/JMP` pair.
+    extern_runtime_functions: HashMap<String, (u32, u32)>,
+    /// Records which FFI library short names have already
+    /// been loaded in the current compilation unit. Cleared
+    /// each `compile`.
+    extern_runtime_libs_loaded: std::collections::HashSet<String>,
     // --
     messages: Vec<Message>,
     context: Context,
@@ -481,6 +533,16 @@ pub struct Compiler {
     /// `do_compile` to recover the `NodeId` of the node it's currently
     /// emitting. Reset at the start of each `compile`.
     emit_idx: usize,
+    /// Bytecode offset WHERE the prologue (CALL+JMP+HALT)
+    /// ENDS and user-program code BEGINS. Set at
+    /// construction to `self.bytecode.len()` (after the
+    /// prologue has been prepended). The runtime pipeline
+    /// patches the prologue's JMP operand to this offset (NOT
+    /// to `main_offset`) so any module-level `extern` block
+    /// bytes execute before `main`. Without this, the prologue
+    /// would skip past the extern block entirely (because
+    /// `main_offset` lands past it).
+    program_start_offset: u32,
 }
 
 impl Default for Compiler {
@@ -491,6 +553,10 @@ impl Default for Compiler {
             Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
             Byte::new(Instruction::HALT),
         ]);
+        // The first USER code (i.e., the first byte after
+        // the prologue) is offset `bytecode.len()`, which
+        // is exactly 3 (CALL + JMP + HALT).
+        let program_start_offset = bytecode.len() as u32;
 
         Self {
             namespace: String::default(),
@@ -498,12 +564,17 @@ impl Default for Compiler {
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
             native: HashMap::default(),
+            extern_libs: HashMap::with_capacity(4),
+            extern_runtime_libs: HashMap::with_capacity(4),
+            extern_runtime_functions: HashMap::with_capacity(16),
+            extern_runtime_libs_loaded: HashSet::new(),
             // ---
             messages: Vec::default(),
             context: Context::default(),
             // ---
             checker: crate::typechecking::Checker::new(),
             emit_idx: 0,
+            program_start_offset,
         }
     }
 }
@@ -970,6 +1041,17 @@ fn is_straight_line(expr: &parser::ast::Expression) -> bool {
         Expression::Match { .. } => false,
         Expression::Function { .. } => false,
 
+        // ---- Aggregates (Phase 23) ----
+        //
+        // Tuples/arrays/indexing are handled by the legacy
+        // single-pass codegen today. Falling back keeps the
+        // legacy emitter authoritative for these forms until
+        // the CFG path learns to allocate heap aggregates.
+        Expression::Tuple(_)
+        | Expression::Array(_)
+        | Expression::Dict(_)
+        | Expression::Index(_, _) => false,
+
         // ---- Control flow: If / Branch / Loop are recursed into ----
         //
         // Phase 1.5 lifts these. The cfg_builder's `build_if` /
@@ -1049,13 +1131,15 @@ fn is_straight_line(expr: &parser::ast::Expression) -> bool {
         Expression::Call { .. } => false,
         Expression::Construct { .. } => false,
         Expression::Access(_, _) => false,
+        Expression::Dload(_) | Expression::Declare(_) | Expression::Invoke(_) => false,
 
         // ---- Slot-semantic operations (cfg_builder doesn't emit STORE_POP etc.) ----
         Expression::Assignment(_, _) => false,
         Expression::Defer(_) => false,
 
         // ---- Top-level / out-of-scope (cfg_builder returns None silently) ----
-        Expression::Implementation(_, _, _)
+        Expression::ExternBlock { .. }
+        | Expression::Implementation(_, _, _)
         | Expression::Class(_, _)
         | Expression::Field(_, _, _)
         | Expression::Method(_, _)
@@ -1066,6 +1150,7 @@ fn is_straight_line(expr: &parser::ast::Expression) -> bool {
         | Expression::Dec(_)
         | Expression::EnumDecl { .. }
         | Expression::EnumVariant { .. }
+        | Expression::TypeAlias { .. }
         | Expression::Default(_)
         | Expression::Use { .. }
         | Expression::List(_)
@@ -1134,6 +1219,26 @@ impl Compiler {
         self.functions[name]
     }
 
+    /// Bytecode offset WHERE the prologue (CALL+JMP+HALT)
+    /// ENDS and user-program code BEGINS. Used by the runtime
+    /// pipeline to patch the prologue's JMP operand so that
+    /// any module-level `extern` block bytes (appended to
+    /// `self.bytecode` before `main`) execute before main.
+    /// Without this, the prologue would skip past the extern
+    /// block entirely (because `main_offset` lands past it).
+    pub fn program_start_offset(&self) -> u32 {
+        self.program_start_offset
+    }
+
+    /// True iff at least one `extern` block was emitted in
+    /// the last `compile`. The pipeline uses this to decide
+    /// whether to JMP to `program_start_offset` (which would
+    /// execute `extern` block bytes first) or directly to
+    /// `main` (which is correct when no extern was used).
+    pub fn has_extern_block(&self) -> bool {
+        !self.extern_runtime_functions.is_empty()
+    }
+
     /// Look up the slot for a name used in an arm body. First
     /// checks the per-arm `match_bindings` map (where match-bound
     /// names live at slots 1, 2, 3, ... matching the VM's
@@ -1153,6 +1258,20 @@ impl Compiler {
             .variables
             .key(&name.to_string())
             .map(|s| s as u32)
+    }
+
+    /// Borrow the FFI library map populated by the last
+    /// `compile` (or `compile_test`) call. Each entry maps a
+    /// function name declared in an `extern "libname" { ... }`
+    /// block to the library short name (`"c"`, `"ssl"`, ...).
+    /// Tests pass this map to
+    /// [`Machine::register_extern_libs`](../../machine/src/vm.rs)
+    /// so the VM loads the libraries and binds the symbols
+    /// at startup (mirrored today by the runtime-emit
+    /// `FfiLoad`/`DeclareFFI` opcodes; the compile-time
+    /// table is kept for the existing pipeline test runner).
+    pub fn extern_libs(&self) -> &HashMap<String, String> {
+        &self.extern_libs
     }
 
     pub fn get_messages(&self) -> &Vec<Message> {
@@ -1419,7 +1538,17 @@ impl Compiler {
     fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
         match receiver.1.as_ref() {
             Expression::Identifier(name) => {
-                self.checker.codegen_var_type(name).cloned()
+                self.checker.codegen_var_type(name).cloned().map(|t| {
+                    // Apply the running substitution so an
+                    // unannotated `let d = { foo: 42 };` (which
+                    // minted a fresh `TyVar` and then unified it
+                    // with `Ty::Record { foo: int }`) resolves
+                    // to the actual record type. Phase 25.
+                    crate::typechecking::subst::apply_ty_prune(
+                        self.checker.subst(),
+                        &t,
+                    )
+                })
             }
             Expression::Access(inner, field) => {
                 // Chained access — the inner access's type is
@@ -1430,8 +1559,19 @@ impl Compiler {
                 // `Ty::Con("Inner")` for
                 // `enum Outer { Outer { x: Inner } }`).
                 let inner_ty = self.receiver_type(inner)?;
-                let inner_enum = extract_enum_name(&inner_ty)?;
-                self.checker.field_type_for(&inner_enum, field)
+                if let Some(name) = extract_enum_name(&inner_ty) {
+                    return self.checker.field_type_for(&name, field);
+                }
+                // Phase 25: chained record access. If the inner
+                // is `Ty::Record { fields }`, look up `field`
+                // directly. Otherwise None.
+                if let Ty::Record { fields } = &inner_ty {
+                    return fields
+                        .iter()
+                        .find(|(n, _)| n == field)
+                        .map(|(_, t)| t.clone());
+                }
+                None
             }
             _ => None,
         }
@@ -1711,6 +1851,241 @@ impl Compiler {
                 self.bytecode
                     .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
             }
+
+            // ---- Userland FFI builtins ----
+            Expression::Dload(path) => {
+                let bc = self.do_compile(path);
+                self.bytecode.extend(bc);
+                self.bytecode.push(Byte::new(Instruction::FfiLoad));
+            }
+            // ---- Phase 23: aggregates ----
+            //
+            // `(a, b, c)` and `[a, b, c]` literals. Compile each
+            // child (PUSHes its `Value` in source order — so the
+            // LAST source element ends up on top), then emit
+            // `MakeTuple` / `MakeArray` with arity in the low 16
+            // bits. The runtime pops `arity` values and reverses
+            // for source-order storage.
+            Expression::Tuple(items) => {
+                for c in items {
+                    let mut bc = self.do_compile(c);
+                    bytecode.append(&mut bc);
+                }
+                let arity = items.len() as u32;
+                bytecode.push(
+                    Byte::new(Instruction::MakeTuple).with_operand_u32(arity),
+                );
+            }
+            Expression::Array(items) => {
+                for c in items {
+                    let mut bc = self.do_compile(c);
+                    bytecode.append(&mut bc);
+                }
+                let arity = items.len() as u32;
+                bytecode.push(
+                    Byte::new(Instruction::MakeArray).with_operand_u32(arity),
+                );
+            }
+            // ---- Phase 25: dict literal ----
+            //
+            // `{ name: expr, ... }` emits each (name, value) pair
+            // in source order. The runtime walks pairs in reverse
+            // (pop the top = LAST source pair). The field-name is
+            // interned via `STRING` (which pushes a heap
+            // `Object::String` address); `MakeDict` reuses the
+            // existing `Object::Instance` storage (the string
+            // table keys the `Table<Member>`).
+            Expression::Dict(items) => {
+                // Eagerly resolve field names to strings before
+                // any bytecode emission so the byte offsets
+                // remain stable.
+                let field_names: Vec<&str> =
+                    items.iter().map(|f| f.name).collect();
+                for (f, name) in items.iter().zip(field_names.iter()) {
+                    // value first (so it's UNDER the field name
+                    // when both are pushed). MakeDict pops the
+                    // top first (which is the field-name) and
+                    // then the value, so they end up correctly
+                    // paired in (name, value) order in the
+                    // runtime's pair Vec.
+                    let mut bc = self.do_compile(&f.value);
+                    bytecode.append(&mut bc);
+                    // field-name string — emits STRING then
+                    // DATA bytes (the runtime's standard
+                    // string-literal encoding — see
+                    // `Expression::String` arm).
+                    bytecode
+                        .push(Byte::new(Instruction::STRING).with_operand_u32(name.len() as u32));
+                    for ch in name.chars() {
+                        bytecode
+                            .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                    }
+                }
+                let arity = items.len() as u32;
+                bytecode.push(
+                    Byte::new(Instruction::MakeDict).with_operand_u32(arity),
+                );
+            }
+            // `t[i]` — pop the index (top), pop the target,
+            // push the element at `target[index]`. The Index
+            // opcode carries no operand (the index is at the top
+            // of the operand stack at dispatch time).
+            Expression::Index(target, index) => {
+                let mut target_bc = self.do_compile(target);
+                bytecode.append(&mut target_bc);
+                let mut index_bc = self.do_compile(index);
+                bytecode.append(&mut index_bc);
+                bytecode.push(Byte::new(Instruction::Index));
+            }
+            // ---- Phase 26: declare/invoke tuple form ----
+            //
+            // `declare(lib, name, (T1, T2), R)` — the arguments
+            // tuple is a single AST `Tuple` expression. The
+            // codegen emits each tuple element's bytecode (so
+            // each element pushes its FFI-type tag onto the
+            // stack — for the userland `FFIType::X` form this
+            // is `MakeEnum`; for the bare `int`/`string` form
+            // this is `CONST <tag>`). After the elements,
+            // `MakeTuple <arity>` allocates the tuple and
+            // pushes it as a single Value. Then the name
+            // string, then the lib handle, then `DeclareFFI`
+            // pops the tuple and walks its elements for arg
+            // tags. The ret-type tag is popped first (on top of
+            // the stack).
+            Expression::Declare(args) => {
+                if args.len() != 4 {
+                    let mut m = common::Message::error(
+                        "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)".to_string(),
+                        span.into_range(),
+                    );
+                    m.push(common::Label::new(
+                        format!(
+                            "expected 4 arguments (lib, name, args_tuple, ret_type); got {}",
+                            args.len()
+                        ),
+                        span.into_range(),
+                    ));
+                    self.messages.push(m);
+                    // Emit a defensive operand so the bytecode
+                    // stays well-formed (DeclareFFI on a partial
+                    // stack will just fail at runtime).
+                    self.bytecode.push(
+                        Byte::new(Instruction::DeclareFFI).with_operand_u32(0),
+                    );
+                } else {
+                    let lib = &args[0];
+                    let name = &args[1];
+                    let args_tuple = &args[2];
+                    let ret_type = &args[3];
+
+                    // Verify `args[2]` is a Tuple expression.
+                    // Otherwise it's a type error — emit a
+                    // diagnostic and proceed defensively.
+                    let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
+                        Expression::Tuple(items) => items.iter().cloned().collect(),
+                        _ => {
+                            let mut m = common::Message::error(
+                                "declare(...) arguments tuple must be (T1, T2, ...) syntax"
+                                    .to_string(),
+                                args_tuple.0.into_range(),
+                            );
+                            m.push(common::Label::new(
+                                "wrap the arg types in parentheses — (FFIType::Int, FFIType::Float)".to_string(),
+                                args_tuple.0.into_range(),
+                            ));
+                            self.messages.push(m);
+                            Vec::new()
+                        }
+                    };
+
+                    let lib_bc = self.do_compile(lib);
+                    self.bytecode.extend(lib_bc);
+                    let name_bc = self.do_compile(name);
+                    self.bytecode.extend(name_bc);
+
+                    // Each element pushes its tag onto the
+                    // stack. Then `MakeTuple` packs them all
+                    // into a single Value.
+                    for elem in &tuple_elements {
+                        let bc = self.do_compile(elem);
+                        self.bytecode.extend(bc);
+                    }
+                    let arity = tuple_elements.len() as u32;
+                    self.bytecode
+                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+
+                    // Ret-type tag on top.
+                    let ret_bc = self.do_compile(ret_type);
+                    self.bytecode.extend(ret_bc);
+
+                    // DeclareFFI pops name + tuple + lib in
+                    // dispatch order (see VM).
+                    let operand = (arity) & 0xFFFF;
+                    self.bytecode
+                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
+                }
+            }
+            Expression::Invoke(args) => {
+                // Phase 26 — `invoke(lib, fn_id, (a, b, c))`.
+                // The 3rd arg is a Tuple expression containing
+                // the runtime values.
+                if args.len() != 3 {
+                    let mut m = common::Message::error(
+                        "invoke requires arguments as a tuple in position 3 (use (a, b, ...) syntax)".to_string(),
+                        span.into_range(),
+                    );
+                    m.push(common::Label::new(
+                        format!(
+                            "expected 3 arguments (lib, fn_id, args_tuple); got {}",
+                            args.len()
+                        ),
+                        span.into_range(),
+                    ));
+                    self.messages.push(m);
+                    self.bytecode
+                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(0));
+                } else {
+                    let lib = &args[0];
+                    let fn_id = &args[1];
+                    let args_tuple = &args[2];
+
+                    let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
+                        Expression::Tuple(items) => items.iter().cloned().collect(),
+                        _ => {
+                            let mut m = common::Message::error(
+                                "invoke(...) arguments must be a tuple in position 3"
+                                    .to_string(),
+                                args_tuple.0.into_range(),
+                            );
+                            m.push(common::Label::new(
+                                "wrap the arg values in parentheses — (40, 2)".to_string(),
+                                args_tuple.0.into_range(),
+                            ));
+                            self.messages.push(m);
+                            Vec::new()
+                        }
+                    };
+
+                    let lib_bc = self.do_compile(lib);
+                    self.bytecode.extend(lib_bc);
+                    let fn_bc = self.do_compile(fn_id);
+                    self.bytecode.extend(fn_bc);
+
+                    // Each element's bytecode pushes a Value.
+                    for elem in &tuple_elements {
+                        let bc = self.do_compile(elem);
+                        self.bytecode.extend(bc);
+                    }
+                    let arity = tuple_elements.len() as u32;
+                    self.bytecode
+                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+
+                    // FfiInvoke pops tuple (top) + fn_id + lib.
+                    let operand = (arity) & 0xFFFF;
+                    self.bytecode
+                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
+                }
+            }
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
                 self.context.defers.iter().for_each(|offset| {
                     self.bytecode
@@ -1928,7 +2303,42 @@ impl Compiler {
                 let identifier = self.resolve_variable(name);
                 let n = self.aliases.get(&identifier).unwrap_or(&identifier);
 
-                if let Some(offset) = self.functions.get(n).copied() {
+                // Phase 22b: if `name` was declared by an
+                // `extern` block, dispatch to runtime
+                // `FfiInvoke` instead of a user-function
+                // `CALL/JMP`. None of this needs new AST or
+                // opcode changes — `invoke` is just
+                // `invoke(lib, fn_id, args)` where `lib` is
+                // loaded from a let-slot and `fn_id` is
+                // loaded from another (both interned at
+                // `extern_block` codegen time).
+                if let Some(&(lib_slot, fn_id_slot)) =
+                    self.extern_runtime_functions.get(n)
+                {
+                    // Stage arg bytecode in a local Vec to
+                    // release the `&mut self.bytecode` borrow
+                    // before the loop calls `self.do_compile`.
+                    let mut arg_bc = Vec::new();
+                    let arity = if let Some(items) = args {
+                        for arg in items {
+                            arg_bc.append(&mut self.do_compile(arg));
+                        }
+                        items.len()
+                    } else {
+                        0
+                    };
+                    self.bytecode.push(
+                        Byte::new(Instruction::LOAD).with_operand_u32(lib_slot),
+                    );
+                    self.bytecode.push(
+                        Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot),
+                    );
+                    self.bytecode.append(&mut arg_bc);
+                    self.bytecode.push(
+                        Byte::new(Instruction::FfiInvoke)
+                            .with_operand_u32(arity as u32),
+                    );
+                } else if let Some(offset) = self.functions.get(n).copied() {
                     if let Some(args) = args {
                         args.iter()
                             .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
@@ -2270,83 +2680,113 @@ impl Compiler {
 
                 self.context.constants.insert(symbol, false);
             }
-            Expression::Assignment(name, value) => {
-                let name = self.resolve_variable(name);
+            Expression::Assignment(lhs, value) => {
+                // Phase 25 — `d.field = expr` form for record
+                // mutation. Detect via `Access(_, _)` on the
+                // LHS and emit a `SetField` sequence instead of
+                // the legacy `STORE_POP` for plain variables.
+                let lhs_is_access = matches!(lhs.1.as_ref(), Expression::Access(_, _));
+                if lhs_is_access {
+                    if let Expression::Access(target_expr, field) = lhs.1.as_ref() {
+                        // Compute the RHS first (top of stack at
+                        // dispatch will be the new value).
+                        bytecode.append(&mut self.do_compile(value));
+                        // THEN the receiver (so it's UNDER the
+                        // value). `SetField` pops in reverse
+                        // order (value, field-name, target).
+                        bytecode.append(&mut self.do_compile(target_expr));
+                        // Push field-name string last (so it's
+                        // on top). Use STRING+DATA encoding.
+                        bytecode.push(
+                            Byte::new(Instruction::STRING)
+                                .with_operand_u32(field.len() as u32),
+                        );
+                        for ch in field.chars() {
+                            bytecode
+                                .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                        }
+                        bytecode.push(Byte::new(Instruction::SetField));
+                    }
+                    // Continue to the next match arm — don't
+                    // fall through to the let-variable path.
+                } else {
+                    let name = self.resolve_variable(lhs);
 
-                self.context.assignments.insert(name.clone(), true);
+                    self.context.assignments.insert(name.clone(), true);
 
-                // Match bindings (arm body pattern bindings) live
-                // in `match_bindings`, not the global `variables`
-                // Interner. Fall back to the global Interner only
-                // when no match is in scope.
-                let symbol_opt = if let Some(map) = &self.context.match_bindings {
-                    if let Some(&slot) = map.get(&name) {
-                        Some(slot as usize)
+                    // Match bindings (arm body pattern bindings) live
+                    // in `match_bindings`, not the global `variables`
+                    // Interner. Fall back to the global Interner only
+                    // when no match is in scope.
+                    let symbol_opt = if let Some(map) = &self.context.match_bindings {
+                        if let Some(&slot) = map.get(&name) {
+                            Some(slot as usize)
+                        } else {
+                            self.context.variables.key(&name)
+                        }
                     } else {
                         self.context.variables.key(&name)
-                    }
-                } else {
-                    self.context.variables.key(&name)
-                };
+                    };
 
-                if let Some(symbol) = symbol_opt {
-                    if unlikely(self.context.constants.contains_key(&symbol)) {
-                        let assigned = likely(*self.context.constants.get(&symbol).unwrap());
+                    if let Some(symbol) = symbol_opt {
+                        if unlikely(self.context.constants.contains_key(&symbol)) {
+                            let assigned = likely(*self.context.constants.get(&symbol).unwrap());
 
-                        if !assigned {
-                            self.context.constants.entry(symbol).and_modify(|state| {
-                                *state = true;
-                            });
-                        } else {
-                            let mut message =
-                                Message::error("Assignment error".to_string(), span.into_range());
-                            message.push(DiagLabel::new(
-                                format!(
-                                    "Unable to assign to an already assigned constant '{}'",
-                                    name
-                                ),
-                                span.into_range(),
-                            ));
-                            self.messages.push(message);
+                            if !assigned {
+                                self.context.constants.entry(symbol).and_modify(|state| {
+                                    *state = true;
+                                });
+                            } else {
+                                let mut message =
+                                    Message::error("Assignment error".to_string(), span.into_range());
+                                message.push(DiagLabel::new(
+                                    format!(
+                                        "Unable to assign to an already assigned constant '{}'",
+                                        name
+                                    ),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
                         }
+
+                        // ---- Phase 18E: let-bound variable re-assignment ----
+                        //
+                        // Pre-18E codegen emitted `STORE` (a no-op
+                        // since Phase 15D — see `Instruction::STORE`)
+                        // + `DUPLICATE`. The combination was buggy:
+                        // the `STORE` didn't write the new value into
+                        // the slot (it just confirmed whatever was
+                        // already there from `UNPACK` /
+                        // `JUMP_IF_MATCH`), and the `DUPLICATE`
+                        // pushed a second copy of the value onto the
+                        // stack without ever correcting the slot.
+                        //
+                        // Post-18E codegen emits `STORE_POP slot` —
+                        // the load-bearing pop-and-write opcode
+                        // introduced in this phase. The new value
+                        // lands at the slot; the cursor stays past
+                        // the slot so subsequent pushes don't
+                        // clobber it.
+                        let mut expr = self.do_compile(value);
+
+                        bytecode.append(&mut expr);
+                        bytecode.push(
+                            Byte::new(Instruction::StorePop)
+                                .with_operand_u32(symbol as u32),
+                        );
+                    } else {
+                        let mut message =
+                            Message::error("Undefined variable".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!(
+                                "Unable to assign to a non-existing variable/constant '{}'",
+                                name
+                            ),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
                     }
-
-                    // ---- Phase 18E: let-bound variable re-assignment ----
-                    //
-                    // Pre-18E codegen emitted `STORE` (a no-op
-                    // since Phase 15D — see `Instruction::STORE`)
-                    // + `DUPLICATE`. The combination was buggy:
-                    // the `STORE` didn't write the new value into
-                    // the slot (it just confirmed whatever was
-                    // already there from `UNPACK` /
-                    // `JUMP_IF_MATCH`), and the `DUPLICATE`
-                    // pushed a second copy of the value onto the
-                    // stack without ever correcting the slot.
-                    //
-                    // Post-18E codegen emits `STORE_POP slot` —
-                    // the load-bearing pop-and-write opcode
-                    // introduced in this phase. The new value
-                    // lands at the slot; the cursor stays past
-                    // the slot so subsequent pushes don't
-                    // clobber it.
-                    let mut expr = self.do_compile(value);
-
-                    bytecode.append(&mut expr);
-                    bytecode.push(
-                        Byte::new(Instruction::StorePop)
-                            .with_operand_u32(symbol as u32),
-                    );
-                } else {
-                    let mut message =
-                        Message::error("Undefined variable".to_string(), span.into_range());
-                    message.push(DiagLabel::new(
-                        format!(
-                            "Unable to assign to a non-existing variable/constant '{}'",
-                            name
-                        ),
-                        span.into_range(),
-                    ));
-                    self.messages.push(message);
                 }
             }
 
@@ -2367,6 +2807,197 @@ impl Compiler {
             // mint IDs (see `pre_walk_pattern`). The codegen
             // below consumes exactly that many IDs by recursing
             // via `self.do_compile`.
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                // Phase 22b runtime-emit FFI block.
+                //
+                // We append directly to `self.bytecode` (NOT
+                // to the local `bytecode` Vec this match arm
+                // would otherwise return), matching how
+                // `Expression::Function` emits its body. The
+                // prologue's `JMP` targets the offset of main
+                // in `self.bytecode` at the moment main is
+                // emitted — if we wrote to the local Vec, the
+                // extern bytes would land AFTER main's body
+                // and never execute.
+                //
+                // 1. Synthesize a let-slot for the library
+                //    handle (shared by every fn in this block).
+                let lib_slot = if let Some(&existing) =
+                    self.extern_runtime_libs.get(library.as_str())
+                {
+                    existing
+                } else {
+                    let name = format!("__ext_lib_{}", library);
+                    let slot = self.context.variables.intern(name) as u32;
+                    self.extern_runtime_libs
+                        .insert(library.clone(), slot);
+                    slot
+                };
+                // 2. dlopen the library (only on the first
+                //    occurrence across the whole compile).
+                if !self
+                    .extern_runtime_libs_loaded
+                    .contains(library.as_str())
+                {
+                    self.extern_runtime_libs_loaded
+                        .insert(library.clone());
+                    let span: SimpleSpan = (0..0).into();
+                    let path_expr: parser::ast::Output = (
+                        span,
+                        Box::new(parser::ast::Expression::String(
+                            library.as_str(),
+                        )),
+                    );
+                    let mut bc = self.do_compile(&path_expr);
+                    self.bytecode.append(&mut bc);
+                    self.bytecode.push(Byte::new(Instruction::FfiLoad));
+                    self.bytecode.push(
+                        Byte::new(Instruction::StorePop)
+                            .with_operand_u32(lib_slot),
+                    );
+                }
+                // 2b. ALSO populate the legacy compile-time
+                //     extern_libs table. The test runner's
+                //     `Machine::register_extern_libs` reads
+                //     this to do compile-time dlopen via the
+                //     `NATIVE` opcode. With the runtime
+                //     emission above, this is redundant for
+                //     fresh VMs but keeps backward compat with
+                //     the existing pipeline tests.
+                for decl in declarations {
+                    self.extern_libs
+                        .entry(decl.name.to_string())
+                        .or_insert_with(|| library.clone());
+                }
+                // 3. For each declared function, emit
+                //    `declare(lib, name, arg_tags...,
+                //    ret_tag)` and store the function id in
+                //    a let-slot.
+                for decl in declarations {
+                    let fn_name = decl.name.to_string();
+                    // First-wins on fn-name collisions across
+                    // multiple `extern` blocks.
+                    if self.extern_runtime_functions.contains_key(&fn_name)
+                    {
+                        continue;
+                    }
+                    let fn_id_slot_name = format!("__ext_fn_{}", fn_name);
+                    let fn_id_slot = self
+                        .context
+                        .variables
+                        .intern(fn_id_slot_name) as u32;
+                    // Push the library handle.
+                    self.bytecode.push(
+                        Byte::new(Instruction::LOAD).with_operand_u32(lib_slot),
+                    );
+                    // Push the function name (string literal).
+                    let span: SimpleSpan = (0..0).into();
+                    let name_expr: parser::ast::Output = (
+                        span,
+                        Box::new(parser::ast::Expression::String(
+                            decl.name,
+                        )),
+                    );
+                    let mut name_bc = self.do_compile(&name_expr);
+                    self.bytecode.append(&mut name_bc);
+                    // Push each arg type as a CONST tag
+                    // (skipping the FFIType enum dispatch).
+                    let mut arg_type_tags: Vec<u32> = Vec::new();
+                    if let Expression::Fragment(items) =
+                        decl.args.1.as_ref()
+                    {
+                        for arg in items {
+                            if let Expression::Argument(
+                                type_expr,
+                                _param_name,
+                            ) = arg.1.as_ref()
+                            {
+                                // Phase 24: the type is now a
+                                // full Output. For the FFI
+                                // extern-block path we only
+                                // support bare identifiers
+                                // (`int`, `float`, etc.); arrays
+                                // and tuples aren't valid FFI
+                                // arg types.
+                                let type_name = match type_expr.1.as_ref() {
+                                    Expression::Type(n) => *n,
+                                    _ => "",
+                                };
+                                if let Some(tag) =
+                                    ffi_type_tag_from_str(type_name)
+                                {
+                                    self.bytecode.push(
+                                        Byte::new(Instruction::CONST)
+                                            .with_value_u32(tag as u32),
+                                    );
+                                    arg_type_tags.push(tag);
+                                } else {
+                                    self.messages.push({
+                                        let mut m = common::Message::error(
+                                            format!(
+                                                "Unknown FFI argument type `{}`",
+                                                type_name
+                                            ),
+                                            arg.0.into_range(),
+                                        );
+                                        m.push(common::Label::new(
+                                            format!(
+                                                "expected one of: int, float, string, void; got `{}`",
+                                                type_name
+                                            ),
+                                            arg.0.into_range(),
+                                        ));
+                                        m
+                                    });
+                                    arg_type_tags.push(0);
+                                }
+                            } else {
+                                self.messages.push({
+                                    let mut m = common::Message::error(
+                                        "Extern fn argument must be `name: type` form"
+                                            .to_string(),
+                                        arg.0.into_range(),
+                                    );
+                                    m.push(common::Label::new(
+                                        "got an unexpected expression"
+                                            .to_string(),
+                                        arg.0.into_range(),
+                                    ));
+                                    m
+                                });
+                                arg_type_tags.push(0);
+                            }
+                        }
+                    }
+                    let arity = arg_type_tags.len() as u32;
+                    // Push the ret type tag.
+                    let ret_tag = decl
+                        .returns
+                        .and_then(|s| ffi_type_tag_from_str(s))
+                        .unwrap_or(0);
+                    self.bytecode.push(
+                        Byte::new(Instruction::CONST)
+                            .with_value_u32(ret_tag as u32),
+                    );
+                    // Emit DeclareFFI.
+                    self.bytecode.push(
+                        Byte::new(Instruction::DeclareFFI)
+                            .with_operand_u32(arity),
+                    );
+                    // Store the function id.
+                    self.bytecode.push(
+                        Byte::new(Instruction::StorePop)
+                            .with_operand_u32(fn_id_slot),
+                    );
+                    self.extern_runtime_functions.insert(
+                        fn_name.clone(),
+                        (lib_slot, fn_id_slot),
+                    );
+                }
+            }
             Expression::EnumDecl { name: _, variants } => {
                 // Recurse into each variant. Each variant's
                 // `do_compile` consumes 1 ID (for the variant
@@ -2378,6 +3009,13 @@ impl Compiler {
                 for v in variants {
                     bytecode.append(&mut self.do_compile(v));
                 }
+            }
+            Expression::TypeAlias { ty, .. } => {
+                // Phase 28 — `type X = T;` is metadata only;
+                // the alias is substituted at typecheck time.
+                // Recurse into the RHS so its children
+                // consume IDs (matching the pre-walk).
+                bytecode.append(&mut self.do_compile(ty));
             }
             Expression::EnumVariant { payload, .. } => {
                 // Recurse into each payload's `Type` expression
@@ -3450,17 +4088,40 @@ impl Compiler {
                 // was already emitted upstream.
                 bytecode.append(&mut self.do_compile(receiver));
 
-                let enum_name = self.enum_name_for_receiver(receiver);
-                let field_index = enum_name
-                    .as_ref()
-                    .and_then(|name| self.checker.field_index_for(name, field))
-                    .map(|(_variant, idx)| idx)
-                    .unwrap_or(0);
+                // Phase 25 — detect `Ty::Record` (anonymous dict)
+                // receivers and route to `GetField` (string-keyed)
+                // instead of `LoadField` (enum-indexed). For record-
+                // shaped enum variants the existing path stays.
+                let receiver_ty = self.receiver_type(receiver);
+                let is_record = matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
+                if is_record {
+                    // Push the field-name string on TOP of the
+                    // receiver (which is already on the stack
+                    // from `do_compile(receiver)` above). GetField
+                    // pops the field-name (top) and the receiver,
+                    // pushes the value. Use STRING+DATA encoding.
+                    bytecode.push(
+                        Byte::new(Instruction::STRING)
+                            .with_operand_u32(field.len() as u32),
+                    );
+                    for ch in field.chars() {
+                        bytecode
+                            .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                    }
+                    bytecode.push(Byte::new(Instruction::GetField));
+                } else {
+                    let enum_name = self.enum_name_for_receiver(receiver);
+                    let field_index = enum_name
+                        .as_ref()
+                        .and_then(|name| self.checker.field_index_for(name, field))
+                        .map(|(_variant, idx)| idx)
+                        .unwrap_or(0);
 
-                bytecode.push(
-                    Byte::new(Instruction::LoadField)
-                        .with_operand_u32(field_index as u32),
-                );
+                    bytecode.push(
+                        Byte::new(Instruction::LoadField)
+                            .with_operand_u32(field_index as u32),
+                    );
+                }
             }
 
             _expr => {

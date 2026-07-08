@@ -1,0 +1,49 @@
+// ffi_sum.0s — Userland FFI example. Demonstrates the
+// `dload` / `declare` / `invoke` API surface that lets a
+// script load a C library, declare its signatures, and call
+// functions entirely from source — no VM-recompile-time
+// definitions required.
+//
+// The corresponding C source is `sum.c` in this directory:
+//
+//   int sum(int a, int b) { return a + b; }
+//
+// Build the shared library with:
+//
+//   cc -shared -fPIC -o libsum.so sum.c
+//
+// then keep `libsum.so` in the current directory (or anywhere
+// `dlopen` can find it — the binary must be loadable by the
+// dynamic linker for the runtime to resolve the symbol).
+//
+// Expected output: `42` (40 + 2).
+//
+// The pipeline test runner compiles this file in-memory and
+// passes the resulting bytecode to a fresh `Machine`. The
+// runtime's `Machine::register_extern_libs` is no longer
+// called for `extern` blocks — userland FFI is now
+// self-contained in the script.
+
+enum FFIType {
+    Int,
+    Float,
+    String,
+    Void,
+}
+
+fn main() {
+    // `dload("<full path>")` is the most portable form — no
+    // dependence on cwd or LD_LIBRARY_PATH at runtime.
+    let lib = dload("/home/ddimitrov/projects/zero-script/examples/libsum.so");
+    // Phase 26 — `declare` and `invoke` now take the
+    // arguments as a single tuple:
+    //   declare(lib, name, (T1, T2, ...), R)
+    //   invoke(lib, fn_id, (v1, v2, ...))
+    let sum_id = declare(
+        lib,
+        "sum",
+        (FFIType::Int, FFIType::Int),
+        FFIType::Int,
+    );
+    print "%i", invoke(lib, sum_id, (40, 2));
+}

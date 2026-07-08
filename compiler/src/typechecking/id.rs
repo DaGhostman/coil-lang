@@ -171,13 +171,47 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             }
         }
 
-        // `Vec<Output>` — block, program, fragment, list.
+        // `Vec<Output>` — block, program, fragment, list,
+        // and the userland FFI builtins (`declare`/`invoke`
+        // carry a list of args).
         Expression::Block(cs)
         | Expression::Program(cs)
         | Expression::Fragment(cs)
-        | Expression::List(cs) => {
+        | Expression::List(cs)
+        | Expression::Declare(cs)
+        | Expression::Invoke(cs) => {
             for c in cs {
                 pre_walk(c, table);
+            }
+        }
+        // `dload(path)` — single child.
+        Expression::Dload(path) => pre_walk(path, table),
+        // `(a, b, c)` — tuple literal. Walks each element so
+        // each gets its own NodeId for opcode selection.
+        Expression::Tuple(items) => {
+            for c in items {
+                pre_walk(c, table);
+            }
+        }
+        // `[a, b, c]` — array literal. Same as Tuple for ID
+        // walking purposes (the runtime distinguishes by
+        // opcode, not by AST shape).
+        Expression::Array(items) => {
+            for c in items {
+                pre_walk(c, table);
+            }
+        }
+        // `t[i]` — index access. Walks both operands.
+        Expression::Index(target, index) => {
+            pre_walk(target, table);
+            pre_walk(index, table);
+        }
+        // `{ name: expr, ... }` — dict literal. Walks every
+        // value expression (the field NAME is inert metadata
+        // and doesn't need an ID).
+        Expression::Dict(fields) => {
+            for f in fields {
+                pre_walk(&f.value, table);
             }
         }
         // `If(branches)` — each branch is itself an Output.
@@ -257,6 +291,24 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         Expression::EnumDecl { variants, .. } => {
             for v in variants {
                 pre_walk(v, table);
+            }
+        }
+        // Phase 28 — `type Name = T;` aliases. Walk the RHS
+        // so its children consume IDs in lockstep with the
+        // pre-walk. Alias resolution happens in the
+        // typechecker (substituting Name with the RHS Ty on
+        // lookup), not in the pre-walk.
+        Expression::TypeAlias { ty, .. } => {
+            pre_walk(ty, table);
+        }
+        // FFI declaration block: each function declaration has
+        // its own `Output` (the `args` field). The pre-walk
+        // visits each so the typechecker's ID cache lines up
+        // with the codegen's ID consumption. The function
+        // arguments are visited as `Argument` outputs.
+        Expression::ExternBlock { declarations, .. } => {
+            for decl in declarations {
+                pre_walk(&decl.args, table);
             }
         }
         // `EnumVariant` carries the payload shape (`EnumVariantPayload`):

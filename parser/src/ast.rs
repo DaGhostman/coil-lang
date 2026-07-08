@@ -24,7 +24,11 @@ pub enum Expression<'expr> {
     Bool(bool),
     Module(String, Output<'expr>),
 
-    Argument(&'expr str, &'expr str),
+    /// Function argument: `(T name)`. The type `T` is
+    /// represented as a full `Output<'expr>` (Phase 24) so
+    /// aggregate types like `[int]` and `(int, string)` are
+    /// preserved through the parser.
+    Argument(Output<'expr>, &'expr str),
     Identifier(&'expr str),
     Type(&'expr str),
     Comment(&'expr str),
@@ -61,6 +65,7 @@ pub enum Expression<'expr> {
     Gt(Output<'expr>, Output<'expr>),
 
     List(Vec<Output<'expr>>),
+    Array(Vec<Output<'expr>>),
     Expr(Output<'expr>),
     Group(Output<'expr>),
     ExprStatement(Output<'expr>),
@@ -72,16 +77,107 @@ pub enum Expression<'expr> {
 
     Assignment(Output<'expr>, Output<'expr>),
 
+    /// `(a, b, c)` — heterogeneous product type literal.
+    /// Each element may be a different type. Used in:
+    ///   - source: tuple literals in expression position
+    ///   - `declare(lib, name, (T1, T2), R)` — the arg-types
+    ///     tuple (Phase 23 second point)
+    ///   - `invoke(lib, fn_id, (a, b))` — packed args (Phase 23
+    ///     third point)
+    Tuple(Vec<Output<'expr>>),
+
+    /// `{name: expr, name: expr, ...}` — anonymous record / dict
+    /// literal (Phase 25). Structurally typed. Mutable via
+    /// the same `Access` field-update path as classes. The
+    /// runtime reuses `Object::Instance` for storage.
+    Dict(Vec<RecordFieldValue<'expr>>),
+
+    /// `t[i]` or `arr[i]` — element access. The index may be
+    /// any expression evaluated to an integer at runtime.
+    /// Out-of-bounds indices push `Value::from(-1i64)` (a
+    /// sentinel; the typechecker doesn't catch this).
+    Index(Output<'expr>, Output<'expr>),
+
+    /// `dload(path)` — userland dynamic library load. Pops a
+    /// string path, calls `dlopen`, and pushes the library
+    /// handle (an `Object::Library` heap address disguised as
+    /// an `int`). Subsequent `declare(...)` / `invoke(...)`
+    /// calls take this handle as their first argument.
+    Dload(Output<'expr>),
+
+    /// `declare(lib, name, args_tuple, ret_type)` — userland
+    /// runtime registration of an FFI signature.
+    ///
+    /// Phase 23 redesign: `args_tuple` is a single tuple
+    /// expression whose elements are the parameter *types*
+    /// (each an `FFIType::X` constructor application
+    /// evaluated to its enum tag integer). The return type
+    /// is the LAST argument, OUTSIDE the tuple. Example:
+    ///
+    /// ```ignore
+    ///     declare(ffi,
+    ///             "sum",
+    ///             (FFIType::Int, FFIType::Int),
+    ///             FFIType::Int)
+    /// ```
+    ///
+    /// Returns a function ID (an `int`) the user passes to
+    /// `invoke(...)`. The arity is the tuple's element count
+    /// (`args_tuple.1.len()`); the runtime's `DeclareFFI`
+    /// opcode reads the tag stack and emits one tag per
+    /// tuple position.
+    Declare(Vec<Output<'expr>>),
+
+    /// `invoke(lib, fn_id, args_tuple)` — call the function
+    /// previously registered by `declare`.
+    ///
+    /// Phase 23 redesign: the value args are passed as a
+    /// single tuple (or array) expression. The VM unpacks
+    /// the elements at dispatch time and passes each one to
+    /// the C function in source order. Example:
+    ///
+    /// ```ignore
+    ///     invoke(ffi, sum_id, (40, 2))
+    /// ```
+    ///
+    /// The payload of the tuple is also acceptable via
+    /// `let args = (40, 2); invoke(ffi, sum_id, args)`.
+    Invoke(Vec<Output<'expr>>),
+
     Use {
         path: Vec<String>,
         name: String,
         alias: Option<String>,
     },
 
+    /// `extern "libname" { fn name(args) -> ret; ... }` — declare
+    /// external (FFI) functions loaded from a shared library.
+    ///
+    /// `library` is the name passed to `dlopen` (e.g. `"c"`,
+    /// `"m"`, `"dl"`). The exact filename is resolved by the
+    /// platform's dynamic linker (so `"c"` on Linux finds
+    /// `libc.so.6` or `libc.so`).
+    ///
+    /// Each `declarations` entry is a function signature
+    /// declared with the `fn name(args) -> ret;` syntax inside
+    /// the extern block. The body of an extern function is
+    /// `None` (extern functions have no Rust-side body — the
+    /// VM resolves the symbol at startup).
+    ExternBlock {
+        library: String,
+        declarations: Vec<ExternFunction<'expr>>,
+    },
+
     Function {
         name: &'expr str,
         args: Output<'expr>,
-        returns: Option<&'expr str>,
+        /// Phase 24 — return type is now a full type
+        /// annotation (was `Option<&'expr str>` in earlier
+        /// phases). The typechecker still accepts the
+        /// pre-Phase-24 plain-identifier form via the
+        /// `Expression::Type(name)` node; array and
+        /// tuple type annotations are new.
+        returns: Option<Output<'expr>>,
         body: Output<'expr>,
     },
 
@@ -115,6 +211,15 @@ pub enum Expression<'expr> {
 
     // ---- Phase 15A: sum types and pattern matching ----
     // ---- Phase 17B: record-shaped variant payloads ----
+    // ---- Phase 28: type aliases ----
+    /// `type Name = T;` — declares a type alias. Phase 28
+    /// additive only; no runtime effect (the alias is
+    /// substituted at parse / typecheck time).
+    TypeAlias {
+        name: &'expr str,
+        ty: Box<Output<'expr>>,
+    },
+
     /// `enum Name { Variant1, Variant2(T1, T2), Variant3 { x: T, y: T }, ... }`
     /// — a top-level sum-type declaration. Carries no executable body;
     /// the declaration is registered with the typechecker in 15B and
@@ -179,6 +284,17 @@ pub struct RecordFieldDecl<'expr> {
     pub value: Output<'expr>,
 }
 
+/// One function declaration inside an
+/// [`Expression::ExternBlock`]. The body is always `None` (FFI
+/// functions have no Rust-side implementation — the symbol is
+/// resolved by the VM's dynamic linker at startup).
+#[derive(Clone, PartialEq, Debug)]
+pub struct ExternFunction<'expr> {
+    pub name: &'expr str,
+    pub args: Output<'expr>,
+    pub returns: Option<&'expr str>,
+}
+
 /// One record field in an `EnumConstructPayload::Record`. The
 /// `name` is the field's label and `value` is the expression that
 /// produces the field's runtime value. Mirrors `RecordFieldDecl`
@@ -237,7 +353,9 @@ pub struct MatchArm<'expr> {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Pattern<'expr> {
     Wildcard,
-    Binding { name: &'expr str },
+    Binding {
+        name: &'expr str,
+    },
     Constructor {
         enum_name: &'expr str,
         variant_name: &'expr str,
@@ -291,9 +409,7 @@ impl<'a> Display for Pattern<'a> {
                             .iter()
                             .map(|pf| match &pf.pattern {
                                 // Shorthand `x`: render as just `x`.
-                                Pattern::Binding { name } if *name == pf.name => {
-                                    name.to_string()
-                                }
+                                Pattern::Binding { name } if *name == pf.name => name.to_string(),
                                 _ => format!("{}: {}", pf.name, pf.pattern),
                             })
                             .collect();
@@ -360,20 +476,61 @@ impl<'a> Display for Expression<'a> {
                             .join(", ")
                     ))
             ),
+            Self::Dload(path) => write!(f, "dload({})", path.1),
+            Self::Tuple(items) => write!(
+                f,
+                "({})",
+                items
+                    .iter()
+                    .map(|a| a.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Array(items) => write!(
+                f,
+                "[{}]",
+                items
+                    .iter()
+                    .map(|a| a.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Index(target, index) => write!(f, "{}[{}]", target.1, index.1),
+            Self::Declare(args) | Self::Invoke(args) => {
+                let kw = if matches!(self, Self::Declare(_)) {
+                    "declare"
+                } else {
+                    "invoke"
+                };
+                write!(
+                    f,
+                    "{}({})",
+                    kw,
+                    args.iter()
+                        .map(|a| a.1.to_string())
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                )
+            }
             Self::Function {
                 name,
                 args,
                 returns,
                 body,
             } => {
-                write!(
-                    f,
-                    "fn {}({}){} {{\n{}}}",
-                    name,
-                    args.1,
-                    returns.map_or(String::default(), |ret| format!(" -> {}", ret)),
-                    body.1
-                )
+                // `returns` is now `Option<Output>`. Print the
+                // inner expression via Display.
+                let ret_str = returns
+                    .as_ref()
+                    .map(|ret| format!(" -> {}", &ret.1))
+                    .unwrap_or_default();
+                // Emit the function body inline. The `name`,
+                // `args.1`, `ret_str`, and `body.1` substitutions
+                // happen via the runtime format machinery; the
+                // surrounding `{` / `}` are literal (escaped via
+                // `{{` / `}}` so the format parser doesn't
+                // interpret them as `{}` placeholders).
+                write!(f, "fn {}({}){} {{\n{}}}", name, args.1, ret_str, body.1)
             }
             Self::Defer(b) => write!(f, "defer {}", b.1),
             Self::Call { name, args } => {
@@ -407,6 +564,17 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{} = {}", n.1, e.1)
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
+            Self::TypeAlias { name, ty } => write!(f, "type {} = {};", name, ty.1),
+            // Dict literal (Phase 25) — `{ name: expr, ... }`.
+            // Renders the record as a constructor-shaped string
+            // used for round-trip Display tests.
+            Self::Dict(items) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, f.value.1))
+                    .collect();
+                write!(f, "{{ {} }}", parts.join(", "))
+            }
             Self::EnumDecl { name, variants } => {
                 let vs = variants
                     .iter()
@@ -512,7 +680,15 @@ impl<'a> Display for Expression<'a> {
             Self::Access(receiver, field) => {
                 write!(f, "{}.{}", receiver.1, field)
             }
-            e => todo!("Missing rest of nodes: {}", e),
+            // The following arms are exhaustive but the
+            // Display impl previously used `todo!()` for
+            // any other variant. We add specific arms for
+            // everything we know about; an unknown variant
+            // renders as `<unhandled: ...>` so a Display
+            // test failure is loud (rather than aborting
+            // the whole test process via `todo!`).
+            Self::Type(n) => write!(f, "{}", n),
+            e => write!(f, "<unhandled: {:?}>", e),
         }
     }
 }

@@ -22,7 +22,7 @@
 
 use std::collections::HashSet;
 
-use super::ty::{ftv_scheme, ftv_ty, Scheme, Ty, TyVarId};
+use super::ty::{Scheme, Ty, TyVarId, ftv_scheme, ftv_ty};
 
 /// A partial map from `TyVarId` to `Ty`.
 ///
@@ -73,10 +73,7 @@ impl Subst {
 
     /// Look up the binding for `v`, if any.
     pub fn get(&self, v: TyVarId) -> Option<&Ty> {
-        self.mappings
-            .iter()
-            .find(|(k, _)| *k == v)
-            .map(|(_, t)| t)
+        self.mappings.iter().find(|(k, _)| *k == v).map(|(_, t)| t)
     }
 
     /// Number of bindings.
@@ -127,10 +124,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             None => Ty::Var(*v),
         },
         Ty::Con(_) => ty.clone(),
-        Ty::Fun(a, b) => Ty::Fun(
-            Box::new(apply_ty(subst, a)),
-            Box::new(apply_ty(subst, b)),
-        ),
+        Ty::Fun(a, b) => Ty::Fun(Box::new(apply_ty(subst, a)), Box::new(apply_ty(subst, b))),
         Ty::App(c, args) => Ty::App(
             Box::new(apply_ty(subst, c)),
             args.iter().map(|t| apply_ty(subst, t)).collect(),
@@ -167,6 +161,20 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             owner: Box::new(apply_ty(subst, owner)),
             tag: *tag,
             arity: *arity,
+        },
+        // Phase 24 — recurse through aggregate types. The
+        // length component of `Array` and the field names of
+        // `Record` are inert (no free vars).
+        Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| apply_ty(subst, t)).collect()),
+        Ty::Array { element, length } => Ty::Array {
+            element: Box::new(apply_ty(subst, element)),
+            length: length.clone(),
+        },
+        Ty::Record { fields } => Ty::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), apply_ty(subst, t)))
+                .collect(),
         },
     }
 }
@@ -290,7 +298,10 @@ mod tests {
     fn apply_recurses_through_fun() {
         let s = Subst::singleton(TyVarId(0), int());
         let ty = Ty::Fun(Box::new(v(0)), Box::new(string()));
-        assert_eq!(apply_ty(&s, &ty), Ty::Fun(Box::new(int()), Box::new(string())));
+        assert_eq!(
+            apply_ty(&s, &ty),
+            Ty::Fun(Box::new(int()), Box::new(string()))
+        );
     }
 
     #[test]

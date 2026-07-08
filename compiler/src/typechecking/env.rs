@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::ty::{ftv_scheme, ftv_ty, Scheme, Ty, TyVarId};
+use super::ty::{Scheme, Ty, TyVarId, ftv_scheme, ftv_ty};
 
 /// A counter that mints fresh `TyVarId`s. Each call to [`TyVarCounter::fresh`]
 /// returns a distinct id.
@@ -242,9 +242,7 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
                         }
                         crate::typechecking::ty::EnumVariantPayloadTy::Tuple(tys) => {
                             crate::typechecking::ty::EnumVariantPayloadTy::Tuple(
-                                tys.iter()
-                                    .map(|t| substitute_vars(t, mapping))
-                                    .collect(),
+                                tys.iter().map(|t| substitute_vars(t, mapping)).collect(),
                             )
                         }
                         crate::typechecking::ty::EnumVariantPayloadTy::Record(fields) => {
@@ -265,14 +263,28 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
             tag: *tag,
             arity: *arity,
         },
+        // Phase 24 — recurse through aggregates.
+        Ty::Tuple(tys) => {
+            Ty::Tuple(tys.iter().map(|t| substitute_vars(t, mapping)).collect())
+        }
+        Ty::Array { element, length } => Ty::Array {
+            element: Box::new(substitute_vars(element, mapping)),
+            length: length.clone(),
+        },
+        Ty::Record { fields } => Ty::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), substitute_vars(t, mapping)))
+                .collect(),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::subst::{apply_ty_prune, Subst};
-    use crate::typechecking::ty::{boolean, int, string, Ty};
+    use crate::typechecking::subst::{Subst, apply_ty_prune};
+    use crate::typechecking::ty::{Ty, boolean, int, string};
 
     fn v(i: u32) -> Ty {
         Ty::Var(TyVarId(i))

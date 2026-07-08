@@ -1,6 +1,6 @@
 use ast::{
-    EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output, Pattern,
-    PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, Visibility,
+    EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output, Pattern, PatternField,
+    PatternPayload, RecordFieldDecl, RecordFieldValue, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -122,6 +122,65 @@ impl<'pratt> Pratt<'pratt> {
         text::ident().padded().map_with(output!(Identifier))
     }
 
+    /// Phase 24 — type-annotation parser. Accepts the bare
+    /// identifier form (`int`, `string`, `Foo`) AND the
+    /// aggregate forms `[T]` / `[T; N]` and `(T1, T2, ...)`
+    /// that are needed for array/tuple types in
+    /// `let x: [int; 3] = ...`, `fn f(int a) -> [int]`, etc.
+    ///
+    /// The parser-level representation is a `Tuple`/`Array`
+    /// expression node containing nested `Type(name)` nodes
+    /// for the element types; the typechecker's `parse_type_name`
+    /// helper understands the shape.
+    fn type_annotation(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        use chumsky::Parser;
+        // `[T]` or `[T; N]` — array form. `T` is the
+        // element type; `N` (optional) is a non-negative
+        // integer for static-length arrays.
+        let array_type = text::ident()
+            .padded()
+            .map_with(output!(Type))
+            .then(
+                // Optional `; N` for static length.
+                op!(";")
+                    .ignore_then(
+                        text::int(10)
+                            .to_slice()
+                            .from_str::<i64>()
+                            .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0)),
+                    )
+                    .or_not(),
+            )
+            .delimited_by(op!('['), op!(']'))
+            .map_with(|(elem, n_opt), e| match n_opt {
+                Some(n) => (
+                    e.span(),
+                    Box::new(Expression::Array(vec![(
+                        e.span(),
+                        Box::new(Expression::Integer(n as i64)),
+                    )])),
+                ),
+                None => (
+                    e.span(),
+                    Box::new(Expression::Array(vec![elem])),
+                ),
+            });
+        // `(T1, T2, ...)` — tuple form. Reuses the
+        // existing tuple_atom machinery.
+        let tuple_type = self.tuple_atom(
+            // Inner element: an identifier-or-int (for the
+            // `; N` shape inherited from array). For Phase
+            // 24 we don't yet support nested aggregate
+            // types as type annotations (so a tuple element
+            // is just an identifier, not another tuple).
+            text::ident().padded().map_with(output!(Type)),
+        );
+        choice((array_type, tuple_type, text::ident().padded().map_with(output!(Type))))
+    }
+
     fn expr(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -140,6 +199,28 @@ impl<'pratt> Pratt<'pratt> {
                 // `self.ident()` so the identifier parser refuses
                 // to match it.
                 self.match_expr(expr.clone()),
+                // Userland FFI builtins — must come BEFORE
+                // `self.call(...)` because `dload(args)` /
+                // `declare(args)` / `invoke(args)` would
+                // otherwise match `self.call(...)` as ordinary
+                // function calls to non-existent functions.
+                self.dload(expr.clone()),
+                self.declare(expr.clone()),
+                self.invoke_(expr.clone()),
+                // `(a, b, c)` — tuple atom. MUST come before
+                // `self.call(...)` (which expects a leading
+                // ident) AND before `self.ident()`.
+                self.tuple_atom(expr.clone()),
+                // `[a, b, c]` — array atom.
+                self.array_atom(expr.clone()),
+                // `{ name: expr, ... }` — dict atom (Phase 25).
+                // Tried before `self.ident()` only because the
+                // backtracking inside `choice` will otherwise
+                // try the ident form first (which would fail
+                // because `{` isn't an ident). The `Block`
+                // parser is statement-level and never sees
+                // expression context, so `{` here is unambiguous.
+                self.dict_atom(expr.clone()),
                 // `EnumName::Variant(args)` — qualified constructor
                 // application. MUST be tried before `self.call(...)`
                 // because both start with `ident`: the backtracking
@@ -343,9 +424,19 @@ impl<'pratt> Pratt<'pratt> {
                 postfix(
                     Precedence::Primary as u16,
                     just('.').ignore_then(text::ident()),
-                    |lhs, field, e| {
-                        (e.span(), Box::new(Expression::Access(lhs, field)))
-                    },
+                    |lhs, field, e| (e.span(), Box::new(Expression::Access(lhs, field))),
+                ),
+                // `target[index]` — postfix indexing at Primary
+                // precedence (the same level as field access, so
+                // `t[i].x` parses as `Access(Index(t, i), x)`).
+                // The operator is `[expr]` where `expr` is itself
+                // a full expression (so `t[i+1]`, `t[f()]` etc.
+                // all parse naturally).
+                postfix(
+                    Precedence::Primary as u16,
+                    expr.clone()
+                        .delimited_by(op!('['), op!(']')),
+                    |lhs, index, e| (e.span(), Box::new(Expression::Index(lhs, index))),
                 ),
             ))
         })
@@ -403,10 +494,17 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        let arg = text::ident()
-            .padded()
+        let arg = self
+            .type_annotation()
             .then(text::ident().padded())
-            .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
+            .map_with(|(ty, name), e| {
+                // For the typechecker the `ty` is an
+                // `Expression::Type(name)` (or `Array`/`Tuple`
+                // containing `Type`s). Wrap in `Argument` —
+                // Phase 24 carries the full type annotation
+                // instead of just the source name.
+                (e.span(), Box::new(Expression::Argument(ty, name)))
+            });
 
         arg.separated_by(op!(','))
             .allow_trailing()
@@ -427,7 +525,7 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("fn")
             .then(text::ident().padded())
             .then(self.arg_list())
-            .then(op!("->").ignore_then(text::ident().padded()).or_not())
+            .then(op!("->").ignore_then(self.type_annotation()).or_not())
             .then(self.block(stmt))
             .map_with(|((((_, name), args), returns), body), e| {
                 (
@@ -514,10 +612,8 @@ impl<'pratt> Pratt<'pratt> {
                         .or_not(),
                 )
                 .map_with(|((cond, body), else_clause), e| {
-                    let then_branch: Output = (
-                        e.span(),
-                        Box::new(Expression::Branch(Some(cond), body)),
-                    );
+                    let then_branch: Output =
+                        (e.span(), Box::new(Expression::Branch(Some(cond), body)));
                     let mut branches: Vec<Output> = vec![then_branch];
                     if let Some(else_output) = else_clause {
                         match else_output.1.as_ref() {
@@ -559,6 +655,85 @@ impl<'pratt> Pratt<'pratt> {
             )
             .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Print(fmt, params))))
     }
+
+    // ============================================================
+    //  Userland FFI builtins — `dload`, `declare`, `invoke`
+    //
+    // These are expression-level (not statement-level like
+    // `print`) because they return values. They're parsed
+    // inside the atom choice so the keyword is registered with
+    // chumsky before `self.ident()` (which would otherwise
+    // match them as identifiers).
+    // ============================================================
+
+    fn dload<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::keyword("dload")
+            .labelled("dload builtin")
+            .ignore_then(
+                expr.clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('('), op!(')')),
+            )
+            .map_with(|args, e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Dload(args.into_iter().next().unwrap())),
+                )
+            })
+    }
+
+    fn declare<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::keyword("declare")
+            .labelled("declare builtin")
+            .ignore_then(
+                expr.clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('('), op!(')')),
+            )
+            .map_with(|args, e| (e.span(), Box::new(Expression::Declare(args))))
+    }
+
+    fn invoke_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::keyword("invoke")
+            .labelled("invoke builtin")
+            .ignore_then(
+                expr.clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('('), op!(')')),
+            )
+            .map_with(|args, e| (e.span(), Box::new(Expression::Invoke(args))))
+    }
+
     fn return_(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -619,10 +794,101 @@ impl<'pratt> Pratt<'pratt> {
             self.class(),
             self.impl_block(stmt.clone()),
             self.func(stmt.clone()),
+            self.type_alias(),
             self.enum_decl(),
             self.defer(stmt.clone()),
+            self.extern_block(),
             stmt.clone(),
         ))
+    }
+
+    /// `type Name = T;` — type alias (Phase 28). The right-hand
+    /// side is a full type annotation (`int`, `[int; 5]`,
+    /// `(int, string)`, a class name, etc.). The alias is
+    /// registered with the typechecker (which substitutes
+    /// `Name` with `T` at lookup time). The parser emits a
+    /// single `Expression::TypeAlias` node; the codegen
+    /// emits nothing (zero-cost).
+    fn type_alias(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then_ignore(op!("="))
+            .then(self.type_annotation())
+            .then_ignore(op!(";"))
+            .map_with(|(name, ty), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::TypeAlias {
+                        name,
+                        ty: Box::new(ty),
+                    }),
+                )
+            })
+            .labelled("type alias")
+    }
+
+    /// `extern "libname" { fn name(args) -> ret; ... }` — declare
+    /// external (FFI) functions from a shared library.
+    ///
+    /// The block contains a list of zero-or-more function
+    /// declarations with a trailing semicolon (no body). Each
+    /// `fn name(args) -> ret;` inside the `{ ... }` produces an
+    /// `ExternFunction` (a separate struct, not an `Expression`
+    /// variant — extern functions are metadata, not runtime
+    /// expressions). The whole block produces an
+    /// `Expression::ExternBlock` carrying the library name and
+    /// the list of declared functions.
+    fn extern_block(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        use crate::ast::ExternFunction;
+        // The `fn name(args) -> ret;` sub-parser produces
+        // `ExternFunction` directly (not an `Output`). The
+        // declaration chain accepts parsers of any output type
+        // as long as the final `map_with` produces an `Output`.
+        let extern_function_decl = keyword!("fn")
+            .then(text::ident().padded())
+            .then(self.arg_list())
+            .then(op!("->").ignore_then(text::ident().padded()).or_not())
+            // The trailing `;` is required (no body).
+            .then_ignore(op!(";"))
+            .map_with(|(((_, name), args), returns), _e| ExternFunction {
+                name,
+                args,
+                returns,
+            });
+
+        // Inline string-literal parser for the library name.
+        // We don't use `self.string()` because it returns an
+        // `Output` (wrapping the value in an `Expression`),
+        // but we just need the raw `String` for the library
+        // name (it's metadata, not a runtime expression).
+        let library_name = just('"')
+            .ignore_then(none_of('"').repeated().to_slice())
+            .then_ignore(just('"'))
+            .map(|s: &'pratt str| s.to_string());
+
+        keyword!("extern")
+            .ignore_then(library_name)
+            .then(
+                extern_function_decl
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(library, declarations), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::ExternBlock {
+                        library,
+                        declarations,
+                    }),
+                )
+            })
     }
 
     /// `class Name { [pub] field: Type, ... }`
@@ -755,7 +1021,7 @@ impl<'pratt> Pratt<'pratt> {
     {
         keyword!("let")
             .ignore_then(text::ident())
-            .then(op!(":").ignore_then(self.ident()).or_not())
+            .then(op!(":").ignore_then(self.type_annotation()).or_not())
             .then(op!("=").ignore_then(self.expr()).or_not())
             .map_with(|((name, ty), val), e| {
                 let mut result = vec![(e.span(), Box::new(Expression::Variable(name, ty)))];
@@ -786,6 +1052,139 @@ impl<'pratt> Pratt<'pratt> {
             .collect::<Vec<_>>()
             .or_not()
             .delimited_by(op!('('), op!(')'))
+    }
+
+    /// `(a, b, c)` — tuple literal atom.
+    ///
+    /// Phase 24 fix: a tuple literal REQUIRES a comma inside
+    /// the parens. Without a comma, the parens are a Group
+    /// (parenthesised expression), NOT a tuple. This matches
+    /// the user's spec:
+    ///   - `(1, 2)`   → tuple (two elements, comma-separated)
+    ///   - `(1,)`     → tuple (one element, trailing comma)
+    ///   - `(1)`      → group (one element, no comma)
+    ///   - `(1 + 2)`  → group (single expression, no comma)
+    ///
+    /// The previous implementation matched any `at_least(1)`
+    /// parenthesised list as a tuple, which broke `f((1+2)*3)`
+    /// arithmetic by mis-parsing the `(1+2)` grouping as a
+    /// 1-tuple.
+    fn tuple_atom<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        // A tuple is `at_least(2)` items separated by commas,
+        // OR exactly 1 item with a trailing comma. Either way,
+        // a comma must be present inside the parens.
+        use chumsky::Parser;
+        let two_or_more = expr
+            .clone()
+            .separated_by(op!(','))
+            .allow_trailing()
+            .at_least(2)
+            .collect::<Vec<_>>();
+        let one_with_trailing = expr
+            .clone()
+            .then_ignore(op!(','))
+            .map(|e| vec![e])
+            .labelled("single-element tuple");
+        choice((two_or_more, one_with_trailing))
+            .delimited_by(op!('('), op!(')'))
+            .map_with(|items, e| (e.span(), Box::new(Expression::Tuple(items))))
+            .labelled("tuple")
+    }
+
+    /// `{name: expr, name: expr, ...}` — anonymous record /
+    /// dict literal (Phase 25). Parsed in the atom choice,
+    /// BEFORE the `tuple_atom` and the `Block` parser (the
+    /// latter matches `{ stmt; stmt; }` in statement
+    /// position, which the atom choice never sees).
+    ///
+    /// Bare `{` is unambiguous with `Block` because the
+    /// `Block` parser lives at statement level (not in the
+    /// expression atom), and bare `{` followed by a field
+    /// shape (`ident : expr`) can never start a block (a
+    /// valid expression after `{` would have to be an
+    /// identifier — but our parser knows that an
+    /// identifier alone is a value, not a statement, so the
+    /// dispatch picks the `Dict` arm).
+    fn dict_atom<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        use chumsky::Parser;
+        use crate::ast::RecordFieldValue;
+        // Each field: `name : expr`. Bare name (without the
+        // `:`) isn't supported here (the typechecker and
+        // codegen always have the explicit form, and the
+        // pre-Phase-25 enum record constructor uses the same
+        // explicit form).
+        let field = text::ident()
+            .padded()
+            .then_ignore(op!(":"))
+            .then(expr)
+            .map_with(|(name, value), e| (e.span(), RecordFieldValue { name, value }))
+            .labelled("dict field");
+        field
+            .separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("{"), op!("}"))
+            .map_with(|fields, e| {
+                let fs: Vec<RecordFieldValue<'pratt>> =
+                    fields.into_iter().map(|(_, f)| f).collect();
+                (e.span(), Box::new(Expression::Dict(fs)))
+            })
+            .labelled("dict")
+    }
+    ///
+    /// Same shape as the tuple atom but with `[]` brackets.
+    /// Empty `[]` IS allowed (the parser distinguishes by
+    /// bracket shape; an empty array is fine).
+    fn array_atom<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        use chumsky::Parser;
+        let inner = expr
+            .clone()
+            .separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>();
+        inner
+            .delimited_by(op!('['), op!(']'))
+            .map_with(|items, e| (e.span(), Box::new(Expression::Array(items))))
+            .labelled("array")
+    }
+
+    /// `target[index]` postfix indexing helper. The actual
+    /// wiring lives at the `pratt` call site below; this
+    /// method is unused and reserved for future expansion
+    /// (e.g., for explicit `slice(i, j)` syntax).
+    #[allow(dead_code)]
+    fn index_postfix_disabled<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        _expr: T,
+    ) {
     }
 
     fn call<
@@ -835,15 +1234,7 @@ impl<'pratt> Pratt<'pratt> {
             .padded()
             .then_ignore(op!(":"))
             .then(expr.clone())
-            .map_with(|(name, value), e| {
-                (
-                    e.span(),
-                    RecordFieldValue {
-                        name,
-                        value,
-                    },
-                )
-            })
+            .map_with(|(name, value), e| (e.span(), RecordFieldValue { name, value }))
             .labelled("record field");
 
         let record_payload = record_field
@@ -859,21 +1250,17 @@ impl<'pratt> Pratt<'pratt> {
                 // — emitting a chumsky error here from inside
                 // `map_with` would require a borrowed emitter and
                 // duplicate the diagnostic machinery.
-                EnumConstructPayload::Record(
-                    fields.into_iter().map(|(_, f)| f).collect(),
-                )
+                EnumConstructPayload::Record(fields.into_iter().map(|(_, f)| f).collect())
             })
             .labelled("record payload");
 
         // Tuple payload: `(arg1, arg2, ...)` — `None` means Unit.
         // Empty parens `()` are also treated as Unit (so users can
         // write `Option::None()` instead of `Option::None`).
-        let tuple_payload = self.params(expr.clone()).map(|opt| {
-            match opt {
-                Some(args) if args.is_empty() => EnumConstructPayload::Unit,
-                Some(args) => EnumConstructPayload::Tuple(args),
-                None => EnumConstructPayload::Unit,
-            }
+        let tuple_payload = self.params(expr.clone()).map(|opt| match opt {
+            Some(args) if args.is_empty() => EnumConstructPayload::Unit,
+            Some(args) => EnumConstructPayload::Tuple(args),
+            None => EnumConstructPayload::Unit,
         });
 
         // Shape selector: tuple or record. Both are optional
@@ -926,10 +1313,7 @@ impl<'pratt> Pratt<'pratt> {
                     .delimited_by(op!('{'), op!('}')),
             )
             .map_with(|(scrutinee, arms), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::Match { scrutinee, arms }),
-                )
+                (e.span(), Box::new(Expression::Match { scrutinee, arms }))
             })
     }
 
@@ -944,8 +1328,9 @@ impl<'pratt> Pratt<'pratt> {
     >(
         &self,
         expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, MatchArm<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
+    ) -> impl Parser<'pratt, &'pratt str, MatchArm<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
         self.pattern()
             .then_ignore(op!("=>"))
             .then(expr)
@@ -973,9 +1358,7 @@ impl<'pratt> Pratt<'pratt> {
             // "extra field".
             let record_pattern_field = text::ident()
                 .padded()
-                .then(
-                    op!(":").ignore_then(pattern_parser.clone()).or_not(),
-                )
+                .then(op!(":").ignore_then(pattern_parser.clone()).or_not())
                 .map_with(|(name, sub_pat), _| {
                     let pattern = match sub_pat {
                         Some(p) => p,
@@ -1025,13 +1408,13 @@ impl<'pratt> Pratt<'pratt> {
                 .then_ignore(just("::").padded())
                 .then(text::ident().padded())
                 .then(payload_choice)
-                .map_with(|((enum_name, variant_name), payload), _| {
-                    Pattern::Constructor {
+                .map_with(
+                    |((enum_name, variant_name), payload), _| Pattern::Constructor {
                         enum_name,
                         variant_name,
                         payload,
-                    }
-                });
+                    },
+                );
 
             choice((
                 // `_` and `default` both parse to the same wildcard
@@ -1067,10 +1450,7 @@ impl<'pratt> Pratt<'pratt> {
                     .delimited_by(op!('{'), op!('}')),
             )
             .map_with(|(name, variants), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::EnumDecl { name, variants }),
-                )
+                (e.span(), Box::new(Expression::EnumDecl { name, variants }))
             })
     }
 
@@ -1155,10 +1535,10 @@ impl<'pratt> Pratt<'pratt> {
 
 #[cfg(test)]
 mod tests {
+    use crate::Pratt;
     use crate::ast::{
         EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Pattern, PatternPayload,
     };
-    use crate::Pratt;
     use chumsky::Parser;
 
     macro_rules! expr {
@@ -1367,11 +1747,7 @@ mod tests {
                     enum_name,
                     variant_name,
                     fields,
-                } => (
-                    *enum_name,
-                    *variant_name,
-                    fields.clone(),
-                ),
+                } => (*enum_name, *variant_name, fields.clone()),
                 other => panic!("expected Construct inside Expr, got {:?}", other),
             },
             other => panic!("expected Expr, got {:?}", other),
@@ -1545,35 +1921,33 @@ mod tests {
             other => other,
         };
         match inner {
-            Expression::Match { arms, .. } => {
-                match &arms[0].pattern {
-                    Pattern::Constructor {
-                        enum_name,
-                        variant_name,
-                        payload,
-                    } => {
-                        assert_eq!(*enum_name, "E");
-                        assert_eq!(*variant_name, "Foo");
-                        match payload {
-                            PatternPayload::Record(fields) => {
-                                assert_eq!(fields.len(), 2);
-                                assert_eq!(fields[0].name, "x");
-                                assert_eq!(fields[1].name, "y");
-                                match &fields[0].pattern {
-                                    Pattern::Binding { name } => assert_eq!(*name, "x"),
-                                    other => panic!("expected Binding(x), got {:?}", other),
-                                }
-                                match &fields[1].pattern {
-                                    Pattern::Binding { name } => assert_eq!(*name, "y"),
-                                    other => panic!("expected Binding(y), got {:?}", other),
-                                }
+            Expression::Match { arms, .. } => match &arms[0].pattern {
+                Pattern::Constructor {
+                    enum_name,
+                    variant_name,
+                    payload,
+                } => {
+                    assert_eq!(*enum_name, "E");
+                    assert_eq!(*variant_name, "Foo");
+                    match payload {
+                        PatternPayload::Record(fields) => {
+                            assert_eq!(fields.len(), 2);
+                            assert_eq!(fields[0].name, "x");
+                            assert_eq!(fields[1].name, "y");
+                            match &fields[0].pattern {
+                                Pattern::Binding { name } => assert_eq!(*name, "x"),
+                                other => panic!("expected Binding(x), got {:?}", other),
                             }
-                            other => panic!("expected Record payload, got {:?}", other),
+                            match &fields[1].pattern {
+                                Pattern::Binding { name } => assert_eq!(*name, "y"),
+                                other => panic!("expected Binding(y), got {:?}", other),
+                            }
                         }
+                        other => panic!("expected Record payload, got {:?}", other),
                     }
-                    other => panic!("expected Constructor(E::Foo), got {:?}", other),
                 }
-            }
+                other => panic!("expected Constructor(E::Foo), got {:?}", other),
+            },
             other => panic!("expected Match, got {:?}", other),
         }
     }
@@ -1667,7 +2041,10 @@ mod tests {
                             other => panic!("expected Tuple payload, got {:?}", other),
                         }
                     }
-                    other => panic!("expected outer Constructor(Option::Some(...)), got {:?}", other),
+                    other => panic!(
+                        "expected outer Constructor(Option::Some(...)), got {:?}",
+                        other
+                    ),
                 }
             }
             other => panic!("expected Match, got {:?}", other),
@@ -1732,16 +2109,10 @@ mod tests {
                         };
                         match recv_inner {
                             Expression::Identifier(n) => assert_eq!(*n, "p"),
-                            other => panic!(
-                                "expected Identifier(p), got {:?}",
-                                other
-                            ),
+                            other => panic!("expected Identifier(p), got {:?}", other),
                         }
                     }
-                    other => panic!(
-                        "expected Access(p, x) as outer receiver, got {:?}",
-                        other
-                    ),
+                    other => panic!("expected Access(p, x) as outer receiver, got {:?}", other),
                 }
             }
             other => panic!("expected Access(p.x, y), got {:?}", other),
@@ -1851,19 +2222,13 @@ mod tests {
                     Expression::Branch(c, b) => (c.clone(), b.clone()),
                     other => panic!("expected Branch at index 0, got {:?}", other),
                 };
-                assert!(
-                    cond_opt.is_some(),
-                    "first if-branch's cond must be Some(_)"
-                );
+                assert!(cond_opt.is_some(), "first if-branch's cond must be Some(_)");
                 // Second branch: None (the terminal else)
                 let (cond_opt, _) = match branches[1].1.as_ref() {
                     Expression::Branch(c, b) => (c.clone(), b.clone()),
                     other => panic!("expected Branch at index 1, got {:?}", other),
                 };
-                assert!(
-                    cond_opt.is_none(),
-                    "else-branch's cond must be None"
-                );
+                assert!(cond_opt.is_none(), "else-branch's cond must be None");
             }
             other => panic!("expected If, got {:?}", other),
         }
@@ -1897,7 +2262,8 @@ mod tests {
     fn parse_if_else_if_single_else() {
         // `if c1 { b1 } else if c2 { b2 } else { b3 }` → three branches.
         // Branch 0: Some(c1), Branch 1: Some(c2), Branch 2: None.
-        let src = "fn main() { if 1 > 0 { return 1; } else if 1 < 0 { return 2; } else { return 3; } }";
+        let src =
+            "fn main() { if 1 > 0 { return 1; } else if 1 < 0 { return 2; } else { return 3; } }";
         match unwrap_fn_if(src) {
             Expression::If(branches) => {
                 assert_eq!(branches.len(), 3, "if/else-if/else has 3 branches");
@@ -1907,11 +2273,7 @@ mod tests {
                         Expression::Branch(c, b) => (c.clone(), b.clone()),
                         other => panic!("expected Branch at index {}, got {:?}", i, other),
                     };
-                    assert!(
-                        cond_opt.is_some(),
-                        "branch #{} cond must be Some(_)",
-                        i
-                    );
+                    assert!(cond_opt.is_some(), "branch #{} cond must be Some(_)", i);
                 }
                 // Last: None (terminal else)
                 let (cond_opt, _) = match branches[2].1.as_ref() {
@@ -1941,11 +2303,7 @@ mod tests {
                         Expression::Branch(c, b) => (c.clone(), b.clone()),
                         other => panic!("expected Branch at index {}, got {:?}", i, other),
                     };
-                    assert!(
-                        cond_opt.is_some(),
-                        "branch #{} cond must be Some(_)",
-                        i
-                    );
+                    assert!(cond_opt.is_some(), "branch #{} cond must be Some(_)", i);
                 }
                 let (cond_opt, _) = match branches[3].1.as_ref() {
                     Expression::Branch(c, b) => (c.clone(), b.clone()),
@@ -1974,5 +2332,84 @@ mod tests {
             result
         );
     }
-}
 
+    // ============================================================
+    //  Phase 22: FFI — `extern "libname" { fn ...; }` blocks
+    // ============================================================
+
+    /// `extern "c" { fn puts(string s); }` parses to an
+    /// `Expression::ExternBlock` with the library name "c" and
+    /// a single function declaration `puts` (arity 1, returns
+    /// `None`).
+    #[test]
+    fn parse_extern_block_single_function() {
+        let ast = decl_ast!("extern \"c\" { fn puts(string s); }");
+        match ast {
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                assert_eq!(library, "c");
+                assert_eq!(declarations.len(), 1);
+                let f = &declarations[0];
+                assert_eq!(f.name, "puts");
+                // Returns: none
+                assert!(f.returns.is_none());
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    /// Multiple functions in one extern block all parse, in
+    /// source order.
+    #[test]
+    fn parse_extern_block_multiple_functions() {
+        let ast = decl_ast!("extern \"c\" { fn puts(string s); fn strlen(string s) -> int; }");
+        match ast {
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                assert_eq!(library, "c");
+                assert_eq!(declarations.len(), 2);
+                assert_eq!(declarations[0].name, "puts");
+                assert!(declarations[0].returns.is_none());
+                assert_eq!(declarations[1].name, "strlen");
+                assert_eq!(declarations[1].returns, Some("int"));
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    /// An empty extern block (no declarations) is valid
+    /// syntax — the `dlopen` call happens, but no symbols
+    /// are bound. Useful for side-effect-only libraries.
+    #[test]
+    fn parse_extern_block_empty_body() {
+        let ast = decl_ast!("extern \"m\" {}");
+        match ast {
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                assert_eq!(library, "m");
+                assert!(declarations.is_empty());
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    /// A trailing semicolon is required — `fn foo(string s)` (no
+    /// `;`) should fail to parse, so users can't accidentally
+    /// write a function body that won't be executed.
+    #[test]
+    fn parse_extern_function_requires_trailing_semicolon() {
+        let src = "extern \"c\" { fn puts(string s) }"; // missing ';'
+        let result = Pratt::default().declaration().parse(src).into_result();
+        assert!(
+            result.is_err(),
+            "expected parse to fail for missing trailing ';' in extern fn, got {:?}",
+            result
+        );
+    }
+}

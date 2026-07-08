@@ -7,3 +7,8 @@ edition = "2024"
 common = { path = "../common" }
 rkyv = "0.8.12"
 rustc-hash = { version = "2.1.1", features = ["std", "rand"] }
+libloading = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"

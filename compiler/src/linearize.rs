@@ -125,9 +125,7 @@
 
 use common::{Byte, Instruction, Value};
 
-use crate::cfg::{
-    BinOpKind, Function, Inst, Terminator, UnaryOpKind,
-};
+use crate::cfg::{BinOpKind, Function, Inst, Terminator, UnaryOpKind};
 
 /// Linearize a CFG [`Function`] into stack-based bytecode.
 ///
@@ -276,7 +274,12 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
             // index directly.
             bc.push(Byte::new(Instruction::LOAD).with_operand_u32(*index as u32));
         }
-        Inst::BinOp { op, dst: _, lhs: _, rhs: _ } => {
+        Inst::BinOp {
+            op,
+            dst: _,
+            lhs: _,
+            rhs: _,
+        } => {
             // The operands `lhs` and `rhs` are SSA [`ValueId`]s;
             // for straight-line code the values are still on the
             // stack at the expected positions (stack-top invariant).
@@ -287,7 +290,11 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
         Inst::UnaryOp { op, dst: _, src: _ } => {
             bc.push(map_unaryop(*op));
         }
-        Inst::Call { dst, callee: _, args } => {
+        Inst::Call {
+            dst,
+            callee: _,
+            args,
+        } => {
             // CALL arity + JMP target. The target is a placeholder
             // (u32::MAX) — the upstream pipeline patches it after
             // linearization (see `compiler/src/lib.rs` for the
@@ -313,11 +320,12 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
             // Layout (see `common/src/opcode.rs`):
             //   operands[15:0]  = field_index
             //   operands[31:16] = reserved
-            bc.push(
-                Byte::new(Instruction::LoadField).with_operand_u32(*field_index as u32),
-            );
+            bc.push(Byte::new(Instruction::LoadField).with_operand_u32(*field_index as u32));
         }
-        Inst::Unpack { dst: _, scrutinee: _ } => {
+        Inst::Unpack {
+            dst: _,
+            scrutinee: _,
+        } => {
             // UNPACK pops the scrutinee and pushes the payload
             // values. The arity is `dst.len()`.
             //
@@ -348,9 +356,7 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
             //   operands[15:0]  = arity
             let arity = (payload.len() as u32) & 0xFFFF;
             let tag_shifted = (*tag & 0xFFFF) << 16;
-            bc.push(
-                Byte::new(Instruction::MakeEnum).with_operand_u32(tag_shifted | arity),
-            );
+            bc.push(Byte::new(Instruction::MakeEnum).with_operand_u32(tag_shifted | arity));
         }
         Inst::Print { args } => {
             // PRINT pops the format string (and any params in
@@ -397,9 +403,7 @@ fn emit_inst(inst: &Inst, bc: &mut Vec<Byte>) {
                 // the format string, args[1..] are the
                 // params), then PRINT.
                 let params_count = (args.len() - 1) as u32;
-                bc.push(
-                    Byte::new(Instruction::FORMAT).with_operand_u32(params_count),
-                );
+                bc.push(Byte::new(Instruction::FORMAT).with_operand_u32(params_count));
                 bc.push(Byte::new(Instruction::PRINT));
             }
         }
@@ -494,10 +498,8 @@ fn emit_terminator_placeholder(
                     bc.push(Byte::new(Instruction::RETURN));
                 }
                 None => {
-                    let last_is_param_load = matches!(
-                        bc.last().map(|b| b.bytecode()),
-                        Some(Instruction::LOAD)
-                    );
+                    let last_is_param_load =
+                        matches!(bc.last().map(|b| b.bytecode()), Some(Instruction::LOAD));
                     if last_is_param_load {
                         // Phase 1.6 fast path: the preceding
                         // Param pushed the value. RETURN pops it.
@@ -597,16 +599,14 @@ fn patch_terminator(
             // JMP's operand — the VM reads jump operands as
             // absolute offsets in the program bytecode.
             let offset = base_offset + block_offsets[target.index()] as u32;
-            bc[patch.pos] =
-                Byte::new(Instruction::JMP).with_operand_u32(offset);
+            bc[patch.pos] = Byte::new(Instruction::JMP).with_operand_u32(offset);
         }
         PatchKind::Branch { false_bb } => {
             // The JMPF jumps to `false_bb` when the condition
             // is false. The `true_bb` is reached by fall-through
             // to the next block in declaration order.
             let offset = base_offset + block_offsets[false_bb.index()] as u32;
-            bc[patch.pos] =
-                Byte::new(Instruction::JMPF).with_operand_u32(offset);
+            bc[patch.pos] = Byte::new(Instruction::JMPF).with_operand_u32(offset);
         }
         PatchKind::SwitchCase { tag, target } => {
             // The JUMP_IF_MATCH's tag (operands[31:16]) is
@@ -650,9 +650,7 @@ enum PatchKind {
     /// operand with `block_offsets[false_bb.index()]`. The
     /// `true_bb` is reached by fall-through (no patching
     /// needed).
-    Branch {
-        false_bb: crate::cfg::BlockId,
-    },
+    Branch { false_bb: crate::cfg::BlockId },
     /// `Terminator::Switch` per-case placeholder — patches the
     /// JUMP_IF_MATCH's `value[31:0]` with
     /// `block_offsets[target.index()]`. The tag is preserved in
@@ -799,7 +797,12 @@ mod tests {
         // RETURN handler pops.
         let f = fn_returning_unit("empty");
         let bc = linearize(&f, 0);
-        assert_eq!(bc.len(), 2, "expected two bytes (CONST 0 + RETURN), got {:?}", bc);
+        assert_eq!(
+            bc.len(),
+            2,
+            "expected two bytes (CONST 0 + RETURN), got {:?}",
+            bc
+        );
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         assert_eq!(bc[0].value_u32(), 0);
         assert!(matches!(bc[1].bytecode(), Instruction::RETURN));
@@ -906,7 +909,10 @@ mod tests {
     fn linearize_const_float_emits_const_with_bits() {
         let dst = ValueId(0);
         let mut block = Block::new(BlockId(0));
-        block.insts.push(Inst::ConstF { dst, value: 1.5_f64 });
+        block.insts.push(Inst::ConstF {
+            dst,
+            value: 1.5_f64,
+        });
         block.terminator = Terminator::Return(Some(dst));
         let f = Function {
             name: "half".to_string(),
@@ -1047,7 +1053,10 @@ mod tests {
         let fmt = ValueId(0);
         let arg = ValueId(1);
         let mut block = Block::new(BlockId(0));
-        block.insts.push(Inst::Const { dst: arg, value: 42 });
+        block.insts.push(Inst::Const {
+            dst: arg,
+            value: 42,
+        });
         block.insts.push(Inst::ConstString {
             dst: fmt,
             value: "%i".to_string(),
@@ -1520,19 +1529,11 @@ mod tests {
         assert_eq!(bc.len(), 5);
         assert!(matches!(bc[0].bytecode(), Instruction::CONST));
         assert!(matches!(bc[1].bytecode(), Instruction::JMP));
-        assert_eq!(
-            bc[1].operand_u32(),
-            2,
-            "first JMP targets b1 (offset 2)"
-        );
+        assert_eq!(bc[1].operand_u32(), 2, "first JMP targets b1 (offset 2)");
         assert!(matches!(bc[2].bytecode(), Instruction::CONST));
         assert_eq!(bc[2].value_u32(), 2);
         assert!(matches!(bc[3].bytecode(), Instruction::JMP));
-        assert_eq!(
-            bc[3].operand_u32(),
-            4,
-            "second JMP targets b2 (offset 4)"
-        );
+        assert_eq!(bc[3].operand_u32(), 4, "second JMP targets b2 (offset 4)");
         assert!(matches!(bc[4].bytecode(), Instruction::RETURN));
     }
 

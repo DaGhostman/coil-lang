@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use super::ty::{EnumVariantPayloadTy, Scheme, Ty};
+use super::ty::{ArrayLength, EnumVariantPayloadTy, Scheme, Ty};
 
 /// Format a `Ty` the way a user would read it:
 ///
@@ -83,6 +83,31 @@ impl fmt::Display for Ty {
                 // when emitting MAKE_ENUM.
                 write!(f, "{}::v{}", owner, tag)
             }
+            // Phase 24 — typed aggregates.
+            Ty::Tuple(tys) => {
+                write!(f, "(")?;
+                for (i, t) in tys.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, ")")
+            }
+            Ty::Array { element, length } => match length {
+                ArrayLength::Static(n) => write!(f, "[{}; {}]", element, n),
+                ArrayLength::Dynamic => write!(f, "[{}]", element),
+            },
+            Ty::Record { fields } => {
+                write!(f, "{{ ")?;
+                for (i, (name, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", name, ty)?;
+                }
+                write!(f, " }}")
+            }
         }
     }
 }
@@ -110,7 +135,7 @@ impl fmt::Display for Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::ty::{float, int, list, string, TyVarId};
+    use crate::typechecking::ty::{TyVarId, float, int, list, string};
 
     #[test]
     fn display_var() {
@@ -148,10 +173,7 @@ mod tests {
 
     #[test]
     fn display_app_with_args() {
-        let ty = Ty::App(
-            Box::new(Ty::Con("Foo".into())),
-            vec![int(), string()],
-        );
+        let ty = Ty::App(Box::new(Ty::Con("Foo".into())), vec![int(), string()]);
         assert_eq!(format!("{}", ty), "Foo<int, string>");
     }
 
@@ -210,10 +232,7 @@ mod tests {
                 ("Unit".into(), EnumVariantPayloadTy::Unit),
                 (
                     "Rec".into(),
-                    EnumVariantPayloadTy::Record(vec![
-                        ("x".into(), int()),
-                        ("y".into(), string()),
-                    ]),
+                    EnumVariantPayloadTy::Record(vec![("x".into(), int()), ("y".into(), string())]),
                 ),
             ],
         };

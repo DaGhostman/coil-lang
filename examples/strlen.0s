@@ -1,0 +1,36 @@
+// strlen.0s — User-defined binding to a C library function via
+// the source-level `extern` block syntax. Demonstrates that
+// integrating with 3rd-party libraries like libc, libcurl,
+// or openssl is just writing zero-script code — NO VM
+// rebuild, NO Rust closures to register, NO manual dload/
+// declare/invoke ceremony.
+//
+// What happens at compile time:
+//   1. `extern "c" { fn strlen(string s) -> int; }` causes
+//      the compiler to emit bytecode that:
+//        a. calls `dload("c")` and stores the library handle
+//           in a hidden let-slot,
+//        b. calls `declare(lib, "strlen", String, Int)` and
+//           stores the function id in another hidden let-slot.
+//   2. `let n = strlen("hello");` becomes
+//        LOAD lib_slot, LOAD fn_id_slot,
+//        CONST "hello"-as-string  (pushed onto stack as the
+//                                   arg the runtime passes to
+//                                   FFI),
+//        FfiInvoke 1,                       (arity=1)
+//        StorePop n_slot.
+//   3. `print "%i", n;` reads `n` from its slot and prints it.
+//
+// At runtime, no Rust code outside the VM touches anything.
+// `cargo run -- examples/strlen.0s` works out of the box.
+//
+// Expected output: `5` (strlen of "hello").
+
+extern "libc.so.6" {
+    fn strlen(string s) -> int;
+}
+
+fn main() {
+    let n = strlen("hello");
+    print "%i", n;
+}

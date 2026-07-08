@@ -54,6 +54,21 @@ impl TyVarId {
 ///   zero-based variant index in the owner's `variants` list;
 ///   `arity` is cached to spare codegen a per-call lookup. `arity`
 ///   counts the total number of fields (0 for Unit, N for Tuple/Record).
+///
+/// Phase 24 added three variants for typed aggregates:
+/// - `Tuple(Vec<Ty>)` — heterogeneous product type `(T1, T2, ...)`. Each
+///   element has its own (potentially distinct) type. The vec is in
+///   source/declaration order. The arity is fixed (length is type-level).
+/// - `Array { element, length }` — homogeneous collection `[T]` or `[T; N]`.
+///   `length` is `ArrayLength::Static(N)` for a compile-time-known length
+///   (literal `[1, 2, 3]` or `[int; 5]` annotation) and `ArrayLength::Dynamic`
+///   for runtime-determined length (function return, parameter, etc.).
+///   Static-length arrays enable compile-time out-of-bounds detection.
+/// - `Record { fields }` — anonymous dict `{ name: T, name: T, ... }`.
+///   Field names are unique within a record; structurally-equal field
+///   sets unify. Dicts are mutable (Phase 25). The fields are in
+///   declaration order at construction; the typechecker canonically
+///   sorts them lex-by-name for unification determinism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Var(TyVarId),
@@ -70,6 +85,37 @@ pub enum Ty {
         tag: u32,
         arity: usize,
     },
+    /// `(T1, T2, ..., Tn)` — heterogeneous tuple. Length is fixed.
+    Tuple(Vec<Ty>),
+    /// `[T]` (dynamic length) or `[T; N]` (static length N).
+    Array {
+        element: Box<Ty>,
+        length: ArrayLength,
+    },
+    /// `{ name: T, ... }` — anonymous dict / record. Structurally typed
+    /// (Phase 25). Mutable.
+    Record {
+        fields: Vec<(String, Ty)>,
+    },
+}
+
+/// The length component of `Ty::Array`. `Static(N)` makes the array's
+/// length a type-level constant (compile-time known) and lets the
+/// typechecker flag constant out-of-bounds indices. `Dynamic` is for
+/// arrays whose length is only known at runtime (function returns,
+/// JSON-decoded arrays, SQL results — Phase 24 user requirement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayLength {
+    Static(usize),
+    Dynamic,
+}
+
+impl ArrayLength {
+    /// True iff this length is known at compile time. Used by the
+    /// typechecker's index-out-of-bounds check (Phase 24).
+    pub fn is_static(&self) -> bool {
+        matches!(self, ArrayLength::Static(_))
+    }
 }
 
 /// The payload shape of a single `Ty::Sum` variant. Phase 17B
@@ -111,9 +157,7 @@ impl EnumVariantPayloadTy {
         match self {
             EnumVariantPayloadTy::Unit => Vec::new(),
             EnumVariantPayloadTy::Tuple(tys) => tys.iter().collect(),
-            EnumVariantPayloadTy::Record(fields) => {
-                fields.iter().map(|(_, ty)| ty).collect()
-            }
+            EnumVariantPayloadTy::Record(fields) => fields.iter().map(|(_, ty)| ty).collect(),
         }
     }
 
@@ -210,6 +254,32 @@ pub fn list(inner: Ty) -> Ty {
     Ty::List(Box::new(inner))
 }
 
+/// Build the `(T1, T2, ..., Tn)` heterogeneous tuple type.
+pub fn tuple(tys: Vec<Ty>) -> Ty {
+    Ty::Tuple(tys)
+}
+
+/// Build the `[T]` (dynamic-length) array type.
+pub fn array(element: Ty) -> Ty {
+    Ty::Array {
+        element: Box::new(element),
+        length: ArrayLength::Dynamic,
+    }
+}
+
+/// Build the `[T; N]` (fixed-length) array type.
+pub fn array_fixed(element: Ty, length: usize) -> Ty {
+    Ty::Array {
+        element: Box::new(element),
+        length: ArrayLength::Static(length),
+    }
+}
+
+/// Build the `{ name: T, ... }` anonymous record type.
+pub fn record(fields: Vec<(String, Ty)>) -> Ty {
+    Ty::Record { fields }
+}
+
 // --- Free type variables ---
 
 /// Free type variables of a `Ty`.
@@ -255,6 +325,23 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         // sum type).
         Ty::Constructor { owner, .. } => {
             go(owner, acc);
+        }
+        // Phase 24 aggregate types. Tuple elements and Array
+        // elements contribute free variables; Record fields
+        // contribute free variables; the lengths and field NAMES are
+        // inert (no free vars).
+        Ty::Tuple(tys) => {
+            for t in tys {
+                go(t, acc);
+            }
+        }
+        Ty::Array { element, .. } => {
+            go(element, acc);
+        }
+        Ty::Record { fields } => {
+            for (_, fty) in fields {
+                go(fty, acc);
+            }
         }
     }
 }
@@ -306,7 +393,10 @@ mod tests {
 
     #[test]
     fn ftv_of_nested_fun_dedups() {
-        let ty = Ty::Fun(Box::new(v(0)), Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(1)))));
+        let ty = Ty::Fun(
+            Box::new(v(0)),
+            Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(1)))),
+        );
         assert_eq!(ftv_ty(&ty), HashSet::from([TyVarId(0), TyVarId(1)]));
     }
 
@@ -345,14 +435,8 @@ mod tests {
         let sum = Ty::Sum {
             name: "E".into(),
             variants: vec![
-                (
-                    "A".into(),
-                    EnumVariantPayloadTy::Tuple(vec![v(0)]),
-                ),
-                (
-                    "B".into(),
-                    EnumVariantPayloadTy::Tuple(vec![string()]),
-                ),
+                ("A".into(), EnumVariantPayloadTy::Tuple(vec![v(0)])),
+                ("B".into(), EnumVariantPayloadTy::Tuple(vec![string()])),
             ],
         };
         assert_eq!(ftv_ty(&sum), HashSet::from([TyVarId(0)]));
@@ -364,10 +448,7 @@ mod tests {
         // the union of the owner's variant-payload ftvs.
         let sum = Ty::Sum {
             name: "E".into(),
-            variants: vec![(
-                "A".into(),
-                EnumVariantPayloadTy::Tuple(vec![v(1), v(2)]),
-            )],
+            variants: vec![("A".into(), EnumVariantPayloadTy::Tuple(vec![v(1), v(2)]))],
         };
         let ctor = Ty::Constructor {
             owner: Box::new(sum),
@@ -412,10 +493,7 @@ mod tests {
 
     #[test]
     fn payload_field_count_record() {
-        let p = EnumVariantPayloadTy::Record(vec![
-            ("x".into(), int()),
-            ("y".into(), string()),
-        ]);
+        let p = EnumVariantPayloadTy::Record(vec![("x".into(), int()), ("y".into(), string())]);
         assert_eq!(p.field_count(), 2);
     }
 
@@ -432,10 +510,7 @@ mod tests {
 
     #[test]
     fn payload_field_types_record() {
-        let p = EnumVariantPayloadTy::Record(vec![
-            ("x".into(), int()),
-            ("y".into(), string()),
-        ]);
+        let p = EnumVariantPayloadTy::Record(vec![("x".into(), int()), ("y".into(), string())]);
         assert_eq!(p.field_types(), vec![&int(), &string()]);
     }
 
@@ -459,10 +534,7 @@ mod tests {
 
     #[test]
     fn payload_field_pairs_record_keeps_declared_names() {
-        let p = EnumVariantPayloadTy::Record(vec![
-            ("x".into(), int()),
-            ("y".into(), int()),
-        ]);
+        let p = EnumVariantPayloadTy::Record(vec![("x".into(), int()), ("y".into(), int())]);
         assert_eq!(
             p.field_pairs(),
             vec![("x".into(), int()), ("y".into(), int())]

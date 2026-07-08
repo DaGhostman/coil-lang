@@ -210,7 +210,7 @@ impl BlockBuilder {
     /// label. Equivalent to
     /// `let l = self.fresh_label(); self.emit_jump_to(l, kind, bytecode); l`.
     #[allow(dead_code)] // Not used by the current If codegen; reserved for future
-                        // control-flow emitters (e.g., Loop, While).
+    // control-flow emitters (e.g., Loop, While).
     pub fn emit_jump(&mut self, kind: JumpKind, bytecode: &mut Vec<Byte>) -> Label {
         let label = self.fresh_label();
         self.emit_jump_to(label, kind, bytecode);
@@ -265,15 +265,9 @@ impl BlockBuilder {
     /// responsible for patching via `bind_label`.
     fn make_jump_placeholder(kind: JumpKind) -> Byte {
         match kind {
-            JumpKind::Unconditional => {
-                Byte::new(Instruction::JMP).with_operand_u32(0)
-            }
-            JumpKind::JumpIfFalse => {
-                Byte::new(Instruction::JMPF).with_operand_u32(0)
-            }
-            JumpKind::JumpIfTrue => {
-                Byte::new(Instruction::JMPT).with_operand_u32(0)
-            }
+            JumpKind::Unconditional => Byte::new(Instruction::JMP).with_operand_u32(0),
+            JumpKind::JumpIfFalse => Byte::new(Instruction::JMPF).with_operand_u32(0),
+            JumpKind::JumpIfTrue => Byte::new(Instruction::JMPT).with_operand_u32(0),
             JumpKind::JumpIfMatch { tag, .. } => {
                 // Phase 18C: tag in operands[31:16], 32-bit target
                 // in value[31:0]. Placeholder target = 0 (will be
@@ -469,11 +463,14 @@ mod tests {
         for pos in [0, 2, 4] {
             assert!(
                 matches!(bc[pos].bytecode(), Instruction::JMP),
-                "byte at position {} should be JMP", pos
+                "byte at position {} should be JMP",
+                pos
             );
             assert_eq!(
-                bc[pos].operand_u32(), 100,
-                "JMP at position {} should target 100", pos
+                bc[pos].operand_u32(),
+                100,
+                "JMP at position {} should target 100",
+                pos
             );
         }
     }
@@ -547,7 +544,13 @@ mod tests {
         // JUMP_IF_MATCH
         let mut bb = BlockBuilder::new();
         let mut bc: Vec<Byte> = Vec::new();
-        bb.emit_jump(JumpKind::JumpIfMatch { tag: 0xABCD, arity: 1 }, &mut bc);
+        bb.emit_jump(
+            JumpKind::JumpIfMatch {
+                tag: 0xABCD,
+                arity: 1,
+            },
+            &mut bc,
+        );
         assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
         assert_eq!((bc[0].operand_u32() >> 16) as u16, 0xABCD);
     }

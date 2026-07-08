@@ -11,7 +11,10 @@ pub enum FrameState {
 
 impl From<(usize, usize)> for Frame {
     fn from(value: (usize, usize)) -> Self {
-        Self { ip: value.0, sp: value.1 }
+        Self {
+            ip: value.0,
+            sp: value.1,
+        }
     }
 }
 
@@ -27,10 +30,9 @@ pub struct Frame {
     sp: usize,
 }
 
-
 impl Frame {
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn tell(&self) -> usize {
         self.ip
     }
@@ -46,7 +48,7 @@ impl Frame {
     }
 
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn get(&self) -> usize {
         self.sp
     }

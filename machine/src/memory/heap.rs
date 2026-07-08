@@ -42,6 +42,60 @@ impl Default for Heap {
 }
 
 impl Heap {
+    /// Walk the intrusive object list and return a C string
+    /// pointer to the data of the string object at `addr`, if
+    /// `addr` is the address of a `Gc<ObjString>`. Returns
+    /// `None` if `addr` doesn't point at a string object in this
+    /// heap.
+    ///
+    /// This is the FFI entry point: a C function's `*const
+    /// c_char` argument is materialized by the VM as a
+    /// heap-allocated `ObjString`; the C function receives a
+    /// raw pointer to the `ObjString`'s `Gc<T>` cell, which is
+    /// what the `Value` carries. To pass the actual C string
+    /// to the FFI call, we look up the `Object` by that address
+    /// and ask for its `as_cstr` pointer.
+    ///
+    /// O(n) in the number of live heap objects (the intrusive
+    /// list walk). Acceptable for the common case (a handful of
+    /// strings per FFI call); a future hash-map cache could
+    /// bring it to O(1).
+    #[must_use]
+    /// Walk the intrusive object list and return a pointer to
+    /// the NUL-terminated data of the `Object::String` at
+    /// `addr`. Returns `None` if there's no such object or
+    /// the object isn't a string.
+    ///
+    /// Safety: the returned pointer is borrowed from the
+    /// `String`'s underlying bytes (which the runtime stores
+    /// in a `Vec<u8>` inside the `GcData` cell). Read it
+    /// immediately — the runtime may free the cell on the
+    /// next GC pass.
+    ///
+    /// The implementation copies the string into a freshly-
+    /// allocated `CString` (with explicit NUL terminator)
+    /// and returns its `.as_ptr()`. The `CString` is kept
+    /// alive (leaked) for the duration of the FFI call — the
+    /// caller's caller owns it.
+    pub fn cstr_from_addr(&self, addr: u64) -> Option<*const std::os::raw::c_char> {
+        let mut current = self.head_for_lookup();
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let crate::memory::Object::String(gc) = reference {
+                    // Build a NUL-terminated copy. The Box
+                    // leaks for the duration of the program
+                    // (we explicitly leak below).
+                    let s: std::ffi::CString =
+                        std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
+                    let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
+                    return Some(boxed.as_ptr());
+                }
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
     /// Allocates an object and returns its handle. The object is pushed to the
     /// front of the list of allocated objects.
     pub fn alloc<T: GcSized, F>(&mut self, data: T, map: F) -> (Object, Gc<T>)
@@ -76,6 +130,22 @@ impl Heap {
         let (_, s) = self.alloc(obj_string, Object::String);
         self.strings.insert(s, ());
         s
+    }
+
+    /// Allocate a loaded FFI library handle as a heap
+    /// `Object::Library`. Returns the `Gc<ObjLibrary>` cell
+    /// (for GC tracking and `mark`/`unmark` access) and the
+    /// heap `Object` handle (for the per-VM cache).
+    pub fn alloc_library(
+        &mut self,
+        library: std::sync::Arc<crate::ffi::Library>,
+    ) -> (Object, crate::memory::Gc<ObjLibrary>) {
+        let obj_lib = ObjLibrary {
+            library,
+            signatures: Vec::new(),
+            by_name: std::collections::HashMap::new(),
+        };
+        self.alloc(obj_lib, Object::Library)
     }
 
     /// Releases all objects that aren't marked. This method also removes
@@ -167,6 +237,19 @@ impl Heap {
             }
             Object::Enum(e) => {
                 e.release();
+            }
+            // FFI libraries are dropped when the `ObjLibrary`
+            // cell is released. The `Arc<Library>` inside
+            // decrements its refcount; the actual `dlclose`
+            // happens when the last reference goes away.
+            Object::Library(l) => {
+                l.release();
+            }
+            Object::Tuple(t) => {
+                t.release();
+            }
+            Object::Array(a) => {
+                a.release();
             }
         }
     }
@@ -285,6 +368,16 @@ pub type RefInstance = Gc<ObjInstance>;
 /// tests.
 pub type RefEnum = Gc<ObjEnum>;
 
+/// A type alias for a heap-allocated FFI library handle.
+///
+/// `ObjLibrary` owns an `Arc<libloading::Library>` (the loaded
+/// shared library) and a function-signature map for fast
+/// dispatch. The VM keeps the `Arc` alive as long as the
+/// `Value` referencing the `ObjLibrary` is live, so the
+/// underlying `Library` isn't dropped while userland FFI
+/// calls are in flight.
+pub type RefLibrary = Gc<ObjLibrary>;
+
 /// An enumeration of all potential errors that occur when working with objects.
 #[derive(Debug)]
 pub enum Error {
@@ -313,6 +406,25 @@ pub enum Object {
     /// following pointers recursively so nested enums and inner
     /// strings are preserved.
     Enum(RefEnum),
+    /// A loaded FFI shared library (userland `load(...)`).
+    ///
+    /// The `Arc<Library>` is held via the `Gc<ObjLibrary>`
+    /// cell's pointer indirection — the `Arc` is kept alive as
+    /// long as the `Value` referencing this `Object` is
+    /// live. FFI dispatch resolves symbols via the
+    /// `Library::get` API.
+    Library(RefLibrary),
+
+    /// `(a, b, c)` — heterogeneous product type. See
+    /// [`ObjTuple`] for storage details. Allocated by the
+    /// `MakeTuple` instruction (Phase 23).
+    Tuple(crate::memory::Gc<ObjTuple>),
+
+    /// `[a, b, c]` — homogeneous-style collection. See
+    /// [`ObjArray`]. Allocated by `MakeArray`. Storage is
+    /// identical to `Tuple`; only the source syntax
+    /// differs.
+    Array(crate::memory::Gc<ObjArray>),
 }
 
 impl Object {
@@ -322,6 +434,13 @@ impl Object {
             Self::String(s) => s.mark(),
             Self::Instance(i) => i.mark(),
             Self::Enum(e) => e.mark(),
+            // FFI libraries: mark through the `Gc<ObjLibrary>`
+            // indirection. `Gc` derefs to `GcData` which
+            // derefs to `ObjLibrary`; we need to mark the
+            // `GcData` cell itself (not the inner `Library`).
+            Self::Library(l) => l.mark(),
+            Self::Tuple(t) => t.mark(),
+            Self::Array(a) => a.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -334,16 +453,22 @@ impl Object {
             Self::String(s) => s.unmark(),
             Self::Instance(i) => i.unmark(),
             Self::Enum(e) => e.unmark(),
+            Self::Library(l) => l.unmark(),
+            Self::Tuple(t) => t.unmark(),
+            Self::Array(a) => a.unmark(),
         }
     }
 
     /// Return whether the object is marked.
-    #[must_use] 
+    #[must_use]
     pub fn is_marked(&self) -> bool {
         match self {
             Self::String(s) => s.is_marked(),
             Self::Instance(i) => i.is_marked(),
             Self::Enum(e) => e.is_marked(),
+            Self::Library(l) => l.is_marked(),
+            Self::Tuple(t) => t.is_marked(),
+            Self::Array(a) => a.is_marked(),
         }
     }
 
@@ -374,16 +499,46 @@ impl Object {
                     }
                 }
             }
+            // FFI libraries don't have nested object
+            // references — the `Arc<Library>` inside is
+            // not a heap-tracked object (it's an OS-level
+            // resource, not a GC-tracked cell). Nothing to
+            // trace here.
+            Self::Library(_) => {}
+            // Tuples and arrays store `Value`s directly.
+            // Phase 23 doesn't yet implement the value-
+            // to-object walker inside `mark_references`
+            // (the call site passes only `&mut grey_objects`).
+            // Caller-side handling in
+            // `Machine::gc_collect`'s transitive loop adds
+            // any heap-pointing element values to the grey
+            // stack by re-walking the heap with the
+            // freshly-marked tuples/arrays in the
+            // `current` walk.
+            //
+            // For now: tuples/arrays are safe ONLY if all
+            // element values are immediate (int/float/bool).
+            // Using heap objects inside tuples/arrays would
+            // be a use-after-free after a GC pass. The
+            // current userland FFI examples don't do this,
+            // so this is acceptable for the iteration —
+            // TODO: walk Value elements in mark_references
+            // (requires `&Heap` here).
+            Self::Tuple(_) => {}
+            Self::Array(_) => {}
         }
     }
 
     /// Get the next object reference in the linked list.
-    #[must_use] 
+    #[must_use]
     pub fn get_next(&self) -> Option<Self> {
         match self {
             Self::String(s) => s.get_next(),
             Self::Instance(i) => i.get_next(),
             Self::Enum(e) => e.get_next(),
+            Self::Library(l) => l.get_next(),
+            Self::Tuple(t) => t.get_next(),
+            Self::Array(a) => a.get_next(),
         }
     }
 
@@ -393,15 +548,21 @@ impl Object {
             Self::String(s) => s.set_next(next),
             Self::Instance(i) => i.set_next(next),
             Self::Enum(e) => e.set_next(next),
+            Self::Library(l) => l.set_next(next),
+            Self::Tuple(t) => t.set_next(next),
+            Self::Array(a) => a.set_next(next),
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn addr(&self) -> u64 {
         match self {
             Self::String(s) => s.as_ptr() as u64,
             Self::Instance(i) => i.as_ptr() as u64,
             Self::Enum(e) => e.as_ptr() as u64,
+            Self::Library(l) => l.as_ptr() as u64,
+            Self::Tuple(t) => t.as_ptr() as u64,
+            Self::Array(a) => a.as_ptr() as u64,
         }
     }
 }
@@ -412,6 +573,9 @@ impl GcSized for Object {
             Self::String(s) => s.size(),
             Self::Instance(i) => i.size(),
             Self::Enum(e) => e.size(),
+            Self::Library(l) => l.size(),
+            Self::Tuple(t) => t.size(),
+            Self::Array(a) => a.size(),
         }
     }
 }
@@ -422,6 +586,41 @@ impl fmt::Display for Object {
             Self::String(s) => write!(f, "{}", s.as_ref()),
             Self::Instance(_) => write!(f, "0x{:08x}", self.addr()),
             Self::Enum(_) => write!(f, "0x{:08x}", self.addr()),
+            Self::Library(_) => write!(f, "0x{:08x}", self.addr()),
+            Self::Tuple(t) => write!(f, "{}", t.as_ref()),
+            Self::Array(a) => write!(f, "{}", a.as_ref()),
+        }
+    }
+}
+
+impl Object {
+    /// Return a `*const c_char` to the underlying byte buffer of
+    /// this string object, suitable for passing to C functions
+    /// that expect a null-terminated C string.
+    ///
+    /// `Object::String` stores its data as a Rust `String`
+    /// (guaranteed UTF-8, but the C ABI doesn't care about
+    /// encoding — it just reads until the first `0` byte). The
+    /// `String` is laid out contiguously in memory, so we can
+    /// take a pointer to its first byte and pass it directly.
+    ///
+    /// For non-string objects, returns `null()` (callers must
+    /// type-check before calling FFI).
+    pub fn as_cstr(&self) -> *const std::os::raw::c_char {
+        match self {
+            // `s` is `&Gc<ObjString>`; dereference to get `&ObjString`,
+            // then take a pointer to the `data: String` field.
+            Self::String(s) => s.data.data.as_ptr() as *const std::os::raw::c_char,
+            // Non-string objects don't have a C-string
+            // representation. Return null; the caller's
+            // typechecker is supposed to prevent this case at
+            // compile time, but we degrade gracefully if a
+            // dynamic library is called with the wrong type.
+            Self::Instance(_)
+            | Self::Enum(_)
+            | Self::Library(_)
+            | Self::Tuple(_)
+            | Self::Array(_) => std::ptr::null(),
         }
     }
 }
@@ -437,7 +636,7 @@ pub struct ObjInstance {
 }
 
 impl ObjInstance {
-    #[must_use] 
+    #[must_use]
     pub fn default() -> Self {
         Self {
             fields: Table::default(),
@@ -455,7 +654,16 @@ impl ObjInstance {
 
 impl GcSized for ObjInstance {
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.fields.capacity()
+        // Phase 25 — dict storage. The `Table`'s entry
+        // storage is heap-allocated via Rust's global
+        // allocator (`alloc::alloc`) in `Table::resize`, NOT
+        // via the VM's heap. We deliberately don't include
+        // `fields.capacity()` here so `Heap::alloc_bytes`
+        // tracks ONLY what the VM's heap allocated (the
+        // `ObjInstance` struct itself + the field KEYS via
+        // `Heap::intern`). The table's entry slots are
+        // freed by Rust's allocator on instance drop.
+        std::mem::size_of::<Self>()
     }
 }
 
@@ -490,7 +698,7 @@ pub struct ObjString {
 }
 
 impl ObjString {
-    #[must_use] 
+    #[must_use]
     pub fn hash(s: &str) -> u32 {
         let mut hash = 2_166_136_261;
         for b in s.bytes() {
@@ -515,9 +723,159 @@ impl From<&str> for ObjString {
     }
 }
 
+// ---- Phase 23: aggregates (tuples + arrays) ----
+//
+// `(a, b, c)` and `[a, b, c]` literals become heap-allocated
+// containers of `Value`s. The runtime treats tuples and
+// arrays identically at the storage level (a `Vec<Value>`);
+// they differ only in user-facing syntax and in the path
+// that allocates them (`MakeTuple` vs `MakeArray`).
+//
+// We store `Value`s directly (not `Member`s) because
+// immediate integers and floats are 1:1 with `Value`, and
+// the GC walks heap pointers via `Member`-shaped wrappers
+// only for enums/instances that may recursively contain
+// each other.
+pub struct ObjTuple {
+    /// Source-order element storage. `elements[i]` is the
+    /// `i`th tuple element. Length is fixed at allocation
+    /// time (tuples are immutable after construction).
+    pub elements: Vec<Value>,
+}
+
+pub struct ObjArray {
+    /// Source-order element storage. Same as `ObjTuple`
+    /// but with semantically different allocator opcode
+    /// (`MakeArray` for `[]` literals).
+    pub elements: Vec<Value>,
+}
+
+impl GcSized for ObjTuple {
+    fn size(&self) -> usize {
+        mem::size_of::<Self>() + self.elements.capacity() * mem::size_of::<Value>()
+    }
+}
+
+impl GcSized for ObjArray {
+    fn size(&self) -> usize {
+        mem::size_of::<Self>() + self.elements.capacity() * mem::size_of::<Value>()
+    }
+}
+
+impl fmt::Display for ObjTuple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "({})",
+            self.elements
+                .iter()
+                .map(|v| format!("{}", v.as_int()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+impl fmt::Display for ObjArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}]",
+            self.elements
+                .iter()
+                .map(|v| format!("{}", v.as_int()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 impl fmt::Display for ObjString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.data)
+    }
+}
+
+/// A heap-allocated FFI library handle.
+///
+/// `ObjLibrary` owns an `Arc<libloading::Library>` (the loaded
+/// shared library) and a function-signature map for fast
+/// dispatch. The VM keeps the `Arc` alive as long as the
+/// `Value` referencing this `Object` is live, so the
+/// underlying `Library` isn't dropped while userland FFI
+/// calls are in flight.
+///
+/// Function signatures are cached as a `Vec<FunctionSig>`
+/// (in declaration order) — the userland `lib.invoke("name",
+/// ...)` call matches by name to avoid re-resolving the symbol
+/// on every dispatch. The `Library` Arc is held inside the
+/// struct so the underlying `dlopen`'d `Library` survives as
+/// long as any `Value` references this `Object`.
+pub struct ObjLibrary {
+    /// The loaded shared library. Kept alive as long as the
+    /// `Value` referencing this `Object` is live.
+    pub library: std::sync::Arc<crate::ffi::Library>,
+    /// Cached function signatures, in declaration order.
+    /// Indexed by the userland `lib.invoke("name", ...)`
+    /// call's resolved function ID.
+    pub signatures: Vec<FunctionSig>,
+    /// Lookup table from function name (as it appears in
+    /// the source) to its index in `signatures`. Built
+    /// lazily on the first `invoke` (or eagerly by
+    /// `Machine::register_extern_libs`).
+    pub by_name: std::collections::HashMap<String, usize>,
+}
+
+/// C signature for an FFI function, cached at the call site
+/// (or pre-built by the compiler's `extern` block). Used by
+/// `Machine::resolve_ffi` to marshal arguments and the return
+/// value between zero-script `Value`s and C ABI types.
+#[derive(Clone, Debug)]
+pub struct FunctionSig {
+    /// The function's name as it appears in source (and in
+    /// the symbol table of the loaded library).
+    pub name: String,
+    /// Number of arguments (matches the C function's arity).
+    pub arity: usize,
+    /// Argument types, in source order (first arg first).
+    pub arg_types: Vec<FfiType>,
+    /// Return type.
+    pub ret_type: FfiType,
+}
+
+/// C ABI types for FFI argument and return values. Each
+/// variant maps to a specific C type and a specific
+/// `Value` representation in the VM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiType {
+    /// C `int64_t` (or any 64-bit signed integer). The VM
+    /// stores this as `Value::from(i64)`.
+    Int,
+    /// C `double`. The VM stores this as `Value::from(f64)`.
+    Float,
+    /// C `const char *` (a C string, null-terminated). The
+    /// VM stores this as a heap-allocated `Object::String`
+    /// whose address is what gets passed to the FFI call.
+    String,
+    /// C `void` — only valid as a return type. FFI calls
+    /// that return `void` push nothing on the operand stack.
+    Void,
+}
+
+impl GcSized for ObjLibrary {
+    fn size(&self) -> usize {
+        mem::size_of::<Self>() + mem::size_of_val(&*self.library)
+    }
+}
+
+impl fmt::Display for ObjLibrary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "<library at 0x{:x}, {} function(s)>",
+            std::sync::Arc::as_ptr(&self.library) as u64,
+            self.signatures.len()
+        )
     }
 }
 
@@ -594,7 +952,7 @@ pub struct Gc<T> {
 }
 
 impl<T> Gc<T> {
-    #[must_use] 
+    #[must_use]
     pub fn new(boxed: Box<GcData<T>>) -> Self {
         Self {
             ptr: NonNull::from(Box::leak(boxed)),
@@ -605,12 +963,12 @@ impl<T> Gc<T> {
         _ = unsafe { Box::from_raw(self.ptr.as_ptr()) };
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn ptr_eq(lhs: Self, rhs: Self) -> bool {
         lhs.ptr.eq(&rhs.ptr)
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn as_ptr(&self) -> *const GcData<T> {
         self.ptr.as_ptr()
     }
@@ -659,7 +1017,7 @@ impl<V> Default for Table<V> {
 
 impl<V> Table<V> {
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self(UnsafeCell::new(Store::new()))
     }

@@ -92,7 +92,9 @@ fn assignment_to_undeclared_variable_emits_help() {
         msgs
     );
     // The error should also include a help hint suggesting a fix.
-    let ast = Pratt::default().parse("undeclared = 1;").expect("parse failed");
+    let ast = Pratt::default()
+        .parse("undeclared = 1;")
+        .expect("parse failed");
     let mut c = Checker::new();
     let _ty = c.check_program(&ast);
     let msgs = c.take_messages();
@@ -159,7 +161,11 @@ fn float_inference_works() {
 fn string_inference_works() {
     // Plain string literal infers to string.
     let (ty, msgs) = check(r#""hello";"#);
-    assert!(msgs.is_empty(), "string literal should type-check, got: {:?}", msgs);
+    assert!(
+        msgs.is_empty(),
+        "string literal should type-check, got: {:?}",
+        msgs
+    );
     assert_eq!(ty, "string");
 }
 
@@ -238,7 +244,8 @@ fn match_with_all_variants_no_messages() {
 #[test]
 fn non_exhaustive_match_emits_diagnostic() {
     // One arm missing the `Some` variant → "Non-exhaustive" error.
-    let src = "let x = Option::None(); match x { Option::None() => 0 }; enum Option { None, Some(int) }";
+    let src =
+        "let x = Option::None(); match x { Option::None() => 0 }; enum Option { None, Some(int) }";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.iter().any(|m| m.contains("Non-exhaustive match")),
@@ -350,7 +357,8 @@ fn record_construct_extra_field_diagnostic() {
          fn main() { E::Foo { x: 1, y: 2, z: 3 }; }",
     );
     assert!(
-        msgs.iter().any(|m| m.contains("Unknown field `z`") || m.contains("no field `z`")),
+        msgs.iter()
+            .any(|m| m.contains("Unknown field `z`") || m.contains("no field `z`")),
         "expected 'Unknown field `z`' / 'no field `z`' diagnostic, got: {:?}",
         msgs
     );
@@ -369,7 +377,8 @@ fn record_pattern_unknown_field_diagnostic() {
          }",
     );
     assert!(
-        msgs.iter().any(|m| m.contains("Unknown field `z`") || m.contains("missing field `z`")),
+        msgs.iter()
+            .any(|m| m.contains("Unknown field `z`") || m.contains("missing field `z`")),
         "expected 'Unknown field `z`' / 'missing field `z`' diagnostic, got: {:?}",
         msgs
     );

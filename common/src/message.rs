@@ -1,6 +1,5 @@
 use std::ops::Range;
 
-
 #[derive(PartialEq, Hash, Eq, Copy, Clone, Debug)]
 pub enum MessageKind {
     WARNING,
@@ -16,10 +15,7 @@ pub struct Label {
 
 impl Label {
     pub fn new(message: String, range: Range<usize>) -> Self {
-        Self {
-            message,
-            range,
-        }
+        Self { message, range }
     }
 
     pub fn range(&self) -> &Range<usize> {
@@ -40,9 +36,7 @@ pub struct Message {
     help: Option<String>,
     labels: Vec<Label>,
     range: Range<usize>,
-
 }
-
 
 impl Message {
     pub fn new(kind: MessageKind, message: String, range: Range<usize>) -> Self {
@@ -51,7 +45,7 @@ impl Message {
             range,
             help: None,
             message,
-            labels: Vec::with_capacity(16)
+            labels: Vec::with_capacity(16),
         }
     }
 

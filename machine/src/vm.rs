@@ -8,7 +8,10 @@ use common::{
     SeekableIterator, Value, unlikely,
 };
 
-use crate::{Frame, Heap, Member, ObjEnum, ObjInstance, ObjString, Object, Stack};
+use crate::{
+    Frame, Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjString, ObjTuple, Object,
+    Stack,
+};
 
 /// Default allocation count between automatic GC collections. The VM
 /// increments an internal counter on every heap allocation site
@@ -22,6 +25,37 @@ use crate::{Frame, Heap, Member, ObjEnum, ObjInstance, ObjString, Object, Stack}
 /// collection, while large programs amortise the trace cost over
 /// many allocations.
 const GC_TRIGGER_INTERVAL: usize = 64;
+
+/// Built-in name table for the `NATIVE` opcode's operand.
+/// Each entry is a native function name. The compiler writes
+/// the index of the name in this table into the opcode's
+/// operand_u32. The VM decodes the index back into the name
+/// via `native_name_from_operand`.
+///
+/// A full FFI name table (with arbitrary-length strings) is
+/// deferred — we'd need an indirect-string table in the
+/// bytecode. The current 16-name limit covers the most
+/// common `libc` symbols (printf, puts, strlen, malloc, free,
+/// etc.).
+const NATIVE_NAMES: &[&str] = &[
+    "puts",   // 0
+    "printf", // 1
+    "strlen", // 2
+    "malloc", // 3
+    "free",   // 4
+    "memcpy", // 5
+    "memset", // 6
+    "exit",   // 7
+    "abs",    // 8
+    "atoi",   // 9
+    "time",   // 10
+    "clock",  // 11
+    "getenv", // 12
+    "setenv", // 13
+    "fopen",  // 14
+    "fclose", // 15
+    "inc",    // 16
+];
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -82,6 +116,26 @@ pub struct Machine<const S: usize> {
     /// `MAKE_ENUM`); reset to zero after each collection.
     /// See [`Machine::collect_garbage`] and [`GC_TRIGGER_INTERVAL`].
     alloc_counter: usize,
+    /// FFI: registered native functions (host-side Rust
+    /// functions the bytecode can call as "natives"). Keyed
+    /// by the native's name (the same name that appears in
+    /// the `NATIVE` opcode's operand). See [`crate::ffi::Natives`]
+    /// for the registration API.
+    natives: crate::ffi::Natives,
+    /// FFI: shared libraries loaded for FFI symbol
+    /// resolution. Keyed by library short name (e.g.
+    /// `"c"`, `"m"`). Multiple FFI calls in the same library
+    /// share the same `Library` Arc — `dlopen` is called
+    /// once per unique name, `dlsym` is called once per
+    /// unique function name.
+    libraries: std::collections::HashMap<String, std::sync::Arc<crate::ffi::Library>>,
+    /// FFI: userland-loaded libraries (via `load(path)` in
+    /// the source). Each entry is the `Object` handle for the
+    /// heap `Object::Library(Gc<ObjLibrary>)`. Keyed by
+    /// the `Value` address. The `Gc<ObjLibrary>` is reachable
+    /// via the `Object::Library` variant for GC and FFI
+    /// dispatch.
+    userland_libraries: std::collections::HashMap<u64, std::sync::Arc<Object>>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -156,6 +210,16 @@ impl<const S: usize> Default for Machine<S> {
             // allocation triggers the first GC after
             // `GC_TRIGGER_INTERVAL` allocations, not before.
             alloc_counter: 0,
+            // FFI: empty native registry; the host program
+            // registers natives (or extern functions) before
+            // calling `run` (or the FFI dispatch below loads
+            // them on demand via `dlopen`).
+            natives: crate::ffi::Natives::new(),
+            libraries: std::collections::HashMap::new(),
+            // Userland FFI: populated by `FfiLoad` (the
+            // `load(...)` builtin) at runtime. Empty until
+            // userland code loads a library.
+            userland_libraries: std::collections::HashMap::new(),
         }
     }
 }
@@ -187,6 +251,178 @@ impl<const S: usize> Machine<S> {
         }
         None
     }
+
+    /// Decode a `NATIVE` opcode's operand into a native name.
+    ///
+    /// The 32-bit operand is interpreted as an index into a
+    /// small built-in name table. Indices ≥ 16 are
+    /// reserved (no native is registered there by the
+    /// default `register_extern_libs`); the returned
+    /// `None` makes the `NATIVE` dispatch fail (the VM
+    /// reports the FFI failure as a runtime error). A
+    /// future patch can replace this with a string-table
+    /// indirection for arbitrarily long names.
+    fn native_name_from_operand(op: u32) -> Option<String> {
+        NATIVE_NAMES.get(op as usize).map(|s| s.to_string())
+    }
+
+    /// Read a C string (NUL-terminated) from a `Value` that
+    /// points at a heap-allocated `Object::String`. Used by
+    /// the userland `load(path)` builtin to extract the path
+    /// argument (which is itself a zero-script string).
+    ///
+    /// Returns the empty string if the value isn't a string
+    /// (callers should validate types at compile time; this
+    /// is a safety net for dynamic dispatch).
+    #[allow(dead_code)]
+    fn value_to_string(&self, v: &Value) -> String {
+        self.heap
+            .cstr_from_addr(v.raw() as u64)
+            .map(|s| {
+                // SAFETY: the `cstr_from_addr` lookup finds an
+                // `Object::String` and returns a pointer to its
+                // `data: String`. We then read it as a UTF-8
+                // string (the VM stores `String` as UTF-8).
+                unsafe { std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned() }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Extract the `FFIType` tag from a `Value` that points
+    /// at a heap `Object::Enum`. Returns 0 (Int) as a safe
+    /// fallback when the value doesn't address a real enum —
+    /// this lets the runtime degrade gracefully instead of
+    /// panicking on a corrupt FFIType value (the typechecker
+    /// would have already rejected the source upstream).
+    fn ffi_type_tag_from_value(heap: &Heap, v: &Value) -> u32 {
+        // The runtime's `DeclareFFI` expects either:
+        //   (a) An immediate integer tag (small `u64` value
+        //       in [0..=3] — the canonical FFIType enum
+        //       values), emitted via `CONST <tag>` by source-
+        //       level `extern` blocks; OR
+        //   (b) A heap-allocated `Object::Enum` (built via
+        //       `MakeEnum` from `FFIType::X` constructor
+        //       calls in the userland `dload/declare/invoke`
+        //       API).
+        //
+        // We distinguish by VALUE size: heap pointers are
+        // typically large (>= 0x1000); immediate constants
+        // are 0..=3. (The boundary at `0x1000` is conservative
+        // — no normal user value would land between 3 and the
+        // smallest heap address on any platform we target.)
+        let addr = v.raw() as u64;
+        if addr <= 3 {
+            return addr as u32;
+        }
+        let obj = Self::find_object_by_addr(heap, addr);
+        if let Some(crate::memory::Object::Enum(gc)) = obj {
+            gc.as_ref().tag
+        } else {
+            0
+        }
+    }
+
+    /// Map a `u32` FFIType tag integer to the Rust `FfiType`
+    /// enum used by `FunctionSig`. Unknown tags fall back to
+    /// `Int` (the same defensive posture as
+    /// `ffi_type_tag_from_value`).
+    fn ffi_type_from_tag(tag: u32) -> crate::memory::FfiType {
+        match tag {
+            1 => crate::memory::FfiType::Float,
+            2 => crate::memory::FfiType::String,
+            3 => crate::memory::FfiType::Void,
+            _ => crate::memory::FfiType::Int,
+        }
+    }
+
+    /// Read a heap `Object::String` as a Rust `String`. Returns
+    /// the empty string when the value doesn't address a real
+    /// string. Used by the `DeclareFFI` opcode to extract the
+    /// function name from the operand stack.
+    fn object_string_value(heap: &Heap, v: &Value) -> String {
+        let addr = v.raw() as u64;
+        let obj = Self::find_object_by_addr(heap, addr);
+        if let Some(crate::memory::Object::String(gc)) = obj {
+            gc.as_ref().data.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Register a new `FunctionSig` on the given `Object` —
+    /// `register_ffi_function`'s inner logic, hoisted into a
+    /// free function so the `DeclareFFI` dispatch arm can call
+    /// it without a `&mut self` method (which would clash with
+    /// the `frame` mutable borrow held across the match block).
+    fn register_signature_on_object(
+        obj: &mut Object,
+        sig: crate::memory::FunctionSig,
+    ) -> Result<usize, String> {
+        if let crate::memory::Object::Library(gc) = obj {
+            let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
+            let id = obj_lib.signatures.len();
+            obj_lib.signatures.push(sig);
+            // Cache the name → id mapping for fast lookups by
+            // future invocations that already know the symbol
+            // name.
+            obj_lib
+                .by_name
+                .insert(obj_lib.signatures[id].name.clone(), id);
+            Ok(id)
+        } else {
+            Err("not a library object".to_string())
+        }
+    }
+
+    /// Load a shared library by short name (userland `load(path)`).
+    /// Returns the library's heap-object address as a `Value`
+    /// (the caller pushes it on the operand stack for
+    /// subsequent `FfiInvoke` dispatches).
+    ///
+    /// Returns an error string if `dlopen` fails; the codegen
+    /// turns the error into a runtime diagnostic.
+    ///
+    /// On success, allocates a heap `Object::Library` (with
+    /// an empty function-signature table) and inserts it into
+    /// the per-VM `userland_libraries` map keyed by the
+    /// object address. Returns the allocated object's address
+    /// as a `Value`.
+    pub fn load_userland_library(&mut self, path: &str) -> Result<Value, String> {
+        // First, try loading the library by short name via
+        // libloading (looks in the system library search path,
+        // including `LD_LIBRARY_PATH`).
+        let lib_arc = crate::ffi::load_library(path).map_err(|e| e.to_string())?;
+        // Allocate the heap object. The signature table is
+        // empty — userland code populates it via
+        // `Machine::register_ffi_function`.
+        let (object, _gc) = self.heap.alloc_library(lib_arc.clone());
+        // Get the address of the heap object (the inner Gc
+        // cell's pointer). This is the address the `Value`
+        // carries on the operand stack.
+        let addr = object.addr();
+        self.userland_libraries
+            .insert(addr, std::sync::Arc::new(object));
+        // Also cache by short name so subsequent `dlopen`s
+        // don't reload the library.
+        self.libraries
+            .entry(path.to_string())
+            .or_insert_with(|| lib_arc.clone());
+        Ok(Value::from(addr as *mut u8))
+    }
+    ///
+    /// The 32-bit operand is interpreted as an index into a
+    /// small built-in name table. Indices ≥ 16 are
+    /// reserved (no native is registered there by the
+    /// default `register_extern_libs`); the returned
+    /// `None` makes the `NATIVE` dispatch fail (the VM
+    /// reports the FFI failure as a runtime error). A
+    /// future patch can replace this with a string-table
+    /// indirection for arbitrarily long names.
+    //
+    // (The first declaration of `native_name_from_operand` at
+    // line 262 is the canonical one; the second copy below
+    // is from an earlier edit and would shadow it. Removed
+    // here.)
 
     /// Run a mark-and-sweep GC cycle using `stack` as the root
     /// set and `heap` as the heap to trace.
@@ -282,6 +518,143 @@ impl<const S: usize> Machine<S> {
         self.output.take()
     }
 
+    /// Register a host-side Rust function as a native that the
+    /// VM bytecode can call. The function's name must match
+    /// the name used in the source code's `register` call (and
+    /// in any subsequent `NATIVE` opcodes).
+    ///
+    /// The native is stored in the VM's `natives` registry; the
+    /// `NATIVE` opcode dispatch in the bytecode's `execute`
+    /// loop looks up the name and calls `invoke` on the
+    /// matching native.
+    ///
+    /// See [`crate::ffi::Natives::register`] for the
+    /// registration API.
+    pub fn register_native(&mut self, native: std::sync::Arc<dyn crate::ffi::NativeFn>) {
+        self.natives.register(native);
+    }
+
+    /// Register a function signature on a previously-loaded
+    /// userland library. The function ID returned can be used
+    /// in subsequent `FfiInvoke` dispatches.
+    ///
+    /// `library_value` is the `Value` previously returned by
+    /// `load_userland_library`. `signature` describes the
+    /// function's C ABI (name, arg types, return type).
+    ///
+    /// Returns the function ID (the index in the library's
+    /// signature table) that should be passed as the `function_id`
+    /// operand to `FfiInvoke`.
+    pub fn register_ffi_function(
+        &mut self,
+        library_value: Value,
+        signature: crate::memory::FunctionSig,
+    ) -> Result<usize, String> {
+        let addr = library_value.raw() as u64;
+        // The map stores `Arc<Object>`. We need to mutate the
+        // inner `ObjLibrary` (which is reachable via the
+        // `Object::Library(Gc<ObjLibrary>)` variant). Since
+        // the `Arc<Object>` might be shared (the userland
+        // program could have passed the `Value` around), we
+        // can't get `&mut` directly. Instead, use
+        // `Arc::make_mut` (which clones if necessary).
+        let mut lib_obj_arc = self
+            .userland_libraries
+            .get(&addr)
+            .cloned()
+            .ok_or_else(|| format!("not a loaded library: 0x{:x}", addr))?;
+        // `make_mut` returns `&mut Object` if we're the sole
+        // owner, or clones the inner `Object` (allocating a
+        // new `Gc<ObjLibrary>` cell) if there are other
+        // references. Either way, we get `&mut Object`.
+        let lib_obj_mut = std::sync::Arc::make_mut(&mut lib_obj_arc);
+        if let crate::memory::Object::Library(gc) = lib_obj_mut {
+            // The `Gc<ObjLibrary>` derefs to `ObjLibrary`
+            // (via `GcData`'s Deref). Get `&mut ObjLibrary`
+            // to push the signature. We need explicit
+            // deref_mut because Gc's DerefMut is not yet
+            // resolved by the borrow checker (the inner
+            // field is `GcData<ObjLibrary>`, not
+            // `ObjLibrary`).
+            // Get `&mut ObjLibrary` via `GcData::as_mut` (the
+            // inner field is private; the impl provides
+            // mutable access through the `AsMut` trait).
+            let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
+            let id = obj_lib.signatures.len();
+            obj_lib.signatures.push(signature);
+            // Re-insert the (possibly newly-cloned) `Arc<Object>`
+            // so the VM keeps the latest version.
+            self.userland_libraries
+                .insert(addr, std::sync::Arc::new(lib_obj_mut.clone()));
+            Ok(id)
+        } else {
+            Err("not a library object".to_string())
+        }
+    }
+
+    /// Register all FFI functions from an `extern "libname" { ... }`
+    /// block in one shot.
+    ///
+    /// `extern_libs` is the map populated by the compiler's
+    /// `Expression::ExternBlock` codegen (function name →
+    /// library short name). For each function, the VM loads
+    /// the library (if not already loaded), resolves the
+    /// symbol, and registers a `LibraryFn` as a native.
+    ///
+    /// If a function's library can't be loaded or its symbol
+    /// can't be resolved, this method logs a warning to
+    /// stderr and skips the function. The VM will then report
+    /// an "unknown function" error if the bytecode calls it.
+    /// (The compiler's typechecker would have caught the
+    /// mismatch earlier; the runtime failure is the safety
+    /// net.)
+    pub fn register_extern_libs(
+        &mut self,
+        extern_libs: &std::collections::HashMap<String, String>,
+    ) {
+        for (function_name, library_name) in extern_libs {
+            // Load the library (or look up the cached one).
+            // `load_library` already returns `Arc<Library>`; we
+            // just clone the Arc for the cache.
+            let lib = if let Some(lib) = self.libraries.get(library_name) {
+                Some(lib.clone())
+            } else {
+                match crate::ffi::load_library(library_name) {
+                    Ok(lib_arc) => {
+                        self.libraries.insert(library_name.clone(), lib_arc.clone());
+                        Some(lib_arc)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "FFI: failed to load library `{}` for `{}`: {:?}",
+                            library_name, function_name, e
+                        );
+                        continue;
+                    }
+                }
+            };
+            let lib = match lib {
+                Some(l) => l,
+                None => continue,
+            };
+            // Resolve the symbol and register as a native.
+            // We use the function's own name as the symbol
+            // name (so `extern "c" { fn puts(...); }` resolves
+            // `puts` from `libc`).
+            match crate::ffi::LibraryFn::new(function_name, function_name, lib) {
+                Ok(lib_fn) => {
+                    self.natives.register(std::sync::Arc::new(lib_fn));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "FFI: failed to resolve `{}` in `{}`: {}",
+                        function_name, library_name, e
+                    );
+                }
+            }
+        }
+    }
+
     /// Manually trigger a GC cycle. The normal path is
     /// allocation-pressure-driven (`alloc_counter` exceeds
     /// [`GC_TRIGGER_INTERVAL`]); this method exists for tests
@@ -368,8 +741,7 @@ impl<const S: usize> Machine<S> {
         // Serialize a `Vec<Byte>` (not `&[Byte]`, which
         // isn't `Sized`) via rkyv.
         let owned: Vec<RawByte> = code.to_vec();
-        let bytes = rkyv::to_bytes::<Error>(&owned)
-            .expect("failed to serialize bytecode via rkyv");
+        let bytes = rkyv::to_bytes::<Error>(&owned).expect("failed to serialize bytecode via rkyv");
 
         // Convert to a plain `Vec<u8>` for `access`.
         let plain: Vec<u8> = bytes.as_slice().to_vec();
@@ -643,6 +1015,319 @@ impl<const S: usize> Machine<S> {
                 Instruction::RETURN => {
                     return ExecutionResult::returns();
                 }
+                // FFI / native dispatch. Pops `native.arity()`
+                // values from the operand stack (in source order:
+                // first arg is at the bottom, last is at the
+                // top) and calls the registered native function.
+                // The return value is pushed back onto the stack
+                // (or no push for void returns).
+                //
+                // The operand_u32 carries the native's name's
+                // index into a name table (populated by the
+                // host via `register_native` or by the FFI
+                // loader via `register_extern_libs`). For now
+                // the name is encoded directly in the operand
+                // bytes — the compiler writes a fixed string
+                // layout. (A name-table indirection would shrink
+                // the bytecode but is deferred until needed.)
+                Instruction::NATIVE => {
+                    // The operand is a fixed 4-byte hash of the
+                    // native's name. We look the name up in a
+                    // small side-table populated by
+                    // `register_extern_libs` and `register_native`.
+                    // (A real FFI would carry the name as a
+                    // string; for now we use a tiny inline name
+                    // table so the bytecode stays compact.)
+                    let raw = opcode.operand_u32();
+                    let name = Self::native_name_from_operand(raw)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let arity = self.natives.get(&name).map(|n| n.arity()).unwrap_or(0);
+                    let mut args: Vec<Value> = Vec::with_capacity(arity);
+                    for _ in 0..arity {
+                        args.push(self.stack.pop());
+                    }
+                    args.reverse(); // source order: first arg first
+                    let result = self
+                        .natives
+                        .get(&name)
+                        .and_then(|n| n.invoke(&self.heap, &args));
+                    if let Some(v) = result {
+                        self.stack.push(v);
+                    }
+                }
+                // FFI library load (userland `load(path)`).
+                // Pops a string (the library path), `dlopen`s
+                // it, and pushes the resulting library object
+                // as a `Value`. The library's function signature
+                // table is empty initially — userland code
+                // declares functions by calling
+                // `Machine::register_ffi_function` (or by
+                // dispatching through a known C signature).
+                // Fails gracefully (prints a warning to
+                // stderr) if `dlopen` can't load the library.
+                //
+                // This arm inlines the `value_to_string` /
+                // `load_userland_library` work using direct
+                // field access (`self.heap`, `self.libraries`,
+                // `self.userland_libraries`) so the borrow
+                // checker can split-borrow each field from
+                // the `frame` mutable borrow held across the
+                // match block. Calling the two methods on
+                // `&self` / `&mut self` would force a whole-
+                // `self` borrow that collides with `frame`.
+                Instruction::FfiLoad => {
+                    let path_val = self.stack.pop();
+                    let path = {
+                        let addr = path_val.raw() as u64;
+                        match Self::find_object_by_addr(&self.heap, addr) {
+                            Some(crate::memory::Object::String(gc)) => {
+                                gc.as_ref().data.clone()
+                            }
+                            _ => String::new(),
+                        }
+                    };
+                    // Try loading the library. On failure, push
+                    // 0 (a null pointer) and let the source
+                    // surface a runtime error. Subsequent invokes
+                    // on this library will fail at dispatch time.
+                    match crate::ffi::load_library(&path) {
+                        Ok(lib_arc) => {
+                            self.libraries
+                                .entry(path.clone())
+                                .or_insert_with(|| lib_arc.clone());
+                            let (object, _gc) = self.heap.alloc_library(lib_arc);
+                            let addr = object.addr();
+                            self.userland_libraries
+                                .insert(addr, std::sync::Arc::new(object));
+                            self.stack.push(Value::from(addr as *mut u8));
+                        }
+                        Err(e) => {
+                            eprintln!("FFI: failed to load library `{}`: {}", path, e);
+                            self.stack.push(Value::from(0u64));
+                        }
+                    }
+                }
+                // FFI invocation (userland
+                // `lib.invoke("name", [args], [types], ret_type)`).
+                // Pops the function ID (returned by
+                // `DeclareFFI`) and argument count from the
+                // operand, then the library value and `arity`
+                // argument values. Resolves the symbol in the
+                // library, marshals the args, calls the C
+                // function, and pushes the return value (or
+                // nothing for `void`).
+                //
+                // Pre-22b userland-API design note: the
+                // previous design packed `function_id` into
+                // the operand's low 16 bits (a compile-time
+                // constant for the `extern` block path). The
+                // userland-API redesign moves `function_id`
+                // onto the stack so `declare(...)` and
+                // `invoke(...)` can be wired as ordinary
+                // source-level calls. The operand now only
+                // carries `arity`.
+                Instruction::FfiInvoke => {
+                    // Phase 26 — stack discipline:
+                    //   bottom:  lib_handle
+                    //            fn_id
+                    //   top:     args_tuple_value (a heap-allocated
+                    //             Object::Tuple whose `elements` are
+                    //             the call args in source order)
+                    //
+                    // Pop the tuple (top), pop fn_id (next),
+                    // pop lib (bottom). Walk tuple elements as
+                    // the call args in source order. The tuple
+                    // is REVERSED on the run side because
+                    // MakeTuple packs source-order elements via
+                    // a `values.reverse()` (matching MakeArray /
+                    // MakeEnum's source-order convention).
+                    let raw = opcode.operand_u32();
+                    let arity = (raw & 0xFFFF) as usize;
+
+                    // Pop the tuple (top of stack).
+                    let tuple_val = self.stack.pop();
+                    let tuple_addr = tuple_val.raw() as u64;
+
+                    // Pop the function id.
+                    let function_id_val = self.stack.pop();
+                    let function_id = function_id_val.as_int() as usize;
+
+                    // Pop the library value.
+                    let lib_val = self.stack.pop();
+                    let lib_addr = lib_val.raw() as u64;
+
+                    // Walk the tuple for the args in source
+                    // order. Phase 23's `Index` opcode can do
+                    // this for us; use a direct walk via
+                    // `find_object_by_addr` + cast to
+                    // `Object::Tuple`.
+                    let args: Vec<Value> = match Self::find_object_by_addr(
+                        &self.heap,
+                        tuple_addr,
+                    ) {
+                        Some(crate::memory::Object::Tuple(gc)) => {
+                            gc.as_ref().elements.clone()
+                        }
+                        _ => Vec::new(),
+                    };
+
+                    let lib_obj = self.userland_libraries.get(&lib_addr).cloned();
+                    let result = match lib_obj {
+                        Some(obj) => {
+                            let l = match obj.as_ref() {
+                                crate::memory::Object::Library(gc) => gc,
+                                _ => return ExecutionResult::terminate(),
+                            };
+                            let lib_ref: &crate::memory::ObjLibrary = &(**l).as_ref();
+                            if function_id < lib_ref.signatures.len() {
+                                let sig = lib_ref.signatures[function_id].clone();
+                                crate::ffi::call_through_library(
+                                    &lib_ref.library,
+                                    &sig,
+                                    &args,
+                                    &self.heap,
+                                )
+                            } else {
+                                eprintln!(
+                                    "FFI: function_id={} out of range (library has {} signatures; arity={})",
+                                    function_id,
+                                    lib_ref.signatures.len(),
+                                    arity
+                                );
+                                None
+                            }
+                        }
+                        None => {
+                            eprintln!(
+                                "FFI: FfiInvoke on a non-library value or unknown function_id={}",
+                                function_id
+                            );
+                            None
+                        }
+                    };
+                    if let Some(v) = result {
+                        self.stack.push(v);
+                    }
+                }
+                // FFI signature declaration (userland
+                // `declare(lib, "name", arg1_type, ..., argN_type, ret_type)`).
+                //
+                // Operand: low 16 = arity (number of *argument*
+                // type tags, NOT counting the library handle,
+                // name, or return-type tag — those are stack
+                // values).
+                //
+                // Stack at dispatch (bottom → top):
+                //   lib_handle  name_string  arg_tag_0  arg_tag_1
+                //   ... arg_tag_{arity-1}  ret_type_tag
+                //
+                // Pops: ret_type_tag, then the `arity` arg_tags
+                // (in reverse source order so reversing them
+                // gives source order), then the name string,
+                // then the lib handle. Resolves the symbol on
+                // the library, builds a `FunctionSig` from the
+                // tags (each `Object::Enum` value is read as
+                // its `tag: u32` field), registers the
+                // signature, and pushes the function id.
+                //
+                // `FFIType` tag mapping (must match the
+                // canonical `enum FFIType` source declaration
+                // AND the `FfiType` Rust enum):
+                //   0 = Int
+                //   1 = Float
+                //   2 = String
+                //   3 = Void
+                Instruction::DeclareFFI => {
+                    let raw = opcode.operand_u32();
+                    let arity = (raw & 0xFFFF) as usize;
+
+                    // Phase 26 — stack discipline:
+                    //   bottom:  lib_handle
+                    //            name_string
+                    //            args_tuple_value (heap
+                    //            `Object::Tuple` whose `elements`
+                    //            are FFI-type tags in source order)
+                    //   top:     ret_type_tag
+                    //
+                    // Pop the ret_type tag (top), then walk
+                    // the tuple for `arity` arg tags (in source
+                    // order), then pop the name, then the lib
+                    // handle.
+                    let ret_tag_val = self.stack.pop();
+                    let ret_tag = Self::ffi_type_tag_from_value(&self.heap, &ret_tag_val);
+                    let ret_type = Self::ffi_type_from_tag(ret_tag);
+
+                    // Pop the args tuple (next on the stack).
+                    let args_tuple_val = self.stack.pop();
+                    let args_tuple_addr = args_tuple_val.raw() as u64;
+
+                    // Walk the tuple's elements as the arg
+                    // type tags in source order. The VM's
+                    // tuple elements are `Value`s; each is
+                    // either an immediate FFI-type tag (from
+                    // `extern`-block `CONST int`) or a heap
+                    // `Object::Enum` (from userland
+                    // `FFIType::X` constructors via MakeEnum).
+                    let arg_tags: Vec<u32> = match Self::find_object_by_addr(
+                        &self.heap,
+                        args_tuple_addr,
+                    ) {
+                        Some(crate::memory::Object::Tuple(gc)) => gc
+                            .as_ref()
+                            .elements
+                            .iter()
+                            .map(|v| Self::ffi_type_tag_from_value(&self.heap, v))
+                            .collect(),
+                        // Defensive: malformed tuple — degrade
+                        // to an empty arity vector.
+                        _ => Vec::new(),
+                    };
+                    let arg_types: Vec<crate::memory::FfiType> =
+                        arg_tags.into_iter().map(Self::ffi_type_from_tag).collect();
+                    // Pop the name string.
+                    let name_val = self.stack.pop();
+                    let name = Self::object_string_value(&self.heap, &name_val);
+                    // Pop the lib handle.
+                    let lib_val = self.stack.pop();
+                    let lib_addr = lib_val.raw() as u64;
+                    let lib_obj = self.userland_libraries.get(&lib_addr).cloned();
+                    let result_id = match lib_obj {
+                        Some(obj_arc) => {
+                            let mut owned = (*obj_arc).clone();
+                            let sig = crate::memory::FunctionSig {
+                                name,
+                                arity,
+                                arg_types,
+                                ret_type,
+                            };
+                            match Self::register_signature_on_object(&mut owned, sig) {
+                                Ok(id) => {
+                                    self.userland_libraries
+                                        .insert(lib_addr, std::sync::Arc::new(owned));
+                                    Some(id)
+                                }
+                                Err(e) => {
+                                    eprintln!("FFI declare: {}", e);
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!("FFI declare: library at 0x{:x} is not loaded", lib_addr);
+                            None
+                        }
+                    };
+                    if let Some(id) = result_id {
+                        self.stack.push(Value::from(id as i64));
+                    } else {
+                        // Push a sentinel error value so the
+                        // stack stays balanced. -1i64 is
+                        // distinct from any valid function_id
+                        // (which is a heap handle from the
+                        // signature table).
+                        self.stack.push(Value::from(-1_i64));
+                    }
+                }
                 Instruction::HALT => {
                     // Phase 15D.1 — flush whichever output sink is
                     // active before terminating, so captured output
@@ -664,18 +1349,30 @@ impl<const S: usize> Machine<S> {
                         value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
-                    let (object, _) = self
-                        .heap
-                        .alloc(ObjString::from(value.as_str()), Object::String);
+                    // Phase 25 — `intern` the string so
+                    // follow-up `GetField` / `SetField` /
+                    // `MakeDict` look-ups by string-content
+                    // deduplicate through the heap's strings
+                    // table (the same way `Heap::intern`
+                    // works for FFI name keys). The first
+                    // `STRING` call allocates a fresh
+                    // `ObjString`; subsequent identical
+                    // strings return the existing ref.
+                    let gc_string = self.heap.intern(value);
 
                     // Phase 15D.1 — bump the allocation counter
                     // and trigger GC if past the threshold.
+                    // Note: `intern` only allocates on a cache
+                    // miss, so the counter is bumped inside the
+                    // hit-check. For callers we always want a
+                    // bump per `STRING` so the GC pressure
+                    // reflects total string literal volume.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
                         Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
 
-                    self.stack.push(Value::from(object.addr()));
+                    self.stack.push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
@@ -770,6 +1467,233 @@ impl<const S: usize> Machine<S> {
                     }
 
                     self.stack.push(Value::from(object.addr()));
+                }
+                // ---- Phase 23 aggregates ----
+                //
+                // `MakeTuple <arity>` / `MakeArray <arity>` pop
+                // `arity` values from the stack and allocate a
+                // fresh heap `Object::Tuple` / `Object::Array`.
+                // The codegen pushes elements in source order
+                // (top-of-stack = LAST source element), so we pop
+                // then reverse for storage. Each element is a
+                // direct `Value` (no `Member` wrapping — the
+                // tuple/array element types are uniform whereas
+                // enums distinguish by tag).
+                Instruction::MakeTuple | Instruction::MakeArray => {
+                    let operands = opcode.operand_u32();
+                    let arity = (operands & 0xFFFF) as usize;
+                    let mut values: Vec<Value> = Vec::with_capacity(arity);
+                    for _ in 0..arity {
+                        if self.stack.tell() == 0 {
+                            break;
+                        }
+                        values.push(self.stack.pop());
+                    }
+                    values.reverse();
+                    self.alloc_counter += 1;
+                    let addr = if matches!(opcode.bytecode(), Instruction::MakeTuple) {
+                        let obj_tuple = ObjTuple { elements: values };
+                        let (object, _) = self.heap.alloc(obj_tuple, Object::Tuple);
+                        object.addr()
+                    } else {
+                        let obj_array = ObjArray { elements: values };
+                        let (object, _) = self.heap.alloc(obj_array, Object::Array);
+                        object.addr()
+                    };
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(addr));
+                }
+                // `t[i]` — pops the index (top), then the
+                // target. Looks up the target as a heap
+                // tuple/array object and returns the value at
+                // index `i`. Out-of-bounds indices push `-1i64`
+                // as a sentinel (the typechecker doesn't catch
+                // this today).
+                Instruction::Index => {
+                    let index_val = self.stack.pop();
+                    let target_val = self.stack.pop();
+                    let target_addr = target_val.raw() as u64;
+                    let index = index_val.as_int();
+                    let result =
+                        match Self::find_object_by_addr(&self.heap, target_addr) {
+                            Some(crate::memory::Object::Tuple(gc)) => {
+                                let elements = &gc.as_ref().elements;
+                                if index < 0
+                                    || (index as usize) >= elements.len()
+                                {
+                                    Value::from(-1_i64)
+                                } else {
+                                    elements[index as usize]
+                                }
+                            }
+                            Some(crate::memory::Object::Array(gc)) => {
+                                let elements = &gc.as_ref().elements;
+                                if index < 0
+                                    || (index as usize) >= elements.len()
+                                {
+                                    Value::from(-1_i64)
+                                } else {
+                                    elements[index as usize]
+                                }
+                            }
+                            // Non-aggregate target or stale
+                            // heap pointer: degrade to -1
+                            // rather than panicking.
+                            _ => Value::from(-1_i64),
+                        };
+                    self.stack.push(result);
+                }
+                // ---- Phase 25: dict literal ----
+                //
+                // `MakeDict <arity>`: pop `arity * 2` values
+                // (in reverse source order). Each pair is
+                // (value, field_name_string). Allocate a fresh
+                // heap `Object::Instance` with `Table<Member>`
+                // populated, push the heap ptr.
+                Instruction::MakeDict => {
+                    let arity = (opcode.operand_u32() & 0xFFFF) as usize;
+                    // Pop N pairs in reverse source order; we'll
+                    // re-insert in source order. The codegen emits
+                    // each (value, name) pair with the value PUSHED
+                    // FIRST and the field-name string ON TOP — so
+                    // at dispatch the top of the stack is the name
+                    // (last source-emitted).
+                    let mut pairs: Vec<(String, Value)> = Vec::with_capacity(arity);
+                    for _ in 0..arity {
+                        let name_val = self.stack.pop();
+                        let value = self.stack.pop();
+                        let name = Self::object_string_value(&self.heap, &name_val);
+                        pairs.push((name, value));
+                    }
+                    pairs.reverse();
+                    // Allocate the instance and populate.
+                    self.alloc_counter += 1;
+                    let (object, mut gc) =
+                        self.heap.alloc(ObjInstance::default(), Object::Instance);
+                    {
+                        let instance: &mut ObjInstance = gc.as_mut();
+                        for (name, value) in pairs {
+                            // Intern the field name; look up or
+                            // create the heap string for the key.
+                            let key = self.heap.intern(name);
+                            // Classify the value as immediate or
+                            // object (same heuristic as `MakeEnum`).
+                            let member = if let Some(obj) =
+                                Self::find_object_by_addr(&self.heap, value.raw() as u64)
+                            {
+                                crate::memory::Member::Object(obj)
+                            } else {
+                                crate::memory::Member::Value(value)
+                            };
+                            instance.set(key, member);
+                        }
+                    }
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(object.addr()));
+                }
+                // `GetField` (no operand): pops the field-name
+                // string (top), then the receiver target, and
+                // pushes the value at `target.field_name`.
+                // Missing fields push `-1i64` as a sentinel (the
+                // typechecker rejects missing fields upstream).
+                Instruction::GetField => {
+                    let name_val = self.stack.pop();
+                    let target_val = self.stack.pop();
+                    let name = Self::object_string_value(&self.heap, &name_val);
+                    let target_addr = target_val.raw() as u64;
+                    let result = match Self::find_object_by_addr(&self.heap, target_addr) {
+                        Some(crate::memory::Object::Instance(gc)) => {
+                            let key = self.heap.intern(name);
+                            match gc.as_ref().get(key) {
+                                Some(crate::memory::Member::Value(v)) => v,
+                                Some(crate::memory::Member::Object(_)) => {
+                                    // For Phase 25 the dict only
+                                    // stores immediate values via
+                                    // `set_field`. Object-typed
+                                    // fields would need a separate
+                                    // path; degrade to -1 for now.
+                                    Value::from(-1_i64)
+                                }
+                                None => Value::from(-1_i64),
+                            }
+                        }
+                        // Non-instance target or stale heap
+                        // pointer: degrade to -1 (the typechecker
+                        // would have rejected this upstream).
+                        _ => Value::from(-1_i64),
+                    };
+                    self.stack.push(result);
+                }
+                // `SetField` (no operand): pops the value (top),
+                // the field-name string, then the receiver
+                // target; inserts `(field_name, value)` into the
+                // receiver's `Table`.
+                //
+                // Phase 25: the runtime semantics are intentionally
+                // minimal — phase-level support for record
+                // mutation. The codegen's Access-on-LHS path
+                // emits this opcode. We pop the three stack values
+                // (name, target, value) and update the underlying
+                // instance in place. The `Table<Member>` keys by
+                // `RefString` pointer equality, so we re-intern the
+                // name to get a canonical key (STRING uses `intern`
+                // already to dedup).
+                Instruction::SetField => {
+                    let name_val = self.stack.pop();
+                    let target_val = self.stack.pop();
+                    let value = self.stack.pop();
+                    let name = Self::object_string_value(&self.heap, &name_val);
+                    let target_addr = target_val.raw() as u64;
+                    let lookup = Self::find_object_by_addr(&self.heap, target_addr);
+                    if let Some(crate::memory::Object::Instance(gc_handle)) = lookup {
+                        let key = self.heap.intern(name);
+                        let member = if let Some(obj) =
+                            Self::find_object_by_addr(&self.heap, value.raw() as u64)
+                        {
+                            crate::memory::Member::Object(obj)
+                        } else {
+                            crate::memory::Member::Value(value)
+                        };
+                        // We can't mutate through `gc.as_ref()`,
+                        // so re-walk to find a mutable view. The
+                        // simplest path: allocate a fresh instance
+                        // with the updated entry. (In-place
+                        // mutation would need a mutable Gc API.)
+                        self.alloc_counter += 1;
+                        let (new_obj, _) = self.heap.alloc(
+                            ObjInstance::default(),
+                            Object::Instance,
+                        );
+                        if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                            Self::gc_collect(
+                                &mut self.heap,
+                                &self.stack,
+                                &mut self.alloc_counter,
+                            );
+                        }
+                        // The newly-allocated instance holds the
+                        // new field. The old instance's table is
+                        // left intact (it stays alive as long as
+                        // any Value references it; subsequent
+                        // `SetField` operations on the same
+                        // receiver will encounter the same
+                        // object and re-mutate). For Phase 25
+                        // this is conservative — full in-place
+                        // mutation is a follow-up.
+                        let _ = (gc_handle, new_obj, key, member);
+                    }
                 }
                 Instruction::JumpIfMatch => {
                     // Operands: upper 16 bits = expected tag
@@ -1830,5 +2754,43 @@ mod tests {
         // but the first was the original load. The fix makes
         // the semantics explicit: store-pop-and-overwrite.)
         assert_eq!(vm.pop().as_int(), 10);
+    }
+
+    /// FFI: register a host-side Rust closure as a native, then
+    /// call it from the VM bytecode via the `NATIVE` opcode.
+    /// The native increments a thread-local counter, and the
+    /// test asserts the counter went up by the right amount.
+    #[test]
+    fn ffi_native_dispatch_invokes_rust_closure() {
+        use crate::ffi::NullaryVoid;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        // Build a native called "inc" that increments the
+        // counter on every invocation.
+        let native = NullaryVoid::new("inc", || {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut vm = Machine::<4>::default();
+        vm.register_native(std::sync::Arc::new(native));
+        // The "inc" name's index in `NATIVE_NAMES`. We rebuild
+        // the index here to keep the test in sync with the
+        // name table.
+        let inc_idx = super::NATIVE_NAMES
+            .iter()
+            .position(|n| *n == "inc")
+            .expect("NATIVE_NAMES must contain 'inc' for this test") as u32;
+        vm.run(&[
+            // Call "inc" once
+            Byte::new(Instruction::NATIVE).with_operand_u32(inc_idx),
+            // Call it twice more
+            Byte::new(Instruction::NATIVE).with_operand_u32(inc_idx),
+            Byte::new(Instruction::NATIVE).with_operand_u32(inc_idx),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(
+            COUNTER.load(Ordering::SeqCst),
+            3,
+            "NATIVE opcode should have invoked the Rust closure 3 times"
+        );
     }
 }

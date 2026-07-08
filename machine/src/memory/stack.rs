@@ -14,7 +14,7 @@ impl<T: Default + Copy, const N: usize> Default for Stack<T, N> {
 }
 
 impl<T: Default + Copy, const N: usize> Stack<T, N> {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             stack: std::array::from_fn(|_| T::default()),

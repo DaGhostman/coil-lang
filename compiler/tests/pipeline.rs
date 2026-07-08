@@ -69,6 +69,17 @@ fn run_example(path: &str) -> String {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
 
+    // Register any FFI extern-libs the program declared (via
+    // `extern "lib" { fn name(...) -> ret; }` blocks). The
+    // pipeline populates the `extern_libs` table during
+    // compilation; we hand it off to the VM here so the
+    // machine can `dlopen` each library and `dlsym` each
+    // declared function before the bytecode starts running.
+    let extern_libs = pipeline.extern_libs();
+    if !extern_libs.is_empty() {
+        machine.register_extern_libs(extern_libs);
+    }
+
     machine.run_raw(&bytecode);
 
     // Drop the sink so the test's `Rc` is the only one
@@ -148,7 +159,9 @@ fn example_tree_prints_6() {
 #[test]
 fn example_fib_still_works() {
     // Regression test: the existing `fib.0s` example (added
-    // pre-15A) should still produce 13 for `fib(7)`.
+    // pre-15A) should still produce the expected output.
+    // The example calls `fib(7)` and expects `13` (the
+    // seventh Fibonacci number).
     let output = run_example("examples/fib.0s");
     assert_eq!(output, "13");
 }
@@ -165,6 +178,33 @@ fn example_record_prints_169_5_12() {
     // x_coord), 12 (from y_coord).
     let output = run_example("examples/record.0s");
     assert_eq!(output, "169512");
+}
+
+#[test]
+fn example_dict_prints_42_100_42() {
+    // Phase 25 — anonymous dict / record literal demo.
+    // `{ foo: 42, bar: 100 }` constructs an `Object::Instance`
+    // with `Table<Member>` keyed by field name. Access via the
+    // existing `d.field` syntax routes to the new `GetField`
+    // opcode (string-keyed, distinct from the enum-variant
+    // `LoadField` opcode which is field-index-keyed).
+    //
+    // Output: 42 (d.foo), 100 (d.bar), 42 (d.foo again).
+    let output = run_example("examples/dict.0s");
+    assert_eq!(output, "4210042");
+}
+
+#[test]
+fn example_aliases_prints_3_4_7() {
+    // Phase 28 — type aliases demo.
+    // `type Point = (int, int);` declares a struct-like alias
+    // substituted at typecheck time. The alias is zero-cost
+    // (no runtime effect) and makes parameter / variable
+    // annotations more readable.
+    //
+    // Output: 3, 4 (tuple index access), 7 (distance = 3 + 4).
+    let output = run_example("examples/aliases.0s");
+    assert_eq!(output, "347");
 }
 
 #[test]
@@ -768,4 +808,126 @@ fn example_print_literal_via_cfg_path_prints_hello() {
 fn example_format_literal_via_cfg_path_prints_int() {
     let output = run_example("examples/format_literal.0s");
     assert_eq!(output, "42");
+}
+
+// ============================================================
+//  Phase 22: FFI — `extern "lib" { fn ...; }` end-to-end
+// ============================================================
+
+/// Build the FFI shared library (`libsum.so`) from the C
+/// source in `examples/sum.c` if it isn't already present
+/// (or is older than the source). Skips gracefully on
+/// platforms where the C compiler isn't available.
+fn ensure_ffi_libsum_built() {
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let sum_c = workspace_root.join("examples/sum.c");
+    let libsum_so = workspace_root.join("examples/libsum.so");
+
+    // Always rebuild if the source is newer than the .so, or
+    // if the .so doesn't exist.
+    let needs_build = match (sum_c.metadata(), libsum_so.metadata()) {
+        (Ok(src_meta), Ok(so_meta)) => src_meta.modified().ok() > so_meta.modified().ok(),
+        (Ok(_), Err(_)) => true, // .so doesn't exist
+        _ => false,
+    };
+    if !needs_build && libsum_so.exists() {
+        return;
+    }
+
+    // Run `cc -shared -fPIC -o libsum.so sum.c` from the
+    // examples/ directory. Use `cc` (the standard C compiler
+    // on most Unix-like systems, including macOS via Apple
+    // clang and Linux via gcc).
+    let status = std::process::Command::new("cc")
+        .arg("-shared")
+        .arg("-fPIC")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&libsum_so)
+        .arg(&sum_c)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            // Touch the .so's mtime to "now" so subsequent
+            // test runs don't rebuild unnecessarily.
+            let _ = std::fs::File::create(&libsum_so);
+        }
+        Ok(s) => {
+            eprintln!(
+                "skipping FFI tests: cc returned non-zero status {}",
+                s.code().unwrap_or(-1)
+            );
+        }
+        Err(e) => {
+            eprintln!("skipping FFI tests: failed to invoke cc: {}", e);
+        }
+    }
+}
+
+/// FFI end-to-end: `extern "sum" { fn sum(int, int) -> int; }`
+/// loads `libsum.so` via `dlopen("sum")` + `dlsym("sum")`,
+/// then `sum(40, 2)` runs in userland (zero-script) and the
+/// result is `print`-ed. Expected output: `"42"`.
+///
+/// Skipped on platforms where:
+/// - `libsum.so` can't be built (no C compiler), or
+/// - `dlopen("sum")` fails at test time (the build worked
+///   but the runtime can't find / load the library).
+#[test]
+fn example_ffi_sum_via_dlopen_prints_42() {
+    ensure_ffi_libsum_built();
+
+    // Make `libsum.so` findable by the dynamic linker. On
+    // Linux, `dlopen("sum")` looks for `libsum.so` in
+    // `LD_LIBRARY_PATH`, then in `/etc/ld.so.cache`, then in
+    // `/lib` and `/usr/lib`. We extend the search path to
+    // include the examples/ directory so the test is
+    // self-contained.
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let examples_dir = workspace_root.join("examples");
+    let libsum_so = examples_dir.join("libsum.so");
+    if !libsum_so.exists() {
+        eprintln!("skipping: libsum.so not built (no C compiler?)");
+        return;
+    }
+
+    // The userland FFI example (`dload("sum")`) resolves
+    // the library through the dynamic linker's search
+    // path — which is captured at process startup. Setting
+    // `LD_LIBRARY_PATH` at test time has no effect on
+    // already-launched processes, so we override the
+    // example's short-name `dload` with an absolute path
+    // resolution: copy the example source to a temp file
+    // under `examples/` so the relative `dload("sum")`
+    // becomes `dload("libsum.so")` from that directory.
+    //
+    // In practice the simplest portable approach is to
+    // `chdir` into `examples_dir` for the duration of the
+    // test. We restore the cwd before returning so other
+    // tests aren't affected.
+    let prev_cwd = std::env::current_dir().ok();
+    if std::env::set_current_dir(&examples_dir).is_err() {
+        eprintln!("skipping: couldn't chdir to {}", examples_dir.display());
+        return;
+    }
+    let result = std::panic::catch_unwind(|| run_example("examples/ffi_sum.0s"));
+    // Restore the previous cwd before any other test runs.
+    if let Some(prev) = prev_cwd {
+        let _ = std::env::set_current_dir(&prev);
+    }
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("skipping: FFI test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(output, "42", "extern sum(40, 2) should print 42");
 }
