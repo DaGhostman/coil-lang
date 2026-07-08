@@ -293,6 +293,8 @@ impl Pipeline {
     /// namespace.
     fn enqueue_file(&mut self, file: PathBuf) {
         if self.processed.contains(&file) {
+            #[cfg(debug_assertions)]
+            eprintln!("[pipeline]   already loaded {}", file.display());
             return;
         }
         let ns = self.manifest.namespace_of(&self.project_root, &file);
@@ -301,7 +303,13 @@ impl Pipeline {
         // unbounded recursion in diamond dependencies.
         self.processed.insert(file.clone());
         self.file_namespaces.insert(file.clone(), ns.clone());
-        self.worklist.push_back(WorkItem { file, namespace: ns });
+        self.worklist.push_back(WorkItem { file: file.clone(), namespace: ns.clone() });
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline]   enqueued {} (namespace={})",
+            file.display(),
+            ns.as_deref().unwrap_or("<none>")
+        );
     }
 
     /// Read the source text for `file`, populating the
@@ -311,10 +319,14 @@ impl Pipeline {
     /// error and bails.
     fn read_source(&mut self, file: &Path) -> Option<String> {
         if let Some(cached) = self.source_cache.get(file) {
+            #[cfg(debug_assertions)]
+            eprintln!("[pipeline]   cache hit for {}", file.display());
             return Some(cached.clone());
         }
         match std::fs::read_to_string(file) {
             Ok(s) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[pipeline]   loaded {} ({} bytes)", file.display(), s.len());
                 self.source_cache.insert(file.to_path_buf(), s.clone());
                 Some(s)
             }
@@ -333,6 +345,8 @@ impl Pipeline {
     /// (so the same file isn't discovered twice). The
     /// `failed` flag is set if any file fails to parse.
     fn discover_all(&mut self) {
+        #[cfg(debug_assertions)]
+        eprintln!("[pipeline] scanning for files (entry={:?})", self.entry_file);
         // We need a separate "discover-only" loop that
         // processes the worklist front-to-back but
         // doesn't compile. We mutate `self.worklist`
@@ -352,6 +366,8 @@ impl Pipeline {
         let mut i = 0;
         while i < to_discover.len() {
             let file = to_discover[i].clone();
+            #[cfg(debug_assertions)]
+            eprintln!("[pipeline]   scanning {} (depth {})", file.display(), i);
             // Read the source (cached after the first
             // call). The `compile_file` pass reuses the
             // same cached source, so the file is only
@@ -389,13 +405,26 @@ impl Pipeline {
             };
             self.enqueue_uses(&ast);
             // Pick up any newly enqueued files.
+            let before = to_discover.len();
             for item in &self.worklist {
                 if !to_discover.contains(&item.file) {
                     to_discover.push(item.file.clone());
                 }
             }
+            #[cfg(debug_assertions)]
+            if to_discover.len() > before {
+                eprintln!(
+                    "[pipeline]   {} new file(s) discovered",
+                    to_discover.len() - before
+                );
+            }
             i += 1;
         }
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline] scanning complete, {} file(s) in worklist",
+            self.worklist.len()
+        );
     }
 
     /// Compile a single file: parse, enqueue uses, and
@@ -419,6 +448,13 @@ impl Pipeline {
                     .to_string()
             })
         };
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline] compiling {} (namespace={:?}, entry={})",
+            file.display(),
+            namespace,
+            is_entry
+        );
 
         let src = match self.read_source(&file) {
             Some(s) => s,
@@ -472,6 +508,13 @@ impl Pipeline {
         let bytecode = self
             .compiler
             .compile_module(namespace.as_str(), &ast);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline]   compiled {} → {} bytes (total: {})",
+            file.display(),
+            bytecode.len(),
+            self.bytecode.len()
+        );
 
         // Append this file's bytecode to the running
         // output. Each file's bytecode is independent;
@@ -512,6 +555,11 @@ impl Pipeline {
         // that when a file's `use foo::bar;` looks
         // up `foo::bar` in `self.functions`, the
         // function is already there.
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline] compiling worklist ({} files, LIFO)",
+            self.worklist.len()
+        );
         while let Some(item) = self.worklist.pop_back() {
             let is_entry = self
                 .entry_file
@@ -657,9 +705,12 @@ impl Pipeline {
 
         // Discovery + LIFO compile (see `compile`).
         self.discover_all();
-        eprintln!("[pipeline] worklist after discover: {:#?}", self.worklist);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[pipeline] compiling worklist ({} files, LIFO)",
+            self.worklist.len()
+        );
         while let Some(item) = self.worklist.pop_back() {
-            eprintln!("[pipeline] pop_back: {:?}", item.file);
             let is_entry = self
                 .entry_file
                 .as_ref()
