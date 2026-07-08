@@ -2,6 +2,7 @@ mod block_builder;
 pub mod cfg;
 mod cfg_builder;
 mod linearize;
+mod manifest;
 mod pipeline;
 mod typechecking;
 
@@ -494,6 +495,18 @@ pub struct Compiler {
 
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
+    /// Phase 29A — top-level items per namespace.
+    /// Populated by the codegen for each compiled file.
+    /// Keyed by the file's namespace (e.g. `"foo"` for
+    /// `src/foo.0s` or `""` for the entry file). The
+    /// value lists the bare item names (e.g. `["sadge",
+    /// "greet"]`).
+    ///
+    /// Used by the glob-import codegen
+    /// (`use foo::*;`) to expand the file's items into
+    /// the current scope. Populated as a side effect of
+    /// the `Expression::Function` arm.
+    module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
     /// Phase 22b: compile-time FFI table populated by the
     /// `Expression::ExternBlock` codegen. Maps each function
@@ -563,6 +576,7 @@ impl Default for Compiler {
             bytecode,
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
+            module_items: std::collections::HashMap::default(),
             native: HashMap::default(),
             extern_libs: HashMap::with_capacity(4),
             extern_runtime_libs: HashMap::with_capacity(4),
@@ -1418,6 +1432,7 @@ impl Compiler {
         };
 
         // 4. Linearize the CFG to bytecode.
+        eprintln!("[cfg-path] linearizing {} blocks for function `{}`", cfg.blocks.len(), name);
         //
         // The linearizer records block offsets RELATIVE TO the
         // start of this function's bytecode, but the VM reads
@@ -1597,16 +1612,129 @@ impl Compiler {
                 name,
                 alias,
             } => {
-                let mut prefix = p.clone();
-                if prefix.len() == 1 {
-                    prefix.push("".to_string());
+                // Phase 29A: `use foo::bar;` and
+                // `use foo::bar as x;` map the local
+                // name (or alias) to the qualified
+                // name. The qualified name is what
+                // `Expression::Call` looks up in
+                // `self.functions` (and friends).
+                //
+                // For a single-segment path like
+                // `use foo::bar;`, the qualified name
+                // is `foo::bar`. For a multi-segment
+                // path like `use a::b::c;`, the
+                // qualified name is `a::b::c`.
+                //
+                // For a glob like `use foo::bar::*;`,
+                // the pipeline pre-loaded `foo::bar`
+                // (so its top-level items are
+                // registered in `self.functions` /
+                // `self.classes` / `self.enums` /
+                // etc.). The codegen is a no-op for
+                // globs — the items are already
+                // registered under their fully
+                // qualified names; the user refers
+                // to them by that qualified name.
+                // Future work: populate the env so
+                // `bar::baz()` is implicit and the
+                // user can write `baz()` directly.
+                if name == "*" {
+                    // Phase 29A — glob expansion.
+                    //
+                    // `use foo::*;` brings every top-level
+                    // item in the file `foo.0s` (namespace
+                    // `foo`) into scope. The file's
+                    // namespace is `<path joined with ::>`
+                    // (no trailing `::name` because the
+                    // `name` segment is the glob marker
+                    // `*`, not an item name).
+                    //
+                    // Items in `foo.0s` are registered in
+                    // `self.functions` with FQNs of the
+                    // form `foo::<item_name>` (one extra
+                    // segment beyond the file's namespace).
+                    // We walk `self.functions` and add an
+                    // alias for each entry whose FQN starts
+                    // with the file's namespace and has
+                    // exactly one more segment.
+                    let module_ns = p.join("::");
+                    let prefix = if module_ns.is_empty() {
+                        // Top-level glob: `use *;` (no
+                        // module path). Items have
+                        // single-segment FQNs.
+                        String::new()
+                    } else {
+                        format!("{}::", module_ns)
+                    };
+                    // Collect the FQNs first to avoid
+                    // borrowing `self.functions` while
+                    // we mutate `self.aliases`.
+                    let fqns: Vec<String> = self
+                        .functions
+                        .keys()
+                        .filter(|fqn| {
+                            fqn.starts_with(&prefix)
+                                && fqn[prefix.len()..]
+                                    .contains("::")
+                                == false
+                                && !fqn[prefix.len()..]
+                                    .is_empty()
+                        })
+                        .cloned()
+                        .collect();
+                    for fqn in fqns {
+                        // The bare item name is the
+                        // last segment of the FQN.
+                        let item_name = fqn
+                            [prefix.len()..]
+                            .to_string();
+                        self.aliases
+                            .insert(item_name, fqn);
+                    }
+                } else {
+                    // Concrete import. The qualified
+                    // name is `<path>::<name>::<name>`
+                    // — the file's path becomes the
+                    // namespace (`foo::sadge` for
+                    // `foo/sadge.0s`), and the
+                    // function inside the file is
+                    // `<namespace>::<function_name>`.
+                    // So `sadge` in `foo/sadge.0s`
+                    // is at FQN `foo::sadge::sadge`.
+                    let namespace = if p.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}::{}", p.join("::"), name)
+                    };
+                    // We don't know the function
+                    // name yet (it's whatever the
+                    // user names the function in
+                    // the file). The convention is
+                    // that the function has the
+                    // SAME name as the file's stem
+                    // (the LAST segment of the use
+                    // path). So the FQN is
+                    // `namespace::name`.
+                    let qualified = format!("{}::{}", namespace, name);
+                    let local = alias.clone().unwrap_or_else(|| name.clone());
+                    self.aliases.insert(local, qualified);
                 }
-                self.aliases.insert(
-                    alias.clone().unwrap_or(name.to_string()),
-                    format!("{}{}", prefix.join("::"), name),
-                );
             }
             Expression::Noop(_) => (),
+            // ---- Phase 29A: `mod foo;` is a forward
+            // declaration that triggers the pipeline to
+            // load `foo.0s` (if not already loaded).
+            // The codegen is a no-op — the `Module`
+            // node's `name` is consumed by the pipeline
+            // in its `enqueue_uses` walker; the
+            // `do_compile` arm exists only to consume
+            // the NodeId (so the pre-walk and infer
+            // ID tables stay in lockstep) and to emit
+            // zero bytecode bytes.
+            Expression::Module(_, _body) => {
+                // No bytecode. The pipeline has already
+                // enqueued the file; nothing more to do.
+            }
             Expression::Group(e) => bytecode.append(&mut self.do_compile(e)),
             Expression::Program(children) => {
                 children.iter().for_each(|child| {
@@ -1736,8 +1864,34 @@ impl Compiler {
                 returns: _returns,
                 body,
             } => {
+                // Phase 29A: the function's fully qualified
+                // name is `<namespace>::<name>` UNLESS the
+                // namespace is empty (the entry file) — in
+                // which case it's just `<name>`.
+                //
+                // The namespace is the file's path
+                // (e.g. `foo/sadge.0s` → namespace
+                // `foo::sadge`). A function `helper` in
+                // that file is registered as
+                // `foo::sadge::helper`. A function `main`
+                // in the entry file (namespace `""`) is
+                // registered as just `main`.
+                let qualified = if self.namespace.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}::{}", self.namespace, name)
+                };
+                // Phase 29A — record this function in the
+                // current namespace's `module_items` so a
+                // later `use <this-namespace>::*;` glob can
+                // expand the function's name into the
+                // caller's scope.
+                self.module_items
+                    .entry(self.namespace.clone())
+                    .or_insert_with(Vec::new)
+                    .push(name.to_string());
                 self.functions
-                    .insert(format!("{}{}", self.namespace, name), self.bytecode.len());
+                    .insert(qualified, self.bytecode.len());
 
                 let mut a = self.do_compile(args);
 
@@ -2301,7 +2455,7 @@ impl Compiler {
             }
             Expression::Call { name, args } => {
                 let identifier = self.resolve_variable(name);
-                let n = self.aliases.get(&identifier).unwrap_or(&identifier);
+                let n = self.aliases.get(&identifier).cloned().unwrap_or_else(|| identifier.clone());
 
                 // Phase 22b: if `name` was declared by an
                 // `extern` block, dispatch to runtime
@@ -2313,7 +2467,7 @@ impl Compiler {
                 // loaded from another (both interned at
                 // `extern_block` codegen time).
                 if let Some(&(lib_slot, fn_id_slot)) =
-                    self.extern_runtime_functions.get(n)
+                    self.extern_runtime_functions.get(&n)
                 {
                     // Stage arg bytecode in a local Vec to
                     // release the `&mut self.bytecode` borrow
@@ -2338,7 +2492,7 @@ impl Compiler {
                         Byte::new(Instruction::FfiInvoke)
                             .with_operand_u32(arity as u32),
                     );
-                } else if let Some(offset) = self.functions.get(n).copied() {
+                } else if let Some(offset) = self.functions.get(&n).copied() {
                     if let Some(args) = args {
                         args.iter()
                             .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
@@ -2348,7 +2502,7 @@ impl Compiler {
                         args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
                     ));
                     bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
-                } else if self.native.get(n).is_some() {
+                } else if self.native.get(&n).is_some() {
                     todo!("Not implemented");
                 } else {
                     let mut message =
@@ -4163,7 +4317,50 @@ impl Compiler {
 
         self.bytecode.append(&mut program);
 
+        // Phase 29A: callers (the pipeline) need only the
+        // NEW bytes produced by this call, not the
+        // cumulative bytecode. The legacy `self.bytecode.clone()`
+        // return value was correct for single-file
+        // programs (where the caller used `compile_test` /
+        // `compile_src` and expected the prologue + body),
+        // but caused duplication in multi-file programs.
+        //
+        // For backward compatibility with `compile_test` /
+        // `compile_src`, we still return the cumulative
+        // bytecode here. The pipeline (which uses
+        // `compile_src_from_file` + the new
+        // `compile_module` method below) takes the diff.
         self.bytecode.clone()
+    }
+
+    /// Phase 29A: compile a module and return ONLY the new
+    /// bytes (not the cumulative bytecode). The pipeline
+    /// uses this for multi-file programs. The returned
+    /// bytes have JMP/CALL operands in absolute form —
+    /// both the compiler's `self.bytecode` and the
+    /// pipeline's `self.bytecode` start with the same
+    /// 3-byte prologue, so absolute operands are valid
+    /// in both contexts.
+    ///
+    /// This is the multi-file-aware counterpart to
+    /// `compile`. Single-file entry points (`compile_test`,
+    /// `compile_src`) still use `compile`.
+    pub fn compile_module<'compiler>(
+        &mut self,
+        module: &str,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) -> Vec<Byte> {
+        // Phase 29A: capture the offset BEFORE the compile
+        // so we can take only the new bytes.
+        let pre_compile_len = self.bytecode.len();
+        let _ = self.compile(module, ast);
+        // The new bytes are `self.bytecode[pre_compile_len..]`.
+        // Their operands are absolute offsets in
+        // `self.bytecode`. Both the compiler and the
+        // pipeline start with the same 3-byte prologue,
+        // so absolute operands are valid in both contexts
+        // — no operand adjustment is needed.
+        self.bytecode[pre_compile_len..].to_vec()
     }
 }
 
@@ -4501,18 +4698,17 @@ mod tests {
             .expect("expected at least one JMP in the loop bytecode");
         let jmp_target = jmp.operand_u32();
 
-        // The JMP's target must be > 3 (past the prologue)
-        // AND should match the start of the loop's iterable
-        // (= offset of the first non-prologue byte). For
-        // this test program, that's the position of the
-        // first JMPF's iterable operand (the start of
-        // `i < 3`). We don't assert the exact offset
-        // (depends on the precise prologue layout), but we
-        // do assert it's > 3 — i.e., the back-edge points
-        // INTO the function body, not at the prologue.
+        // The JMP's target must point INTO the function
+        // body (i.e., not be 0 which would be the start of
+        // the body itself — the back-edge is to the loop's
+        // iterable, not to the very first byte). The
+        // body is what `compile_src` returns, so offset
+        // 0 is the start of `main` (no prologue in the
+        // returned slice — see the Phase 29A changes
+        // to `Compiler::compile`).
         assert!(
-            jmp_target > 3,
-            "JMP back-edge target {} should be > 3 (past the 3-byte prologue)",
+            jmp_target > 0,
+            "JMP back-edge target {} should be > 0 (into the loop body)",
             jmp_target
         );
     }

@@ -795,6 +795,12 @@ impl<'pratt> Pratt<'pratt> {
             self.impl_block(stmt.clone()),
             self.func(stmt.clone()),
             self.type_alias(),
+            // Phase 29: `use` and `mod` are top-level
+            // declarations, registered before the catch-all
+            // `stmt` so their leading keywords (`use` / `mod`)
+            // aren't mis-parsed as identifiers.
+            self.use_(),
+            self.mod_(),
             self.enum_decl(),
             self.defer(stmt.clone()),
             self.extern_block(),
@@ -828,6 +834,162 @@ impl<'pratt> Pratt<'pratt> {
                 )
             })
             .labelled("type alias")
+    }
+
+    /// `use foo::bar::baz;` — import a single item from a
+    /// module path. Phase 29 — replaces the previously
+    /// dead `Expression::Use` AST node (which existed but
+    /// was never produced by a parser). The codegen +
+    /// pipeline populate the typechecker's env and the
+    /// compiler's `aliases` map from the parsed `Use` node.
+    ///
+    /// Forms:
+    /// - `use foo::bar;` → `{ path: ["foo"], name: "bar", alias: None }`
+    /// - `use foo::bar::baz;` → `{ path: ["foo","bar"], name: "baz", alias: None }`
+    /// - `use foo::bar as x;` → `{ path: ["foo"], name: "bar", alias: Some("x") }`
+    /// - `use foo::bar::*;` (glob) → encoded as `{ path, name: "*", .. }`.
+    ///
+    /// The path is built iteratively via `.then()` because
+    /// chumsky's `.separated_by` requires the parser to
+    /// yield owned values, but `text::ident()` yields a
+    /// borrowed slice — the type system can't infer the
+    /// conversion. Using `.then_ignore(op!("::"))` repeated
+    /// 0..N times gives us a `Vec<&'pratt str>` directly.
+    fn use_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        // A path segment is one ident. The path is
+        // `ident (:: ident)* (:: *)?`. Each `::` is
+        // followed by either another ident or a `*`
+        // (glob marker).
+        let segment = text::ident().padded();
+
+        // Each `::`-prefixed piece is either an ident or
+        // a `*`. We represent both as `Option<String>`:
+        // `Some(name)` for an ident, `None` for the glob
+        // marker. The first ident is consumed outside the
+        // loop (so we have at least one segment before
+        // any `::` is seen).
+        let path_tail = op!("::")
+            .ignore_then(
+                choice((
+                    text::ident().padded().map(|s: &str| Some(s.to_string())),
+                    just('*').padded().to(None),
+                ))
+                .map_with(|opt, e| (e.span(), opt)),
+            )
+            .repeated()
+            .collect::<Vec<_>>();
+
+        // Path = first ident + zero or more `::` pieces.
+        keyword!("use")
+            .ignore_then(segment.then(path_tail))
+            .map(|(first, rest): (&'pratt str, Vec<(SimpleSpan, Option<String>)>)| {
+                let mut out: Vec<Option<String>> = Vec::with_capacity(1 + rest.len());
+                out.push(Some(first.to_string()));
+                for (_span, opt) in rest {
+                    out.push(opt);
+                }
+                out
+            })
+            // After the path: either `as alias` (alias form)
+            // or nothing (concrete form). The glob marker
+            // (`*`) was consumed inside the path_tail above.
+            // The trailing `;` is consumed by the outer
+            // `.then_ignore(op!(";"))` below — we must NOT
+            // consume it here.
+            .then(
+                keyword!("as")
+                    .ignore_then(text::ident().padded())
+                    .map(|s: &str| s.to_string())
+                    .or_not(),
+            )
+            .then_ignore(op!(";"))
+            .map_with(|(segments, alias), e| {
+                // Walk the segments. The last segment is
+                // either:
+                //   - Some(name) — concrete import.
+                //   - None — glob (`use foo::bar::*;`).
+                // All earlier segments form the path.
+                let mut segs = segments;
+                let last = segs
+                    .pop()
+                    .expect("at least one segment from the leading ident");
+                let path: Vec<String> = segs
+                    .into_iter()
+                    .map(|opt| opt.expect("only the LAST segment may be a glob"))
+                    .collect();
+
+                if let Some(name) = last {
+                    // Concrete import. Alias is whatever
+                    // the `as` clause produced.
+                    (
+                        e.span(),
+                        Box::new(Expression::Use {
+                            path,
+                            name,
+                            alias,
+                        }),
+                    )
+                } else {
+                    // Glob import. `alias` is always None
+                    // (a glob can't be aliased — the
+                    // alias would have nothing to bind
+                    // to, since glob imports are resolved
+                    // by the pipeline at compile time).
+                    (
+                        e.span(),
+                        Box::new(Expression::Use {
+                            path,
+                            name: "*".to_string(),
+                            alias: None,
+                        }),
+                    )
+                }
+            })
+            .labelled("use statement")
+    }
+
+    /// `mod foo;` — forward declaration of a module.
+    /// Phase 29 — registers `foo` as a module the pipeline
+    /// should load (if not already loaded). Useful for
+    /// forward references and for making module usage
+    /// explicit at the top of a file.
+    ///
+    /// `mod foo;` triggers the pipeline to load `foo.0s`
+    /// (via `Manifest::resolve_module`), but does NOT pull
+    /// its items into the current scope. Use a separate
+    /// `use foo::bar;` to refer to a specific item.
+    ///
+    /// The parser reuses the existing
+    /// `Expression::Module(String, Output)` variant with a
+    /// `Noop` body. The pipeline only consumes the name;
+    /// the body is meaningless.
+    fn mod_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("mod")
+            .ignore_then(text::ident().padded().map(|s: &str| s))
+            .then_ignore(op!(";"))
+            .map_with(|name: &'pratt str, e| {
+                let noop_span = e.span();
+                // Noop wraps an Output, which wraps a Box<Expression>.
+                // We use a leaf Integer(0) as the inner expression.
+                // The pipeline doesn't traverse the body; the
+                // name is all that matters.
+                let inner: Output = (
+                    noop_span,
+                    Box::new(Expression::Integer(0)),
+                );
+                let body: Output = (
+                    noop_span,
+                    Box::new(Expression::Noop(inner)),
+                );
+                (e.span(), Box::new(Expression::Module(name.to_string(), body)))
+            })
+            .labelled("mod declaration")
     }
 
     /// `extern "libname" { fn name(args) -> ret; ... }` — declare
@@ -2411,5 +2573,102 @@ mod tests {
             "expected parse to fail for missing trailing ';' in extern fn, got {:?}",
             result
         );
+    }
+
+    // ============================================================
+    //  Phase 29: `use` and `mod` parsers
+    // ============================================================
+
+    /// `use foo::bar;` — single-segment path. Path is `["foo"]`,
+    /// name is `"bar"`, no alias.
+    #[test]
+    fn parse_use_single_segment() {
+        let src = "use foo::bar;";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Use { path, name, alias } => {
+                    assert_eq!(path, &["foo".to_string()]);
+                    assert_eq!(name, "bar");
+                    assert!(alias.is_none());
+                }
+                other => panic!("expected Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    /// `use foo::bar::baz;` — multi-segment path. Path is
+    /// `["foo", "bar"]`, name is `"baz"`.
+    #[test]
+    fn parse_use_multi_segment() {
+        let src = "use foo::bar::baz;";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Use { path, name, alias } => {
+                    assert_eq!(path, &["foo".to_string(), "bar".to_string()]);
+                    assert_eq!(name, "baz");
+                    assert!(alias.is_none());
+                }
+                other => panic!("expected Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    /// `use foo::bar as x;` — alias. Path is `["foo"]`, name is
+    /// `"bar"`, alias is `Some("x")`.
+    #[test]
+    fn parse_use_with_alias() {
+        let src = "use foo::bar as x;";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Use { path, name, alias } => {
+                    assert_eq!(path, &["foo".to_string()]);
+                    assert_eq!(name, "bar");
+                    assert_eq!(alias.as_deref(), Some("x"));
+                }
+                other => panic!("expected Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    /// `use foo::bar::*;` — glob. Path is `["foo", "bar"]`,
+    /// name is `"*"` (sentinel for glob).
+    #[test]
+    fn parse_use_glob() {
+        let src = "use foo::bar::*;";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Use { path, name, alias } => {
+                    assert_eq!(path, &["foo".to_string(), "bar".to_string()]);
+                    assert_eq!(name, "*");
+                    assert!(alias.is_none());
+                }
+                other => panic!("expected Use, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    /// `mod foo;` — forward declaration. Body is a Noop;
+    /// pipeline only consumes the name.
+    #[test]
+    fn parse_mod_forward_declaration() {
+        let src = "mod foo;";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Module(name, _body) => {
+                    assert_eq!(name, "foo");
+                }
+                other => panic!("expected Module, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
     }
 }

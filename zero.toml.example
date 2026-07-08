@@ -1,0 +1,77 @@
+# Example zero.toml — copy this to your project root as `zero.toml`.
+#
+# Phase 29 — `zero.toml` is the project manifest. It declares the
+# directories the compiler searches for `use foo::bar::baz;` imports
+# and an optional explicit entry point.
+
+[module]
+# Search roots for `use` resolution. Each path is relative to the
+# directory containing this `zero.toml` file. The compiler searches
+# the roots in order; the first file that exists wins.
+roots = ["./src", "./vendor", "./builtins"]
+
+# The default roots (when no `zero.toml` exists) are just `["src"]`.
+
+[entry]
+# Optional: the entry-point file. The compiler jumps straight to
+# `main` in this file. If omitted, the entry is the file passed on
+# the command line (e.g. `zero-script examples/foo.0s`).
+# file = "./src/main.0s"
+
+# --------------------------------------------------------------------------
+# Discovery algorithm
+# --------------------------------------------------------------------------
+#
+# Given `use foo::bar::baz;` and the roots above, the compiler
+# searches, in order:
+#
+#   1. ./src/foo/bar/baz.0s
+#   2. ./vendor/foo/bar/baz.0s
+#   3. ./builtins/foo/bar/baz.0s
+#
+# The first file that exists wins. The file's namespace is the path
+# RELATIVE to the matching root, with the extension stripped and
+# `/` replaced with `::`. So `./src/foo/bar/baz.0s` lives in
+# namespace `foo::bar::baz`, and its top-level `fn helper()` is
+# bytecode-named `foo::bar::baz::helper`.
+#
+# --------------------------------------------------------------------------
+# Glob imports
+# --------------------------------------------------------------------------
+#
+# `use foo::bar::*;` triggers the loader to compile `foo/bar.0s`,
+# but does NOT pull its items into the current scope. After a
+# glob, you must use the fully qualified name:
+#
+#     use foo::bar::*;
+#     fn main() {
+#         foo::bar::some_helper();
+#     }
+#
+# Future versions will support auto-importing glob items; for now,
+# use `use foo::bar::{name1 as x, name2 as y};` to bring specific
+# items into scope.
+#
+# --------------------------------------------------------------------------
+# Aliasing
+# --------------------------------------------------------------------------
+#
+# `use foo::bar as baz;` brings `bar` into scope as `baz`. Calls
+# to `baz()` resolve to the qualified name `foo::bar`.
+#
+# `use builtins::core::ffi::dload as loadlib;` lets the user rename
+# a builtin to avoid conflicts (e.g., when a user function is also
+# called `dload`).
+#
+# --------------------------------------------------------------------------
+# Reserved keys
+# --------------------------------------------------------------------------
+#
+# The parser accepts these top-level keys under each section; any
+# other key is a parse error. Future versions may add:
+#
+#   [module]
+#   preludes = ["./stdlib"]  # auto-imported in every file
+#   strict   = true          # reject undefined names at typecheck
+#
+# These are recognized by the parser but currently ignored.

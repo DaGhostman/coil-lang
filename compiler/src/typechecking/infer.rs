@@ -371,7 +371,27 @@ impl Checker {
 
             // ---- Wrappers / no-ops ----
             Expression::Noop(_) | Expression::Comment(_) => unit_ty(),
-            Expression::Use { .. } | Expression::Module(_, _) => unit_ty(),
+            // `use foo::bar;` and `use foo::bar as x;` add an
+            // alias to the env. Phase 29A — without this, the
+            // typechecker would emit "Cannot find function `x`"
+            // when the user calls the aliased name. The function
+            // type is left as a free type variable (it'll be
+            // resolved at the call site when we see the
+            // qualified name in `self.aliases`).
+            Expression::Use { path: _, name, alias } => {
+                let local = alias.clone().unwrap_or_else(|| name.clone());
+                // Insert a polymorphic type variable so
+                // any calls to the local name pass
+                // type-checking. The codegen resolves
+                // the actual FQN at the call site via
+                // `self.aliases`.
+                self.env.insert_top(
+                    local,
+                    Scheme::mono(Ty::Var(self.counter.fresh())),
+                );
+                unit_ty()
+            }
+            Expression::Module(_, _) => unit_ty(),
             // FFI declaration block — register each function
             // signature in the top frame (so subsequent calls
             // can type-check) and return unit. The body is

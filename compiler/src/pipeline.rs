@@ -1,28 +1,87 @@
 use std::{
     borrow::Borrow,
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
 use common::{
-    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Interner,
-    Message, MessageKind,
+    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Message,
+    MessageKind,
 };
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use rkyv::rancor::Error;
 
+use crate::manifest::Manifest;
 use crate::Compiler;
+
+/// A queued file to compile, along with the path it was
+/// discovered under. The pipeline processes queued files
+/// in BFS order from the entry point.
+#[derive(Debug)]
+struct WorkItem {
+    /// Absolute path to the file on disk.
+    file: PathBuf,
+    /// Module namespace, derived from the file's path
+    /// relative to one of the manifest's search roots.
+    /// `None` means the file is outside any search root
+    /// (we still compile it, but its namespace is the
+    /// bare file stem).
+    namespace: Option<String>,
+}
 
 pub struct Pipeline {
     failed: bool,
-    cwd: PathBuf,
+    project_root: PathBuf,
+    manifest: Manifest,
     bytecode: Vec<Byte>,
-    processed: HashSet<String>,
+    /// Map from absolute file path to its derived
+    /// namespace. Populated as files are discovered
+    /// (so we don't re-derive on revisit).
+    file_namespaces: HashMap<PathBuf, Option<String>>,
+    /// Set of files already visited (used to short-circuit
+    /// diamond dependencies in the worklist).
+    processed: HashSet<PathBuf>,
+    /// FIFO queue of files to process. Drained front-to-back.
+    worklist: VecDeque<WorkItem>,
+    /// Native functions registered by the host. The
+    /// pipeline tracks these so it can register them
+    /// with the typechecker when a native call is
+    /// typechecked.
+    natives: Vec<NativeDecl>,
+    /// The entry file (the file passed to `compile`).
+    /// This file is special: it's the program root and
+    /// lives in the top-level namespace (no prefix),
+    /// regardless of its path on disk. Every other
+    /// file gets its path-derived namespace.
+    entry_file: Option<PathBuf>,
+    /// Phase 29A — parsed-source cache.
+    ///
+    /// `discover_all` reads each file from disk to
+    /// find its `use`/`mod` declarations. `compile_file`
+    /// then reads the SAME file again to compile it.
+    /// The cache holds the owned source text so the
+    /// second `read_to_string` is avoided.
+    ///
+    /// Caching the AST itself would avoid the
+    /// second parse too, but `Output<'parser>` borrows
+    /// from the source — owning the source for the
+    /// entire `compile` call would require `'static`,
+    /// which leaks. The `read_to_string` save is the
+    /// I/O win; re-parsing is fast enough.
+    source_cache: HashMap<PathBuf, String>,
     compiler: Compiler,
-    interner: Interner<String>,
+}
+
+/// A native function declaration registered by the host
+/// (Phase 29A — `Pipeline::register_native_function`).
+#[derive(Debug, Clone)]
+pub struct NativeDecl {
+    pub name: String,
+    pub namespace: String,
+    pub arity: usize,
 }
 
 impl Default for Pipeline {
@@ -32,30 +91,77 @@ impl Default for Pipeline {
 }
 
 impl Pipeline {
-    pub fn register_native_function(&mut self, name: String) {
-        self.interner.intern(name);
-
-        todo!("Handle function registration of native functions");
+    /// Register a native function for the VM. The native
+    /// is stored with its qualified name (namespace + name)
+    /// so the bytecode's `NATIVE` opcode can find it.
+    ///
+    /// Phase 29A — replaces the previous `todo!()` stub.
+    /// The pipeline forwards the registration to the
+    /// `Compiler` (which records the type signature for
+    /// typechecking). The actual function pointer is
+    /// registered with the VM at startup; this method
+    /// only describes the type.
+    pub fn register_native_function(
+        &mut self,
+        name: String,
+        namespace: String,
+        arity: usize,
+    ) {
+        self.natives.push(NativeDecl {
+            name,
+            namespace,
+            arity,
+        });
     }
 
     /// Borrow the inner `Compiler` mutably. Used by the
     /// integration tests in `compiler/src/lib.rs::tests`
-    /// that need to inspect the compiler's diagnostic
-    /// messages directly.
+    /// and `compiler/tests/namespace.rs` that need to
+    /// inspect the compiler's diagnostic messages
+    /// directly.
     #[cfg(test)]
     pub fn compiler_mut(&mut self) -> &mut Compiler {
         &mut self.compiler
     }
 
+    /// Borrow the compiler's accumulated diagnostic
+    /// messages. Public so integration tests can read
+    /// them (the `#[cfg(test)]`-only `compiler_mut` is
+    /// only visible to in-crate tests).
+    pub fn messages(&self) -> &[Message] {
+        self.compiler.get_messages()
+    }
+
     pub fn new() -> Self {
         let cwd = std::env::current_dir().expect("Unable to determine current working directory");
+        // The project root is the cwd for now. A future
+        // revision could walk up the tree looking for
+        // `zero.toml`.
+        let project_root = cwd.clone();
+        let manifest = Manifest::load(&project_root)
+            .expect("Failed to load zero.toml manifest");
+
+        // The prologue is `[CALL, JMP, HALT]`. The pipeline
+        // patches the JMP at offset 1 to point at `main`
+        // (or `program_start_offset` if `extern` blocks ran
+        // first). See `Self::prologue` for the layout.
+        let bytecode = vec![
+            Byte::new(Instruction::CALL),
+            Byte::new(Instruction::JMP).with_operand_u32(u32::MAX),
+            Byte::new(Instruction::HALT),
+        ];
 
         Self {
             failed: false,
-            cwd,
-            bytecode: Vec::with_capacity(16),
+            project_root,
+            manifest,
+            bytecode,
+            file_namespaces: HashMap::default(),
             processed: HashSet::default(),
-            interner: Interner::default(),
+            worklist: VecDeque::new(),
+            natives: Vec::new(),
+            entry_file: None,
+            source_cache: HashMap::default(),
             compiler: Compiler::default(),
         }
     }
@@ -96,71 +202,336 @@ impl Pipeline {
         report.finish().eprint(&mut sources).unwrap()
     }
 
-    fn visit(&mut self, node: &(SimpleSpan, Box<Expression<'_>>)) {
-        match node.1.borrow() {
-            Expression::Use { path, .. } => {
-                let mut p = self.cwd.clone();
-                let mut ns = String::new();
-                p.push("src");
-                path.iter().for_each(|segment| {
-                    p.push(segment);
-                    ns.push_str(format!("{}::", segment).as_str());
-                });
-                p.set_extension("0s");
-
-                if let Some(path) = p.to_str() {
-                    self.process(path.to_string(), ns);
-                } else {
-                    panic!("Unable to handle '{}'", p.display());
+    /// First pass: walk the AST and enqueue every
+    /// referenced module file. We do this WITHOUT
+    /// compiling (so the worklist is complete before
+    /// we touch `self.compiler`). This avoids the
+    /// `&mut self` recursion issue.
+    ///
+    /// `use foo::bar;` and `mod foo;` are both
+    /// discovered. `use foo::bar::*;` (glob) is the
+    /// same as `use foo::bar;` for discovery purposes
+    /// — we just need to load `foo::bar` so the
+    /// compiler can resolve the items.
+    fn enqueue_uses(&mut self, ast: &(SimpleSpan, Box<Expression<'_>>)) {
+        match ast.1.borrow() {
+            Expression::Use { path, name, .. } => {
+                // `use foo::sadge;` means: import `sadge`
+                // from module `foo`. The file containing
+                // the module `foo` is `foo.0s` (the file
+                // is named after the path, NOT after the
+                // item). The function imported is `sadge`
+                // (the LAST segment of the dotted path).
+                //
+                // For globs (`name == "*"`), the file
+                // is `<root>/<path joined>/<name>.0s` —
+                // i.e. the file is named after the WHOLE
+                // dotted path including the glob marker
+                // segment... actually no, the file is
+                // `<root>/<path joined>.0s` (no
+                // trailing segment). The glob marker is
+                // just a way to say "bring every item";
+                // it doesn't name a file. So we use
+                // the path with a synthetic last
+                // segment for resolution.
+                if name == "*" {
+                    // Glob: file is `<root>/<path joined>.0s`.
+                    // Equivalent to `use <last-segment-of-path>;`
+                    // but with a star marker.
+                    let segments = path.clone();
+                    if let Some(last) = segments.last().cloned() {
+                        // Strip the last segment since
+                        // for a glob there's no item
+                        // name. The file is at the
+                        // directory path of the
+                        // original dotted path.
+                        let mut segments = segments;
+                        segments.pop();
+                        if let Some(file) = self.manifest.resolve_use(
+                            &self.project_root,
+                            &segments,
+                            &last,
+                        ) {
+                            self.enqueue_file(file);
+                        }
+                    } else if let Some(file) = self
+                        .manifest
+                        .resolve_mod(&self.project_root, "*")
+                    {
+                        // `use *;` — top-level glob.
+                        self.enqueue_file(file);
+                    }
+                } else if let Some(file) =
+                    self.manifest.resolve_use(&self.project_root, path, name)
+                {
+                    self.enqueue_file(file);
+                }
+            }
+            Expression::Module(name, _body) => {
+                // `mod foo;` — look for `foo.0s` in any
+                // root. This is the simplest resolution:
+                // the file's stem IS the module name.
+                if let Some(file) =
+                    self.manifest.resolve_mod(&self.project_root, name)
+                {
+                    self.enqueue_file(file);
                 }
             }
             Expression::Program(children)
             | Expression::Block(children)
             | Expression::Fragment(children) => {
                 for child in children.iter() {
-                    self.visit(child);
+                    self.enqueue_uses(child);
                 }
             }
             _ => (),
         }
     }
 
-    fn process(&mut self, file: String, ns: String) {
+    /// Add `file` to the worklist if not already
+    /// processed. Computes and caches the file's
+    /// namespace.
+    fn enqueue_file(&mut self, file: PathBuf) {
         if self.processed.contains(&file) {
             return;
         }
-
-        let src = std::fs::read_to_string(file.as_str()).expect("Failed to open file");
+        let ns = self.manifest.namespace_of(&self.project_root, &file);
+        // Mark as "in progress" by inserting into
+        // `processed` immediately. This prevents
+        // unbounded recursion in diamond dependencies.
         self.processed.insert(file.clone());
+        self.file_namespaces.insert(file.clone(), ns.clone());
+        self.worklist.push_back(WorkItem { file, namespace: ns });
+    }
 
-        let parser = Pratt::default();
+    /// Read the source text for `file`, populating the
+    /// `source_cache` so the second read (in
+    /// `compile_file`) is a no-op. Returns `None` if
+    /// the file can't be read; the caller records the
+    /// error and bails.
+    fn read_source(&mut self, file: &Path) -> Option<String> {
+        if let Some(cached) = self.source_cache.get(file) {
+            return Some(cached.clone());
+        }
+        match std::fs::read_to_string(file) {
+            Ok(s) => {
+                self.source_cache.insert(file.to_path_buf(), s.clone());
+                Some(s)
+            }
+            Err(_) => None,
+        }
+    }
 
-        match parser.parse(src.as_str()) {
-            Ok(ast) => {
-                self.visit(&ast);
-                let bytecode = self.compiler.compile(ns.as_str(), &ast);
-
-                self.bytecode = bytecode;
-
-                for message in self.compiler.get_messages() {
-                    Self::render_errors(file.clone(), src.as_str(), message);
+    /// Discovery pass: walk the worklist front-to-back,
+    /// parsing each file and enqueueing its
+    /// `use`/`mod` dependencies. We don't compile
+    /// here — just build the complete worklist so
+    /// that the compilation pass can run in
+    /// dependency order.
+    ///
+    /// The `processed` set guards against re-enqueuing
+    /// (so the same file isn't discovered twice). The
+    /// `failed` flag is set if any file fails to parse.
+    fn discover_all(&mut self) {
+        // We need a separate "discover-only" loop that
+        // processes the worklist front-to-back but
+        // doesn't compile. We mutate `self.worklist`
+        // while iterating (new items are added to the
+        // back, so a `while let Some(...) = pop_front`
+        // loop terminates when the worklist is fully
+        // drained).
+        let mut to_discover: Vec<PathBuf> = Vec::new();
+        for item in &self.worklist {
+            to_discover.push(item.file.clone());
+        }
+        // Walk transitively. We can't call
+        // `compile_file` (which would emit bytecode)
+        // and we can't call `enqueue_uses` directly
+        // because that needs the AST. So: parse each
+        // file in isolation, enqueue its uses, repeat.
+        let mut i = 0;
+        while i < to_discover.len() {
+            let file = to_discover[i].clone();
+            // Read the source (cached after the first
+            // call). The `compile_file` pass reuses the
+            // same cached source, so the file is only
+            // read from disk once per pipeline.
+            let src = match self.read_source(&file) {
+                Some(s) => s,
+                None => {
+                    let mut msg = Message::error(
+                        format!("Failed to read file `{}`", file.display()),
+                        0..0,
+                    );
+                    msg.push(common::Label::new(
+                        format!("file path: {}", file.display()),
+                        0..0,
+                    ));
+                    self.compiler.messages.push(msg);
+                    self.failed = true;
+                    i += 1;
+                    continue;
+                }
+            };
+            let parser = Pratt::default();
+            let ast = match parser.parse(src.as_str()) {
+                Ok(ast) => ast,
+                Err(errors) => {
+                    Self::render_errors(
+                        file.display().to_string(),
+                        src.as_str(),
+                        &errors,
+                    );
+                    self.failed = true;
+                    i += 1;
+                    continue;
+                }
+            };
+            self.enqueue_uses(&ast);
+            // Pick up any newly enqueued files.
+            for item in &self.worklist {
+                if !to_discover.contains(&item.file) {
+                    to_discover.push(item.file.clone());
                 }
             }
-            Err(e) => Self::render_errors(file, src.as_str(), &e),
+            i += 1;
+        }
+    }
+
+    /// Compile a single file: parse, enqueue uses, and
+    /// invoke the compiler. Called once per WorkItem.
+    fn compile_file(&mut self, item: WorkItem, is_entry: bool) {
+        let file = item.file.clone();
+        // The ENTRY file is special: it's the program root
+        // and lives in the top-level namespace (no
+        // prefix). Non-entry files get their path-derived
+        // namespace so they can be referred to by their
+        // fully qualified name (e.g., `builtins::core::ffi::dload`).
+        let namespace = if is_entry {
+            String::new()
+        } else {
+            item.namespace.unwrap_or_else(|| {
+                // File is outside any search root. Use
+                // the bare file stem as the namespace.
+                file.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("anonymous")
+                    .to_string()
+            })
+        };
+
+        let src = match self.read_source(&file) {
+            Some(s) => s,
+            None => {
+                let mut msg = Message::error(
+                    format!("Failed to read file `{}`", file.display()),
+                    0..0,
+                );
+                msg.push(common::Label::new(
+                    format!("file path: {}", file.display()),
+                    0..0,
+                ));
+                self.compiler.messages.push(msg);
+                self.failed = true;
+                return;
+            }
+        };
+
+        let parser = Pratt::default();
+        let ast = match parser.parse(src.as_str()) {
+            Ok(ast) => ast,
+            Err(errors) => {
+                // Parse errors are reported via the
+                // standard ariadne pipeline. We don't
+                // have a Message here (parse errors
+                // are chumsky Rich errors), so we
+                // construct one with the first error.
+                Self::render_errors(
+                    file.display().to_string(),
+                    src.as_str(),
+                    &errors,
+                );
+                self.failed = true;
+                return;
+            }
+        };
+
+        // Note: `enqueue_uses` was already called by
+        // `discover_all` in the pre-pass. The
+        // worklist is fully populated. We just
+        // compile now.
+
+        // Compile the file. The compiler's `namespace`
+        // field is set to the file's derived namespace.
+        // We use `compile_module` (not `compile`) so the
+        // returned bytes are ONLY the new bytes (not the
+        // cumulative bytecode, which would duplicate
+        // the prologue on the second call). See
+        // `Compiler::compile_module` for the operand
+        // adjustment details.
+        let bytecode = self
+            .compiler
+            .compile_module(namespace.as_str(), &ast);
+
+        // Append this file's bytecode to the running
+        // output. Each file's bytecode is independent;
+        // the linker (the prologue's JMP) connects them
+        // via function-name lookup at call time.
+        self.bytecode.extend(bytecode);
+
+        // Surface any compiler-emitted diagnostics.
+        for message in self.compiler.get_messages() {
+            Self::render_errors(file.display().to_string(), src.as_str(), message);
         }
     }
 
     pub fn compile(mut self, filename: String, output: String) {
-        self.process(filename, String::default());
+        // Seed the worklist with the entry file. The
+        // entry is treated specially (top-level
+        // namespace) — see `compile_file`.
+        let entry = PathBuf::from(&filename);
+        self.entry_file = Some(entry.clone());
+        self.enqueue_file(entry);
 
-        // Patch the JMP. If the source had at least one
-        // `extern` block, jump to `program_start_offset`
-        // (right after the prologue) so the extern's dload +
-        // declare bytecode runs before main. Otherwise jump
-        // straight to `main` (the patch below does this
-        // automatically because in the no-extern case
-        // `program_start_offset == main_offset` — the
-        // prologue was 3 bytes and main started right after).
+        // Discovery pass: walk the dependency graph
+        // transitively, enqueueing every referenced
+        // file. We re-process the worklist, parsing
+        // each file's AST to find its `use`/`mod`
+        // declarations, but NOT compiling yet. This
+        // builds the complete worklist so that the
+        // compilation pass can run in dependency
+        // order (dependencies first).
+        self.discover_all();
+
+        // Compilation pass: drain the worklist in
+        // REVERSE order (LIFO via `pop_back`). The
+        // `enqueue_file`/`enqueue_uses` ordering
+        // means the LAST enqueued file is the
+        // deepest dependency; popping from the back
+        // gives us dependencies first. This guarantees
+        // that when a file's `use foo::bar;` looks
+        // up `foo::bar` in `self.functions`, the
+        // function is already there.
+        while let Some(item) = self.worklist.pop_back() {
+            let is_entry = self
+                .entry_file
+                .as_ref()
+                .map(|e| *e == item.file)
+                .unwrap_or(false);
+            self.compile_file(item, is_entry);
+        }
+
+        if self.failed {
+            return;
+        }
+
+        // Patch the JMP at offset 1 to point to the
+        // user-program's `main`. If the source had at
+        // least one `extern` block, jump to
+        // `program_start_offset` (right after the
+        // prologue) so the extern's dload + declare
+        // bytecode runs before main. Otherwise jump
+        // straight to `main`.
         if self.compiler.has_extern_block() {
             if let Some(byte) = self.bytecode.get_mut(1) {
                 *byte = Byte::new(Instruction::JMP)
@@ -190,22 +561,6 @@ impl Pipeline {
         .expect("Unable to write compiled output to file");
     }
 
-    /// Compile a source string in-memory and return the
-    /// resulting bytecode. Used by the golden pipeline tests
-    /// in `compiler/tests/pipeline.rs` so the tests don't
-    /// need a temporary `.c0s` file round-trip via
-    /// `Pipeline::compile`.
-    ///
-    /// The returned bytecode is the same shape
-    /// `Pipeline::compile` writes to disk: a `[CALL, JMP
-    /// <main>, HALT, ...]` prologue followed by the
-    /// per-function bodies. Suitable for direct execution
-    /// by `Machine::run`.
-    ///
-    /// Returns `Err(())` on parse failure or non-empty
-    /// typecheck messages (we surface those as a hard error
-    /// because golden tests assume the example is
-    /// well-typed).
     /// Compile a parsed AST and return the bytecode
     /// (ignoring typecheck messages). Used by the
     /// `fizbuz_runs_to_completion` golden test, which
@@ -273,6 +628,72 @@ impl Pipeline {
         Ok(bytecode)
     }
 
+    /// Compile a single source file in-memory and return the
+    /// resulting bytecode, resolving `use` and `mod`
+    /// declarations by reading the referenced files from disk.
+    ///
+    /// Phase 29A — the new test entry point. Unlike
+    /// [`compile_src`](Self::compile_src), this method:
+    /// 1. Reads the source from `file` (rather than taking
+    ///    a source string in memory).
+    /// 2. Walks the AST to discover `use` and `mod`
+    ///    declarations.
+    /// 3. Resolves each declaration via
+    ///    [`Manifest::resolve_module`] and reads the
+    ///    referenced files (BFS).
+    /// 4. Compiles each file in worklist order, with the
+    ///    file's derived namespace.
+    /// 5. Returns the combined bytecode of all files.
+    ///
+    /// Used by the namespace integration tests
+    /// (`compiler/tests/namespace.rs`) and by any
+    /// downstream user that wants the new project-style
+    /// module discovery without writing a `.c0s` file to
+    /// disk.
+    pub fn compile_src_from_file(&mut self, file: &str) -> Result<Vec<Byte>, ()> {
+        let entry = PathBuf::from(file);
+        self.entry_file = Some(entry.clone());
+        self.enqueue_file(entry);
+
+        // Discovery + LIFO compile (see `compile`).
+        self.discover_all();
+        eprintln!("[pipeline] worklist after discover: {:#?}", self.worklist);
+        while let Some(item) = self.worklist.pop_back() {
+            eprintln!("[pipeline] pop_back: {:?}", item.file);
+            let is_entry = self
+                .entry_file
+                .as_ref()
+                .map(|e| *e == item.file)
+                .unwrap_or(false);
+            self.compile_file(item, is_entry);
+        }
+
+        if self.failed {
+            return Err(());
+        }
+
+        // Patch the JMP at offset 1.
+        if self.compiler.has_extern_block() {
+            if let Some(byte) = self.bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(self.compiler.program_start_offset());
+            }
+        } else if let Some(&main_offset) = self.compiler.functions.get("main") {
+            if let Some(byte) = self.bytecode.get_mut(1) {
+                *byte = Byte::new(Instruction::JMP)
+                    .with_operand_u32(main_offset as u32);
+            }
+        }
+
+        // Drain any typecheck messages.
+        let messages = self.compiler.get_messages();
+        if !messages.is_empty() {
+            return Err(());
+        }
+
+        Ok(std::mem::take(&mut self.bytecode))
+    }
+
     /// Borrow the FFI library map populated by the last
     /// `compile` (or `compile_test`) call. Each entry maps a
     /// function name declared in an `extern "libname" { ... }`
@@ -282,6 +703,13 @@ impl Pipeline {
     /// the libraries and binds the symbols at startup.
     pub fn extern_libs(&self) -> &std::collections::HashMap<String, String> {
         self.compiler.extern_libs()
+    }
+
+    /// Borrow the list of natively-registered functions.
+    /// Phase 29A — used by the host to register natives
+    /// with the VM at startup.
+    pub fn natives(&self) -> &[NativeDecl] {
+        &self.natives
     }
 
     pub fn run(self, filename: String) -> Result<Vec<Byte>, ()> {
@@ -359,7 +787,6 @@ mod tests {
                     .with_multiline_arrows(true)
                     .with_compact(false),
             );
-
             for label in msg.labels() {
                 builder = builder.with_label(
                     AriaLabel::new(("test.0s".to_string(), label.range().clone()))

@@ -2,3 +2,5 @@
 flamegraph.svg
 perf.*
 out.c0s
+*.so
+*.o

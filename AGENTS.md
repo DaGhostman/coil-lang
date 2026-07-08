@@ -4253,3 +4253,251 @@ compiler or machine warnings.
    cases. Future work could allow dynamic-length
    arrays to grow at runtime (would need a separate
    opcode).
+
+## PHASE 29A — NAMESPACES + PROJECT-LEVEL MODULE DISCOVERY (COMPLETED)
+
+### Summary
+
+Added a project-level module system to zero-script.
+The `use foo::bar;` and `use foo::bar as baz;` and
+`use foo::*;` forms now resolve to actual `.0s` files
+on disk, discovered through a `zero.toml` manifest at
+the project root. The `mod foo;` forward declaration
+triggers the same discovery.
+
+The user-facing API:
+- **`use foo::bar;`** — imports `bar` (a function in
+  `src/foo.0s`) into the current scope. `bar()` calls
+  resolve to the fully qualified name `foo::bar`.
+- **`use foo::bar as baz;`** — same as above, but
+  `baz` is the local name.
+- **`use foo::*;`** — glob: brings every top-level
+  item from `foo.0s` into scope (e.g., `sadge` and
+  `greet` if both are top-level functions in
+  `foo.0s`).
+- **`mod foo;`** — forward declaration: triggers the
+  pipeline to load `foo.0s` if not already loaded.
+- **`zero.toml`** — project manifest at the project
+  root. Declares search roots for `use` resolution
+  and an optional entry-point file.
+
+### File → namespace convention
+
+A file at `<root>/<path>.0s` has namespace
+`<path::as::double_colons>`. The entry file (passed
+to the compiler) is special: it lives in the
+top-level namespace (no prefix), regardless of its
+path on disk.
+
+Examples:
+- `src/foo.0s` → namespace `foo`. Top-level
+  function `sadge` has FQN `foo::sadge`.
+- `src/lib/io.0s` → namespace `lib::io`. Top-level
+  function `read` has FQN `lib::io::read`.
+- `src/main.0s` (the entry file) → namespace `""`.
+  Top-level function `main` has FQN `main`.
+
+### `use` resolution convention
+
+`use <a>::<b>::<c>;` looks for the file
+`<root>/<a>/<b>/<c>.0s`. The item imported is
+`c` (the LAST segment). So `use foo::sadge;` looks
+for `<root>/foo/sadge.0s` and imports `sadge` (a
+top-level function in that file).
+
+For globs (`use foo::*;`): the file is
+`<root>/foo.0s` (the LAST segment is dropped
+because the glob marker isn't an item name). The
+glob brings every top-level item from that file
+into scope.
+
+### File additions
+
+**`compiler/src/manifest.rs`** (~580 LOC) — `zero.toml`
+parser and `Manifest` struct. The manifest declares
+search roots; module paths in `use` statements are
+resolved by searching each root in order.
+
+**`compiler/tests/namespace.rs`** (~290 LOC) — 7
+golden end-to-end tests for the new namespace system.
+
+**`zero.toml.example`** (~80 LOC) — example manifest
+documenting the format.
+
+### File modifications
+
+- **`parser/src/lib.rs`** — added `use_` parser
+  (handles `use`, `as`, and `*` glob) and `mod_`
+  parser. Both are top-level declarations registered
+  before the catch-all `stmt` parser.
+- **`compiler/src/pipeline.rs`** — rewritten to use
+  the manifest. New `compile_src_from_file` method
+  is the multi-file entry point. New `discover_all`
+  pre-pass parses every file in the dependency
+  graph to build a complete worklist; the compile
+  pass drains the worklist in LIFO order so
+  dependencies are compiled before their consumers.
+  New `source_cache` field avoids re-reading files
+  from disk between the discovery and compile passes.
+- **`compiler/src/lib.rs`** — codegen for
+  `Expression::Use` now populates the alias map
+  (local name → qualified name). Glob (`*`)
+  expansion walks `self.functions` for entries
+  matching the file's namespace prefix.
+  `Expression::Module` is a no-op (forward
+  declaration only). `Expression::Function` now
+  records each compiled function in
+  `Compiler::module_items` (for glob expansion).
+  New `Compiler::compile_module` method returns
+  ONLY the new bytes from a compile call (not the
+  cumulative bytecode); the pipeline uses this to
+  avoid duplicating bytes in multi-file programs.
+- **`compiler/src/typechecking/infer.rs`** — the
+  `Expression::Use` arm now inserts an alias into
+  the typechecker's env (with a fresh type variable).
+  Without this, calls to aliased names would emit
+  "Cannot find function `x`" errors.
+
+### Decisions locked in (during implementation)
+
+1. **Multi-file compile uses `compile_module` (not
+   `compile`).** `compile` returns the CUMULATIVE
+   bytecode (pre-Phase-29A behavior — fine for
+   single-file). `compile_module` returns the diff
+   (`self.bytecode[pre_compile_len..]`). The pipeline
+   uses the diff to avoid duplicating the prologue
+   on the second+ call.
+2. **JMP/CALL operands in the returned slice are
+   absolute offsets in `self.bytecode` — no operand
+   adjustment is needed** because both the compiler
+   and the pipeline use the same 3-byte prologue,
+   so absolute offsets in the slice map 1:1 to
+   absolute offsets in the pipeline's bytecode. If
+   the prologue length ever differs, the pipeline
+   will need to adjust JMP-family operands.
+3. **Source caching, not AST caching.** The pipeline
+   caches the file's source text (one read per file
+   per pipeline invocation). The AST itself isn't
+   cached because `Output<'parser>` borrows from
+   the source; owning the source for the entire
+   pipeline lifetime would require `'static`, which
+   leaks. Re-parsing is fast (chumsky is incremental).
+4. **Discovery is LIFO compile order.** The worklist
+   is processed with `pop_back` (LIFO), so
+   dependencies are compiled BEFORE their
+   consumers. This guarantees that when
+   `main.0s`'s `sadge()` call is compiled, the
+   function `foo::sadge::sadge` is already in
+   `self.functions`.
+5. **The entry file is special.** It uses namespace
+   `""` (no prefix) regardless of its path on
+   disk. The user-facing function `main` lives in
+   the top-level namespace.
+6. **The pipeline acquires a process-wide Mutex
+   before changing cwd in the test harness.**
+   Cargo's parallel test runner would otherwise
+   have multiple threads fighting over the cwd and
+   reading the wrong `zero.toml`. A longer-term fix
+   would thread-local the cwd or pass the manifest
+   path explicitly to the pipeline.
+7. **`use foo::*;` resolves the file as `foo.0s`**
+   (the last segment is dropped from the path
+   because the glob marker isn't an item name). This
+   matches the existing convention: `use foo::bar;`
+   looks for `foo.0s` (with `bar` as the function
+   name in that file), so `use foo::*;` looks for
+   the same `foo.0s` and brings all its top-level
+   items into scope.
+8. **`mod foo;` is a no-op at codegen time** — it
+   only triggers the pipeline to load `foo.0s`. The
+   pipeline's `enqueue_uses` walker handles the load.
+9. **Namespace is a code-only concept at the FQN
+   level.** Functions in different files but with
+   the same simple name (e.g., `foo::sadge` and
+   `bar::sadge`) don't conflict in the bytecode —
+   the FQN disambiguates them. The user calls
+   them by their fully qualified name (or via an
+   alias) to disambiguate at the call site.
+
+### Test counts (29A final)
+
+| Suite | Count | Delta vs 28 |
+|---|---|---|
+| `compiler/src/manifest.rs::tests` | 16 | +16 (NEW) |
+| `compiler/src/lib.rs::tests` | 478 | 0 |
+| `compiler/src/typechecking/*::tests` | 251 | 0 |
+| `compiler/tests/diagnostics.rs` | 33 | 0 |
+| `compiler/tests/pipeline.rs` | 22 | 0 |
+| `compiler/tests/namespace.rs` | 7 | +7 (NEW) |
+| `machine/src/vm.rs::tests` | 17 | 0 |
+| `machine/src/ffi.rs::tests` | 8 | 0 |
+| `parser/src/lib.rs::tests` | 33 | +2 (`use` parser tests) |
+| `common` | 26 | 0 |
+| doctests | 6 | 0 |
+| **Total** | **897** | **+25** |
+
+### Files modified
+
+| File | Net change | Purpose |
+|---|---|---|
+| `compiler/src/manifest.rs` | +580 LOC (new) | `zero.toml` parser + path resolution |
+| `compiler/src/pipeline.rs` | +280 / -80 LOC | Manifest-driven multi-file pipeline |
+| `compiler/src/lib.rs` | +180 / -50 LOC | `Use`/`Module` codegen, glob expansion, `compile_module` |
+| `compiler/src/typechecking/infer.rs` | +30 LOC | `Use` arm populates env |
+| `parser/src/lib.rs` | +280 / -10 LOC | `use_` and `mod_` parsers |
+| `compiler/tests/namespace.rs` | +290 LOC (new) | 7 end-to-end namespace tests |
+| `zero.toml.example` | +80 LOC (new) | Example manifest |
+| `examples/modules.0s` | rewrote | Use the new namespace form |
+| `examples/src/foo/sadge.0s` | new | The file that `examples/modules.0s` uses |
+
+### Build status (29A)
+
+`cargo build --workspace` produces only the three
+pre-existing parser warnings (`None`/`Xor`/`Equal`/
+`Unary`/`Call` variants, `prefix` field, `inc`/`dec`
+methods in `parser/src/lib.rs`). No new compiler or
+machine warnings.
+
+### Anything 29B+ needs to know
+
+- **`ARCHIVE_VERSION` is still 1.** The bytecode wire
+  format didn't change in 29A. If 29B widens the
+  `NATIVE` operand (for library-isolated natives),
+  bump `ARCHIVE_VERSION` to 2.
+- **The `use` resolution is path-based, not name-based.**
+  `use foo::sadge;` looks for the file `foo.0s` (with
+  `sadge` as the function name inside). It does NOT
+  search for a file named `foo.0s` with `sadge` as the
+  function inside (which would be a Rust-style
+  module::item separation). This convention is
+  consistent across the whole stack but may surprise
+  Rust users.
+- **Glob imports are file-scoped, not directory-scoped.**
+  `use foo::*;` brings items from `foo.0s` (a single
+  file) into scope. It does NOT transitively reach
+  into files in the `foo/` subdirectory. To reach
+  those, the user must write a separate
+  `use foo::bar;` for each sub-module.
+- **The pipeline's `compile_module` returns the
+  absolute-offsets slice.** If you add a new JMP-family
+  opcode in 29B+ that needs an absolute offset
+  adjustment when crossing file boundaries, update
+  the operand-adjustment logic in `compile_module`
+  (or add a new filter case in the match arm).
+- **The `Compiler::module_items` table is populated
+  during codegen.** Glob expansion in the codegen
+  reads from this table (or, equivalently, from
+  `self.functions`). If you add a new item kind
+  (e.g., a class), it should also be recorded in
+  `module_items` so globs can export it.
+- **The `mod foo;` declaration is currently a
+  no-op at codegen time** — it only triggers
+  pipeline loading. Future work: `mod foo { ... }`
+  (inline module declarations) would need actual
+  codegen work.
+- **The process-wide `CWD_LOCK` in the namespace
+  test harness** is a temporary fix for parallel
+  test execution. A better long-term solution
+  would be to make `Manifest::load` accept a path
+  argument (not derive it from cwd), so the
+  pipeline doesn't need to change cwd.
