@@ -5,6 +5,10 @@ edition = "2024"
 
 [features]
 pratt = []
+# Phase 1 perf: gate the multi-pass CFG codegen so the runtime binary
+# doesn't pull ~6,800 LOC of compiler code into its icache. See
+# AGENTS.md Phase 30A for the full rationale.
+cfg-codegen = []
 
 [dependencies]
 ahash = "0.8.12"

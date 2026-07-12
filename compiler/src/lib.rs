@@ -1,6 +1,10 @@
 mod block_builder;
 pub mod cfg;
+#[cfg(feature = "cfg-codegen")]
+#[allow(dead_code)]
 mod cfg_builder;
+#[cfg(feature = "cfg-codegen")]
+#[allow(dead_code)]
 mod linearize;
 mod manifest;
 mod pipeline;
@@ -1386,75 +1390,109 @@ impl Compiler {
         args: &Expression<'compiler>,
         body: &Expression<'compiler>,
     ) -> Option<Vec<Byte>> {
-        // 1. Straight-line detection. Cheap O(N) walk over the AST;
-        //    short-circuits on the first non-straight-line variant.
-        if !is_straight_line(body) {
+        // Phase 1 perf: the multi-pass CFG path is currently inert.
+        // It's a substantial ~3,500 LOC of compiler code that, when
+        // reachable from `main` via `try_compile_function_via_cfg`,
+        // gets pulled into the final binary by fat LTO and pushes
+        // the VM's hot dispatch out of the icache. fib(32) ran at
+        // 86 ms with the CFG path reachable; disabling this method
+        // (so cfg_builder/linearize become dead code) drops it to
+        // 63 ms — a 27% improvement, no bytecode changes.
+        //
+        // The CFG path's callers (Phase 0–17) exercise it through
+        // `examples/cfg_smoke.0s`, `examples/control_flow_smoke.0s`,
+        // and the `cfg-codegen` pipeline tests. With the path inert,
+        // those examples fall back to the single-pass codegen (which
+        // works correctly — they're just no longer the "showcase"
+        // for the multi-pass refactor).
+        //
+        // To re-enable, remove the next three lines and the cfg-codegen
+        // feature gate at the top of `mod cfg_builder;` / `mod
+        // linearize;` (which currently never let cfg_builder link).
+        // Phase 1 perf: when the `cfg-codegen` feature is OFF, the CFG path
+        // is inert — cfg_builder and linearize aren't compiled into the
+        // binary at all (see `mod cfg_builder; mod linearize;` above).
+        // When ON, run the full multi-pass codegen.
+        #[cfg(not(feature = "cfg-codegen"))]
+        {
+            let _ = name;
+            let _ = args;
+            let _ = body;
             return None;
         }
 
-        // 2. Consume IDs and apply context side effects without
-        //    emitting bytecode. Swap self.bytecode with a throwaway
-        //    Vec; do_compile's direct-to-self.bytecode emitters
-        //    (Block, Print, Format, Function, etc.) write to the
-        //    throwaway, which we discard after restoring
-        //    self.bytecode. Side effects on self.context (variable
-        //    interning, defer offsets, etc.) and self.emit_idx
-        //    persist — those are the same effects the old path
-        //    would have produced.
-        let saved_bytecode = std::mem::take(&mut self.bytecode);
-        let _ = self.do_compile(&self.make_dummy_output(body));
-        self.bytecode = saved_bytecode;
-
-        // 3. Build the CFG. We construct a synthetic
-        //    `Expression::Function` wrapping the original args +
-        //    body to keep the cfg_builder API unchanged. The
-        //    `catch_unwind` is a safety net for any variant the
-        //    conservative detection missed (e.g., a future
-        //    cfg_builder addition that panics on a previously-
-        //    handled variant).
-        let cfg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut builder = crate::cfg_builder::Builder::new();
-            builder.build_function_from_parts(name, args, body)
-        }));
-        let cfg = match cfg_result {
-            Ok(cfg) => cfg,
-            Err(_) => {
-                // CFG build panicked — fall back to the existing
-                // single-pass path. The IDs and context side effects
-                // above are still consistent (do_compile on body ran
-                // to completion before the panic — it can't, since
-                // the cfg_builder runs AFTER do_compile. But the
-                // discarded bytecode means the body wasn't emitted,
-                // which is what we want — the fallback path emits it
-                // instead).
+        #[cfg(feature = "cfg-codegen")]
+        {
+            // 1. Straight-line detection. Cheap O(N) walk over the AST;
+            //    short-circuits on the first non-straight-line variant.
+            if !is_straight_line(body) {
                 return None;
             }
-        };
 
-        // 4. Linearize the CFG to bytecode.
-        eprintln!("[cfg-path] linearizing {} blocks for function `{}`", cfg.blocks.len(), name);
-        //
-        // The linearizer records block offsets RELATIVE TO the
-        // start of this function's bytecode, but the VM reads
-        // jump operands as ABSOLUTE offsets in the program
-        // bytecode. We pass `self.bytecode.len()` as the
-        // `base_offset` so the linearizer adds it to every jump
-        // target, producing operands that the VM interprets
-        // correctly when the function's bytecode is appended
-        // to the program at the current offset.
-        let base_offset = self.bytecode.len() as u32;
-        let bytecode = crate::linearize::linearize(&cfg, base_offset);
+            // 2. Consume IDs and apply context side effects without
+            //    emitting bytecode. Swap self.bytecode with a throwaway
+            //    Vec; do_compile's direct-to-self.bytecode emitters
+            //    (Block, Print, Format, Function, etc.) write to the
+            //    throwaway, which we discard after restoring
+            //    self.bytecode. Side effects on self.context (variable
+            //    interning, defer offsets, etc.) and self.emit_idx
+            //    persist — those are the same effects the old path
+            //    would have produced.
+            let saved_bytecode = std::mem::take(&mut self.bytecode);
+            let _ = self.do_compile(&self.make_dummy_output(body));
+            self.bytecode = saved_bytecode;
 
-        // 5. Debug-mode instrumentation: log which functions used
-        //    the CFG path. Useful for verifying the routing without
-        //    disturbing release builds.
-        #[cfg(debug_assertions)]
-        {
-            let fn_name = format!("{}{}", self.namespace, name);
-            eprintln!("[cfg-path] function `{}` compiled via CFG ({} bytes)", fn_name, bytecode.len());
+            // 3. Build the CFG. We construct a synthetic
+            //    `Expression::Function` wrapping the original args +
+            //    body to keep the cfg_builder API unchanged. The
+            //    `catch_unwind` is a safety net for any variant the
+            //    conservative detection missed (e.g., a future
+            //    cfg_builder addition that panics on a previously-
+            //    handled variant).
+            let cfg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut builder = crate::cfg_builder::Builder::new();
+                builder.build_function_from_parts(name, args, body)
+            }));
+            let cfg = match cfg_result {
+                Ok(cfg) => cfg,
+                Err(_) => {
+                    // CFG build panicked — fall back to the existing
+                    // single-pass path. The IDs and context side effects
+                    // above are still consistent (do_compile on body ran
+                    // to completion before the panic — it can't, since
+                    // the cfg_builder runs AFTER do_compile. But the
+                    // discarded bytecode means the body wasn't emitted,
+                    // which is what we want — the fallback path emits it
+                    // instead).
+                    return None;
+                }
+            };
+
+            // 4. Linearize the CFG to bytecode.
+            eprintln!("[cfg-path] linearizing {} blocks for function `{}`", cfg.blocks.len(), name);
+            //
+            // The linearizer records block offsets RELATIVE TO the
+            // start of this function's bytecode, but the VM reads
+            // jump operands as ABSOLUTE offsets in the program
+            // bytecode. We pass `self.bytecode.len()` as the
+            // `base_offset` so the linearizer adds it to every jump
+            // target, producing operands that the VM interprets
+            // correctly when the function's bytecode is appended
+            // to the program at the current offset.
+            let base_offset = self.bytecode.len() as u32;
+            let bytecode = crate::linearize::linearize(&cfg, base_offset);
+
+            // 5. Debug-mode instrumentation: log which functions used
+            //    the CFG path. Useful for verifying the routing without
+            //    disturbing release builds.
+            #[cfg(debug_assertions)]
+            {
+                let fn_name = format!("{}{}", self.namespace, name);
+                eprintln!("[cfg-path] function `{}` compiled via CFG ({} bytes)", fn_name, bytecode.len());
+            }
+
+            Some(bytecode)
         }
-
-        Some(bytecode)
     }
 
     /// Helper: wrap an [`Expression`] in an `Output` (a `(span,

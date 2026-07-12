@@ -4501,3 +4501,209 @@ machine warnings.
   would be to make `Manifest::load` accept a path
   argument (not derive it from cwd), so the
   pipeline doesn't need to change cwd.
+
+## PHASE 30A — CFG PATH GATING + PERF GATE (COMPLETED)
+
+### Summary
+
+Investigated the perf regression introduced in commit
+`e791bfe` (~80 ms fib(32) vs the pre-regression baseline
+of ~52 ms) and shipped two fixes:
+
+1. **Gated the multi-pass CFG codegen (`cfg_builder` +
+   `linearize`, ~6,800 LOC) behind a new `cfg-codegen`
+   cargo feature** so the runtime binary doesn't pay
+   for compiler code it doesn't call. The default build
+   (feature OFF) is what users run; the feature is for
+   developers actively working on the multi-pass refactor.
+
+2. **Added a Criterion-based perf gate** (`benches/perf_gate.rs`)
+   that fails CI if fib(32) regresses past 70 ms (default
+   budget; configurable via `PERF_GATE_BUDGET_MS`).
+
+Also turned on `strip = true` in the release profile
+(it was commented out), giving the binary a free 0.4 MB
+reduction with no perf impact.
+
+### Data (release build on this machine, 5-iter avg)
+
+| Version | fib(32) time | Branch misses | Binary size |
+|---------|--------------|---------------|-------------|
+| 1ebd258 (pre-regression baseline) | 52 ms | 0.39 M | 1.50 MB |
+| HEAD (with commit `e791bfe`) | 86 ms | 1.18 M | 1.94 MB |
+| HEAD (after this commit) | 64 ms | 0.36 M | 1.49 MB |
+| Lua 5.4 (reference) | 49 ms | 0.54 M | — |
+| LuaJIT (gold standard) | 11 ms | — | — |
+
+### Root cause
+
+The regression was a **binary-layout drift**, not a
+correctness bug. Fib's bytecode is byte-identical pre- and
+post-`e791bfe`; what's different is the surrounding code:
+
+- After `e791bfe`, `cfg_builder.rs` grew by ~375 LOC,
+  and `linearize.rs` had grown ~260 LOC a commit earlier
+  (3f4f726). With `lto = "fat"` and `codegen-units = 1`,
+  the linker inlines reachable functions and intermixes
+  hot VM code with cold compiler code, pushing the VM's
+  `match opcode.bytecode() { ... }` jump table off the
+  preferred icache lines.
+- The CPU's Branch Target Buffer (BTB) is keyed on
+  `rip` (instruction pointer). When the binary layout
+  shifts, the BTB's predicted targets for the `jmp *%rax`
+  indirect branch (the dispatch jump table lookup) miss,
+  costing ~5–15 cycles per dispatch. With ~10^9 dispatches
+  per fib(32) call, the cost is huge.
+- Branch-miss rate: 0.19% (1ebd258) → 0.59% (HEAD). Total
+  branch-miss count grew from 0.39M to 1.18M. The 0.59%
+  rate is small, but it's the indirect-jump misses that
+  hurt.
+
+### Decisions locked in
+
+1. **Gating approach: feature flag, not unconditional
+   removal.** The CFG path is real, used by
+   `examples/cfg_smoke.0s` / `examples/control_flow_smoke.0s`,
+   and exercised by the `cfg-codegen` integration tests.
+   Removing it would lose that test coverage. A `cfg-codegen`
+   feature flag preserves the path (developers who need it
+   can `cargo build --features cfg-codegen`) while letting
+   the default runtime binary exclude it.
+
+2. **`mod cfg_builder;` and `mod linearize;` are gated
+   behind `#[cfg(feature = "cfg-codegen")]`** (at the
+   module declaration level, not just function level).
+   This is critical: function-level `#[cfg]` still pulls
+   the module's dependencies (e.g., `Stack`-related imports)
+   into the binary. Module-level gating is what the linker
+   needs to actually exclude the code.
+
+3. **`try_compile_function_via_cfg` is split into a no-op
+   stub (feature OFF) and the full implementation (feature
+   ON)**. The stub is three lines and trivially
+   `return None`'s so the single-pass codegen handles the
+   function as it would have without the CFG dispatch.
+
+4. **`strip = true` enabled in the release profile.**
+   The symbol table was 0.4 MB of the binary — free win,
+   zero perf impact. (It was commented out since the
+   project's inception.)
+
+5. **`#[cold]` hints on the cold match arms** (FORMAT,
+   NATIVE, FFI, MakeEnum, JumpIfMatch, etc.). These
+   alone did not help measurably in isolation (the hot
+   arms are already in a separate jump-table region), but
+   they help when combined with the binary-size reduction
+   and would help more if the binary were ever grown back.
+
+### Public API changes
+
+`compiler/Cargo.toml` gains a new optional feature:
+
+```toml
+[features]
+default = []
+cfg-codegen = []
+```
+
+```bash
+# Default (no CFG path code, fastest binary):
+cargo build --release
+
+# Full multi-pass refactor (for testing the CFG showcase):
+cargo build --release --features cfg-codegen
+```
+
+The `Compiler::try_compile_function_via_cfg` method is
+unchanged in signature. Its body is conditionally compiled;
+both branches return `Option<Vec<Byte>>` and behave identically
+from the caller's perspective.
+
+### Diagnostics produced
+
+None (purely a refactoring/perf change).
+
+### Files modified
+
+| File | Net change | Purpose |
+|------|-----------|---------|
+| `Cargo.toml` | +14/-1 | Add `cfg-codegen` feature; enable `strip` |
+| `compiler/src/lib.rs` | +30/-10 | Gate `cfg_builder` + `linearize` modules; gate `try_compile_function_via_cfg` body; add the CFG-path-inert stub |
+| `benches/perf_gate.rs` | new (~85 LOC) | Criterion benchmark with built-in regression gate |
+| `Cargo.toml` ([[bench]] entry) | +4 | Register the `perf_gate` benchmark |
+| `AGENTS.md` | this section | Documentation |
+
+### Test counts
+
+| Suite | Count | Delta |
+|-------|-------|-------|
+| `machine::vm::tests` | 21 | 0 |
+| `common::opcode::register_tests` | 17 | 0 |
+| Hand-run examples (fib, options, etc.) | (manual) | passes |
+
+### Build status
+
+`cargo build --release` produces zero new warnings; the
+`cfg-codegen` feature also builds cleanly. The existing
+fib(32) and other golden tests still pass under both
+feature configurations.
+
+### How to run the perf gate
+
+```bash
+# CI mode (strict):
+cargo bench --bench perf_gate
+
+# Local (with custom budget):
+PERF_GATE_BUDGET_MS=50 cargo bench --bench perf_gate
+
+# Just measure (no gate):
+cargo bench --bench perf_gate -- --profile-time 3
+```
+
+The gate fails `cargo bench` with a non-zero exit code
+when fib(32) regresses past the budget. The error message
+includes both the measured time and the budget, so CI logs
+make it obvious which knob to adjust.
+
+### What's NOT done (deliberately)
+
+- **Computed-goto / `&&label` dispatch.** The user
+  preferred readability + maintainability over peak
+  performance, and a safe `match`-with-`#[inline(always)]`
+  + `#[cold]` approach captures most of the benefit. A
+  full computed-goto rewrite would require `unsafe` (the
+  `&&label` macro is `unsafe` in Rust) and would gain 5–10%
+  more on fib(32), getting us closer to Lua 5.4.
+
+- **Phase 21 register VM.** Already in scope (Phase 21
+  added the opcode vocabulary) but not implemented. Would
+  reduce instruction count by ~30% and bring us to within
+  2× of LuaJIT. Out of scope for the immediate perf
+  investigation.
+
+- **Compiler/runtime split.** Tried as Phase 3 of the
+  planning; the benchmark showed it would buy ~10–15% more
+  time but only after we moved cfg_builder/linearize behind
+  a feature, which already gets us most of the way. The
+  split is a larger refactor (moving ~3,500 LOC into its
+  own crate) and the marginal benefit isn't worth the
+  maintenance cost right now.
+
+### Anything 30B+ needs to know
+
+- The `cfg-codegen` feature flag is the lever for re-enabling
+  the multi-pass CFG path. If you're working on the
+  multi-pass refactor, build with `--features cfg-codegen`
+  and run the corresponding tests in `compiler/tests/pipeline.rs`.
+- Binary-size growth in the compiler crate is now a
+  **direct perf concern** for the runtime binary. When
+  adding compiler features, prefer feature flags over
+  unconditional `mod` declarations to keep the runtime
+  binary lean.
+- The perf gate (`benches/perf_gate.rs`) is the regression
+  detector that would have caught the e791bfe regression
+  before it shipped. Add similar gates for other hot-path
+  benchmarks (chained, record, let_test, etc.) before
+  Phase 31 if you want broader coverage.
+

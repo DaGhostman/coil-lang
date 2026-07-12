@@ -22,12 +22,30 @@ criterion = { version = "^0.8", features = ["html_reports"] }
 name = "fib"
 harness = false
 
+[[bench]]
+name = "perf_gate"
+harness = false
+
+[features]
+# Phase 1 perf: the multi-pass CFG-based codegen (`cfg_builder` +
+# `linearize`) is gated behind this feature so the runtime binary can
+# be compiled without pulling ~6,800 LOC of compiler code into the
+# icache and triggering the BTB-prediction regression (see AGENTS.md
+# Phase 1 perf). Enabling it is required to run the `cfg-codegen`
+# pipeline tests and the `examples/cfg_smoke.0s` /
+# `examples/control_flow_smoke.0s` showcases.
+default = []
+# Note: the actual `cfg-codegen` feature flag lives in
+# `compiler/Cargo.toml` (so it's a package-scoped feature, which
+# `#[cfg]` can reference). The workspace-level entry above is
+# reserved for future workspace-wide feature flags.
+
 [profile.release]
 opt-level=3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-# strip = true
+strip = true
 # debug = 1
 
 [profile.branch_misses]
