@@ -3940,3 +3940,60 @@ machine warnings.
   argument (not derive it from cwd), so the
   pipeline doesn't need to change cwd.
 
+## Cursor Cloud specific instructions
+
+This is a Rust workspace (the `zero-script` compiler + VM). There is
+one product: a CLI that compiles a `.0s` source file to bytecode and
+runs it on the stack VM. Crates: `common`, `parser`, `compiler`,
+`machine`, and the root `zero-script` binary (`src/main.rs`).
+
+### Toolchain (non-obvious)
+
+- The workspace uses `edition = "2024"`, which requires Rust
+  **stable ≥ 1.85**. The base VM image ships rustc 1.83, which is too
+  old and fails with `feature edition2024 is required`. The update
+  script installs/selects stable via `rustup` (`rustup toolchain
+  install stable` + `rustup default stable`), so a fresh shell should
+  already be on a new-enough toolchain. If you hit the `edition2024`
+  error, run `rustup default stable`.
+
+### Build / test / run
+
+- Build: `cargo build --workspace` (dev). Only 3 pre-existing parser
+  warnings are expected; treat this as the effective lint gate.
+- Run a program (dev): `cargo run -- examples/fib.0s`. Release binary:
+  `cargo build --release` then `./target/release/zero-script <file>`.
+- Test: `cargo test --workspace` — but see the two gotchas below.
+
+### Gotchas (important)
+
+1. **Run tests in `--release`.** In a debug build the
+   `example_fib_still_works` pipeline test computes `fib(32)` naively
+   on the tree-walking VM and takes minutes, blowing past test
+   timeouts (SIGKILL). `cargo test --workspace --release` finishes in
+   seconds. Debug tests are fine if you exclude that one test.
+2. **Skip the FFI test.** `example_ffi_sum_via_dlopen_prints_42` (and
+   `examples/ffi_sum.0s`) is broken independent of environment: the
+   `.0s` source hardcodes a foreign absolute path
+   (`/home/ddimitrov/.../libsum.so`) and needs a locally-built,
+   gitignored `libsum.so`. On failure it aborts the whole test binary
+   (SIGABRT). Exclude it: `cargo test --workspace --release --
+   --skip example_ffi_sum`. To exercise FFI locally, build the lib
+   (`cc -shared -fPIC -o examples/libsum.so examples/sum.c`) and point
+   the `dload(...)` path in `examples/ffi_sum.0s` at it.
+3. **`cargo clippy` fails on a pre-existing deny-level lint**
+   (`derived_hash_with_manual_eq` in `common/src/value.rs`) under
+   modern clippy. This is committed code, not an environment problem;
+   the repo's lint gate is `cargo build`, not clippy.
+4. **The runner caches bytecode to `out.c0s`.** `src/main.rs` reuses
+   an existing `out.c0s` instead of recompiling, so when running a
+   *different* `.0s` file you must `rm -f out.c0s` first or you'll
+   re-run the previous program. `out.c0s` and `*.so` are gitignored.
+
+### Expected example outputs (regression reference)
+
+`fib`→`2178309`, `option`→`42`, `fizbuz`→`FIZBUZFIZFIZBUZFIZFIZBUZ`,
+`tree`→`6`, `record`→`169512`, `mixed`→`025122`, `dict`→`4210042`,
+`chained`→`427`, `let_test`→`51020`, `result`→`420-1`. (`print` emits
+no trailing newline, so multi-`print` programs concatenate.)
+
