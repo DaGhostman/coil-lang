@@ -1,11 +1,4 @@
 mod block_builder;
-pub mod cfg;
-#[cfg(feature = "cfg-codegen")]
-#[allow(dead_code)]
-mod cfg_builder;
-#[cfg(feature = "cfg-codegen")]
-#[allow(dead_code)]
-mod linearize;
 mod manifest;
 mod pipeline;
 mod typechecking;
@@ -981,257 +974,6 @@ fn emit_pattern_binding<'compiler>(
     }
 }
 
-/// Walk an [`Expression`] looking for variants that the
-/// multi-pass CFG path (Phase 0.3+) cannot fully handle.
-///
-/// Returns `true` iff every variant in the subtree is "straight-line"
-/// for the CFG path: no operations that depend on
-/// runtime-resolved placeholders the Phase 0.3 linearizer hasn't been
-/// taught to emit (FORMAT/PRINT, call targets, enum tag/arity, field
-/// indices), and no metadata variants that the cfg_builder silently
-/// no-ops on (which would silently break runtime semantics).
-///
-/// ## What is flagged as "not straight-line"
-///
-/// - **Control flow** — `Match`, nested `Function`. The cfg_builder
-///   handles `If` / `Branch` / `Loop` (Phase 1.1 / 1.2 / 1.3 work),
-///   and the linearizer emits `Jump` / `Branch` / `Switch`
-///   placeholders that are patched in a second pass. Match and
-///   nested Function are deferred: Match requires tag / arity
-///   resolution from the typechecker (a future commit will thread
-///   the checker through `linearize`); nested Function is out of
-///   scope for the CFG builder.
-/// - **Linearizer placeholders** — `Print`, `Format`, `Call`,
-///   `Construct`, `Access`. The Phase 0.3 linearizer emits these
-///   with unresolvable placeholders (JMP u32::MAX for calls, tag/arity
-///   = 0 for `Construct`, field_index = 0 for `Access`, no FORMAT/PRINT
-///   for `Print`/`Format`). The old single-pass path resolves them
-///   correctly upstream; the CFG path cannot, so we fall back.
-/// - **Slot-semantic operations** — `Assignment`, `Defer`. The
-///   cfg_builder updates its own `locals` map but does NOT emit the
-///   `STORE_POP` / `JMP`-to-defer-bytecode opcodes the existing
-///   single-pass path emits. Falling back is the safe choice.
-/// - **Top-level / out-of-scope metadata** — `Implementation`,
-///   `Class`, `Field`, `Method`, `Member`, `Update`, `Instantiate`,
-///   `Inc`, `Dec`, `EnumDecl`, `EnumVariant`, `Default`, `Use`, `List`,
-///   `Constant`, `Comment`, `Module`, `Noop`, `Yield`, `Resume`,
-///   `Program`. These don't appear inside a function body in a
-///   well-formed AST; if they do, falling back is the safe choice.
-///
-/// ## What is straight-line (recursed into)
-///
-/// Binary ops (`Add`, `Sub`, `Mul`, ..., `And`, `Or`), unary ops
-/// (`Negate`, `Not`, `Positive`), constants (`Integer`, `Float`,
-/// `Bool`, `String`), `Identifier`, `Return` / `ImplicitReturn`,
-/// `Block`, `Fragment`, `Expr`, `ExprStatement`, `Statement`, `Group`,
-/// `If` / `Branch` / `Loop` (Phase 1.5 — control flow is now
-/// straight-line-friendly because the linearizer emits multi-block
-/// terminators and patches them in a second pass), and the metadata
-/// `Variable`, `Argument`, `Type` variants.
-///
-/// ## Phase 1.5 scope
-///
-/// This commit lifts the `If` / `Branch` / `Loop` restrictions
-/// from `is_straight_line`. The cfg_builder's `build_if` /
-/// `build_while` already produce multi-block CFGs; the
-/// linearizer's Phase 1.1 / 1.2 work emits `Branch` and `Jump`
-/// placeholders that are patched in a second pass. After this
-/// commit, any function whose body contains ONLY the recursed-into
-/// variants above (plus the metadata `Variable` / `Argument` /
-/// `Type` no-ops) routes through the CFG path; anything with
-/// `Match`, `Print`, `Format`, `Call`, `Construct`, `Access`,
-/// `Assignment`, or nested `Function` falls back to the
-/// existing single-pass path.
-///
-/// The lifting is incremental — `Match` is left flagged for the
-/// tag-resolution work, and the other restrictions remain in
-/// place until their respective codegen paths are ready.
-fn is_straight_line(expr: &parser::ast::Expression) -> bool {
-    use parser::ast::Expression;
-    match expr {
-        // ---- Control flow: Match and nested Function are still flagged ----
-        //
-        // Match codegen requires tag / arity resolution from the
-        // typechecker's `tag_for` / `arity_for` registry; the
-        // linearizer currently emits `tag = 0` / `arity = 0`
-        // placeholders without resolving them. Nested Function
-        // is out of scope for the cfg_builder.
-        Expression::Match { .. } => false,
-        Expression::Function { .. } => false,
-
-        // ---- Aggregates (Phase 23) ----
-        //
-        // Tuples/arrays/indexing are handled by the legacy
-        // single-pass codegen today. Falling back keeps the
-        // legacy emitter authoritative for these forms until
-        // the CFG path learns to allocate heap aggregates.
-        Expression::Tuple(_)
-        | Expression::Array(_)
-        | Expression::Dict(_)
-        | Expression::Index(_, _) => false,
-
-        // ---- Control flow: If / Branch / Loop are recursed into ----
-        //
-        // Phase 1.5 lifts these. The cfg_builder's `build_if` /
-        // `build_while` produce multi-block CFGs; the linearizer's
-        // Phase 1.1 / 1.2 work emits `Branch` / `Jump` placeholders
-        // and patches them in a second pass. Each `If` branch is
-        // an `Expression::Branch(cond, body)`; we recurse into
-        // both. (A standalone `Branch` outside an `If` would panic
-        // the cfg_builder, but `try_compile_function_via_cfg`'s
-        // `catch_unwind` safety net catches that and falls back.)
-        Expression::If(branches) => branches
-            .iter()
-            .all(|b| is_straight_line(b.1.as_ref())),
-        Expression::Branch(cond, body) => {
-            cond.as_ref()
-                .map_or(true, |c| is_straight_line(c.1.as_ref()))
-                && is_straight_line(body.1.as_ref())
-        }
-        Expression::Loop {
-            iterable, body, ..
-        } => {
-            is_straight_line(iterable.1.as_ref())
-                && is_straight_line(body.1.as_ref())
-        }
-
-        // ---- Linearizer emits placeholders (not resolved in Phase 0.3) ----
-        //
-        // Print is lifted for two cases:
-        //
-        //   1. `print "literal";` — a constant string format
-        //      with no params. The cfg_builder pushes
-        //      `Inst::Print { args: [fmt] }` and the linearizer
-        //      emits a single `PRINT` opcode after the format
-        //      string's `STRING` push. (Phase 1.6 simple case.)
-        //
-        //   2. `print "%i", 42;` — a constant string format with
-        //      literal-constant params (Integer, Float, String,
-        //      Bool). The cfg_builder pushes the format string
-        //      first (via `ConstString`), then each param's
-        //      `Const` (or `ConstString` for string params), then
-        //      `Inst::Print { args: [fmt, param_0, ...] }`. The
-        //      linearizer emits `FORMAT(N)` followed by `PRINT`,
-        //      matching the single-pass codegen's stack layout
-        //      (params stacked on top of the format string).
-        //
-        // Identifier params (e.g. `let y = 1; print "%i", y;`)
-        // are NOT lifted — the CFG path has no "reload" mechanism
-        // for SSA values that are already on the stack from a
-        // prior inst (e.g. the BinOp that produced `y`). The
-        // value sits below the format string after the
-        // `ConstString` push, so the FORMAT opcode would pop
-        // them in the wrong order. Identifier params fall back
-        // to the single-pass codegen path, which handles them
-        // correctly via `do_compile`'s recursive emission.
-        // Lifting Identifier params requires either a
-        // `Reload`-style CFG instruction (deferred to a future
-        // phase) or a stack-position-tracking linearizer.
-        //
-        // Format (without the trailing PRINT) is left at
-        // `false` — the single-pass codegen path is the
-        // canonical emitter for `format` expressions.
-        Expression::Print(fmt, params) => {
-            matches!(fmt.1.as_ref(), Expression::String(_))
-                && params.as_ref().map_or(true, |p| {
-                    p.iter().all(|arg| {
-                        matches!(
-                            arg.1.as_ref(),
-                            Expression::Integer(_)
-                                | Expression::Float(_)
-                                | Expression::String(_)
-                                | Expression::Bool(_)
-                        )
-                    })
-                })
-        }
-        Expression::Format(_, _) => false,
-        Expression::Call { .. } => false,
-        Expression::Construct { .. } => false,
-        Expression::Access(_, _) => false,
-        Expression::Dload(_) | Expression::Declare(_) | Expression::Invoke(_) => false,
-
-        // ---- Slot-semantic operations (cfg_builder doesn't emit STORE_POP etc.) ----
-        Expression::Assignment(_, _) => false,
-        Expression::Defer(_) => false,
-
-        // ---- Top-level / out-of-scope (cfg_builder returns None silently) ----
-        Expression::ExternBlock { .. }
-        | Expression::Implementation(_, _, _)
-        | Expression::Class(_, _)
-        | Expression::Field(_, _, _)
-        | Expression::Method(_, _)
-        | Expression::Member(_)
-        | Expression::Update(_, _)
-        | Expression::Instantiate(_, _)
-        | Expression::Inc(_)
-        | Expression::Dec(_)
-        | Expression::EnumDecl { .. }
-        | Expression::EnumVariant { .. }
-        | Expression::TypeAlias { .. }
-        | Expression::Default(_)
-        | Expression::Use { .. }
-        | Expression::List(_)
-        | Expression::Constant(_, _)
-        | Expression::Comment(_)
-        | Expression::Module(_, _)
-        | Expression::Noop(_)
-        | Expression::Yield(_)
-        | Expression::Resume(_, _) => false,
-
-        // ---- Recurse into container variants ----
-        Expression::Block(children) | Expression::Fragment(children) => {
-            children.iter().all(|c| is_straight_line(c.1.as_ref()))
-        }
-        Expression::Program(children) => children
-            .iter()
-            .all(|c| is_straight_line(c.1.as_ref())),
-
-        Expression::Add(l, r)
-        | Expression::Sub(l, r)
-        | Expression::Mul(l, r)
-        | Expression::Div(l, r)
-        | Expression::Mod(l, r)
-        | Expression::Pow(l, r)
-        | Expression::Shl(l, r)
-        | Expression::Shr(l, r)
-        | Expression::Xor(l, r)
-        | Expression::BitAnd(l, r)
-        | Expression::BitOr(l, r)
-        | Expression::Eq(l, r)
-        | Expression::Neq(l, r)
-        | Expression::Leq(l, r)
-        | Expression::Geq(l, r)
-        | Expression::Le(l, r)
-        | Expression::Gt(l, r)
-        | Expression::And(l, r)
-        | Expression::Or(l, r) => {
-            is_straight_line(l.1.as_ref()) && is_straight_line(r.1.as_ref())
-        }
-
-        Expression::Negate(e)
-        | Expression::Not(e)
-        | Expression::Positive(e)
-        | Expression::Return(e)
-        | Expression::ImplicitReturn(e) => is_straight_line(e.1.as_ref()),
-
-        Expression::Statement(e)
-        | Expression::ExprStatement(e)
-        | Expression::Expr(e)
-        | Expression::Group(e) => is_straight_line(e.1.as_ref()),
-
-        // ---- Leaves ----
-        Expression::Integer(_)
-        | Expression::Float(_)
-        | Expression::Bool(_)
-        | Expression::String(_)
-        | Expression::Identifier(_)
-        | Expression::Variable(_, _)
-        | Expression::Argument(_, _)
-        | Expression::Type(_) => true,
-    }
-}
-
 impl Compiler {
     pub fn get_function(&self, name: &str) -> usize {
         self.functions[name]
@@ -1345,176 +1087,6 @@ impl Compiler {
         )
     }
 
-    /// Try to compile the function body via the multi-pass CFG path
-    /// (Phase 0.3 — `cfg_builder` + `linearize`).
-    ///
-    /// Returns `Some(bytecode)` iff:
-    ///
-    /// 1. The body is "straight-line" per [`is_straight_line`] (no
-    ///    control flow, no operations with unresolvable
-    ///    placeholders, no metadata variants the cfg_builder
-    ///    silently no-ops on).
-    /// 2. The cfg_builder succeeds without panicking (it panics on
-    ///    any variant it doesn't handle; `catch_unwind` is the
-    ///    safety net for variants the conservative detection above
-    ///    missed).
-    /// 3. The linearizer produces well-formed bytecode (it panics
-    ///    on multi-block terminators; same safety net).
-    ///
-    /// Returns `None` to indicate "use the existing single-pass path
-    /// instead" — the caller (the `Expression::Function` arm of
-    /// [`Compiler::do_compile`]) then falls back.
-    ///
-    /// ## Why this is safe
-    ///
-    /// The integration is purely additive: if `try_compile_function_via_cfg`
-    /// returns `Some`, we use the CFG bytecode; if it returns `None`,
-    /// we use the existing single-pass path with no behavior change.
-    /// The conservative [`is_straight_line`] detection ensures the
-    /// CFG bytecode is semantically equivalent to the single-pass
-    /// bytecode for the qualified functions.
-    ///
-    /// ## ID consumption
-    ///
-    /// Even when the CFG path produces the bytecode, we still need
-    /// to advance `emit_idx` past the body so subsequent AST nodes
-    /// (the next function's body, etc.) stay aligned with the
-    /// pre-walk's minted `NodeId`s. We do this by calling
-    /// [`Compiler::do_compile`] on the body with `self.bytecode`
-    /// temporarily swapped for a throwaway `Vec` — the side effects
-    /// (context updates, ID consumption) persist, but the bytecode
-    /// emission is discarded.
-    fn try_compile_function_via_cfg<'compiler>(
-        &mut self,
-        name: &'compiler str,
-        args: &Expression<'compiler>,
-        body: &Expression<'compiler>,
-    ) -> Option<Vec<Byte>> {
-        // Phase 1 perf: the multi-pass CFG path is currently inert.
-        // It's a substantial ~3,500 LOC of compiler code that, when
-        // reachable from `main` via `try_compile_function_via_cfg`,
-        // gets pulled into the final binary by fat LTO and pushes
-        // the VM's hot dispatch out of the icache. fib(32) ran at
-        // 86 ms with the CFG path reachable; disabling this method
-        // (so cfg_builder/linearize become dead code) drops it to
-        // 63 ms — a 27% improvement, no bytecode changes.
-        //
-        // The CFG path's callers (Phase 0–17) exercise it through
-        // `examples/cfg_smoke.0s`, `examples/control_flow_smoke.0s`,
-        // and the `cfg-codegen` pipeline tests. With the path inert,
-        // those examples fall back to the single-pass codegen (which
-        // works correctly — they're just no longer the "showcase"
-        // for the multi-pass refactor).
-        //
-        // To re-enable, remove the next three lines and the cfg-codegen
-        // feature gate at the top of `mod cfg_builder;` / `mod
-        // linearize;` (which currently never let cfg_builder link).
-        // Phase 1 perf: when the `cfg-codegen` feature is OFF, the CFG path
-        // is inert — cfg_builder and linearize aren't compiled into the
-        // binary at all (see `mod cfg_builder; mod linearize;` above).
-        // When ON, run the full multi-pass codegen.
-        #[cfg(not(feature = "cfg-codegen"))]
-        {
-            let _ = name;
-            let _ = args;
-            let _ = body;
-            return None;
-        }
-
-        #[cfg(feature = "cfg-codegen")]
-        {
-            // 1. Straight-line detection. Cheap O(N) walk over the AST;
-            //    short-circuits on the first non-straight-line variant.
-            if !is_straight_line(body) {
-                return None;
-            }
-
-            // 2. Consume IDs and apply context side effects without
-            //    emitting bytecode. Swap self.bytecode with a throwaway
-            //    Vec; do_compile's direct-to-self.bytecode emitters
-            //    (Block, Print, Format, Function, etc.) write to the
-            //    throwaway, which we discard after restoring
-            //    self.bytecode. Side effects on self.context (variable
-            //    interning, defer offsets, etc.) and self.emit_idx
-            //    persist — those are the same effects the old path
-            //    would have produced.
-            let saved_bytecode = std::mem::take(&mut self.bytecode);
-            let _ = self.do_compile(&self.make_dummy_output(body));
-            self.bytecode = saved_bytecode;
-
-            // 3. Build the CFG. We construct a synthetic
-            //    `Expression::Function` wrapping the original args +
-            //    body to keep the cfg_builder API unchanged. The
-            //    `catch_unwind` is a safety net for any variant the
-            //    conservative detection missed (e.g., a future
-            //    cfg_builder addition that panics on a previously-
-            //    handled variant).
-            let cfg_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut builder = crate::cfg_builder::Builder::new();
-                builder.build_function_from_parts(name, args, body)
-            }));
-            let cfg = match cfg_result {
-                Ok(cfg) => cfg,
-                Err(_) => {
-                    // CFG build panicked — fall back to the existing
-                    // single-pass path. The IDs and context side effects
-                    // above are still consistent (do_compile on body ran
-                    // to completion before the panic — it can't, since
-                    // the cfg_builder runs AFTER do_compile. But the
-                    // discarded bytecode means the body wasn't emitted,
-                    // which is what we want — the fallback path emits it
-                    // instead).
-                    return None;
-                }
-            };
-
-            // 4. Linearize the CFG to bytecode.
-            eprintln!("[cfg-path] linearizing {} blocks for function `{}`", cfg.blocks.len(), name);
-            //
-            // The linearizer records block offsets RELATIVE TO the
-            // start of this function's bytecode, but the VM reads
-            // jump operands as ABSOLUTE offsets in the program
-            // bytecode. We pass `self.bytecode.len()` as the
-            // `base_offset` so the linearizer adds it to every jump
-            // target, producing operands that the VM interprets
-            // correctly when the function's bytecode is appended
-            // to the program at the current offset.
-            let base_offset = self.bytecode.len() as u32;
-            let bytecode = crate::linearize::linearize(&cfg, base_offset);
-
-            // 5. Debug-mode instrumentation: log which functions used
-            //    the CFG path. Useful for verifying the routing without
-            //    disturbing release builds.
-            #[cfg(debug_assertions)]
-            {
-                let fn_name = format!("{}{}", self.namespace, name);
-                eprintln!("[cfg-path] function `{}` compiled via CFG ({} bytes)", fn_name, bytecode.len());
-            }
-
-            Some(bytecode)
-        }
-    }
-
-    /// Helper: wrap an [`Expression`] in an `Output` (a `(span,
-    /// Box<Expression>)` tuple) with a dummy span, so it can be
-    /// passed to [`Compiler::do_compile`] for ID-consumption
-    /// purposes.
-    ///
-    /// The span is irrelevant to ID consumption (do_compile only
-    /// reads `emit_idx` for the node, then advances it). We use
-    /// a zero-width span as a dummy — purely cosmetic.
-    fn make_dummy_output<'compiler>(
-        &self,
-        expr: &Expression<'compiler>,
-    ) -> Output<'compiler> {
-        // Construct a zero-width span at offset 0. We use
-        // `From<Range>` rather than `SimpleSpan::new` because the
-        // latter requires the `Span` trait in scope, which the
-        // compiler crate doesn't pull in directly (it goes
-        // through the `parser` crate).
-        let span: SimpleSpan = (0..0).into();
-        (span, Box::new(expr.clone()))
-    }
 
     /// Extract the enum name from the inferred type of a field-access
     /// receiver (Phase 18D — `Expression::Access` codegen; Phase 19
@@ -1935,53 +1507,23 @@ impl Compiler {
 
                 self.bytecode.append(&mut a);
 
-                // ---- Phase 0.3: try the CFG path for the body ----
-                //
-                // For straight-line functions (see
-                // [`is_straight_line`]), the multi-pass CFG path
-                // (`cfg_builder` + `linearize`) can produce the
-                // function body's bytecode directly. Falling back
-                // to the existing single-pass path is the safety
-                // net for any function that has control flow or
-                // uses a feature the Phase 0.3 linearizer can't
-                // fully resolve (Print/Format/Call/Construct/Access
-                // placeholders, etc.).
-                //
-                // The integration is purely additive: the old path
-                // below is unchanged, and is the path used when the
-                // CFG builder doesn't qualify.
-                if let Some(cfg_bytecode) = self
-                    .try_compile_function_via_cfg(name, args.1.as_ref(), body.1.as_ref())
-                {
-                    // The CFG path already includes the `RETURN`
-                    // terminator (via the linearizer), so we skip
-                    // the post-processing (`defers` JMPs + auto-
-                    // `CONST 0 / RETURN`). The `defers` loop is a
-                    // no-op for CFG-path functions anyway — the
-                    // cfg_builder doesn't track `Defer` (it returns
-                    // `None` for `Defer`), so `self.context.defers`
-                    // is unchanged by the CFG path's ID-consumption
-                    // walk.
-                    self.bytecode.extend(cfg_bytecode);
-                } else {
-                    let mut c = self.do_compile(body);
-                    self.bytecode.append(&mut c);
+                let mut c = self.do_compile(body);
+                self.bytecode.append(&mut c);
 
-                    self.context.defers.iter().for_each(|offset| {
-                        self.bytecode
-                            .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
-                    });
+                self.context.defers.iter().for_each(|offset| {
+                    self.bytecode
+                        .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+                });
 
-                    if !matches!(
-                        self.bytecode.last().map(|b| b.bytecode()),
-                        Some(Instruction::RETURN)
-                    ) {
-                        self.bytecode.push(Byte::new_with_value(
-                            Instruction::CONST,
-                            Value::default().raw() as _,
-                        ));
-                        self.bytecode.push(Byte::new(Instruction::RETURN));
-                    }
+                if !matches!(
+                    self.bytecode.last().map(|b| b.bytecode()),
+                    Some(Instruction::RETURN)
+                ) {
+                    self.bytecode.push(Byte::new_with_value(
+                        Instruction::CONST,
+                        Value::default().raw() as _,
+                    ));
+                    self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
             }
             Expression::Expr(child) | Expression::Statement(child) => {
@@ -5712,29 +5254,11 @@ fn main() {
 
     /// Codegen test 24 (Phase 18E): a simple `let x = expr; print x;`
     /// emits exactly one `STORE_POP` (the load-bearing store of the
-    /// RHS into `x`'s slot) in addition to the RHS's `CONST`. The
-    /// pre-18E codegen emitted no `STORE_POP` at all, so this test
-    /// fails on the unfixed compiler.
-    ///
-    /// Phase 1.6 (Format lift) caveat: the print param must be a
-    /// Call (`double(x)`) so the function falls back to the
-    /// single-pass codegen. `Expression::Call` is still flagged
-    /// as not-straight-line in `is_straight_line`, so the Call
-    /// forces the fallback. Without this, `print "%i", x;` would
-    /// route through the CFG path (which uses SSA-style locals
-    /// resolution instead of `STORE_POP`), and the assertion
-    /// would be vacuously true (0 STORE_POPs found, but for a
-    /// different reason).
+    /// RHS into `x`'s slot) in addition to the RHS's `CONST`.
     #[test]
     fn let_x_then_print_x_emits_store_pop() {
         use common::Instruction;
-        let bc = compile_src(
-            "fn main() { \
-                 let x = 42; \
-                 print \"%i\", double(x); \
-             } \
-             fn double(int y) -> int { return y * 2; }",
-        );
+        let bc = compile_src("fn main() { let x = 42; print \"%i\", x; }");
 
         // At least one STORE_POP — the explicit
         // pop-and-write for `let x = 42`. The codegen
@@ -5766,19 +5290,7 @@ fn main() {
 
     /// Codegen test 25 (Phase 18E): two `let` bindings in the same
     /// scope emit two `STORE_POP`s — one per binding, with
-    /// distinct slot operands (0 and 1). The pre-18E codegen
-    /// emitted no `STORE_POP`s, so this test would fail with a
-    /// 0-count.
-    ///
-    /// Phase 1.6 (Format lift) caveat: the print param must be
-    /// a Call (`double(x + y)`) so the function falls back to
-    /// the single-pass codegen. `Expression::Call` is still
-    /// flagged as not-straight-line in `is_straight_line`, so
-    /// the Call forces the fallback. Without this,
-    /// `print "%i", x + y;` would route through the CFG path
-    /// (which uses SSA-style locals resolution instead of
-    /// `STORE_POP`), and the assertion would be vacuously
-    /// true.
+    /// distinct slot operands (0 and 1).
     #[test]
     fn let_two_bindings_emit_two_store_pops() {
         use common::Instruction;
@@ -5786,9 +5298,8 @@ fn main() {
             "fn main() { \
                  let x = 5; \
                  let y = 10; \
-                 print \"%i\", double(x + y); \
-             } \
-             fn double(int z) -> int { return z * 2; }",
+                 print \"%i\", x + y; \
+             }",
         );
 
         let store_pops: Vec<u32> = bc

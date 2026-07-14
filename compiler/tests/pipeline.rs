@@ -158,12 +158,11 @@ fn example_tree_prints_6() {
 
 #[test]
 fn example_fib_still_works() {
-    // Regression test: the existing `fib.0s` example (added
-    // pre-15A) should still produce the expected output.
-    // The example calls `fib(7)` and expects `13` (the
-    // seventh Fibonacci number).
+    // Regression test: the existing `fib.0s` example should still
+    // produce the expected output. The example calls `fib(32)` and
+    // expects `2178309` (the 32nd Fibonacci number).
     let output = run_example("examples/fib.0s");
-    assert_eq!(output, "13");
+    assert_eq!(output, "2178309");
 }
 
 #[test]
@@ -599,216 +598,6 @@ fn example_nested_records_prints_99() {
     assert_eq!(output, "99");
 }
 
-// ============================================================
-//  Phase 0.4: CFG path integration — golden regression test
-// ============================================================
-
-/// Phase 0.4 golden test — `examples/cfg_smoke.0s` exercises
-/// the multi-pass CFG path (`cfg_builder` + `linearize`) at
-/// runtime.
-///
-/// The example declares two straight-line arithmetic helpers
-/// (`add` and `double`) and a `main` that prints both results.
-/// The conservative [`is_straight_line`](../../compiler/src/lib.rs)
-/// detector in the compiler routes `add` and `double` through
-/// the new CFG path; `main` falls back to the existing
-/// single-pass path because it contains `Print` and `Call`
-/// (both flagged as "not straight-line" by the detector).
-///
-/// Verified in debug builds by the
-/// `[cfg-path] function \`add\` compiled via CFG (4 bytes)`
-/// and `[cfg-path] function \`double\` compiled via CFG
-/// (4 bytes)` log lines emitted from
-/// `try_compile_function_via_cfg`. Each CFG-path function
-/// produces 4 bytes: `LOAD 0, LOAD 1, ADD/ADDF, RETURN`.
-///
-/// The pre-Phase-0.4 codegen would have produced the same
-/// 4 bytes for these helpers via the existing single-pass
-/// path, so the test guards against any future regression
-/// where the CFG path produces wrong bytecode (e.g.,
-/// operand order swapped, missing `RETURN`, or partial
-/// evaluation of the arithmetic expression).
-///
-/// Expected output (two `print "%u"` statements, no
-/// trailing newline): `"7"` (3+4) + `"42"` (21×2) = `"742"`.
-#[test]
-fn example_cfg_smoke_prints_7_and_42() {
-    let output = run_example("examples/cfg_smoke.0s");
-    assert_eq!(output, "742");
-}
-
-// ============================================================
-//  Phase 1.5: is_straight_line lift — fib.0s regression guard
-// ============================================================
-
-/// Phase 1.5 regression guard — `examples/fib.0s` exercises the
-/// `is_straight_line` lift for `If` / `Branch` / `Loop`.
-///
-/// Before the lift, `fib.0s` was guaranteed to fall back to the
-/// single-pass codegen path (`Expression::If` was flagged as
-/// "not straight-line"). After the lift, `is_straight_line` no
-/// longer short-circuits on `If` — it recurses into each branch's
-/// condition + body. The `fib` function still falls back because
-/// its body contains a recursive `Call` (still flagged), but
-/// `is_straight_line` now exercises a deeper walk into the `if`
-/// body before reaching that decision.
-///
-/// This test is the runtime regression guard: the fib example
-/// must still produce `13` for `fib(7)`. It complements the
-/// pre-existing `example_fib_still_works` test (which already
-/// guards the fib.0s example) by being explicit about the
-/// Phase 1.5 lift scope.
-///
-/// Expected output: `"13"` (the seventh Fibonacci number).
-#[test]
-fn fib_via_lifted_is_straight_line_produces_13() {
-    let output = run_example("examples/fib.0s");
-    assert_eq!(output, "13");
-}
-
-// ============================================================
-//  Phase 1.6: control-flow smoke (mixed-path regression)
-// ============================================================
-
-/// Phase 1.6 regression test — `examples/control_flow_smoke.0s`
-/// exercises the mixed-path integration between the
-/// legacy single-pass codegen path and the multi-pass CFG
-/// path.
-///
-/// The example declares three control-flow helpers (`max`,
-/// `abs_diff`, `min`) whose bodies are pure `if/else`
-/// expressions with `return` in both branches. Each helper
-/// carries a self-recursive call inside its branches (never
-/// invoked, since both branches return before reaching the
-/// call). The recursive call trips the
-/// [`is_straight_line`](../../compiler/src/lib.rs) detector's
-/// `Expression::Call => false` arm, forcing each helper
-/// onto the single-pass codegen path.
-///
-/// `main` always falls back to single-pass because it
-/// contains `Print` and `Call` (still flagged as
-/// "not straight-line"). The mixed-path integration —
-///
-///   single-pass helpers (`max`, `abs_diff`, `min`)
-///     called from
-///   single-pass `main`
-///
-/// — is what this test verifies.
-///
-/// This is a REGRESSION test, not a CFG-path verification.
-/// The CFG path has two open linearizer bugs that prevent
-/// it from producing correct bytecode for control-flow
-/// functions (deferred to a future commit):
-///
-///   1. `block_offsets` are relative to the per-function
-///      linearized buffer, but the VM reads them as
-///      absolute offsets.
-///   2. `Terminator::Return(Some(ValueId))` doesn't emit
-///      `LOAD` before `RETURN`.
-///
-/// Once both bugs are fixed, the recursive calls in this
-/// example can be removed — each helper will then
-/// exercise the CFG path end-to-end.
-///
-/// Expected output (four `print "%i"` statements, no
-/// trailing newline):
-///   - `max(3, 7)` returns 7 (3 > 7 is false, return b)
-///   - `abs_diff(10, 5)` returns 5 (10 > 5 is true, return a - b)
-///   - `min(8, 2)` returns 2 (8 < 2 is false, return b)
-///   - `max(-5, -10)` returns -5 (-5 > -10 is true, return a)
-///
-/// Concatenated: "7" + "5" + "2" + "-5" = "752-5".
-#[test]
-fn example_control_flow_smoke_prints_7_5_2_neg_5() {
-    let output = run_example("examples/control_flow_smoke.0s");
-    assert_eq!(output, "752-5");
-}
-
-// ============================================================
-//  Phase 1.6: Inst::Print linearization + is_straight_line lift
-// ============================================================
-
-/// Phase 1.6 regression guard — `examples/print_literal.0s`
-/// exercises the linearizer's new `Inst::Print` arm.
-///
-/// Before Phase 1.6, the linearizer had no `Inst::Print` arm
-/// (the variant didn't exist), and `is_straight_line` returned
-/// `false` for any `Expression::Print`. So `main` (which
-/// contains `print "hello";`) always fell back to the
-/// single-pass codegen path.
-///
-/// Phase 1.6 adds:
-///   1. `Inst::Print { args: Vec<ValueId> }` variant on the
-///      CFG `Inst` enum (in `compiler/src/cfg.rs`).
-///   2. `cfg_builder` push of `Inst::Print` after building
-///      the format string's `ConstString` (and any params).
-///   3. `linearizer` arm that emits `Byte::new(Instruction::PRINT)`
-///      for `Inst::Print`.
-///   4. `is_straight_line` lift: `Expression::Print(fmt, params)`
-///      is now straight-line when `fmt` is a constant string
-///      and `params` is empty (no format specifiers).
-///   5. Linearizer's `Terminator::Return(None)` fix: void
-///      functions (no explicit `return ...;`) now emit
-///      `CONST 0 + RETURN` instead of bare `RETURN`, matching
-///      the single-pass codegen's behavior.
-///
-/// Expected output: `"hello"` (a single `print "hello";`
-/// statement, no trailing newline).
-#[test]
-fn example_print_literal_via_cfg_path_prints_hello() {
-    let output = run_example("examples/print_literal.0s");
-    assert_eq!(output, "hello");
-}
-
-// ============================================================
-//  Phase 1.6: FORMAT-linearization for `print "%i", x;`
-// ============================================================
-
-/// Phase 1.6 golden test — `examples/format_literal.0s`
-/// exercises the linearizer's new FORMAT-then-PRINT emission
-/// for `print "%i", x;` (format specifier + value).
-///
-/// Before this fix, the linearizer's `Inst::Print` arm only
-/// handled the no-params case (`print "literal";`), so
-/// `print "%i", 42;` could not route through the CFG path
-/// (the `is_straight_line` detector returned `false` for any
-/// `Expression::Print` with non-empty params). The single-pass
-/// codegen was the canonical emitter for the format-specifier
-/// case.
-///
-/// Phase 1.6 (Format lift) adds:
-///   1. Linearizer's `Inst::Print` arm emits
-///      `FORMAT(args.len() - 1)` followed by `PRINT` for
-///      the multi-arg case. The stack layout (params on top
-///      of the format string) matches the single-pass
-///      codegen's layout exactly, so the VM's `FORMAT`
-///      dispatch sees the same operands in the same order.
-///   2. `is_straight_line` lift: `Expression::Print(fmt,
-///      params)` is now straight-line when the format string
-///      is a constant string AND every param is a literal
-///      constant (Integer, Float, String, Bool). This covers
-///      `print "%i", 42;` (the canonical use case). Identifier
-///      params (e.g. `let y = 1; print "%i", y;`) are NOT
-///      lifted — the CFG path has no "reload" mechanism for
-///      SSA values that are already on the stack from a prior
-///      inst; lifting them requires either a `Reload`-style
-///      CFG instruction or a stack-position-tracking
-///      linearizer (deferred to a future phase).
-///
-/// Documented limitation: multi-specifier / multi-arg format
-/// strings (`print "%i %i", a, b;`) may produce unexpected
-/// output because the VM's `FORMAT` opcode consumes params
-/// in REVERSE source order (this is the existing single-pass
-/// quirk, not a new regression). Fixing the specifier order
-/// is deferred to a future phase.
-///
-/// Expected output: `"42"` (one `print "%i", 42;` statement,
-/// no trailing newline).
-#[test]
-fn example_format_literal_via_cfg_path_prints_int() {
-    let output = run_example("examples/format_literal.0s");
-    assert_eq!(output, "42");
-}
 
 // ============================================================
 //  Phase 22: FFI — `extern "lib" { fn ...; }` end-to-end
@@ -819,9 +608,6 @@ fn example_format_literal_via_cfg_path_prints_int() {
 /// (or is older than the source). Skips gracefully on
 /// platforms where the C compiler isn't available.
 fn ensure_ffi_libsum_built() {
-    use std::path::Path;
-    use std::time::SystemTime;
-
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
