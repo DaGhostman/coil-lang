@@ -798,19 +798,89 @@ impl Checker {
             // application (otherwise the codegen won't know how
             // to encode the type). Returns `int`.
             Expression::Declare(args) => {
-                for arg in args {
-                    let _ = self.infer(arg);
+                if args.len() == 4 {
+                    self.infer(&args[0]);
+                    self.infer(&args[1]);
+                    match args[2].1.as_ref() {
+                        Expression::Tuple(items) => {
+                            for item in items {
+                                self.infer(item);
+                                self.require_ffi_type_expr(item);
+                            }
+                        }
+                        _ => {
+                            let mut m = Message::error(
+                                "declare(...) third argument must be an arguments tuple (T1, T2, ...)"
+                                    .to_string(),
+                                args[2].0.into_range(),
+                            );
+                            m.push(Label::new(
+                                "wrap the arg types in parentheses — (FFIType::Int, FFIType::Float)"
+                                    .to_string(),
+                                args[2].0.into_range(),
+                            ));
+                            self.messages.push(m);
+                        }
+                    }
+                    self.infer(&args[3]);
+                    self.require_ffi_type_expr(&args[3]);
+                } else {
+                    for arg in args {
+                        self.infer(arg);
+                    }
+                    let mut m = Message::error(
+                        "declare requires 4 arguments (lib, name, args_tuple, ret_type)".to_string(),
+                        range.clone(),
+                    );
+                    m.push(Label::new(
+                        format!("got {} arguments", args.len()),
+                        range.clone(),
+                    ));
+                    self.messages.push(m);
                 }
                 int()
             }
-            // `invoke(lib, fn_id, arg1, ..., argN)` — calls a
+            // `invoke(lib, fn_id, (v1, v2, ...))` — calls a
             // previously-declared function and pushes its
             // return value (or nothing for `void`). Returns
             // `int` (the codegen doesn't narrow further — the
             // user knows what they registered).
             Expression::Invoke(args) => {
-                for arg in args {
-                    let _ = self.infer(arg);
+                if args.len() == 3 {
+                    self.infer(&args[0]);
+                    self.infer(&args[1]);
+                    match args[2].1.as_ref() {
+                        Expression::Tuple(items) => {
+                            for item in items {
+                                self.infer(item);
+                            }
+                        }
+                        _ => {
+                            let mut m = Message::error(
+                                "invoke(...) third argument must be an arguments tuple (v1, v2, ...)"
+                                    .to_string(),
+                                args[2].0.into_range(),
+                            );
+                            m.push(Label::new(
+                                "wrap the arg values in parentheses — (40, 2)".to_string(),
+                                args[2].0.into_range(),
+                            ));
+                            self.messages.push(m);
+                        }
+                    }
+                } else {
+                    for arg in args {
+                        self.infer(arg);
+                    }
+                    let mut m = Message::error(
+                        "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
+                        range.clone(),
+                    );
+                    m.push(Label::new(
+                        format!("got {} arguments", args.len()),
+                        range.clone(),
+                    ));
+                    self.messages.push(m);
                 }
                 int()
             }
@@ -1392,8 +1462,43 @@ impl Checker {
         self.env.insert_top(name.to_string(), Scheme::mono(fn_ty));
     }
 
-    // ============================================================
-    //  Function / class / impl handling (Phase 5)
+    /// True when `expr` is a valid FFI type tag expression:
+    /// `FFIType::Int` / `Float` / `String` / `Void`, or a bare
+    /// primitive name (`int`, `float`, `string`, `void`).
+    fn is_ffi_type_expr(&self, expr: &Output) -> bool {
+        match expr.1.as_ref() {
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                fields: _,
+            } if *enum_name == "FFIType" => matches!(
+                *variant_name,
+                "Int" | "Float" | "String" | "Void"
+            ),
+            Expression::Type(name) => matches!(
+                name.to_lowercase().as_str(),
+                "int" | "float" | "string" | "void"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Emit a diagnostic when `expr` is not a valid FFI type tag.
+    fn require_ffi_type_expr(&mut self, expr: &Output) {
+        if self.is_ffi_type_expr(expr) {
+            return;
+        }
+        let mut m = Message::error(
+            "Expected an FFI type tag".to_string(),
+            expr.0.into_range(),
+        );
+        m.push(Label::new(
+            "use FFIType::Int, FFIType::Float, FFIType::String, FFIType::Void, or a bare int/float/string/void type name".to_string(),
+            expr.0.into_range(),
+        ));
+        self.messages.push(m);
+    }
+
     // ============================================================
 
     /// Register a class: store its name and the (visibility, name,

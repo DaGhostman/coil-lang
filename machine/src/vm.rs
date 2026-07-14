@@ -26,37 +26,6 @@ use crate::{
 /// many allocations.
 const GC_TRIGGER_INTERVAL: usize = 64;
 
-/// Built-in name table for the `NATIVE` opcode's operand.
-/// Each entry is a native function name. The compiler writes
-/// the index of the name in this table into the opcode's
-/// operand_u32. The VM decodes the index back into the name
-/// via `native_name_from_operand`.
-///
-/// A full FFI name table (with arbitrary-length strings) is
-/// deferred — we'd need an indirect-string table in the
-/// bytecode. The current 16-name limit covers the most
-/// common `libc` symbols (printf, puts, strlen, malloc, free,
-/// etc.).
-const NATIVE_NAMES: &[&str] = &[
-    "puts",   // 0
-    "printf", // 1
-    "strlen", // 2
-    "malloc", // 3
-    "free",   // 4
-    "memcpy", // 5
-    "memset", // 6
-    "exit",   // 7
-    "abs",    // 8
-    "atoi",   // 9
-    "time",   // 10
-    "clock",  // 11
-    "getenv", // 12
-    "setenv", // 13
-    "fopen",  // 14
-    "fclose", // 15
-    "inc",    // 16
-];
-
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
         {
@@ -116,11 +85,8 @@ pub struct Machine<const S: usize> {
     /// `MAKE_ENUM`); reset to zero after each collection.
     /// See [`Machine::collect_garbage`] and [`GC_TRIGGER_INTERVAL`].
     alloc_counter: usize,
-    /// FFI: registered native functions (host-side Rust
-    /// functions the bytecode can call as "natives"). Keyed
-    /// by the native's name (the same name that appears in
-    /// the `NATIVE` opcode's operand). See [`crate::ffi::Natives`]
-    /// for the registration API.
+    /// FFI: registered host native functions keyed by name and id.
+    /// Populated via [`Machine::register_fn`].
     natives: crate::ffi::Natives,
     /// FFI: shared libraries loaded for FFI symbol
     /// resolution. Keyed by library short name (e.g.
@@ -152,19 +118,28 @@ enum ExecutionOutcome {
 struct ExecutionResult {
     outcome: ExecutionOutcome,
     arity: usize,
+    /// `CALL` only: the absolute bytecode offset the inner frame
+    /// should start at. `0` means "fall through to the byte after
+    /// CALL (legacy `CALL` + `JMP` pair)" — the inner frame's first
+    /// dispatched instruction is then the `JMP`. Non-zero is the
+    /// folded form: the inner frame starts directly at the
+    /// callee body.
+    call_target: usize,
 }
 impl ExecutionResult {
     pub fn returns() -> Self {
         Self {
             outcome: ExecutionOutcome::RETURN,
             arity: 0,
+            call_target: 0,
         }
     }
 
-    pub fn call(arity: usize) -> Self {
+    pub fn call(arity: usize, target: usize) -> Self {
         Self {
             outcome: ExecutionOutcome::CALL,
             arity,
+            call_target: target,
         }
     }
 
@@ -172,6 +147,7 @@ impl ExecutionResult {
         Self {
             outcome: ExecutionOutcome::TERMINATION,
             arity: 0,
+            call_target: 0,
         }
     }
 
@@ -179,6 +155,7 @@ impl ExecutionResult {
         Self {
             outcome: ExecutionOutcome::INVALID,
             arity: usize::MAX,
+            call_target: 0,
         }
     }
 
@@ -190,6 +167,11 @@ impl ExecutionResult {
     #[inline]
     pub fn arity(&self) -> usize {
         self.arity
+    }
+
+    #[inline]
+    pub fn call_target(&self) -> usize {
+        self.call_target
     }
 }
 
@@ -250,20 +232,6 @@ impl<const S: usize> Machine<S> {
             current = reference.get_next();
         }
         None
-    }
-
-    /// Decode a `NATIVE` opcode's operand into a native name.
-    ///
-    /// The 32-bit operand is interpreted as an index into a
-    /// small built-in name table. Indices ≥ 16 are
-    /// reserved (no native is registered there by the
-    /// default `register_extern_libs`); the returned
-    /// `None` makes the `NATIVE` dispatch fail (the VM
-    /// reports the FFI failure as a runtime error). A
-    /// future patch can replace this with a string-table
-    /// indirection for arbitrarily long names.
-    fn native_name_from_operand(op: u32) -> Option<String> {
-        NATIVE_NAMES.get(op as usize).map(|s| s.to_string())
     }
 
     /// Read a C string (NUL-terminated) from a `Value` that
@@ -349,26 +317,14 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Register a new `FunctionSig` on the given `Object` —
-    /// `register_ffi_function`'s inner logic, hoisted into a
-    /// free function so the `DeclareFFI` dispatch arm can call
-    /// it without a `&mut self` method (which would clash with
-    /// the `frame` mutable borrow held across the match block).
+    /// Register a new FFI function on the given library `Object`.
     fn register_signature_on_object(
         obj: &mut Object,
-        sig: crate::memory::FunctionSig,
+        sig: crate::ffi::FfiSignature,
     ) -> Result<usize, String> {
         if let crate::memory::Object::Library(gc) = obj {
             let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
-            let id = obj_lib.signatures.len();
-            obj_lib.signatures.push(sig);
-            // Cache the name → id mapping for fast lookups by
-            // future invocations that already know the symbol
-            // name.
-            obj_lib
-                .by_name
-                .insert(obj_lib.signatures[id].name.clone(), id);
-            Ok(id)
+            crate::ffi::register_on_library(obj_lib, sig).map_err(|e| e.to_string())
         } else {
             Err("not a library object".to_string())
         }
@@ -409,20 +365,6 @@ impl<const S: usize> Machine<S> {
             .or_insert_with(|| lib_arc.clone());
         Ok(Value::from(addr as *mut u8))
     }
-    ///
-    /// The 32-bit operand is interpreted as an index into a
-    /// small built-in name table. Indices ≥ 16 are
-    /// reserved (no native is registered there by the
-    /// default `register_extern_libs`); the returned
-    /// `None` makes the `NATIVE` dispatch fail (the VM
-    /// reports the FFI failure as a runtime error). A
-    /// future patch can replace this with a string-table
-    /// indirection for arbitrarily long names.
-    //
-    // (The first declaration of `native_name_from_operand` at
-    // line 262 is the canonical one; the second copy below
-    // is from an earlier edit and would shadow it. Removed
-    // here.)
 
     /// Run a mark-and-sweep GC cycle using `stack` as the root
     /// set and `heap` as the heap to trace.
@@ -518,72 +460,45 @@ impl<const S: usize> Machine<S> {
         self.output.take()
     }
 
-    /// Register a host-side Rust function as a native that the
-    /// VM bytecode can call. The function's name must match
-    /// the name used in the source code's `register` call (and
-    /// in any subsequent `NATIVE` opcodes).
-    ///
-    /// The native is stored in the VM's `natives` registry; the
-    /// `NATIVE` opcode dispatch in the bytecode's `execute`
-    /// loop looks up the name and calls `invoke` on the
-    /// matching native.
-    ///
-    /// See [`crate::ffi::Natives::register`] for the
-    /// registration API.
-    pub fn register_native(&mut self, native: std::sync::Arc<dyn crate::ffi::NativeFn>) {
-        self.natives.register(native);
+
+    /// Register a host native with an explicit signature via the
+    /// builder API. Returns the stable native id used by
+    /// [`Instruction::HostInvoke`].
+    pub fn register_fn<F>(&mut self, sig: crate::ffi::FfiSignature, func: F) -> usize
+    where
+        F: Fn(&mut Heap, &[Value]) -> Result<Option<Value>, crate::ffi::FfiError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.natives.register(std::sync::Arc::new(
+            crate::ffi::HostClosureFn::new(sig, func),
+        ))
+    }
+
+    /// Back-compat alias for [`Self::register_fn`].
+    pub fn register_native(&mut self, native: std::sync::Arc<dyn crate::ffi::NativeFn>) -> usize {
+        self.natives.register(native)
     }
 
     /// Register a function signature on a previously-loaded
-    /// userland library. The function ID returned can be used
-    /// in subsequent `FfiInvoke` dispatches.
-    ///
-    /// `library_value` is the `Value` previously returned by
-    /// `load_userland_library`. `signature` describes the
-    /// function's C ABI (name, arg types, return type).
-    ///
-    /// Returns the function ID (the index in the library's
-    /// signature table) that should be passed as the `function_id`
-    /// operand to `FfiInvoke`.
+    /// userland library (host/test helper — userland code uses
+    /// `DeclareFFI` at runtime).
     pub fn register_ffi_function(
         &mut self,
         library_value: Value,
-        signature: crate::memory::FunctionSig,
+        signature: crate::ffi::FfiSignature,
     ) -> Result<usize, String> {
         let addr = library_value.raw() as u64;
-        // The map stores `Arc<Object>`. We need to mutate the
-        // inner `ObjLibrary` (which is reachable via the
-        // `Object::Library(Gc<ObjLibrary>)` variant). Since
-        // the `Arc<Object>` might be shared (the userland
-        // program could have passed the `Value` around), we
-        // can't get `&mut` directly. Instead, use
-        // `Arc::make_mut` (which clones if necessary).
         let mut lib_obj_arc = self
             .userland_libraries
             .get(&addr)
             .cloned()
             .ok_or_else(|| format!("not a loaded library: 0x{:x}", addr))?;
-        // `make_mut` returns `&mut Object` if we're the sole
-        // owner, or clones the inner `Object` (allocating a
-        // new `Gc<ObjLibrary>` cell) if there are other
-        // references. Either way, we get `&mut Object`.
         let lib_obj_mut = std::sync::Arc::make_mut(&mut lib_obj_arc);
         if let crate::memory::Object::Library(gc) = lib_obj_mut {
-            // The `Gc<ObjLibrary>` derefs to `ObjLibrary`
-            // (via `GcData`'s Deref). Get `&mut ObjLibrary`
-            // to push the signature. We need explicit
-            // deref_mut because Gc's DerefMut is not yet
-            // resolved by the borrow checker (the inner
-            // field is `GcData<ObjLibrary>`, not
-            // `ObjLibrary`).
-            // Get `&mut ObjLibrary` via `GcData::as_mut` (the
-            // inner field is private; the impl provides
-            // mutable access through the `AsMut` trait).
             let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
-            let id = obj_lib.signatures.len();
-            obj_lib.signatures.push(signature);
-            // Re-insert the (possibly newly-cloned) `Arc<Object>`
-            // so the VM keeps the latest version.
+            let id = crate::ffi::register_on_library(obj_lib, signature).map_err(|e| e.to_string())?;
             self.userland_libraries
                 .insert(addr, std::sync::Arc::new(lib_obj_mut.clone()));
             Ok(id)
@@ -592,70 +507,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Register all FFI functions from an `extern "libname" { ... }`
-    /// block in one shot.
-    ///
-    /// `extern_libs` is the map populated by the compiler's
-    /// `Expression::ExternBlock` codegen (function name →
-    /// library short name). For each function, the VM loads
-    /// the library (if not already loaded), resolves the
-    /// symbol, and registers a `LibraryFn` as a native.
-    ///
-    /// If a function's library can't be loaded or its symbol
-    /// can't be resolved, this method logs a warning to
-    /// stderr and skips the function. The VM will then report
-    /// an "unknown function" error if the bytecode calls it.
-    /// (The compiler's typechecker would have caught the
-    /// mismatch earlier; the runtime failure is the safety
-    /// net.)
-    pub fn register_extern_libs(
-        &mut self,
-        extern_libs: &std::collections::HashMap<String, String>,
-    ) {
-        for (function_name, library_name) in extern_libs {
-            // Load the library (or look up the cached one).
-            // `load_library` already returns `Arc<Library>`; we
-            // just clone the Arc for the cache.
-            let lib = if let Some(lib) = self.libraries.get(library_name) {
-                Some(lib.clone())
-            } else {
-                match crate::ffi::load_library(library_name) {
-                    Ok(lib_arc) => {
-                        self.libraries.insert(library_name.clone(), lib_arc.clone());
-                        Some(lib_arc)
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "FFI: failed to load library `{}` for `{}`: {:?}",
-                            library_name, function_name, e
-                        );
-                        continue;
-                    }
-                }
-            };
-            let lib = match lib {
-                Some(l) => l,
-                None => continue,
-            };
-            // Resolve the symbol and register as a native.
-            // We use the function's own name as the symbol
-            // name (so `extern "c" { fn puts(...); }` resolves
-            // `puts` from `libc`).
-            match crate::ffi::LibraryFn::new(function_name, function_name, lib) {
-                Ok(lib_fn) => {
-                    self.natives.register(std::sync::Arc::new(lib_fn));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "FFI: failed to resolve `{}` in `{}`: {}",
-                        function_name, library_name, e
-                    );
-                }
-            }
-        }
-    }
-
-    /// Manually trigger a GC cycle. The normal path is
+    /// Manually trigger a GC cycle.
     /// allocation-pressure-driven (`alloc_counter` exceeds
     /// [`GC_TRIGGER_INTERVAL`]); this method exists for tests
     /// that want to deterministically verify GC behaviour
@@ -694,14 +546,36 @@ impl<const S: usize> Machine<S> {
 
             match result.outcome() {
                 ExecutionOutcome::CALL => {
-                    self.frames.get_mut().seek(code_iter.tell() + 1);
-                    // code_iter.seek(result.tell());
-                    self.frames.current_mut().enter();
-                    self.frames
-                        .current_mut()
-                        .set(self.stack.tell() - result.arity());
+                    // Phase 18G perf optimisation — fold the legacy
+                    // `CALL arity; JMP offset` pair into a single
+                    // `CALL arity, target` whose target lives in
+                    // `value[31:0]`. Older bytecode archives
+                    // (value = 0) fall through to the JMP after
+                    // CALL — the inner frame's first instruction
+                    // is then the JMP, which seeks.
+                    //
+                    // folded form (target != 0):
+                    //   - caller's return IP = current cursor
+                    //     (the byte right after CALL)
+                    //   - the callee starts at `target` immediately
+                    // legacy form (target == 0):
+                    //   - caller's return IP = current cursor + 1
+                    //     (the byte right after the JMP that
+                    //     follows CALL)
+                    //   - the callee runs JMP first, which seeks
+                    let target = result.call_target();
+                    let return_ip = code_iter.tell() + if target == 0 { 1 } else { 0 };
+                    let arity = result.arity();
+                    let callee_sp = self.stack.tell() - arity;
 
+                    self.frames.get_mut().seek(return_ip);
+                    self.frames.current_mut().enter();
+                    self.frames.current_mut().set(callee_sp);
                     self.frames.consume();
+
+                    if target != 0 {
+                        code_iter.seek(target);
+                    }
                 }
                 ExecutionOutcome::RETURN => {
                     let current = self.frames.pop();
@@ -997,7 +871,10 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::CALL => {
-                    return ExecutionResult::call(opcode.operand_u32() as usize);
+                    return ExecutionResult::call(
+                        opcode.operand_u32() as usize,
+                        opcode.value_u32() as usize,
+                    );
                 }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
@@ -1031,29 +908,7 @@ impl<const S: usize> Machine<S> {
                 // layout. (A name-table indirection would shrink
                 // the bytecode but is deferred until needed.)
                 Instruction::NATIVE => {
-                    // The operand is a fixed 4-byte hash of the
-                    // native's name. We look the name up in a
-                    // small side-table populated by
-                    // `register_extern_libs` and `register_native`.
-                    // (A real FFI would carry the name as a
-                    // string; for now we use a tiny inline name
-                    // table so the bytecode stays compact.)
-                    let raw = opcode.operand_u32();
-                    let name = Self::native_name_from_operand(raw)
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let arity = self.natives.get(&name).map(|n| n.arity()).unwrap_or(0);
-                    let mut args: Vec<Value> = Vec::with_capacity(arity);
-                    for _ in 0..arity {
-                        args.push(self.stack.pop());
-                    }
-                    args.reverse(); // source order: first arg first
-                    let result = self
-                        .natives
-                        .get(&name)
-                        .and_then(|n| n.invoke(&self.heap, &args));
-                    if let Some(v) = result {
-                        self.stack.push(v);
-                    }
+                    eprintln!("FFI: deprecated NATIVE opcode — recompile from source");
                 }
                 // FFI library load (userland `load(path)`).
                 // Pops a string (the library path), `dlopen`s
@@ -1142,7 +997,7 @@ impl<const S: usize> Machine<S> {
                     // a `values.reverse()` (matching MakeArray /
                     // MakeEnum's source-order convention).
                     let raw = opcode.operand_u32();
-                    let arity = (raw & 0xFFFF) as usize;
+                    let _arity = (raw & 0xFFFF) as usize;
 
                     // Pop the tuple (top of stack).
                     let tuple_val = self.stack.pop();
@@ -1172,7 +1027,7 @@ impl<const S: usize> Machine<S> {
                     };
 
                     let lib_obj = self.userland_libraries.get(&lib_addr).cloned();
-                    let result = match lib_obj {
+                    let invoke_result = match lib_obj {
                         Some(obj) => {
                             let l = match obj.as_ref() {
                                 crate::memory::Object::Library(gc) => gc,
@@ -1180,33 +1035,51 @@ impl<const S: usize> Machine<S> {
                             };
                             let lib_ref: &crate::memory::ObjLibrary = &(**l).as_ref();
                             if function_id < lib_ref.signatures.len() {
-                                let sig = lib_ref.signatures[function_id].clone();
-                                crate::ffi::call_through_library(
-                                    &lib_ref.library,
-                                    &sig,
-                                    &args,
-                                    &self.heap,
-                                )
+                                let registered = &lib_ref.signatures[function_id];
+                                let ffi_sig = registered.ffi_signature();
+                                if args.len() != ffi_sig.arity() {
+                                    eprintln!(
+                                        "FFI: arity mismatch at invoke (expected {}, got {})",
+                                        ffi_sig.arity(),
+                                        args.len()
+                                    );
+                                    Err(crate::ffi::FfiError::ArityMismatch {
+                                        expected: ffi_sig.arity(),
+                                        got: args.len(),
+                                    })
+                                } else {
+                                    crate::ffi::invoke_via_libffi(
+                                        &registered.prepared,
+                                        &ffi_sig,
+                                        &args,
+                                        &mut self.heap,
+                                    )
+                                }
                             } else {
                                 eprintln!(
-                                    "FFI: function_id={} out of range (library has {} signatures; arity={})",
+                                    "FFI: function_id={} out of range (library has {} signatures)",
                                     function_id,
-                                    lib_ref.signatures.len(),
-                                    arity
+                                    lib_ref.signatures.len()
                                 );
-                                None
+                                Err(crate::ffi::FfiError::Unsupported(
+                                    "function id out of range".into(),
+                                ))
                             }
                         }
                         None => {
                             eprintln!(
-                                "FFI: FfiInvoke on a non-library value or unknown function_id={}",
+                                "FFI: FfiInvoke on a non-library value (function_id={})",
                                 function_id
                             );
-                            None
+                            Err(crate::ffi::FfiError::Unsupported(
+                                "invalid library handle".into(),
+                            ))
                         }
                     };
-                    if let Some(v) = result {
-                        self.stack.push(v);
+                    match invoke_result {
+                        Ok(Some(v)) => self.stack.push(v),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("FFI invoke failed: {e}"),
                     }
                 }
                 // FFI signature declaration (userland
@@ -1239,7 +1112,7 @@ impl<const S: usize> Machine<S> {
                 //   3 = Void
                 Instruction::DeclareFFI => {
                     let raw = opcode.operand_u32();
-                    let arity = (raw & 0xFFFF) as usize;
+                    let _arity = (raw & 0xFFFF) as usize;
 
                     // Phase 26 — stack discipline:
                     //   bottom:  lib_handle
@@ -1294,13 +1167,12 @@ impl<const S: usize> Machine<S> {
                     let result_id = match lib_obj {
                         Some(obj_arc) => {
                             let mut owned = (*obj_arc).clone();
-                            let sig = crate::memory::FunctionSig {
+                            let ffi_sig = crate::ffi::FfiSignature {
                                 name,
-                                arity,
-                                arg_types,
-                                ret_type,
+                                args: arg_types,
+                                ret: ret_type,
                             };
-                            match Self::register_signature_on_object(&mut owned, sig) {
+                            match Self::register_signature_on_object(&mut owned, ffi_sig) {
                                 Ok(id) => {
                                     self.userland_libraries
                                         .insert(lib_addr, std::sync::Arc::new(owned));
@@ -1326,6 +1198,29 @@ impl<const S: usize> Machine<S> {
                         // (which is a heap handle from the
                         // signature table).
                         self.stack.push(Value::from(-1_i64));
+                    }
+                }
+                Instruction::HostInvoke => {
+                    let raw = opcode.operand_u32();
+                    let _arity = (raw & 0xFFFF) as usize;
+                    let tuple_val = self.stack.pop();
+                    let tuple_addr = tuple_val.raw() as u64;
+                    let fn_id_val = self.stack.pop();
+                    let fn_id = fn_id_val.as_int() as usize;
+                    let args: Vec<Value> = match Self::find_object_by_addr(
+                        &self.heap,
+                        tuple_addr,
+                    ) {
+                        Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.clone(),
+                        _ => Vec::new(),
+                    };
+                    match self.natives.get_by_id(fn_id) {
+                        Some(native) => match native.invoke(&mut self.heap, &args) {
+                            Ok(Some(v)) => self.stack.push(v),
+                            Ok(None) => {}
+                            Err(e) => eprintln!("HostInvoke failed for `{}`: {e}", native.name()),
+                        },
+                        None => eprintln!("HostInvoke: unknown native id {fn_id}"),
                     }
                 }
                 Instruction::HALT => {
@@ -2756,41 +2651,38 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 10);
     }
 
-    /// FFI: register a host-side Rust closure as a native, then
-    /// call it from the VM bytecode via the `NATIVE` opcode.
-    /// The native increments a thread-local counter, and the
-    /// test asserts the counter went up by the right amount.
+    /// Host native dispatch via explicit signature registry.
     #[test]
-    fn ffi_native_dispatch_invokes_rust_closure() {
-        use crate::ffi::NullaryVoid;
+    fn host_invoke_dispatches_rust_closure() {
+        use crate::ffi::FfiSignatureBuilder;
+        use crate::memory::FfiType;
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        // Build a native called "inc" that increments the
-        // counter on every invocation.
-        let native = NullaryVoid::new("inc", || {
-            COUNTER.fetch_add(1, Ordering::SeqCst);
-        });
+        let sig = FfiSignatureBuilder::new("inc")
+            .ret(FfiType::Void)
+            .build()
+            .unwrap();
         let mut vm = Machine::<4>::default();
-        vm.register_native(std::sync::Arc::new(native));
-        // The "inc" name's index in `NATIVE_NAMES`. We rebuild
-        // the index here to keep the test in sync with the
-        // name table.
-        let inc_idx = super::NATIVE_NAMES
-            .iter()
-            .position(|n| *n == "inc")
-            .expect("NATIVE_NAMES must contain 'inc' for this test") as u32;
+        let fn_id = vm.register_fn(sig, |_heap, _args| {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        });
         vm.run(&[
-            // Call "inc" once
-            Byte::new(Instruction::NATIVE).with_operand_u32(inc_idx),
-            // Call it twice more
-            Byte::new(Instruction::NATIVE).with_operand_u32(inc_idx),
-            Byte::new(Instruction::NATIVE).with_operand_u32(inc_idx),
+            Byte::new(Instruction::CONST).with_value_u32(fn_id as u32),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(0),
+            Byte::new(Instruction::HostInvoke).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_value_u32(fn_id as u32),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(0),
+            Byte::new(Instruction::HostInvoke).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_value_u32(fn_id as u32),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(0),
+            Byte::new(Instruction::HostInvoke).with_operand_u32(0),
             Byte::new(Instruction::HALT),
         ]);
         assert_eq!(
             COUNTER.load(Ordering::SeqCst),
             3,
-            "NATIVE opcode should have invoked the Rust closure 3 times"
+            "HostInvoke should have invoked the Rust closure 3 times"
         );
     }
 }

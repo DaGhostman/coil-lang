@@ -815,32 +815,48 @@ pub struct ObjLibrary {
     /// The loaded shared library. Kept alive as long as the
     /// `Value` referencing this `Object` is live.
     pub library: std::sync::Arc<crate::ffi::Library>,
-    /// Cached function signatures, in declaration order.
-    /// Indexed by the userland `lib.invoke("name", ...)`
-    /// call's resolved function ID.
-    pub signatures: Vec<FunctionSig>,
+    /// Cached FFI registrations, in declaration order.
+    /// Indexed by the userland `invoke(lib, fn_id, ...)` id.
+    pub signatures: Vec<RegisteredFunction>,
     /// Lookup table from function name (as it appears in
-    /// the source) to its index in `signatures`. Built
-    /// lazily on the first `invoke` (or eagerly by
-    /// `Machine::register_extern_libs`).
+    /// the source) to its index in `signatures`.
     pub by_name: std::collections::HashMap<String, usize>,
 }
 
-/// C signature for an FFI function, cached at the call site
-/// (or pre-built by the compiler's `extern` block). Used by
-/// `Machine::resolve_ffi` to marshal arguments and the return
-/// value between zero-script `Value`s and C ABI types.
+/// C signature metadata for an FFI function.
 #[derive(Clone, Debug)]
 pub struct FunctionSig {
-    /// The function's name as it appears in source (and in
-    /// the symbol table of the loaded library).
     pub name: String,
-    /// Number of arguments (matches the C function's arity).
     pub arity: usize,
-    /// Argument types, in source order (first arg first).
     pub arg_types: Vec<FfiType>,
-    /// Return type.
     pub ret_type: FfiType,
+}
+
+impl FunctionSig {
+    pub fn from_ffi_signature(sig: &crate::ffi::FfiSignature) -> Self {
+        Self {
+            name: sig.name.clone(),
+            arity: sig.arity(),
+            arg_types: sig.args.clone(),
+            ret_type: sig.ret,
+        }
+    }
+}
+
+/// A declared FFI function with a prepared libffi call interface.
+pub struct RegisteredFunction {
+    pub sig: FunctionSig,
+    pub prepared: crate::ffi::PreparedCall,
+}
+
+impl RegisteredFunction {
+    pub fn ffi_signature(&self) -> crate::ffi::FfiSignature {
+        crate::ffi::FfiSignature {
+            name: self.sig.name.clone(),
+            args: self.sig.arg_types.clone(),
+            ret: self.sig.ret_type,
+        }
+    }
 }
 
 /// C ABI types for FFI argument and return values. Each

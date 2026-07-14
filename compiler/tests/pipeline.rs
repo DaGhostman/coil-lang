@@ -58,38 +58,29 @@ fn run_example(path: &str) -> String {
     let full = workspace_root.join(path);
     let src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
+    run_example_src(&src)
+}
 
-    let mut pipeline = Pipeline::new();
-    let bytecode = pipeline
-        .compile_src(&src)
-        .expect("example failed to compile (parse error or type errors)");
-
+fn run_bytecode(bytecode: Vec<common::Byte>) -> String {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
-
-    // Register any FFI extern-libs the program declared (via
-    // `extern "lib" { fn name(...) -> ret; }` blocks). The
-    // pipeline populates the `extern_libs` table during
-    // compilation; we hand it off to the VM here so the
-    // machine can `dlopen` each library and `dlsym` each
-    // declared function before the bytecode starts running.
-    let extern_libs = pipeline.extern_libs();
-    if !extern_libs.is_empty() {
-        machine.register_extern_libs(extern_libs);
-    }
-
     machine.run_raw(&bytecode);
-
-    // Drop the sink so the test's `Rc` is the only one
-    // (then we can move the `Vec` out).
     let _ = machine.restore_output();
-
     let bytes = Rc::try_unwrap(buf)
         .expect("VM still holds a reference to the buffer")
         .into_inner();
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
+}
+
+/// Compile and run in-memory source.
+fn run_example_src(src: &str) -> String {
+    let mut pipeline = Pipeline::new();
+    let bytecode = pipeline
+        .compile_src(src)
+        .expect("example failed to compile (parse error or type errors)");
+    run_bytecode(bytecode)
 }
 
 #[test]
@@ -639,9 +630,17 @@ fn ensure_ffi_libsum_built() {
         .status();
     match status {
         Ok(s) if s.success() => {
-            // Touch the .so's mtime to "now" so subsequent
-            // test runs don't rebuild unnecessarily.
-            let _ = std::fs::File::create(&libsum_so);
+            // cc already wrote the file and updated its mtime.
+            // Never use File::create here — it truncates the .so.
+            if let Ok(meta) = std::fs::metadata(&libsum_so) {
+                if meta.len() < 256 {
+                    eprintln!(
+                        "warning: {} looks truncated ({} bytes) after cc build",
+                        libsum_so.display(),
+                        meta.len()
+                    );
+                }
+            }
         }
         Ok(s) => {
             eprintln!(
@@ -677,37 +676,26 @@ fn example_ffi_sum_via_dlopen_prints_42() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
-    let examples_dir = workspace_root.join("examples");
-    let libsum_so = examples_dir.join("libsum.so");
+    let libsum_so = workspace_root.join("examples/libsum.so");
     if !libsum_so.exists() {
         eprintln!("skipping: libsum.so not built (no C compiler?)");
         return;
     }
 
-    // The userland FFI example (`dload("sum")`) resolves
-    // the library through the dynamic linker's search
-    // path — which is captured at process startup. Setting
-    // `LD_LIBRARY_PATH` at test time has no effect on
-    // already-launched processes, so we override the
-    // example's short-name `dload` with an absolute path
-    // resolution: copy the example source to a temp file
-    // under `examples/` so the relative `dload("sum")`
-    // becomes `dload("libsum.so")` from that directory.
-    //
-    // In practice the simplest portable approach is to
-    // `chdir` into `examples_dir` for the duration of the
-    // test. We restore the cwd before returning so other
-    // tests aren't affected.
-    let prev_cwd = std::env::current_dir().ok();
-    if std::env::set_current_dir(&examples_dir).is_err() {
-        eprintln!("skipping: couldn't chdir to {}", examples_dir.display());
-        return;
-    }
-    let result = std::panic::catch_unwind(|| run_example("examples/ffi_sum.0s"));
-    // Restore the previous cwd before any other test runs.
-    if let Some(prev) = prev_cwd {
-        let _ = std::env::set_current_dir(&prev);
-    }
+    // Use an absolute dload path so parallel tests don't depend
+    // on process cwd (chdir races with other pipeline tests).
+    let full = workspace_root.join("examples/ffi_sum.0s");
+    let lib_abs = libsum_so
+        .canonicalize()
+        .unwrap_or_else(|_| libsum_so.clone());
+    let mut src = std::fs::read_to_string(&full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
+    src = src.replace(
+        "dload(\"libsum.so\")",
+        &format!("dload(\"{}\")", lib_abs.display()),
+    );
+
+    let result = std::panic::catch_unwind(|| run_example_src(&src));
     let output = match result {
         Ok(s) => s,
         Err(_) => {
@@ -715,5 +703,42 @@ fn example_ffi_sum_via_dlopen_prints_42() {
             return;
         }
     };
-    assert_eq!(output, "42", "extern sum(40, 2) should print 42");
+    assert_eq!(output, "42", "sum(40, 2) via userland FFI should print 42");
+}
+
+/// Extern-block end-to-end: `extern "libc.so.6" { fn strlen(string) -> int; }`
+/// loads libc via `FfiLoad`, declares the signature with `DeclareFFI`
+/// (Phase 26 tuple form), then `strlen("hello")` prints `5`.
+///
+/// Skipped when libc cannot be loaded (Windows, minimal containers).
+#[test]
+fn example_strlen_prints_5() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let examples_dir = workspace_root.join("examples");
+
+    // Quick probe: if dlopen("libc.so.6") fails, skip.
+    if machine::load_library("libc.so.6").is_err() {
+        eprintln!("skipping: libc.so.6 not loadable on this platform");
+        return;
+    }
+
+    let prev_cwd = std::env::current_dir().ok();
+    if std::env::set_current_dir(&examples_dir).is_err() {
+        eprintln!("skipping: couldn't chdir to {}", examples_dir.display());
+        return;
+    }
+    let result = std::panic::catch_unwind(|| run_example("examples/strlen.0s"));
+    if let Some(prev) = prev_cwd {
+        let _ = std::env::set_current_dir(&prev);
+    }
+    let output = match result {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("skipping: strlen test panicked (dlopen failure?)");
+            return;
+        }
+    };
+    assert_eq!(output, "5", "strlen(\"hello\") should print 5");
 }

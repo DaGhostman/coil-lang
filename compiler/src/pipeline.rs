@@ -11,6 +11,7 @@ use common::{
     ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Message,
     MessageKind,
 };
+use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use rkyv::rancor::Error;
 
@@ -54,6 +55,8 @@ pub struct Pipeline {
     /// with the typechecker when a native call is
     /// typechecked.
     natives: Vec<NativeDecl>,
+    /// Host Rust closures registered via [`Self::register_host_native`].
+    host_natives: Vec<std::sync::Arc<dyn NativeFn>>,
     /// The entry file (the file passed to `compile`).
     /// This file is special: it's the program root and
     /// lives in the top-level namespace (no prefix),
@@ -93,7 +96,7 @@ source_cache: Vec<Option<String>>,
 pub struct NativeDecl {
     pub name: String,
     pub namespace: String,
-    pub arity: usize,
+    pub sig: FfiSignature,
 }
 
 impl Default for Pipeline {
@@ -103,27 +106,58 @@ impl Default for Pipeline {
 }
 
 impl Pipeline {
-    /// Register a native function for the VM. The native
-    /// is stored with its qualified name (namespace + name)
-    /// so the bytecode's `NATIVE` opcode can find it.
-    ///
-    /// Phase 29A — replaces the previous `todo!()` stub.
-    /// The pipeline forwards the registration to the
-    /// `Compiler` (which records the type signature for
-    /// typechecking). The actual function pointer is
-    /// registered with the VM at startup; this method
-    /// only describes the type.
+    /// Register a host native with an explicit [`FfiSignature`]
+    /// and Rust closure. The signature is forwarded to the HM
+    /// typechecker; the closure is stored for
+    /// [`Self::wire_host_natives`].
+    pub fn register_host_native<F>(
+        &mut self,
+        sig: FfiSignature,
+        func: F,
+    ) -> usize
+    where
+        F: Fn(&mut Heap, &[common::Value]) -> Result<Option<common::Value>, FfiError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let params: Vec<crate::typechecking::ty::Ty> =
+            sig.args.iter().copied().map(ffi_type_to_ty).collect();
+        let ret = ffi_type_to_ty(sig.ret);
+        self.compiler.register(&sig.name, &params, &ret);
+        let id = self.host_natives.len();
+        self.host_natives.push(std::sync::Arc::new(
+            HostClosureFn::new(sig, func),
+        ));
+        id
+    }
+
+    /// Register a native function's type signature (metadata
+    /// only — no VM closure). Embedders that supply their own
+    /// closures should prefer [`Self::register_host_native`].
     pub fn register_native_function(
         &mut self,
         name: String,
         namespace: String,
-        arity: usize,
+        sig: FfiSignature,
     ) {
+        let params: Vec<crate::typechecking::ty::Ty> =
+            sig.args.iter().copied().map(ffi_type_to_ty).collect();
+        let ret = ffi_type_to_ty(sig.ret);
+        self.compiler.register(&name, &params, &ret);
         self.natives.push(NativeDecl {
             name,
             namespace,
-            arity,
+            sig,
         });
+    }
+
+    /// Wire host natives registered via [`Self::register_host_native`]
+    /// into the VM. Call before `Machine::run_raw`.
+    pub fn wire_host_natives<const N: usize>(&self, machine: &mut machine::Machine<N>) {
+        for native in &self.host_natives {
+            machine.register_native(std::sync::Arc::clone(native));
+        }
     }
 
     /// Borrow the inner `Compiler` mutably. Used by the
@@ -171,6 +205,7 @@ impl Pipeline {
             processed: Vec::new(),
             worklist: VecDeque::new(),
             natives: Vec::new(),
+            host_natives: Vec::new(),
             entry_file: None,
             source_interner: common::Interner::default(),
             source_cache: Vec::new(),
@@ -808,17 +843,6 @@ impl Pipeline {
         Ok(std::mem::take(&mut self.bytecode))
     }
 
-    /// Borrow the FFI library map populated by the last
-    /// `compile` (or `compile_test`) call. Each entry maps a
-    /// function name declared in an `extern "libname" { ... }`
-    /// block to the library short name (`"sum"`, `"c"`, ...).
-    /// The test runner passes this map to
-    /// `Machine::register_extern_libs` so the VM loads
-    /// the libraries and binds the symbols at startup.
-    pub fn extern_libs(&self) -> &std::collections::HashMap<String, String> {
-        self.compiler.extern_libs()
-    }
-
     /// Borrow the list of natively-registered functions.
     /// Phase 29A — used by the host to register natives
     /// with the VM at startup.
@@ -953,5 +977,15 @@ mod tests {
             let _ = builder;
         }));
         assert!(result.is_ok());
+    }
+}
+
+fn ffi_type_to_ty(ty: FfiType) -> crate::typechecking::ty::Ty {
+    use crate::typechecking::ty::{float, int, string, unit};
+    match ty {
+        FfiType::Int => int(),
+        FfiType::Float => float(),
+        FfiType::String => string(),
+        FfiType::Void => unit(),
     }
 }

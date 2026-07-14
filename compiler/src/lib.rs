@@ -505,14 +505,6 @@ pub struct Compiler {
     /// the `Expression::Function` arm.
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
-    /// Phase 22b: compile-time FFI table populated by the
-    /// `Expression::ExternBlock` codegen. Maps each function
-    /// name declared by an `extern` block to the SHORT
-    /// library name (so the test runner / pipeline can
-    /// register them via `Machine::register_extern_libs` at
-    /// VM startup). Multiple functions in one block share an
-    /// entry.
-    extern_libs: HashMap<String, String>,
     /// Phase 22b: runtime-emit FFI metadata for `extern` blocks.
     /// Maps the library short name to the let-slot holding
     /// the library handle that the runtime's `FfiLoad`
@@ -575,7 +567,6 @@ impl Default for Compiler {
             functions: HashMap::with_capacity(32),
             module_items: std::collections::HashMap::default(),
             native: HashMap::default(),
-            extern_libs: HashMap::with_capacity(4),
             extern_runtime_libs: HashMap::with_capacity(4),
             extern_runtime_functions: HashMap::with_capacity(16),
             extern_runtime_libs_loaded: HashSet::new(),
@@ -1018,20 +1009,6 @@ impl Compiler {
             .variables
             .key(&name.to_string())
             .map(|s| s as u32)
-    }
-
-    /// Borrow the FFI library map populated by the last
-    /// `compile` (or `compile_test`) call. Each entry maps a
-    /// function name declared in an `extern "libname" { ... }`
-    /// block to the library short name (`"c"`, `"ssl"`, ...).
-    /// Tests pass this map to
-    /// [`Machine::register_extern_libs`](../../machine/src/vm.rs)
-    /// so the VM loads the libraries and binds the symbols
-    /// at startup (mirrored today by the runtime-emit
-    /// `FfiLoad`/`DeclareFFI` opcodes; the compile-time
-    /// table is kept for the existing pipeline test runner).
-    pub fn extern_libs(&self) -> &HashMap<String, String> {
-        &self.extern_libs
     }
 
     pub fn get_messages(&self) -> &Vec<Message> {
@@ -2079,8 +2056,31 @@ impl Compiler {
                     );
                     self.bytecode.append(&mut arg_bc);
                     self.bytecode.push(
+                        Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32),
+                    );
+                    self.bytecode.push(
                         Byte::new(Instruction::FfiInvoke)
                             .with_operand_u32(arity as u32),
+                    );
+                } else if let Some(&native_id) = self.native.get(&n) {
+                    let mut arg_bc = Vec::new();
+                    let arity = if let Some(items) = args {
+                        for arg in items {
+                            arg_bc.append(&mut self.do_compile(arg));
+                        }
+                        items.len()
+                    } else {
+                        0
+                    };
+                    self.bytecode.push(
+                        Byte::new(Instruction::CONST).with_value_u32(native_id as u32),
+                    );
+                    self.bytecode.append(&mut arg_bc);
+                    self.bytecode.push(
+                        Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32),
+                    );
+                    self.bytecode.push(
+                        Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
                     );
                 } else if let Some(offset) = self.functions.get(&n).copied() {
                     if let Some(args) = args {
@@ -2088,12 +2088,18 @@ impl Compiler {
                             .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                     }
 
-                    bytecode.push(Byte::new(Instruction::CALL).with_operand_u32(
-                        args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                    ));
-                    bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(offset as u32));
-                } else if self.native.get(&n).is_some() {
-                    todo!("Not implemented");
+                    // Phase 18G perf: fold `CALL arity; JMP target`
+                    // into a single `CALL arity, target` whose target
+                    // lives in `value[31:0]`. Saves one VM dispatch
+                    // per call site (recursive functions like
+                    // `fib` pay this on every recursive call).
+                    bytecode.push(
+                        Byte::new(Instruction::CALL)
+                            .with_operand_u32(
+                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                            )
+                            .with_value_u32(offset as u32),
+                    );
                 } else {
                     let mut message =
                         Message::error("Unknown function".to_string(), span.into_range());
@@ -2603,23 +2609,8 @@ impl Compiler {
                             .with_operand_u32(lib_slot),
                     );
                 }
-                // 2b. ALSO populate the legacy compile-time
-                //     extern_libs table. The test runner's
-                //     `Machine::register_extern_libs` reads
-                //     this to do compile-time dlopen via the
-                //     `NATIVE` opcode. With the runtime
-                //     emission above, this is redundant for
-                //     fresh VMs but keeps backward compat with
-                //     the existing pipeline tests.
-                for decl in declarations {
-                    self.extern_libs
-                        .entry(decl.name.to_string())
-                        .or_insert_with(|| library.clone());
-                }
-                // 3. For each declared function, emit
-                //    `declare(lib, name, arg_tags...,
-                //    ret_tag)` and store the function id in
-                //    a let-slot.
+                // 3. For each declared function, emit declare(lib,
+                //    name, (arg_tags...), ret) and store fn id.
                 for decl in declarations {
                     let fn_name = decl.name.to_string();
                     // First-wins on fn-name collisions across
@@ -2717,7 +2708,10 @@ impl Compiler {
                         }
                     }
                     let arity = arg_type_tags.len() as u32;
-                    // Push the ret type tag.
+                    self.bytecode.push(
+                        Byte::new(Instruction::MakeTuple).with_operand_u32(arity),
+                    );
+                    // Push the ret type tag (top of stack for DeclareFFI).
                     let ret_tag = decl
                         .returns
                         .and_then(|s| ffi_type_tag_from_str(s))

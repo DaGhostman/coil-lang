@@ -3096,166 +3096,84 @@ deleted and subsequent opcodes renumbered.
 
 ### Summary
 
-Added end-to-end FFI support: the language's `extern
-"libname" { fn name(args) -> ret; ... }` block declares
-external functions loaded from a shared library. The
-parser produces an `Expression::ExternBlock` AST node; the
-typechecker registers each declared function as a native;
-the compiler emits zero bytecode for the block (the
-declaration is metadata, the actual `dlopen`/`dlsym`
-happens at VM startup); the VM loads the shared library
-via `libloading` and resolves the symbol on first call.
+End-to-end FFI with **explicit signatures and libffi dynamic dispatch**.
+There is a single invoke path: `DeclareFFI` registers a function (dlsym +
+prepared CIF at declare time); `FfiInvoke` / `HostInvoke` call through
+libffi or a host closure — **no signature guessing**.
 
-Two registration paths coexist:
+Entry points:
 
-1. **Host-registered natives** — a Rust program that embeds
-   the VM can register a `Box<dyn Fn>` (or similar)
-   directly via `Machine::register_native`. The native is
-   stored in the VM's `natives` registry keyed by name.
-2. **Dynamic-library (FFI) natives** — the language's
-   `extern "libname" { ... }` block triggers
-   `Machine::register_extern_libs`, which calls
-   `libloading::Library::new(name)` for each unique
-   library name and `libloading::Library::get<T>(sym)` for
-   each function. The resolved function pointer is
-   wrapped in a `LibraryFn` and stored in the same
-   `natives` registry.
+1. **`extern "lib" { fn f(...); }`** — compile-time bytecode emits
+   `FfiLoad` + `DeclareFFI` + `FfiInvoke` (Phase 26 tuple stack form).
+2. **Userland `dload` / `declare` / `invoke`** — same opcodes at runtime.
+3. **Host embedder** — `Machine::register_fn(FfiSignature, closure)` +
+   `HostInvoke` bytecode from `Compiler::register()`.
 
-Both paths produce a `Box<dyn NativeFn>` (the
-`NativeFn` trait), and the VM's `NATIVE` opcode dispatch
-calls `native.invoke(heap, args)` regardless of how the
-native was registered.
+Legacy paths removed: `register_extern_libs`, `extern_libs`,
+`LibraryFn::new` guess loop, `NATIVE_NAMES` table. `Instruction::NATIVE`
+remains in the enum for archive stability but dispatch is a no-op.
+`ARCHIVE_VERSION = 3` (adds `HostInvoke`).
+
+### Module layout (`machine/src/ffi/`)
+
+- `signature.rs` — `FfiSignature`, `FfiSignatureBuilder`, `FfiError`
+- `call.rs` — `prepare_cif`, `prepare_cif_for_symbol`, `invoke_via_libffi`
+- `registry.rs` — `NativeFn`, `HostClosureFn`, `Natives`
+- `mod.rs` — `register_on_library`, `load_library`
 
 ### ABI
 
-The current implementation supports a fixed set of C
-signatures (see [`crate::ffi::LibraryFn::new`]'s
-"try-each-signature-in-order" loop):
+`FfiType` maps to libffi: `Int`→`i64`, `Float`→`f64`, `String`→pointer,
+`Void`→void. Supported at declare time; libffi rejects invalid combos.
+String returns from C are copied into a fresh `ObjString` immediately.
 
-- `() -> ()`
-- `(i64) -> ()`
-- `(i64) -> i64`
-- `(*const c_char) -> ()`
-- `(*const c_char) -> i64`
+### Stack discipline (Phase 26)
 
-Variadic functions and other signatures are not supported
-yet; adding a new signature is a 6-line addition
-(extend the `LibraryFnKind` enum and add one match arm
-in `LibraryFn::new`).
+- **`DeclareFFI`**: `lib`, `name`, `MakeTuple(arg_tags)`, `ret_tag` →
+  function id (or `-1` on missing symbol / libffi error).
+- **`FfiInvoke`**: `lib`, `fn_id`, `MakeTuple(args)` → return value.
+- **`HostInvoke`**: `CONST native_id`, `MakeTuple(args)` → return value.
 
-### Type marshalling
+Extern-block codegen emits `MakeTuple` for arg tags and call args (fixes
+pre-refactor flat-stack bug).
 
-The VM stores values as `Value` (a 64-bit tagged
-representation of int/float/bool/heap-pointer). On
-`NATIVE` dispatch, the raw bits are reinterpreted as the
-expected C type:
+### Host / pipeline API
 
-- Integers: `Value::as_int()` returns `i64`; on the
-  way in, `i64` is bit-cast to `Value` via
-  `Value::from(i64)`.
-- Strings: the `Value`'s raw bits are a heap-object
-  address; the FFI marshaller calls
-  `Heap::cstr_from_addr(raw)` to look up the
-  `Object::String` and get a `*const c_char` to its
-  data. The library stays loaded via the `LibraryFn`'s
-  `_library: Arc<Library>` field for the duration of
-  the call.
+```rust
+vm.register_fn(
+    FfiSignatureBuilder::new("my_fn")
+        .arg(FfiType::Int)
+        .ret(FfiType::Int)
+        .build()?,
+    |heap, args| { Ok(Some(Value::from(args[0].as_int()))) },
+);
 
-### Files added / modified
+pipeline.register_host_native(sig, closure); // typecheck + store closure
+pipeline.wire_host_natives(&mut vm);       // before run_raw
+```
 
-**Added:**
+### Typechecker
 
-- `machine/src/ffi.rs` (~700 LOC) — FFI module with
-  `NativeFn` trait, `Natives` registry,
-  `LibraryFn` wrapper for dynamic-library symbols,
-  `load_library` helper, and 8 tests.
-
-**Modified:**
-
-- `common/src/opcode.rs` — `Instruction::NATIVE` is now
-  a real opcode (was a dead placeholder). The
-  `NATIVE_NAMES` table at the top of `machine/src/vm.rs`
-  maps the operand_u32 to a name.
-- `machine/Cargo.toml` — added `libloading = "0.8"`
-  (and `libc = "0.2"` for the FFI tests).
-- `machine/src/vm.rs` — added `Machine::natives` and
-  `Machine::libraries` fields, `register_native` and
-  `register_extern_libs` public methods, the
-  `Instruction::NATIVE` dispatch arm in `execute`, and
-  the `NATIVE_NAMES` constant.
-- `parser/src/ast.rs` — added `Expression::ExternBlock`
-  variant and `ExternFunction` struct.
-- `parser/src/lib.rs` — added the `extern_block` parser
-  in the declaration chain (4 new tests).
-- `compiler/src/typechecking/infer.rs` — `infer` matches
-  `Expression::ExternBlock` and registers each declared
-  function as a native in the typechecker's top frame
-  (so subsequent calls to those functions type-check
-  cleanly). The pre-walk also matches the new variant.
-- `compiler/src/typechecking/id.rs` — pre-walk matches
-  `Expression::ExternBlock` and walks each function
-  declaration's argument list.
-- `compiler/src/lib.rs` — `do_compile` matches
-  `Expression::ExternBlock` and populates
-  `Compiler::extern_libs` (function name → library name)
-  for the VM's startup-time FFI loader. The
-  `default()` impl initializes the new `extern_libs`
-  field.
-- `machine/src/vm.rs` — added the FFI test
-  (`ffi_native_dispatch_invokes_rust_closure`).
+`declare` / `invoke` validate tuple shapes and FFI type tags
+(`FFIType::X` or bare `int`/`float`/`string`/`void`).
 
 ### Tests
 
-- 8 tests in `machine/src/ffi.rs` (Unitary, String,
-  I64, library registration, end-to-end `strlen`
-  via `libc` on non-Windows). The libc-dependent
-  tests skip gracefully on systems where libc isn't
-  reachable via `dlopen`.
-- 4 new parser tests for `extern` (single function,
-  multiple functions, empty block, missing trailing
-  `;`).
-- 1 new VM test for `NATIVE` dispatch
-  (registers a host-side `NullaryVoid` native and
-  verifies it's called from bytecode).
-- All pre-existing tests continue to pass.
+| Test | Purpose |
+|------|---------|
+| `machine/src/ffi/call.rs` | libffi int/float/string/void, missing symbol, wrong arity |
+| `example_strlen_prints_5` | extern-block end-to-end |
+| `example_ffi_sum_via_dlopen_prints_42` | userland declare/invoke |
+| `host_invoke_dispatches_rust_closure` | host native via `HostInvoke` |
 
-### Build status (Phase 22)
+**Test harness note:** `ensure_ffi_libsum_built` must not call
+`File::create` on `libsum.so` after `cc` — that truncates the shared
+library to zero bytes. The FFI sum test uses an absolute `dload(...)` path.
 
-`cargo build --workspace` produces only the three
-pre-existing parser warnings. No new warnings. All 504
-existing tests still pass plus the new 12 FFI tests (8 in
-`ffi.rs` + 4 in `parser` + 1 in `vm.rs`) = 519 tests.
+### Build status
 
-### Anything 22+ needs to know
-
-- The `NATIVE_NAMES` table is hardcoded to 16
-  entries (indexes 0–15 are libc symbols; index 16 is
-  "inc" for the FFI test). A real FFI deployment
-  needs a string-table indirection (the operand is
-  only 4 bytes, which doesn't fit a typical libc symbol
-  name). The current 4-byte operand is enough for the
-  built-in table; dynamic names are looked up via
-  `Machine::register_extern_libs` (the function name
-  itself is the symbol, no operand encoding needed).
-- `dlopen` failures are logged to stderr and the
-  function is skipped (the VM treats it as "unknown
-  function" at call time, which surfaces as a
-  `Instruction::NATIVE` dispatch to `None`).
-  The compiler's typechecker would have caught the
-  mismatch earlier; the runtime failure is the safety
-  net.
-- The `extern` block does NOT emit any bytecode. The
-  function declarations are metadata, the actual
-  `dlopen`/`dlsym` happens at VM startup. This is by
-  design — the function is available immediately
-  (no need for an `init` step) but the FFI symbol
-  resolution is deferred until the first call (so
-  unused FFI functions don't `dlopen` their library).
-- The current `extern` block is **file-scope** only
-  (top-level declaration). It cannot appear inside a
-  `fn` body. This matches the FFI semantics in most
-  languages (C, Rust, etc.) where external declarations
-  are file-scope.
+Requires system libffi (`libffi-dev` on Arch). `cargo test --workspace`
+passes (477+ tests). `machine/Cargo.toml` adds `libffi = "4.0.0"`.
 
 ## PHASE 24 — TYPED AGGREGATES: ARRAYS + TUPLES (COMPLETED)
 

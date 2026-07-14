@@ -11,6 +11,7 @@ ahash = "0.8.12"
 anyhow = "1.0.100"
 ariadne = { version = "0.6.0", features = ["auto-color"] }
 common = { path = "../common" }
+machine = { path = "../machine" }
 parser = { path = "../parser" }
 regex = "1.11.2"
 rkyv = "0.8.12"

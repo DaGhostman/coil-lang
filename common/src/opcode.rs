@@ -151,32 +151,15 @@ pub enum Instruction {
     // `FfiLoad` pops a string (the library path), calls
     // `dlopen`, allocates a heap `Object::Library` wrapping
     // the loaded `Library`, and pushes the library's address
-    // as a `Value`. The library's `FunctionSig` table is
-    // populated by the host (or by `Machine::register_extern_libs`).
+    // as a `Value`. Signatures are registered later via
+    // `DeclareFFI` at runtime.
     FfiLoad,
     //
-    // `FfiInvoke` resolves a function by ID in the library's
-    // signature table, marshals the top `arity` `Value`s into
-    // the matched C types, calls the resolved symbol via
-    // `libloading`, and pushes the return value (or nothing
-    // for `void`). The library object is the value immediately
-    // below the args on the stack:
-    //
-    //   push library_value
-    //   push arg_0
-    //   ...
-    //   push arg_{arity-1}
-    //   FfiInvoke function_id, arity
-    //
-    // The runtime dispatches via the matched C signature's
-    // `extern "C" fn(...) -> ...` type, which is one of the
-    // six supported by `LibraryFn` (see `machine::ffi`).
-    //
-    // FfiInvoke (Phase 22b userland API) — takes function_id
-    // from the stack (returned by `DeclareFFI`), so the
-    // operand only needs to carry arity. See the dispatch
-    // arm in `machine/src/vm.rs` for the full stack
-    // discipline.
+    // `FfiInvoke` (Phase 26 tuple form) — stack at dispatch
+    // (bottom → top): lib_handle, fn_id, args_tuple.
+    // Resolves the function by id in the library's signature
+    // table and calls it via libffi using the explicit signature
+    // prepared at declare time. No signature guessing.
     FfiInvoke,
 
     // ---- Phase 22b append: DeclareFFI ----
@@ -189,17 +172,13 @@ pub enum Instruction {
     //             as additional stack values).
     //   high 16 = reserved (0)
     //
-    // Stack at dispatch (bottom → top):
-    //   lib_handle  name_string  arg_tag_0  arg_tag_1  ...
-    //   arg_tag_{arity-1}  ret_type_tag
+    // Stack at dispatch (Phase 26 — bottom → top):
+    //   lib_handle  name_string  args_tuple  ret_type_tag
     //
-    // Pops: arity arg_type tags, then the ret_type tag,
-    // then the name string, then the lib handle. Resolves
-    // the symbol on the library's `Arc<Library>` (via
-    // `libloading::Library::get`), builds a `FunctionSig`
-    // from the arg/ret tags, registers it on the library's
-    // signature table, and pushes the function_id (a fresh
-    // `usize` index) for use by FfiInvoke.
+    // Pops ret tag, walks args_tuple for arg type tags, pops
+    // name and lib handle. Resolves the symbol via dlsym,
+    // prepares a libffi CIF, and registers the signature.
+    // Pushes the function id (or -1 on failure).
     DeclareFFI,
 
     // ---- Phase 23: aggregates (tuples + arrays + indexing) ----
@@ -255,6 +234,17 @@ pub enum Instruction {
     // match-arm bindings (Phase 15D). Phase 25's record
     // mutation path.
     SetField,
+
+    // ---- Phase 30: host native invoke (APPENDED) ----
+    //
+    // Stack at dispatch (bottom → top):
+    //   fn_id (native registry index)
+    //   args_tuple (Object::Tuple)
+    //
+    // Operand: low 16 = arity (element count in args tuple).
+    // Pops tuple then fn_id, dispatches to the host native
+    // registry entry registered via `Machine::register_fn`.
+    HostInvoke,
 }
 
 impl From<u8> for Instruction {

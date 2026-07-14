@@ -128,11 +128,6 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
 
-    let extern_libs = pipeline.extern_libs();
-    if !extern_libs.is_empty() {
-        machine.register_extern_libs(extern_libs);
-    }
-
     machine.run_raw(&bytecode);
     let _ = machine.restore_output();
 

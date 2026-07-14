@@ -19,10 +19,8 @@
 // Expected output: `42` (40 + 2).
 //
 // The pipeline test runner compiles this file in-memory and
-// passes the resulting bytecode to a fresh `Machine`. The
-// runtime's `Machine::register_extern_libs` is no longer
-// called for `extern` blocks — userland FFI is now
-// self-contained in the script.
+// passes the resulting bytecode to a fresh `Machine`. Userland
+// FFI is self-contained in the script via `dload`/`declare`/`invoke`.
 
 enum FFIType {
     Int,
@@ -34,7 +32,7 @@ enum FFIType {
 fn main() {
     // `dload("<full path>")` is the most portable form — no
     // dependence on cwd or LD_LIBRARY_PATH at runtime.
-    let lib = dload("/home/ddimitrov/projects/zero-script/examples/libsum.so");
+    let lib = dload("libsum.so");
     // Phase 26 — `declare` and `invoke` now take the
     // arguments as a single tuple:
     //   declare(lib, name, (T1, T2, ...), R)

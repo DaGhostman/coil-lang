@@ -3,9 +3,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// Current archive version. Bump this when the bytecode format
 /// or `Byte` struct layout changes incompatibly.
 ///
-/// v2: removed unused register-form opcode slots (discriminants
-/// 55–85); subsequent opcodes renumbered. Recompile from source.
-pub const ARCHIVE_VERSION: u32 = 2;
+/// v3: FFI refactor — explicit libffi signatures; `HostInvoke`
+/// appended; legacy `NATIVE` dispatch removed. Recompile from source.
+pub const ARCHIVE_VERSION: u32 = 3;
 
 /// Versioned wrapper for serialized bytecode. Replaces the
 /// pre-18C `ArchivedVec<ArchivedByte>` format.
