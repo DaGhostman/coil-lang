@@ -113,8 +113,8 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     let _guard = CwdGuard(original_cwd);
 
     let mut pipeline = Pipeline::new();
-    let bytecode = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
-        Ok(bc) => bc,
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
         Err(()) => {
             for msg in pipeline.messages() {
                 eprintln!("PIPELINE ERROR: {}", msg.message());
@@ -128,7 +128,7 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
 
-    machine.run_raw(&bytecode);
+    machine.run_raw(&bytecode, &constants);
     let _ = machine.restore_output();
 
     let bytes = Rc::try_unwrap(buf)

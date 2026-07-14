@@ -61,12 +61,12 @@ fn run_example(path: &str) -> String {
     run_example_src(&src)
 }
 
-fn run_bytecode(bytecode: Vec<common::Byte>) -> String {
+fn run_bytecode(bytecode: Vec<common::Byte>, constants: Vec<u64>) -> String {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode);
+    machine.run_raw(&bytecode, &constants);
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
         .expect("VM still holds a reference to the buffer")
@@ -77,10 +77,10 @@ fn run_bytecode(bytecode: Vec<common::Byte>) -> String {
 /// Compile and run in-memory source.
 fn run_example_src(src: &str) -> String {
     let mut pipeline = Pipeline::new();
-    let bytecode = pipeline
+    let (bytecode, constants) = pipeline
         .compile_src(src)
         .expect("example failed to compile (parse error or type errors)");
-    run_bytecode(bytecode)
+    run_bytecode(bytecode, constants)
 }
 
 #[test]
@@ -124,13 +124,13 @@ fn example_result_prints_42_and_neg1() {
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
     let ast = parser.parse(&src).expect("result.0s should parse");
-    let bytecode = pipeline.compile_test("", &ast);
+    let (bytecode, constants) = pipeline.compile_test("", &ast);
 
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode);
+    machine.run_raw(&bytecode, &constants);
 
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
@@ -288,14 +288,14 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
     let ast = parser.parse(&src).expect("result.0s should parse");
-    let bytecode = pipeline.compile_test("", &ast);
+    let (bytecode, constants) = pipeline.compile_test("", &ast);
 
     // Run the bytecode on a Machine that captures stdout.
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode);
+    machine.run_raw(&bytecode, &constants);
 
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
@@ -362,7 +362,7 @@ fn fizbuz_runs_to_completion() {
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
     let ast = parser.parse(&src).expect("fizbuz.0s should parse");
-    let bytecode = pipeline.compile_test("", &ast);
+    let (bytecode, constants) = pipeline.compile_test("", &ast);
 
     // Run the bytecode on a Machine that captures
     // stdout. (We don't assert on output — the example
@@ -376,7 +376,7 @@ fn fizbuz_runs_to_completion() {
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode);
+    machine.run_raw(&bytecode, &constants);
 
     // The real assertion is "the program didn't hang".
     // (A hang would manifest as a 120s+ test timeout.)
@@ -405,7 +405,7 @@ fn let_binding_emits_store_pop_in_bytecode() {
     "#;
     let parser = parser::Pratt::default();
     let ast = parser.parse(src).expect("let-binding program should parse");
-    let bytecode = pipeline.compile_test("", &ast);
+    let (bytecode, _constants) = pipeline.compile_test("", &ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
     // Exactly 2 StorePop — one for `let x = 5;` and one
@@ -490,13 +490,13 @@ fn example_let_chained_bindings_works() {
     let ast = parser
         .parse(src)
         .expect("chained-bindings program should parse");
-    let bytecode = pipeline.compile_test("", &ast);
+    let (bytecode, constants) = pipeline.compile_test("", &ast);
 
     let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(std::rc::Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode);
+    machine.run_raw(&bytecode, &constants);
 
     let _ = machine.restore_output();
     let bytes = std::rc::Rc::try_unwrap(buf)
@@ -538,7 +538,7 @@ fn nested_if_in_loop_runs_correctly() {
     "#;
     let parser = parser::Pratt::default();
     let ast = parser.parse(src).expect("nested if-in-loop should parse");
-    let bytecode = pipeline.compile_test("", &ast);
+    let (bytecode, _constants) = pipeline.compile_test("", &ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
     // The bytecode should contain at least 2 JMPF (the

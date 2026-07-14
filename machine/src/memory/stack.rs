@@ -75,6 +75,7 @@ impl<T: Default, const N: usize> Index<Range<usize>> for Stack<T, N> {
     type Output = [T];
 
     fn index(&self, index: Range<usize>) -> &Self::Output {
+        promise!(index.end <= N);
         &self.stack[index]
     }
 }
@@ -91,6 +92,7 @@ impl<T: Default + Copy, const N: usize> IntoIterator for Stack<T, N> {
 impl<T: Default + Copy, const N: usize> Index<usize> for Stack<T, N> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
+        promise!(index < N);
         &self.stack[index]
     }
 }

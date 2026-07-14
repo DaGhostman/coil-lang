@@ -695,6 +695,7 @@ impl Pipeline {
         // `version` mismatch (see `Pipeline::run`).
         let program = ArchivedProgram {
             version: ARCHIVE_VERSION,
+            constants: self.compiler.constants.clone(),
             bytecode: self.bytecode,
         };
 
@@ -717,7 +718,7 @@ impl Pipeline {
         &mut self,
         module: &str,
         ast: &(SimpleSpan, Box<Expression<'_>>),
-    ) -> Vec<Byte> {
+    ) -> (Vec<Byte>, Vec<u64>) {
         let mut bytecode = self.compiler.compile(module, ast);
 
         // Patch the JMP at offset 1 (the second prologue
@@ -738,10 +739,10 @@ impl Pipeline {
             }
         }
 
-        bytecode
+        (bytecode, self.compiler.constants.clone())
     }
 
-    pub fn compile_src(&mut self, src: &str) -> Result<Vec<Byte>, ()> {
+    pub fn compile_src(&mut self, src: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let parser = Pratt::default();
         let ast = parser.parse(src).map_err(|_| ())?;
 
@@ -771,7 +772,7 @@ impl Pipeline {
             }
         }
 
-        Ok(bytecode)
+        Ok((bytecode, self.compiler.constants.clone()))
     }
 
     /// Compile a single source file in-memory and return the
@@ -796,7 +797,7 @@ impl Pipeline {
     /// downstream user that wants the new project-style
     /// module discovery without writing a `.c0s` file to
     /// disk.
-    pub fn compile_src_from_file(&mut self, file: &str) -> Result<Vec<Byte>, ()> {
+    pub fn compile_src_from_file(&mut self, file: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let entry = PathBuf::from(file);
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);
@@ -840,7 +841,7 @@ impl Pipeline {
             return Err(());
         }
 
-        Ok(std::mem::take(&mut self.bytecode))
+        Ok((std::mem::take(&mut self.bytecode), self.compiler.constants.clone()))
     }
 
     /// Borrow the list of natively-registered functions.
@@ -850,7 +851,7 @@ impl Pipeline {
         &self.natives
     }
 
-    pub fn run(self, filename: String) -> Result<Vec<Byte>, ()> {
+    pub fn run(self, filename: String) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let mut f = File::open(filename).expect("Unable to find file");
         let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");
@@ -879,8 +880,10 @@ impl Pipeline {
         // impl for `ArchivedVec` handles the deep copy.
         let bytecode = rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode)
             .expect("Unable to deserialize bytecode");
+        let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
+            .expect("Unable to deserialize constant pool");
 
-        Ok(bytecode)
+        Ok((bytecode, constants))
     }
 }
 

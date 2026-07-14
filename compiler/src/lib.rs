@@ -545,6 +545,9 @@ pub struct Compiler {
     /// would skip past the extern block entirely (because
     /// `main_offset` lands past it).
     program_start_offset: u32,
+    /// Wide immediates referenced from compact 8-byte `Byte`
+    /// operands (floats, `JumpIfMatch` targets, etc.).
+    constants: Vec<u64>,
 }
 
 impl Default for Compiler {
@@ -577,7 +580,20 @@ impl Default for Compiler {
             checker: crate::typechecking::Checker::new(),
             emit_idx: 0,
             program_start_offset,
+            constants: Vec::default(),
         }
+    }
+}
+
+impl Compiler {
+    pub fn constants(&self) -> &[u64] {
+        &self.constants
+    }
+
+    pub fn intern_constant(&mut self, value: u64) -> u32 {
+        let idx = self.constants.len() as u32;
+        self.constants.push(value);
+        idx
     }
 }
 
@@ -1982,7 +1998,7 @@ impl Compiler {
                 // to skip past the body when the condition is
                 // false.
                 let exit_label_target = self.bytecode.len() as u32;
-                bb.bind_label(exit_label, exit_label_target, &mut self.bytecode);
+                bb.bind_label(exit_label, exit_label_target, &mut self.bytecode, &mut self.constants);
 
                 // Emit the back-edge JMP → top_label. When the
                 // body finishes, control jumps back to the top of
@@ -1991,7 +2007,7 @@ impl Compiler {
 
                 // NOW bind top_label (after the back-edge JMP was
                 // emitted, so the JMP's position is in `pending`).
-                bb.bind_label(top_label, top_label_target, &mut self.bytecode);
+                bb.bind_label(top_label, top_label_target, &mut self.bytecode, &mut self.constants);
 
                 // Validate: every label that had a pending jump is
                 // bound. (Both `top_label` and `exit_label` were
@@ -2094,11 +2110,10 @@ impl Compiler {
                     // per call site (recursive functions like
                     // `fib` pay this on every recursive call).
                     bytecode.push(
-                        Byte::new(Instruction::CALL)
-                            .with_operand_u32(
-                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                            )
-                            .with_value_u32(offset as u32),
+                        Byte::new(Instruction::CALL).with_call_packed(
+                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                            offset as u32,
+                        ),
                     );
                 } else {
                     let mut message =
@@ -2205,7 +2220,7 @@ impl Compiler {
                     if i > 0 {
                         if let Some(prev_label) = branch_start_labels[i - 1] {
                             let target = self.bytecode.len() as u32;
-                            bb.bind_label(prev_label, target, &mut self.bytecode);
+                            bb.bind_label(prev_label, target, &mut self.bytecode, &mut self.constants);
                         }
                     }
 
@@ -2258,7 +2273,7 @@ impl Compiler {
                 // every JMP → end placeholder AND the last JMPF
                 // placeholder (if any).
                 let end_pos = self.bytecode.len() as u32;
-                bb.bind_label(end_label, end_pos, &mut self.bytecode);
+                bb.bind_label(end_label, end_pos, &mut self.bytecode, &mut self.constants);
 
                 // Validate: every label that had a pending jump must
                 // be bound. (Allocated-but-unused labels are allowed.)
@@ -2357,10 +2372,11 @@ impl Compiler {
                 Instruction::CONST,
                 Value::from(*state).raw() as _,
             )),
-            Expression::Float(num) => bytecode.push(Byte::new_with_value(
-                Instruction::CONST,
-                Value::from(*num).raw() as _,
-            )),
+            Expression::Float(num) => {
+                let bits = Value::from(*num).raw() as u64;
+                let idx = self.intern_constant(bits);
+                bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            }
             Expression::String(str) => {
                 let escaped = str
                     .replace("\\n", "\n")
@@ -3293,6 +3309,7 @@ impl Compiler {
                             first_arm_label,
                             self.bytecode.len() as u32,
                             &mut self.bytecode,
+                            &mut self.constants,
                         );
                         test_chain_first_arms.insert(first_arm_idx);
                         // Mark ALL arms in this group as
@@ -3436,6 +3453,7 @@ impl Compiler {
                                     label,
                                     self.bytecode.len() as u32,
                                     &mut self.bytecode,
+                                    &mut self.constants,
                                 );
                             }
                         }
@@ -3461,6 +3479,7 @@ impl Compiler {
                                 *label,
                                 self.bytecode.len() as u32,
                                 &mut self.bytecode,
+                                &mut self.constants,
                             );
                         }
 
@@ -3709,7 +3728,7 @@ impl Compiler {
                     // is a count, not an index).
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                     let end_pos = (self.bytecode.len() - 1) as u32;
-                    bb.bind_label(end_label, end_pos, &mut self.bytecode);
+                    bb.bind_label(end_label, end_pos, &mut self.bytecode, &mut self.constants);
 
                     // Validate: every label that had a
                     // pending jump is bound.
@@ -3890,6 +3909,7 @@ impl Compiler {
         // is consulted by `do_compile` for opcode selection (e.g.,
         // `ADD` vs `ADDF`).
         self.emit_idx = 0;
+        self.constants.clear();
         let _program_ty = self.checker.check_program(ast);
 
         let mut program = self.do_compile(ast);
@@ -3973,9 +3993,11 @@ mod tests {
     use super::*;
     use parser::Pratt;
 
-    fn compile_src(src: &str) -> Vec<Byte> {
+    fn compile_src(src: &str) -> (Vec<Byte>, Vec<u64>) {
         let ast = Pratt::default().parse(src).expect("parse failed");
-        Compiler::default().compile("test", &ast)
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("test", &ast);
+        (bc, compiler.constants)
     }
 
     /// End-to-end: a simple integer expression compiles to bytecode
@@ -3984,7 +4006,7 @@ mod tests {
     /// runs without panicking and produces a non-empty bytecode.
     #[test]
     fn integer_arithmetic_emits_bytecode() {
-        let bc = compile_src("42;");
+        let (bc, pool) = compile_src("42;");
         assert!(!bc.is_empty());
     }
 
@@ -3993,7 +4015,7 @@ mod tests {
     #[test]
     fn float_arithmetic_emits_float_opcode() {
         use common::Instruction;
-        let bc = compile_src("1.0 + 2.0;");
+        let (bc, pool) = compile_src("1.0 + 2.0;");
         // Find the binary operator instruction. The bytecode is
         // initialised with CALL/JMP/HALT, then operand code, then the
         // operator. We search for the LAST ADDF / ADD.
@@ -4013,7 +4035,7 @@ mod tests {
     #[test]
     fn integer_arithmetic_emits_int_opcode() {
         use common::Instruction;
-        let bc = compile_src("1 + 2;");
+        let (bc, pool) = compile_src("1 + 2;");
         let mut last_binop: Option<&Instruction> = None;
         for b in &bc {
             if matches!(b.bytecode(), Instruction::ADDF | Instruction::ADD) {
@@ -4031,7 +4053,7 @@ mod tests {
     /// result — either way, the test should not panic.
     #[test]
     fn mixed_int_float_arithmetic_emits_bytecode() {
-        let bc = compile_src("1 + 2.0;");
+        let (bc, pool) = compile_src("1 + 2.0;");
         assert!(!bc.is_empty());
     }
 
@@ -4074,7 +4096,7 @@ mod tests {
     #[test]
     fn construct_emits_make_enum_with_correct_tag_and_arity() {
         use common::Instruction;
-        let bc = compile_src("enum Option { None, Some(int) } let x = Option::Some(42);");
+        let (bc, pool) = compile_src("enum Option { None, Some(int) } let x = Option::Some(42);");
 
         // Find the MAKE_ENUM instruction. Its operands encode
         // (tag, arity) — for `Option::Some(42)`, tag=1, arity=1.
@@ -4094,7 +4116,7 @@ mod tests {
     #[test]
     fn match_emits_jump_if_match_cascade() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              match Option::Some(1) { \
                  Option::None() => 0, \
@@ -4129,7 +4151,7 @@ mod tests {
     #[test]
     fn wildcard_match_arm_emits_pop() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              let x = Option::Some(42); \
              match x { _ => 42 };",
@@ -4158,7 +4180,7 @@ mod tests {
     #[test]
     fn match_with_nested_constructor_pattern_emits_unpack_cascade() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              enum Result { Ok(Option), Err(string) } \
              match Result::Ok(Option::Some(1)) { \
@@ -4222,7 +4244,7 @@ mod tests {
     #[test]
     fn loop_emits_top_label_and_back_edge() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "fn main() { \
                  let i = 0; \
                  while (i < 3) { \
@@ -4264,7 +4286,7 @@ mod tests {
     #[test]
     fn loop_jmp_back_edge_targets_loop_top_not_prologue() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "fn main() { \
                  let i = 0; \
                  while (i < 3) { \
@@ -4314,7 +4336,7 @@ mod tests {
     #[test]
     fn match_jump_if_match_targets_are_patched_to_arm_offsets() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              match Option::Some(1) { \
                  Option::None() => 0, \
@@ -4334,7 +4356,7 @@ mod tests {
             "expected at least one JUMP_IF_MATCH in the match bytecode"
         );
         for (i, jim) in jump_if_matches.iter().enumerate() {
-            let target = jim.value_u32();
+            let target = jim.jump_if_match_target(&pool);
             let tag = (jim.operand_u32() >> 16) as u16;
             assert!(
                 target > 0,
@@ -4362,7 +4384,7 @@ mod tests {
     #[test]
     fn match_jmp_to_end_placeholders_are_patched_to_end_label() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int), Maybe(int) } \
              match Option::Some(1) { \
                  Option::None() => 0, \
@@ -4437,7 +4459,7 @@ mod tests {
     #[test]
     fn nested_match_in_loop_emits_expected_opcodes() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              fn main() { \
                  let x = Option::Some(0); \
@@ -4519,7 +4541,7 @@ mod tests {
         // CONST operands in REVERSE declaration order so the VM's
         // `MAKE_ENUM` produces a payload in DECLARATION order
         // (payload[0] = x = 2, payload[1] = y = 3, payload[2] = z = 1).
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             r#"enum E { Foo { x: int, y: int, z: int } }
 fn main() {
     print "%i", E::Foo { z: 1, x: 2, y: 3 };
@@ -4534,7 +4556,7 @@ fn main() {
         let const_operands: Vec<i64> = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::CONST))
-            .map(|b| b.constant() as i64)
+            .map(|b| b.constant(&[]) as i64)
             .filter(|&v| v >= 1 && v <= 3)
             .collect();
         assert_eq!(
@@ -4561,7 +4583,7 @@ fn main() {
     #[test]
     fn record_construct_one_field_emits_correct_bytecode() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { Foo { x: int } } fn main() { let _ = E::Foo { x: 1 }; }",
         );
 
@@ -4579,7 +4601,7 @@ fn main() {
         // Exactly 1 CONST with value 1 (the literal `1`).
         let const_one_count = bc
             .iter()
-            .filter(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant() == 1)
+            .filter(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant(&[]) == 1)
             .count();
         assert_eq!(
             const_one_count, 1,
@@ -4605,7 +4627,7 @@ fn main() {
         //
         // Use a `print` to consume the match's result so the
         // binding code is not optimized away.
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { Foo { x: int, y: int, z: int } } \
              fn main() { \
                  let e = E::Foo { x: 1, y: 2, z: 3 }; \
@@ -4654,7 +4676,7 @@ fn main() {
         use common::Instruction;
         // Use prints to keep the constructs alive in the
         // bytecode (the codegen is silent on unused `let _`).
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { A, B(int), C { x: int } } \
              fn main() { \
                  print \"%i\", E::A; \
@@ -4701,7 +4723,7 @@ fn main() {
     #[test]
     fn record_pattern_with_wildcard_field_emits_pop() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { Foo { x: int, y: int } } \
              fn main() { \
                  let e = E::Foo { x: 1, y: 2 }; \
@@ -4734,7 +4756,7 @@ fn main() {
         // The spec says "E::Empty => 0" where Empty is unit.
         // The codegen for a unit-variant last arm emits POP,
         // not UNPACK.
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { Empty, Foo(int) } \
              fn main() { \
                  let e = E::Empty; \
@@ -4818,7 +4840,7 @@ fn main() {
         // Both arms share the outer tag `E::A`. The first arm's
         // inner pattern is `Option::Some(v)` — a Constructor with a
         // Binding sub-pattern, which triggers the new test chain.
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              enum E { A(Option) } \
              fn main() { \
@@ -4863,7 +4885,7 @@ fn main() {
         // neither carries a Binding, so `arm_has_runtime_test`
         // returns false for both arms. No test chain is emitted;
         // the codegen keeps the existing layout.
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
              enum E { A(Option) } \
              fn main() { \
@@ -4918,7 +4940,7 @@ fn main() {
         // pattern `E::A(v)` as a Constructor with a single Binding
         // sub-pattern; `arm_has_runtime_test` recursively checks
         // that sub-pattern, which is a Binding → no runtime test).
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { A(int), B(int) } \
              fn main() { \
                  let x = E::A(5); \
@@ -4962,7 +4984,7 @@ fn main() {
         // (the multi-arm group's JUMP_IF_MATCH targets the test
         // chain start; the single-arm group's JUMP_IF_MATCH targets
         // its arm body).
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum E { A, B } \
              fn main() { \
                  let x = E::A; \
@@ -5142,7 +5164,7 @@ fn main() {
     #[test]
     fn access_field_emits_receiver_then_load_field() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
              fn get_x(Point p) -> int { return p.x; } \
              fn main() { print \"%i\", get_x(Point::Point { x: 42, y: 7 }); }",
@@ -5185,7 +5207,7 @@ fn main() {
         // Two functions, each accessing a different field. The
         // x_coord access emits LoadField(0); the y_coord access
         // emits LoadField(1).
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
              fn x_coord(Point p) -> int { return p.x; } \
              fn y_coord(Point p) -> int { return p.y; } \
@@ -5252,7 +5274,7 @@ fn main() {
     #[test]
     fn let_x_then_print_x_emits_store_pop() {
         use common::Instruction;
-        let bc = compile_src("fn main() { let x = 42; print \"%i\", x; }");
+        let (bc, pool) = compile_src("fn main() { let x = 42; print \"%i\", x; }");
 
         // At least one STORE_POP — the explicit
         // pop-and-write for `let x = 42`. The codegen
@@ -5288,7 +5310,7 @@ fn main() {
     #[test]
     fn let_two_bindings_emit_two_store_pops() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "fn main() { \
                  let x = 5; \
                  let y = 10; \
@@ -5324,7 +5346,7 @@ fn main() {
     #[test]
     fn let_x_reassignment_emits_store_pop_not_store() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "fn main() { \
                  let x = 5; \
                  x = 10; \
@@ -5382,7 +5404,7 @@ fn main() {
     #[test]
     fn access_chained_field_emits_two_load_fields() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Inner { Inner { v: int } } \
              enum Outer { Outer { x: Inner, y: int } } \
              fn get_x_v(Outer o) -> int { return o.x.v; } \
@@ -5412,7 +5434,7 @@ fn main() {
     #[test]
     fn access_chained_field_second_load_field_targets_inner_enum() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Inner { Inner { v: int, w: int } } \
              enum Outer { Outer { x: Inner, y: int } } \
              fn get_x_v(Outer o) -> int { return o.x.v; } \
@@ -5467,7 +5489,7 @@ fn main() {
     #[test]
     fn access_chained_field_with_correct_field_index() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Inner { Inner { v: int, w: int } } \
              enum Outer { Outer { x: Inner, y: int } } \
              fn get_x_w(Outer o) -> int { return o.x.w; } \
@@ -5539,7 +5561,7 @@ fn main() {
     #[test]
     fn match_nested_record_in_tuple_binds_correctly() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Inner { I { v: int } } \
              enum Result { Ok(Inner), Err(string) } \
              match Result::Ok(Inner::I { v: 42 }) { \
@@ -5590,7 +5612,7 @@ fn main() {
     #[test]
     fn match_nested_record_in_record_binds_correctly() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Inner { I { v: int } } \
              enum Result { Ok { x: Inner }, Err(string) } \
              match Result::Ok { x: Inner::I { v: 42 } } { \
@@ -5629,7 +5651,7 @@ fn main() {
     #[test]
     fn match_depth_3_nested_records_bind_correctly() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum W { W { v: int } } \
              enum Baz { Qux { a: W } } \
              enum Foo { Bar(Baz), Other } \
@@ -5663,7 +5685,7 @@ fn main() {
     #[test]
     fn match_nested_record_missing_field_consumes_slot() {
         use common::Instruction;
-        let bc = compile_src(
+        let (bc, pool) = compile_src(
             "enum Inner { I { v: int } } \
              enum Result { Ok(Inner), Err(string) } \
              match Result::Ok(Inner::I { v: 42 }) { \
@@ -5693,7 +5715,7 @@ fn main() {
         // constant — see `Byte::constant()`.)
         let has_99 = bc
             .iter()
-            .any(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant() == 99);
+            .any(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant(&[]) == 99);
         assert!(has_99, "expected CONST 99 for the arm body");
     }
 }

@@ -237,11 +237,17 @@ impl BlockBuilder {
     /// Patches every pending jump that targets `label` with
     /// `target`. **Idempotent**: calling again on the same label
     /// re-patches every pending jump with the new target.
-    pub fn bind_label(&mut self, label: Label, target: u32, bytecode: &mut [Byte]) {
+    pub fn bind_label(
+        &mut self,
+        label: Label,
+        target: u32,
+        bytecode: &mut [Byte],
+        pool: &mut Vec<u64>,
+    ) {
         self.bound.insert(label.0);
         if let Some(positions) = self.pending.get(&label.0) {
             for pos in positions {
-                Self::patch_jump_operand(bytecode, *pos, target);
+                Self::patch_jump_operand(bytecode, *pos, target, pool);
             }
         }
     }
@@ -271,41 +277,35 @@ impl BlockBuilder {
             JumpKind::JumpIfFalse => Byte::new(Instruction::JMPF).with_operand_u32(0),
             JumpKind::JumpIfTrue => Byte::new(Instruction::JMPT).with_operand_u32(0),
             JumpKind::JumpIfMatch { tag, .. } => {
-                // Phase 18C: tag in operands[31:16], 32-bit target
-                // in value[31:0]. Placeholder target = 0 (will be
-                // patched by patch_jump_operand).
-                //
-                // `arity` is intentionally discarded — the VM
-                // reads the real arity from the enum at runtime.
-                Byte::new(Instruction::JumpIfMatch)
-                    .with_operands_u16([tag as u16, 0])
-                    .with_value_u32(0)
+                Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag as u16, 0])
             }
         }
     }
 
-    /// Internal helper: patch the operand of a jump at `byte_pos`
-    /// to point to `target` (an absolute offset in `bytecode`).
-    /// Preserves the tag (upper 16 bits) for `JumpIfMatch`; replaces
-    /// the entire operand for `JMP`/`JMPF`/`JMPT`.
-    fn patch_jump_operand(bytecode: &mut [Byte], byte_pos: usize, target: u32) {
+    /// Patch the operand of a jump at `byte_pos` to point to
+    /// `target`. For `JumpIfMatch`, appends `target` to `pool`
+    /// and stores the pool index in the lower 16 bits.
+    fn patch_jump_operand(
+        bytecode: &mut [Byte],
+        byte_pos: usize,
+        target: u32,
+        pool: &mut Vec<u64>,
+    ) {
         let byte = &mut bytecode[byte_pos];
         match byte.bytecode() {
             Instruction::JMP | Instruction::JMPF | Instruction::JMPT => {
                 *byte = byte.with_operand_u32(target);
             }
             Instruction::JumpIfMatch => {
-                // Phase 18C: tag is preserved in operands[31:16];
-                // 32-bit target now lives in value[31:0]. The
-                // pre-18C u16::try_from panic is gone — wide
-                // targets (> 65,535 bytes) are now supported.
                 let tag = (byte.operand_u32() >> 16) as u16;
-                *byte = byte.with_operands_u16([tag, 0]).with_value_u32(target);
+                let pool_idx = pool.len() as u16;
+                pool.push(target as u64);
+                *byte = Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag, pool_idx]);
             }
             other => panic!(
                 "BlockBuilder: patch_jump_operand called on non-jump \
-                 instruction {:?} at position {}",
-                other, byte_pos
+                 instruction {} at position {}",
+                *other as u8, byte_pos
             ),
         }
     }
@@ -394,6 +394,7 @@ mod tests {
         let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
 
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         bc.push(const_int(1));
         bc.push(const_int(2));
@@ -401,7 +402,7 @@ mod tests {
         bc.push(const_int(3));
         // The JMP is at position 2; bind it to absolute position
         // 5 (past the final CONST).
-        bb.bind_label(l, 5, &mut bc);
+        bb.bind_label(l, 5, &mut bc, &mut pool);
 
         assert!(matches!(bc[2].bytecode(), Instruction::JMP));
         assert_eq!(bc[2].operand_u32(), 5);
@@ -421,9 +422,10 @@ mod tests {
         let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
 
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         bb.emit_jump_to(l, JumpKind::JumpIfMatch { tag: 5, arity: 1 }, &mut bc);
-        bb.bind_label(l, 100_000, &mut bc);
+        bb.bind_label(l, 100_000, &mut bc, &mut pool);
 
         assert!(matches!(bc[0].bytecode(), Instruction::JumpIfMatch));
         let operand = bc[0].operand_u32();
@@ -432,9 +434,9 @@ mod tests {
         assert_eq!(
             operand & 0xFFFF,
             0,
-            "lower 16 bits of operands should be reserved"
+            "lower 16 bits should hold pool index 0"
         );
-        let target = bc[0].value_u32();
+        let target = bc[0].jump_if_match_target(&pool);
         assert!(
             target > 0xFFFF,
             "test must exercise wide-target path (target={})",
@@ -452,6 +454,7 @@ mod tests {
         let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
 
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
         bc.push(const_int(1));
@@ -459,7 +462,7 @@ mod tests {
         bc.push(const_int(2));
         bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
 
-        bb.bind_label(l, 100, &mut bc);
+        bb.bind_label(l, 100, &mut bc, &mut pool);
 
         // All three JMPs (at positions 0, 2, 4) target 100.
         for pos in [0, 2, 4] {
@@ -486,13 +489,14 @@ mod tests {
         let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
 
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
 
-        bb.bind_label(l, 50, &mut bc);
+        bb.bind_label(l, 50, &mut bc, &mut pool);
         assert_eq!(bc[0].operand_u32(), 50);
 
-        bb.bind_label(l, 200, &mut bc);
+        bb.bind_label(l, 200, &mut bc, &mut pool);
         assert_eq!(bc[0].operand_u32(), 200);
     }
 
@@ -506,12 +510,13 @@ mod tests {
         let a = bb.fresh_label();
         let b = bb.fresh_label();
 
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         bb.emit_jump_to(a, JumpKind::Unconditional, &mut bc);
         bc.push(const_int(1));
         bb.emit_jump_to(b, JumpKind::Unconditional, &mut bc);
 
-        bb.bind_label(a, 100, &mut bc);
+        bb.bind_label(a, 100, &mut bc, &mut pool);
 
         // JMP at position 0 (target A) should be 100.
         assert_eq!(bc[0].operand_u32(), 100);
@@ -581,9 +586,10 @@ mod tests {
     #[test]
     fn finalize_succeeds_when_all_labels_bound() {
         let mut bb = BlockBuilder::new();
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         let l = bb.emit_jump(JumpKind::Unconditional, &mut bc);
-        bb.bind_label(l, 100, &mut bc);
+        bb.bind_label(l, 100, &mut bc, &mut pool);
         assert!(bb.finalize().is_ok());
     }
 
@@ -599,6 +605,7 @@ mod tests {
         let mut bb = BlockBuilder::new();
         let end_label = bb.fresh_label();
 
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
 
         // Emit <cond> (CONST 1).
@@ -614,7 +621,7 @@ mod tests {
 
         // Bind end_label to current bytecode.len().
         let end_pos = bc.len() as u32;
-        bb.bind_label(end_label, end_pos, &mut bc);
+        bb.bind_label(end_label, end_pos, &mut bc, &mut pool);
 
         // Assert: bytecode has 5 bytes total.
         assert_eq!(bc.len(), 5);
@@ -645,12 +652,13 @@ mod tests {
     fn emit_jump_to_after_bind_label_records_new_pending() {
         let mut bb = BlockBuilder::new();
         let l = bb.fresh_label();
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
 
         // First jump.
         bb.emit_jump_to(l, JumpKind::Unconditional, &mut bc);
         bc.push(const_int(1));
-        bb.bind_label(l, 10, &mut bc);
+        bb.bind_label(l, 10, &mut bc, &mut pool);
         // First jump now targets 10.
         assert_eq!(bc[0].operand_u32(), 10);
 
@@ -661,7 +669,7 @@ mod tests {
         assert_eq!(bc[2].operand_u32(), 0);
 
         // Re-bind — both jumps should now target 20.
-        bb.bind_label(l, 20, &mut bc);
+        bb.bind_label(l, 20, &mut bc, &mut pool);
         assert_eq!(bc[0].operand_u32(), 20);
         assert_eq!(bc[2].operand_u32(), 20);
     }
@@ -675,9 +683,10 @@ mod tests {
     fn fresh_label_without_jump_is_fine() {
         let mut bb = BlockBuilder::new();
         let _l = bb.fresh_label(); // never used
+        let mut pool = Vec::new();
         let mut bc: Vec<Byte> = Vec::new();
         let l2 = bb.emit_jump(JumpKind::Unconditional, &mut bc);
-        bb.bind_label(l2, 100, &mut bc);
+        bb.bind_label(l2, 100, &mut bc, &mut pool);
         assert!(bb.finalize().is_ok());
     }
 }

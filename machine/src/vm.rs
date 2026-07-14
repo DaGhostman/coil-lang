@@ -4,13 +4,12 @@ use std::{
 };
 
 use common::{
-    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte,
-    SeekableIterator, Value, unlikely,
+    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte, Value,
+    promise,
 };
 
 use crate::{
-    Frame, Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjString, ObjTuple, Object,
-    Stack,
+    Frame, Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjString, ObjTuple, Object, Stack,
 };
 
 /// Default allocation count between automatic GC collections. The VM
@@ -29,18 +28,26 @@ const GC_TRIGGER_INTERVAL: usize = 64;
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
         {
-            let rhs = $stack.pop().$from();
-            let lhs = $stack.peek().$from();
-
-            $stack.top().replace((lhs $op rhs).$to());
+            let sp = $stack.tell();
+            promise!(sp >= 2);
+            let rhs_idx = sp - 1;
+            let lhs_idx = sp - 2;
+            let rhs = $stack[rhs_idx].$from();
+            let lhs = $stack[lhs_idx].$from();
+            $stack[lhs_idx].replace((lhs $op rhs).$to());
+            $stack.seek(lhs_idx + 1);
         }
     };
     ($stack: expr, $op:tt, $from: ident) => {
         {
-            let rhs = $stack.pop().$from();
-            let lhs = $stack.peek().$from();
-
-            $stack.top().replace((lhs $op rhs) as _)
+            let sp = $stack.tell();
+            promise!(sp >= 2);
+            let rhs_idx = sp - 1;
+            let lhs_idx = sp - 2;
+            let rhs = $stack[rhs_idx].$from();
+            let lhs = $stack[lhs_idx].$from();
+            $stack[lhs_idx].replace((lhs $op rhs) as _);
+            $stack.seek(lhs_idx + 1);
         }
     };
 }
@@ -48,17 +55,22 @@ macro_rules! binary {
 macro_rules! unary {
     ($stack: expr, $op: tt, $from: ident, $to: ident) => {
         {
-        let rhs = $stack.peek().$from();
-
-        $stack.top().replace(($op rhs).$to());
+            let sp = $stack.tell();
+            promise!(sp >= 1);
+            let idx = sp - 1;
+            let rhs = $stack[idx].$from();
+            $stack[idx].replace(($op rhs).$to());
         }
     };
-    ($stack: expr, $op: tt, $from: ident) => { {
-            let rhs = $stack.peek().$from();
-
-            $stack.top().replace(($op rhs) as _);
+    ($stack: expr, $op: tt, $from: ident) => {
+        {
+            let sp = $stack.tell();
+            promise!(sp >= 1);
+            let idx = sp - 1;
+            let rhs = $stack[idx].$from();
+            $stack[idx].replace(($op rhs) as _);
         }
-    }
+    };
 }
 
 // type External = fn(&[Value]) -> Value;
@@ -102,77 +114,6 @@ pub struct Machine<const S: usize> {
     /// via the `Object::Library` variant for GC and FFI
     /// dispatch.
     userland_libraries: std::collections::HashMap<u64, std::sync::Arc<Object>>,
-}
-
-#[derive(Default, Copy, Clone)]
-#[repr(u8)]
-enum ExecutionOutcome {
-    #[default]
-    INVALID,
-    CALL,
-    RETURN,
-    TERMINATION,
-}
-
-#[derive(Default)]
-struct ExecutionResult {
-    outcome: ExecutionOutcome,
-    arity: usize,
-    /// `CALL` only: the absolute bytecode offset the inner frame
-    /// should start at. `0` means "fall through to the byte after
-    /// CALL (legacy `CALL` + `JMP` pair)" — the inner frame's first
-    /// dispatched instruction is then the `JMP`. Non-zero is the
-    /// folded form: the inner frame starts directly at the
-    /// callee body.
-    call_target: usize,
-}
-impl ExecutionResult {
-    pub fn returns() -> Self {
-        Self {
-            outcome: ExecutionOutcome::RETURN,
-            arity: 0,
-            call_target: 0,
-        }
-    }
-
-    pub fn call(arity: usize, target: usize) -> Self {
-        Self {
-            outcome: ExecutionOutcome::CALL,
-            arity,
-            call_target: target,
-        }
-    }
-
-    pub fn terminate() -> Self {
-        Self {
-            outcome: ExecutionOutcome::TERMINATION,
-            arity: 0,
-            call_target: 0,
-        }
-    }
-
-    pub fn invalid() -> Self {
-        Self {
-            outcome: ExecutionOutcome::INVALID,
-            arity: usize::MAX,
-            call_target: 0,
-        }
-    }
-
-    #[inline]
-    pub fn outcome(&self) -> ExecutionOutcome {
-        self.outcome
-    }
-
-    #[inline]
-    pub fn arity(&self) -> usize {
-        self.arity
-    }
-
-    #[inline]
-    pub fn call_target(&self) -> usize {
-        self.call_target
-    }
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -460,7 +401,6 @@ impl<const S: usize> Machine<S> {
         self.output.take()
     }
 
-
     /// Register a host native with an explicit signature via the
     /// builder API. Returns the stable native id used by
     /// [`Instruction::HostInvoke`].
@@ -471,9 +411,10 @@ impl<const S: usize> Machine<S> {
             + Sync
             + 'static,
     {
-        self.natives.register(std::sync::Arc::new(
-            crate::ffi::HostClosureFn::new(sig, func),
-        ))
+        self.natives
+            .register(std::sync::Arc::new(crate::ffi::HostClosureFn::new(
+                sig, func,
+            )))
     }
 
     /// Back-compat alias for [`Self::register_fn`].
@@ -498,7 +439,8 @@ impl<const S: usize> Machine<S> {
         let lib_obj_mut = std::sync::Arc::make_mut(&mut lib_obj_arc);
         if let crate::memory::Object::Library(gc) = lib_obj_mut {
             let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
-            let id = crate::ffi::register_on_library(obj_lib, signature).map_err(|e| e.to_string())?;
+            let id =
+                crate::ffi::register_on_library(obj_lib, signature).map_err(|e| e.to_string())?;
             self.userland_libraries
                 .insert(addr, std::sync::Arc::new(lib_obj_mut.clone()));
             Ok(id)
@@ -535,65 +477,16 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn run(&mut self, code: &[Byte]) {
+        self.run_with_pool(code, &[]);
+    }
+
+    /// Run bytecode with an optional constant pool (Phase 19 perf —
+    /// wide immediates for `CONST` / `JumpIfMatch` / folded `CALL`).
+    pub fn run_with_pool(&mut self, code: &[Byte], constants: &[u64]) {
         if code.is_empty() {
             return;
         }
-
-        let mut code_iter = SeekableIterator::new(code);
-
-        loop {
-            let result = self.execute(&mut code_iter);
-
-            match result.outcome() {
-                ExecutionOutcome::CALL => {
-                    // Phase 18G perf optimisation — fold the legacy
-                    // `CALL arity; JMP offset` pair into a single
-                    // `CALL arity, target` whose target lives in
-                    // `value[31:0]`. Older bytecode archives
-                    // (value = 0) fall through to the JMP after
-                    // CALL — the inner frame's first instruction
-                    // is then the JMP, which seeks.
-                    //
-                    // folded form (target != 0):
-                    //   - caller's return IP = current cursor
-                    //     (the byte right after CALL)
-                    //   - the callee starts at `target` immediately
-                    // legacy form (target == 0):
-                    //   - caller's return IP = current cursor + 1
-                    //     (the byte right after the JMP that
-                    //     follows CALL)
-                    //   - the callee runs JMP first, which seeks
-                    let target = result.call_target();
-                    let return_ip = code_iter.tell() + if target == 0 { 1 } else { 0 };
-                    let arity = result.arity();
-                    let callee_sp = self.stack.tell() - arity;
-
-                    self.frames.get_mut().seek(return_ip);
-                    self.frames.current_mut().enter();
-                    self.frames.current_mut().set(callee_sp);
-                    self.frames.consume();
-
-                    if target != 0 {
-                        code_iter.seek(target);
-                    }
-                }
-                ExecutionOutcome::RETURN => {
-                    let current = self.frames.pop();
-                    let v = self.stack.pop();
-                    self.stack.seek(current.get());
-                    self.stack.push(v);
-
-                    let prev = self.frames.get_mut();
-
-                    code_iter.seek(prev.tell());
-                }
-                ExecutionOutcome::TERMINATION => {
-                    unlikely(true);
-                    break;
-                }
-                _ => (),
-            }
-        }
+        self.execute(code, constants);
     }
 
     /// Run a non-archived `&[Byte]` (the form produced by
@@ -609,69 +502,48 @@ impl<const S: usize> Machine<S> {
     /// (rkyv's archived layout may not match the source
     /// layout exactly for some field types), so we go
     /// through the proper serialization path.
-    pub fn run_raw(&mut self, code: &[RawByte]) {
-        use rkyv::{rancor::Error, vec::ArchivedVec};
-
-        // Serialize a `Vec<Byte>` (not `&[Byte]`, which
-        // isn't `Sized`) via rkyv.
-        let owned: Vec<RawByte> = code.to_vec();
-        let bytes = rkyv::to_bytes::<Error>(&owned).expect("failed to serialize bytecode via rkyv");
-
-        // Convert to a plain `Vec<u8>` for `access`.
-        let plain: Vec<u8> = bytes.as_slice().to_vec();
-        drop(bytes); // AlignedVec → drop, no `into_owned`
-
-        // Deserialize back to the archived form.
-        let archived = rkyv::access::<ArchivedVec<Byte>, Error>(&plain)
-            .expect("failed to deserialize bytecode via rkyv");
-
-        self.run(archived.as_slice());
+    pub fn run_raw(&mut self, code: &[RawByte], constants: &[u64]) {
+        let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
+        self.run_with_pool(code, constants);
     }
 
     #[inline(always)]
-    fn execute(&mut self, code: &mut SeekableIterator<'_, Byte>) -> ExecutionResult {
+    fn execute(&mut self, code: &[Byte], constants: &[u64]) {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
-        let frame = self.frames.get_mut();
+        let mut ip: usize = 0;
+        let mut sp = self.frames.get_mut().get();
 
-        while let Some(opcode) = code.next() {
+        while ip < code.len() {
+            let opcode = &code[ip];
+            ip += 1;
+
             #[cfg(debug_assertions)]
             {
                 eprintln!(
                     "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
                     frame_no,
-                    code.tell(),
-                    format!("{:?}", opcode.bytecode()),
+                    ip,
+                    *opcode.bytecode() as u8,
                     opcode.operand_u16(0),
                     opcode.operand_u16(1),
                     self.stack.as_slice()
                 );
             }
 
-            #[cfg(debug_assertions)]
-            {
-                // Phase 15D.1 — replaced by the allocation-pressure
-                // GC wired in the per-allocation arms below. The
-                // debug-only per-instruction GC block was visible as
-                // "Performing GC trace" / "Performing GC collection"
-                // spam in debug builds; release builds had no GC at
-                // all (heap grew unboundedly). The new strategy:
-                // increment `alloc_counter` at every heap allocation
-                // site and trigger `collect_garbage` when the counter
-                // exceeds `GC_TRIGGER_INTERVAL`. This block is left
-                // empty intentionally — allocation sites below carry
-                // the GC responsibility now.
-            }
+            let bc = opcode.bytecode();
+            // #[cfg(not(debug_assertions))]
+            // promise!(*bc as u8 <= Instruction::HostInvoke as u8);
 
-            match opcode.bytecode() {
+            match bc {
                 Instruction::POP => {
                     self.stack.pop();
                 }
                 Instruction::DUPLICATE => {
                     self.stack.push(*self.stack.peek());
                 }
-                Instruction::CONST => self.stack.push(Value::from(opcode.constant())),
+                Instruction::CONST => self.stack.push(Value::from(opcode.constant(constants))),
                 Instruction::STORE => {
                     // Phase 15D — STORE is now effectively a
                     // no-op: it reads the value at the slot's
@@ -709,20 +581,20 @@ impl<const S: usize> Machine<S> {
                     // `UNPACK` puts each payload value at the
                     // slot's position, and `STORE` confirms
                     // the binding without disturbing the value.
-                    let slot = frame.get() + opcode.operand_u32() as usize;
+                    let slot = sp + opcode.operand_u32() as usize;
                     let val = self.stack[slot];
                     self.stack[slot] = val;
                 }
                 Instruction::LOAD => {
                     self.stack
-                        .push(self.stack[frame.get() + opcode.operand_u32() as usize]);
+                        .push(self.stack[sp + opcode.operand_u32() as usize]);
                 }
                 Instruction::INC => {
-                    let lhs = *self.stack[frame.get() + opcode.operand_u32() as usize].inc();
+                    let lhs = *self.stack[sp + opcode.operand_u32() as usize].inc();
                     self.stack.push(lhs);
                 }
                 Instruction::DEC => {
-                    let lhs = *self.stack[frame.get() + opcode.operand_u32() as usize].dec();
+                    let lhs = *self.stack[sp + opcode.operand_u32() as usize].dec();
                     self.stack.push(lhs);
                 }
                 Instruction::NOT => unary!(self.stack, !, as_bool),
@@ -858,23 +730,30 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::JMP => {
-                    code.seek(opcode.operand_u32() as usize);
+                    ip = opcode.operand_u32() as usize;
                 }
                 Instruction::JMPF => {
                     if !self.stack.pop().as_bool() {
-                        code.seek(opcode.operand_u32() as usize);
+                        ip = opcode.operand_u32() as usize;
                     }
                 }
                 Instruction::JMPT => {
                     if self.stack.pop().as_bool() {
-                        code.seek(opcode.operand_u32() as usize);
+                        ip = opcode.operand_u32() as usize;
                     }
                 }
                 Instruction::CALL => {
-                    return ExecutionResult::call(
-                        opcode.operand_u32() as usize,
-                        opcode.value_u32() as usize,
-                    );
+                    let (arity, target) = opcode.call_parts();
+                    let return_ip = ip + if target == 0 { 1 } else { 0 };
+                    let callee_sp = self.stack.tell() - arity;
+                    self.frames.get_mut().seek(return_ip);
+                    self.frames.current_mut().enter();
+                    self.frames.current_mut().set(callee_sp);
+                    self.frames.consume();
+                    sp = callee_sp;
+                    if target != 0 {
+                        ip = target;
+                    }
                 }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
@@ -890,7 +769,13 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
                 }
                 Instruction::RETURN => {
-                    return ExecutionResult::returns();
+                    let ret_val = self.stack.pop();
+                    let frame_left = self.frames.pop();
+                    self.stack.seek(frame_left.get());
+                    self.stack.push(ret_val);
+                    let caller = self.frames.get_mut();
+                    ip = caller.tell();
+                    sp = caller.get();
                 }
                 // FFI / native dispatch. Pops `native.arity()`
                 // values from the operand stack (in source order:
@@ -935,9 +820,7 @@ impl<const S: usize> Machine<S> {
                     let path = {
                         let addr = path_val.raw() as u64;
                         match Self::find_object_by_addr(&self.heap, addr) {
-                            Some(crate::memory::Object::String(gc)) => {
-                                gc.as_ref().data.clone()
-                            }
+                            Some(crate::memory::Object::String(gc)) => gc.as_ref().data.clone(),
                             _ => String::new(),
                         }
                     };
@@ -1016,13 +899,8 @@ impl<const S: usize> Machine<S> {
                     // this for us; use a direct walk via
                     // `find_object_by_addr` + cast to
                     // `Object::Tuple`.
-                    let args: Vec<Value> = match Self::find_object_by_addr(
-                        &self.heap,
-                        tuple_addr,
-                    ) {
-                        Some(crate::memory::Object::Tuple(gc)) => {
-                            gc.as_ref().elements.clone()
-                        }
+                    let args: Vec<Value> = match Self::find_object_by_addr(&self.heap, tuple_addr) {
+                        Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.clone(),
                         _ => Vec::new(),
                     };
 
@@ -1031,7 +909,7 @@ impl<const S: usize> Machine<S> {
                         Some(obj) => {
                             let l = match obj.as_ref() {
                                 crate::memory::Object::Library(gc) => gc,
-                                _ => return ExecutionResult::terminate(),
+                                _ => return,
                             };
                             let lib_ref: &crate::memory::ObjLibrary = &(**l).as_ref();
                             if function_id < lib_ref.signatures.len() {
@@ -1141,20 +1019,18 @@ impl<const S: usize> Machine<S> {
                     // `extern`-block `CONST int`) or a heap
                     // `Object::Enum` (from userland
                     // `FFIType::X` constructors via MakeEnum).
-                    let arg_tags: Vec<u32> = match Self::find_object_by_addr(
-                        &self.heap,
-                        args_tuple_addr,
-                    ) {
-                        Some(crate::memory::Object::Tuple(gc)) => gc
-                            .as_ref()
-                            .elements
-                            .iter()
-                            .map(|v| Self::ffi_type_tag_from_value(&self.heap, v))
-                            .collect(),
-                        // Defensive: malformed tuple — degrade
-                        // to an empty arity vector.
-                        _ => Vec::new(),
-                    };
+                    let arg_tags: Vec<u32> =
+                        match Self::find_object_by_addr(&self.heap, args_tuple_addr) {
+                            Some(crate::memory::Object::Tuple(gc)) => gc
+                                .as_ref()
+                                .elements
+                                .iter()
+                                .map(|v| Self::ffi_type_tag_from_value(&self.heap, v))
+                                .collect(),
+                            // Defensive: malformed tuple — degrade
+                            // to an empty arity vector.
+                            _ => Vec::new(),
+                        };
                     let arg_types: Vec<crate::memory::FfiType> =
                         arg_tags.into_iter().map(Self::ffi_type_from_tag).collect();
                     // Pop the name string.
@@ -1207,10 +1083,7 @@ impl<const S: usize> Machine<S> {
                     let tuple_addr = tuple_val.raw() as u64;
                     let fn_id_val = self.stack.pop();
                     let fn_id = fn_id_val.as_int() as usize;
-                    let args: Vec<Value> = match Self::find_object_by_addr(
-                        &self.heap,
-                        tuple_addr,
-                    ) {
+                    let args: Vec<Value> = match Self::find_object_by_addr(&self.heap, tuple_addr) {
                         Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.clone(),
                         _ => Vec::new(),
                     };
@@ -1232,15 +1105,15 @@ impl<const S: usize> Machine<S> {
                     } else {
                         let _ = io::stdout().flush();
                     }
-                    return ExecutionResult::terminate();
+                    return;
                 }
                 Instruction::STRING => {
                     let length = opcode.operand_u32() as usize;
                     let mut value: String = String::with_capacity(length);
 
-                    while length != value.len()
-                        && let Some(data) = code.next()
-                    {
+                    while length != value.len() && ip < code.len() {
+                        let data = &code[ip];
+                        ip += 1;
                         value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
@@ -1267,7 +1140,8 @@ impl<const S: usize> Machine<S> {
                         Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
 
-                    self.stack.push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
+                    self.stack
+                        .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
@@ -1396,11 +1270,7 @@ impl<const S: usize> Machine<S> {
                         object.addr()
                     };
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &mut self.alloc_counter,
-                        );
+                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
                     self.stack.push(Value::from(addr));
                 }
@@ -1415,33 +1285,28 @@ impl<const S: usize> Machine<S> {
                     let target_val = self.stack.pop();
                     let target_addr = target_val.raw() as u64;
                     let index = index_val.as_int();
-                    let result =
-                        match Self::find_object_by_addr(&self.heap, target_addr) {
-                            Some(crate::memory::Object::Tuple(gc)) => {
-                                let elements = &gc.as_ref().elements;
-                                if index < 0
-                                    || (index as usize) >= elements.len()
-                                {
-                                    Value::from(-1_i64)
-                                } else {
-                                    elements[index as usize]
-                                }
+                    let result = match Self::find_object_by_addr(&self.heap, target_addr) {
+                        Some(crate::memory::Object::Tuple(gc)) => {
+                            let elements = &gc.as_ref().elements;
+                            if index < 0 || (index as usize) >= elements.len() {
+                                Value::from(-1_i64)
+                            } else {
+                                elements[index as usize]
                             }
-                            Some(crate::memory::Object::Array(gc)) => {
-                                let elements = &gc.as_ref().elements;
-                                if index < 0
-                                    || (index as usize) >= elements.len()
-                                {
-                                    Value::from(-1_i64)
-                                } else {
-                                    elements[index as usize]
-                                }
+                        }
+                        Some(crate::memory::Object::Array(gc)) => {
+                            let elements = &gc.as_ref().elements;
+                            if index < 0 || (index as usize) >= elements.len() {
+                                Value::from(-1_i64)
+                            } else {
+                                elements[index as usize]
                             }
-                            // Non-aggregate target or stale
-                            // heap pointer: degrade to -1
-                            // rather than panicking.
-                            _ => Value::from(-1_i64),
-                        };
+                        }
+                        // Non-aggregate target or stale
+                        // heap pointer: degrade to -1
+                        // rather than panicking.
+                        _ => Value::from(-1_i64),
+                    };
                     self.stack.push(result);
                 }
                 // ---- Phase 25: dict literal ----
@@ -1490,11 +1355,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &mut self.alloc_counter,
-                        );
+                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                     }
                     self.stack.push(Value::from(object.addr()));
                 }
@@ -1567,16 +1428,10 @@ impl<const S: usize> Machine<S> {
                         // with the updated entry. (In-place
                         // mutation would need a mutable Gc API.)
                         self.alloc_counter += 1;
-                        let (new_obj, _) = self.heap.alloc(
-                            ObjInstance::default(),
-                            Object::Instance,
-                        );
+                        let (new_obj, _) =
+                            self.heap.alloc(ObjInstance::default(), Object::Instance);
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                            Self::gc_collect(
-                                &mut self.heap,
-                                &self.stack,
-                                &mut self.alloc_counter,
-                            );
+                            Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                         }
                         // The newly-allocated instance holds the
                         // new field. The old instance's table is
@@ -1620,7 +1475,6 @@ impl<const S: usize> Machine<S> {
                     // for the rationale.
                     let operands = opcode.operand_u32();
                     let expected_tag = (operands >> 16) as u32;
-                    let target_offset = opcode.value_u32() as usize;
 
                     if self.stack.tell() == 0 {
                         // No scrutinee — bail.
@@ -1641,6 +1495,7 @@ impl<const S: usize> Machine<S> {
                         if let Some(enum_ref) = obj_enum {
                             let enum_ref = enum_ref.as_ref();
                             if enum_ref.tag == expected_tag {
+                                let target_offset = opcode.jump_if_match_target(constants);
                                 // Match — consume the scrutinee
                                 // and push the payload values in
                                 // declaration order.
@@ -1652,7 +1507,7 @@ impl<const S: usize> Machine<S> {
                                     };
                                     self.stack.push(value);
                                 }
-                                code.seek(target_offset);
+                                ip = target_offset;
                             }
                             // else: fall through; scrutinee still
                             // on stack for the next arm.
@@ -1793,7 +1648,7 @@ impl<const S: usize> Machine<S> {
                     let slot_offset = (operands & 0xFFFF) as usize;
                     let _arity = (operands >> 16) as usize;
 
-                    let slot = frame.get() + slot_offset;
+                    let slot = sp + slot_offset;
                     if slot >= self.stack.tell() {
                         // Slot is out of bounds — bail (defensive).
                     } else {
@@ -1860,24 +1715,22 @@ impl<const S: usize> Machine<S> {
                     // "local is allocated" semantic — once a
                     // slot has been written, future operand
                     // pushes go above it.
-                    let slot = frame.get() + opcode.operand_u32() as usize;
+                    let slot = sp + opcode.operand_u32() as usize;
                     let val = self.stack.pop();
                     self.stack[slot] = val;
                     if self.stack.tell() < slot + 1 {
                         self.stack.seek(slot + 1);
                     }
                 }
-                _ => return ExecutionResult::invalid(),
+                _ => return,
             }
         }
-
-        ExecutionResult::terminate()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction, Value};
+    use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction};
 
     use crate::{Machine, ObjEnum};
 
@@ -1896,10 +1749,8 @@ mod tests {
     /// pre-18C the target was a 16-bit value in
     /// `operands[15:0]`, which capped reachable match-arm
     /// bodies at 65,535 bytes).
-    fn jump_if_match(tag: u16, target: u32) -> Byte {
-        Byte::new(Instruction::JumpIfMatch)
-            .with_operands_u16([tag, 0])
-            .with_value_u32(target)
+    fn jump_if_match(tag: u16, pool_idx: u16) -> Byte {
+        Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag, pool_idx])
     }
 
     /// Build an `UNPACK` byte with the given arity in the
@@ -1931,7 +1782,7 @@ mod tests {
     /// onto the stack. Used to set up the operand values for
     /// `MAKE_ENUM` and `JUMP_IF_MATCH`.
     fn const_int(value: i64) -> Byte {
-        Byte::new(Instruction::CONST).with_value(Value::from(value))
+        Byte::new(Instruction::CONST).with_const_inline(value as i32)
     }
 
     /// Step 1: execute `MAKE_ENUM 0 0` (zero-arity constructor).
@@ -1998,17 +1849,21 @@ mod tests {
         // enum's tag IS 2, the jump is taken. The payload
         // (42) is pushed onto the stack.
         let mut vm = Machine::<4>::default();
-        vm.run(&[
-            // Build the enum (tag=2, arity=1) with payload [42]:
-            const_int(42),
-            make_enum(2, 1),
-            // JUMP_IF_MATCH tag=2 target=4
-            jump_if_match(2, 4u32),
-            // (Should not reach here on the jump-taken path.)
-            const_int(999),
-            // HALT at offset 4 (the target).
-            Byte::new(Instruction::HALT),
-        ]);
+        let constants = vec![4u64];
+        vm.run_with_pool(
+            &[
+                // Build the enum (tag=2, arity=1) with payload [42]:
+                const_int(42),
+                make_enum(2, 1),
+                // JUMP_IF_MATCH tag=2 target=4 (pool[0])
+                jump_if_match(2, 0),
+                // (Should not reach here on the jump-taken path.)
+                const_int(999),
+                // HALT at offset 4 (the target).
+                Byte::new(Instruction::HALT),
+            ],
+            &constants,
+        );
         // After the jump, the payload (42) was pushed. Top of
         // stack is 42.
         let v = vm.pop();
@@ -2033,12 +1888,13 @@ mod tests {
     #[test]
     fn jump_if_match_wide_target_round_trips() {
         let target: u32 = 100_000;
-        let byte = jump_if_match(5, target);
+        let constants = vec![target as u64];
+        let byte = jump_if_match(5, 0);
         assert!(matches!(byte.bytecode(), Instruction::JumpIfMatch));
         assert_eq!(
-            byte.value_u32(),
-            target,
-            "wide target should round-trip via value_u32"
+            byte.jump_if_match_target(&constants),
+            target as usize,
+            "wide target should resolve via constant pool"
         );
         assert_eq!(
             byte.operand_u32() >> 16,
@@ -2048,7 +1904,7 @@ mod tests {
         assert_eq!(
             byte.operand_u32() & 0xFFFF,
             0,
-            "lower 16 bits of operands should be reserved"
+            "lower 16 bits should hold the pool index"
         );
         assert!(target > 0xFFFF, "test must exercise wide-target path");
     }
@@ -2060,17 +1916,20 @@ mod tests {
     #[test]
     fn jump_if_match_not_taken_falls_through() {
         let mut vm = Machine::<4>::default();
-        vm.run(&[
-            // Build an enum (tag=2, arity=1) with payload [42]:
-            const_int(42),
-            make_enum(2, 1),
-            // JUMP_IF_MATCH tag=5 target=4 (won't match; fall through)
-            jump_if_match(5, 4u32),
-            // (Should be reached on the fall-through path.)
-            const_int(99),
-            // Target for the (non-taken) jump at offset 4.
-            Byte::new(Instruction::HALT),
-        ]);
+        vm.run_with_pool(
+            &[
+                // Build an enum (tag=2, arity=1) with payload [42]:
+                const_int(42),
+                make_enum(2, 1),
+                // JUMP_IF_MATCH tag=5 (won't match; fall through)
+                jump_if_match(5, 0),
+                // (Should be reached on the fall-through path.)
+                const_int(99),
+                // Target for the (non-taken) jump at offset 4.
+                Byte::new(Instruction::HALT),
+            ],
+            &[],
+        );
         // After fall-through, we pushed 99. Stack: [enum_ptr, 99].
         let v = vm.pop();
         assert_eq!(v.as_int(), 99, "JUMP_IF_MATCH should have fallen through");
