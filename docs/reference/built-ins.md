@@ -1,0 +1,293 @@
+# Built-ins reference
+
+Built-in facilities provided by the language runtime and compiler — not ordinary user-defined functions in a standard library.
+
+zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/O modules, etc.). What exists today is I/O, FFI, and host-embedder hooks.
+
+---
+
+## Overview
+
+| Builtin | Kind | Purpose |
+|---------|------|---------|
+| `print` | Statement | Write to stdout |
+| `dload` | Expression | `dlopen` a shared library |
+| `declare` | Expression | Register FFI function signature |
+| `invoke` | Expression | Call registered FFI function |
+| Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
+
+Internal (not user syntax): `FORMAT` opcode used by `print` with specifiers; `Expression::Format` in AST without a `format` keyword.
+
+---
+
+## `print`
+
+### Syntax
+
+```
+print_stmt ::= 'print' STRING (',' expr)* ';'
+```
+
+### Forms
+
+| Form | Example | Behavior |
+|------|---------|----------|
+| Literal only | `print "hello";` | Writes `hello` |
+| Format + args | `print "%i", x;` | Interpolates specifiers |
+| Multiple args | `print "%i %s", n, name;` | One specifier per arg, left to right |
+
+### Format specifiers
+
+The typechecker validates specifiers against arguments when the format string is a compile-time literal.
+
+| Specifier | Argument type | Output |
+|-----------|---------------|--------|
+| `%i` | `int` | Signed decimal integer |
+| `%f` | `float` | Float (debug-style formatting) |
+| `%s` | `string` | String contents |
+| `%z` | `bool` | `true` or `false` |
+| `%b` | `int` | Binary representation (VM-specific) |
+| `%x` | `int` | Hex representation (VM-specific) |
+| `%u` | `int` | Unsigned-style address rendering |
+| `%p` | `int` | Pointer-style hex |
+| `%%` | *(none)* | Literal `%` |
+
+**Not supported:** `%d` (rejected by typechecker — use `%i`).
+
+### Examples
+
+```0s
+print "plain text";
+print "%i", 42;
+print "%s %z", "ok", true;
+print "100%% complete";   // literal percent via %%
+```
+
+### Runtime pipeline
+
+1. If specifiers present: `FORMAT` builds a new string on the heap.
+2. `PRINT` pops the string and writes to stdout (or a redirected writer in tests).
+
+See [Tutorial 01](../tutorial/01-basics.md) for introductory usage.
+
+---
+
+## `dload`
+
+Load a native shared library at runtime.
+
+### Syntax
+
+```0s
+dload(path_expr)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `path_expr` | `string` | Path or name passed to `dlopen` |
+
+### Returns
+
+Library handle as `int` (heap library object address). Returns `-1` on failure.
+
+### Example
+
+```0s
+let lib = dload("libsum.so");
+```
+
+### Notes
+
+- Requires libffi-enabled build.
+- Prefer full paths when cwd is unpredictable.
+- Same mechanism as the string in `extern "..." { ... }` blocks.
+
+---
+
+## `declare`
+
+Register a C function signature in a loaded library.
+
+### Syntax
+
+```0s
+declare(lib, name, (arg_types...), ret_type)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `lib` | `int` | Handle from `dload` |
+| `name` | `string` | Symbol name for `dlsym` |
+| `(arg_types...)` | Tuple of FFI tags | One tag per parameter |
+| `ret_type` | FFI tag | Return type (`void` allowed) |
+
+### Returns
+
+Function id (`int`), or `-1` if symbol missing or libffi rejects signature.
+
+### FFI type tags
+
+Either enum constructors or bare names:
+
+```0s
+enum FFIType { Int, Float, String, Void }
+
+declare(lib, "f", (FFIType::Int, FFIType::String), FFIType::Int);
+declare(lib, "g", (int, float), void);   // bare names
+```
+
+| Tag | Meaning |
+|-----|---------|
+| `int` / `FFIType::Int` | 64-bit integer |
+| `float` / `FFIType::Float` | 64-bit float |
+| `string` / `FFIType::String` | C string |
+| `void` / `FFIType::Void` | No return value only |
+
+`void` cannot appear as an argument type.
+
+---
+
+## `invoke`
+
+Call a function registered with `declare`.
+
+### Syntax
+
+```0s
+invoke(lib, fn_id, (args...))
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `lib` | `int` | Same library handle |
+| `fn_id` | `int` | Id from `declare` |
+| `(args...)` | Tuple of values | Must match declared arity and types |
+
+### Returns
+
+Value per declared return type. `void` functions push nothing meaningful — do not rely on a return value.
+
+### Example
+
+```0s
+print "%i", invoke(lib, sum_id, (40, 2));
+```
+
+### Typechecker note
+
+`invoke` is typed as `int` at inference time regardless of declared return type. The programmer is responsible for consistency with `declare`.
+
+---
+
+## Compile-time FFI (`extern` blocks)
+
+Not separate builtins — the compiler lowers extern declarations to `dload` / `declare` / `invoke` sequences. User code calls look like normal functions:
+
+```0s
+extern "libc.so.6" {
+    fn strlen(string s) -> int;
+}
+
+fn main() {
+    print "%i", strlen("hello");
+}
+```
+
+See [FFI tutorial](../tutorial/07-ffi.md).
+
+---
+
+## What is NOT a builtin
+
+There is **no general standard library** yet. The following are **not** built-in — you must provide your own functions or FFI:
+
+| Category | Examples |
+|----------|----------|
+| Collections API | `len`, `push`, `sort`, iterators |
+| String ops | concat (`+`), slice, trim (except `print` formatting) |
+| Math | `sin`, `sqrt`, `random` |
+| File I/O | `read_file`, `write_file` |
+| Networking | sockets, HTTP |
+| Concurrency | threads, async/await (parser not wired) |
+| Memory | `alloc`, `free` |
+
+Use **FFI** to call C libraries for these capabilities, or **host natives** when embedding the VM in Rust.
+
+---
+
+## Host embedder API
+
+Advanced: register Rust closures callable from bytecode without a `.so` file.
+
+### Rust API
+
+```rust
+use compiler::pipeline::Pipeline;
+use machine::ffi::{FfiSignature, FfiSignatureBuilder};
+use machine::memory::{FfiType, Heap};
+use common::Value;
+
+let mut pipeline = Pipeline::default();
+
+let sig = FfiSignatureBuilder::new("my_add")
+    .arg(FfiType::Int)
+    .arg(FfiType::Int)
+    .ret(FfiType::Int)
+    .build()
+    .unwrap();
+
+pipeline.register_host_native(sig, |heap: &mut Heap, args: &[Value]| {
+    let sum = args[0].as_int() + args[1].as_int();
+    Ok(Some(Value::from(sum)))
+});
+
+// After compile:
+pipeline.wire_host_natives(&mut vm);
+vm.run_raw(&bytecode);
+```
+
+### Workflow
+
+| Step | API |
+|------|-----|
+| Register type + closure | `Pipeline::register_host_native(sig, closure)` |
+| Typecheck user calls | Signatures forwarded to HM checker via `Compiler::register` |
+| Wire before run | `Pipeline::wire_host_natives(&mut vm)` |
+| Bytecode opcode | `HostInvoke` |
+
+### Metadata-only registration
+
+`Pipeline::register_native_function(name, namespace, sig)` registers types without a closure — for tooling or deferred wiring.
+
+### When to use
+
+| Approach | Use when |
+|----------|----------|
+| Host natives | Embedding zero-script in a Rust app; hot callbacks; sandboxed API surface |
+| `extern` / `dload` | Calling existing C libraries; plugins as `.so` files |
+
+---
+
+## VM opcodes (reference)
+
+User code does not name these directly; the compiler emits them:
+
+| Opcode | Role |
+|--------|------|
+| `PRINT` | Write string to output |
+| `FORMAT` | Build formatted string from specifiers |
+| `FfiLoad` | `dload` |
+| `DeclareFFI` | `declare` |
+| `FfiInvoke` | `invoke` |
+| `HostInvoke` | Host-registered closure |
+
+---
+
+## Related documents
+
+| Document | Contents |
+|----------|----------|
+| [FFI tutorial](../tutorial/07-ffi.md) | End-to-end C interop |
+| [Keywords](keywords.md) | `print`, `dload`, etc. |
+| [Types](types.md) | Format specifier type rules |
+| [Getting Started](../getting-started.md) | libffi prerequisites |

@@ -1,0 +1,207 @@
+# Getting Started
+
+This guide walks you through building zero-script, running your first program, and understanding how source becomes bytecode on the VM.
+
+## Prerequisites
+
+### Rust toolchain
+
+zero-script is a Rust workspace. Install a recent stable Rust toolchain ([rustup](https://rustup.rs/)) and ensure `cargo` is on your `PATH`.
+
+```bash
+rustc --version
+cargo --version
+```
+
+### libffi (optional, for FFI examples)
+
+Examples that call C code (`examples/strlen.0s`, `examples/ffi_sum.0s`) require **libffi** at link time.
+
+| Platform | Package |
+|----------|---------|
+| Arch Linux | `libffi` |
+| Debian / Ubuntu | `libffi-dev` |
+| Fedora | `libffi-devel` |
+
+You can build and run all non-FFI examples without libffi.
+
+## Build the project
+
+Clone the repository and build the workspace from the root:
+
+```bash
+cd zero-script
+cargo build --workspace
+```
+
+For optimized binaries:
+
+```bash
+cargo build --release --workspace
+```
+
+A successful build produces the `zero-script` binary (via `src/main.rs`) plus the `parser`, `compiler`, `machine`, and `common` crates as libraries.
+
+## Run your first program
+
+The canonical starter example computes the 32nd Fibonacci number recursively:
+
+```0s
+fn fib(int n) -> int {
+    if n <= 2 {
+        return 1;
+    }
+
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    print "%i", fib(32);
+}
+```
+
+Run it:
+
+```bash
+cargo run -- examples/fib.0s
+```
+
+**Expected output:** `2178309`
+
+The CLI compiles `examples/fib.0s` to bytecode, serializes it into `out.c0s` in the current directory (if the file does not already exist), then loads and executes it on the VM.
+
+### Recompiling after changes
+
+The runner caches `out.c0s`. After editing a `.0s` file, delete the archive to pick up changes:
+
+```bash
+rm -f out.c0s
+cargo run -- examples/fib.0s
+```
+
+If the archive version in the binary does not match the file on disk, the runner prints a version mismatch message and exits — delete `out.c0s` and run again.
+
+## A simpler hello-world
+
+For a minimal smoke test:
+
+```bash
+cargo run -- examples/print_literal.0s
+```
+
+Source:
+
+```0s
+fn main() {
+    print "hello";
+}
+```
+
+**Expected output:** `hello`
+
+## Project layout
+
+```
+zero-script/
+├── common/              # Opcodes, values, diagnostics, archive envelope
+├── parser/              # Lexer + Pratt parser → AST
+├── compiler/
+│   ├── src/typechecking/  # Hindley–Milner inference
+│   ├── src/pipeline.rs    # Compile driver, multi-file discovery
+│   ├── src/peephole.rs    # Opcode fusion pass
+│   └── tests/             # Golden pipeline and diagnostic tests
+├── machine/
+│   ├── src/vm.rs          # Bytecode interpreter
+│   ├── src/memory/        # Stack, heap, GC
+│   └── src/ffi/           # libffi dynamic calls + host natives
+├── examples/              # Runnable .0s programs (catalog in examples.md)
+├── docs/                  # User documentation (you are here)
+├── src/main.rs            # `cargo run` entry point
+└── zero.toml.example      # Sample project manifest for modules
+```
+
+### Crate responsibilities
+
+| Crate | Role |
+|-------|------|
+| `parser` | Turn `.0s` text into an AST (`Expression`, `Pattern`, declarations) |
+| `compiler` | Typecheck, emit bytecode, peephole-optimize, write `.c0s` archives |
+| `machine` | Execute bytecode; manage stack, heap, and automatic GC |
+| `common` | Shared `Instruction` opcodes, `Value` representation, `ArchivedProgram` |
+
+## Compilation model
+
+zero-script uses a **single-pass stack codegen** pipeline (with a post-codegen peephole pass). There is no separate register-IR stage in the current tree.
+
+```
+┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────┐
+│  .0s source │ →  │ Parser (AST) │ →  │ HM checker  │ →  │ Codegen  │
+└─────────────┘    └──────────────┘    └─────────────┘    └────┬─────┘
+                                                                │
+                    ┌──────────────┐    ┌─────────────┐         ▼
+                    │ VM execute   │ ←  │  out.c0s    │ ←  Peephole
+                    └──────────────┘    │  (rkyv)     │
+                                        └─────────────┘
+```
+
+### Stages in detail
+
+1. **Parse** — `parser::Pratt` builds an AST. Syntax errors are reported with spans.
+2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
+3. **Codegen** — `Compiler::compile` walks the AST and appends stack instructions (`LOAD`, `CONST`, `JMP`, `MakeEnum`, `StorePop`, …) to a bytecode vector.
+4. **Peephole** — `peephole::optimize` fuses frequent instruction sequences (`LOAD; CONST; ADD` → `BinSlotImm`, and similar) and relocates jump targets.
+5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **8**) must match at load time.
+6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
+
+### Entry point convention
+
+Every program must define `fn main()`. The compiler emits a short prologue (`CALL`, `JMP`, `HALT`) and patches the `JMP` to jump to `main` (or to extern-block setup when `extern` declarations are present).
+
+## Source and archive files
+
+| Extension | Meaning |
+|-----------|---------|
+| `.0s` | zero-script source |
+| `.c0s` | Compiled bytecode archive (rkyv-serialized `ArchivedProgram`) |
+
+The default CLI writes `out.c0s` in the working directory. Treat archives as **compiler-version-specific** — stale archives are rejected when `ARCHIVE_VERSION` changes.
+
+## What you can write today
+
+The language includes:
+
+- **Primitives:** `int`, `float`, `string`, `bool`
+- **Functions** with typed parameters and return types
+- **`let` bindings** and reassignment (`x = expr;`)
+- **Control flow:** `if` / `else`, `while` loops
+- **Enums** with unit, tuple, and record-shaped variants
+- **`match`** with constructors, wildcards, and nested record patterns
+- **Tuples** `(a, b)`, **arrays** `[T]` / `[T; N]`, **dicts** `{ key: value }`
+- **Type aliases** `type Point = (int, int);`
+- **Modules** via `use foo::bar;` and `mod foo;` (multi-file projects; see [reference/modules.md](reference/modules.md))
+- **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`
+- **Classes** (partial — see `examples/classes.0s`)
+
+Not yet available: `async` / `yield`, string concatenation with `+`, and a user-facing `format` keyword (use `print "%i", value` instead).
+
+## Next steps
+
+1. **Tutorial** — start with [01 — Basics](tutorial/01-basics.md) for a guided tour of syntax and types.
+2. **Examples** — browse the full catalog in [examples.md](examples.md); each entry includes the run command and expected output.
+3. **Reference** — keep [reference/syntax.md](reference/syntax.md) and [reference/types.md](reference/types.md) open while you code.
+4. **Modules** — copy `zero.toml.example` to `zero.toml` when you split code across files; see [reference/project-config.md](reference/project-config.md).
+
+### Suggested learning path
+
+| Step | Example | Teaches |
+|------|---------|---------|
+| 1 | `print_literal.0s` | `print`, `main` |
+| 2 | `let_test.0s` | `let`, reassignment |
+| 3 | `fizbuz.0s` | `if`, modulo, multiple prints |
+| 4 | `option.0s` | enums, `match` |
+| 5 | `record.0s` | record variants, field access |
+| 6 | `dict.0s` | anonymous records |
+| 7 | `aliases.0s` | type aliases, tuples |
+| 8 | `strlen.0s` or `ffi_sum.0s` | FFI (after installing libffi) |
+
+Happy scripting.
