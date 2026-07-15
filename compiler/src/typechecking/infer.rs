@@ -79,6 +79,12 @@ pub struct Checker {
 
     /// Yield value type for the enclosing `async fn`, if any.
     current_yield_ty: Option<Ty>,
+
+    /// Send/resume-in value type for the enclosing `async fn`, if any.
+    current_send_ty: Option<Ty>,
+
+    /// True when the enclosing `async fn` uses `let x = yield …`.
+    yield_receives_used: bool,
 }
 
 /// One pending exhaustiveness check, recorded at the match site and
@@ -172,6 +178,8 @@ impl Checker {
             async_functions: std::collections::HashSet::new(),
             async_depth: 0,
             current_yield_ty: None,
+            current_send_ty: None,
+            yield_receives_used: false,
         }
     }
 
@@ -200,6 +208,8 @@ impl Checker {
         self.async_functions.clear();
         self.async_depth = 0;
         self.current_yield_ty = None;
+        self.current_send_ty = None;
+        self.yield_receives_used = false;
 
         // Mint NodeIds for every AST node (pre-walk). The visit order
         // matches `infer`'s recursion, so the IDs line up.
@@ -261,9 +271,35 @@ impl Checker {
         self.cache.iter().map(|(k, v)| (*k, v))
     }
 
-    // ============================================================
-    //  Inference over the AST
-    // ============================================================
+    fn coroutine_type(&self, yield_ty: Ty, send_ty: Ty) -> Ty {
+        Ty::App(
+            Box::new(Ty::Con("coroutine".to_string())),
+            vec![yield_ty, send_ty],
+        )
+    }
+
+    fn split_coroutine(&self, ty: &Ty) -> Option<(Ty, Ty)> {
+        match apply_ty_prune(&self.subst, ty) {
+            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == "coroutine") => {
+                match args.len() {
+                    1 => Some((args[0].clone(), unit_ty())),
+                    2 => Some((args[0].clone(), args[1].clone())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn format_coroutine_ty(&self, yield_ty: &Ty, send_ty: &Ty) -> String {
+        let y = apply_ty_prune(&self.subst, yield_ty).to_string();
+        let s = apply_ty_prune(&self.subst, send_ty);
+        if s == unit_ty() {
+            format!("coroutine<{y}>")
+        } else {
+            format!("coroutine<{y}, {s}>")
+        }
+    }
 
     fn infer(&mut self, expr: &Output) -> Ty {
         // Pull the next ID from the pre-walk's minting order. Both
@@ -445,6 +481,9 @@ impl Checker {
                     }
                 }
 
+                if is_yield_expression(value) {
+                    self.yield_receives_used = true;
+                }
                 let val_ty = self.infer(value);
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
@@ -834,20 +873,48 @@ impl Checker {
                 if let Some(yield_ty) = self.current_yield_ty.clone() {
                     self.unify(&yield_ty, &ty, &e.0.into_range(), "yield value");
                 }
+                if let Some(send_ty) = self.current_send_ty.clone() {
+                    apply_ty_prune(&self.subst, &send_ty)
+                } else {
+                    unit_ty()
+                }
+            }
+            Expression::YieldFrom(e) => {
+                if self.async_depth == 0 {
+                    return self.error_with_help(
+                        "yield from outside async function".to_string(),
+                        range,
+                        Some("yield from may only appear inside an async fn body".to_string()),
+                    );
+                }
+                let inner_ty = self.infer(e);
+                let (y_var, s_var) = (Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh()));
+                let expected = self.coroutine_type(y_var.clone(), s_var.clone());
+                self.unify(
+                    &inner_ty,
+                    &expected,
+                    &range,
+                    "yield from target",
+                );
+                if let Some(yield_ty) = self.current_yield_ty.clone() {
+                    self.unify(&yield_ty, &y_var, &range, "yield from yield type");
+                }
+                if let Some(send_ty) = self.current_send_ty.clone() {
+                    self.unify(&send_ty, &s_var, &range, "yield from send type");
+                }
                 unit_ty()
             }
             Expression::Resume(target, arg) => {
-                if let Some(a) = arg {
-                    let _ = self.infer(a);
-                }
                 let target_ty = self.infer(target);
-                let elem = Ty::Var(self.counter.fresh());
-                let coro_ty = Ty::App(
-                    Box::new(Ty::Con("coroutine".to_string())),
-                    vec![elem.clone()],
-                );
+                let y_var = Ty::Var(self.counter.fresh());
+                let s_var = Ty::Var(self.counter.fresh());
+                let coro_ty = self.coroutine_type(y_var.clone(), s_var.clone());
                 self.unify(&target_ty, &coro_ty, &range, "resume target");
-                apply_ty_prune(&self.subst, &elem)
+                if let Some(a) = arg {
+                    let v_ty = self.infer(a);
+                    self.unify(&v_ty, &s_var, &a.0.into_range(), "resume send value");
+                }
+                apply_ty_prune(&self.subst, &y_var)
             }
             Expression::List(elements) => self.infer_list(elements, range),
 
@@ -1068,6 +1135,9 @@ impl Checker {
                     if i + 1 < children.len() {
                         let next = &children[i + 1];
                         if !is_declaration_like(next) {
+                            if is_yield_expression(next) {
+                                self.yield_receives_used = true;
+                            }
                             let val_ty = self.infer(next);
                             self.unify(&var_ty, &val_ty, &child.0.into_range(), "let binding");
                             i += 1;
@@ -1487,19 +1557,18 @@ impl Checker {
         is_coro: bool,
     ) -> Ty {
         let arg_tys = self.parse_arg_list(args);
-        let (ret_ty, yield_slot) = if is_coro {
+        let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
-            let coro = Ty::App(
-                Box::new(Ty::Con("coroutine".to_string())),
-                vec![yield_ty.clone()],
-            );
-            (coro, Some(yield_ty))
+            let send_ty = Ty::Var(self.counter.fresh());
+            let coro = self.coroutine_type(yield_ty.clone(), send_ty.clone());
+            (coro, Some(yield_ty), Some(send_ty))
         } else {
             (
                 match returns {
                     Some(r) => self.parse_type_name(r),
                     None => Ty::Var(self.counter.fresh()),
                 },
+                None,
                 None,
             )
         };
@@ -1525,8 +1594,14 @@ impl Checker {
             ret_ty.clone()
         });
         let prev_yield = self.current_yield_ty.take();
+        let prev_send = self.current_send_ty.take();
+        let prev_yield_receives = self.yield_receives_used;
+        self.yield_receives_used = false;
         if let Some(yield_ty) = yield_slot {
             self.current_yield_ty = Some(yield_ty);
+        }
+        if let Some(send_ty) = send_slot {
+            self.current_send_ty = Some(send_ty);
         }
         let prev_async = self.async_depth;
         if is_coro {
@@ -1549,13 +1624,22 @@ impl Checker {
 
         if is_coro {
             self.async_depth = prev_async;
-            if let Some(yield_ty) = self.current_yield_ty.take() {
+            if let (Some(yield_ty), Some(send_ty)) =
+                (self.current_yield_ty.take(), self.current_send_ty.take())
+            {
                 let resolved_yield = apply_ty_prune(&self.subst, &yield_ty);
-                fun_ty = {
-                    let mut ft = Ty::App(
-                        Box::new(Ty::Con("coroutine".to_string())),
-                        vec![resolved_yield],
+                let mut resolved_send = apply_ty_prune(&self.subst, &send_ty);
+                if !self.yield_receives_used {
+                    self.unify(
+                        &resolved_send,
+                        &unit_ty(),
+                        range,
+                        "coroutine send type",
                     );
+                    resolved_send = unit_ty();
+                }
+                fun_ty = {
+                    let mut ft = self.coroutine_type(resolved_yield, resolved_send);
                     for (_, arg_ty) in arg_tys.iter().rev() {
                         ft = Ty::Fun(Box::new(arg_ty.clone()), Box::new(ft));
                     }
@@ -1565,8 +1649,10 @@ impl Checker {
                     ft
                 };
             }
+            self.yield_receives_used = prev_yield_receives;
         }
         self.current_yield_ty = prev_yield;
+        self.current_send_ty = prev_send;
 
         self.current_return_ty = prev_ret;
         self.unify(&Ty::Var(alpha), &fun_ty, range, "function type");
@@ -1737,6 +1823,7 @@ impl Checker {
             | Expression::Return(e)
             | Expression::ImplicitReturn(e)
             | Expression::Yield(e)
+            | Expression::YieldFrom(e)
             | Expression::Negate(e)
             | Expression::Not(e)
             | Expression::Positive(e)
@@ -3084,6 +3171,12 @@ fn format_specifier_type(spec: char) -> &'static str {
 /// True if `ty` (already resolved under the substitution) is the
 /// type expected by `spec`.
 fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
+    // Unresolved type variables may unify later (e.g. coroutine send
+    // type `S` for `let msg = yield …` before `resume h with v` is
+    // seen). Defer the format check rather than error on `tN`.
+    if matches!(ty, Ty::Var(_)) {
+        return true;
+    }
     match spec {
         'i' | 'b' | 'x' | 'u' | 'p' => matches!(ty, Ty::Con(n) if n == "int"),
         'f' => matches!(ty, Ty::Con(n) if n == "float"),
@@ -3093,6 +3186,15 @@ fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
         // implement) — can't be matched; the caller will still
         // record a diagnostic, but we don't want to say it matches
         // every type.
+        _ => false,
+    }
+}
+
+/// True when `node` is a `yield` expression (possibly wrapped in `Expr`).
+fn is_yield_expression(node: &Output) -> bool {
+    match node.1.as_ref() {
+        Expression::Yield(_) => true,
+        Expression::Expr(e) | Expression::Group(e) => is_yield_expression(e),
         _ => false,
     }
 }
@@ -5114,10 +5216,43 @@ mod tests {
         match apply_ty_prune(&c.subst(), ty) {
             Ty::App(con, args) => {
                 assert_eq!(con.as_ref(), &Ty::Con("coroutine".to_string()));
-                assert_eq!(args.len(), 1);
+                assert_eq!(args.len(), 2);
+                assert_eq!(apply_ty_prune(&c.subst(), &args[1]), unit_ty());
             }
-            other => panic!("expected coroutine<_>, got {:?}", other),
+            other => panic!("expected coroutine<_, unit>, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn resume_with_send_unifies_send_type() {
+        let src = r#"async fn ping() { let msg = yield "ready"; }
+fn main() { let h = ping(); resume h with "hello"; }"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+    }
+
+    #[test]
+    fn coro_send_example_typechecks() {
+        let src = include_str!("../../../examples/coro_send.0s");
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+    }
+
+    #[test]
+    fn yield_from_requires_coroutine_target() {
+        let (c, _) = check("async fn bad() { yield from 1; }");
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| {
+                    m.message().contains("Type mismatch")
+                        && m.help()
+                            .as_ref()
+                            .is_some_and(|h| h.contains("yield from target"))
+                }),
+            "expected yield-from type error, got {:?}",
+            c.messages()
+        );
     }
 
     #[test]

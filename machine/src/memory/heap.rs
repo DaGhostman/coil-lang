@@ -570,6 +570,12 @@ pub struct ObjCoroutine {
     pub saved_stack: Vec<Value>,
     /// `(ip, sp_offset)` pairs; `sp_offset` is relative to the coroutine segment base.
     pub saved_frames: Vec<(usize, usize)>,
+    /// Value from the resumer's `resume h with v` (delivered at the next binding yield).
+    pub pending_send: Value,
+    /// Active `yield from` delegate, if any.
+    pub yield_from: Option<RefCoroutine>,
+    /// Outer continuation IP when the delegate completes.
+    pub yield_from_resume_ip: usize,
 }
 
 impl GcSized for ObjTuple {

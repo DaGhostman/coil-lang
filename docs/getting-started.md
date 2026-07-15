@@ -150,7 +150,7 @@ zero-script uses a **single-pass stack codegen** pipeline (with a post-codegen p
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
 3. **Codegen** — `Compiler::compile` walks the AST and appends stack instructions (`LOAD`, `CONST`, `JMP`, `MakeEnum`, `StorePop`, …) to a bytecode vector.
 4. **Peephole** — `peephole::optimize` fuses frequent instruction sequences (`LOAD; CONST; ADD` → `BinSlotImm`, and similar) and relocates jump targets.
-5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **8**) must match at load time.
+5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **9**) must match at load time.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 
 ### Entry point convention
@@ -181,8 +181,9 @@ The language includes:
 - **Modules** via `use foo::bar;` and `mod foo;` (multi-file projects; see [reference/modules.md](reference/modules.md))
 - **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`
 - **Classes** (partial — see `examples/classes.0s`)
+- **Coroutines** — `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` (see [tutorial/08-coroutines.md](tutorial/08-coroutines.md))
 
-Not yet available: `async` / `yield`, string concatenation with `+`, and a user-facing `format` keyword (use `print "%i", value` instead).
+Not yet available: string concatenation with `+`, and a user-facing `format` keyword (use `print "%i", value` instead).
 
 ## Next steps
 

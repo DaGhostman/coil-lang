@@ -1,5 +1,26 @@
 # zero-script — AGENTS
 
+## Learned User Preferences
+
+- Run tests with a 64MB memory limit to catch leaks; exceeding it likely indicates a memory leak.
+- Use `poop` for CPU performance benchmarks: `cargo build --release && poop -d 6000 "./target/release/zero-script examples/fib.0s" && rm out.c0s`.
+- Use parallel sub-agents scoped to disjoint files or modules for large tasks (docs, comment cleanup, exploration).
+- Draft implementation plans before large language-feature work; do not edit attached plan files during implementation.
+- New language features require full HM typechecker integration and updated user-facing docs in `docs/`.
+- Include minimal runnable examples with clear expected output before committing feature work.
+- Stage and commit only related changes; exclude unrelated modified files from commits.
+- User is flexible on syntax when designing new language constructs.
+
+## Learned Workspace Facts
+
+- zero-script is a statically typed language with HM inference, compiled to stack bytecode and run on a custom VM; sources use `.0s`, build with `cargo build --workspace`, run with `cargo run -- examples/foo.0s`.
+- User-facing documentation lives in `docs/` (tutorial chapters, reference pages, examples catalog).
+- Single-pass stack codegen in `compiler/src/lib.rs` is the only compilation path; register-VM migration was removed.
+- Coroutines (Phase 1–2): `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` via `MakeCoro`/`ResumeCoro`/`YieldCoro`/`YieldFromCoro`; `coroutine<Y, S>` types; `ARCHIVE_VERSION` is 9.
+- FFI uses compile-time `extern` blocks and runtime `dload`/`declare`/`invoke` with libffi; signatures should use a builder pattern, not hardcoded int-only assumptions.
+- `fib(32)` in `examples/fib.0s` is the primary performance regression benchmark (expected output `2178309`).
+- The CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
+
 ## PHASE 14 - HINDLEY–MILNER TYPECHECKER (COMPLETED)
 
 ### Summary
@@ -3972,4 +3993,104 @@ unfused (poor perf ROI).
   first pair; float and negative results are not folded.
 - `FORMAT; PRINT` fusion remains unimplemented on purpose (I/O
   bound). Revisit only if formatting moves off the hot path.
+
+## PHASE CORO-2 — SEND/RECEIVE, BINDING YIELD, YIELD FROM (COMPLETED)
+
+### Summary
+
+Extended Phase 1 coroutines with bidirectional communication
+(`resume h with v`, `let x = yield e`), `yield from` delegation,
+full `coroutine<Y, S>` typechecking, VM/runtime support, tests,
+and user docs. `ARCHIVE_VERSION` bumped to **9** (`YieldFromCoro`
+appended).
+
+### Syntax (locked in)
+
+| Feature | Syntax |
+|---------|--------|
+| Resume with value | `resume h with expr` |
+| Receive at yield | `let x = yield expr` or `x = yield expr` |
+| Delegate | `yield from expr` |
+
+Display: `resume h with v` (not `resume h(v)`).
+
+### VM / opcodes
+
+- `ObjCoroutine` gains `pending_send`, `yield_from`,
+  `yield_from_resume_ip`.
+- `ResumeCoro`: `operands[0] & 1` = **has_send**; stack
+  `[..., send, handle]` (TOS = handle). On resume, if
+  `resume_ip` points at `StorePop`, push `pending_send` for
+  binding-yield receive sites.
+- `YieldFromCoro`: pop sub-handle; delegate loop forwards
+  yields/sends through outer coroutine.
+- `yield_coroutine` saves coroutine locals from coroutine
+  frame `sp` (not caller `base_sp`), pops `resume_stack`
+  entry on yield return.
+
+### Typechecker
+
+- `current_send_ty` + `yield_receives_used` (only set for
+  binding-yield in `Fragment` / `Assignment`, not bare
+  `yield` statements).
+- `async fn` → `coroutine<Y, S>`; pretty-print omits `S`
+  when `unit`.
+- `YieldFrom` requires `coroutine<Y, S>` matching enclosing
+  async fn yield/send types.
+
+### Codegen
+
+- `Resume`: emit arg (if any), target, `ResumeCoro(has_send)`.
+- `YieldFrom`: emit subexpr + `YieldFromCoro`.
+- `Fragment` `[Variable, yield]` → `YieldCoro` then `StorePop`
+  (receive runs after next resume).
+
+### Examples
+
+| File | Output |
+|------|--------|
+| `examples/coro_send.0s` | `hello` |
+| `examples/coro_yield_from.0s` | `012` |
+| `examples/coro_gen.0s` | `012` |
+| `examples/coro_interleave.0s` | `10,100,101,11,12,102` |
+
+Bind `resume` results before `print` — inline
+`print "%i", resume h` can leave handles on the stack.
+
+### Known limitations
+
+- **Parameterized coroutines + interleave:** `async fn
+  counter(int base)` with two interleaved handles can lose
+  argument slots after multiple yields; use separate async
+  fns or avoid interleaving parameterized handles until fixed.
+- **`done(h)` introspection** — deferred (Phase 3+).
+- Resume-after-done still returns `0` (MVP).
+
+### Test counts (CORO-2 final)
+
+| Suite | Delta |
+|-------|-------|
+| `compiler/src/lib.rs::tests` | +4 codegen |
+| `compiler/tests/diagnostics.rs` | +2 |
+| `compiler/tests/pipeline.rs` | +2 golden |
+| `machine/src/vm.rs::tests` | +1 |
+| `parser/src/lib.rs::tests` | +4 |
+| `compiler/src/typechecking/infer.rs::tests` | +6 (approx.) |
+
+`cargo test --workspace` — all tests pass.
+
+### Files modified (representative)
+
+| File | Purpose |
+|------|---------|
+| `common/src/opcode.rs` | `YieldFromCoro` |
+| `common/src/archive.rs` | `ARCHIVE_VERSION = 9` |
+| `machine/src/memory/heap.rs` | `ObjCoroutine` fields |
+| `machine/src/vm.rs` | Send/receive/delegate runtime |
+| `parser/src/lib.rs`, `ast.rs` | `yield from`, `resume with`, binding yield |
+| `compiler/src/lib.rs` | Codegen |
+| `compiler/src/typechecking/infer.rs`, `pretty.rs` | `coroutine<Y, S>` |
+| `docs/tutorial/08-coroutines.md` | New tutorial |
+| `docs/*` | Reference + examples catalog |
+| `examples/coro_*.0s` | New/updated demos |
 

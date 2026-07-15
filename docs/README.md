@@ -28,7 +28,7 @@ See [Getting Started](getting-started.md) for prerequisites, project layout, and
 1. **Parse** — the Pratt parser reads `.0s` source into an AST.
 2. **Typecheck** — Algorithm W (Hindley–Milner) infers types and reports source-anchored diagnostics.
 3. **Codegen** — the compiler emits stack bytecode, then runs a peephole fusion pass.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **8**) and written to `out.c0s` on first run.
+4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **9**) and written to `out.c0s` on first run.
 5. **Execute** — the VM loads the archive and runs `main`.
 
 Re-run the same binary without deleting `out.c0s` to reuse the cached compile. Delete `out.c0s` (or bump the archive version) to force a fresh compile.
@@ -46,7 +46,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`) | Supported (requires libffi) |
 | Classes | Partial (declaration / `new`; limited runtime) |
-| `async` / `yield` / coroutines | **Not implemented** |
+| Coroutines (`async`, `yield`, `resume`, `yield from`) | Supported |
 | String concat via `+` | **Not implemented** |
 | `format` as a user keyword | **Not implemented** (use `print "%i", x` style) |
 
@@ -67,6 +67,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [05 — Aggregates](tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
 | [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `zero.toml` |
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
+| [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from` |
 
 Classes (`class`, `impl`, `new`) are partially supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
 
@@ -132,4 +133,5 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 | Dicts / anonymous records | `examples/dict.0s` |
 | Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
 | FFI | `examples/strlen.0s`, `examples/ffi_sum.0s` |
+| Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s` |
 | Full catalog | [examples.md](examples.md) |

@@ -191,6 +191,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.declare(expr.clone()),
                 self.invoke_(expr.clone()),
                 self.resume_(expr.clone()),
+                self.yield_expr_(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
@@ -503,13 +504,28 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
+    fn yield_expr_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("yield").ignore_then(choice((
+            keyword!("from")
+                .ignore_then(expr.clone())
+                .map_with(output!(YieldFrom)),
+            expr.map_with(output!(Yield)),
+        )))
+    }
+
     fn yield_(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("yield")
-            .ignore_then(self.expr())
-            .map_with(output!(Yield))
+        self.yield_expr_(self.expr())
     }
 
     fn resume_<
@@ -522,8 +538,9 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("resume")
-            .ignore_then(expr)
-            .map_with(|target, e| (e.span(), Box::new(Expression::Resume(target, None))))
+            .ignore_then(expr.clone())
+            .then(keyword!("with").ignore_then(expr).or_not())
+            .map_with(|(target, arg), e| (e.span(), Box::new(Expression::Resume(target, arg))))
     }
 
     fn defer<
@@ -2304,21 +2321,34 @@ mod tests {
         let src = "async fn coro() { yield 42; }";
         let result = Pratt::default().declaration().parse(src).into_result();
         let (_span, expr) = result.expect("yield statement should parse");
+        fn expect_yield_42(expr: &Expression) {
+            let yield_node = match expr {
+                Expression::Expr(e) => e.1.as_ref(),
+                other => other,
+            };
+            match yield_node {
+                Expression::Yield(y) => match y.1.as_ref() {
+                    Expression::Expr(e) => match e.1.as_ref() {
+                        Expression::Integer(42) => {}
+                        other => panic!("expected yield 42, got {:?}", other),
+                    },
+                    Expression::Integer(42) => {}
+                    other => panic!("expected yield 42, got {:?}", other),
+                },
+                other => panic!("expected Yield, got {:?}", other),
+            }
+        }
         match expr.as_ref() {
             Expression::Function { body, .. } => match body.1.as_ref() {
                 Expression::Block(stmts) => match stmts[0].1.as_ref() {
                     Expression::Statement(stmt) => match stmt.1.as_ref() {
-                        Expression::Yield(inner) => match inner.1.as_ref() {
-                            Expression::Expr(e) => match e.1.as_ref() {
-                                Expression::Integer(42) => {}
-                                other => panic!("expected yield 42, got {:?}", other),
-                            },
-                            Expression::Integer(42) => {}
-                            other => panic!("expected yield 42, got {:?}", other),
-                        },
-                        other => panic!("expected Yield in Statement, got {:?}", other),
+                        Expression::Yield(y) => expect_yield_42(y.1.as_ref()),
+                        Expression::ExprStatement(inner) => {
+                            expect_yield_42(inner.1.as_ref());
+                        }
+                        other => panic!("expected Yield statement, got {:?}", other),
                     },
-                    other => panic!("expected Statement(Yield), got {:?}", other),
+                    other => panic!("expected Statement, got {:?}", other),
                 },
                 other => panic!("expected Block, got {:?}", other),
             },
@@ -2343,6 +2373,87 @@ mod tests {
                 }
             }
             other => panic!("expected Resume, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_resume_with_send_round_trips() {
+        same!("resume h with 42");
+        let parsed = expr_ast!("resume h with 42");
+        let inner = match &parsed {
+            Expression::Expr(e) => e.1.as_ref(),
+            other => other,
+        };
+        match inner {
+            Expression::Resume(target, Some(arg)) => {
+                match target.1.as_ref() {
+                    Expression::Identifier(name) => assert_eq!(*name, "h"),
+                    other => panic!("expected identifier target, got {:?}", other),
+                }
+                match arg.1.as_ref() {
+                    Expression::Expr(e) => match e.1.as_ref() {
+                        Expression::Integer(42) => {}
+                        other => panic!("expected send arg 42, got {:?}", other),
+                    },
+                    Expression::Integer(42) => {}
+                    other => panic!("expected send arg 42, got {:?}", other),
+                }
+            }
+            other => panic!("expected Resume with arg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_let_binding_yield_round_trips() {
+        let ast = decl_ast!("async fn f() { let x = yield 1; }");
+        match ast {
+            Expression::Function { body, .. } => match body.1.as_ref() {
+                Expression::Block(stmts) => match stmts[0].1.as_ref() {
+                    Expression::Statement(stmt) => match stmt.1.as_ref() {
+                        Expression::Fragment(children) => {
+                            assert_eq!(children.len(), 2);
+                            let init = children[1].1.as_ref();
+                            let yield_expr = match init {
+                                Expression::Yield(y) => y.1.as_ref(),
+                                Expression::Expr(e) => match e.1.as_ref() {
+                                    Expression::Yield(y) => y.1.as_ref(),
+                                    other => panic!("expected Yield initializer, got {:?}", other),
+                                },
+                                other => panic!("expected Yield initializer, got {:?}", other),
+                            };
+                            match yield_expr {
+                                Expression::Expr(e) => match e.1.as_ref() {
+                                    Expression::Integer(1) => {}
+                                    other => panic!("expected yield 1, got {:?}", other),
+                                },
+                                Expression::Integer(1) => {}
+                                other => panic!("expected yield 1, got {:?}", other),
+                            }
+                        }
+                        other => panic!("expected Fragment let, got {:?}", other),
+                    },
+                    other => panic!("expected Statement, got {:?}", other),
+                },
+                other => panic!("expected Block, got {:?}", other),
+            },
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_yield_from_round_trips() {
+        same!("yield from inner");
+        let parsed = expr_ast!("yield from inner");
+        let inner = match &parsed {
+            Expression::Expr(e) => e.1.as_ref(),
+            other => other,
+        };
+        match inner {
+            Expression::YieldFrom(target) => match target.1.as_ref() {
+                Expression::Identifier(name) => assert_eq!(*name, "inner"),
+                other => panic!("expected identifier, got {:?}", other),
+            },
+            other => panic!("expected YieldFrom, got {:?}", other),
         }
     }
 

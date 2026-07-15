@@ -102,6 +102,7 @@ macro_rules! unary {
 type OutputSink = Box<dyn IoWrite>;
 
 /// Saved resumer context while a coroutine runs on the shared stack.
+#[derive(Clone, Copy)]
 struct ResumeCtx {
     coro: RefCoroutine,
     base_sp: usize,
@@ -256,6 +257,9 @@ impl<const S: usize> Machine<S> {
                         roots.push(addr);
                     }
                 }
+                if let Some(delegate) = &gc.as_ref().yield_from {
+                    roots.push(delegate.as_ptr() as u64);
+                }
             }
         }
 
@@ -380,6 +384,54 @@ impl<const S: usize> Machine<S> {
         }
     }
 
+    fn find_delegator(&self, sub: RefCoroutine) -> Option<RefCoroutine> {
+        let sub_addr = sub.as_ptr() as u64;
+        let mut current = self.heap.head_for_lookup();
+        while let Some(reference) = current {
+            if let Object::Coroutine(gc) = reference {
+                if gc.as_ref().yield_from.as_ref().is_some_and(|d| d.as_ptr() as u64 == sub_addr)
+                {
+                    return Some(gc.clone());
+                }
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
+    fn save_coroutine_state(
+        &self,
+        coro_gc: RefCoroutine,
+        ip: usize,
+        sp: usize,
+        base_sp: usize,
+        frame_depth: usize,
+    ) {
+        let top = self.stack.tell();
+        let segment = if base_sp <= top {
+            self.stack.as_slice()[base_sp..top].to_vec()
+        } else {
+            Vec::new()
+        };
+        let current_depth = self.frames.len();
+        let mut saved_frames = Vec::new();
+        for idx in (frame_depth + 1)..current_depth {
+            saved_frames.push((self.frames[idx].tell(), self.frames[idx].get().saturating_sub(base_sp)));
+        }
+        if saved_frames.is_empty() {
+            saved_frames.push((ip, sp.saturating_sub(base_sp)));
+        } else {
+            saved_frames.last_mut().unwrap().0 = ip;
+        }
+
+        self.with_coroutine_mut(coro_gc.as_ptr() as u64, |coro| {
+            coro.saved_stack = segment;
+            coro.saved_frames = saved_frames;
+            coro.resume_ip = ip;
+            coro.state = CoroState::Suspended;
+        });
+    }
+
     fn after_return(&mut self, ip: &mut usize, sp: &mut usize) {
         let caller = self.frames.get_mut();
         *ip = caller.tell();
@@ -390,18 +442,31 @@ impl<const S: usize> Machine<S> {
                     coro.state = CoroState::Done;
                     coro.saved_stack.clear();
                     coro.saved_frames.clear();
+                    coro.yield_from = None;
                 });
                 self.resume_stack.pop();
             }
         }
     }
 
-    fn resume_coroutine(&mut self, ip: &mut usize, sp: &mut usize, gc: RefCoroutine) {
+    fn resume_coroutine(
+        &mut self,
+        ip: &mut usize,
+        sp: &mut usize,
+        gc: RefCoroutine,
+        send_val: Value,
+        code: &[Byte],
+        push_send_for_receive: bool,
+    ) {
         let return_ip = *ip;
         let coro = gc.as_ref();
         let base_sp = self.stack.tell();
 
         self.frames.get_mut().seek(return_ip);
+
+        self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
+            c.pending_send = send_val;
+        });
 
         self.resume_stack.push(ResumeCtx {
             coro: gc,
@@ -422,6 +487,57 @@ impl<const S: usize> Machine<S> {
 
         *ip = coro.resume_ip;
         *sp = base_sp + coro.saved_frames.last().map_or(0, |(_, off)| *off);
+
+        if push_send_for_receive
+            && *ip < code.len()
+            && matches!(code[*ip].bytecode(), Instruction::StorePop)
+        {
+            self.stack.push(send_val);
+        }
+    }
+
+    fn delegate_yield_to_parent(
+        &mut self,
+        sub_gc: RefCoroutine,
+        ip: &mut usize,
+        sp: &mut usize,
+        yield_val: Value,
+        sub_base_sp: usize,
+        sub_frame_depth: usize,
+    ) {
+        let Some(parent) = self.find_delegator(sub_gc) else {
+            return;
+        };
+
+        self.save_coroutine_state(sub_gc, *ip, *sp, sub_base_sp, sub_frame_depth);
+
+        let parent_entry_idx = self
+            .resume_stack
+            .iter()
+            .position(|c| c.coro.as_ptr() == parent.as_ptr())
+            .unwrap_or(self.resume_stack.len().saturating_sub(1));
+        let parent_ctx = &self.resume_stack[parent_entry_idx];
+
+        self.save_coroutine_state(
+            parent,
+            parent.as_ref().yield_from_resume_ip,
+            self.stack.tell(),
+            parent_ctx.base_sp,
+            parent_ctx.frame_depth,
+        );
+
+        self.stack.seek(parent_ctx.base_sp);
+        while self.frames.len() > parent_ctx.frame_depth {
+            self.frames.pop();
+        }
+        if self.resume_stack.len() > parent_entry_idx + 1 {
+            self.resume_stack.truncate(parent_entry_idx + 1);
+        }
+
+        self.stack.push(yield_val);
+        let caller = self.frames.get_mut();
+        *ip = caller.tell();
+        *sp = caller.get();
     }
 
     fn yield_coroutine(&mut self, ip: &mut usize, sp: &mut usize, yield_val: Value) {
@@ -431,11 +547,25 @@ impl<const S: usize> Machine<S> {
         };
         let (coro_gc, base_sp, frame_depth) = ctx;
 
-        let segment = self.stack.as_slice()[base_sp..].to_vec();
-        let frame_depth_usize = frame_depth;
+        if self.find_delegator(coro_gc).is_some() {
+            self.delegate_yield_to_parent(coro_gc, ip, sp, yield_val, base_sp, frame_depth);
+            return;
+        }
+
         let current_depth = self.frames.len();
+        let top = self.stack.tell();
+        let coro_sp = if current_depth > frame_depth {
+            self.frames[current_depth - 1].get()
+        } else {
+            base_sp
+        };
+        let segment = if coro_sp <= top {
+            self.stack.as_slice()[coro_sp..top].to_vec()
+        } else {
+            Vec::new()
+        };
         let mut saved_frames = Vec::new();
-        for idx in (frame_depth_usize + 1)..current_depth {
+        for idx in (frame_depth + 1)..current_depth {
             saved_frames.push((self.frames[idx].tell(), self.frames[idx].get() - base_sp));
         }
         if saved_frames.is_empty() {
@@ -452,7 +582,7 @@ impl<const S: usize> Machine<S> {
         });
 
         self.stack.seek(base_sp);
-        while self.frames.len() > frame_depth_usize {
+        while self.frames.len() > frame_depth {
             self.frames.pop();
         }
 
@@ -460,6 +590,20 @@ impl<const S: usize> Machine<S> {
         let caller = self.frames.get_mut();
         *ip = caller.tell();
         *sp = caller.get();
+        self.resume_stack.pop();
+    }
+
+    fn start_yield_from(&mut self, ip: &mut usize, sp: &mut usize, sub: RefCoroutine, code: &[Byte]) {
+        let Some(outer_ctx) = self.resume_stack.last().copied() else {
+            return;
+        };
+        let outer = outer_ctx.coro;
+        self.save_coroutine_state(outer, *ip, *sp, outer_ctx.base_sp, outer_ctx.frame_depth);
+        self.with_coroutine_mut(outer.as_ptr() as u64, |outer_coro| {
+            outer_coro.yield_from = Some(sub);
+            outer_coro.yield_from_resume_ip = *ip;
+        });
+        self.resume_coroutine(ip, sp, sub, Value::from(0_i64), code, false);
     }
 
     /// Read-only access to the heap. Used by the GC integration
@@ -522,7 +666,7 @@ impl<const S: usize> Machine<S> {
 
             let bc = opcode.bytecode();
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::YieldCoro as u8);
+            promise!(*bc as u8 <= Instruction::YieldFromCoro as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1390,6 +1534,9 @@ impl<const S: usize> Machine<S> {
                         resume_ip: target,
                         saved_stack: values,
                         saved_frames: vec![(target, 0)],
+                        pending_send: Value::from(0_i64),
+                        yield_from: None,
+                        yield_from_resume_ip: 0,
                     };
                     let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
 
@@ -1403,15 +1550,40 @@ impl<const S: usize> Machine<S> {
                 Instruction::ResumeCoro => {
                     if self.stack.tell() == 0 {
                     } else {
+                        let has_send = opcode.operand_u32() & 1 != 0;
                         let handle = self.stack.pop();
+                        let send_val = if has_send {
+                            self.stack.pop()
+                        } else {
+                            Value::from(0_i64)
+                        };
                         let addr = handle.raw() as u64;
                         if let Some(Object::Coroutine(gc)) =
                             Self::find_object_by_addr(&self.heap, addr)
                         {
                             if gc.as_ref().state == CoroState::Done {
                                 self.stack.push(Value::from(0_i64));
+                            } else if let Some(sub) = gc.as_ref().yield_from {
+                                self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
+                                    c.pending_send = send_val;
+                                });
+                                self.resume_coroutine(
+                                    &mut ip,
+                                    &mut sp,
+                                    sub,
+                                    send_val,
+                                    code,
+                                    true,
+                                );
                             } else {
-                                self.resume_coroutine(&mut ip, &mut sp, gc);
+                                self.resume_coroutine(
+                                    &mut ip,
+                                    &mut sp,
+                                    gc,
+                                    send_val,
+                                    code,
+                                    true,
+                                );
                             }
                         } else {
                             self.stack.push(Value::from(0_i64));
@@ -1423,6 +1595,18 @@ impl<const S: usize> Machine<S> {
                     } else {
                         let yield_val = self.stack.pop();
                         self.yield_coroutine(&mut ip, &mut sp, yield_val);
+                    }
+                }
+                Instruction::YieldFromCoro => {
+                    if self.stack.tell() == 0 {
+                    } else {
+                        let handle = self.stack.pop();
+                        let addr = handle.raw() as u64;
+                        if let Some(Object::Coroutine(sub)) =
+                            Self::find_object_by_addr(&self.heap, addr)
+                        {
+                            self.start_yield_from(&mut ip, &mut sp, sub, code);
+                        }
                     }
                 }
                 _ => return,
@@ -2199,6 +2383,31 @@ mod tests {
         ]);
         assert_eq!(vm.pop().as_int(), 0);
         assert_eq!(vm.pop().as_int(), 7);
+    }
+
+    /// Resume with send + binding yield: second resume returns the sent value.
+    #[test]
+    fn coroutine_resume_with_send_binding_yield() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 8),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            const_int(200),
+            load(0),
+            Byte::new(Instruction::ResumeCoro).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            // 8: coroutine body — yield out, receive send, yield received value
+            const_int(100),
+            Byte::new(Instruction::YieldCoro),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 200);
+        assert_eq!(vm.pop().as_int(), 100);
     }
 
     /// Coroutine handle + saved stack survive an automatic GC cycle.

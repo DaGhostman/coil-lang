@@ -124,11 +124,13 @@ pub enum Instruction {
     // Coroutines — append-only.
     //
     // MakeCoro:  [31:24] arity, [23:0] entry target (same layout as CALL)
-    // ResumeCoro: no operand; pops coroutine handle
+    // ResumeCoro: operands[0] & 1 = has_send; stack [..., send, handle] (TOS = handle)
     // YieldCoro:  no operand; pops yield value
+    // YieldFromCoro: no operand; pops sub-coroutine handle
     MakeCoro,
     ResumeCoro,
     YieldCoro,
+    YieldFromCoro,
 }
 
 impl From<u8> for Instruction {

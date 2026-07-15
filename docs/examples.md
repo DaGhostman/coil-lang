@@ -561,26 +561,66 @@ fn main() {
 
 ---
 
-## Not implemented / broken examples
+## Coroutines
 
-### `examples/coro.0s` — does not parse
+Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/receive and `yield from`. See [Tutorial: Coroutines](tutorial/08-coroutines.md).
 
-**Intended to demonstrate:** `async fn`, `yield`, and `resume` coroutines.
+### `examples/coro.0s`
 
-```0s
-async fn coro() {
-    print "Suspended\n";
-    yield 1;
-    print "Resumed\n";
-}
-```
+**Demonstrates:** Basic suspend/resume with prints between yields.
 
 | | |
 |---|---|
-| **Status** | **Not implemented** — `async`, `yield`, and coroutines are not part of the language yet. The parser rejects this file. |
-| **Run** | Fails at parse time |
+| **Run** | `rm -f out.c0s && cargo run -- examples/coro.0s` |
+| **Output** | Suspended/resumed trace (see source) |
 
 ---
+
+### `examples/coro_gen.0s`
+
+**Demonstrates:** Generator-style counter (`yield 0`, `yield 1`, `yield 2`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/coro_gen.0s` |
+| **Output** | `012` |
+
+---
+
+### `examples/coro_send.0s`
+
+**Demonstrates:** Binding yield + `resume h with v` (ping-pong send).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/coro_send.0s` |
+| **Output** | `hello` |
+
+---
+
+### `examples/coro_yield_from.0s`
+
+**Demonstrates:** `yield from` delegation.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/coro_yield_from.0s` |
+| **Output** | `012` |
+
+---
+
+### `examples/coro_interleave.0s`
+
+**Demonstrates:** Two independent handles resumed in arbitrary order.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/coro_interleave.0s` |
+| **Output** | `10,100,101,11,12,102` |
+
+---
+
+## Not implemented / broken examples
 
 ## Quick reference table
 
@@ -611,7 +651,11 @@ async fn coro() {
 | `ffi_sum.0s` | FFI | `42` |
 | `sum.c` | FFI | (C source, not `.0s`) |
 | `classes.0s` | Classes | `7` |
-| `coro.0s` | — | **Parse error** (unimplemented) |
+| `coro.0s` | Coroutines | (see source) |
+| `coro_gen.0s` | Coroutines | `012` |
+| `coro_send.0s` | Coroutines | `hello` |
+| `coro_yield_from.0s` | Coroutines | `012` |
+| `coro_interleave.0s` | Coroutines | `10,100,101,11,12,102` |
 
 ## Running tests that mirror examples
 

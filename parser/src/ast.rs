@@ -29,6 +29,7 @@ pub enum Expression<'expr> {
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
     Yield(Output<'expr>),
+    YieldFrom(Output<'expr>),
     Resume(Output<'expr>, Option<Output<'expr>>),
     Negate(Output<'expr>),
     Not(Output<'expr>),
@@ -547,8 +548,9 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{}.{}", receiver.1, field)
             }
             Self::Yield(inner) => write!(f, "yield {}", inner.1),
+            Self::YieldFrom(inner) => write!(f, "yield from {}", inner.1),
             Self::Resume(target, None) => write!(f, "resume {}", target.1),
-            Self::Resume(target, Some(arg)) => write!(f, "resume {}({})", target.1, arg.1),
+            Self::Resume(target, Some(arg)) => write!(f, "resume {} with {}", target.1, arg.1),
             Self::Type(n) => write!(f, "{}", n),
             e => write!(f, "<unhandled: {:?}>", e),
         }

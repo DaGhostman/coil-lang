@@ -58,7 +58,7 @@ declaration ::= class_decl
 ### Functions
 
 ```
-function_decl ::= 'fn' IDENT arg_list ('->' type_annotation)? block
+function_decl ::= 'async'? 'fn' IDENT arg_list ('->' type_annotation)? block
 arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
 ```
 
@@ -176,6 +176,7 @@ statement ::= while_stmt
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return expr ';'` |
+| `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
 | `if` | `if expr block ('else' (block \| if_stmt))?` |
 | Block | `'{' statement* '}'` |
@@ -195,6 +196,7 @@ Expression grammar uses a **Pratt parser** with atoms and operator precedence (s
 ```
 atom ::= match_expr
        | dload_call | declare_call | invoke_call
+       | resume_expr | yield_expr
        | tuple_lit | array_lit | dict_lit
        | construct | call | instantiate
        | float | int | string
@@ -216,6 +218,35 @@ atom ::= match_expr
 | Match | `match expr '{' arm (',' arm)* '}'` | See patterns below |
 | Index | `expr '[' expr ']'` | Postfix |
 | Access | `expr '.' IDENT` | Postfix field access |
+| Resume | `resume expr ('with' expr)?` | Continue coroutine; optional send value |
+| Yield | `yield expr` | Suspend with yielded value |
+| Yield from | `yield from expr` | Delegate to sub-coroutine handle |
+
+### Coroutines
+
+```
+async_fn     ::= 'async' function_decl
+resume_expr  ::= 'resume' expr ('with' expr)?
+yield_expr   ::= 'yield' ('from' expr | expr)
+binding_yield ::= 'let' IDENT '=' yield_expr
+```
+
+Examples:
+
+```0s
+async fn ping() {
+    let msg = yield "ready";
+    print "%s", msg;
+}
+
+fn main() {
+    let h = ping();
+    resume h;
+    resume h with "hello";
+}
+```
+
+See [Tutorial: Coroutines](../tutorial/08-coroutines.md).
 
 ### Assignment
 

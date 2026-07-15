@@ -1245,9 +1245,19 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(expr));
                 bytecode.push(Byte::new(Instruction::YieldCoro));
             }
-            Expression::Resume(target, _arg) => {
+            Expression::YieldFrom(expr) => {
+                bytecode.append(&mut self.do_compile(expr));
+                bytecode.push(Byte::new(Instruction::YieldFromCoro));
+            }
+            Expression::Resume(target, arg) => {
+                if let Some(a) = arg {
+                    bytecode.append(&mut self.do_compile(a));
+                }
                 bytecode.append(&mut self.do_compile(target));
-                bytecode.push(Byte::new(Instruction::ResumeCoro));
+                let has_send = if arg.is_some() { 1u32 } else { 0u32 };
+                bytecode.push(
+                    Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send),
+                );
             }
             Expression::Class(name, state) => {
                 self.context.classes.insert(
@@ -2777,6 +2787,55 @@ mod tests {
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::ResumeCoro)),
             "expected ResumeCoro at call site"
+        );
+    }
+
+    /// Binding yield (`let x = yield e`) emits YieldCoro then StorePop.
+    #[test]
+    fn let_binding_yield_emits_yield_coro_then_store_pop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("async fn f() { let x = yield 1; }");
+        let yield_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::YieldCoro))
+            .expect("expected YieldCoro");
+        let store_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .expect("expected StorePop");
+        assert!(
+            yield_pos < store_pos,
+            "YieldCoro (at {}) must precede StorePop (at {}) for binding yield",
+            yield_pos,
+            store_pos
+        );
+    }
+
+    /// Resume-with-send sets the has_send bit on ResumeCoro.
+    #[test]
+    fn resume_with_send_emits_has_send_operand() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn main() { resume h with 42; }");
+        let resume = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::ResumeCoro))
+            .expect("expected ResumeCoro");
+        assert_ne!(
+            resume.operand_u32() & 1,
+            0,
+            "ResumeCoro for `resume h with v` must set has_send bit"
+        );
+    }
+
+    /// `yield from` emits YieldFromCoro.
+    #[test]
+    fn yield_from_emits_yield_from_coro() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("async fn f() { yield from inner; }");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::YieldFromCoro)),
+            "expected YieldFromCoro for yield from"
         );
     }
 

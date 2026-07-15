@@ -454,3 +454,15 @@ fn example_coro_interleave_prints_out_of_order_counters() {
     let output = run_example("examples/coro_interleave.0s");
     assert_eq!(output, "10,100,101,11,12,102");
 }
+
+#[test]
+fn example_coro_send_prints_hello() {
+    let output = run_example("examples/coro_send.0s");
+    assert_eq!(output, "hello");
+}
+
+#[test]
+fn example_coro_yield_from_prints_012() {
+    let output = run_example("examples/coro_yield_from.0s");
+    assert_eq!(output, "012");
+}

@@ -19,6 +19,16 @@ impl fmt::Display for Ty {
             Ty::App(c, args) => {
                 if args.is_empty() {
                     write!(f, "{}", c)
+                } else if let Ty::Con(name) = c.as_ref() {
+                    if name == "coroutine" && args.len() == 2 {
+                        let y = &args[0];
+                        let s = &args[1];
+                        if matches!(s, Ty::Con(n) if n == "unit") {
+                            return write!(f, "coroutine<{}>", y);
+                        }
+                        return write!(f, "coroutine<{}, {}>", y, s);
+                    }
+                    write!(f, "{}<{}>", c, args.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))
                 } else {
                     let inner = args
                         .iter()

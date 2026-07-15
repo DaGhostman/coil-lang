@@ -33,13 +33,18 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `dload` | Builtin | Load shared library | [Built-ins — FFI](built-ins.md#dload) |
 | `declare` | Builtin | Register FFI signature | [Built-ins — FFI](built-ins.md#declare) |
 | `invoke` | Builtin | Call FFI function | [Built-ins — FFI](built-ins.md#invoke) |
+| `async` | Declaration | Coroutine function (`coroutine<Y>` / `coroutine<Y, S>`) | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
+| `yield` | Expression / stmt | Suspend coroutine; optional receive binding | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
+| `yield from` | Expression / stmt | Delegate to sub-coroutine | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
+| `resume` | Expression | Continue coroutine handle | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
+| `with` | Resume modifier | Send value on resume (`resume h with v`) | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 
 ---
 
 ## Declaration keywords
 
 ```
-fn | enum | type | use | mod | extern | class | impl | defer
+fn | enum | type | use | mod | extern | class | impl | defer | async
 ```
 
 Registered in the top-level `declaration()` parser before generic statements so keywords like `enum` are not misparsed as `let`.
@@ -59,7 +64,7 @@ Appear inside `{ ... }` blocks via `statement()`.
 ## Expression / literal keywords
 
 ```
-match | new | true | false | dload | declare | invoke
+match | new | true | false | dload | declare | invoke | yield | resume
 ```
 
 Parsed as **atoms** before the generic `ident()` rule so they are never treated as variable names.

@@ -216,6 +216,33 @@ Static(N) ~ Static(M)    ✓ (element types must unify; N and M need not match f
 
 ---
 
+## Coroutine types (`coroutine<Y, S>`)
+
+`async fn` bodies return a handle typed as `coroutine<Y, S>`:
+
+| Parameter | Meaning |
+|-----------|---------|
+| `Y` | Type **yielded out** on each `yield expr` |
+| `S` | Type **sent in** on `resume h with v` and received by `let x = yield e` |
+
+When no binding-yield or send sites exist, `S` defaults to `unit` and diagnostics print `coroutine<Y>`.
+
+```0s
+async fn counter() -> coroutine<int> {
+    yield 0;
+    yield 1;
+}
+
+async fn ping() -> coroutine<string, string> {
+    let msg = yield "ready";
+    yield msg;
+}
+```
+
+Resume expression type: if `h : coroutine<Y, S>`, then `resume h` has type `Y`, and `resume h with v` requires `v : S`.
+
+---
+
 ## Known limitations
 
 | Area | Limitation |
@@ -231,6 +258,7 @@ Static(N) ~ Static(M)    ✓ (element types must unify; N and M need not match f
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
 | String `+` | Not in current tree — do not rely on string concatenation |
+| Coroutine args + interleave | Parameterized async fns may lose arg slots when two handles are interleaved; use separate `async fn` per counter or resume fully before switching |
 | `const` | No `const` keyword in parser — use `let` |
 
 ---
