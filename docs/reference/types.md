@@ -258,7 +258,7 @@ Resume expression type: if `h : coroutine<Y, S>`, then `resume h` has type `Y`, 
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
 | String `+` | Not in current tree — do not rely on string concatenation |
-| Coroutine args + interleave | Parameterized async fns may lose arg slots when two handles are interleaved; use separate `async fn` per counter or resume fully before switching |
+| `async fn` return type | `return expr;` inside an `async fn` is unified against `unit`, not the declared `-> T`; omit the return-type annotation or avoid `return` in coroutine bodies |
 | `const` | No `const` keyword in parser — use `let` |
 
 ---

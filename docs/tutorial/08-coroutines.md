@@ -43,7 +43,11 @@ fn main() {
 
 Resuming a **done** coroutine returns `0` (MVP protocol).
 
-> **Tip:** Bind the result of `resume` to a local (`let v = resume h;`) before passing it to `print`. Inline `print "%i", resume h` can leave extra handles on the operand stack and corrupt later resumes.
+`resume h` can be used inline anywhere an expression is expected, including directly as a `print` argument:
+
+```0s
+print "%i,", resume h;
+```
 
 ## Send and receive (Phase 2)
 
@@ -105,7 +109,27 @@ Output: `01` (from `examples/coro_yield_from.0s`).
 
 ## Interleaving
 
-Two handles are independent — resuming one does not advance the other. See `examples/coro_interleave.0s` for alternating `resume` calls.
+Two handles are independent — resuming one does not advance the other, even when both handles come from the same (possibly parameterized) `async fn`:
+
+```0s
+async fn counter(int base) {
+    yield base;
+    yield base + 1;
+    yield base + 2;
+}
+
+fn main() {
+    let a = counter(1);
+    let b = counter(100);
+
+    print "%i,", resume a; // 1
+    print "%i,", resume b; // 100
+    print "%i,", resume a; // 2
+    print "%i", resume b;  // 101
+}
+```
+
+See `examples/coro_interleave.0s` for a longer alternating-`resume` example.
 
 ## Recompiling
 

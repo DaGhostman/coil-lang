@@ -957,15 +957,32 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(child));
                 // Do not add pop if previous instruction is `DUP` since they both cancel eachother
                 // out
-                if !matches!(
+                //
+                // Also skip the POP for a bare `yield expr;` / `yield from expr;`
+                // statement. The parser's `expr_statement()` alternative matches
+                // `yield` before the dedicated (POP-free) `self.yield_()` statement
+                // parser ever gets a chance (see `parser::statement`), so every
+                // bare yield lands here. A trailing POP would be DEAD CODE at
+                // compile time (nothing is pushed when the yield executes) but
+                // becomes the coroutine's `resume_ip` — the NEXT time the
+                // coroutine is resumed, the VM starts by executing that POP,
+                // which pops whatever happens to be on top of the (shared)
+                // stack at the resumer's call site. For a `resume` used inline
+                // inside another expression (e.g. `print "%i", resume h;`),
+                // that top-of-stack value belongs to the RESUMER (e.g. the
+                // format string), not the coroutine — corrupting it.
+                if matches!(
                     bytecode.last().map(|b| b.bytecode()),
                     Some(Instruction::DUPLICATE)
                 ) {
-                    bytecode.push(Byte::new(Instruction::POP));
-                } else {
                     // If it was supposed to add `POP` but prev is `DUP`
                     // then remove the DUP as well
                     bytecode.pop();
+                } else if !matches!(
+                    bytecode.last().map(|b| b.bytecode()),
+                    Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
+                ) {
+                    bytecode.push(Byte::new(Instruction::POP));
                 }
             }
             Expression::Print(format, params) => {
@@ -2836,6 +2853,51 @@ mod tests {
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::YieldFromCoro)),
             "expected YieldFromCoro for yield from"
+        );
+    }
+
+    /// A bare `yield expr;` statement parses through `expr_statement()`
+    /// (see `parser::statement`, where `self.expr_statement()` is tried
+    /// before the dedicated `self.yield_()` alternative), landing as
+    /// `ExprStatement(Yield(...))`. Regression guard: `ExprStatement`
+    /// must NOT emit a trailing `POP` after `YieldCoro` (or
+    /// `YieldFromCoro`) — that POP becomes the coroutine's `resume_ip`
+    /// and, on the NEXT resume, pops whatever the resumer happens to
+    /// have on top of the shared operand stack (e.g. a `print` format
+    /// string mid-construction), corrupting it. See the crash this
+    /// guards against: `print "%i", resume h;` used to misalign a
+    /// pointer dereference in the VM.
+    #[test]
+    fn bare_yield_statement_does_not_emit_trailing_pop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("async fn f() { yield 1; yield 2; }");
+        let yield_positions: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::YieldCoro))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(yield_positions.len(), 2, "expected two YieldCoro sites");
+        for pos in yield_positions {
+            assert!(
+                !matches!(bc.get(pos + 1).map(|b| b.bytecode()), Some(Instruction::POP)),
+                "bare `yield expr;` must not be followed by POP (would corrupt the next resume)"
+            );
+        }
+    }
+
+    /// Same guard for a bare `yield from expr;` statement.
+    #[test]
+    fn bare_yield_from_statement_does_not_emit_trailing_pop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("async fn f() { yield from inner; }");
+        let pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::YieldFromCoro))
+            .expect("expected YieldFromCoro");
+        assert!(
+            !matches!(bc.get(pos + 1).map(|b| b.bytecode()), Some(Instruction::POP)),
+            "bare `yield from expr;` must not be followed by POP"
         );
     }
 

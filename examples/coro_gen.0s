@@ -6,10 +6,7 @@ async fn counter() {
 
 fn main() {
     let h = counter();
-    let v0 = resume h;
-    print "%i", v0;
-    let v1 = resume h;
-    print "%i", v1;
-    let v2 = resume h;
-    print "%i", v2;
+    print "%i", resume h;
+    print "%i", resume h;
+    print "%i", resume h;
 }

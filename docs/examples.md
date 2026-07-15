@@ -611,7 +611,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ### `examples/coro_interleave.0s`
 
-**Demonstrates:** Two independent handles resumed in arbitrary order.
+**Demonstrates:** Two independent handles from the same parameterized `async fn`, resumed in arbitrary order, with `resume` used inline as a `print` argument.
 
 | | |
 |---|---|

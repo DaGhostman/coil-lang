@@ -4054,17 +4054,133 @@ Display: `resume h with v` (not `resume h(v)`).
 | `examples/coro_gen.0s` | `012` |
 | `examples/coro_interleave.0s` | `10,100,101,11,12,102` |
 
-Bind `resume` results before `print` — inline
-`print "%i", resume h` can leave handles on the stack.
-
 ### Known limitations
 
-- **Parameterized coroutines + interleave:** `async fn
-  counter(int base)` with two interleaved handles can lose
-  argument slots after multiple yields; use separate async
-  fns or avoid interleaving parameterized handles until fixed.
 - **`done(h)` introspection** — deferred (Phase 3+).
 - Resume-after-done still returns `0` (MVP).
+- **`return expr;` inside `async fn`.** `current_return_ty` is
+  forced to `unit` for every coroutine body regardless of the
+  declared `-> T` (there's no "R" slot in `coroutine<Y, S>` for
+  the value produced when the coroutine completes via
+  `return`). Omit the return-type annotation, or avoid `return`
+  in coroutine bodies (fall off the end for the auto-default
+  `0`). See `docs/reference/types.md`.
+
+## PHASE CORO-2.1 — INLINE RESUME + PARAMETERIZED INTERLEAVE FIX (COMPLETED)
+
+### Summary
+
+Fixed the two CORO-2 "practical notes" that were originally
+documented as workarounds/limitations:
+
+1. `print "%i", resume h;` (inline, no `let` binding) could
+   misalign a pointer dereference in the VM.
+2. Two handles from the SAME parameterized `async fn`
+   (`async fn counter(int base)`), interleaved, could lose
+   `base`'s value after a few resumes.
+
+Both had the SAME root cause — a single-line fix in
+`compiler/src/lib.rs`'s `Expression::ExprStatement` codegen arm.
+
+### Root cause
+
+`parser::statement()`'s `choice(...)` tries
+`self.expr_statement()` BEFORE the dedicated `self.yield_()`
+alternative. Since `yield expr` is a valid `expr()` atom (added
+for binding-yield in Phase 2B), a bare `yield expr;` statement
+is ALWAYS parsed as `ExprStatement(Yield(...))` — the
+POP-free `self.yield_()` alternative at the bottom of the
+`choice` is dead code for plain yield statements. It never gets
+a chance to fire because `choice` returns the FIRST alternative
+that succeeds, not the most specific one.
+
+`Expression::ExprStatement`'s codegen unconditionally appended
+a `POP` after its child's bytecode (mirroring "statement
+expressions discard their value"). For `ExprStatement(Yield(e))`
+this produced `<e>, YieldCoro, POP`. That `POP` is dead code
+during FORWARD execution (nothing is pushed by a non-binding
+yield) — but it becomes the coroutine's `resume_ip`. The NEXT
+time the coroutine is resumed, the VM starts by executing that
+`POP`, which pops whatever the RESUMER currently has on top of
+the shared operand stack. For `resume` called inline inside
+another expression (`print`'s in-progress format string, or a
+parameterized coroutine's own `base` argument slot sitting just
+below the resumer's locals), that's someone else's value —
+corrupting it.
+
+### Fix
+
+`Expression::ExprStatement` now also skips the `POP` when the
+last emitted instruction is `YieldCoro` or `YieldFromCoro`
+(alongside the pre-existing `DUPLICATE` skip):
+
+```rust
+if matches!(bytecode.last().map(|b| b.bytecode()), Some(Instruction::DUPLICATE)) {
+    bytecode.pop();
+} else if !matches!(
+    bytecode.last().map(|b| b.bytecode()),
+    Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
+) {
+    bytecode.push(Byte::new(Instruction::POP));
+}
+```
+
+No parser change was needed — reordering `statement()`'s
+`choice` to try `self.yield_()` before `self.expr_statement()`
+would have also worked, but the codegen fix is a one-line,
+lower-risk change that doesn't touch parsing at all (binding
+yield, `resume h with v`, and every other yield/resume path are
+unaffected).
+
+### What works now
+
+- `print "%i", resume h;` — no intermediate `let` needed.
+- Two (or more) handles from the SAME parameterized `async fn`,
+  interleaved in any order, with `resume` used inline. Verified
+  with 3+ interleaved handles and resumes past completion (Done
+  → `0`) in both directions.
+- `examples/coro_gen.0s` and `examples/coro_interleave.0s`
+  rewritten to use the previously-broken inline-`resume`-in-
+  `print` pattern directly (no more defensive `let`-binding or
+  separate-per-counter workarounds).
+
+### Files modified
+
+| File | Purpose |
+|------|---------|
+| `compiler/src/lib.rs` | One-line `ExprStatement` fix + 2 new codegen regression tests (`bare_yield_statement_does_not_emit_trailing_pop`, `bare_yield_from_statement_does_not_emit_trailing_pop`) |
+| `compiler/tests/pipeline.rs` | 2 new golden regression tests (`inline_resume_in_print_does_not_corrupt_stack`, `parameterized_interleaved_coroutines_inline_resume_stay_independent`) |
+| `examples/coro_gen.0s` | Rewritten to use inline `print "%i", resume h;` |
+| `examples/coro_interleave.0s` | Rewritten to use a single parameterized `async fn counter(int base)` with two interleaved handles + inline resume (output unchanged: `10,100,101,11,12,102`) |
+| `docs/tutorial/08-coroutines.md` | Removed the stale "bind before print" tip; interleaving section now shows a real parameterized example |
+| `docs/reference/types.md` | Removed the stale "Coroutine args + interleave" limitation row; added the (separate, pre-existing) `async fn` return-type limitation discovered while investigating |
+| `docs/examples.md` | Updated `coro_interleave.0s` description |
+
+### Test counts (CORO-2.1 final)
+
+| Suite | Delta |
+|-------|-------|
+| `compiler/src/lib.rs::tests` | +2 codegen |
+| `compiler/tests/pipeline.rs` | +2 golden |
+
+`cargo test --workspace` — all tests pass (382 lib + 25
+pipeline, up from 380 + 23).
+
+### Anything 3+ needs to know
+
+- The `ExprStatement` POP-skip is keyed on the LAST emitted
+  instruction only (same limitation as the pre-existing
+  `DUPLICATE` skip it sits next to). An expression like
+  `(yield x) + 1;` as a bare statement wouldn't end in
+  `YieldCoro` and would still get a `POP` — but that shape
+  isn't reachable from real source today (yield's result isn't
+  usable in further binary expressions per the current grammar).
+- The `return expr;`-inside-`async fn` gap (found while
+  reproducing the interleave bug, NOT caused by this fix) is
+  now tracked as a known limitation. Fixing it would need a
+  real "R" type slot on `coroutine<Y, S>` (or a 3rd type
+  parameter) plumbed through `infer_function`, codegen's
+  auto-default, and `pretty.rs`.
 
 ### Test counts (CORO-2 final)
 

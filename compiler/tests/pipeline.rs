@@ -466,3 +466,61 @@ fn example_coro_yield_from_prints_012() {
     let output = run_example("examples/coro_yield_from.0s");
     assert_eq!(output, "012");
 }
+
+/// Regression guard: `resume h` used INLINE as a `print` argument
+/// (no intermediate `let` binding) must not corrupt the operand
+/// stack. Pre-fix, the bare `yield expr;` statement's spurious
+/// trailing `POP` (see `bare_yield_statement_does_not_emit_trailing_pop`
+/// in `compiler/src/lib.rs`) would pop whatever the resumer had
+/// already pushed for the in-progress `print` call (e.g. the format
+/// string), leading to a misaligned pointer dereference.
+#[test]
+fn inline_resume_in_print_does_not_corrupt_stack() {
+    let src = r#"
+        async fn counter() {
+            yield 0;
+            yield 1;
+            yield 2;
+        }
+
+        fn main() {
+            let h = counter();
+            print "%i,", resume h;
+            print "%i,", resume h;
+            print "%i", resume h;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "0,1,2");
+}
+
+/// Regression guard: two handles from the SAME parameterized
+/// `async fn`, interleaved, with `resume` used inline. Pre-fix, the
+/// same spurious trailing `POP` corrupted each coroutine's argument
+/// slot (`base`) on every resume after the first yield, producing
+/// wrong values once interleaving pushed other locals onto the
+/// shared stack.
+#[test]
+fn parameterized_interleaved_coroutines_inline_resume_stay_independent() {
+    let src = r#"
+        async fn counter(int base) {
+            yield base;
+            yield base + 1;
+            yield base + 2;
+        }
+
+        fn main() {
+            let a = counter(1);
+            let b = counter(100);
+
+            print "%i,", resume a;
+            print "%i,", resume b;
+            print "%i,", resume a;
+            print "%i,", resume b;
+            print "%i,", resume a;
+            print "%i", resume b;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "1,100,2,101,3,102");
+}
