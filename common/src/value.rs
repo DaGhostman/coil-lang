@@ -1,6 +1,6 @@
 type Storage = u64;
 
-#[derive(Default, Copy, Clone, Eq, Hash)]
+#[derive(Default, Copy, Clone, Eq)]
 pub struct Value(*mut u8);
 
 impl From<i64> for Value {
