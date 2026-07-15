@@ -103,15 +103,25 @@ impl<'a> Value {
         // (self.0 as usize >> 3) as _
     }
 
-    pub fn inc(&mut self) -> &Self {
-        unsafe { self.0 = self.0.add(1) };
-
+    pub fn inc_int(&mut self) -> &Self {
+        self.replace((self.as_int() + 1) as _);
         self
     }
 
-    pub fn dec(&mut self) -> &Self {
-        unsafe { self.0 = self.0.add(1) };
+    pub fn dec_int(&mut self) -> &Self {
+        self.replace((self.as_int() - 1) as _);
+        self
+    }
 
+    pub fn inc_float(&mut self) -> &Self {
+        let v = self.as_float() + 1.0;
+        self.replace(v.to_bits() as _);
+        self
+    }
+
+    pub fn dec_float(&mut self) -> &Self {
+        let v = self.as_float() - 1.0;
+        self.replace(v.to_bits() as _);
         self
     }
 }

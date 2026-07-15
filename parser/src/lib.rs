@@ -3,8 +3,8 @@
 //! Builds a span-annotated `Expression` AST for the compiler pipeline.
 
 use ast::{
-    EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output, Pattern, PatternField,
-    PatternPayload, RecordFieldDecl, RecordFieldValue, Visibility,
+    AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output,
+    Pattern, PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -24,7 +24,6 @@ use common::{Label, Message};
 
 #[repr(u16)]
 enum Precedence {
-    None = 0,
     Assign,
     Or,
     Xor,
@@ -65,7 +64,6 @@ pub mod ast;
 
 #[derive(Default)]
 pub struct Pratt<'pratt> {
-    prefix: String,
     _data: PhantomData<&'pratt ()>,
 }
 
@@ -205,7 +203,6 @@ impl<'pratt> Pratt<'pratt> {
                 // inside `choice` will try the next alternative if
                 // the `::` after the first ident is missing.
                 self.construct(expr.clone()),
-                self.call(expr.clone()),
                 self.instantiate(expr.clone()),
                 // float comes before int so that `1.0` is parsed as a
                 // float, not an `int` `1` followed by a stray `.0`.
@@ -238,8 +235,7 @@ impl<'pratt> Pratt<'pratt> {
             choice((atom, self.group(expr.clone()))).pratt((
                 // No postfix `!` here — it would conflict with `!=`
                 // (which should be parsed as a single infix operator).
-                // Bitwise/logical negation is the prefix `~` operator,
-                // listed further down.
+                // Prefix `!` is logical NOT; prefix `~` is bitwise NOT on integers.
                 infix(
                     right(Precedence::Binary as u16),
                     op!("<<"),
@@ -269,11 +265,6 @@ impl<'pratt> Pratt<'pratt> {
                     (e.span(), Box::new(Expression::Or(lhs, rhs)))
                 }),
                 infix(
-                    right(Precedence::Binary as u16),
-                    op!('^'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Xor(lhs, rhs))),
-                ),
-                infix(
                     right(Precedence::Factor as u16),
                     choice((op!("**"), op!("*"), op!("/"), op!("%"))),
                     |lhs, op, rhs, e| {
@@ -291,12 +282,7 @@ impl<'pratt> Pratt<'pratt> {
                 ),
                 infix(
                     right(Precedence::Compare as u16),
-                    // Multi-character operators come first so that
-                    // `>=` is matched as `>=` rather than as `>`
-                    // followed by `=`.
                     choice((
-                        op!("=="),
-                        op!("!="),
                         op!(">="),
                         op!("<="),
                         op!(">"),
@@ -306,8 +292,6 @@ impl<'pratt> Pratt<'pratt> {
                         (
                             e.span(),
                             Box::new(match op {
-                                "==" => Expression::Eq(lhs, rhs),
-                                "!=" => Expression::Neq(lhs, rhs),
                                 ">" => Expression::Gt(lhs, rhs),
                                 ">=" => Expression::Geq(lhs, rhs),
                                 "<=" => Expression::Leq(lhs, rhs),
@@ -317,43 +301,58 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     },
                 ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!("!="),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Neq(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!('>'),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Gt(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!(">="),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Geq(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!('<'),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Le(lhs, rhs))),
-                // ),
-                // infix(
-                //     right(Precedence::Compare as u16),
-                //     op!("<="),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Leq(lhs, rhs))),
-                // ),
-                prefix(
-                    Precedence::Negate as u16,
-                    choice((op!('-'), op!('~'), op!('+'))),
-                    |c, rhs, e| {
+                infix(
+                    right(Precedence::Equal as u16),
+                    choice((op!("=="), op!("!="))),
+                    |lhs, op, rhs, e| {
                         (
                             e.span(),
-                            Box::new(match c {
-                                '-' => Expression::Negate(rhs),
-                                '+' => Expression::Positive(rhs),
-                                '~' => Expression::Not(rhs),
-                                _ => unreachable!("No other prefix operators"),
+                            Box::new(match op {
+                                "==" => Expression::Eq(lhs, rhs),
+                                "!=" => Expression::Neq(lhs, rhs),
+                                _ => unreachable!("No more equality operators"),
                             }),
+                        )
+                    },
+                ),
+                infix(
+                    right(Precedence::Xor as u16),
+                    op!('^'),
+                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Xor(lhs, rhs))),
+                ),
+                infix(
+                    right(Precedence::Assign as u16),
+                    choice((
+                        op!("**="),
+                        op!("<<="),
+                        op!(">>="),
+                        op!("+="),
+                        op!("-="),
+                        op!("*="),
+                        op!("/="),
+                        op!("%="),
+                        op!("&="),
+                        op!("|="),
+                        op!("^="),
+                    )),
+                    |lhs, op, rhs, e| {
+                        let assign_op = match op {
+                            "+=" => AssignOp::Add,
+                            "-=" => AssignOp::Sub,
+                            "*=" => AssignOp::Mul,
+                            "/=" => AssignOp::Div,
+                            "%=" => AssignOp::Mod,
+                            "**=" => AssignOp::Pow,
+                            "<<=" => AssignOp::Shl,
+                            ">>=" => AssignOp::Shr,
+                            "&=" => AssignOp::BitAnd,
+                            "|=" => AssignOp::BitOr,
+                            "^=" => AssignOp::BitXor,
+                            _ => unreachable!("No other compound assignment operators"),
+                        };
+                        (
+                            e.span(),
+                            Box::new(Expression::CompoundAssign(lhs, assign_op, rhs)),
                         )
                     },
                 ),
@@ -362,65 +361,82 @@ impl<'pratt> Pratt<'pratt> {
                     op!("="),
                     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
                 ),
+                prefix(
+                    Precedence::Unary as u16,
+                    choice((op!("++"), op!("--"))),
+                    |op, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(Expression::Adjust {
+                                op: if op == "++" {
+                                    AdjustOp::Inc
+                                } else {
+                                    AdjustOp::Dec
+                                },
+                                prefix: true,
+                                target: rhs,
+                            }),
+                        )
+                    },
+                ),
+                prefix(
+                    Precedence::Negate as u16,
+                    choice((op!('-'), op!('~'), op!('+'), op!('!'))),
+                    |c, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(match c {
+                                '-' => Expression::Negate(rhs),
+                                '+' => Expression::Positive(rhs),
+                                '~' => Expression::Not(rhs),
+                                '!' => Expression::LogicalNot(rhs),
+                                _ => unreachable!("No other prefix operators"),
+                            }),
+                        )
+                    },
+                ),
                 infix(left(Precedence::Term as u16), op!('-'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Sub(lhs, rhs)))
                 }),
                 infix(left(Precedence::Term as u16), op!('+'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Add(lhs, rhs)))
                 }),
-                // infix(
-                //     right(Precedence::None as u16),
-                //     op!('='),
-                //     |lhs, _, rhs, e| (e.span(), Box::new(Expression::Assignment(lhs, rhs))),
-                // ),
                 postfix(
                     Precedence::Primary as u16,
                     choice((op!("++"), op!("--"))),
                     |lhs, op, e| {
                         (
                             e.span(),
-                            Box::new(match op {
-                                "++" => Expression::Inc(lhs),
-                                "--" => Expression::Dec(lhs),
-                                _ => unreachable!("no other inc/dec operators"),
+                            Box::new(Expression::Adjust {
+                                op: if op == "++" {
+                                    AdjustOp::Inc
+                                } else {
+                                    AdjustOp::Dec
+                                },
+                                prefix: false,
+                                target: lhs,
                             }),
                         )
                     },
                 ),
-                // Postfix `.ident`. Float literals still parse as atoms (`1.0`), not `1.x`.
                 postfix(
                     Precedence::Primary as u16,
                     just('.').ignore_then(text::ident()),
                     |lhs, field, e| (e.span(), Box::new(Expression::Access(lhs, field))),
                 ),
-                // `target[index]` — postfix indexing at Primary
-                // precedence (the same level as field access, so
-                // `t[i].x` parses as `Access(Index(t, i), x)`).
-                // The operator is `[expr]` where `expr` is itself
-                // a full expression (so `t[i+1]`, `t[f()]` etc.
-                // all parse naturally).
                 postfix(
                     Precedence::Primary as u16,
                     expr.clone().delimited_by(op!('['), op!(']')),
                     |lhs, index, e| (e.span(), Box::new(Expression::Index(lhs, index))),
                 ),
+                postfix(
+                    Precedence::Call as u16,
+                    self.params(expr.clone()),
+                    |lhs, args, e| (e.span(), Box::new(Expression::Call { name: lhs, args })),
+                ),
             ))
         })
         .map_with(output!(Expr))
-    }
-
-    fn inc(
-        &self,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        self.ident().then_ignore(just("++")).map_with(output!(Inc))
-    }
-
-    fn dec(
-        &self,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        self.ident().then_ignore(just("--")).map_with(output!(Inc))
     }
 
     fn group<
@@ -1616,7 +1632,8 @@ impl<'pratt> Pratt<'pratt> {
 mod tests {
     use crate::Pratt;
     use crate::ast::{
-        EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Pattern, PatternPayload,
+        AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, MatchArm,
+        Pattern, PatternPayload,
     };
     use chumsky::Parser;
 
@@ -1682,6 +1699,8 @@ mod tests {
     #[test]
     fn pratt_test_precedence() {
         same!("~1");
+        same!("!true");
+        same!("!0");
         same!("-1");
         same!("+1");
         same!("1 + 2");
@@ -2169,6 +2188,66 @@ mod tests {
             "expected Float(1.0), got {:?}",
             inner
         );
+    }
+
+    #[test]
+    fn compound_assign_parses_at_assignment_precedence() {
+        let ast = expr_ast!("x += 1 + 2");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        assert!(matches!(
+            inner,
+            Expression::CompoundAssign(_, AssignOp::Add, _)
+        ));
+    }
+
+    #[test]
+    fn prefix_increment_parses_as_adjust() {
+        let ast = expr_ast!("++x");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Adjust {
+                op: AdjustOp::Inc,
+                prefix: true,
+                ..
+            } => {}
+            other => panic!("expected prefix ++, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn postfix_increment_parses_as_adjust() {
+        let ast = expr_ast!("x++");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Adjust {
+                op: AdjustOp::Inc,
+                prefix: false,
+                ..
+            } => {}
+            other => panic!("expected postfix ++, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn power_assign_token_is_not_split() {
+        let ast = expr_ast!("x **= 2");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        assert!(matches!(
+            inner,
+            Expression::CompoundAssign(_, AssignOp::Pow, _)
+        ));
     }
 
     /// Unwrap the single `If` from a one-statement `fn main() { ... }` body.

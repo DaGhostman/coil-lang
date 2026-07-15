@@ -371,6 +371,9 @@ pub struct Compiler {
 
     /// Qualified names of `async fn` declarations (emit `MakeCoro` at call sites).
     coroutine_fns: std::collections::HashSet<String>,
+
+    /// Counter for compiler-generated temporary slots.
+    temp_counter: u32,
 }
 
 impl Default for Compiler {
@@ -405,6 +408,7 @@ impl Default for Compiler {
             program_start_offset,
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
+            temp_counter: 0,
         }
     }
 }
@@ -757,6 +761,268 @@ impl Compiler {
             Some(crate::typechecking::ty::Ty::Con(ref name))
                 if name == crate::typechecking::ty::FLOAT
         )
+    }
+
+    fn alloc_temp_slot(&mut self) -> u32 {
+        self.temp_counter += 1;
+        let name = format!("__tmp{}", self.temp_counter);
+        self.context.variables.intern(name) as u32
+    }
+
+    fn emit_field_name(&self, bytecode: &mut Vec<Byte>, field: &str) {
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32));
+        for ch in field.chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+        }
+    }
+
+    fn variable_slot(&mut self, name: &str) -> Option<u32> {
+        if let Some(map) = &self.context.match_bindings {
+            if let Some(&slot) = map.get(name) {
+                return Some(slot);
+            }
+        }
+        self.context.variables.key(&name.to_string()).map(|s| s as u32)
+    }
+
+    fn is_float_ty(&self, node: &Output) -> bool {
+        let id = self.checker.id_table().ids()[self.emit_idx];
+        matches!(
+            self.checker.lookup_at(id),
+            Some(crate::typechecking::ty::Ty::Con(ref name))
+                if name == crate::typechecking::ty::FLOAT
+        )
+    }
+
+    fn binop_for_assign_op(
+        op: parser::ast::AssignOp,
+        is_float: bool,
+    ) -> Instruction {
+        use parser::ast::AssignOp;
+        match (op, is_float) {
+            (AssignOp::Add, false) => Instruction::ADD,
+            (AssignOp::Add, true) => Instruction::ADDF,
+            (AssignOp::Sub, false) => Instruction::SUB,
+            (AssignOp::Sub, true) => Instruction::SUBF,
+            (AssignOp::Mul, false) => Instruction::MUL,
+            (AssignOp::Mul, true) => Instruction::MULF,
+            (AssignOp::Div, false) => Instruction::DIV,
+            (AssignOp::Div, true) => Instruction::DIVF,
+            (AssignOp::Mod, false) => Instruction::MOD,
+            (AssignOp::Mod, true) => Instruction::MODF,
+            (AssignOp::Pow, false) => Instruction::Pow,
+            (AssignOp::Pow, true) => Instruction::PowF,
+            (AssignOp::Shl, _) => Instruction::SHL,
+            (AssignOp::Shr, _) => Instruction::SHR,
+            (AssignOp::BitAnd, _) => Instruction::BITAND,
+            (AssignOp::BitOr, _) => Instruction::BITOR,
+            (AssignOp::BitXor, _) => Instruction::XOR,
+        }
+    }
+
+    fn emit_read_lvalue(&mut self, bytecode: &mut Vec<Byte>, target: &Output) -> bool {
+        match target.1.as_ref() {
+            Expression::Identifier(name) => {
+                if let Some(slot) = self.variable_slot(name) {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                    self.is_float_ty(target)
+                } else {
+                    false
+                }
+            }
+            Expression::Access(receiver, field) => {
+                bytecode.append(&mut self.do_compile(receiver));
+                self.emit_field_name(bytecode, field);
+                bytecode.push(Byte::new(Instruction::GetField));
+                matches!(
+                    self.receiver_type(receiver),
+                    Some(crate::typechecking::Ty::Con(ref n))
+                        if n == crate::typechecking::ty::FLOAT
+                )
+            }
+            Expression::Index(arr, idx) => {
+                let tmp_arr = self.alloc_temp_slot();
+                let tmp_idx = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(arr));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                bytecode.append(&mut self.do_compile(idx));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                bytecode.push(Byte::new(Instruction::Index));
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn emit_write_lvalue(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        target: &Output,
+        leave_value_on_stack: bool,
+    ) {
+        match target.1.as_ref() {
+            Expression::Identifier(name) => {
+                if let Some(slot) = self.variable_slot(name) {
+                    if leave_value_on_stack {
+                        bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    }
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                }
+            }
+            Expression::Access(receiver, field) => {
+                if leave_value_on_stack {
+                    bytecode.push(Byte::new(Instruction::DUPLICATE));
+                }
+                bytecode.append(&mut self.do_compile(receiver));
+                self.emit_field_name(bytecode, field);
+                bytecode.push(Byte::new(Instruction::SetField));
+            }
+            Expression::Index(arr, idx) => {
+                let tmp_arr = self.alloc_temp_slot();
+                let tmp_idx = self.alloc_temp_slot();
+                let tmp_val = self.alloc_temp_slot();
+                if leave_value_on_stack {
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                } else {
+                    bytecode.push(Byte::new(Instruction::POP));
+                }
+                bytecode.append(&mut self.do_compile(arr));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                bytecode.append(&mut self.do_compile(idx));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                if leave_value_on_stack {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                }
+                bytecode.push(Byte::new(Instruction::StoreIndex));
+            }
+            _ => {
+                bytecode.push(Byte::new(Instruction::POP));
+            }
+        }
+    }
+
+    fn emit_compound_assign(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        target: &Output,
+        op: parser::ast::AssignOp,
+        rhs: &Output,
+    ) {
+        if let Expression::Index(arr, idx) = target.1.as_ref() {
+            let tmp_arr = self.alloc_temp_slot();
+            let tmp_idx = self.alloc_temp_slot();
+            bytecode.append(&mut self.do_compile(arr));
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+            bytecode.append(&mut self.do_compile(idx));
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+            bytecode.push(Byte::new(Instruction::Index));
+            bytecode.append(&mut self.do_compile(rhs));
+            bytecode.push(Byte::new(Self::binop_for_assign_op(op, false)));
+            let tmp_val = self.alloc_temp_slot();
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+            bytecode.push(Byte::new(Instruction::StoreIndex));
+            return;
+        }
+
+        let is_float = self.emit_read_lvalue(bytecode, target);
+        bytecode.append(&mut self.do_compile(rhs));
+        bytecode.push(Byte::new(Self::binop_for_assign_op(op, is_float)));
+        bytecode.push(Byte::new(Instruction::DUPLICATE));
+        self.emit_write_lvalue(bytecode, target, true);
+    }
+
+    fn emit_adjust(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        target: &Output,
+        op: parser::ast::AdjustOp,
+        prefix: bool,
+    ) {
+        if let Expression::Identifier(name) = target.1.as_ref() {
+            if let Some(slot) = self.variable_slot(name) {
+                let is_float = self.is_float_ty(target);
+                let instr = match op {
+                    parser::ast::AdjustOp::Inc => Instruction::INC,
+                    parser::ast::AdjustOp::Dec => Instruction::DEC,
+                };
+                bytecode.push(Byte::new(instr).with_inc_dec(slot, prefix, is_float));
+                return;
+            }
+        }
+
+        let delta: i64 = match op {
+            parser::ast::AdjustOp::Inc => 1,
+            parser::ast::AdjustOp::Dec => -1,
+        };
+
+        if let Expression::Index(arr, idx) = target.1.as_ref() {
+            let tmp_arr = self.alloc_temp_slot();
+            let tmp_idx = self.alloc_temp_slot();
+            bytecode.append(&mut self.do_compile(arr));
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+            bytecode.append(&mut self.do_compile(idx));
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+            bytecode.push(Byte::new(Instruction::Index));
+            if !prefix {
+                bytecode.push(Byte::new(Instruction::DUPLICATE));
+            }
+            bytecode.push(Byte::new_with_value(
+                Instruction::CONST,
+                Value::from(delta).raw() as _,
+            ));
+            bytecode.push(Byte::new(Instruction::ADD));
+            let tmp_val = self.alloc_temp_slot();
+            if prefix {
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+            } else {
+                bytecode.push(Byte::new(Instruction::DUPLICATE));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                bytecode.push(Byte::new(Instruction::POP));
+            }
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+            bytecode.push(Byte::new(Instruction::StoreIndex));
+            return;
+        }
+
+        let is_float = self.emit_read_lvalue(bytecode, target);
+        if !prefix {
+            bytecode.push(Byte::new(Instruction::DUPLICATE));
+        }
+        if is_float {
+            bytecode.push(Byte::new_with_value(
+                Instruction::CONST,
+                Value::from(delta as f64).raw() as _,
+            ));
+            bytecode.push(Byte::new(Instruction::ADDF));
+        } else {
+            bytecode.push(Byte::new_with_value(
+                Instruction::CONST,
+                Value::from(delta).raw() as _,
+            ));
+            bytecode.push(Byte::new(Instruction::ADD));
+        }
+        if prefix {
+            bytecode.push(Byte::new(Instruction::DUPLICATE));
+            self.emit_write_lvalue(bytecode, target, true);
+        } else {
+            bytecode.push(Byte::new(Instruction::DUPLICATE));
+            self.emit_write_lvalue(bytecode, target, false);
+            bytecode.push(Byte::new(Instruction::POP));
+        }
     }
 
     /// Resolve enum name for field access via the codegen side-table.
@@ -1354,17 +1620,11 @@ impl Compiler {
 
                 // bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(0));
             }
-            Expression::Inc(var) => {
-                let name = self.resolve_variable(var);
-                let symbol = self.context.variables.intern(name);
-
-                bytecode.push(Byte::new(Instruction::INC).with_operand_u32(symbol as u32));
+            Expression::Adjust { op, prefix, target } => {
+                self.emit_adjust(&mut bytecode, target, *op, *prefix);
             }
-            Expression::Dec(var) => {
-                let name = self.resolve_variable(var);
-                let symbol = self.context.variables.intern(name);
-
-                bytecode.push(Byte::new(Instruction::DEC).with_operand_u32(symbol as u32));
+            Expression::CompoundAssign(target, op, rhs) => {
+                self.emit_compound_assign(&mut bytecode, target, *op, rhs);
             }
             // --- Loop codegen ---
             // Layout: [top] cond, JMPF→exit, body, JMP→top
@@ -1629,6 +1889,9 @@ impl Compiler {
             Expression::Not(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NOT));
             }
+            Expression::LogicalNot(lhs) => {
+                unary!(bytecode, self, lhs, Byte::new(Instruction::LogNot));
+            }
             Expression::Negate(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
@@ -1674,6 +1937,38 @@ impl Compiler {
             }
             Expression::And(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::AND));
+            }
+            Expression::Positive(lhs) => {
+                bytecode.append(&mut self.do_compile(lhs));
+            }
+            Expression::Pow(lhs, rhs) => {
+                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                bytecode.push(Byte::new(if is_float {
+                    Instruction::PowF
+                } else {
+                    Instruction::Pow
+                }));
+            }
+            Expression::Shl(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHL));
+            }
+            Expression::Shr(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHR));
+            }
+            Expression::Xor(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::XOR));
+            }
+            Expression::BitAnd(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::BITAND));
+            }
+            Expression::BitOr(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::BITOR));
+            }
+            Expression::Or(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::OR));
+            }
+            Expression::Neq(lhs, rhs) => {
+                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
             }
             Expression::Integer(num) => bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
@@ -1758,88 +2053,86 @@ impl Compiler {
                 self.context.constants.insert(symbol, false);
             }
             Expression::Assignment(lhs, value) => {
-                // Dict field assignment: value, target, field name → SetField.
-                let lhs_is_access = matches!(lhs.1.as_ref(), Expression::Access(_, _));
-                if lhs_is_access {
-                    if let Expression::Access(target_expr, field) = lhs.1.as_ref() {
-                        // Compute the RHS first (top of stack at
-                        // dispatch will be the new value).
+                match lhs.1.as_ref() {
+                    Expression::Access(target_expr, field) => {
                         bytecode.append(&mut self.do_compile(value));
-                        // THEN the receiver (so it's UNDER the
-                        // value). `SetField` pops in reverse
-                        // order (value, field-name, target).
                         bytecode.append(&mut self.do_compile(target_expr));
-                        // Push field-name string last (so it's
-                        // on top). Use STRING+DATA encoding.
-                        bytecode.push(
-                            Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32),
-                        );
-                        for ch in field.chars() {
-                            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                        }
+                        self.emit_field_name(&mut bytecode, field);
                         bytecode.push(Byte::new(Instruction::SetField));
                     }
-                    // Continue to the next match arm — don't
-                    // fall through to the let-variable path.
-                } else {
-                    let name = self.resolve_variable(lhs);
-
-                    self.context.assignments.insert(name.clone(), true);
-
-                    // Match bindings (arm body pattern bindings) live
-                    // in `match_bindings`, not the global `variables`
-                    // Interner. Fall back to the global Interner only
-                    // when no match is in scope.
-                    let symbol_opt = if let Some(map) = &self.context.match_bindings {
-                        if let Some(&slot) = map.get(&name) {
-                            Some(slot as usize)
-                        } else {
-                            self.context.variables.key(&name)
-                        }
-                    } else {
-                        self.context.variables.key(&name)
-                    };
-
-                    if let Some(symbol) = symbol_opt {
-                        if unlikely(self.context.constants.contains_key(&symbol)) {
-                            let assigned = likely(*self.context.constants.get(&symbol).unwrap());
-
-                            if !assigned {
-                                self.context.constants.entry(symbol).and_modify(|state| {
-                                    *state = true;
-                                });
+                    Expression::Index(arr, idx) => {
+                        let tmp_arr = self.alloc_temp_slot();
+                        let tmp_idx = self.alloc_temp_slot();
+                        let tmp_val = self.alloc_temp_slot();
+                        bytecode.append(&mut self.do_compile(value));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                        bytecode.append(&mut self.do_compile(arr));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                        bytecode.append(&mut self.do_compile(idx));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                        bytecode.push(Byte::new(Instruction::StoreIndex));
+                    }
+                    Expression::Identifier(name) => {
+                        self.context.assignments.insert(name.to_string(), true);
+                        let symbol_opt = if let Some(map) = &self.context.match_bindings {
+                            if let Some(&slot) = map.get(*name) {
+                                Some(slot as usize)
                             } else {
-                                let mut message = Message::error(
-                                    "Assignment error".to_string(),
-                                    span.into_range(),
-                                );
-                                message.push(DiagLabel::new(
-                                    format!(
-                                        "Unable to assign to an already assigned constant '{}'",
-                                        name
-                                    ),
-                                    span.into_range(),
-                                ));
-                                self.messages.push(message);
+                                self.context.variables.key(&name.to_string())
                             }
+                        } else {
+                            self.context.variables.key(&name.to_string())
+                        };
+
+                        if let Some(symbol) = symbol_opt {
+                            if unlikely(self.context.constants.contains_key(&symbol)) {
+                                let assigned =
+                                    likely(*self.context.constants.get(&symbol).unwrap());
+                                if !assigned {
+                                    self.context.constants.entry(symbol).and_modify(|state| {
+                                        *state = true;
+                                    });
+                                } else {
+                                    let mut message = Message::error(
+                                        "Assignment error".to_string(),
+                                        span.into_range(),
+                                    );
+                                    message.push(DiagLabel::new(
+                                        format!(
+                                            "Unable to assign to an already assigned constant '{}'",
+                                            name
+                                        ),
+                                        span.into_range(),
+                                    ));
+                                    self.messages.push(message);
+                                }
+                            }
+                            bytecode.append(&mut self.do_compile(value));
+                            bytecode.push(Byte::new(Instruction::DUPLICATE));
+                            bytecode.push(
+                                Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32),
+                            );
+                        } else {
+                            let mut message = Message::error(
+                                "Undefined variable".to_string(),
+                                span.into_range(),
+                            );
+                            message.push(DiagLabel::new(
+                                format!(
+                                    "Unable to assign to a non-existing variable/constant '{}'",
+                                    name
+                                ),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
                         }
-
-                        let mut expr = self.do_compile(value);
-
-                        bytecode.append(&mut expr);
-                        bytecode
-                            .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
-                    } else {
-                        let mut message =
-                            Message::error("Undefined variable".to_string(), span.into_range());
-                        message.push(DiagLabel::new(
-                            format!(
-                                "Unable to assign to a non-existing variable/constant '{}'",
-                                name
-                            ),
-                            span.into_range(),
-                        ));
-                        self.messages.push(message);
+                    }
+                    _ => {
+                        bytecode.append(&mut self.do_compile(value));
+                        bytecode.push(Byte::new(Instruction::POP));
                     }
                 }
             }
@@ -2714,6 +3007,7 @@ impl Compiler {
         self.namespace = module.to_string();
 
         self.emit_idx = 0;
+        self.temp_counter = 0;
         self.constants.clear();
         let _program_ty = self.checker.check_program(ast);
 

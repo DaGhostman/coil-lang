@@ -576,6 +576,17 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+### `examples/operators.0s`
+
+**Demonstrates:** Compound assignment, prefix/postfix increment, array and dict mutation, power, logical/bitwise operators.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/operators.0s` |
+| **Output** | `801125428falsetrue3` |
+
+---
+
 ### `examples/coro_gen.0s`
 
 **Demonstrates:** Generator-style counter (`yield 0`, `yield 1`, `yield 2`).
@@ -644,6 +655,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `chained.0s` | Enums / fields | `427` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
+| `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` (needs module setup) |
 | `src/foo/sadge.0s` | Modules | (support file) |
 | `src/foo.0s` | Modules | (support file) |

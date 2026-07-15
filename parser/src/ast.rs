@@ -3,6 +3,29 @@ use std::{borrow::Borrow, fmt::Display};
 use chumsky::span::SimpleSpan;
 pub type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
 
+/// Compound assignment operator (`+=`, `-=`, …).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AssignOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Shl,
+    Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+}
+
+/// Prefix/postfix increment or decrement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AdjustOp {
+    Inc,
+    Dec,
+}
+
 #[derive(Clone, PartialEq, Debug, Copy, Default)]
 pub enum Visibility {
     #[default]
@@ -33,10 +56,17 @@ pub enum Expression<'expr> {
     Resume(Output<'expr>, Option<Output<'expr>>),
     Negate(Output<'expr>),
     Not(Output<'expr>),
+    LogicalNot(Output<'expr>),
     Positive(Output<'expr>),
     Default(&'expr str),
-    Inc(Output<'expr>),
-    Dec(Output<'expr>),
+    /// `target += rhs` and related compound assignments.
+    CompoundAssign(Output<'expr>, AssignOp, Output<'expr>),
+    /// Prefix/postfix `++` / `--`.
+    Adjust {
+        op: AdjustOp,
+        prefix: bool,
+        target: Output<'expr>,
+    },
     Add(Output<'expr>, Output<'expr>),
     Sub(Output<'expr>, Output<'expr>),
     Mul(Output<'expr>, Output<'expr>),
@@ -132,7 +162,6 @@ pub enum Expression<'expr> {
     Method(Visibility, Output<'expr>),
     Member(Output<'expr>),
     Access(Output<'expr>, &'expr str),
-    Update(Output<'expr>, Output<'expr>),
 
     Instantiate(Output<'expr>, Option<Vec<Output<'expr>>>),
 
@@ -311,8 +340,10 @@ impl<'a> Display for Expression<'a> {
         match self {
             Self::Integer(n) => write!(f, "{}", n),
             Self::Float(n) => write!(f, "{:.?}", n),
+            Self::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             Self::Identifier(id) => write!(f, "{}", id),
             Self::Not(n) => write!(f, "~{}", n.1),
+            Self::LogicalNot(n) => write!(f, "!{}", n.1),
             Self::Sub(lhs, rhs) => write!(f, "{} - {}", lhs.borrow().1, rhs.borrow().1),
             Self::Add(lhs, rhs) => write!(f, "{} + {}", lhs.borrow().1, rhs.borrow().1),
             Self::Mul(lhs, rhs) => write!(f, "{} * {}", lhs.borrow().1, rhs.borrow().1),
@@ -330,8 +361,33 @@ impl<'a> Display for Expression<'a> {
             Self::Le(lhs, rhs) => write!(f, "{} < {}", lhs.borrow().1, rhs.borrow().1),
             Self::Eq(lhs, rhs) => write!(f, "{} == {}", lhs.borrow().1, rhs.borrow().1),
             Self::Neq(lhs, rhs) => write!(f, "{} != {}", lhs.borrow().1, rhs.borrow().1),
-            Self::Inc(n) => write!(f, "{}++", n.borrow().1),
-            Self::Dec(n) => write!(f, "{}--", n.borrow().1),
+            Self::CompoundAssign(lhs, op, rhs) => {
+                let sym = match op {
+                    AssignOp::Add => "+=",
+                    AssignOp::Sub => "-=",
+                    AssignOp::Mul => "*=",
+                    AssignOp::Div => "/=",
+                    AssignOp::Mod => "%=",
+                    AssignOp::Pow => "**=",
+                    AssignOp::Shl => "<<=",
+                    AssignOp::Shr => ">>=",
+                    AssignOp::BitAnd => "&=",
+                    AssignOp::BitOr => "|=",
+                    AssignOp::BitXor => "^=",
+                };
+                write!(f, "{} {} {}", lhs.borrow().1, sym, rhs.borrow().1)
+            }
+            Self::Adjust { op, prefix, target } => {
+                let sym = match op {
+                    AdjustOp::Inc => "++",
+                    AdjustOp::Dec => "--",
+                };
+                if *prefix {
+                    write!(f, "{}{}", sym, target.borrow().1)
+                } else {
+                    write!(f, "{}{}", target.borrow().1, sym)
+                }
+            }
             Self::Negate(n) => write!(f, "-{}", n.borrow().1),
             Self::Positive(n) => write!(f, "+{}", n.borrow().1),
             Self::Expr(e) => write!(f, "{}", e.1),

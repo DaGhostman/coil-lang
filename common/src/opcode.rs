@@ -81,6 +81,7 @@ pub enum Instruction {
 
     // StorePop: [31:0] slot_index — pop stack and write slot (let bindings).
     // STORE is a no-op used by match-arm binding codegen.
+    // INC/DEC: [31:3] slot, [2] prefix (1=new value), [1] float, [0] reserved.
     StorePop,
 
     // UnpackAt: [31:16] arity, [15:0] slot offset — unpack enum at slot in place.
@@ -131,6 +132,20 @@ pub enum Instruction {
     ResumeCoro,
     YieldCoro,
     YieldFromCoro,
+
+    // Power — append-only.
+    Pow,
+    PowF,
+
+    // Bitwise AND/OR distinct from logical AND/OR.
+    BITAND,
+    BITOR,
+
+    /// Pop `value`, `index`, `target`; store into array element; push `value`.
+    StoreIndex,
+
+    /// Logical NOT: bool or int (zero vs non-zero) → bool.
+    LogNot,
 }
 
 impl From<u8> for Instruction {
@@ -315,6 +330,21 @@ impl Byte {
             ((o >> 8) & 0xFF) as usize,
         )
     }
+
+    /// INC/DEC: [31:3] slot, [2] prefix, [1] float.
+    pub fn with_inc_dec(mut self, slot: u32, prefix: bool, is_float: bool) -> Self {
+        self.operands = (slot << 3) | ((prefix as u32) << 2) | ((is_float as u32) << 1);
+        self
+    }
+
+    pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
+        let o = self.operands;
+        (
+            (o >> 3) as usize,
+            (o & 0b100) != 0,
+            (o & 0b010) != 0,
+        )
+    }
 }
 
 impl ArchivedByte {
@@ -452,6 +482,20 @@ impl ArchivedByte {
 
     pub fn with_bin_slot_slot(mut self, op: u8, a: u8, b: u8) -> Self {
         self.operands = (((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8)).into();
+        self
+    }
+
+    pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 3) as usize,
+            (o & 0b100) != 0,
+            (o & 0b010) != 0,
+        )
+    }
+
+    pub fn with_inc_dec(mut self, slot: u32, prefix: bool, is_float: bool) -> Self {
+        self.operands = ((slot << 3) | ((prefix as u32) << 2) | ((is_float as u32) << 1)).into();
         self
     }
 }

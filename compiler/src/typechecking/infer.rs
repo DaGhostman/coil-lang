@@ -484,7 +484,27 @@ impl Checker {
                 unit_ty()
             }
 
-            // ---- Assignment ----
+            // ---- Assignment / compound assignment / adjust ----
+            Expression::CompoundAssign(target, op, value) => {
+                let target_ty = self.infer_mutable_lvalue(target, range.clone());
+                let val_ty = self.infer(value);
+                let op_name = Self::compound_op_name(*op);
+                if matches!(
+                    op,
+                    parser::ast::AssignOp::Shl
+                        | parser::ast::AssignOp::Shr
+                        | parser::ast::AssignOp::BitAnd
+                        | parser::ast::AssignOp::BitOr
+                        | parser::ast::AssignOp::BitXor
+                ) {
+                    let _ = unify_with(&self.subst, &target_ty, &int());
+                    let _ = unify_with(&self.subst, &val_ty, &int());
+                } else {
+                    self.unify(&target_ty, &val_ty, &range, &format!("operands of `{}=`", op_name));
+                }
+                apply_ty_prune(&self.subst, &target_ty)
+            }
+
             Expression::Assignment(name, value) => {
                 // `x = resume x` overwrites the coroutine handle with the yield value.
                 if let (
@@ -512,31 +532,9 @@ impl Checker {
                     self.yield_receives_used = true;
                 }
                 let val_ty = self.infer(value);
-                let ident = match name.1.as_ref() {
-                    Expression::Identifier(n) => n.to_string(),
-                    _ => {
-                        return self.error_with_help(
-                            "Invalid assignment target".to_string(),
-                            range,
-                            Some(
-                                "the left-hand side of an assignment must be a variable"
-                                    .to_string(),
-                            ),
-                        );
-                    }
-                };
-                let scheme = self.env.lookup(&ident).cloned();
-                match scheme {
-                    Some(s) => {
-                        let var_ty = instantiate(&s, &mut self.counter);
-                        self.unify(&var_ty, &val_ty, &range, "assignment")
-                    }
-                    None => self.error_with_help(
-                        format!("Cannot assign to undeclared variable `{}`", ident),
-                        range,
-                        Some(format!("try declaring it first with `let {};`", ident)),
-                    ),
-                }
+                let target_ty = self.infer_mutable_lvalue(name, range.clone());
+                self.unify(&target_ty, &val_ty, &range, "assignment");
+                apply_ty_prune(&self.subst, &val_ty)
             }
 
             // ---- Arithmetic / bitwise ----
@@ -576,10 +574,40 @@ impl Checker {
 
             // ---- Prefix / postfix ----
             Expression::Negate(e) | Expression::Positive(e) => self.infer(e),
-            Expression::Not(e) => self.infer(e),
-            Expression::Inc(e) | Expression::Dec(e) => self.infer(e),
-
-            // ---- Calls ----
+            Expression::Not(e) => {
+                let t = self.infer(e);
+                self.unify(&t, &int(), &e.0.into_range(), "operand of `~`");
+                int()
+            }
+            Expression::LogicalNot(e) => {
+                let t = self.infer(e);
+                let pruned = apply_ty_prune(&self.subst, &t);
+                match pruned {
+                    Ty::Con(name) if name == "bool" || name == "int" => boolean(),
+                    _ => {
+                        let _ = self.error_with_help(
+                            "Logical NOT requires a `bool` or `int` operand".to_string(),
+                            e.0.into_range(),
+                            Some(format!(
+                                "found `{pruned}`; use `~` for bitwise negation on integers"
+                            )),
+                        );
+                        boolean()
+                    }
+                }
+            }
+            Expression::Adjust { target, .. } => {
+                let ty = self.infer_mutable_lvalue(target, range.clone());
+                let pruned = apply_ty_prune(&self.subst, &ty);
+                if !matches!(pruned, Ty::Con(ref n) if n == "int" || n == "float") {
+                    let _ = self.error_with_help(
+                        "Increment/decrement requires a numeric lvalue".to_string(),
+                        range,
+                        Some("only `int` and `float` variables, fields, and indices support ++/--".to_string()),
+                    );
+                }
+                pruned
+            }
             Expression::Call { name, args } => {
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
@@ -1048,7 +1076,6 @@ impl Checker {
                     ),
                 }
             }
-            Expression::Update(_, e) => self.infer(e),
             Expression::Instantiate(class_expr, _args) => self.infer(class_expr),
             Expression::Field(_, _, _) => unit_ty(),
 
@@ -1222,6 +1249,107 @@ impl Checker {
         let lt = self.infer(lhs);
         let rt = self.infer(rhs);
         self.unify(&lt, &rt, &range, &format!("operands of `{}`", op))
+    }
+
+    fn compound_op_name(op: parser::ast::AssignOp) -> &'static str {
+        use parser::ast::AssignOp;
+        match op {
+            AssignOp::Add => "+",
+            AssignOp::Sub => "-",
+            AssignOp::Mul => "*",
+            AssignOp::Div => "/",
+            AssignOp::Mod => "%",
+            AssignOp::Pow => "**",
+            AssignOp::Shl => "<<",
+            AssignOp::Shr => ">>",
+            AssignOp::BitAnd => "&",
+            AssignOp::BitOr => "|",
+            AssignOp::BitXor => "^",
+        }
+    }
+
+    fn infer_mutable_lvalue(&mut self, target: &Output, range: Range<usize>) -> Ty {
+        match target.1.as_ref() {
+            Expression::Identifier(n) => {
+                let ident = n.to_string();
+                match self.env.lookup(&ident).cloned() {
+                    Some(s) => instantiate(&s, &mut self.counter),
+                    None => self.error_with_help(
+                        format!("Cannot assign to undeclared variable `{}`", ident),
+                        range,
+                        Some(format!("try declaring it first with `let {};`", ident)),
+                    ),
+                }
+            }
+            Expression::Access(receiver, field) => {
+                let receiver_ty = self.infer(receiver);
+                let resolved = apply_ty_prune(&self.subst, &receiver_ty);
+                match &resolved {
+                    Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
+                        Some((_, fty)) => fty.clone(),
+                        None => {
+                            let known: Vec<&str> =
+                                fields.iter().map(|(n, _)| n.as_str()).collect();
+                            self.error_with_help(
+                                format!("Cannot find field `{}` on record", field),
+                                range,
+                                Some(format!("the record has fields: {}", known.join(", "))),
+                            )
+                        }
+                    },
+                    _ => self.error_with_help(
+                        "Invalid assignment target".to_string(),
+                        range,
+                        Some(
+                            "only variables, dict fields, and array elements may be assigned"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
+            Expression::Index(arr, idx) => {
+                let target_ty = self.infer(arr);
+                let target_ty = apply_ty_prune(&self.subst, &target_ty);
+                let index_ty = self.infer(idx);
+                let _ = unify_with(&self.subst, &apply_ty_prune(&self.subst, &index_ty), &int());
+                match &target_ty {
+                    Ty::Array { element, length } => {
+                        if let ArrayLength::Static(n) = length {
+                            if let Expression::Integer(i) = idx.1.as_ref() {
+                                if *i < 0 || (*i as usize) >= *n {
+                                    let _ = self.error_with_help(
+                                        format!(
+                                            "array index {} out of bounds for array of length {}",
+                                            i, n
+                                        ),
+                                        range.clone(),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        (**element).clone()
+                    }
+                    Ty::Tuple(_) => self.error_with_help(
+                        "Invalid assignment target".to_string(),
+                        range,
+                        Some("tuple elements are immutable".to_string()),
+                    ),
+                    _ => self.error_with_help(
+                        "Invalid assignment target".to_string(),
+                        range,
+                        Some("only array elements may be indexed for assignment".to_string()),
+                    ),
+                }
+            }
+            _ => self.error_with_help(
+                "Invalid assignment target".to_string(),
+                range,
+                Some(
+                    "the left-hand side must be a variable, dict field, or array index".to_string(),
+                ),
+            ),
+        }
     }
 
     fn infer_if(&mut self, branches: &[Output]) -> Ty {
@@ -1926,13 +2054,17 @@ impl Checker {
             | Expression::YieldFrom(e)
             | Expression::Negate(e)
             | Expression::Not(e)
+            | Expression::LogicalNot(e)
             | Expression::Positive(e)
-            | Expression::Inc(e)
-            | Expression::Dec(e)
+            | Expression::Adjust { target: e, .. }
             | Expression::Defer(e)
-            | Expression::Member(e)
-            | Expression::Update(_, e) => {
+            | Expression::Member(e) => {
                 self.pre_register_enums_walk(e, errors);
+            }
+
+            Expression::CompoundAssign(name, _, value) => {
+                self.pre_register_enums_walk(name, errors);
+                self.pre_register_enums_walk(value, errors);
             }
 
             Expression::Assignment(name, value) => {
@@ -3589,8 +3721,26 @@ mod tests {
     }
 
     #[test]
-    fn not_bool() {
-        assert_ok("~true", boolean());
+    fn bitwise_not_int() {
+        assert_ok("~7", int());
+    }
+
+    #[test]
+    fn logical_not_bool() {
+        assert_ok("!true", boolean());
+        assert_ok("!false", boolean());
+    }
+
+    #[test]
+    fn logical_not_int() {
+        assert_ok("!0", boolean());
+        assert_ok("!42", boolean());
+    }
+
+    #[test]
+    fn logical_not_rejects_float() {
+        let msgs = assert_messages("!1.0;");
+        assert!(!msgs.is_empty());
     }
 
     // ---- Postfix ----

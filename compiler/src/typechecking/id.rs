@@ -80,12 +80,16 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::YieldFrom(e)
         | Expression::Negate(e)
         | Expression::Not(e)
+        | Expression::LogicalNot(e)
         | Expression::Positive(e)
-        | Expression::Inc(e)
-        | Expression::Dec(e)
+        | Expression::Adjust { target: e, .. }
         | Expression::Defer(e)
-        | Expression::Member(e)
-        | Expression::Update(_, e) => pre_walk(e, table),
+        | Expression::Member(e) => pre_walk(e, table),
+
+        Expression::CompoundAssign(name, _, value) => {
+            pre_walk(name, table);
+            pre_walk(value, table);
+        }
 
         Expression::Assignment(name, value) => {
             pre_walk(name, table);

@@ -625,3 +625,9 @@ fn example_ffi_callback_prints_42() {
     let output = run_ffi_example_with_lib("examples/ffi_callback.0s", &libsum);
     assert_eq!(output, "42");
 }
+
+#[test]
+fn example_operators_prints_expected() {
+    let output = run_example("examples/operators.0s");
+    assert_eq!(output, "801125428falsetrue3");
+}

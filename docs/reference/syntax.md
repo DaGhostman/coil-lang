@@ -253,9 +253,13 @@ See [Tutorial: Coroutines](../tutorial/08-coroutines.md).
 Assignment is an expression (lowest precedence):
 
 ```
-assignment ::= lvalue '=' expr
-lvalue     ::= IDENT | access | index  /* field/index LHS for dict mutation */
+assignment ::= lvalue assign_op expr
+assign_op    ::= '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '**=' | '<<=' | '>>=' | '&=' | '|=' | '^='
+lvalue       ::= IDENT | access | index
+adjust       ::= ('++' | '--') lvalue | lvalue ('++' | '--')
 ```
+
+Compound assignment is right-associative. Prefix/postfix `++`/`--` bind at unary and primary precedence respectively.
 
 ---
 

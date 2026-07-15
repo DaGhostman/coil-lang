@@ -101,6 +101,26 @@ Expected output when run: `51020` (three integers printed back-to-back).
 
 Assignment requires an existing binding. Assigning to an undeclared name is a compile-time error.
 
+Compound assignment (`+=`, `-=`, `*=`, and the other arithmetic/bitwise forms) updates a binding in place and evaluates to the new value:
+
+```0s
+let x = 5;
+x += 3;
+print "%i", x;   // 8
+```
+
+Increment and decrement follow C-like rules: prefix forms (`++x`, `--x`) evaluate to the new value; postfix forms (`x++`, `x--`) evaluate to the old value. They work on variables, dict fields, and array elements.
+
+```0s
+let y = 0;
+print "%i", y++;   // 0
+print "%i", y;     // 1
+let z = 0;
+print "%i", ++z;   // 1
+```
+
+See `examples/operators.0s` for a broader operator demo.
+
 ---
 
 ## Functions

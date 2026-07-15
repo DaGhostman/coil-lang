@@ -30,7 +30,7 @@ Associativity:
 | **Logical AND** | `&&` | Both operands `bool` → `bool` |
 | **Logical OR** | `\|\|` | Both operands `bool` → `bool` |
 | **Comparison** | `==`, `!=`, `<`, `<=`, `>`, `>=` | Operands same type → `bool` |
-| **Assignment** | `=` | Lowest — `lvalue = expr` |
+| **Assignment** | `=`, `+=`, `-=`, … | Lowest — right-associative |
 
 Forms **not** in the Pratt table but still tight-binding:
 
@@ -52,7 +52,7 @@ Forms **not** in the Pratt table but still tight-binding:
 | `*` | `int` / `float` | same | `MUL` / `MULF` |
 | `/` | `int` / `float` | same | `DIV` / `DIVF` |
 | `%` | `int` / `float` | same | `MOD` / `MODF` |
-| `**` | `int` / `float` | same | Power |
+| `**` | `int` / `float` | same | `Pow` / `PowF` |
 
 Mixed `int` and `float` operands → **type error** at compile time.
 
@@ -82,7 +82,16 @@ Operands are inferred together (typically `int`):
 | `&&` | `bool`, `bool` | `bool` |
 | `\|\|` | `bool`, `bool` | `bool` |
 
-Short-circuit behavior follows VM evaluation order (both operands evaluated in current codegen).
+Short-circuit behavior follows VM evaluation order (both operands evaluated eagerly in current codegen).
+
+| Operator | VM opcode |
+|----------|-----------|
+| `&&` | `AND` |
+| `\|\|` | `OR` |
+| `&` | `BITAND` |
+| `\|` | `BITOR` |
+| `^` | `XOR` |
+| `<<`, `>>` | `SHL`, `SHR` |
 
 ---
 
@@ -101,28 +110,33 @@ Float and int comparisons use separate opcode families (`LE` vs `LEF`, etc.) sel
 
 ```
 identifier = expr
-field_access = expr    // dict record mutation (limited runtime)
+field_access = expr
+array[index] = expr
+identifier += expr    // and other compound forms
 ```
 
 | Rule | Detail |
 |------|--------|
-| LHS | Identifier, or field access on dict |
-| Type | RHS must unify with existing binding |
+| LHS | Identifier, dict field (`d.x`), or array index (`arr[i]`) |
+| Compound | `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `<<=`, `>>=`, `&=`, `\|=`, `^=` |
+| Type | RHS must unify with the assigned slot (bitwise compound ops require `int`) |
 | Undeclared | Error — use `let` first |
-| Value | Assignment expression type is the RHS type |
+| Value | Assignment and compound-assignment expressions evaluate to the assigned value |
 
 `let` bindings use `StorePop`; match arms use no-op `STORE` for pattern slots.
 
 ---
 
-## Postfix increment / decrement
+## Increment / decrement
 
-| Form | Syntax | Notes |
-|------|--------|-------|
-| Postfix increment | `expr++` | Parsed at Primary precedence |
-| Postfix decrement | `expr--` | Same |
+| Form | Syntax | Result value |
+|------|--------|--------------|
+| Postfix increment | `expr++` | Old value |
+| Postfix decrement | `expr--` | Old value |
+| Prefix increment | `++expr` | New value |
+| Prefix decrement | `--expr` | New value |
 
-Prefix increment on identifiers exists in parser helpers but is not exposed in the main expression Pratt chain.
+Works on variables, mutable dict fields, and array elements. Enum record fields and tuples are immutable.
 
 ---
 
@@ -166,9 +180,10 @@ Index expression is full `expr` — `arr[i + 1]` is valid.
 |----------|------|---------|--------|
 | `-` | Negate | numeric | numeric |
 | `+` | Positive | numeric | numeric (no-op) |
-| `~` | NOT | `int` | `int` (bitwise) |
+| `~` | Bitwise NOT | `int` | `int` (flip bits) |
+| `!` | Logical NOT | `bool` or `int` | `bool` |
 
-There is **no** postfix or prefix `!` for logical NOT — use `~` for bitwise negation on integers or compare to zero for booleans.
+For `!` on integers, zero is false and any non-zero value is true (`!0` → `true`, `!42` → `false`).
 
 ---
 
@@ -183,6 +198,7 @@ There is **no** postfix or prefix `!` for logical NOT — use `~` for bitwise ne
 | `1.0` | Float literal | `1` `.` `0` |
 | `a++` | Postfix inc | |
 | `!=` | Single operator | `!` `=` |
+| `!true` | Prefix logical NOT | `!` applied to `true` |
 
 ---
 

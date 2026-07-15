@@ -888,15 +888,38 @@ impl<const S: usize> Machine<S> {
                         .push(self.stack[sp + opcode.operand_u32() as usize]);
                 }
                 Instruction::INC => {
-                    let lhs = *self.stack[sp + opcode.operand_u32() as usize].inc();
-                    self.stack.push(lhs);
+                    let (slot, prefix, is_float) = opcode.inc_dec_parts();
+                    let idx = sp + slot;
+                    let old = self.stack[idx];
+                    let new_val = if is_float {
+                        Value::from(old.as_float() + 1.0)
+                    } else {
+                        Value::from(old.as_int() + 1)
+                    };
+                    self.stack[idx] = new_val;
+                    self.stack.push(if prefix { new_val } else { old });
                 }
                 Instruction::DEC => {
-                    let lhs = *self.stack[sp + opcode.operand_u32() as usize].dec();
-                    self.stack.push(lhs);
+                    let (slot, prefix, is_float) = opcode.inc_dec_parts();
+                    let idx = sp + slot;
+                    let old = self.stack[idx];
+                    let new_val = if is_float {
+                        Value::from(old.as_float() - 1.0)
+                    } else {
+                        Value::from(old.as_int() - 1)
+                    };
+                    self.stack[idx] = new_val;
+                    self.stack.push(if prefix { new_val } else { old });
                 }
-                Instruction::NOT => unary!(self.stack, !, as_bool),
+                Instruction::NOT => unary!(self.stack, !, as_int),
+                Instruction::LogNot => {
+                    let val = self.stack.pop();
+                    self.stack
+                        .push(Value::from(!(val.as_int() != 0)));
+                }
                 Instruction::NEG => unary!(self.stack, -, as_int),
+                Instruction::AND => binary!(self.stack, &&, as_bool),
+                Instruction::OR => binary!(self.stack, ||, as_bool),
                 Instruction::ADD => binary!(self.stack, +, as_int),
                 Instruction::SUB => binary!(self.stack, -, as_int),
                 Instruction::MUL => binary!(self.stack, *, as_int),
@@ -913,6 +936,29 @@ impl<const S: usize> Machine<S> {
                 Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
                 Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
                 Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
+                Instruction::SHL => binary!(self.stack, <<, as_int),
+                Instruction::SHR => binary!(self.stack, >>, as_int),
+                Instruction::XOR => binary!(self.stack, ^, as_int),
+                Instruction::BITAND => binary!(self.stack, &, as_int),
+                Instruction::BITOR => binary!(self.stack, |, as_int),
+                Instruction::Pow => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 2);
+                    let rhs = self.stack[sp - 1].as_int();
+                    let lhs = self.stack[sp - 2].as_int();
+                    let result = lhs.pow(rhs as u32);
+                    self.stack[sp - 2].replace(result as _);
+                    self.stack.seek(sp - 1);
+                }
+                Instruction::PowF => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 2);
+                    let rhs = self.stack[sp - 1].as_float();
+                    let lhs = self.stack[sp - 2].as_float();
+                    let result = lhs.powf(rhs);
+                    self.stack[sp - 2].replace(result.to_bits() as _);
+                    self.stack.seek(sp - 1);
+                }
                 Instruction::LEF => binary!(self.stack, <, as_float),
                 Instruction::LEQF => binary!(self.stack, <=, as_float),
                 Instruction::GTF => binary!(self.stack, >, as_float),
@@ -1521,8 +1567,9 @@ impl<const S: usize> Machine<S> {
                     let value = self.stack.pop();
                     let name = Self::object_string_value(&self.heap, &name_val);
                     let target_addr = target_val.raw() as u64;
-                    let lookup = Self::find_object_by_addr(&self.heap, target_addr);
-                    if let Some(crate::memory::Object::Instance(gc_handle)) = lookup {
+                    if let Some(crate::memory::Object::Instance(mut gc)) =
+                        Self::find_object_by_addr(&self.heap, target_addr)
+                    {
                         let key = self.heap.intern(name);
                         let member = if let Some(obj) =
                             Self::find_object_by_addr(&self.heap, value.raw() as u64)
@@ -1531,15 +1578,25 @@ impl<const S: usize> Machine<S> {
                         } else {
                             crate::memory::Member::Value(value)
                         };
-                        // In-place mutation not yet implemented; allocates a fresh instance.
-                        self.alloc_counter += 1;
-                        let (new_obj, _) =
-                            self.heap.alloc(ObjInstance::default(), Object::Instance);
-                        if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                            Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
-                        }
-                        let _ = (gc_handle, new_obj, key, member);
+                        gc.as_mut().set(key, member);
                     }
+                    self.stack.push(value);
+                }
+                Instruction::StoreIndex => {
+                    let value = self.stack.pop();
+                    let index_val = self.stack.pop();
+                    let target_val = self.stack.pop();
+                    let target_addr = target_val.raw() as u64;
+                    let index = index_val.as_int();
+                    if let Some(crate::memory::Object::Array(mut gc)) =
+                        Self::find_object_by_addr(&self.heap, target_addr)
+                    {
+                        let arr = gc.as_mut();
+                        if index >= 0 && (index as usize) < arr.elements.len() {
+                            arr.elements[index as usize] = value;
+                        }
+                    }
+                    self.stack.push(value);
                 }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; jump target in value[31:0].
@@ -2648,6 +2705,63 @@ mod tests {
         ]);
         assert_eq!(vm.pop().as_int(), 200);
         assert_eq!(vm.pop().as_int(), 100);
+    }
+
+    #[test]
+    fn log_not_bool_and_int() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            Byte::new(Instruction::LogNot),
+            const_int(0),
+            Byte::new(Instruction::LogNot),
+            const_int(42),
+            Byte::new(Instruction::LogNot),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_bool(), false);
+        assert_eq!(vm.pop().as_bool(), true);
+        assert_eq!(vm.pop().as_bool(), false);
+    }
+
+    #[test]
+    fn inc_prefix_returns_new_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            store_pop(0),
+            Byte::new(Instruction::INC).with_inc_dec(0, true, false),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 6);
+        assert_eq!(vm.stack[0].as_int(), 6);
+    }
+
+    #[test]
+    fn inc_postfix_returns_old_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            store_pop(0),
+            Byte::new(Instruction::INC).with_inc_dec(0, false, false),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 5);
+        assert_eq!(vm.stack[0].as_int(), 6);
+    }
+
+    #[test]
+    fn dec_prefix_and_postfix() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(5),
+            store_pop(0),
+            Byte::new(Instruction::DEC).with_inc_dec(0, false, false),
+            Byte::new(Instruction::DEC).with_inc_dec(0, true, false),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 3);
+        assert_eq!(vm.stack[0].as_int(), 3);
     }
 
     /// Coroutine handle + saved stack survive an automatic GC cycle.
