@@ -190,6 +190,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.dload(expr.clone()),
                 self.declare(expr.clone()),
                 self.invoke_(expr.clone()),
+                self.resume_(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
@@ -481,22 +482,48 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("fn")
+        keyword!("async")
+            .or_not()
+            .then(keyword!("fn"))
             .then(text::ident().padded())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             .then(self.block(stmt))
-            .map_with(|((((_, name), args), returns), body), e| {
+            .map_with(|(((((is_coro, _), name), args), returns), body), e| {
                 (
                     e.span(),
                     Box::new(Expression::Function {
                         name,
+                        is_coro: is_coro.is_some(),
                         args,
                         returns,
                         body,
                     }),
                 )
             })
+    }
+
+    fn yield_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("yield")
+            .ignore_then(self.expr())
+            .map_with(output!(Yield))
+    }
+
+    fn resume_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("resume")
+            .ignore_then(expr)
+            .map_with(|target, e| (e.span(), Box::new(Expression::Resume(target, None))))
     }
 
     fn defer<
@@ -725,6 +752,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.expr_statement(),
                 self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
+                self.yield_().then_ignore(op!(';')),
                 self.comment(),
             ))
         })
@@ -2253,6 +2281,69 @@ mod tests {
             "expected parse to fail for dangling else, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn parse_async_fn_round_trips() {
+        let ast = decl_ast!("async fn coro() { yield 1; }");
+        match ast {
+            Expression::Function {
+                name,
+                is_coro,
+                ..
+            } => {
+                assert_eq!(name, "coro");
+                assert!(is_coro);
+            }
+            other => panic!("expected async Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_yield_statement() {
+        let src = "async fn coro() { yield 42; }";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        let (_span, expr) = result.expect("yield statement should parse");
+        match expr.as_ref() {
+            Expression::Function { body, .. } => match body.1.as_ref() {
+                Expression::Block(stmts) => match stmts[0].1.as_ref() {
+                    Expression::Statement(stmt) => match stmt.1.as_ref() {
+                        Expression::Yield(inner) => match inner.1.as_ref() {
+                            Expression::Expr(e) => match e.1.as_ref() {
+                                Expression::Integer(42) => {}
+                                other => panic!("expected yield 42, got {:?}", other),
+                            },
+                            Expression::Integer(42) => {}
+                            other => panic!("expected yield 42, got {:?}", other),
+                        },
+                        other => panic!("expected Yield in Statement, got {:?}", other),
+                    },
+                    other => panic!("expected Statement(Yield), got {:?}", other),
+                },
+                other => panic!("expected Block, got {:?}", other),
+            },
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_resume_expression() {
+        same!("resume h");
+        let parsed = expr_ast!("resume h");
+        let inner = match &parsed {
+            Expression::Expr(e) => e.1.as_ref(),
+            other => other,
+        };
+        match inner {
+            Expression::Resume(target, arg) => {
+                assert!(arg.is_none());
+                match target.1.as_ref() {
+                    Expression::Identifier(name) => assert_eq!(*name, "h"),
+                    other => panic!("expected identifier target, got {:?}", other),
+                }
+            }
+            other => panic!("expected Resume, got {:?}", other),
+        }
     }
 
     /// `extern "c" { fn puts(string s); }` parses to `ExternBlock`.

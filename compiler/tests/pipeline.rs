@@ -436,3 +436,21 @@ fn example_strlen_prints_5() {
     };
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
 }
+
+#[test]
+fn example_coro_prints_suspended_1_resumed() {
+    let output = run_example("examples/coro.0s");
+    assert_eq!(output, "Suspended\n1Resumed\n");
+}
+
+#[test]
+fn example_coro_gen_prints_012() {
+    let output = run_example("examples/coro_gen.0s");
+    assert_eq!(output, "012");
+}
+
+#[test]
+fn example_coro_interleave_prints_out_of_order_counters() {
+    let output = run_example("examples/coro_interleave.0s");
+    assert_eq!(output, "10,100,101,11,12,102");
+}

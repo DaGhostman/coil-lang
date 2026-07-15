@@ -101,6 +101,7 @@ pub enum Expression<'expr> {
 
     Function {
         name: &'expr str,
+        is_coro: bool,
         args: Output<'expr>,
         returns: Option<Output<'expr>>,
         body: Output<'expr>,
@@ -386,15 +387,21 @@ impl<'a> Display for Expression<'a> {
             }
             Self::Function {
                 name,
+                is_coro,
                 args,
                 returns,
                 body,
             } => {
+                let async_kw = if *is_coro { "async " } else { "" };
                 let ret_str = returns
                     .as_ref()
                     .map(|ret| format!(" -> {}", ret.1))
                     .unwrap_or_default();
-                write!(f, "fn {}({}){} {{\n{}}}", name, args.1, ret_str, body.1)
+                write!(
+                    f,
+                    "{}fn {}({}){} {{\n{}}}",
+                    async_kw, name, args.1, ret_str, body.1
+                )
             }
             Self::Defer(b) => write!(f, "defer {}", b.1),
             Self::Call { name, args } => {
@@ -539,6 +546,9 @@ impl<'a> Display for Expression<'a> {
             Self::Access(receiver, field) => {
                 write!(f, "{}.{}", receiver.1, field)
             }
+            Self::Yield(inner) => write!(f, "yield {}", inner.1),
+            Self::Resume(target, None) => write!(f, "resume {}", target.1),
+            Self::Resume(target, Some(arg)) => write!(f, "resume {}({})", target.1, arg.1),
             Self::Type(n) => write!(f, "{}", n),
             e => write!(f, "<unhandled: {:?}>", e),
         }

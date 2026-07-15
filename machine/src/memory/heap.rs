@@ -193,6 +193,9 @@ impl Heap {
             Object::Array(a) => {
                 a.release();
             }
+            Object::Coroutine(c) => {
+                c.release();
+            }
         }
     }
 
@@ -281,6 +284,16 @@ pub type RefString = Gc<ObjString>;
 pub type RefInstance = Gc<ObjInstance>;
 pub type RefEnum = Gc<ObjEnum>;
 pub type RefLibrary = Gc<ObjLibrary>;
+pub type RefCoroutine = Gc<ObjCoroutine>;
+
+/// Lifecycle of a heap-allocated coroutine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroState {
+    /// Created but never resumed, or suspended at a `yield`.
+    Suspended,
+    /// Body returned; further `resume` is a no-op (returns default).
+    Done,
+}
 
 /// An enumeration of all potential errors that occur when working with objects.
 #[derive(Debug)]
@@ -306,6 +319,7 @@ pub enum Object {
     Library(RefLibrary),
     Tuple(crate::memory::Gc<ObjTuple>),
     Array(crate::memory::Gc<ObjArray>),
+    Coroutine(RefCoroutine),
 }
 
 impl Object {
@@ -318,6 +332,7 @@ impl Object {
             Self::Library(l) => l.mark(),
             Self::Tuple(t) => t.mark(),
             Self::Array(a) => a.mark(),
+            Self::Coroutine(c) => c.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -333,6 +348,7 @@ impl Object {
             Self::Library(l) => l.unmark(),
             Self::Tuple(t) => t.unmark(),
             Self::Array(a) => a.unmark(),
+            Self::Coroutine(c) => c.unmark(),
         }
     }
 
@@ -346,6 +362,7 @@ impl Object {
             Self::Library(l) => l.is_marked(),
             Self::Tuple(t) => t.is_marked(),
             Self::Array(a) => a.is_marked(),
+            Self::Coroutine(c) => c.is_marked(),
         }
     }
 
@@ -368,9 +385,10 @@ impl Object {
                 }
             }
             Self::Library(_) => {}
-            // Tuple/array elements are traced in `Machine::gc_collect` for now.
+            // Tuple/array/coroutine saved stacks are traced in `Machine::gc_collect`.
             Self::Tuple(_) => {}
             Self::Array(_) => {}
+            Self::Coroutine(_) => {}
         }
     }
 
@@ -384,6 +402,7 @@ impl Object {
             Self::Library(l) => l.get_next(),
             Self::Tuple(t) => t.get_next(),
             Self::Array(a) => a.get_next(),
+            Self::Coroutine(c) => c.get_next(),
         }
     }
 
@@ -396,6 +415,7 @@ impl Object {
             Self::Library(l) => l.set_next(next),
             Self::Tuple(t) => t.set_next(next),
             Self::Array(a) => a.set_next(next),
+            Self::Coroutine(c) => c.set_next(next),
         }
     }
 
@@ -408,6 +428,7 @@ impl Object {
             Self::Library(l) => l.as_ptr() as u64,
             Self::Tuple(t) => t.as_ptr() as u64,
             Self::Array(a) => a.as_ptr() as u64,
+            Self::Coroutine(c) => c.as_ptr() as u64,
         }
     }
 }
@@ -421,6 +442,7 @@ impl GcSized for Object {
             Self::Library(l) => l.size(),
             Self::Tuple(t) => t.size(),
             Self::Array(a) => a.size(),
+            Self::Coroutine(c) => c.size(),
         }
     }
 }
@@ -434,6 +456,7 @@ impl fmt::Display for Object {
             Self::Library(_) => write!(f, "0x{:08x}", self.addr()),
             Self::Tuple(t) => write!(f, "{}", t.as_ref()),
             Self::Array(a) => write!(f, "{}", a.as_ref()),
+            Self::Coroutine(c) => write!(f, "{}", c.as_ref()),
         }
     }
 }
@@ -447,7 +470,8 @@ impl Object {
             | Self::Enum(_)
             | Self::Library(_)
             | Self::Tuple(_)
-            | Self::Array(_) => std::ptr::null(),
+            | Self::Array(_)
+            | Self::Coroutine(_) => std::ptr::null(),
         }
     }
 }
@@ -538,6 +562,16 @@ pub struct ObjArray {
     pub elements: Vec<Value>,
 }
 
+/// Suspended async function state: saved stack segment + call frames.
+pub struct ObjCoroutine {
+    pub state: CoroState,
+    pub resume_ip: usize,
+    /// Stack segment (args + locals + operands) relative to segment base 0.
+    pub saved_stack: Vec<Value>,
+    /// `(ip, sp_offset)` pairs; `sp_offset` is relative to the coroutine segment base.
+    pub saved_frames: Vec<(usize, usize)>,
+}
+
 impl GcSized for ObjTuple {
     fn size(&self) -> usize {
         mem::size_of::<Self>() + self.elements.capacity() * mem::size_of::<Value>()
@@ -547,6 +581,14 @@ impl GcSized for ObjTuple {
 impl GcSized for ObjArray {
     fn size(&self) -> usize {
         mem::size_of::<Self>() + self.elements.capacity() * mem::size_of::<Value>()
+    }
+}
+
+impl GcSized for ObjCoroutine {
+    fn size(&self) -> usize {
+        // `saved_stack` / `saved_frames` use Rust's allocator, not the VM
+        // heap byte counter (same contract as `ObjInstance`).
+        mem::size_of::<Self>()
     }
 }
 
@@ -575,6 +617,12 @@ impl fmt::Display for ObjArray {
                 .collect::<Vec<_>>()
                 .join(", ")
         )
+    }
+}
+
+impl fmt::Display for ObjCoroutine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<coroutine {:?}>", self.state)
     }
 }
 
@@ -745,6 +793,14 @@ impl<T> Gc<T> {
     #[must_use]
     pub const fn as_ptr(&self) -> *const GcData<T> {
         self.ptr.as_ptr()
+    }
+
+    /// Mutable access to the inner payload (single-threaded VM only).
+    pub fn payload_mut(&self) -> &mut T {
+        unsafe {
+            let ptr = self.ptr.as_ptr().cast::<GcData<T>>();
+            (*ptr).as_mut()
+        }
     }
 }
 

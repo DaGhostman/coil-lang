@@ -5,11 +5,8 @@ async fn coro() {
 }
 
 fn main() {
-    let x = coro();
-
-    x = resume x;
-
-    print "%u", x;
-
-    x;
+    let h = coro();
+    let x = resume h;
+    print "%i", x;
+    resume h;
 }

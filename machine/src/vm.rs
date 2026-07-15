@@ -14,7 +14,8 @@ use common::{
 };
 
 use crate::{
-    Frame, Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjString, ObjTuple, Object, Stack,
+    CoroState, Frame, Heap, Member, ObjArray, ObjCoroutine, ObjEnum, ObjInstance, ObjString,
+    ObjTuple, Object, RefCoroutine, Stack,
 };
 
 /// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
@@ -100,6 +101,13 @@ macro_rules! unary {
 
 type OutputSink = Box<dyn IoWrite>;
 
+/// Saved resumer context while a coroutine runs on the shared stack.
+struct ResumeCtx {
+    coro: RefCoroutine,
+    base_sp: usize,
+    frame_depth: usize,
+}
+
 pub struct Machine<const S: usize> {
     heap: Heap,
     stack: Stack<Value, 8192>,
@@ -109,6 +117,7 @@ pub struct Machine<const S: usize> {
     natives: crate::ffi::Natives,
     libraries: std::collections::HashMap<String, std::sync::Arc<crate::ffi::Library>>,
     userland_libraries: std::collections::HashMap<u64, std::sync::Arc<Object>>,
+    resume_stack: Vec<ResumeCtx>,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -124,6 +133,7 @@ impl<const S: usize> Default for Machine<S> {
             natives: crate::ffi::Natives::new(),
             libraries: std::collections::HashMap::new(),
             userland_libraries: std::collections::HashMap::new(),
+            resume_stack: Vec::new(),
         }
     }
 }
@@ -213,8 +223,41 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
-    fn gc_collect(heap: &mut Heap, stack: &Stack<Value, 8192>, alloc_counter: &mut usize) {
-        let roots: Vec<u64> = stack.as_slice().iter().map(|v| v.raw() as u64).collect();
+    fn gc_collect(
+        heap: &mut Heap,
+        stack: &Stack<Value, 8192>,
+        resume_stack: &[ResumeCtx],
+        alloc_counter: &mut usize,
+    ) {
+        let mut roots: Vec<u64> = stack
+            .buffer()
+            .iter()
+            .filter_map(|v| {
+                let addr = v.raw() as u64;
+                if addr != 0 && heap.contains_addr(addr as *mut u8) {
+                    Some(addr)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for ctx in resume_stack {
+            roots.push(ctx.coro.as_ptr() as u64);
+        }
+
+        // Conservatively root values held in suspended coroutine stacks.
+        for obj in heap.into_iter() {
+            if let Object::Coroutine(gc) = obj {
+                roots.push(gc.as_ptr() as u64);
+                for v in &gc.as_ref().saved_stack {
+                    let addr = v.raw() as u64;
+                    if addr != 0 && heap.contains_addr(addr as *mut u8) {
+                        roots.push(addr);
+                    }
+                }
+            }
+        }
 
         heap.trace(&roots);
 
@@ -321,7 +364,102 @@ impl<const S: usize> Machine<S> {
 
     /// Manually trigger GC (for tests).
     pub fn collect_garbage(&mut self) {
-        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+    }
+
+    fn with_coroutine_mut(&self, addr: u64, f: impl FnOnce(&mut ObjCoroutine)) {
+        let mut current = self.heap.head_for_lookup();
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let Object::Coroutine(gc) = reference {
+                    f(gc.payload_mut());
+                }
+                return;
+            }
+            current = reference.get_next();
+        }
+    }
+
+    fn after_return(&mut self, ip: &mut usize, sp: &mut usize) {
+        let caller = self.frames.get_mut();
+        *ip = caller.tell();
+        *sp = caller.get();
+        if let Some(ctx) = self.resume_stack.last() {
+            if self.frames.len() <= ctx.frame_depth {
+                self.with_coroutine_mut(ctx.coro.as_ptr() as u64, |coro| {
+                    coro.state = CoroState::Done;
+                    coro.saved_stack.clear();
+                    coro.saved_frames.clear();
+                });
+                self.resume_stack.pop();
+            }
+        }
+    }
+
+    fn resume_coroutine(&mut self, ip: &mut usize, sp: &mut usize, gc: RefCoroutine) {
+        let return_ip = *ip;
+        let coro = gc.as_ref();
+        let base_sp = self.stack.tell();
+
+        self.frames.get_mut().seek(return_ip);
+
+        self.resume_stack.push(ResumeCtx {
+            coro: gc,
+            base_sp,
+            frame_depth: self.frames.len(),
+        });
+
+        for v in &coro.saved_stack {
+            self.stack.push(*v);
+        }
+
+        for &(frame_ip, sp_off) in &coro.saved_frames {
+            self.frames.setup_current_and_advance(|f| {
+                f.seek(frame_ip);
+                f.set(base_sp + sp_off);
+            });
+        }
+
+        *ip = coro.resume_ip;
+        *sp = base_sp + coro.saved_frames.last().map_or(0, |(_, off)| *off);
+    }
+
+    fn yield_coroutine(&mut self, ip: &mut usize, sp: &mut usize, yield_val: Value) {
+        let Some(ctx) = self.resume_stack.last().map(|c| (c.coro, c.base_sp, c.frame_depth)) else {
+            self.stack.push(yield_val);
+            return;
+        };
+        let (coro_gc, base_sp, frame_depth) = ctx;
+
+        let segment = self.stack.as_slice()[base_sp..].to_vec();
+        let frame_depth_usize = frame_depth;
+        let current_depth = self.frames.len();
+        let mut saved_frames = Vec::new();
+        for idx in (frame_depth_usize + 1)..current_depth {
+            saved_frames.push((self.frames[idx].tell(), self.frames[idx].get() - base_sp));
+        }
+        if saved_frames.is_empty() {
+            saved_frames.push((*ip, *sp - base_sp));
+        } else {
+            saved_frames.last_mut().unwrap().0 = *ip;
+        }
+
+        self.with_coroutine_mut(coro_gc.as_ptr() as u64, |coro| {
+            coro.saved_stack = segment;
+            coro.saved_frames = saved_frames;
+            coro.resume_ip = *ip;
+            coro.state = CoroState::Suspended;
+        });
+
+        self.stack.seek(base_sp);
+        while self.frames.len() > frame_depth_usize {
+            self.frames.pop();
+        }
+
+        self.stack.push(yield_val);
+        let caller = self.frames.get_mut();
+        *ip = caller.tell();
+        *sp = caller.get();
     }
 
     /// Read-only access to the heap. Used by the GC integration
@@ -384,7 +522,7 @@ impl<const S: usize> Machine<S> {
 
             let bc = opcode.bytecode();
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::BinSlotSlot as u8);
+            promise!(*bc as u8 <= Instruction::YieldCoro as u8);
 
             match bc {
                 Instruction::POP => {
@@ -529,7 +667,7 @@ impl<const S: usize> Machine<S> {
 
                         self.alloc_counter += 1;
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                            Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                            Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                         }
 
                         self.stack.push(Value::from(obj.addr()));
@@ -575,7 +713,7 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                     }
 
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
@@ -585,9 +723,7 @@ impl<const S: usize> Machine<S> {
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
-                    let caller = self.frames.get_mut();
-                    ip = caller.tell();
-                    sp = caller.get();
+                    self.after_return(&mut ip, &mut sp);
                 }
                 // Fused `LOAD slot; CONST imm; <binop>`.
                 Instruction::BinSlotImm => {
@@ -635,18 +771,14 @@ impl<const S: usize> Machine<S> {
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
-                    let caller = self.frames.get_mut();
-                    ip = caller.tell();
-                    sp = caller.get();
+                    self.after_return(&mut ip, &mut sp);
                 }
                 Instruction::ConstReturnImm => {
                     let ret_val = Value::from(opcode.operand_u32() as i32 as i64 as u64);
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
-                    let caller = self.frames.get_mut();
-                    ip = caller.tell();
-                    sp = caller.get();
+                    self.after_return(&mut ip, &mut sp);
                 }
                 Instruction::BinReturn => {
                     match Instruction::from(opcode.bin_return_op()) {
@@ -676,9 +808,7 @@ impl<const S: usize> Machine<S> {
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
-                    let caller = self.frames.get_mut();
-                    ip = caller.tell();
-                    sp = caller.get();
+                    self.after_return(&mut ip, &mut sp);
                 }
                 Instruction::BinSlotSlot => {
                     let (op, a, b) = opcode.bin_slot_slot_parts();
@@ -946,7 +1076,7 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                     }
 
                     self.stack
@@ -987,7 +1117,7 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                     }
 
                     self.stack.push(Value::from(object.addr()));
@@ -1014,7 +1144,7 @@ impl<const S: usize> Machine<S> {
                         object.addr()
                     };
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                     }
                     self.stack.push(Value::from(addr));
                 }
@@ -1073,7 +1203,7 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                     }
                     self.stack.push(Value::from(object.addr()));
                 }
@@ -1116,7 +1246,7 @@ impl<const S: usize> Machine<S> {
                         let (new_obj, _) =
                             self.heap.alloc(ObjInstance::default(), Object::Instance);
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                            Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
+                            Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
                         }
                         let _ = (gc_handle, new_obj, key, member);
                     }
@@ -1242,6 +1372,57 @@ impl<const S: usize> Machine<S> {
                     self.stack[slot] = val;
                     if self.stack.tell() < slot + 1 {
                         self.stack.seek(slot + 1);
+                    }
+                }
+                Instruction::MakeCoro => {
+                    let (arity, target) = opcode.call_parts();
+                    let mut values: Vec<Value> = Vec::with_capacity(arity);
+                    for _ in 0..arity {
+                        if self.stack.tell() == 0 {
+                            break;
+                        }
+                        values.push(self.stack.pop());
+                    }
+                    values.reverse();
+
+                    let obj_coro = ObjCoroutine {
+                        state: CoroState::Suspended,
+                        resume_ip: target,
+                        saved_stack: values,
+                        saved_frames: vec![(target, 0)],
+                    };
+                    let (object, _) = self.heap.alloc(obj_coro, Object::Coroutine);
+
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                    }
+
+                    self.stack.push(Value::from(object.addr()));
+                }
+                Instruction::ResumeCoro => {
+                    if self.stack.tell() == 0 {
+                    } else {
+                        let handle = self.stack.pop();
+                        let addr = handle.raw() as u64;
+                        if let Some(Object::Coroutine(gc)) =
+                            Self::find_object_by_addr(&self.heap, addr)
+                        {
+                            if gc.as_ref().state == CoroState::Done {
+                                self.stack.push(Value::from(0_i64));
+                            } else {
+                                self.resume_coroutine(&mut ip, &mut sp, gc);
+                            }
+                        } else {
+                            self.stack.push(Value::from(0_i64));
+                        }
+                    }
+                }
+                Instruction::YieldCoro => {
+                    if self.stack.tell() == 0 {
+                    } else {
+                        let yield_val = self.stack.pop();
+                        self.yield_coroutine(&mut ip, &mut sp, yield_val);
                     }
                 }
                 _ => return,
@@ -1976,5 +2157,67 @@ mod tests {
             3,
             "HostInvoke should have invoked the Rust closure 3 times"
         );
+    }
+
+    fn make_coro(arity: u32, target: u32) -> Byte {
+        Byte::new(Instruction::MakeCoro).with_call_packed(arity, target)
+    }
+
+    /// Create → resume → yield returns the yielded value to the resumer.
+    #[test]
+    fn coroutine_resume_yields_value() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 3),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            // 3: coroutine body
+            const_int(42),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Resuming a completed coroutine pushes 0 (MVP done protocol).
+    #[test]
+    fn coroutine_resume_after_done_returns_zero() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 9),
+            store_pop(0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            const_int(7),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 0);
+        assert_eq!(vm.pop().as_int(), 7);
+    }
+
+    /// Coroutine handle + saved stack survive an automatic GC cycle.
+    #[test]
+    fn coroutine_handle_survives_gc() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            make_coro(0, 8),
+            store_pop(0),
+            make_enum(0, 0),
+            make_enum(1, 0),
+            make_enum(2, 0),
+            load(0),
+            Byte::new(Instruction::ResumeCoro),
+            Byte::new(Instruction::HALT),
+            const_int(99),
+            Byte::new(Instruction::YieldCoro),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 99);
     }
 }

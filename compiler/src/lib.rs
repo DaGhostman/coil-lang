@@ -369,6 +369,9 @@ pub struct Compiler {
     /// Wide immediates referenced from compact 8-byte `Byte`
     /// operands (floats, `JumpIfMatch` targets, etc.).
     constants: Vec<u64>,
+
+    /// Qualified names of `async fn` declarations (emit `MakeCoro` at call sites).
+    coroutine_fns: std::collections::HashSet<String>,
 }
 
 impl Default for Compiler {
@@ -402,6 +405,7 @@ impl Default for Compiler {
             emit_idx: 0,
             program_start_offset,
             constants: Vec::default(),
+            coroutine_fns: std::collections::HashSet::new(),
         }
     }
 }
@@ -904,6 +908,7 @@ impl Compiler {
             }
             Expression::Function {
                 name,
+                is_coro,
                 args,
                 returns: _returns,
                 body,
@@ -917,7 +922,10 @@ impl Compiler {
                     .entry(self.namespace.clone())
                     .or_default()
                     .push(name.to_string());
-                self.functions.insert(qualified, self.bytecode.len());
+                self.functions.insert(qualified.clone(), self.bytecode.len());
+                if *is_coro {
+                    self.coroutine_fns.insert(qualified);
+                }
 
                 let mut a = self.do_compile(args);
 
@@ -1233,6 +1241,14 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::RETURN));
                 }
             }
+            Expression::Yield(expr) => {
+                bytecode.append(&mut self.do_compile(expr));
+                bytecode.push(Byte::new(Instruction::YieldCoro));
+            }
+            Expression::Resume(target, _arg) => {
+                bytecode.append(&mut self.do_compile(target));
+                bytecode.push(Byte::new(Instruction::ResumeCoro));
+            }
             Expression::Class(name, state) => {
                 self.context.classes.insert(
                     name.to_string(),
@@ -1415,11 +1431,18 @@ impl Compiler {
                             .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                     }
 
-                    // Packed CALL: arity + target in one opcode.
-                    bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
-                        args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                        offset as u32,
-                    ));
+                    if self.coroutine_fns.contains(&n) {
+                        bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
+                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                            offset as u32,
+                        ));
+                    } else {
+                        // Packed CALL: arity + target in one opcode.
+                        bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
+                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                            offset as u32,
+                        ));
+                    }
                 } else {
                     let mut message =
                         Message::error("Unknown function".to_string(), span.into_range());
@@ -2717,6 +2740,44 @@ mod tests {
     fn integer_arithmetic_emits_bytecode() {
         let (bc, _pool) = compile_src("42;");
         assert!(!bc.is_empty());
+    }
+
+    #[test]
+    fn async_call_emits_make_coro_not_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "async fn coro() { yield 1; } fn main() { let h = coro(); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeCoro)),
+            "expected MakeCoro for async fn call"
+        );
+        assert!(
+            !bc.iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CALL)
+                    && b.call_parts().1 > 3
+            }),
+            "async fn call site should not use CALL"
+        );
+    }
+
+    #[test]
+    fn yield_and_resume_emit_coroutine_opcodes() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "async fn coro() { yield 1; } fn main() { let h = coro(); resume h; }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::YieldCoro)),
+            "expected YieldCoro in async body"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ResumeCoro)),
+            "expected ResumeCoro at call site"
+        );
     }
 
     /// Float arithmetic should pick `ADDF` (float) instead of `ADD`

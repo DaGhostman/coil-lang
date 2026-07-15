@@ -65,6 +65,13 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     pub fn as_slice(&self) -> &[T] {
         &self.stack[..self.cursor]
     }
+
+    /// Full backing storage (including slots below the cursor).
+    /// Used by the GC to root live locals that share the operand stack.
+    #[inline]
+    pub fn buffer(&self) -> &[T] {
+        &self.stack
+    }
 }
 
 impl<T: Default, const N: usize> Index<Range<usize>> for Stack<T, N> {

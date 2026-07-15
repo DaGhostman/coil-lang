@@ -83,10 +83,10 @@ fn patch_targets(byte: &mut Byte, fusion_sites: &[FusionSite], pool: &mut [u64])
                 *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
             }
         }
-        Instruction::CALL => {
+        Instruction::CALL | Instruction::MakeCoro => {
             let (arity, target) = byte.call_parts();
             let t = adjust_target(target, fusion_sites);
-            *byte = Byte::new(Instruction::CALL).with_call_packed(arity as u32, t as u32);
+            *byte = Byte::new(*byte.bytecode()).with_call_packed(arity as u32, t as u32);
         }
         Instruction::CmpJmpf => {
             let (op, target) = byte.cmp_jmpf_parts();

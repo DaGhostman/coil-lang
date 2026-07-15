@@ -120,6 +120,15 @@ pub enum Instruction {
     CmpJmpf,
     BinReturn,
     BinSlotSlot,
+
+    // Coroutines — append-only.
+    //
+    // MakeCoro:  [31:24] arity, [23:0] entry target (same layout as CALL)
+    // ResumeCoro: no operand; pops coroutine handle
+    // YieldCoro:  no operand; pops yield value
+    MakeCoro,
+    ResumeCoro,
+    YieldCoro,
 }
 
 impl From<u8> for Instruction {

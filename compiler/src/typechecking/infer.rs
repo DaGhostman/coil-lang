@@ -70,6 +70,15 @@ pub struct Checker {
 
     /// Match exhaustiveness checks deferred until substitution is closed.
     pending_exhaustive: Vec<PendingExhaustive>,
+
+    /// Names of `async fn` declarations (for codegen).
+    async_functions: std::collections::HashSet<String>,
+
+    /// Nesting depth inside `async fn` bodies (for `yield` validation).
+    async_depth: usize,
+
+    /// Yield value type for the enclosing `async fn`, if any.
+    current_yield_ty: Option<Ty>,
 }
 
 /// One pending exhaustiveness check, recorded at the match site and
@@ -160,6 +169,9 @@ impl Checker {
             enum_payloads: BTreeMap::new(),
             enum_arities: BTreeMap::new(),
             pending_exhaustive: Vec::new(),
+            async_functions: std::collections::HashSet::new(),
+            async_depth: 0,
+            current_yield_ty: None,
         }
     }
 
@@ -185,6 +197,9 @@ impl Checker {
         self.enum_payloads.clear();
         self.enum_arities.clear();
         self.pending_exhaustive.clear();
+        self.async_functions.clear();
+        self.async_depth = 0;
+        self.current_yield_ty = None;
 
         // Mint NodeIds for every AST node (pre-walk). The visit order
         // matches `infer`'s recursion, so the IDs line up.
@@ -408,6 +423,28 @@ impl Checker {
 
             // ---- Assignment ----
             Expression::Assignment(name, value) => {
+                // `x = resume x` overwrites the coroutine handle with the yield value.
+                if let (
+                    Expression::Identifier(var_name),
+                    Expression::Resume(target, None),
+                ) = (name.1.as_ref(), value.1.as_ref())
+                {
+                    if let Expression::Identifier(target_name) = target.1.as_ref() {
+                        if var_name == target_name {
+                            let val_ty = self.infer(value);
+                            if self.env.lookup(var_name).is_some() {
+                                self.env.insert_top(
+                                    var_name.to_string(),
+                                    Scheme::mono(val_ty.clone()),
+                                );
+                                self.codegen_var_types
+                                    .insert(var_name.to_string(), val_ty.clone());
+                            }
+                            return val_ty;
+                        }
+                    }
+                }
+
                 let val_ty = self.infer(value);
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
@@ -785,12 +822,32 @@ impl Checker {
                 let _ = self.infer(e);
                 unit_ty()
             }
-            Expression::Yield(e) => self.infer(e),
-            Expression::Resume(_, arg) => {
+            Expression::Yield(e) => {
+                if self.async_depth == 0 {
+                    return self.error_with_help(
+                        "yield outside async function".to_string(),
+                        range,
+                        Some("yield may only appear inside an async fn body".to_string()),
+                    );
+                }
+                let ty = self.infer(e);
+                if let Some(yield_ty) = self.current_yield_ty.clone() {
+                    self.unify(&yield_ty, &ty, &e.0.into_range(), "yield value");
+                }
+                unit_ty()
+            }
+            Expression::Resume(target, arg) => {
                 if let Some(a) = arg {
                     let _ = self.infer(a);
                 }
-                unit_ty()
+                let target_ty = self.infer(target);
+                let elem = Ty::Var(self.counter.fresh());
+                let coro_ty = Ty::App(
+                    Box::new(Ty::Con("coroutine".to_string())),
+                    vec![elem.clone()],
+                );
+                self.unify(&target_ty, &coro_ty, &range, "resume target");
+                apply_ty_prune(&self.subst, &elem)
             }
             Expression::List(elements) => self.infer_list(elements, range),
 
@@ -803,11 +860,20 @@ impl Checker {
             // ---- Function declarations ----
             Expression::Function {
                 name,
+                is_coro,
                 args,
                 returns,
                 body,
             } => {
-                self.infer_function(name, args, returns.as_ref(), body, &range, None);
+                self.infer_function(
+                    name,
+                    args,
+                    returns.as_ref(),
+                    body,
+                    &range,
+                    None,
+                    *is_coro,
+                );
                 unit_ty()
             }
             Expression::Implementation(_, owner, methods) => {
@@ -1374,6 +1440,7 @@ impl Checker {
             if let Expression::Method(vis, body) = method.1.as_ref() {
                 if let Expression::Function {
                     name,
+                    is_coro,
                     args,
                     returns,
                     body: func_body,
@@ -1386,6 +1453,7 @@ impl Checker {
                         func_body,
                         &method.0.into_range(),
                         Some(&owner_ty),
+                        *is_coro,
                     );
                     self.methods
                         .entry(owner.to_string())
@@ -1416,11 +1484,24 @@ impl Checker {
         body: &Output,
         range: &Range<usize>,
         self_ty: Option<&Ty>,
+        is_coro: bool,
     ) -> Ty {
         let arg_tys = self.parse_arg_list(args);
-        let ret_ty = match returns {
-            Some(r) => self.parse_type_name(r),
-            None => Ty::Var(self.counter.fresh()),
+        let (ret_ty, yield_slot) = if is_coro {
+            let yield_ty = Ty::Var(self.counter.fresh());
+            let coro = Ty::App(
+                Box::new(Ty::Con("coroutine".to_string())),
+                vec![yield_ty.clone()],
+            );
+            (coro, Some(yield_ty))
+        } else {
+            (
+                match returns {
+                    Some(r) => self.parse_type_name(r),
+                    None => Ty::Var(self.counter.fresh()),
+                },
+                None,
+            )
         };
 
         // Build the declared function type: arg1 -> ... -> argN -> ret,
@@ -1438,7 +1519,20 @@ impl Checker {
         // code. The body sees it too because the new frame we push
         // for the body is a child of the outer.
         let alpha = self.counter.fresh();
-        let prev_ret = self.current_return_ty.replace(ret_ty.clone());
+        let prev_ret = self.current_return_ty.replace(if is_coro {
+            unit_ty()
+        } else {
+            ret_ty.clone()
+        });
+        let prev_yield = self.current_yield_ty.take();
+        if let Some(yield_ty) = yield_slot {
+            self.current_yield_ty = Some(yield_ty);
+        }
+        let prev_async = self.async_depth;
+        if is_coro {
+            self.async_functions.insert(name.to_string());
+            self.async_depth += 1;
+        }
 
         self.env
             .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
@@ -1452,6 +1546,27 @@ impl Checker {
         }
         let _ = self.infer(body);
         self.env.pop();
+
+        if is_coro {
+            self.async_depth = prev_async;
+            if let Some(yield_ty) = self.current_yield_ty.take() {
+                let resolved_yield = apply_ty_prune(&self.subst, &yield_ty);
+                fun_ty = {
+                    let mut ft = Ty::App(
+                        Box::new(Ty::Con("coroutine".to_string())),
+                        vec![resolved_yield],
+                    );
+                    for (_, arg_ty) in arg_tys.iter().rev() {
+                        ft = Ty::Fun(Box::new(arg_ty.clone()), Box::new(ft));
+                    }
+                    if let Some(self_ty) = self_ty {
+                        ft = Ty::Fun(Box::new(self_ty.clone()), Box::new(ft));
+                    }
+                    ft
+                };
+            }
+        }
+        self.current_yield_ty = prev_yield;
 
         self.current_return_ty = prev_ret;
         self.unify(&Ty::Var(alpha), &fun_ty, range, "function type");
@@ -2794,6 +2909,11 @@ impl Checker {
     /// Variable type from codegen side-table.
     pub fn codegen_var_type(&self, name: &str) -> Option<&Ty> {
         self.codegen_var_types.get(name)
+    }
+
+    /// True if `name` was declared as `async fn`.
+    pub fn is_async_function(&self, name: &str) -> bool {
+        self.async_functions.contains(name)
     }
 
     /// Infer without updating the NodeId cache (codegen helper).
@@ -4983,5 +5103,44 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn async_fn_call_has_coroutine_type() {
+        let src = "async fn coro() { yield 1; } fn main() { let h = coro(); }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let ty = c.codegen_var_type("h").expect("h should be recorded");
+        match apply_ty_prune(&c.subst(), ty) {
+            Ty::App(con, args) => {
+                assert_eq!(con.as_ref(), &Ty::Con("coroutine".to_string()));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected coroutine<_>, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resume_expression_returns_yield_type() {
+        let (c, _) = check(
+            "async fn coro() { yield 1; } fn main() { let h = coro(); let x = resume h; }",
+        );
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let x_ty = c
+            .codegen_var_type("x")
+            .expect("x should be recorded in codegen_var_types");
+        assert_eq!(apply_ty_prune(c.subst(), x_ty), int());
+    }
+
+    #[test]
+    fn yield_outside_async_is_diagnostic() {
+        let (c, _) = check("fn main() { yield 1; }");
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("yield outside async")),
+            "expected yield-outside-async diagnostic, got {:?}",
+            c.messages()
+        );
     }
 }
