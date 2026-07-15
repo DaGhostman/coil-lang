@@ -65,6 +65,10 @@ else
     echo "poop not installed; skipping instruction-count benchmark"
 fi
 
+echo
+echo "== Release binary size =="
+ls -lh "$BIN"
+
 if command -v valgrind >/dev/null 2>&1; then
     echo
     echo "== callgrind on fib.0s =="

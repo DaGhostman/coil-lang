@@ -26,13 +26,11 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     pub fn pop(&mut self) -> T {
         promise!(self.cursor > 0);
         self.cursor -= 1;
-        promise!(self.cursor < N);
         self.stack[self.cursor]
     }
 
     #[inline]
     pub fn push(&mut self, value: T) {
-        promise!(self.cursor < self.stack.len());
         promise!(self.cursor < N);
         self.stack[self.cursor] = value;
         self.cursor += 1;
@@ -41,21 +39,18 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
     #[inline]
     pub fn peek(&self) -> &T {
         promise!(self.cursor > 0);
-        promise!(self.cursor < N);
         &self.stack[self.cursor - 1]
     }
 
     #[inline]
     pub fn seek(&mut self, idx: usize) {
-        promise!(self.cursor < N);
+        promise!(idx <= N);
         self.cursor = idx;
     }
 
     #[inline]
     pub fn top(&mut self) -> &mut T {
         promise!(self.cursor > 0);
-        promise!(self.cursor < N);
-
         &mut self.stack[self.cursor - 1]
     }
 
@@ -66,7 +61,6 @@ impl<T: Default + Copy, const N: usize> Stack<T, N> {
 
     #[inline]
     pub fn as_slice(&self) -> &[T] {
-        promise!(self.cursor < N);
         &self.stack[..self.cursor]
     }
 }
@@ -99,7 +93,6 @@ impl<T: Default + Copy, const N: usize> Index<usize> for Stack<T, N> {
 
 impl<T: Default + Copy, const N: usize> IndexMut<usize> for Stack<T, N> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        promise!(index < self.stack.len());
         promise!(index < N);
         &mut self.stack[index]
     }

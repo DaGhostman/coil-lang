@@ -3,10 +3,13 @@ name = "machine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+vm_profile = []
+
 [dependencies]
 common = { path = "../common" }
 rkyv = "0.8.12"
-rustc-hash = { version = "2.1.1", features = ["std", "rand"] }
 libloading = "0.8"
 libffi = "4.0.0"
 libc = "0.2"

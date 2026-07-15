@@ -1,18 +1,34 @@
 use std::io::Read;
 
-use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, Byte};
+use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte};
 use compiler::Pipeline;
 use machine::Machine;
 use rkyv::rancor::Error;
+
+fn compile_to_archive(filename: &str, output: &str) {
+    let src =
+        std::fs::read_to_string(filename).expect("Unable to read source file for compilation");
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(&src)
+        .expect("Compilation failed (parse or type errors)");
+
+    let program = ArchivedProgram {
+        version: ARCHIVE_VERSION,
+        constants,
+        bytecode,
+    };
+
+    let bytes = rkyv::to_bytes::<Error>(&program).expect("Unable to serialize bytecode archive");
+    std::fs::write(output, bytes.as_slice()).expect("Unable to write compiled output to file");
+}
 
 fn main() {
     let argc = std::env::args().collect::<Vec<_>>();
     let filename = argc[1].clone();
 
     if !std::fs::exists("out.c0s").expect("Unable to determine if file exists") {
-        let pipeline = Pipeline::new();
-
-        pipeline.compile(filename, "out.c0s".to_string());
+        compile_to_archive(&filename, "out.c0s");
     }
 
     let mut f = std::fs::File::open("out.c0s").expect("Unable to find file");
@@ -35,5 +51,5 @@ fn main() {
     let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
         .expect("Unable to deserialize constant pool");
 
-    Machine::<64>::default().run_raw(&bytecode, &constants);
+    Machine::<256>::default().run_raw(&bytecode, &constants);
 }

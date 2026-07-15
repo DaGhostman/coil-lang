@@ -3,6 +3,9 @@ use std::{
     io::{self, Write as IoWrite},
 };
 
+#[cfg(any(test, feature = "vm_profile"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use common::{
     ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte, Value,
     promise, unlikely,
@@ -24,6 +27,35 @@ use crate::{
 /// collection, while large programs amortise the trace cost over
 /// many allocations.
 const GC_TRIGGER_INTERVAL: usize = 64;
+
+// Retired VM dispatch count (test / `vm_profile` feature only).
+// Thread-local so parallel `#[test]` runs do not share state.
+#[cfg(any(test, feature = "vm_profile"))]
+thread_local! {
+    static VM_DISPATCH_COUNT: AtomicU64 = const { AtomicU64::new(0) };
+}
+
+/// Reset the VM dispatch counter.
+#[cfg(any(test, feature = "vm_profile"))]
+pub fn reset_dispatch_count() {
+    VM_DISPATCH_COUNT.with(|c| c.store(0, Ordering::Relaxed));
+}
+
+/// Read the VM dispatch counter.
+#[cfg(any(test, feature = "vm_profile"))]
+#[must_use]
+pub fn dispatch_count() -> u64 {
+    VM_DISPATCH_COUNT.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+#[must_use]
+pub fn dispatch_count() -> u64 {
+    0
+}
+
+#[cfg(not(any(test, feature = "vm_profile")))]
+pub fn reset_dispatch_count() {}
 
 macro_rules! binary {
     ($stack: expr, $op:tt, $from: ident, $to: ident) => {
@@ -516,6 +548,9 @@ impl<const S: usize> Machine<S> {
         let mut sp = self.frames.get_mut().get();
 
         while ip < code.len() {
+            #[cfg(any(test, feature = "vm_profile"))]
+            VM_DISPATCH_COUNT.with(|c| c.fetch_add(1, Ordering::Relaxed));
+
             let opcode = &code[ip];
             ip += 1;
 
@@ -534,7 +569,7 @@ impl<const S: usize> Machine<S> {
 
             let bc = opcode.bytecode();
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::HostInvoke as u8);
+            promise!(*bc as u8 <= Instruction::SubCallSlotImm as u8);
 
             match bc {
                 Instruction::POP => {
@@ -755,9 +790,8 @@ impl<const S: usize> Machine<S> {
                     let return_ip = ip + if target == 0 { 1 } else { 0 };
                     let callee_sp = self.stack.tell() - arity;
                     self.frames.get_mut().seek(return_ip);
-                    self.frames.current_mut().enter();
-                    self.frames.current_mut().set(callee_sp);
-                    self.frames.consume();
+                    self.frames
+                        .setup_current_and_advance(|frame| frame.set(callee_sp));
                     sp = callee_sp;
                     if target != 0 {
                         ip = target;
@@ -778,12 +812,30 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
-                    let frame_left = self.frames.pop();
-                    self.stack.seek(frame_left.get());
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
                     self.stack.push(ret_val);
                     let caller = self.frames.get_mut();
                     ip = caller.tell();
                     sp = caller.get();
+                }
+                Instruction::JmpfLeqSlotImm => {
+                    let (slot, imm, target) = opcode.jmpf_leq_slot_imm_parts();
+                    let lhs = self.stack[sp + slot].as_int();
+                    if lhs > imm as i64 {
+                        ip = target;
+                    }
+                }
+                Instruction::SubCallSlotImm => {
+                    let (slot, imm, target) = opcode.sub_call_slot_imm_parts();
+                    let val = self.stack[sp + slot].as_int() - imm as i64;
+                    self.stack.push(Value::from(val));
+                    let callee_sp = self.stack.tell() - 1;
+                    self.frames.get_mut().seek(ip);
+                    self.frames
+                        .setup_current_and_advance(|frame| frame.set(callee_sp));
+                    sp = callee_sp;
+                    ip = target;
                 }
                 // FFI / native dispatch. Pops `native.arity()`
                 // values from the operand stack (in source order:
@@ -801,6 +853,7 @@ impl<const S: usize> Machine<S> {
                 // layout. (A name-table indirection would shrink
                 // the bytecode but is deferred until needed.)
                 Instruction::NATIVE => {
+                    #[cfg(debug_assertions)]
                     eprintln!("FFI: deprecated NATIVE opcode — recompile from source");
                 }
                 // FFI library load (userland `load(path)`).
@@ -847,8 +900,13 @@ impl<const S: usize> Machine<S> {
                                 .insert(addr, std::sync::Arc::new(object));
                             self.stack.push(Value::from(addr as *mut u8));
                         }
+                        #[cfg(debug_assertions)]
                         Err(e) => {
                             eprintln!("FFI: failed to load library `{}`: {}", path, e);
+                            self.stack.push(Value::from(0u64));
+                        }
+                        #[cfg(not(debug_assertions))]
+                        Err(_) => {
                             self.stack.push(Value::from(0u64));
                         }
                     }
@@ -924,6 +982,7 @@ impl<const S: usize> Machine<S> {
                                 let registered = &lib_ref.signatures[function_id];
                                 let ffi_sig = registered.ffi_signature();
                                 if args.len() != ffi_sig.arity() {
+                                    #[cfg(debug_assertions)]
                                     eprintln!(
                                         "FFI: arity mismatch at invoke (expected {}, got {})",
                                         ffi_sig.arity(),
@@ -942,6 +1001,7 @@ impl<const S: usize> Machine<S> {
                                     )
                                 }
                             } else {
+                                #[cfg(debug_assertions)]
                                 eprintln!(
                                     "FFI: function_id={} out of range (library has {} signatures)",
                                     function_id,
@@ -953,6 +1013,7 @@ impl<const S: usize> Machine<S> {
                             }
                         }
                         None => {
+                            #[cfg(debug_assertions)]
                             eprintln!(
                                 "FFI: FfiInvoke on a non-library value (function_id={})",
                                 function_id
@@ -965,7 +1026,10 @@ impl<const S: usize> Machine<S> {
                     match invoke_result {
                         Ok(Some(v)) => self.stack.push(v),
                         Ok(None) => {}
+                        #[cfg(debug_assertions)]
                         Err(e) => eprintln!("FFI invoke failed: {e}"),
+                        #[cfg(not(debug_assertions))]
+                        Err(_) => {}
                     }
                 }
                 // FFI signature declaration (userland
@@ -1062,13 +1126,15 @@ impl<const S: usize> Machine<S> {
                                         .insert(lib_addr, std::sync::Arc::new(owned));
                                     Some(id)
                                 }
-                                Err(e) => {
-                                    eprintln!("FFI declare: {}", e);
+                                Err(_e) => {
+                                    #[cfg(debug_assertions)]
+                                    eprintln!("FFI declare: {}", _e);
                                     None
                                 }
                             }
                         }
                         None => {
+                            #[cfg(debug_assertions)]
                             eprintln!("FFI declare: library at 0x{:x} is not loaded", lib_addr);
                             None
                         }
@@ -1099,9 +1165,15 @@ impl<const S: usize> Machine<S> {
                         Some(native) => match native.invoke(&mut self.heap, &args) {
                             Ok(Some(v)) => self.stack.push(v),
                             Ok(None) => {}
+                            #[cfg(debug_assertions)]
                             Err(e) => eprintln!("HostInvoke failed for `{}`: {e}", native.name()),
+                            #[cfg(not(debug_assertions))]
+                            Err(_) => {}
                         },
+                        #[cfg(debug_assertions)]
                         None => eprintln!("HostInvoke: unknown native id {fn_id}"),
+                        #[cfg(not(debug_assertions))]
+                        None => {}
                     }
                 }
                 Instruction::HALT => {
@@ -1740,6 +1812,7 @@ impl<const S: usize> Machine<S> {
 mod tests {
     use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction};
 
+    use super::{dispatch_count, reset_dispatch_count};
     use crate::{Machine, ObjEnum};
 
     /// Build a `MAKE_ENUM` byte with the given tag and arity
@@ -1784,6 +1857,61 @@ mod tests {
     /// written by `STORE_POP` is read back correctly.
     fn load(slot: u32) -> Byte {
         Byte::new(Instruction::LOAD).with_operand_u32(slot)
+    }
+
+    /// Fused fib body for dispatch-count regression tests.
+    fn fused_fib_bytecode(n: i64) -> Vec<Byte> {
+        vec![
+            Byte::new(Instruction::CONST).with_const_inline(n as i32),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::JmpfLeqSlotImm).with_jmpf_leq_slot_imm(0, 2, 4),
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::SubCallSlotImm).with_sub_call_slot_imm(0, 1, 3),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::SubCallSlotImm).with_sub_call_slot_imm(0, 2, 3),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ]
+    }
+
+    #[test]
+    fn fused_fib_reduces_dispatch_count_for_n13() {
+        reset_dispatch_count();
+        let unfused = [
+            Byte::new(Instruction::CONST).with_const_inline(13),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_const_inline(2),
+            Byte::new(Instruction::LEQ),
+            Byte::new(Instruction::JMPF).with_operand_u32(7),
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::SUB),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_const_inline(2),
+            Byte::new(Instruction::SUB),
+            Byte::new(Instruction::CALL).with_call_packed(1, 3),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ];
+        reset_dispatch_count();
+        Machine::<512>::default().run(&unfused);
+        let unfused_ops = dispatch_count();
+
+        reset_dispatch_count();
+        Machine::<512>::default().run(&fused_fib_bytecode(13));
+        let fused_ops = dispatch_count();
+
+        assert!(
+            fused_ops < unfused_ops,
+            "fused fib should dispatch fewer opcodes (fused={fused_ops}, unfused={unfused_ops})"
+        );
     }
 
     /// Build a `CONST` byte that pushes the given `i64` value

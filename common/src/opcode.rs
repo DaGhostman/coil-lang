@@ -82,11 +82,9 @@ pub enum Instruction {
     //   `ObjEnum::payload.len()` but kept for symmetry with the
     //   spec; the VM reads it from the enum at runtime).
     //
-    // JumpIfMatch layout (Phase 18C: 32-bit target):
+    // JumpIfMatch layout (Phase 18C: 32-bit target via constant pool):
     //   operands[31:16] = expected tag (16 bits)
-    //   operands[15:0]  = reserved (write 0)
-    //   value[31:0]     = absolute bytecode target offset (32 bits)
-    //   value[63:32]    = reserved (write 0)
+    //   operands[15:0]  = pool index for the 32-bit absolute bytecode target
     //
     // LoadField layout (Phase 18D):
     //   operands[15:0]  = field_index (declaration position in the record payload)
@@ -244,6 +242,20 @@ pub enum Instruction {
     // Pops tuple then fn_id, dispatches to the host native
     // registry entry registered via `Machine::register_fn`.
     HostInvoke,
+
+    // ---- Phase VM perf: fused superinstructions (APPENDED) ----
+    //
+    // `JmpfLeqSlotImm` — fuses `LOAD slot; CONST imm; LEQ; JMPF target`.
+    //   operands[31:24] = slot index (relative to frame.sp)
+    //   operands[23:16] = immediate (8-bit unsigned compare rhs)
+    //   operands[15:0]  = jump target when `stack[sp+slot] > imm`
+    //
+    // `SubCallSlotImm` — fuses `LOAD slot; CONST imm; SUB; CALL 1,target`.
+    //   operands[31:24] = slot index
+    //   operands[23:16] = subtract immediate (8-bit unsigned)
+    //   operands[15:0]  = call target (16-bit; arity is fixed at 1)
+    JmpfLeqSlotImm,
+    SubCallSlotImm,
 }
 
 impl From<u8> for Instruction {
@@ -380,6 +392,35 @@ impl Byte {
     pub fn jump_if_match_target(&self, pool: &[u64]) -> usize {
         pool[(self.operands & 0xFFFF) as usize] as usize
     }
+
+    /// Pack `JmpfLeqSlotImm`: slot in [31:24], imm in [23:16], target in [15:0].
+    pub fn with_jmpf_leq_slot_imm(mut self, slot: u8, imm: u8, target: u16) -> Self {
+        debug_assert!(self.bytecode as u8 == Instruction::JmpfLeqSlotImm as u8);
+        self.operands =
+            ((slot as u32) << 24) | ((imm as u32) << 16) | (target as u32);
+        self
+    }
+
+    pub fn jmpf_leq_slot_imm_parts(&self) -> (usize, u8, usize) {
+        let op = self.operands;
+        (
+            ((op >> 24) & 0xFF) as usize,
+            ((op >> 16) & 0xFF) as u8,
+            (op & 0xFFFF) as usize,
+        )
+    }
+
+    /// Pack `SubCallSlotImm`: slot in [31:24], imm in [23:16], target in [15:0].
+    pub fn with_sub_call_slot_imm(mut self, slot: u8, imm: u8, target: u16) -> Self {
+        debug_assert!(self.bytecode as u8 == Instruction::SubCallSlotImm as u8);
+        self.operands =
+            ((slot as u32) << 24) | ((imm as u32) << 16) | (target as u32);
+        self
+    }
+
+    pub fn sub_call_slot_imm_parts(&self) -> (usize, u8, usize) {
+        self.jmpf_leq_slot_imm_parts()
+    }
 }
 
 impl ArchivedByte {
@@ -470,6 +511,30 @@ impl ArchivedByte {
     pub fn jump_if_match_target(&self, pool: &[u64]) -> usize {
         let op: u32 = self.operands.into();
         pool[(op & 0xFFFF) as usize] as usize
+    }
+
+    pub fn jmpf_leq_slot_imm_parts(&self) -> (usize, u8, usize) {
+        let op: u32 = self.operands.into();
+        (
+            ((op >> 24) & 0xFF) as usize,
+            ((op >> 16) & 0xFF) as u8,
+            (op & 0xFFFF) as usize,
+        )
+    }
+
+    pub fn sub_call_slot_imm_parts(&self) -> (usize, u8, usize) {
+        self.jmpf_leq_slot_imm_parts()
+    }
+
+    pub fn with_jmpf_leq_slot_imm(mut self, slot: u8, imm: u8, target: u16) -> Self {
+        let packed =
+            ((slot as u32) << 24) | ((imm as u32) << 16) | (target as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn with_sub_call_slot_imm(self, slot: u8, imm: u8, target: u16) -> Self {
+        self.with_jmpf_leq_slot_imm(slot, imm, target)
     }
 }
 

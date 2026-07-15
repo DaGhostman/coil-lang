@@ -5,7 +5,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///
 /// v4: 8-byte `Byte` (dropped `value` field); wide immediates
 /// live in the constant pool. Recompile from source.
-pub const ARCHIVE_VERSION: u32 = 4;
+/// v5: fused opcodes `JmpfLeqSlotImm` and `SubCallSlotImm`.
+pub const ARCHIVE_VERSION: u32 = 5;
 
 /// Versioned wrapper for serialized bytecode. Replaces the
 /// pre-18C `ArchivedVec<ArchivedByte>` format.

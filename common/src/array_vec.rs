@@ -71,8 +71,17 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
 
     #[inline]
     pub fn consume(&mut self) {
-        promise!(self.current < N || self.current - N < self.expansion.len() + N);
         self.current += 1;
+    }
+
+    /// Set up the active frame slot and advance to the next.
+    #[inline]
+    pub fn setup_current_and_advance<F>(&mut self, setup: F)
+    where
+        F: FnOnce(&mut T),
+    {
+        setup(self.current_mut());
+        self.consume();
     }
 
     #[inline]

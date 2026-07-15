@@ -445,6 +445,7 @@ impl Pipeline {
         // practice O(N) for tree-shaped dependency
         // graphs.
         let mut already_scanned: Vec<PathBuf> = Vec::new();
+        #[cfg(debug_assertions)]
         let mut depth = 0usize;
         let mut prev_len = self.worklist.len();
         loop {
@@ -457,15 +458,24 @@ impl Pipeline {
                 // Re-enqueue at the back so the compile
                 // pass finds it. But don't re-scan.
                 self.worklist.push_back(item);
+                if self
+                    .worklist
+                    .iter()
+                    .all(|w| already_scanned.contains(&w.file))
+                {
+                    break;
+                }
                 continue;
             }
             #[cfg(debug_assertions)]
-            eprintln!(
-                "[pipeline]   scanning {} (depth {})",
-                file.display(),
-                depth
-            );
-            depth += 1;
+            {
+                eprintln!(
+                    "[pipeline]   scanning {} (depth {})",
+                    file.display(),
+                    depth
+                );
+                depth += 1;
+            }
             already_scanned.push(file.clone());
             // Re-enqueue at the back so the compile pass
             // can find it. The compile pass drains the

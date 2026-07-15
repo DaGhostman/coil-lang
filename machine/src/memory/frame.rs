@@ -1,14 +1,3 @@
-#[repr(u8)]
-#[derive(Default, Copy, Clone)]
-pub enum FrameState {
-    #[default]
-    PENDING,
-    SUSPENDED,
-    STARTED,
-    COMPLETE,
-    TERMINATED,
-}
-
 impl From<(usize, usize)> for Frame {
     fn from(value: (usize, usize)) -> Self {
         Self {
