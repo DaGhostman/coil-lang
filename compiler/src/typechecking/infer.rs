@@ -327,31 +327,6 @@ impl Checker {
         )
     }
 
-    #[allow(dead_code)]
-    fn split_coroutine(&self, ty: &Ty) -> Option<(Ty, Ty)> {
-        match apply_ty_prune(&self.subst, ty) {
-            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == "coroutine") => {
-                match args.len() {
-                    1 => Some((args[0].clone(), unit_ty())),
-                    2 => Some((args[0].clone(), args[1].clone())),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn format_coroutine_ty(&self, yield_ty: &Ty, send_ty: &Ty) -> String {
-        let y = apply_ty_prune(&self.subst, yield_ty).to_string();
-        let s = apply_ty_prune(&self.subst, send_ty);
-        if s == unit_ty() {
-            format!("coroutine<{y}>")
-        } else {
-            format!("coroutine<{y}, {s}>")
-        }
-    }
-
     fn infer(&mut self, expr: &Output) -> Ty {
         // Pull the next ID from the pre-walk's minting order. Both
         // `infer` and the pre-walk visit in pre-order, so the `n`-th
