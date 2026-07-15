@@ -39,6 +39,11 @@ pub enum FfiError {
     Libffi(String),
     ArityMismatch { expected: usize, got: usize },
     SymbolNotFound { name: String },
+    LibraryNotFound {
+        name: String,
+        tried: Vec<String>,
+        detail: String,
+    },
     Unsupported(String),
 }
 
@@ -56,6 +61,13 @@ impl std::fmt::Display for FfiError {
                 write!(f, "FFI arity mismatch: expected {expected} args, got {got}")
             }
             Self::SymbolNotFound { name } => write!(f, "FFI symbol `{name}` not found in library"),
+            Self::LibraryNotFound { name, tried, .. } => {
+                write!(
+                    f,
+                    "FFI library `{name}` not found (tried: {})",
+                    tried.join(", ")
+                )
+            }
             Self::Unsupported(msg) => write!(f, "unsupported FFI signature: {msg}"),
         }
     }
@@ -92,7 +104,7 @@ impl FfiSignatureBuilder {
             return Err(FfiError::EmptyName);
         }
         for (index, ty) in self.args.iter().enumerate() {
-            if *ty == FfiType::Void {
+            if ty.is_void() {
                 return Err(FfiError::VoidArgument { index });
             }
         }

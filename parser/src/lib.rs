@@ -794,6 +794,7 @@ impl<'pratt> Pratt<'pratt> {
             self.mod_(),
             self.enum_decl(),
             self.defer(stmt.clone()),
+            self.extern_struct(),
             self.extern_block(),
             stmt.clone(),
         ))
@@ -937,6 +938,38 @@ impl<'pratt> Pratt<'pratt> {
             .labelled("mod declaration")
     }
 
+    /// `extern struct Name { field: type, ... };` — C-layout FFI struct.
+    fn extern_struct(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        use crate::ast::ExternStructDecl;
+        let field = text::ident()
+            .padded()
+            .then_ignore(op!(":"))
+            .then(self.type_annotation())
+            .map_with(|(name, ty), _e| (name.to_string(), ty));
+
+        keyword!("extern")
+            .ignore_then(keyword!("struct"))
+            .ignore_then(text::ident().padded())
+            .then(
+                field
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .then_ignore(op!(";"))
+            .map_with(|(name, fields), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::ExternStruct(ExternStructDecl { name, fields })),
+                )
+            })
+            .labelled("extern struct declaration")
+    }
+
     /// `extern "libname" { fn name(args) -> ret; ... }` — declare
     /// external (FFI) functions from a shared library.
     ///
@@ -960,7 +993,7 @@ impl<'pratt> Pratt<'pratt> {
         let extern_function_decl = keyword!("fn")
             .then(text::ident().padded())
             .then(self.arg_list())
-            .then(op!("->").ignore_then(text::ident().padded()).or_not())
+            .then(op!("->").ignore_then(self.type_annotation()).or_not())
             // The trailing `;` is required (no body).
             .then_ignore(op!(";"))
             .map_with(|(((_, name), args), returns), _e| ExternFunction {
@@ -2490,7 +2523,11 @@ mod tests {
                 assert_eq!(declarations[0].name, "puts");
                 assert!(declarations[0].returns.is_none());
                 assert_eq!(declarations[1].name, "strlen");
-                assert_eq!(declarations[1].returns, Some("int"));
+                assert!(declarations[1].returns.is_some());
+                assert!(matches!(
+                    declarations[1].returns.as_ref().unwrap().1.as_ref(),
+                    Expression::Type("int")
+                ));
             }
             other => panic!("expected ExternBlock, got {:?}", other),
         }

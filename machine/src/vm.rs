@@ -1,8 +1,10 @@
 //! Bytecode interpreter: dispatch loop, automatic GC, and FFI.
 
 use std::{
+    ffi::c_void,
     fmt::Write as FmtWrite,
     io::{self, Write as IoWrite},
+    path::PathBuf,
 };
 
 #[cfg(any(test, feature = "vm_profile"))]
@@ -14,8 +16,8 @@ use common::{
 };
 
 use crate::{
-    CoroState, Frame, Heap, Member, ObjArray, ObjCoroutine, ObjEnum, ObjInstance, ObjString,
-    ObjTuple, Object, RefCoroutine, Stack,
+    CoroState, CStructLayout, Frame, Heap, Member, ObjArray, ObjCoroutine, ObjEnum, ObjInstance,
+    ObjString, ObjTuple, Object, RefCoroutine, Stack,
 };
 
 /// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
@@ -109,6 +111,15 @@ struct ResumeCtx {
     frame_depth: usize,
 }
 
+/// Deferred `FfiInvoke` so libffi (and callbacks) run outside `execute`'s borrow.
+struct PendingFfiInvoke {
+    lib_addr: u64,
+    function_id: usize,
+    args: Vec<Value>,
+    resume_ip: usize,
+    resume_sp: usize,
+}
+
 pub struct Machine<const S: usize> {
     heap: Heap,
     stack: Stack<Value, 8192>,
@@ -119,6 +130,22 @@ pub struct Machine<const S: usize> {
     libraries: std::collections::HashMap<String, std::sync::Arc<crate::ffi::Library>>,
     userland_libraries: std::collections::HashMap<u64, std::sync::Arc<Object>>,
     resume_stack: Vec<ResumeCtx>,
+    /// Directory of the entry script (for relative `dload` paths).
+    base_dir: Option<PathBuf>,
+    /// Extra search paths from `zero.toml` `[ffi]`.
+    ffi_search_paths: Vec<PathBuf>,
+    /// Registered C struct layouts for pass-by-value FFI.
+    struct_layouts: Vec<CStructLayout>,
+    /// Keeps libffi callback trampolines alive (ties lifetime to VM run).
+    ffi_closures: Vec<crate::ffi::OwnedClosure>,
+    /// Bytecode/constants for nested `call_function` / callbacks.
+    program_code: Vec<RawByte>,
+    program_constants: Vec<u64>,
+    /// When > 0, `RETURN` captures into `nested_return` instead of unwinding to caller.
+    nested_depth: u32,
+    nested_return: Option<Value>,
+    /// Set when `execute` pauses before a native FFI call that may reenter the VM.
+    pending_ffi: Option<PendingFfiInvoke>,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -135,11 +162,41 @@ impl<const S: usize> Default for Machine<S> {
             libraries: std::collections::HashMap::new(),
             userland_libraries: std::collections::HashMap::new(),
             resume_stack: Vec::new(),
+            base_dir: None,
+            ffi_search_paths: Vec::new(),
+            struct_layouts: Vec::new(),
+            ffi_closures: Vec::new(),
+            program_code: Vec::new(),
+            program_constants: Vec::new(),
+            nested_depth: 0,
+            nested_return: None,
+            pending_ffi: None,
         }
     }
 }
 
 impl<const S: usize> Machine<S> {
+    pub fn set_ffi_paths(&mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) {
+        self.base_dir = base_dir;
+        self.ffi_search_paths = search_paths;
+    }
+
+    pub fn with_ffi_paths(
+        mut self,
+        base_dir: Option<PathBuf>,
+        search_paths: Vec<PathBuf>,
+    ) -> Self {
+        self.base_dir = base_dir;
+        self.ffi_search_paths = search_paths;
+        self
+    }
+
+    pub fn register_struct_layout(&mut self, layout: CStructLayout) -> u32 {
+        let id = self.struct_layouts.len() as u32;
+        self.struct_layouts.push(layout);
+        id
+    }
+
     // pub fn register(&mut self, name: usize, func: External) {
     //     self.native.insert(name, func);
     // }
@@ -164,27 +221,29 @@ impl<const S: usize> Machine<S> {
             .unwrap_or_default()
     }
 
-    fn ffi_type_tag_from_value(heap: &Heap, v: &Value) -> u32 {
-        // Small integers are immediate FFI type tags; larger values are heap enums.
-        let addr = v.raw() as u64;
-        if addr <= 3 {
-            return addr as u32;
+    fn ffi_type_from_value(v: &Value, heap: &Heap) -> crate::memory::FfiType {
+        let (tag, aux) = Self::decode_ffi_type_tag(v, heap);
+        crate::memory::FfiType::from_tag(tag, aux)
+    }
+
+    fn decode_ffi_type_tag(v: &Value, heap: &Heap) -> (u32, u32) {
+        let raw = v.raw() as u64;
+        if raw <= common::tag::STRUCT as u64 {
+            return (raw as u32, 0);
         }
-        let obj = Self::find_object_by_addr(heap, addr);
-        if let Some(crate::memory::Object::Enum(gc)) = obj {
-            gc.as_ref().tag
+        if raw > 0xFFFF {
+            return ((raw & 0xFFFF) as u32, (raw >> 16) as u32);
+        }
+        if let Some(crate::memory::Object::Enum(gc)) = Self::find_object_by_addr(heap, raw) {
+            (gc.as_ref().tag, 0)
         } else {
-            0
+            (common::tag::INT, 0)
         }
     }
 
-    fn ffi_type_from_tag(tag: u32) -> crate::memory::FfiType {
-        match tag {
-            1 => crate::memory::FfiType::Float,
-            2 => crate::memory::FfiType::String,
-            3 => crate::memory::FfiType::Void,
-            _ => crate::memory::FfiType::Int,
-        }
+    /// Legacy helper — tag only, no aux.
+    fn ffi_type_tag_from_value(heap: &Heap, v: &Value) -> u32 {
+        Self::decode_ffi_type_tag(v, heap).0
     }
 
     fn object_string_value(heap: &Heap, v: &Value) -> String {
@@ -197,14 +256,38 @@ impl<const S: usize> Machine<S> {
         }
     }
 
+    fn materialize_callback_args(
+        &mut self,
+        sig: &crate::ffi::FfiSignature,
+        args: &[Value],
+    ) -> Result<Vec<Value>, crate::ffi::FfiError> {
+        use crate::ffi::{callback_cif, make_int_callback, VmCallFn};
+        use crate::memory::FfiType;
+        let mut out = args.to_vec();
+        let vm_ptr = self as *mut Self as *mut c_void;
+        let call_fn: VmCallFn = Self::invoke_call;
+        for (i, ty) in sig.args.iter().enumerate() {
+            if let FfiType::Callback(_) = ty {
+                let offset = out[i].as_int() as u32;
+                let cif = callback_cif(&[FfiType::Int], FfiType::Int, &self.struct_layouts)?;
+                let closure = make_int_callback(vm_ptr, offset, call_fn, cif)?;
+                let ptr = closure.code_ptr_usize();
+                self.ffi_closures.push(closure);
+                out[i] = Value::from(ptr as u64);
+            }
+        }
+        Ok(out)
+    }
+
     /// Register a new FFI function on the given library `Object`.
     fn register_signature_on_object(
         obj: &mut Object,
         sig: crate::ffi::FfiSignature,
+        layouts: &[CStructLayout],
     ) -> Result<usize, String> {
         if let crate::memory::Object::Library(gc) = obj {
             let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
-            crate::ffi::register_on_library(obj_lib, sig).map_err(|e| e.to_string())
+            crate::ffi::register_on_library(obj_lib, sig, layouts).map_err(|e| e.to_string())
         } else {
             Err("not a library object".to_string())
         }
@@ -356,8 +439,8 @@ impl<const S: usize> Machine<S> {
         let lib_obj_mut = std::sync::Arc::make_mut(&mut lib_obj_arc);
         if let crate::memory::Object::Library(gc) = lib_obj_mut {
             let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
-            let id =
-                crate::ffi::register_on_library(obj_lib, signature).map_err(|e| e.to_string())?;
+            let id = crate::ffi::register_on_library(obj_lib, signature, &self.struct_layouts)
+                .map_err(|e| e.to_string())?;
             self.userland_libraries
                 .insert(addr, std::sync::Arc::new(*lib_obj_mut));
             Ok(id)
@@ -627,7 +710,119 @@ impl<const S: usize> Machine<S> {
         if code.is_empty() {
             return;
         }
-        self.execute(code, constants);
+        self.program_code = unsafe {
+            std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
+        };
+        self.program_constants = constants.to_vec();
+        let mut ip = 0usize;
+        loop {
+            let paused = self.execute(code, constants, ip);
+            if let Some(pending) = self.pending_ffi.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_ffi_invoke(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if !paused {
+                break;
+            }
+        }
+    }
+
+    fn finish_pending_ffi_invoke(&mut self, pending: PendingFfiInvoke) {
+        self.frames.get_mut().set(pending.resume_sp);
+        let lib_obj = self.userland_libraries.get(&pending.lib_addr).cloned();
+        let invoke_result = match lib_obj {
+            Some(obj) => {
+                let l = match obj.as_ref() {
+                    crate::memory::Object::Library(gc) => gc,
+                    _ => return,
+                };
+                let lib_ref: &crate::memory::ObjLibrary = l.as_ref();
+                if pending.function_id < lib_ref.signatures.len() {
+                    let registered = &lib_ref.signatures[pending.function_id];
+                    let ffi_sig = registered.ffi_signature();
+                    let args = self
+                        .materialize_callback_args(&ffi_sig, &pending.args)
+                        .unwrap_or(pending.args);
+                    let mut ctx = crate::ffi::InvokeContext::new(
+                        &mut self.heap as *mut Heap,
+                        &self.struct_layouts,
+                    );
+                    let mut closure_ptrs = Vec::new();
+                    crate::ffi::invoke_via_libffi(
+                        &registered.prepared,
+                        &ffi_sig,
+                        &args,
+                        &mut ctx,
+                        &mut closure_ptrs,
+                    )
+                } else {
+                    Err(crate::ffi::FfiError::Unsupported(
+                        "function id out of range".into(),
+                    ))
+                }
+            }
+            None => Err(crate::ffi::FfiError::Unsupported(
+                "invalid library handle".into(),
+            )),
+        };
+        match invoke_result {
+            Ok(Some(v)) => self.stack.push(v),
+            Ok(None) => {}
+            #[cfg(debug_assertions)]
+            Err(e) => eprintln!("FFI invoke failed: {e}"),
+            #[cfg(not(debug_assertions))]
+            Err(_) => {}
+        }
+    }
+
+    /// Call a zero-script function at `offset` reentrantly (for FFI callbacks).
+    pub fn call_function(&mut self, offset: u32, args: &[Value]) -> Value {
+        let saved_sp = self.stack.tell();
+        for a in args {
+            self.stack.push(*a);
+        }
+        self.nested_return = None;
+        self.nested_depth += 1;
+        let callee_sp = self.stack.tell().saturating_sub(args.len());
+        self.frames.setup_current_and_advance(|f| {
+            f.seek(0);
+            f.set(callee_sp);
+        });
+        let code: &[Byte] = unsafe {
+            std::slice::from_raw_parts(self.program_code.as_ptr().cast(), self.program_code.len())
+        };
+        let constants = self.program_constants.clone();
+        let mut ip = offset as usize;
+        loop {
+            let paused = self.execute(code, &constants, ip);
+            if let Some(pending) = self.pending_ffi.take() {
+                let resume_ip = pending.resume_ip;
+                self.finish_pending_ffi_invoke(pending);
+                ip = resume_ip;
+                continue;
+            }
+            if !paused {
+                break;
+            }
+        }
+        let _ = self.frames.pop();
+        self.stack.seek(saved_sp);
+        self.nested_depth -= 1;
+        self.nested_return.take().unwrap_or_default()
+    }
+
+    /// Type-erased entry for libffi callback trampolines (monomorphized per `S`).
+    unsafe fn invoke_call(
+        vm: *mut c_void,
+        offset: u32,
+        args_ptr: *const Value,
+        len: usize,
+    ) -> Value {
+        let vm = &mut *(vm.cast::<Self>());
+        let args = std::slice::from_raw_parts(args_ptr, len);
+        vm.call_function(offset, args)
     }
 
     /// Run compiler-produced bytecode (archived layout, no `.c0s` round-trip).
@@ -637,11 +832,11 @@ impl<const S: usize> Machine<S> {
     }
 
     #[inline(always)]
-    fn execute(&mut self, code: &[Byte], constants: &[u64]) {
+    fn execute(&mut self, code: &[Byte], constants: &[u64], mut start_ip: usize) -> bool {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
-        let mut ip: usize = 0;
+        let mut ip: usize = start_ip;
         let mut sp = self.frames.get_mut().get();
 
         while ip < code.len() {
@@ -864,6 +1059,10 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
+                    if self.nested_depth > 0 {
+                        self.nested_return = Some(ret_val);
+                        return false;
+                    }
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
@@ -1002,7 +1201,11 @@ impl<const S: usize> Machine<S> {
                     // 0 (a null pointer) and let the source
                     // surface a runtime error. Subsequent invokes
                     // on this library will fail at dispatch time.
-                    match crate::ffi::load_library(&path) {
+                    match crate::ffi::resolve_library(
+                        &path,
+                        self.base_dir.as_deref(),
+                        &self.ffi_search_paths,
+                    ) {
                         Ok(lib_arc) => {
                             self.libraries
                                 .entry(path.clone())
@@ -1013,13 +1216,9 @@ impl<const S: usize> Machine<S> {
                                 .insert(addr, std::sync::Arc::new(object));
                             self.stack.push(Value::from(addr as *mut u8));
                         }
-                        #[cfg(debug_assertions)]
                         Err(e) => {
+                            #[cfg(debug_assertions)]
                             eprintln!("FFI: failed to load library `{}`: {}", path, e);
-                            self.stack.push(Value::from(0u64));
-                        }
-                        #[cfg(not(debug_assertions))]
-                        Err(_) => {
                             self.stack.push(Value::from(0u64));
                         }
                     }
@@ -1032,11 +1231,9 @@ impl<const S: usize> Machine<S> {
                     let tuple_val = self.stack.pop();
                     let tuple_addr = tuple_val.raw() as u64;
 
-                    // Pop the function id.
                     let function_id_val = self.stack.pop();
                     let function_id = function_id_val.as_int() as usize;
 
-                    // Pop the library value.
                     let lib_val = self.stack.pop();
                     let lib_addr = lib_val.raw() as u64;
 
@@ -1045,67 +1242,15 @@ impl<const S: usize> Machine<S> {
                         _ => Vec::new(),
                     };
 
-                    let lib_obj = self.userland_libraries.get(&lib_addr).cloned();
-                    let invoke_result = match lib_obj {
-                        Some(obj) => {
-                            let l = match obj.as_ref() {
-                                crate::memory::Object::Library(gc) => gc,
-                                _ => return,
-                            };
-                            let lib_ref: &crate::memory::ObjLibrary = (**l).as_ref();
-                            if function_id < lib_ref.signatures.len() {
-                                let registered = &lib_ref.signatures[function_id];
-                                let ffi_sig = registered.ffi_signature();
-                                if args.len() != ffi_sig.arity() {
-                                    #[cfg(debug_assertions)]
-                                    eprintln!(
-                                        "FFI: arity mismatch at invoke (expected {}, got {})",
-                                        ffi_sig.arity(),
-                                        args.len()
-                                    );
-                                    Err(crate::ffi::FfiError::ArityMismatch {
-                                        expected: ffi_sig.arity(),
-                                        got: args.len(),
-                                    })
-                                } else {
-                                    crate::ffi::invoke_via_libffi(
-                                        &registered.prepared,
-                                        &ffi_sig,
-                                        &args,
-                                        &mut self.heap,
-                                    )
-                                }
-                            } else {
-                                #[cfg(debug_assertions)]
-                                eprintln!(
-                                    "FFI: function_id={} out of range (library has {} signatures)",
-                                    function_id,
-                                    lib_ref.signatures.len()
-                                );
-                                Err(crate::ffi::FfiError::Unsupported(
-                                    "function id out of range".into(),
-                                ))
-                            }
-                        }
-                        None => {
-                            #[cfg(debug_assertions)]
-                            eprintln!(
-                                "FFI: FfiInvoke on a non-library value (function_id={})",
-                                function_id
-                            );
-                            Err(crate::ffi::FfiError::Unsupported(
-                                "invalid library handle".into(),
-                            ))
-                        }
-                    };
-                    match invoke_result {
-                        Ok(Some(v)) => self.stack.push(v),
-                        Ok(None) => {}
-                        #[cfg(debug_assertions)]
-                        Err(e) => eprintln!("FFI invoke failed: {e}"),
-                        #[cfg(not(debug_assertions))]
-                        Err(_) => {}
-                    }
+                    self.frames.get_mut().set(sp);
+                    self.pending_ffi = Some(PendingFfiInvoke {
+                        lib_addr,
+                        function_id,
+                        args,
+                        resume_ip: ip,
+                        resume_sp: sp,
+                    });
+                    return true;
                 }
                 Instruction::DeclareFFI => {
                     let raw = opcode.operand_u32();
@@ -1113,25 +1258,22 @@ impl<const S: usize> Machine<S> {
 
                     // Stack (bottom → top): lib, name, args_tuple, ret_tag.
                     let ret_tag_val = self.stack.pop();
-                    let ret_tag = Self::ffi_type_tag_from_value(&self.heap, &ret_tag_val);
-                    let ret_type = Self::ffi_type_from_tag(ret_tag);
+                    let ret_type = Self::ffi_type_from_value(&ret_tag_val, &self.heap);
 
                     // Pop the args tuple (next on the stack).
                     let args_tuple_val = self.stack.pop();
                     let args_tuple_addr = args_tuple_val.raw() as u64;
 
-                    let arg_tags: Vec<u32> =
+                    let arg_types: Vec<crate::memory::FfiType> =
                         match Self::find_object_by_addr(&self.heap, args_tuple_addr) {
                             Some(crate::memory::Object::Tuple(gc)) => gc
                                 .as_ref()
                                 .elements
                                 .iter()
-                                .map(|v| Self::ffi_type_tag_from_value(&self.heap, v))
+                                .map(|v| Self::ffi_type_from_value(v, &self.heap))
                                 .collect(),
                             _ => Vec::new(),
                         };
-                    let arg_types: Vec<crate::memory::FfiType> =
-                        arg_tags.into_iter().map(Self::ffi_type_from_tag).collect();
                     // Pop the name string.
                     let name_val = self.stack.pop();
                     let name = Self::object_string_value(&self.heap, &name_val);
@@ -1147,7 +1289,11 @@ impl<const S: usize> Machine<S> {
                                 args: arg_types,
                                 ret: ret_type,
                             };
-                            match Self::register_signature_on_object(&mut owned, ffi_sig) {
+                            match Self::register_signature_on_object(
+                                &mut owned,
+                                ffi_sig,
+                                &self.struct_layouts,
+                            ) {
                                 Ok(id) => {
                                     self.userland_libraries
                                         .insert(lib_addr, std::sync::Arc::new(owned));
@@ -1204,7 +1350,7 @@ impl<const S: usize> Machine<S> {
                     } else {
                         let _ = io::stdout().flush();
                     }
-                    return;
+                    return false;
                 }
                 Instruction::STRING => {
                     let length = opcode.operand_u32() as usize;
@@ -1621,18 +1767,19 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                 }
-                _ => return,
+                _ => return false,
             }
         }
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction};
+    use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction, Byte as RawByte, Value};
 
     use super::{dispatch_count, reset_dispatch_count};
-    use crate::{Machine, ObjEnum};
+    use crate::{Heap, Machine, ObjEnum};
 
     /// Build a `MAKE_ENUM` byte with the given tag and arity
     /// packed into the operand (upper 16 bits = tag, lower 16
@@ -2353,6 +2500,87 @@ mod tests {
             3,
             "HostInvoke should have invoked the Rust closure 3 times"
         );
+    }
+
+    fn install_program(vm: &mut Machine<512>, code: &[Byte]) {
+        vm.program_code = unsafe {
+            std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
+        };
+        vm.program_constants.clear();
+    }
+
+    /// Reentrant `call_function` runs bytecode at the given offset.
+    #[test]
+    fn call_function_runs_bytecode_at_offset() {
+        let mut vm = Machine::<512>::default();
+        install_program(
+            &mut vm,
+            &[
+                load(0),
+                const_int(2),
+                Byte::new(Instruction::MUL),
+                Byte::new(Instruction::RETURN),
+            ],
+        );
+        let out = vm.call_function(0, &[Value::from(21_i64)]);
+        assert_eq!(out.as_int(), 42);
+    }
+
+    /// C → zero-script callback via `apply_cb` in libsum.so.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn vm_callback_apply_cb_doubles() {
+        use crate::ffi::{
+            callback_cif, invoke_via_libffi, make_int_callback, prepare_cif_for_symbol,
+            resolve_library, FfiSignature, InvokeContext,
+        };
+        use crate::memory::FfiType;
+        use std::ffi::c_void;
+
+        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples/libsum.so");
+        if !lib_path.exists() {
+            eprintln!("skipping: libsum.so not built");
+            return;
+        }
+        let lib = resolve_library(
+            lib_path.to_str().unwrap(),
+            None,
+            &[],
+        )
+        .expect("load libsum.so");
+
+        let mut vm = Machine::<512>::default();
+        install_program(
+            &mut vm,
+            &[
+                load(0),
+                const_int(2),
+                Byte::new(Instruction::MUL),
+                Byte::new(Instruction::RETURN),
+            ],
+        );
+
+        let cif = callback_cif(&[FfiType::Int], FfiType::Int, &[]).unwrap();
+        let vm_ptr = &mut vm as *mut Machine<512> as *mut c_void;
+        let closure = make_int_callback(vm_ptr, 0, Machine::<512>::invoke_call, cif).unwrap();
+        let cb_ptr = closure.code_ptr_usize();
+        vm.ffi_closures.push(closure);
+
+        let sig = FfiSignature::from_parts(
+            "apply_cb",
+            vec![FfiType::Callback(0), FfiType::Int],
+            FfiType::Int,
+        )
+        .unwrap();
+        let prepared = prepare_cif_for_symbol(&sig, &lib, "apply_cb", &[]).unwrap();
+        let args = [Value::from(cb_ptr as u64), Value::from(21_i64)];
+        let mut ctx = InvokeContext::new(&mut vm.heap as *mut Heap, &vm.struct_layouts);
+        let mut closure_ptrs = Vec::new();
+        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closure_ptrs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ret.as_int(), 42);
     }
 
     fn make_coro(arity: u32, target: u32) -> Byte {

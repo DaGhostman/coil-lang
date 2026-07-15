@@ -147,6 +147,10 @@ pub enum Expression<'expr> {
         name: &'expr str,
         variants: Vec<Output<'expr>>,
     },
+
+    /// `extern struct Name { field: type, ... };` — C-layout FFI struct.
+    ExternStruct(ExternStructDecl<'expr>),
+
     /// One variant inside an `enum` body.
     EnumVariant {
         name: &'expr str,
@@ -189,7 +193,14 @@ pub struct RecordFieldDecl<'expr> {
 pub struct ExternFunction<'expr> {
     pub name: &'expr str,
     pub args: Output<'expr>,
-    pub returns: Option<&'expr str>,
+    pub returns: Option<Output<'expr>>,
+}
+
+/// C-layout struct for FFI: `extern struct Name { field: type, ... }`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ExternStructDecl<'expr> {
+    pub name: &'expr str,
+    pub fields: Vec<(String, Output<'expr>)>,
 }
 
 /// One field in a record constructor.

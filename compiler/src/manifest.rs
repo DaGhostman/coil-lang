@@ -90,6 +90,8 @@ pub struct Manifest {
     /// Optional explicit entry point. When `None`, the
     /// compiler falls back to the file passed on the CLI.
     pub entry: Option<PathBuf>,
+    /// Extra directories searched when resolving FFI library paths.
+    pub ffi_search_paths: Vec<PathBuf>,
 }
 
 impl Default for Manifest {
@@ -100,6 +102,7 @@ impl Default for Manifest {
         Self {
             roots: vec![PathBuf::from("src")],
             entry: None,
+            ffi_search_paths: Vec::new(),
         }
     }
 }
@@ -127,6 +130,7 @@ impl Manifest {
     pub fn parse(source: &str) -> Result<Self, ManifestError> {
         let mut roots: Option<Vec<PathBuf>> = None;
         let mut entry: Option<PathBuf> = None;
+        let mut ffi_search_paths: Option<Vec<PathBuf>> = None;
         let mut current_section: Option<&'static str> = None;
 
         for (idx, raw_line) in source.lines().enumerate() {
@@ -145,6 +149,7 @@ impl Manifest {
                 current_section = match name.trim() {
                     "module" => Some("module"),
                     "entry" => Some("entry"),
+                    "ffi" => Some("ffi"),
                     other => {
                         return Err(ManifestError::Parse {
                             line: line_num,
@@ -181,6 +186,13 @@ impl Manifest {
                     })?;
                     entry = Some(PathBuf::from(parsed));
                 }
+                ("ffi", "search_paths") => {
+                    let parsed = parse_string_array(value).ok_or(ManifestError::Parse {
+                        line: line_num,
+                        message: format!("expected array of strings, got `{}`", value),
+                    })?;
+                    ffi_search_paths = Some(parsed.into_iter().map(PathBuf::from).collect());
+                }
                 (section, key) => {
                     return Err(ManifestError::Parse {
                         line: line_num,
@@ -193,6 +205,7 @@ impl Manifest {
         Ok(Self {
             roots: roots.unwrap_or_else(|| vec![PathBuf::from("src")]),
             entry,
+            ffi_search_paths: ffi_search_paths.unwrap_or_default(),
         })
     }
 
@@ -477,6 +490,7 @@ mod tests {
         let m = Manifest {
             roots: vec![PathBuf::from("src"), PathBuf::from("vendor")],
             entry: None,
+            ffi_search_paths: Vec::new(),
         };
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
         assert!(
@@ -527,6 +541,7 @@ mod tests {
         let m = Manifest {
             roots: vec![PathBuf::from("src"), PathBuf::from("builtins")],
             entry: None,
+            ffi_search_paths: Vec::new(),
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, Some("core::ffi::dload".to_string()));
@@ -545,6 +560,7 @@ mod tests {
         let m = Manifest {
             roots: vec![PathBuf::from("src")],
             entry: None,
+            ffi_search_paths: Vec::new(),
         };
         let ns = m.namespace_of(&tmp, &file);
         assert_eq!(ns, None);

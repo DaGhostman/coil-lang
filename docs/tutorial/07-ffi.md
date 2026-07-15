@@ -72,18 +72,22 @@ For each `extern` function the compiler roughly:
 
 You do not write those steps by hand when using `extern` blocks.
 
-### Supported FFI types in `extern`
+### Supported FFI types
 
-Argument and return types must be bare primitive names:
+Use **`FFIType::Variant`** (compiler builtin — do not re-declare the enum) or bare type names in `declare` / `extern`:
 
-| Type | C / libffi mapping |
+| Form | C / libffi mapping |
 |------|---------------------|
-| `int` | `i64` |
-| `float` | `f64` |
-| `string` | `const char *` (see [String ABI](#string-abi)) |
-| `void` | Return type only — functions that return nothing |
+| `int` / `FFIType::Int` | `i64` |
+| `float` / `FFIType::Float` | `f64` |
+| `string` / `FFIType::String` | `const char *` |
+| `void` / `FFIType::Void` | Return-only |
+| `bool`, `int8`…`uint64`, `ptr` | Sized integers, bool, raw pointer |
+| `[int]` / `(int, float)` | Lowered to `FFIType::Ptr` (array/tuple buffer) |
+| `FFIType::Callback` | C function pointer → zero-script function |
+| `extern struct Point { x: int32, y: int32 };` | Pass-by-value C struct |
 
-Tuples, arrays, enums, and user types are **not** valid in `extern` signatures.
+Functions with no `-> ret` in `extern` blocks default to **`void`**, not `int`.
 
 ---
 
@@ -110,13 +114,6 @@ cc -shared -fPIC -o libsum.so examples/sum.c
 **zero-script** (`examples/ffi_sum.0s`):
 
 ```0s
-enum FFIType {
-    Int,
-    Float,
-    String,
-    Void,
-}
-
 fn main() {
     let lib = dload("libsum.so");
     let sum_id = declare(
@@ -128,6 +125,8 @@ fn main() {
     print "%i", invoke(lib, sum_id, (40, 2));
 }
 ```
+
+`FFIType` is a **compiler builtin** with fixed tags — you do not declare `enum FFIType` in source.
 
 **Expected output:** `42`
 
@@ -157,14 +156,10 @@ The third argument to `declare` and the fourth (return) must be FFI type tags. T
 
 | Form | Example |
 |------|---------|
-| `FFIType` enum constructor | `FFIType::Int`, `FFIType::Float`, `FFIType::String`, `FFIType::Void` |
-| Bare primitive name | `int`, `float`, `string`, `void` |
+| Built-in `FFIType` constructor | `FFIType::Int`, `FFIType::Ptr`, `FFIType::Callback` |
+| Bare primitive / aggregate name | `int`, `void`, `[int]`, `(int, float)` |
 
-Define the enum in your script (as in `ffi_sum.0s`) or use bare names:
-
-```0s
-let id = declare(lib, "sum", (int, int), int);
-```
+Do **not** re-declare `enum FFIType` — it is registered by the compiler with fixed tags.
 
 Runtime tag mapping:
 

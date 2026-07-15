@@ -28,29 +28,40 @@ fn run_example(path: &str) -> String {
     let full = workspace_root.join(path);
     let src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-    run_example_src(&src)
+    run_example_src_with_entry(&src, Some(full.as_path()))
 }
 
-fn run_bytecode(bytecode: Vec<common::Byte>, constants: Vec<u64>) -> String {
+/// Compile and run in-memory source.
+fn run_example_src(src: &str) -> String {
+    run_example_src_with_entry(src, None)
+}
+
+fn run_example_src_with_entry(src: &str, entry: Option<&std::path::Path>) -> String {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("example failed to compile (parse error or type errors)");
+    run_bytecode(bytecode, constants, &pipeline, entry)
+}
+
+fn run_bytecode(
+    bytecode: Vec<common::Byte>,
+    constants: Vec<u64>,
+    pipeline: &Pipeline,
+    entry: Option<&std::path::Path>,
+) -> String {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
+    pipeline.wire_vm_ffi(&mut machine, entry);
+    pipeline.wire_host_natives(&mut machine);
     machine.run_raw(&bytecode, &constants);
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
         .expect("VM still holds a reference to the buffer")
         .into_inner();
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
-}
-
-/// Compile and run in-memory source.
-fn run_example_src(src: &str) -> String {
-    let mut pipeline = Pipeline::new();
-    let (bytecode, constants) = pipeline
-        .compile_src(src)
-        .expect("example failed to compile (parse error or type errors)");
-    run_bytecode(bytecode, constants)
 }
 
 #[test]
@@ -394,7 +405,9 @@ fn example_ffi_sum_via_dlopen_prints_42() {
         &format!("dload(\"{}\")", lib_abs.display()),
     );
 
-    let result = std::panic::catch_unwind(|| run_example_src(&src));
+    let result = std::panic::catch_unwind(|| {
+        run_example_src_with_entry(&src, Some(full.as_path()))
+    });
     let output = match result {
         Ok(s) => s,
         Err(_) => {
@@ -407,26 +420,20 @@ fn example_ffi_sum_via_dlopen_prints_42() {
 
 #[test]
 fn example_strlen_prints_5() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let examples_dir = workspace_root.join("examples");
-
     // Quick probe: if dlopen("libc.so.6") fails, skip.
     if machine::load_library("libc.so.6").is_err() {
         eprintln!("skipping: libc.so.6 not loadable on this platform");
         return;
     }
 
-    let prev_cwd = std::env::current_dir().ok();
-    if std::env::set_current_dir(&examples_dir).is_err() {
-        eprintln!("skipping: couldn't chdir to {}", examples_dir.display());
-        return;
-    }
-    let result = std::panic::catch_unwind(|| run_example("examples/strlen.0s"));
-    if let Some(prev) = prev_cwd {
-        let _ = std::env::set_current_dir(&prev);
-    }
+    let result = std::panic::catch_unwind(|| {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate must have a parent (workspace root)");
+        let full = workspace_root.join("examples/strlen.0s");
+        let src = std::fs::read_to_string(&full).expect("read strlen.0s");
+        run_example_src_with_entry(&src, Some(full.as_path()))
+    });
     let output = match result {
         Ok(s) => s,
         Err(_) => {
@@ -571,4 +578,50 @@ fn resume_after_done_returns_default_not_last_return_value() {
     "#;
     let output = run_example_src(src);
     assert_eq!(output, "42,0,0");
+}
+
+fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
+    ensure_ffi_libsum_built();
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let full = workspace_root.join(path);
+    let lib_abs = lib_path
+        .canonicalize()
+        .unwrap_or_else(|_| lib_path.to_path_buf());
+    let mut src = std::fs::read_to_string(&full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
+    src = src.replace(
+        "dload(\"libsum.so\")",
+        &format!("dload(\"{}\")", lib_abs.display()),
+    );
+    run_example_src_with_entry(&src, Some(full.as_path()))
+}
+
+#[test]
+fn example_ffi_array_sum_prints_15() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let libsum = workspace_root.join("examples/libsum.so");
+    if !libsum.exists() {
+        eprintln!("skipping: libsum.so not built");
+        return;
+    }
+    let output = run_ffi_example_with_lib("examples/ffi_array.0s", &libsum);
+    assert_eq!(output, "15");
+}
+
+#[test]
+fn example_ffi_callback_prints_42() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let libsum = workspace_root.join("examples/libsum.so");
+    if !libsum.exists() {
+        eprintln!("skipping: libsum.so not built");
+        return;
+    }
+    let output = run_ffi_example_with_lib("examples/ffi_callback.0s", &libsum);
+    assert_eq!(output, "42");
 }

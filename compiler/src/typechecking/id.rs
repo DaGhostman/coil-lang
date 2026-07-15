@@ -230,6 +230,14 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         Expression::ExternBlock { declarations, .. } => {
             for decl in declarations {
                 pre_walk(&decl.args, table);
+                if let Some(ret) = &decl.returns {
+                    pre_walk(ret, table);
+                }
+            }
+        }
+        Expression::ExternStruct(decl) => {
+            for (_, ty) in &decl.fields {
+                pre_walk(ty, table);
             }
         }
         Expression::EnumVariant { payload, .. } => match payload {

@@ -146,6 +146,41 @@ impl Pipeline {
         self.compiler.get_messages()
     }
 
+    /// Wire FFI library resolution paths and C struct layouts into the VM.
+    pub fn wire_vm_ffi<const N: usize>(
+        &self,
+        vm: &mut machine::Machine<N>,
+        entry_path: Option<&std::path::Path>,
+    ) {
+        use machine::{CStructLayout, FfiType};
+        let base_dir = entry_path.and_then(|p| p.parent()).map(std::path::PathBuf::from);
+        let search: Vec<std::path::PathBuf> = self
+            .manifest
+            .ffi_search_paths
+            .iter()
+            .map(|p| self.project_root.join(p))
+            .collect();
+        vm.set_ffi_paths(base_dir, search);
+        for def in self.compiler.c_structs() {
+            let fields = def
+                .fields
+                .iter()
+                .map(|(name, enc)| {
+                    let (tag, aux) = if *enc <= common::tag::STRUCT {
+                        (*enc, 0)
+                    } else {
+                        (*enc & 0xFFFF, *enc >> 16)
+                    };
+                    (name.clone(), FfiType::from_tag(tag, aux))
+                })
+                .collect();
+            vm.register_struct_layout(CStructLayout {
+                name: def.name.clone(),
+                fields,
+            });
+        }
+    }
+
     pub fn new() -> Self {
         let cwd = std::env::current_dir().expect("Unable to determine current working directory");
         // The project root is the cwd for now. A future
@@ -817,12 +852,22 @@ impl Pipeline {
 }
 
 fn ffi_type_to_ty(ty: FfiType) -> crate::typechecking::ty::Ty {
-    use crate::typechecking::ty::{float, int, string, unit};
+    use crate::typechecking::ty::{array, boolean, float, int, string, unit};
     match ty {
-        FfiType::Int => int(),
+        FfiType::Int
+        | FfiType::Int8
+        | FfiType::Int16
+        | FfiType::Int32
+        | FfiType::UInt8
+        | FfiType::UInt16
+        | FfiType::UInt32
+        | FfiType::UInt64 => int(),
         FfiType::Float => float(),
         FfiType::String => string(),
         FfiType::Void => unit(),
+        FfiType::Bool => boolean(),
+        FfiType::Ptr => array(int()),
+        FfiType::Callback(_) | FfiType::Struct(_) => int(),
     }
 }
 

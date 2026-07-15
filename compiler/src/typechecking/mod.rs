@@ -11,5 +11,5 @@ pub mod subst;
 pub mod ty;
 pub mod unify;
 
-pub use infer::Checker;
+pub use infer::{CallbackSigDef, Checker, CStructDef};
 pub use ty::Ty;

@@ -27,6 +27,24 @@
 /// in that library. The VM then wraps the resolved function
 /// pointer in a `LibraryFn` and dispatches `NATIVE` opcodes
 /// that name `sum` to it.
-int sum(int a, int b) {
+#include <stdint.h>
+
+int64_t sum(int64_t a, int64_t b) {
     return a + b;
+}
+
+/// Sum `n` elements from a C int array (for `[int]` → Ptr FFI tests).
+int64_t sum_array(const int64_t *arr, int64_t n) {
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        total += arr[i];
+    }
+    return total;
+}
+
+typedef int64_t (*int64_fn_int64)(int64_t);
+
+/// Invoke a C callback (for FFIType::Callback tests).
+int64_t apply_cb(int64_fn_int64 cb, int64_t x) {
+    return cb(x);
 }

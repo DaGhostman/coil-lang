@@ -51,5 +51,9 @@ fn main() {
     let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
         .expect("Unable to deserialize constant pool");
 
-    Machine::<256>::default().run_raw(&bytecode, &constants);
+    let entry = std::path::Path::new(&filename);
+    let pipeline = Pipeline::new();
+    let mut machine = Machine::<256>::default();
+    pipeline.wire_vm_ffi(&mut machine, Some(entry));
+    machine.run_raw(&bytecode, &constants);
 }

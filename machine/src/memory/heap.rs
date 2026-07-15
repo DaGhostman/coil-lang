@@ -90,6 +90,7 @@ impl Heap {
             library,
             signatures: Vec::new(),
             by_name: std::collections::HashMap::new(),
+            closures: Vec::new(),
         };
         self.alloc(obj_lib, Object::Library)
     }
@@ -215,6 +216,37 @@ impl Heap {
     /// Head of the intrusive object list (for address lookup).
     pub fn head_for_lookup(&self) -> Option<Object> {
         self.head
+    }
+
+    /// Find a heap object by its address (linear scan).
+    pub fn find_object_by_addr(&self, addr: u64) -> Option<Object> {
+        let mut current = self.head_for_lookup();
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                return Some(reference);
+            }
+            current = reference.get_next();
+        }
+        None
+    }
+
+    /// Write back FFI scratch-buffer values into a live `ObjArray`.
+    pub fn update_array_elements(&mut self, addr: u64, values: &[i64]) {
+        let mut current = self.head;
+        while let Some(reference) = current {
+            if reference.addr() == addr {
+                if let Object::Array(mut gc) = reference {
+                    let arr = gc.as_mut();
+                    for (i, &v) in values.iter().enumerate() {
+                        if i < arr.elements.len() {
+                            arr.elements[i] = Value::from(v);
+                        }
+                    }
+                }
+                return;
+            }
+            current = reference.get_next();
+        }
     }
 
     /// True if `addr` is a live heap object. Used to classify stack values as
@@ -643,6 +675,8 @@ pub struct ObjLibrary {
     pub library: std::sync::Arc<crate::ffi::Library>,
     pub signatures: Vec<RegisteredFunction>,
     pub by_name: std::collections::HashMap<String, usize>,
+    /// libffi closures registered for callbacks (keeps trampolines alive).
+    pub closures: Vec<crate::ffi::OwnedClosure>,
 }
 
 /// C signature metadata for an FFI function.
@@ -682,12 +716,85 @@ impl RegisteredFunction {
 }
 
 /// C ABI type tags for FFI marshalling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FfiType {
     Int,
     Float,
     String,
     Void,
+    Bool,
+    Int8,
+    Int16,
+    Int32,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Ptr,
+    Callback(u32),
+    Struct(u32),
+}
+
+impl FfiType {
+    pub fn from_tag(tag: u32, aux: u32) -> Self {
+        use common::tag as t;
+        match tag {
+            x if x == t::FLOAT => Self::Float,
+            x if x == t::STRING => Self::String,
+            x if x == t::VOID => Self::Void,
+            x if x == t::BOOL => Self::Bool,
+            x if x == t::INT8 => Self::Int8,
+            x if x == t::INT16 => Self::Int16,
+            x if x == t::INT32 => Self::Int32,
+            x if x == t::UINT8 => Self::UInt8,
+            x if x == t::UINT16 => Self::UInt16,
+            x if x == t::UINT32 => Self::UInt32,
+            x if x == t::UINT64 => Self::UInt64,
+            x if x == t::PTR => Self::Ptr,
+            x if x == t::CALLBACK => Self::Callback(aux),
+            x if x == t::STRUCT => Self::Struct(aux),
+            _ => Self::Int,
+        }
+    }
+
+    pub fn tag(&self) -> u32 {
+        use common::tag as t;
+        match self {
+            Self::Int => t::INT,
+            Self::Float => t::FLOAT,
+            Self::String => t::STRING,
+            Self::Void => t::VOID,
+            Self::Bool => t::BOOL,
+            Self::Int8 => t::INT8,
+            Self::Int16 => t::INT16,
+            Self::Int32 => t::INT32,
+            Self::UInt8 => t::UINT8,
+            Self::UInt16 => t::UINT16,
+            Self::UInt32 => t::UINT32,
+            Self::UInt64 => t::UINT64,
+            Self::Ptr => t::PTR,
+            Self::Callback(_) => t::CALLBACK,
+            Self::Struct(_) => t::STRUCT,
+        }
+    }
+
+    pub fn aux(&self) -> u32 {
+        match self {
+            Self::Callback(id) | Self::Struct(id) => *id,
+            _ => 0,
+        }
+    }
+
+    pub fn is_void(self) -> bool {
+        matches!(self, Self::Void)
+    }
+}
+
+/// C-layout struct descriptor for pass-by-value FFI.
+#[derive(Clone, Debug)]
+pub struct CStructLayout {
+    pub name: String,
+    pub fields: Vec<(String, FfiType)>,
 }
 
 impl GcSized for ObjLibrary {

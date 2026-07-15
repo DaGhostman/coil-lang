@@ -10,7 +10,7 @@
 //      the compiler to emit bytecode that:
 //        a. calls `dload("c")` and stores the library handle
 //           in a hidden let-slot,
-//        b. calls `declare(lib, "strlen", String, Int)` and
+//        b. calls `declare(lib, "strlen", (FFIType::String), FFIType::Int)` and
 //           stores the function id in another hidden let-slot.
 //   2. `let n = strlen("hello");` becomes
 //        LOAD lib_slot, LOAD fn_id_slot,

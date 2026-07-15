@@ -1,0 +1,11 @@
+// C calls back into zero-script via FFIType::Callback. Expected output: `42`.
+
+fn doubler(int x) -> int {
+    return x * 2;
+}
+
+fn main() {
+    let lib = dload("libsum.so");
+    let id = declare(lib, "apply_cb", (FFIType::Callback, FFIType::Int), FFIType::Int);
+    print "%i", invoke(lib, id, (doubler, 21));
+}

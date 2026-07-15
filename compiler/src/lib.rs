@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, likely, unlikely};
+use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, encode_tag_operand, likely, tag, unlikely};
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind};
 use parser::{
@@ -18,7 +18,7 @@ use parser::{
 };
 
 pub use pipeline::*;
-pub use typechecking::{Checker, Ty};
+pub use typechecking::{CallbackSigDef, Checker, CStructDef, Ty};
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -46,16 +46,15 @@ struct TagGroup {
     is_single_arm_group: bool,
 }
 
-/// Walk `arms` and bucket by outer constructor tag (`u32::MAX` for wildcard/binding).
-/// Map FFI type name strings to runtime tag integers.
-fn ffi_type_tag_from_str(name: &str) -> Option<u32> {
-    match name {
-        "int" => Some(0),
-        "float" => Some(1),
-        "string" => Some(2),
-        "void" => Some(3),
-        _ => None,
-    }
+/// Map FFI type expressions to runtime `(tag, aux)` for declare/invoke codegen.
+fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u32)> {
+    checker.ffi_type_tag_from_output(expr)
+}
+
+fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
+    bytecode.push(
+        Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)),
+    );
 }
 
 fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup> {
@@ -708,6 +707,10 @@ impl Compiler {
         &self.messages
     }
 
+    pub fn c_structs(&self) -> &[CStructDef] {
+        self.checker.c_structs()
+    }
+
     pub fn register(&mut self, name: &str, params: &[Ty], returns: &Ty) -> &mut Self {
         let idx = self.native.len();
         self.native.insert(name.to_string(), idx);
@@ -1140,20 +1143,26 @@ impl Compiler {
                     let name_bc = self.do_compile(name);
                     self.bytecode.extend(name_bc);
 
-                    // Each element pushes its tag onto the
-                    // stack. Then `MakeTuple` packs them all
-                    // into a single Value.
+                    // Each element pushes its FFI type tag onto the stack.
                     for elem in &tuple_elements {
-                        let bc = self.do_compile(elem);
-                        self.bytecode.extend(bc);
+                        if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, elem) {
+                            emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                        } else {
+                            let bc = self.do_compile(elem);
+                            self.bytecode.extend(bc);
+                        }
                     }
                     let arity = tuple_elements.len() as u32;
                     self.bytecode
                         .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
 
                     // Ret-type tag on top.
-                    let ret_bc = self.do_compile(ret_type);
-                    self.bytecode.extend(ret_bc);
+                    if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, ret_type) {
+                        emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                    } else {
+                        let ret_bc = self.do_compile(ret_type);
+                        self.bytecode.extend(ret_bc);
+                    }
 
                     // DeclareFFI pops name + tuple + lib in
                     // dispatch order (see VM).
@@ -1205,8 +1214,17 @@ impl Compiler {
                     let fn_bc = self.do_compile(fn_id);
                     self.bytecode.extend(fn_bc);
 
-                    // Each element's bytecode pushes a Value.
+                    // Each element's bytecode pushes a Value. Function names
+                    // used as callback arguments compile to bytecode offsets.
                     for elem in &tuple_elements {
+                        if let Expression::Identifier(name) = elem.1.as_ref() {
+                            if let Some(&offset) = self.functions.get(*name) {
+                                self.bytecode.push(
+                                    Byte::new(Instruction::CONST).with_operand_u32(offset as u32),
+                                );
+                                continue;
+                            }
+                        }
                         let bc = self.do_compile(elem);
                         self.bytecode.extend(bc);
                     }
@@ -1876,41 +1894,24 @@ impl Compiler {
                         (span, Box::new(parser::ast::Expression::String(decl.name)));
                     let mut name_bc = self.do_compile(&name_expr);
                     self.bytecode.append(&mut name_bc);
-                    // Push each arg type as a CONST tag
-                    // (skipping the FFIType enum dispatch).
+                    // Push each arg type as a CONST tag.
                     let mut arg_type_tags: Vec<u32> = Vec::new();
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
                             if let Expression::Argument(type_expr, _param_name) = arg.1.as_ref() {
-                                // the type is now a
-                                // full Output. For the FFI
-                                // extern-block path we only
-                                // support bare identifiers
-                                // (`int`, `float`, etc.); arrays
-                                // and tuples aren't valid FFI
-                                // arg types.
-                                let type_name = match type_expr.1.as_ref() {
-                                    Expression::Type(n) => *n,
-                                    _ => "",
-                                };
-                                if let Some(tag) = ffi_type_tag_from_str(type_name) {
-                                    self.bytecode
-                                        .push(Byte::new(Instruction::CONST).with_value_u32(tag));
+                                if let Some((tag, aux)) =
+                                    ffi_type_tag_from_output(&self.checker, type_expr)
+                                {
+                                    emit_ffi_type_const(&mut self.bytecode, tag, aux);
                                     arg_type_tags.push(tag);
                                 } else {
                                     self.messages.push({
                                         let mut m = common::Message::error(
-                                            format!(
-                                                "Unknown FFI argument type `{}`",
-                                                type_name
-                                            ),
+                                            "Unknown FFI argument type".to_string(),
                                             arg.0.into_range(),
                                         );
                                         m.push(common::Label::new(
-                                            format!(
-                                                "expected one of: int, float, string, void; got `{}`",
-                                                type_name
-                                            ),
+                                            "use FFIType::X, a bare type name, [T], (T, U), or an extern struct".to_string(),
                                             arg.0.into_range(),
                                         ));
                                         m
@@ -1937,9 +1938,12 @@ impl Compiler {
                     self.bytecode
                         .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
                     // Push the ret type tag (top of stack for DeclareFFI).
-                    let ret_tag = decl.returns.and_then(ffi_type_tag_from_str).unwrap_or(0);
-                    self.bytecode
-                        .push(Byte::new(Instruction::CONST).with_value_u32(ret_tag));
+                    let (ret_tag, ret_aux) = decl
+                        .returns
+                        .as_ref()
+                        .and_then(|r| ffi_type_tag_from_output(&self.checker, r))
+                        .unwrap_or((tag::VOID, 0));
+                    emit_ffi_type_const(&mut self.bytecode, ret_tag, ret_aux);
                     // Emit DeclareFFI.
                     self.bytecode
                         .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(arity));
@@ -1964,6 +1968,11 @@ impl Compiler {
             }
             Expression::TypeAlias { ty, .. } => {
                 bytecode.append(&mut self.do_compile(ty));
+            }
+            Expression::ExternStruct(decl) => {
+                for (_, ty) in &decl.fields {
+                    bytecode.append(&mut self.do_compile(ty));
+                }
             }
             Expression::EnumVariant { payload, .. } => {
                 // Recurse into each payload's `Type` expression

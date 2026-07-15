@@ -1,0 +1,8 @@
+// Sum a zero-script int array via C `sum_array`. Expected output: `15`.
+
+fn main() {
+    let lib = dload("libsum.so");
+    let id = declare(lib, "sum_array", (FFIType::Ptr, FFIType::Int), FFIType::Int);
+    let arr = [1, 2, 3, 4, 5];
+    print "%i", invoke(lib, id, (arr, 5));
+}

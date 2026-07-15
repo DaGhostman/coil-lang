@@ -2,6 +2,7 @@
 
 mod archive;
 mod array_vec;
+mod ffi;
 mod interner;
 mod message;
 mod opcode;
@@ -9,6 +10,8 @@ mod seekable_iter;
 mod value;
 
 pub use archive::*;
+pub use ffi::*;
+pub use ffi::tag;
 pub use array_vec::*;
 pub use interner::*;
 pub use message::*;

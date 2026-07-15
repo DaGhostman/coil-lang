@@ -85,6 +85,26 @@ pub struct Checker {
 
     /// True when the enclosing `async fn` uses `let x = yield …`.
     yield_receives_used: bool,
+
+    /// C-layout struct declarations for FFI (`extern struct`).
+    c_structs: Vec<CStructDef>,
+
+    /// Callback signature descriptors (index = aux id on `FFIType::Callback`).
+    callback_sigs: Vec<CallbackSigDef>,
+}
+
+/// C-layout struct registered via `extern struct Name { ... }`.
+#[derive(Clone, Debug)]
+pub struct CStructDef {
+    pub name: String,
+    pub fields: Vec<(String, u32)>,
+}
+
+/// Callback signature registered for `FFIType::Callback` aux ids.
+#[derive(Clone, Debug)]
+pub struct CallbackSigDef {
+    pub args: Vec<u32>,
+    pub ret: u32,
 }
 
 /// One pending exhaustiveness check, recorded at the match site and
@@ -156,7 +176,7 @@ impl Checker {
         // ever called. `check_program` pushes a second frame so the
         // first stays around for inspection.
         env.push();
-        Self {
+        let mut checker = Self {
             env,
             counter: TyVarCounter::new(),
             subst: Subst::empty(),
@@ -180,7 +200,31 @@ impl Checker {
             current_yield_ty: None,
             current_send_ty: None,
             yield_receives_used: false,
+            c_structs: Vec::new(),
+            callback_sigs: Vec::new(),
+        };
+        checker.register_builtin_ffi_type();
+        checker
+    }
+
+    /// Pre-register the compiler-built-in `FFIType` enum with fixed tags.
+    fn register_builtin_ffi_type(&mut self) {
+        use common::{BUILTIN_FFI_TYPE_ENUM, BUILTIN_FFI_TYPE_VARIANTS};
+        let name = BUILTIN_FFI_TYPE_ENUM.to_string();
+        let variant_names: Vec<String> = BUILTIN_FFI_TYPE_VARIANTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let arities = vec![0; variant_names.len()];
+        let payloads = vec![EnumVariantPayloadTy::Unit; variant_names.len()];
+        let mut tag_map = BTreeMap::new();
+        for (i, vn) in variant_names.iter().enumerate() {
+            tag_map.insert(vn.clone(), i as u32);
         }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
     }
 
     /// Run inference over `ast`. Returns the inferred type of the root
@@ -204,12 +248,17 @@ impl Checker {
         self.enum_tags.clear();
         self.enum_payloads.clear();
         self.enum_arities.clear();
+        self.c_structs.clear();
+        self.callback_sigs.clear();
         self.pending_exhaustive.clear();
         self.async_functions.clear();
         self.async_depth = 0;
         self.current_yield_ty = None;
         self.current_send_ty = None;
         self.yield_receives_used = false;
+
+        // Built-in FFIType survives the per-program enum reset.
+        self.register_builtin_ffi_type();
 
         // Mint NodeIds for every AST node (pre-walk). The visit order
         // matches `infer`'s recursion, so the IDs line up.
@@ -278,6 +327,7 @@ impl Checker {
         )
     }
 
+    #[allow(dead_code)]
     fn split_coroutine(&self, ty: &Ty) -> Option<(Ty, Ty)> {
         match apply_ty_prune(&self.subst, ty) {
             Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == "coroutine") => {
@@ -291,6 +341,7 @@ impl Checker {
         }
     }
 
+    #[allow(dead_code)]
     fn format_coroutine_ty(&self, yield_ty: &Ty, send_ty: &Ty) -> String {
         let y = apply_ty_prune(&self.subst, yield_ty).to_string();
         let s = apply_ty_prune(&self.subst, send_ty);
@@ -388,7 +439,8 @@ impl Checker {
                     };
                     let ret_ty = decl
                         .returns
-                        .map(|r| self.parse_type_name_str(r))
+                        .as_ref()
+                        .map(|r| self.parse_type_name(r))
                         .unwrap_or_else(unit_ty);
                     let fn_ty = arg_tys
                         .iter()
@@ -1036,6 +1088,32 @@ impl Checker {
                 let _ = self.infer(ty); // ID alignment
                 unit_ty()
             }
+            Expression::ExternStruct(decl) => {
+                use common::encode_tag_operand;
+                let span = expr.0.into_range();
+                if self.c_structs.iter().any(|s| s.name == decl.name) {
+                    self.messages.push(Message::error(
+                        format!("Duplicate extern struct `{}`", decl.name),
+                        span.clone(),
+                    ));
+                } else {
+                    let mut fields = Vec::new();
+                    for (fname, fty) in &decl.fields {
+                        self.require_ffi_type_expr(fty);
+                        if let Some((tag, aux)) = self.ffi_type_tag_from_output(fty) {
+                            fields.push((fname.clone(), encode_tag_operand(tag, aux)));
+                        } else {
+                            fields.push((fname.clone(), 0));
+                        }
+                        let _ = self.infer(fty);
+                    }
+                    self.c_structs.push(CStructDef {
+                        name: decl.name.to_string(),
+                        fields,
+                    });
+                }
+                unit_ty()
+            }
             Expression::EnumVariant { payload, .. } => {
                 use parser::ast::EnumVariantPayload;
                 // The pre-walk mints an ID for every payload
@@ -1417,23 +1495,50 @@ impl Checker {
     }
 
     /// True when `expr` is a valid FFI type tag expression:
-    /// `FFIType::Int` / `Float` / `String` / `Void`, or a bare
-    /// primitive name (`int`, `float`, `string`, `void`).
+    /// `FFIType::X`, a bare primitive name, `[T]` / `(T, U)` (lowered to Ptr),
+    /// or `FFIType::Struct` with aux id from a registered layout.
     fn is_ffi_type_expr(&self, expr: &Output) -> bool {
+        self.ffi_type_tag_from_output(expr).is_some()
+    }
+
+    /// Resolve an FFI type expression to `(tag, aux)` for codegen.
+    pub fn ffi_type_tag_from_output(&self, expr: &Output) -> Option<(u32, u32)> {
+        use common::{tag, tag_from_type_name, tag_from_variant_name};
         match expr.1.as_ref() {
             Expression::Construct {
                 enum_name,
                 variant_name,
-                fields: _,
-            } if *enum_name == "FFIType" => {
-                matches!(*variant_name, "Int" | "Float" | "String" | "Void")
+                ..
+            } if common::is_builtin_ffi_enum(enum_name) => {
+                let tag = tag_from_variant_name(variant_name)?;
+                Some((tag, 0))
             }
-            Expression::Type(name) => matches!(
-                name.to_lowercase().as_str(),
-                "int" | "float" | "string" | "void"
-            ),
-            _ => false,
+            Expression::Type(name) | Expression::Identifier(name) => {
+                if let Some(id) = self.c_struct_id(name) {
+                    Some((tag::STRUCT, id))
+                } else {
+                    tag_from_type_name(name).map(|t| (t, 0))
+                }
+            }
+            Expression::Array(items) if items.len() == 1 => Some((tag::PTR, 0)),
+            Expression::Tuple(_) => Some((tag::PTR, 0)),
+            _ => None,
         }
+    }
+
+    pub fn c_struct_id(&self, name: &str) -> Option<u32> {
+        self.c_structs
+            .iter()
+            .position(|s| s.name == name)
+            .map(|i| i as u32)
+    }
+
+    pub fn c_structs(&self) -> &[CStructDef] {
+        &self.c_structs
+    }
+
+    pub fn callback_sigs(&self) -> &[CallbackSigDef] {
+        &self.callback_sigs
     }
 
     /// Emit a diagnostic when `expr` is not a valid FFI type tag.
@@ -1443,7 +1548,7 @@ impl Checker {
         }
         let mut m = Message::error("Expected an FFI type tag".to_string(), expr.0.into_range());
         m.push(Label::new(
-            "use FFIType::Int, FFIType::Float, FFIType::String, FFIType::Void, or a bare int/float/string/void type name".to_string(),
+            "use FFIType::Int, FFIType::Ptr, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
             expr.0.into_range(),
         ));
         self.messages.push(m);
@@ -1749,7 +1854,19 @@ impl Checker {
                     }
                 }
 
-                // Check 1: duplicate enum name.
+                // Check 1: duplicate enum name (including built-in FFIType).
+                if common::is_builtin_ffi_enum(&name_str) {
+                    let mut msg = Message::error(
+                        format!("Cannot redeclare built-in enum `{}`", name_str),
+                        node.0.into_range(),
+                    );
+                    msg.with_help(format!(
+                        "`{}` is provided by the compiler; use `FFIType::Variant` without declaring the enum",
+                        name_str
+                    ));
+                    errors.push(msg);
+                    return;
+                }
                 if self.enums.contains_key(&name_str) {
                     let mut msg = Message::error(
                         format!("Duplicate enum `{}`", name_str),
@@ -1821,7 +1938,8 @@ impl Checker {
             | Expression::Constant(_, _)
             | Expression::Argument(_, _)
             | Expression::Field(_, _, _)
-            | Expression::ExternBlock { .. } => {}
+            | Expression::ExternBlock { .. }
+            | Expression::ExternStruct(_) => {}
 
             Expression::Expr(e)
             | Expression::Group(e)
