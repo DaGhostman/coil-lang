@@ -35,12 +35,20 @@ pub struct FusionSite {
 /// collapsed (used to relocate function entry offsets and the
 /// program start offset). `pool` is the constant pool; the pass
 /// rewrites the `JUMP_IF_MATCH` targets it stores.
-pub fn fuse_bytecode(bytecode: &mut Vec<Byte>, pool: &mut [u64]) -> Vec<FusionSite> {
+pub fn fuse_bytecode(bytecode: &mut Vec<Byte>, pool: &mut Vec<u64>) -> Vec<FusionSite> {
+    let sites = fuse_bytecode_pass(bytecode, pool);
+    for byte in &mut *bytecode {
+        patch_targets(byte, &sites, pool);
+    }
+    sites
+}
+
+fn fuse_bytecode_pass(bytecode: &mut Vec<Byte>, pool: &mut Vec<u64>) -> Vec<FusionSite> {
     let mut out = Vec::with_capacity(bytecode.len());
     let mut fusion_sites: Vec<FusionSite> = Vec::new();
     let mut i = 0;
     while i < bytecode.len() {
-        if let Some((fused, window)) = try_fuse(&bytecode[i..]) {
+        if let Some((fused, window)) = try_fuse(&bytecode[i..], pool) {
             fusion_sites.push(FusionSite {
                 orig: i,
                 removed: window - 1,
@@ -51,10 +59,6 @@ pub fn fuse_bytecode(bytecode: &mut Vec<Byte>, pool: &mut [u64]) -> Vec<FusionSi
         }
         out.push(bytecode[i]);
         i += 1;
-    }
-
-    for byte in &mut out {
-        patch_targets(byte, &fusion_sites, pool);
     }
 
     *bytecode = out;
@@ -95,6 +99,22 @@ fn patch_targets(byte: &mut Byte, fusion_sites: &[FusionSite], pool: &mut [u64])
                 *byte = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(op, t as u16);
             }
         }
+        Instruction::BinSlotImmJmpf => {
+            let (op, slot, pool_idx) = byte.bin_slot_imm_jmpf_parts();
+            if pool_idx < pool.len() {
+                let packed = pool[pool_idx];
+                let imm = packed as u32;
+                let target = adjust_target((packed >> 32) as usize, fusion_sites);
+                pool[pool_idx] = ((target as u64) << 32) | (imm as u64);
+            }
+            let _ = (op, slot);
+        }
+        Instruction::LogNotJmpf => {
+            let t = adjust_target(byte.log_not_jmpf_target(), fusion_sites);
+            if t <= u16::MAX as usize {
+                *byte = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(t as u16);
+            }
+        }
         // `JUMP_IF_MATCH` keeps its absolute target in the constant
         // pool (lower 16 operand bits index it), so relocate the pool
         // entry, not the inline operand. Each `JUMP_IF_MATCH` owns a
@@ -125,6 +145,9 @@ fn is_int_bin_op(i: Instruction) -> bool {
             | Instruction::GEQ
             | Instruction::EQ
             | Instruction::NEQ
+            | Instruction::Pow
+            | Instruction::BITAND
+            | Instruction::BITOR
     )
 }
 
@@ -160,14 +183,20 @@ fn is_bin_op(i: Instruction) -> bool {
                 | Instruction::LEQF
                 | Instruction::GTF
                 | Instruction::GEQF
+                | Instruction::Pow
+                | Instruction::BITAND
+                | Instruction::BITOR
         )
 }
 
 /// Try every fusion rule against the window, returning the fused byte
 /// and the number of original instructions it replaces.
-fn try_fuse(window: &[Byte]) -> Option<(Byte, usize)> {
-    // 3-instruction convoys first (their prefix overlaps the shorter
-    // rules, so they must win when both could match).
+fn try_fuse(window: &[Byte], pool: &mut Vec<u64>) -> Option<(Byte, usize)> {
+    // 4-instruction convoys first.
+    if let Some(b) = try_fuse_load_const_cmp_jmpf(window, pool) {
+        return Some((b, 4));
+    }
+    // 3-instruction convoys (their prefix overlaps the shorter rules).
     if let Some(b) = try_fold_const_bin(window) {
         return Some((b, 3));
     }
@@ -178,6 +207,12 @@ fn try_fuse(window: &[Byte]) -> Option<(Byte, usize)> {
         return Some((b, 3));
     }
     // 2-instruction convoys.
+    if let Some(b) = try_fuse_bin_slot_imm_jmpf(window, pool) {
+        return Some((b, 2));
+    }
+    if let Some(b) = try_fuse_log_not_jmpf(window) {
+        return Some((b, 2));
+    }
     if let Some(b) = try_fuse_cmp_jmpf(window) {
         return Some((b, 2));
     }
@@ -263,6 +298,71 @@ fn try_fold_const_bin(window: &[Byte]) -> Option<Byte> {
         return None;
     }
     Some(Byte::new(Instruction::CONST).with_operand_u32(result as u32))
+}
+
+/// `LOAD s; CONST k; <cmp>; JMPF t` → `BinSlotImmJmpf` (pool packs imm + target).
+fn try_fuse_load_const_cmp_jmpf(window: &[Byte], pool: &mut Vec<u64>) -> Option<Byte> {
+    if window.len() < 4 {
+        return None;
+    }
+    let slot = load_slot(&window[0])?;
+    let imm = i16::try_from(const_inline_value(&window[1])?).ok()?;
+    let op = *window[2].bytecode();
+    if !is_cmp_op(op) {
+        return None;
+    }
+    if *window[3].bytecode() != Instruction::JMPF {
+        return None;
+    }
+    let target = window[3].operand_u32() as u64;
+    let idx = pool.len();
+    pool.push((target << 32) | (imm as u16 as u32 as u64));
+    Some(
+        Byte::new(Instruction::BinSlotImmJmpf)
+            .with_bin_slot_imm_jmpf(op as u8, slot, idx as u16),
+    )
+}
+
+/// `BinSlotImm; JMPF t` → `BinSlotImmJmpf` (second peephole pass).
+fn try_fuse_bin_slot_imm_jmpf(window: &[Byte], pool: &mut Vec<u64>) -> Option<Byte> {
+    if window.len() < 2 {
+        return None;
+    }
+    if *window[0].bytecode() != Instruction::BinSlotImm {
+        return None;
+    }
+    if *window[1].bytecode() != Instruction::JMPF {
+        return None;
+    }
+    let (op, slot, imm) = window[0].bin_slot_imm_parts();
+    if !is_cmp_op(Instruction::from(op)) {
+        return None;
+    }
+    let target = window[1].operand_u32() as u64;
+    let idx = pool.len();
+    pool.push((target << 32) | (imm as u32 as u64));
+    Some(
+        Byte::new(Instruction::BinSlotImmJmpf)
+            .with_bin_slot_imm_jmpf(op, slot as u8, idx as u16),
+    )
+}
+
+/// `LogNot; JMPF t` → `LogNotJmpf`.
+fn try_fuse_log_not_jmpf(window: &[Byte]) -> Option<Byte> {
+    if window.len() < 2 {
+        return None;
+    }
+    if *window[0].bytecode() != Instruction::LogNot {
+        return None;
+    }
+    if *window[1].bytecode() != Instruction::JMPF {
+        return None;
+    }
+    let target = window[1].operand_u32();
+    if target > u16::MAX as u32 {
+        return None;
+    }
+    Some(Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(target as u16))
 }
 
 /// `<cmp>; JMPF t` → `CmpJmpf`.
@@ -530,25 +630,21 @@ mod tests {
             Byte::new(Instruction::JMP).with_operand_u32(20),
         ];
         fuse(&mut bc);
-        // Windows: LOAD;CONST;LEQ at 0 (−2), CONST;RETURN at 4 (−1),
-        // LOAD;CONST;SUB at 6 (−2).
+        // `LOAD; CONST; LEQ; JMPF` fuses to `BinSlotImmJmpf` (−3 bytes).
         let binslot = bc
             .iter()
-            .find(|b| *b.bytecode() == Instruction::BinSlotImm)
-            .expect("bin_slot_imm fusion");
-        assert_eq!(binslot.bin_slot_imm_parts(), (Instruction::LEQ as u8, 0, 2));
-        let jmpf = bc
-            .iter()
-            .find(|b| *b.bytecode() == Instruction::JMPF)
-            .expect("jmpf");
-        // Target 10 sits past all three windows: 10 − (2+1+2) = 5.
-        assert_eq!(jmpf.operand_u32(), 5);
+            .find(|b| *b.bytecode() == Instruction::BinSlotImmJmpf)
+            .expect("bin_slot_imm_jmpf fusion");
+        assert_eq!(
+            binslot.bin_slot_imm_jmpf_parts().0,
+            Instruction::LEQ as u8
+        );
         let jmp = bc
             .iter()
             .find(|b| *b.bytecode() == Instruction::JMP)
             .expect("jmp");
-        // Target 20 sits past all three windows: 20 − 5 = 15.
-        assert_eq!(jmp.operand_u32(), 15);
+        // Target 20 sits past windows at 0 (−3) and 4 (−1) and 6 (−2): 20 − 6 = 14.
+        assert_eq!(jmp.operand_u32(), 14);
     }
 
     #[test]
@@ -564,6 +660,37 @@ mod tests {
         fuse_bytecode(&mut bc, &mut pool);
         // One window at 0 removed 1 byte; target 10 > 2 → 10 - 1 = 9.
         assert_eq!(pool[0], 9);
+    }
+
+    #[test]
+    fn fuse_log_not_jmpf_sequence() {
+        let mut bc = vec![
+            Byte::new(Instruction::LogNot),
+            Byte::new(Instruction::JMPF).with_operand_u32(7),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 2);
+        assert_eq!(*bc[0].bytecode(), Instruction::LogNotJmpf);
+        assert_eq!(bc[0].log_not_jmpf_target(), 6);
+    }
+
+    #[test]
+    fn fuse_load_const_cmp_jmpf_to_bin_slot_imm_jmpf() {
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_const_inline(2000),
+            Byte::new(Instruction::LEQ),
+            Byte::new(Instruction::JMPF).with_operand_u32(20),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut pool = Vec::new();
+        fuse_bytecode(&mut bc, &mut pool);
+        assert_eq!(bc.len(), 2);
+        assert_eq!(*bc[0].bytecode(), Instruction::BinSlotImmJmpf);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0] >> 32, 17); // target 20 − 3 bytes removed
+        assert_eq!(pool[0] as u32 as i32, 2000);
     }
 
     #[test]

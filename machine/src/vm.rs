@@ -1132,6 +1132,15 @@ impl<const S: usize> Machine<S> {
                         Instruction::GEQ => binary!(self.stack, >=, raw),
                         Instruction::EQ => binary!(self.stack, ==, raw),
                         Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::Pow => {
+                            let sp = self.stack.tell();
+                            let rhs = self.stack[sp - 1].as_int().max(0) as u32;
+                            let lhs = self.stack[sp - 2].as_int();
+                            self.stack[sp - 2].replace(lhs.pow(rhs) as u64);
+                            self.stack.seek(sp - 1);
+                        }
+                        Instruction::BITAND => binary!(self.stack, &, as_int),
+                        Instruction::BITOR => binary!(self.stack, |, as_int),
                         _ => {}
                     }
                 }
@@ -1152,6 +1161,41 @@ impl<const S: usize> Machine<S> {
                         _ => {}
                     }
                     if !self.stack.pop().as_bool() {
+                        ip = target;
+                    }
+                }
+                Instruction::BinSlotImmJmpf => {
+                    let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
+                    let packed = constants.get(pool_idx).copied().unwrap_or(0);
+                    let imm = packed as u32 as i32 as i64;
+                    let target = (packed >> 32) as usize;
+                    let lhs = self.stack[sp + slot];
+                    self.stack.push(lhs);
+                    self.stack.push(Value::from(imm));
+                    match Instruction::from(op) {
+                        Instruction::LE => binary!(self.stack, <, raw),
+                        Instruction::LEQ => binary!(self.stack, <=, raw),
+                        Instruction::GT => binary!(self.stack, >, raw),
+                        Instruction::GEQ => binary!(self.stack, >=, raw),
+                        Instruction::EQ => binary!(self.stack, ==, raw),
+                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::LEF => binary!(self.stack, <, as_float),
+                        Instruction::LEQF => binary!(self.stack, <=, as_float),
+                        Instruction::GTF => binary!(self.stack, >, as_float),
+                        Instruction::GEQF => binary!(self.stack, >=, as_float),
+                        _ => {
+                            self.stack.pop();
+                            self.stack.pop();
+                        }
+                    }
+                    if !self.stack.pop().as_bool() {
+                        ip = target;
+                    }
+                }
+                Instruction::LogNotJmpf => {
+                    let target = opcode.log_not_jmpf_target();
+                    let val = self.stack.pop();
+                    if val.as_int() != 0 {
                         ip = target;
                     }
                 }
@@ -1203,31 +1247,44 @@ impl<const S: usize> Machine<S> {
                     let (op, a, b) = opcode.bin_slot_slot_parts();
                     let va = self.stack[sp + a];
                     let vb = self.stack[sp + b];
-                    self.stack.push(va);
-                    self.stack.push(vb);
-                    match Instruction::from(op) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
-                        Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
-                        Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
-                        Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
-                        Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {}
-                    }
+                    let result = match Instruction::from(op) {
+                        Instruction::ADD => Value::from(va.as_int() + vb.as_int()),
+                        Instruction::SUB => Value::from(va.as_int() - vb.as_int()),
+                        Instruction::MUL => Value::from(va.as_int() * vb.as_int()),
+                        Instruction::DIV => Value::from(va.as_int() / vb.as_int()),
+                        Instruction::MOD => Value::from(va.as_int() % vb.as_int()),
+                        Instruction::Pow => {
+                            let exp = vb.as_int().max(0) as u32;
+                            Value::from(va.as_int().pow(exp))
+                        }
+                        Instruction::BITAND => Value::from(va.as_int() & vb.as_int()),
+                        Instruction::BITOR => Value::from(va.as_int() | vb.as_int()),
+                        Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
+                        Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
+                        Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
+                        Instruction::DIVF => Value::from(va.as_float() / vb.as_float()),
+                        Instruction::MODF => Value::from(va.as_float() % vb.as_float()),
+                        Instruction::LE => Value::from((va.raw() < vb.raw()) as i64),
+                        Instruction::LEQ => Value::from((va.raw() <= vb.raw()) as i64),
+                        Instruction::GT => Value::from((va.raw() > vb.raw()) as i64),
+                        Instruction::GEQ => Value::from((va.raw() >= vb.raw()) as i64),
+                        Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
+                        Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
+                        Instruction::LEF => {
+                            Value::from((va.as_float() < vb.as_float()) as i64)
+                        }
+                        Instruction::LEQF => {
+                            Value::from((va.as_float() <= vb.as_float()) as i64)
+                        }
+                        Instruction::GTF => {
+                            Value::from((va.as_float() > vb.as_float()) as i64)
+                        }
+                        Instruction::GEQF => {
+                            Value::from((va.as_float() >= vb.as_float()) as i64)
+                        }
+                        _ => Value::default(),
+                    };
+                    self.stack.push(result);
                 }
                 Instruction::NATIVE => {
                     #[cfg(debug_assertions)]
@@ -1712,14 +1769,12 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::StorePop => {
-                    // Pop TOS into `sp + slot`; advance cursor past the slot so
-                    // subsequent pushes don't clobber locals (`let x; let y;`).
+                    // Pop TOS into `sp + slot`; trim temporaries above that slot
+                    // so fused ops (BinSlotSlot, etc.) don't leave stale stack cells.
                     let slot = sp + opcode.operand_u32() as usize;
                     let val = self.stack.pop();
                     self.stack[slot] = val;
-                    if self.stack.tell() < slot + 1 {
-                        self.stack.seek(slot + 1);
-                    }
+                    self.stack.seek(slot + 1);
                 }
                 Instruction::MakeCoro => {
                     let (arity, target) = opcode.call_parts();

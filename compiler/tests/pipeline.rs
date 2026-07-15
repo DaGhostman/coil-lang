@@ -302,18 +302,23 @@ fn nested_if_in_loop_runs_correctly() {
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
     use common::Instruction;
-    let jmpf_count = bytecode
+    let exit_branch_count = bytecode
         .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::JMPF))
+        .filter(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+            )
+        })
         .count();
     let jmp_count = bytecode
         .iter()
         .filter(|b| matches!(b.bytecode(), Instruction::JMP))
         .count();
     assert!(
-        jmpf_count >= 2,
-        "expected at least 2 JMPF (loop cond + if cond); got {}",
-        jmpf_count
+        exit_branch_count >= 2,
+        "expected at least 2 exit branches (loop + if); got {}",
+        exit_branch_count
     );
     assert!(
         jmp_count >= 1,
@@ -630,4 +635,52 @@ fn example_ffi_callback_prints_42() {
 fn example_operators_prints_expected() {
     let output = run_example("examples/operators.0s");
     assert_eq!(output, "801125428falsetrue3");
+}
+
+#[test]
+fn example_while_loop_accumulates_correctly() {
+    let output = run_example_src(
+        r#"
+        fn main() {
+            let acc = 0;
+            let i = 0;
+            while (i < 100) {
+                acc = acc + i;
+                i = i + 1;
+            }
+            print "%i", acc;
+        }
+        "#,
+    );
+    assert_eq!(output, "4950");
+}
+
+#[test]
+fn example_perf_numeric_prints_expected_sum() {
+    let output = run_example("examples/perf/numeric.0s");
+    assert_eq!(output, "1999000");
+}
+
+#[test]
+fn example_perf_array_mut_prints_expected() {
+    let output = run_example("examples/perf/array_mut.0s");
+    assert_eq!(output, "2000");
+}
+
+#[test]
+fn example_perf_dict_hot_prints_expected() {
+    let output = run_example("examples/perf/dict_hot.0s");
+    assert_eq!(output, "6000");
+}
+
+#[test]
+fn example_perf_operators_loop_prints_expected() {
+    let output = run_example("examples/perf/operators_loop.0s");
+    assert_eq!(output, "149912");
+}
+
+#[test]
+fn example_perf_coro_ping_prints_expected() {
+    let output = run_example("examples/perf/coro_ping.0s");
+    assert_eq!(output, "124750");
 }

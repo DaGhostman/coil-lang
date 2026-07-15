@@ -936,8 +936,7 @@ impl Compiler {
         let is_float = self.emit_read_lvalue(bytecode, target);
         bytecode.append(&mut self.do_compile(rhs));
         bytecode.push(Byte::new(Self::binop_for_assign_op(op, is_float)));
-        bytecode.push(Byte::new(Instruction::DUPLICATE));
-        self.emit_write_lvalue(bytecode, target, true);
+        self.emit_write_lvalue(bytecode, target, false);
     }
 
     fn emit_adjust(
@@ -974,34 +973,43 @@ impl Compiler {
             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
             bytecode.push(Byte::new(Instruction::Index));
-            if !prefix {
-                bytecode.push(Byte::new(Instruction::DUPLICATE));
-            }
+            let tmp_old = if !prefix {
+                let t = self.alloc_temp_slot();
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                bytecode.push(Byte::new(Instruction::Index));
+                t
+            } else {
+                0
+            };
             bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
                 Value::from(delta).raw() as _,
             ));
             bytecode.push(Byte::new(Instruction::ADD));
             let tmp_val = self.alloc_temp_slot();
-            if prefix {
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
-            } else {
-                bytecode.push(Byte::new(Instruction::DUPLICATE));
-                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-                bytecode.push(Byte::new(Instruction::POP));
-            }
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
             bytecode.push(Byte::new(Instruction::StoreIndex));
+            if prefix {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+            } else {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_old));
+            }
             return;
         }
 
         let is_float = self.emit_read_lvalue(bytecode, target);
-        if !prefix {
-            bytecode.push(Byte::new(Instruction::DUPLICATE));
-        }
+        let tmp_old = if !prefix {
+            let tmp = self.alloc_temp_slot();
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
+            tmp
+        } else {
+            0
+        };
         if is_float {
             bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
@@ -1015,13 +1023,11 @@ impl Compiler {
             ));
             bytecode.push(Byte::new(Instruction::ADD));
         }
+        self.emit_write_lvalue(bytecode, target, false);
         if prefix {
-            bytecode.push(Byte::new(Instruction::DUPLICATE));
-            self.emit_write_lvalue(bytecode, target, true);
+            self.emit_read_lvalue(bytecode, target);
         } else {
-            bytecode.push(Byte::new(Instruction::DUPLICATE));
-            self.emit_write_lvalue(bytecode, target, false);
-            bytecode.push(Byte::new(Instruction::POP));
+            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_old));
         }
     }
 
@@ -1247,6 +1253,16 @@ impl Compiler {
                     // If it was supposed to add `POP` but prev is `DUP`
                     // then remove the DUP as well
                     bytecode.pop();
+                } else if matches!(
+                    bytecode.last().map(|b| b.bytecode()),
+                    Some(
+                        Instruction::StorePop
+                            | Instruction::SetField
+                            | Instruction::StoreIndex
+                    )
+                ) {
+                    // `x = expr;` / compound updates already consumed the
+                    // RHS via StorePop/SetField/StoreIndex — no trailing POP.
                 } else if !matches!(
                     bytecode.last().map(|b| b.bytecode()),
                     Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
@@ -1627,7 +1643,7 @@ impl Compiler {
                 self.emit_compound_assign(&mut bytecode, target, *op, rhs);
             }
             // --- Loop codegen ---
-            // Layout: [top] cond, JMPF→exit, body, JMP→top
+            // Layout: [top] cond, JMPF→exit, body, JMP→top, [exit]
             Expression::Loop { iterable, body, .. } => {
                 let mut bb = BlockBuilder::new();
                 let top_label = bb.fresh_label();
@@ -1642,6 +1658,8 @@ impl Compiler {
                 let body_bc = self.do_compile(body);
                 self.bytecode.extend(body_bc);
 
+                bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
                 let exit_label_target = self.bytecode.len() as u32;
                 bb.bind_label(
                     exit_label,
@@ -1649,8 +1667,6 @@ impl Compiler {
                     &mut self.bytecode,
                     &mut self.constants,
                 );
-
-                bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
 
                 bb.bind_label(
                     top_label,
@@ -2111,7 +2127,6 @@ impl Compiler {
                                 }
                             }
                             bytecode.append(&mut self.do_compile(value));
-                            bytecode.push(Byte::new(Instruction::DUPLICATE));
                             bytecode.push(
                                 Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32),
                             );
@@ -3440,25 +3455,58 @@ mod tests {
         assert_eq!(full.functions, module.functions);
     }
 
+    /// Count loop exit branches (unfused `JMPF` or fused `CmpJmpf` / `BinSlotImmJmpf`).
+    fn loop_exit_branch_count(bc: &[common::Byte]) -> usize {
+        use common::Instruction;
+        bc.iter()
+            .filter(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+                )
+            })
+            .count()
+    }
+
+    fn loop_exit_target(bc: &[common::Byte], pool: &[u64]) -> Option<usize> {
+        use common::Instruction;
+        for b in bc {
+            match b.bytecode() {
+                Instruction::JMPF => return Some(b.operand_u32() as usize),
+                Instruction::CmpJmpf => return Some(b.cmp_jmpf_parts().1),
+                Instruction::BinSlotImmJmpf => {
+                    let pool_idx = b.bin_slot_imm_jmpf_parts().2;
+                    return pool.get(pool_idx).map(|p| (*p >> 32) as usize);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     #[test]
     fn fib_compiles_with_fused_superinstructions() {
         use common::Instruction;
         let src = include_str!("../../examples/fib.0s");
         let (bc, _) = compile_src(src);
-        // fib's body fuses: `n <= 2` and the two `n - k` into
+        // fib's body fuses: `n <= 2` may become `BinSlotImmJmpf` or
         // `BinSlotImm`, `return 1` into `ConstReturnImm`, and the
         // `fib(..) + fib(..)` tail into `BinReturn`.
         let bin_slot_imm = bc
             .iter()
             .filter(|b| *b.bytecode() == Instruction::BinSlotImm)
             .count();
+        let bin_slot_imm_jmpf = bc
+            .iter()
+            .filter(|b| *b.bytecode() == Instruction::BinSlotImmJmpf)
+            .count();
         let bin_return = bc
             .iter()
             .filter(|b| *b.bytecode() == Instruction::BinReturn)
             .count();
         assert!(
-            bin_slot_imm >= 3,
-            "expected at least three BinSlotImm in fib bytecode; got {bin_slot_imm}; opcodes: {:?}",
+            bin_slot_imm + bin_slot_imm_jmpf >= 3,
+            "expected at least three slot+imm fused ops in fib bytecode; got imm={bin_slot_imm} jmpf={bin_slot_imm_jmpf}; opcodes: {:?}",
             bc.iter().map(|b| *b.bytecode() as u8).collect::<Vec<_>>()
         );
         assert!(
@@ -3504,24 +3552,144 @@ mod tests {
  }",
         );
 
-        // The loop emits: <iterable>, JMPF, <body>, JMP→top.
-        let jmpf_count = bc
-            .iter()
-            .filter(|b| matches!(b.bytecode(), Instruction::JMPF))
-            .count();
+        // The loop emits: <iterable>, exit-branch, <body>, JMP→top.
+        let exit_branch_count = loop_exit_branch_count(&bc);
         let jmp_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JMP))
             .count();
         assert!(
-            jmpf_count >= 1,
-            "expected at least 1 JMPF (the loop's exit condition); got {}",
-            jmpf_count
+            exit_branch_count >= 1,
+            "expected at least 1 loop exit branch (JMPF/CmpJmpf/BinSlotImmJmpf); got {}",
+            exit_branch_count
         );
         assert!(
             jmp_count >= 1,
             "expected at least 1 JMP (the loop's back-edge); got {}",
             jmp_count
+        );
+    }
+
+    /// Loop exit jump must land past the back-edge `JMP`, even after
+    /// peephole fusion relocates jump targets. The condition may fuse
+    /// to `CmpJmpf` (large limit) or `BinSlotImmJmpf` (inline limit).
+    #[test]
+    fn loop_cmp_jmpf_exit_targets_past_back_edge_after_peephole() {
+        use common::Instruction;
+        let (bc, pool) = compile_src(
+            "fn main() { \
+ let acc = 0; \
+ let i = 0; \
+ while (i < 2000) { \
+ acc = acc + i; \
+ i = i + 1; \
+ } \
+ }",
+        );
+
+        let cond_idx = bc
+            .iter()
+            .position(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::CmpJmpf
+                        | Instruction::BinSlotImm
+                        | Instruction::BinSlotImmJmpf
+                )
+            })
+            .expect("while condition should emit a fused or partial-fused compare");
+        let exit_target = match bc[cond_idx].bytecode() {
+            Instruction::CmpJmpf => bc[cond_idx].cmp_jmpf_parts().1,
+            Instruction::BinSlotImmJmpf => {
+                let pool_idx = bc[cond_idx].bin_slot_imm_jmpf_parts().2;
+                (pool[pool_idx] >> 32) as usize
+            }
+            Instruction::BinSlotImm => bc
+                .get(cond_idx + 1)
+                .filter(|b| matches!(b.bytecode(), Instruction::JMPF))
+                .expect("BinSlotImm condition should be followed by JMPF")
+                .operand_u32() as usize,
+            _ => unreachable!(),
+        };
+
+        let back_jmp_idx = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::JMP))
+            .map(|(i, _)| i)
+            .find(|&i| i > cond_idx)
+            .expect("loop should emit back-edge JMP after condition");
+
+        assert!(
+            exit_target > back_jmp_idx,
+            "loop exit target ({exit_target}) must be past back-edge JMP ({back_jmp_idx}); \
+             otherwise the loop never exits when the condition is false"
+        );
+    }
+
+    /// While-loop exit must land past the back-edge `JMP`, not on it.
+    #[test]
+    fn loop_jmpf_exits_past_back_edge() {
+        use common::Instruction;
+        let (bc, pool) = compile_src(
+            "fn main() { \
+ let i = 0; \
+ while (i < 3) { \
+ i = i + 1; \
+ } \
+ }",
+        );
+
+        let cond_idx = bc
+            .iter()
+            .position(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+                )
+            })
+            .expect("loop should emit an exit branch");
+        let back_jmp_idx = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::JMP))
+            .map(|(i, _)| i)
+            .find(|&i| i > cond_idx)
+            .expect("loop should emit back-edge JMP after exit branch");
+        let exit_target = loop_exit_target(&bc, &pool).expect("loop exit target");
+        assert!(
+            exit_target > back_jmp_idx,
+            "loop exit target ({exit_target}) must be past the back-edge JMP ({back_jmp_idx})"
+        );
+    }
+
+    /// Assignment statements must not leave a trailing DUPLICATE/POP pair
+    /// that shrinks the operand stack below live locals inside loops.
+    #[test]
+    fn assignment_statement_does_not_emit_duplicate_before_store_pop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+ let acc = 0; \
+ let i = 0; \
+ while (i < 2) { \
+ acc = acc + i; \
+ i = i + 1; \
+ } \
+ }",
+        );
+
+        let mut dup_before_store = 0usize;
+        for w in bc.windows(2) {
+            if matches!(w[0].bytecode(), Instruction::DUPLICATE)
+                && matches!(w[1].bytecode(), Instruction::StorePop)
+            {
+                dup_before_store += 1;
+            }
+        }
+        assert_eq!(
+            dup_before_store, 0,
+            "identifier assignment should not emit DUPLICATE before STORE_POP"
         );
     }
 
@@ -3726,10 +3894,7 @@ mod tests {
  }",
         );
 
-        let jmpf_count = bc
-            .iter()
-            .filter(|b| matches!(b.bytecode(), Instruction::JMPF))
-            .count();
+        let exit_branch_count = loop_exit_branch_count(&bc);
         let jmp_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JMP))
@@ -3743,9 +3908,9 @@ mod tests {
             .filter(|b| matches!(b.bytecode(), Instruction::Unpack))
             .count();
         assert!(
-            jmpf_count >= 1,
-            "expected at least 1 JMPF (the loop's exit condition); got {}",
-            jmpf_count
+            exit_branch_count >= 1,
+            "expected at least 1 loop exit branch; got {}",
+            exit_branch_count
         );
         assert!(
             jmp_count >= 1,

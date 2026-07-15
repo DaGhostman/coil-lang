@@ -21,6 +21,20 @@ declare -A EXPECTED=(
     ["examples/dict.0s"]="4210042"
     ["examples/aliases.0s"]="347"
     ["examples/fizbuz.0s"]="FIZBUZFIZFIZBUZFIZFIZBUZ"
+    ["examples/operators.0s"]="801125428falsetrue3"
+    ["examples/perf/numeric.0s"]="1999000"
+    ["examples/perf/array_mut.0s"]="2000"
+    ["examples/perf/dict_hot.0s"]="6000"
+    ["examples/perf/operators_loop.0s"]="149912"
+    ["examples/perf/coro_ping.0s"]="124750"
+)
+
+# CPU-focused subset for poop / quick timing (no FFI, no modules).
+CPU_BENCH=(
+    examples/fib.0s
+    examples/perf/numeric.0s
+    examples/perf/operators_loop.0s
+    examples/perf/match_sum.0s
 )
 
 run_example() {
@@ -60,6 +74,13 @@ if command -v poop >/dev/null 2>&1; then
     echo "== poop benchmark (fib vs lua) =="
     rm -f out.c0s
     poop -d 6000 "$BIN examples/fib.0s" "lua benchmarks/test.lua" || true
+    echo
+    echo "== poop CPU bench subset =="
+    for path in "${CPU_BENCH[@]}"; do
+        rm -f out.c0s
+        echo "-- $path"
+        poop -d 3000 "$BIN $path" || true
+    done
 else
     echo
     echo "poop not installed; skipping instruction-count benchmark"

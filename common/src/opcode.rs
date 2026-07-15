@@ -121,6 +121,10 @@ pub enum Instruction {
     CmpJmpf,
     BinReturn,
     BinSlotSlot,
+    /// `LOAD slot; CONST imm; <cmp>; JMPF t` — pool entry packs imm (low 32) + target (high 32).
+    BinSlotImmJmpf,
+    /// `LogNot; JMPF t` — branch when logical-not result is false.
+    LogNotJmpf,
 
     // Coroutines — append-only.
     //
@@ -322,6 +326,31 @@ impl Byte {
         self
     }
 
+    /// BinSlotImmJmpf: [31:24] op, [23:16] slot, [15:0] pool index.
+    pub fn with_bin_slot_imm_jmpf(mut self, op: u8, slot: u8, pool_idx: u16) -> Self {
+        self.operands = ((op as u32) << 24) | ((slot as u32) << 16) | (pool_idx as u32);
+        self
+    }
+
+    pub fn bin_slot_imm_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    /// LogNotJmpf: [15:0] false-branch target.
+    pub fn with_log_not_jmpf(mut self, target: u16) -> Self {
+        self.operands = target as u32;
+        self
+    }
+
+    pub fn log_not_jmpf_target(&self) -> usize {
+        (self.operands & 0xFFFF) as usize
+    }
+
     pub fn bin_slot_slot_parts(&self) -> (u8, usize, usize) {
         let o = self.operands;
         (
@@ -483,6 +512,30 @@ impl ArchivedByte {
     pub fn with_bin_slot_slot(mut self, op: u8, a: u8, b: u8) -> Self {
         self.operands = (((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8)).into();
         self
+    }
+
+    pub fn with_bin_slot_imm_jmpf(mut self, op: u8, slot: u8, pool_idx: u16) -> Self {
+        let packed = ((op as u32) << 24) | ((slot as u32) << 16) | (pool_idx as u32);
+        self.operands = packed.into();
+        self
+    }
+
+    pub fn bin_slot_imm_jmpf_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as usize,
+        )
+    }
+
+    pub fn with_log_not_jmpf(mut self, target: u16) -> Self {
+        self.operands = (target as u32).into();
+        self
+    }
+
+    pub fn log_not_jmpf_target(&self) -> usize {
+        (u32::from(self.operands) & 0xFFFF) as usize
     }
 
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {

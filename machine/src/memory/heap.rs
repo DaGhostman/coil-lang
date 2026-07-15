@@ -1,5 +1,7 @@
 //! Mark-and-sweep heap: intrusive object list, string interning, and GC.
 
+use std::collections::{HashMap, HashSet};
+
 const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
 const GC_GROWTH_FACTOR: usize = 2;
 
@@ -11,6 +13,8 @@ pub struct Heap {
     gc_growth_factor: usize,
     strings: Table<()>,
     head: Option<Object>,
+    /// O(1) lookup of live objects by address (updated on alloc/sweep).
+    addr_index: HashMap<u64, Object>,
 }
 
 impl Default for Heap {
@@ -21,6 +25,7 @@ impl Default for Heap {
             gc_growth_factor: GC_GROWTH_FACTOR,
             strings: Table::default(),
             head: None,
+            addr_index: HashMap::new(),
         }
     }
 }
@@ -57,6 +62,7 @@ impl Heap {
         let size = object.size();
         self.head = Some(object);
         self.alloc_bytes += size;
+        self.addr_index.insert(object.addr(), object);
 
         #[cfg(debug_assertions)]
         println!(
@@ -124,6 +130,7 @@ impl Heap {
                 prev_obj = curr_obj;
                 curr_obj = next;
             } else {
+                self.addr_index.remove(&curr_ref.addr());
                 unsafe { self.dealloc(curr_ref) };
                 curr_obj = next;
                 if let Some(prev_ref) = prev_obj {
@@ -201,11 +208,12 @@ impl Heap {
     }
 
     pub fn trace(&mut self, values: &[u64]) {
+        let roots: HashSet<u64> = values.iter().copied().collect();
         let mut current = self.head;
 
         let mut gray = Vec::with_capacity(values.len());
         while let Some(reference) = current {
-            if !reference.is_marked() && values.contains(&{ reference.addr() }) {
+            if !reference.is_marked() && roots.contains(&reference.addr()) {
                 reference.mark(&mut gray);
             }
 
@@ -218,16 +226,9 @@ impl Heap {
         self.head
     }
 
-    /// Find a heap object by its address (linear scan).
+    /// Find a heap object by its address (O(1) via addr index).
     pub fn find_object_by_addr(&self, addr: u64) -> Option<Object> {
-        let mut current = self.head_for_lookup();
-        while let Some(reference) = current {
-            if reference.addr() == addr {
-                return Some(reference);
-            }
-            current = reference.get_next();
-        }
-        None
+        self.addr_index.get(&addr).copied()
     }
 
     /// Write back FFI scratch-buffer values into a live `ObjArray`.
@@ -249,17 +250,9 @@ impl Heap {
         }
     }
 
-    /// True if `addr` is a live heap object. Used to classify stack values as
-    /// immediates vs heap pointers (`MAKE_ENUM`). O(n) in live object count.
+    /// True if `addr` is a live heap object.
     pub fn contains_addr(&self, addr: *mut u8) -> bool {
-        let mut current = self.head;
-        while let Some(reference) = current {
-            if reference.addr() as *mut u8 == addr {
-                return true;
-            }
-            current = reference.get_next();
-        }
-        false
+        self.addr_index.contains_key(&(addr as u64))
     }
 }
 
