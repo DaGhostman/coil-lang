@@ -33,7 +33,10 @@ impl HostClosureFn {
     }
 
     /// Convenience builder for common int→int unary functions.
-    pub fn unary_i64(name: impl Into<String>, func: impl Fn(i64) -> i64 + Send + Sync + 'static) -> Self {
+    pub fn unary_i64(
+        name: impl Into<String>,
+        func: impl Fn(i64) -> i64 + Send + Sync + 'static,
+    ) -> Self {
         let signature = FfiSignature::from_parts(name, vec![FfiType::Int], FfiType::Int).unwrap();
         Self::new(signature, move |_heap, args| {
             Ok(Some(Value::from(func(args[0].as_int()))))

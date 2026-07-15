@@ -152,12 +152,7 @@ roots = ["./src"]
         ("src/main.0s", "use foo::sadge;\nfn main() { sadge(); }\n"),
         ("src/foo/sadge.0s", "fn sadge() { print \"%x\\n\", 420; }\n"),
     ];
-    let (root, entry) = build_project(
-        "use_single_segment",
-        manifest,
-        files,
-        "src/main.0s",
-    );
+    let (root, entry) = build_project("use_single_segment", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "1a4\n");
 }
@@ -170,18 +165,10 @@ fn use_with_alias_renames_imported_item() {
 roots = ["./src"]
 "#;
     let files = &[
-        (
-            "src/main.0s",
-            "use foo::sadge as f;\nfn main() { f(); }\n",
-        ),
+        ("src/main.0s", "use foo::sadge as f;\nfn main() { f(); }\n"),
         ("src/foo/sadge.0s", "fn sadge() { print \"%i\", 99; }\n"),
     ];
-    let (root, entry) = build_project(
-        "use_with_alias",
-        manifest,
-        files,
-        "src/main.0s",
-    );
+    let (root, entry) = build_project("use_with_alias", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "99");
 }
@@ -194,21 +181,10 @@ fn use_multi_segment_path_walks_into_nested_directory() {
 roots = ["./src"]
 "#;
     let files = &[
-        (
-            "src/main.0s",
-            "use lib::io::read;\nfn main() { read(); }\n",
-        ),
-        (
-            "src/lib/io/read.0s",
-            "fn read() { print \"%i\", 7; }\n",
-        ),
+        ("src/main.0s", "use lib::io::read;\nfn main() { read(); }\n"),
+        ("src/lib/io/read.0s", "fn read() { print \"%i\", 7; }\n"),
     ];
-    let (root, entry) = build_project(
-        "use_multi_segment",
-        manifest,
-        files,
-        "src/main.0s",
-    );
+    let (root, entry) = build_project("use_multi_segment", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "7");
 }
@@ -223,10 +199,7 @@ fn multiple_roots_search_in_order() {
 roots = ["./src", "./vendor"]
 "#;
     let files = &[
-        (
-            "src/main.0s",
-            "use foo::greet;\nfn main() { greet(); }\n",
-        ),
+        ("src/main.0s", "use foo::greet;\nfn main() { greet(); }\n"),
         (
             "src/foo/greet.0s",
             "fn greet() { print \"%s\", \"from-src\"; }\n",
@@ -238,12 +211,7 @@ roots = ["./src", "./vendor"]
             "fn greet() { print \"%s\", \"from-vendor\"; }\n",
         ),
     ];
-    let (root, entry) = build_project(
-        "multiple_roots",
-        manifest,
-        files,
-        "src/main.0s",
-    );
+    let (root, entry) = build_project("multiple_roots", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "from-src");
 }
@@ -303,12 +271,7 @@ roots = ["./src"]
              fn greet() { print \"%i\", 200; }\n",
         ),
     ];
-    let (root, entry) = build_project(
-        "use_glob",
-        manifest,
-        files,
-        "src/main.0s",
-    );
+    let (root, entry) = build_project("use_glob", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "100200");
 }
@@ -330,33 +293,19 @@ fn use_glob_does_not_reach_subdirectory_files() {
 roots = ["./src"]
 "#;
     let files = &[
-        (
-            "src/main.0s",
-            "use foo::*;\nfn main() { top_only(); }\n",
-        ),
+        ("src/main.0s", "use foo::*;\nfn main() { top_only(); }\n"),
         // The file `foo.0s` has the function
         // `top_only` as a top-level item. The glob
         // targets THIS file.
-        (
-            "src/foo.0s",
-            "fn top_only() { print \"%s\", \"ok\"; }\n",
-        ),
+        ("src/foo.0s", "fn top_only() { print \"%s\", \"ok\"; }\n"),
         // The file `foo/bar.0s` is a separate
         // module with namespace `foo::bar`. It's
         // NOT auto-loaded by `use foo::*;` — the
         // user has to write a separate
         // `use foo::bar;` to reach its items.
-        (
-            "src/foo/bar.0s",
-            "fn bar() { print \"%s\", \"BAD\"; }\n",
-        ),
+        ("src/foo/bar.0s", "fn bar() { print \"%s\", \"BAD\"; }\n"),
     ];
-    let (root, entry) = build_project(
-        "use_glob_subdir",
-        manifest,
-        files,
-        "src/main.0s",
-    );
+    let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "ok");
 }

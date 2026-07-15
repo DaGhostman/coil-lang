@@ -474,7 +474,7 @@ impl<const S: usize> Machine<S> {
             let id =
                 crate::ffi::register_on_library(obj_lib, signature).map_err(|e| e.to_string())?;
             self.userland_libraries
-                .insert(addr, std::sync::Arc::new(lib_obj_mut.clone()));
+                .insert(addr, std::sync::Arc::new(*lib_obj_mut));
             Ok(id)
         } else {
             Err("not a library object".to_string())
@@ -1063,7 +1063,7 @@ impl<const S: usize> Machine<S> {
                                 crate::memory::Object::Library(gc) => gc,
                                 _ => return,
                             };
-                            let lib_ref: &crate::memory::ObjLibrary = &(**l).as_ref();
+                            let lib_ref: &crate::memory::ObjLibrary = (**l).as_ref();
                             if function_id < lib_ref.signatures.len() {
                                 let registered = &lib_ref.signatures[function_id];
                                 let ffi_sig = registered.ffi_signature();
@@ -1200,7 +1200,7 @@ impl<const S: usize> Machine<S> {
                     let lib_obj = self.userland_libraries.get(&lib_addr).cloned();
                     let result_id = match lib_obj {
                         Some(obj_arc) => {
-                            let mut owned = (*obj_arc).clone();
+                            let mut owned = *obj_arc;
                             let ffi_sig = crate::ffi::FfiSignature {
                                 name,
                                 args: arg_types,
@@ -1334,7 +1334,7 @@ impl<const S: usize> Machine<S> {
                     // `Member::Object` (the GC traces the heap
                     // object on mark).
                     let operands = opcode.operand_u32();
-                    let tag = (operands >> 16) as u32;
+                    let tag = operands >> 16;
                     let arity = (operands & 0xFFFF) as usize;
 
                     // Pop arity values into a buffer. The first
@@ -1640,7 +1640,7 @@ impl<const S: usize> Machine<S> {
                     // binding's slot. See `Instruction::UNPACK`
                     // for the rationale.
                     let operands = opcode.operand_u32();
-                    let expected_tag = (operands >> 16) as u32;
+                    let expected_tag = operands >> 16;
 
                     if self.stack.tell() == 0 {
                         // No scrutinee — bail.

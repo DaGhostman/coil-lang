@@ -138,9 +138,9 @@ fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup
 /// is skipped (the codegen just emits a POP to consume the
 /// discarded inner value).
 #[allow(dead_code)] // Reserved for the Phase 17C+ inner-pattern
-                    // runtime-test disambiguation. The current
-                    // forward pass only groups by outer tag and
-                    // does not consult this helper.
+// runtime-test disambiguation. The current
+// forward pass only groups by outer tag and
+// does not consult this helper.
 fn arm_has_runtime_test(arm: &MatchArm) -> bool {
     /// Recursive helper: does the inner payload of this arm's
     /// outer Constructor pattern carry a `Binding` or further
@@ -197,10 +197,10 @@ fn arm_has_runtime_test(arm: &MatchArm) -> bool {
 /// order (so the test chain iterates the fields in the same slot
 /// order as the VM's `UNPACK` / `JUMP_IF_MATCH` payload-push).
 #[allow(dead_code, unused_variables)] // Reserved for the Phase 17C+ inner-pattern runtime
-                    // test disambiguation. Defined here for the upcoming
-                    // multi-arm match group dispatch work.
-                    // `fail_label` will be used by the failure path
-                    // (JMP to fail_label) once that arm is wired up.
+// test disambiguation. Defined here for the upcoming
+// multi-arm match group dispatch work.
+// `fail_label` will be used by the failure path
+// (JMP to fail_label) once that arm is wired up.
 fn emit_inner_test<'compiler>(
     arm_idx: usize,
     checker: &Checker,
@@ -235,11 +235,9 @@ fn emit_inner_test<'compiler>(
                         let slot = next_available_slot(match_bindings_per_arm);
                         match_bindings_per_arm
                             .entry(arm_idx)
-                            .or_insert_with(HashMap::new)
+                            .or_default()
                             .insert(name.to_string(), slot);
-                        bytecode.push(
-                            Byte::new(Instruction::STORE).with_operand_u32(slot),
-                        );
+                        bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(slot));
                     }
                     Pattern::Constructor {
                         enum_name: sub_enum,
@@ -291,9 +289,7 @@ fn emit_inner_test<'compiler>(
                                 fail_label,
                             );
                         } else if let Some(label) = pass_label {
-                            if let Some(inner_tag) =
-                                checker.tag_for(sub_enum, sub_variant)
-                            {
+                            if let Some(inner_tag) = checker.tag_for(sub_enum, sub_variant) {
                                 bb.emit_jump_to(
                                     label,
                                     BbJumpKind::JumpIfMatch {
@@ -303,9 +299,7 @@ fn emit_inner_test<'compiler>(
                                     bytecode,
                                 );
                             } else {
-                                bytecode.push(Byte::new(
-                                    Instruction::POP,
-                                ));
+                                bytecode.push(Byte::new(Instruction::POP));
                             }
                         } else {
                             // Last arm in the group — emit POP to
@@ -328,10 +322,8 @@ fn emit_inner_test<'compiler>(
             // sub-patterns (no nested Constructor), the inner test
             // always succeeds, so a trailing JMP to pass_label is
             // still emitted to route to the arm body.
-            if !any_nested_ctor {
-                if let Some(label) = pass_label {
-                    bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
-                }
+            if !any_nested_ctor && let Some(label) = pass_label {
+                bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
             }
         }
         PatternPayload::Record(fields) => {
@@ -346,10 +338,8 @@ fn emit_inner_test<'compiler>(
             // to the wrong slot. (Phase 18B — nested record
             // patterns.)
             let decl_order = checker.payload_tys_for(enum_name, variant_name);
-            let pattern_site: std::collections::HashMap<
-                &str,
-                &Pattern<'compiler>,
-            > = fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
+            let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
+                fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
             let mut any_nested_ctor = false;
             for (decl_name, _) in decl_order.iter() {
                 let sub_pat = match pattern_site.get(decl_name.as_str()) {
@@ -371,11 +361,9 @@ fn emit_inner_test<'compiler>(
                         let slot = next_available_slot(match_bindings_per_arm);
                         match_bindings_per_arm
                             .entry(arm_idx)
-                            .or_insert_with(HashMap::new)
+                            .or_default()
                             .insert(name.to_string(), slot);
-                        bytecode.push(
-                            Byte::new(Instruction::STORE).with_operand_u32(slot),
-                        );
+                        bytecode.push(Byte::new(Instruction::STORE).with_operand_u32(slot));
                     }
                     Pattern::Constructor {
                         enum_name: sub_enum,
@@ -405,9 +393,7 @@ fn emit_inner_test<'compiler>(
                                 fail_label,
                             );
                         } else if let Some(label) = pass_label {
-                            if let Some(inner_tag) =
-                                checker.tag_for(sub_enum, sub_variant)
-                            {
+                            if let Some(inner_tag) = checker.tag_for(sub_enum, sub_variant) {
                                 bb.emit_jump_to(
                                     label,
                                     BbJumpKind::JumpIfMatch {
@@ -417,9 +403,7 @@ fn emit_inner_test<'compiler>(
                                     bytecode,
                                 );
                             } else {
-                                bytecode.push(Byte::new(
-                                    Instruction::POP,
-                                ));
+                                bytecode.push(Byte::new(Instruction::POP));
                             }
                         } else {
                             // Last arm in the group — emit POP
@@ -431,10 +415,8 @@ fn emit_inner_test<'compiler>(
                     }
                 }
             }
-            if !any_nested_ctor {
-                if let Some(label) = pass_label {
-                    bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
-                }
+            if !any_nested_ctor && let Some(label) = pass_label {
+                bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
             }
         }
     }
@@ -443,7 +425,7 @@ fn emit_inner_test<'compiler>(
 /// Returns the next available slot index for a new binding.
 /// Slots start at 1 (slot 0 is reserved for the scrutinee).
 #[allow(dead_code)] // Reserved for the Phase 17C+ inner-pattern runtime
-                    // test disambiguation.
+// test disambiguation.
 fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>) -> u32 {
     let mut max_slot = 0u32;
     for arm_bindings in match_bindings.values() {
@@ -767,10 +749,8 @@ fn emit_pattern_binding<'compiler>(
                 // get its payload values at the right slot
                 // positions before binding its sub-patterns.
                 if consume_values && !is_outer {
-                    bytecode.push(
-                        Byte::new(Instruction::Unpack)
-                            .with_operand_u32(parts.len() as u32),
-                    );
+                    bytecode
+                        .push(Byte::new(Instruction::Unpack).with_operand_u32(parts.len() as u32));
                 }
                 // Recurse for sub-patterns with the same
                 // `consume_values` flag. The inner values were
@@ -794,18 +774,17 @@ fn emit_pattern_binding<'compiler>(
                 // sub-patterns don't use `parent_decl_order`
                 // (they walk in source order).
                 for sub in parts {
-                    let sub_decl_order: Vec<(String, Ty)> =
-                        if let Pattern::Constructor {
-                            enum_name: sub_enum,
-                            variant_name: sub_variant,
-                            payload: PatternPayload::Record(_),
-                            ..
-                        } = sub
-                        {
-                            checker.payload_tys_for(sub_enum, sub_variant)
-                        } else {
-                            Vec::new()
-                        };
+                    let sub_decl_order: Vec<(String, Ty)> = if let Pattern::Constructor {
+                        enum_name: sub_enum,
+                        variant_name: sub_variant,
+                        payload: PatternPayload::Record(_),
+                        ..
+                    } = sub
+                    {
+                        checker.payload_tys_for(sub_enum, sub_variant)
+                    } else {
+                        Vec::new()
+                    };
                     emit_pattern_binding(
                         checker,
                         match_bindings,
@@ -918,31 +897,26 @@ fn emit_pattern_binding<'compiler>(
                             // u16 values: lower = slot, upper
                             // = arity.
                             let inner_arity =
-                                checker.payload_tys_for(sub_enum, sub_variant)
-                                    .len() as u16;
+                                checker.payload_tys_for(sub_enum, sub_variant).len() as u16;
                             bytecode.push(
                                 Byte::new(Instruction::UnpackAt)
-                                    .with_operands_u16([
-                                        field_slot as u16,
-                                        inner_arity,
-                                    ]),
+                                    .with_operands_u16([field_slot as u16, inner_arity]),
                             );
                         }
                         // Compute the sub-pattern's own
                         // record decl_order if it's a record
                         // constructor (for unbounded nesting).
-                        let sub_decl_order: Vec<(String, Ty)> =
-                            if let Pattern::Constructor {
-                                enum_name: sub_enum,
-                                variant_name: sub_variant,
-                                payload: PatternPayload::Record(_),
-                                ..
-                            } = sub_pat
-                            {
-                                checker.payload_tys_for(sub_enum, sub_variant)
-                            } else {
-                                Vec::new()
-                            };
+                        let sub_decl_order: Vec<(String, Ty)> = if let Pattern::Constructor {
+                            enum_name: sub_enum,
+                            variant_name: sub_variant,
+                            payload: PatternPayload::Record(_),
+                            ..
+                        } = sub_pat
+                        {
+                            checker.payload_tys_for(sub_enum, sub_variant)
+                        } else {
+                            Vec::new()
+                        };
                         emit_pattern_binding(
                             checker,
                             match_bindings,
@@ -1017,10 +991,10 @@ impl Compiler {
     /// Returns the slot ID (u32) if the name is found, `None`
     /// otherwise.
     fn lookup_slot(&self, name: &str) -> Option<u32> {
-        if let Some(map) = &self.context.match_bindings {
-            if let Some(&slot) = map.get(name) {
-                return Some(slot);
-            }
+        if let Some(map) = &self.context.match_bindings
+            && let Some(&slot) = map.get(name)
+        {
+            return Some(slot);
         }
         self.context
             .variables
@@ -1080,7 +1054,6 @@ impl Compiler {
                 if name == crate::typechecking::ty::FLOAT
         )
     }
-
 
     /// Extract the enum name from the inferred type of a field-access
     /// receiver (Phase 18D — `Expression::Access` codegen; Phase 19
@@ -1163,10 +1136,7 @@ impl Compiler {
                     // minted a fresh `TyVar` and then unified it
                     // with `Ty::Record { foo: int }`) resolves
                     // to the actual record type. Phase 25.
-                    crate::typechecking::subst::apply_ty_prune(
-                        self.checker.subst(),
-                        &t,
-                    )
+                    crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
                 })
             }
             Expression::Access(inner, field) => {
@@ -1278,22 +1248,16 @@ impl Compiler {
                         .keys()
                         .filter(|fqn| {
                             fqn.starts_with(&prefix)
-                                && fqn[prefix.len()..]
-                                    .contains("::")
-                                == false
-                                && !fqn[prefix.len()..]
-                                    .is_empty()
+                                && !fqn[prefix.len()..].contains("::")
+                                && !fqn[prefix.len()..].is_empty()
                         })
                         .cloned()
                         .collect();
                     for fqn in fqns {
                         // The bare item name is the
                         // last segment of the FQN.
-                        let item_name = fqn
-                            [prefix.len()..]
-                            .to_string();
-                        self.aliases
-                            .insert(item_name, fqn);
+                        let item_name = fqn[prefix.len()..].to_string();
+                        self.aliases.insert(item_name, fqn);
                     }
                 } else {
                     // Concrete import. The qualified
@@ -1377,20 +1341,16 @@ impl Compiler {
                 // falls through to the legacy child-by-child
                 // iteration so we don't regress unrelated cases.
                 let mut is_let = false;
-                if children.len() == 2 {
-                    if let Expression::Variable(name, _ty) = &children[0].1.as_ref() {
-                        let slot =
-                            self.context.variables.intern(name.to_string()) as u32;
-                        // Emit the RHS.
-                        let mut rhs_bc = self.do_compile(&children[1]);
-                        bytecode.append(&mut rhs_bc);
-                        // Append the explicit store-pop-and-write.
-                        bytecode.push(
-                            Byte::new(Instruction::StorePop)
-                                .with_operand_u32(slot),
-                        );
-                        is_let = true;
-                    }
+                if children.len() == 2
+                    && let Expression::Variable(name, _ty) = &children[0].1.as_ref()
+                {
+                    let slot = self.context.variables.intern(name.to_string()) as u32;
+                    // Emit the RHS.
+                    let mut rhs_bc = self.do_compile(&children[1]);
+                    bytecode.append(&mut rhs_bc);
+                    // Append the explicit store-pop-and-write.
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    is_let = true;
                 }
                 if !is_let {
                     children.iter().for_each(|child| {
@@ -1492,10 +1452,9 @@ impl Compiler {
                 // caller's scope.
                 self.module_items
                     .entry(self.namespace.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(name.to_string());
-                self.functions
-                    .insert(qualified, self.bytecode.len());
+                self.functions.insert(qualified, self.bytecode.len());
 
                 let mut a = self.do_compile(args);
 
@@ -1600,9 +1559,7 @@ impl Compiler {
                     bytecode.append(&mut bc);
                 }
                 let arity = items.len() as u32;
-                bytecode.push(
-                    Byte::new(Instruction::MakeTuple).with_operand_u32(arity),
-                );
+                bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
             }
             Expression::Array(items) => {
                 for c in items {
@@ -1610,9 +1567,7 @@ impl Compiler {
                     bytecode.append(&mut bc);
                 }
                 let arity = items.len() as u32;
-                bytecode.push(
-                    Byte::new(Instruction::MakeArray).with_operand_u32(arity),
-                );
+                bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(arity));
             }
             // ---- Phase 25: dict literal ----
             //
@@ -1627,8 +1582,7 @@ impl Compiler {
                 // Eagerly resolve field names to strings before
                 // any bytecode emission so the byte offsets
                 // remain stable.
-                let field_names: Vec<&str> =
-                    items.iter().map(|f| f.name).collect();
+                let field_names: Vec<&str> = items.iter().map(|f| f.name).collect();
                 for (f, name) in items.iter().zip(field_names.iter()) {
                     // value first (so it's UNDER the field name
                     // when both are pushed). MakeDict pops the
@@ -1645,14 +1599,11 @@ impl Compiler {
                     bytecode
                         .push(Byte::new(Instruction::STRING).with_operand_u32(name.len() as u32));
                     for ch in name.chars() {
-                        bytecode
-                            .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
                     }
                 }
                 let arity = items.len() as u32;
-                bytecode.push(
-                    Byte::new(Instruction::MakeDict).with_operand_u32(arity),
-                );
+                bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(arity));
             }
             // `t[i]` — pop the index (top), pop the target,
             // push the element at `target[index]`. The Index
@@ -1697,9 +1648,8 @@ impl Compiler {
                     // Emit a defensive operand so the bytecode
                     // stays well-formed (DeclareFFI on a partial
                     // stack will just fail at runtime).
-                    self.bytecode.push(
-                        Byte::new(Instruction::DeclareFFI).with_operand_u32(0),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(0));
                 } else {
                     let lib = &args[0];
                     let name = &args[1];
@@ -1710,7 +1660,7 @@ impl Compiler {
                     // Otherwise it's a type error — emit a
                     // diagnostic and proceed defensively.
                     let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
-                        Expression::Tuple(items) => items.iter().cloned().collect(),
+                        Expression::Tuple(items) => items.to_vec(),
                         _ => {
                             let mut m = common::Message::error(
                                 "declare(...) arguments tuple must be (T1, T2, ...) syntax"
@@ -1778,11 +1728,10 @@ impl Compiler {
                     let args_tuple = &args[2];
 
                     let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
-                        Expression::Tuple(items) => items.iter().cloned().collect(),
+                        Expression::Tuple(items) => items.to_vec(),
                         _ => {
                             let mut m = common::Message::error(
-                                "invoke(...) arguments must be a tuple in position 3"
-                                    .to_string(),
+                                "invoke(...) arguments must be a tuple in position 3".to_string(),
                                 args_tuple.0.into_range(),
                             );
                             m.push(common::Label::new(
@@ -1878,7 +1827,7 @@ impl Compiler {
                     self.functions.drain();
                     self.do_compile(func);
 
-                    for (method, _) in self.functions.iter() {
+                    for method in self.functions.keys() {
                         self.context
                             .methods
                             .entry(owner.to_string())
@@ -1999,7 +1948,12 @@ impl Compiler {
                 // to skip past the body when the condition is
                 // false.
                 let exit_label_target = self.bytecode.len() as u32;
-                bb.bind_label(exit_label, exit_label_target, &mut self.bytecode, &mut self.constants);
+                bb.bind_label(
+                    exit_label,
+                    exit_label_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
 
                 // Emit the back-edge JMP → top_label. When the
                 // body finishes, control jumps back to the top of
@@ -2008,7 +1962,12 @@ impl Compiler {
 
                 // NOW bind top_label (after the back-edge JMP was
                 // emitted, so the JMP's position is in `pending`).
-                bb.bind_label(top_label, top_label_target, &mut self.bytecode, &mut self.constants);
+                bb.bind_label(
+                    top_label,
+                    top_label_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
 
                 // Validate: every label that had a pending jump is
                 // bound. (Both `top_label` and `exit_label` were
@@ -2039,7 +1998,11 @@ impl Compiler {
             }
             Expression::Call { name, args } => {
                 let identifier = self.resolve_variable(name);
-                let n = self.aliases.get(&identifier).cloned().unwrap_or_else(|| identifier.clone());
+                let n = self
+                    .aliases
+                    .get(&identifier)
+                    .cloned()
+                    .unwrap_or_else(|| identifier.clone());
 
                 // Phase 22b: if `name` was declared by an
                 // `extern` block, dispatch to runtime
@@ -2050,9 +2013,7 @@ impl Compiler {
                 // loaded from a let-slot and `fn_id` is
                 // loaded from another (both interned at
                 // `extern_block` codegen time).
-                if let Some(&(lib_slot, fn_id_slot)) =
-                    self.extern_runtime_functions.get(&n)
-                {
+                if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
                     // Stage arg bytecode in a local Vec to
                     // release the `&mut self.bytecode` borrow
                     // before the loop calls `self.do_compile`.
@@ -2065,20 +2026,15 @@ impl Compiler {
                     } else {
                         0
                     };
-                    self.bytecode.push(
-                        Byte::new(Instruction::LOAD).with_operand_u32(lib_slot),
-                    );
-                    self.bytecode.push(
-                        Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
+                    self.bytecode
+                        .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
                     self.bytecode.append(&mut arg_bc);
-                    self.bytecode.push(
-                        Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32),
-                    );
-                    self.bytecode.push(
-                        Byte::new(Instruction::FfiInvoke)
-                            .with_operand_u32(arity as u32),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                    self.bytecode
+                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
                 } else if let Some(&native_id) = self.native.get(&n) {
                     let mut arg_bc = Vec::new();
                     let arity = if let Some(items) = args {
@@ -2089,16 +2045,13 @@ impl Compiler {
                     } else {
                         0
                     };
-                    self.bytecode.push(
-                        Byte::new(Instruction::CONST).with_value_u32(native_id as u32),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
                     self.bytecode.append(&mut arg_bc);
-                    self.bytecode.push(
-                        Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32),
-                    );
-                    self.bytecode.push(
-                        Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                    self.bytecode
+                        .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
                 } else if let Some(offset) = self.functions.get(&n).copied() {
                     if let Some(args) = args {
                         args.iter()
@@ -2110,12 +2063,10 @@ impl Compiler {
                     // lives in `value[31:0]`. Saves one VM dispatch
                     // per call site (recursive functions like
                     // `fib` pay this on every recursive call).
-                    bytecode.push(
-                        Byte::new(Instruction::CALL).with_call_packed(
-                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                            offset as u32,
-                        ),
-                    );
+                    bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
+                        args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                        offset as u32,
+                    ));
                 } else {
                     let mut message =
                         Message::error("Unknown function".to_string(), span.into_range());
@@ -2218,11 +2169,11 @@ impl Compiler {
                     // the CURRENT bytecode position (= the start of
                     // this branch). This patches the JMPF placeholder
                     // emitted by the previous iteration.
-                    if i > 0 {
-                        if let Some(prev_label) = branch_start_labels[i - 1] {
-                            let target = self.bytecode.len() as u32;
-                            bb.bind_label(prev_label, target, &mut self.bytecode, &mut self.constants);
-                        }
+                    if i > 0
+                        && let Some(prev_label) = branch_start_labels[i - 1]
+                    {
+                        let target = self.bytecode.len() as u32;
+                        bb.bind_label(prev_label, target, &mut self.bytecode, &mut self.constants);
                     }
 
                     // Emit the condition (if any) followed by a JMPF
@@ -2465,12 +2416,10 @@ impl Compiler {
                         // Push field-name string last (so it's
                         // on top). Use STRING+DATA encoding.
                         bytecode.push(
-                            Byte::new(Instruction::STRING)
-                                .with_operand_u32(field.len() as u32),
+                            Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32),
                         );
                         for ch in field.chars() {
-                            bytecode
-                                .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
                         }
                         bytecode.push(Byte::new(Instruction::SetField));
                     }
@@ -2504,8 +2453,10 @@ impl Compiler {
                                     *state = true;
                                 });
                             } else {
-                                let mut message =
-                                    Message::error("Assignment error".to_string(), span.into_range());
+                                let mut message = Message::error(
+                                    "Assignment error".to_string(),
+                                    span.into_range(),
+                                );
                                 message.push(DiagLabel::new(
                                     format!(
                                         "Unable to assign to an already assigned constant '{}'",
@@ -2538,10 +2489,8 @@ impl Compiler {
                         let mut expr = self.do_compile(value);
 
                         bytecode.append(&mut expr);
-                        bytecode.push(
-                            Byte::new(Instruction::StorePop)
-                                .with_operand_u32(symbol as u32),
-                        );
+                        bytecode
+                            .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
                     } else {
                         let mut message =
                             Message::error("Undefined variable".to_string(), span.into_range());
@@ -2592,39 +2541,29 @@ impl Compiler {
                 //
                 // 1. Synthesize a let-slot for the library
                 //    handle (shared by every fn in this block).
-                let lib_slot = if let Some(&existing) =
-                    self.extern_runtime_libs.get(library.as_str())
-                {
-                    existing
-                } else {
-                    let name = format!("__ext_lib_{}", library);
-                    let slot = self.context.variables.intern(name) as u32;
-                    self.extern_runtime_libs
-                        .insert(library.clone(), slot);
-                    slot
-                };
+                let lib_slot =
+                    if let Some(&existing) = self.extern_runtime_libs.get(library.as_str()) {
+                        existing
+                    } else {
+                        let name = format!("__ext_lib_{}", library);
+                        let slot = self.context.variables.intern(name) as u32;
+                        self.extern_runtime_libs.insert(library.clone(), slot);
+                        slot
+                    };
                 // 2. dlopen the library (only on the first
                 //    occurrence across the whole compile).
-                if !self
-                    .extern_runtime_libs_loaded
-                    .contains(library.as_str())
-                {
-                    self.extern_runtime_libs_loaded
-                        .insert(library.clone());
+                if !self.extern_runtime_libs_loaded.contains(library.as_str()) {
+                    self.extern_runtime_libs_loaded.insert(library.clone());
                     let span: SimpleSpan = (0..0).into();
                     let path_expr: parser::ast::Output = (
                         span,
-                        Box::new(parser::ast::Expression::String(
-                            library.as_str(),
-                        )),
+                        Box::new(parser::ast::Expression::String(library.as_str())),
                     );
                     let mut bc = self.do_compile(&path_expr);
                     self.bytecode.append(&mut bc);
                     self.bytecode.push(Byte::new(Instruction::FfiLoad));
-                    self.bytecode.push(
-                        Byte::new(Instruction::StorePop)
-                            .with_operand_u32(lib_slot),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::StorePop).with_operand_u32(lib_slot));
                 }
                 // 3. For each declared function, emit declare(lib,
                 //    name, (arg_tags...), ret) and store fn id.
@@ -2632,41 +2571,26 @@ impl Compiler {
                     let fn_name = decl.name.to_string();
                     // First-wins on fn-name collisions across
                     // multiple `extern` blocks.
-                    if self.extern_runtime_functions.contains_key(&fn_name)
-                    {
+                    if self.extern_runtime_functions.contains_key(&fn_name) {
                         continue;
                     }
                     let fn_id_slot_name = format!("__ext_fn_{}", fn_name);
-                    let fn_id_slot = self
-                        .context
-                        .variables
-                        .intern(fn_id_slot_name) as u32;
+                    let fn_id_slot = self.context.variables.intern(fn_id_slot_name) as u32;
                     // Push the library handle.
-                    self.bytecode.push(
-                        Byte::new(Instruction::LOAD).with_operand_u32(lib_slot),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                     // Push the function name (string literal).
                     let span: SimpleSpan = (0..0).into();
-                    let name_expr: parser::ast::Output = (
-                        span,
-                        Box::new(parser::ast::Expression::String(
-                            decl.name,
-                        )),
-                    );
+                    let name_expr: parser::ast::Output =
+                        (span, Box::new(parser::ast::Expression::String(decl.name)));
                     let mut name_bc = self.do_compile(&name_expr);
                     self.bytecode.append(&mut name_bc);
                     // Push each arg type as a CONST tag
                     // (skipping the FFIType enum dispatch).
                     let mut arg_type_tags: Vec<u32> = Vec::new();
-                    if let Expression::Fragment(items) =
-                        decl.args.1.as_ref()
-                    {
+                    if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
-                            if let Expression::Argument(
-                                type_expr,
-                                _param_name,
-                            ) = arg.1.as_ref()
-                            {
+                            if let Expression::Argument(type_expr, _param_name) = arg.1.as_ref() {
                                 // Phase 24: the type is now a
                                 // full Output. For the FFI
                                 // extern-block path we only
@@ -2678,13 +2602,9 @@ impl Compiler {
                                     Expression::Type(n) => *n,
                                     _ => "",
                                 };
-                                if let Some(tag) =
-                                    ffi_type_tag_from_str(type_name)
-                                {
-                                    self.bytecode.push(
-                                        Byte::new(Instruction::CONST)
-                                            .with_value_u32(tag as u32),
-                                    );
+                                if let Some(tag) = ffi_type_tag_from_str(type_name) {
+                                    self.bytecode
+                                        .push(Byte::new(Instruction::CONST).with_value_u32(tag));
                                     arg_type_tags.push(tag);
                                 } else {
                                     self.messages.push({
@@ -2709,13 +2629,11 @@ impl Compiler {
                             } else {
                                 self.messages.push({
                                     let mut m = common::Message::error(
-                                        "Extern fn argument must be `name: type` form"
-                                            .to_string(),
+                                        "Extern fn argument must be `name: type` form".to_string(),
                                         arg.0.into_range(),
                                     );
                                     m.push(common::Label::new(
-                                        "got an unexpected expression"
-                                            .to_string(),
+                                        "got an unexpected expression".to_string(),
                                         arg.0.into_range(),
                                     ));
                                     m
@@ -2725,32 +2643,20 @@ impl Compiler {
                         }
                     }
                     let arity = arg_type_tags.len() as u32;
-                    self.bytecode.push(
-                        Byte::new(Instruction::MakeTuple).with_operand_u32(arity),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
                     // Push the ret type tag (top of stack for DeclareFFI).
-                    let ret_tag = decl
-                        .returns
-                        .and_then(|s| ffi_type_tag_from_str(s))
-                        .unwrap_or(0);
-                    self.bytecode.push(
-                        Byte::new(Instruction::CONST)
-                            .with_value_u32(ret_tag as u32),
-                    );
+                    let ret_tag = decl.returns.and_then(ffi_type_tag_from_str).unwrap_or(0);
+                    self.bytecode
+                        .push(Byte::new(Instruction::CONST).with_value_u32(ret_tag));
                     // Emit DeclareFFI.
-                    self.bytecode.push(
-                        Byte::new(Instruction::DeclareFFI)
-                            .with_operand_u32(arity),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(arity));
                     // Store the function id.
-                    self.bytecode.push(
-                        Byte::new(Instruction::StorePop)
-                            .with_operand_u32(fn_id_slot),
-                    );
-                    self.extern_runtime_functions.insert(
-                        fn_name.clone(),
-                        (lib_slot, fn_id_slot),
-                    );
+                    self.bytecode
+                        .push(Byte::new(Instruction::StorePop).with_operand_u32(fn_id_slot));
+                    self.extern_runtime_functions
+                        .insert(fn_name.clone(), (lib_slot, fn_id_slot));
                 }
             }
             Expression::EnumDecl { name: _, variants } => {
@@ -2841,10 +2747,8 @@ impl Compiler {
                     }
                     EnumConstructPayload::Record(parts) => {
                         // Build a name → &Output map for the call site.
-                        let call_site: std::collections::HashMap<&str, &Output> = parts
-                            .iter()
-                            .map(|p| (p.name, &p.value))
-                            .collect();
+                        let call_site: std::collections::HashMap<&str, &Output> =
+                            parts.iter().map(|p| (p.name, &p.value)).collect();
                         let decl_order = self.checker.payload_tys_for(enum_name, variant_name);
                         // Walk DECLARATION order REVERSED — so when
                         // MAKE_ENUM pops, payload[0] is `decl_fields[0]`.
@@ -3094,9 +2998,7 @@ impl Compiler {
                     // returns an owned value), so the local
                     // staging keeps the borrow checker happy
                     // without changing semantics.
-                    let any_multi_arm_group = tag_groups
-                        .iter()
-                        .any(|g| g.arm_indices.len() > 1);
+                    let any_multi_arm_group = tag_groups.iter().any(|g| g.arm_indices.len() > 1);
                     for (g_idx, group) in tag_groups.iter().enumerate() {
                         let is_last_group = g_idx == tag_groups.len() - 1;
                         if !is_last_group || any_multi_arm_group {
@@ -3113,12 +3015,14 @@ impl Compiler {
                             // pre-grouped codegen would have
                             // targeted.
                             let first_arm_idx = group.arm_indices[0];
-                            let label = arm_labels[first_arm_idx].expect(
-                                "non-last group's first arm must have a Label",
-                            );
+                            let label = arm_labels[first_arm_idx]
+                                .expect("non-last group's first arm must have a Label");
                             bb.emit_jump_to(
                                 label,
-                                BbJumpKind::JumpIfMatch { tag: group.tag, arity: 0 },
+                                BbJumpKind::JumpIfMatch {
+                                    tag: group.tag,
+                                    arity: 0,
+                                },
                                 &mut self.bytecode,
                             );
                         } else {
@@ -3185,10 +3089,8 @@ impl Compiler {
                                     // STORE is a no-op
                                     // (Phase 15D).
                                     let _ = name;
-                                    self.bytecode.push(
-                                        Byte::new(Instruction::STORE)
-                                            .with_operand_u32(1),
-                                    );
+                                    self.bytecode
+                                        .push(Byte::new(Instruction::STORE).with_operand_u32(1));
                                 }
                             }
                         }
@@ -3273,10 +3175,8 @@ impl Compiler {
                     // test chain arms, instead of re-emitting
                     // binding code (which would double-pop /
                     // double-store the payload values).
-                    let mut match_bindings_per_arm: HashMap<
-                        usize,
-                        HashMap<String, u32>,
-                    > = HashMap::new();
+                    let mut match_bindings_per_arm: HashMap<usize, HashMap<String, u32>> =
+                        HashMap::new();
 
                     for group in &tag_groups {
                         // Only groups with multiple arms AND
@@ -3295,9 +3195,8 @@ impl Compiler {
                         }
 
                         let first_arm_idx = group.arm_indices[0];
-                        let first_arm_label = arm_labels[first_arm_idx].expect(
-                            "non-last group's first arm must have a Label",
-                        );
+                        let first_arm_label = arm_labels[first_arm_idx]
+                            .expect("non-last group's first arm must have a Label");
 
                         // REBIND the first arm's label so the
                         // outer JUMP_IF_MATCH lands at the
@@ -3328,11 +3227,8 @@ impl Compiler {
                         // body); non-last arms have a fresh
                         // `pass_label` that the reverse pass
                         // binds to the arm's body.
-                        for (rank, &arm_idx) in
-                            group.arm_indices.iter().enumerate()
-                        {
-                            let is_last_in_group =
-                                rank == group.arm_indices.len() - 1;
+                        for (rank, &arm_idx) in group.arm_indices.iter().enumerate() {
+                            let is_last_in_group = rank == group.arm_indices.len() - 1;
 
                             let pass_label = if !is_last_in_group {
                                 Some(bb.fresh_label())
@@ -3358,10 +3254,8 @@ impl Compiler {
                             // still needs to be consistent
                             // with the placeholder value).
                             let fail_label = if !is_last_in_group {
-                                let next_arm_idx =
-                                    group.arm_indices[rank + 1];
-                                arm_labels[next_arm_idx]
-                                    .unwrap_or(end_label)
+                                let next_arm_idx = group.arm_indices[rank + 1];
+                                arm_labels[next_arm_idx].unwrap_or(end_label)
                             } else {
                                 end_label
                             };
@@ -3373,16 +3267,15 @@ impl Compiler {
                             // for runtime tests, by the
                             // definition of
                             // `arm_has_runtime_test`).
-                            let (enum_name, variant_name, payload) =
-                                match &arms[arm_idx].pattern {
-                                    Pattern::Constructor {
-                                        enum_name,
-                                        variant_name,
-                                        payload,
-                                        ..
-                                    } => (*enum_name, *variant_name, payload),
-                                    _ => continue,
-                                };
+                            let (enum_name, variant_name, payload) = match &arms[arm_idx].pattern {
+                                Pattern::Constructor {
+                                    enum_name,
+                                    variant_name,
+                                    payload,
+                                    ..
+                                } => (*enum_name, *variant_name, payload),
+                                _ => continue,
+                            };
 
                             emit_inner_test(
                                 arm_idx,
@@ -3448,15 +3341,15 @@ impl Compiler {
                         // `pass_label_0` instead (the
                         // forward-fallthrough target emitted
                         // by `emit_inner_test`).
-                        if !test_chain_first_arms.contains(&i) {
-                            if let Some(label) = arm_labels[i] {
-                                bb.bind_label(
-                                    label,
-                                    self.bytecode.len() as u32,
-                                    &mut self.bytecode,
-                                    &mut self.constants,
-                                );
-                            }
+                        if !test_chain_first_arms.contains(&i)
+                            && let Some(label) = arm_labels[i]
+                        {
+                            bb.bind_label(
+                                label,
+                                self.bytecode.len() as u32,
+                                &mut self.bytecode,
+                                &mut self.constants,
+                            );
                         }
 
                         // For arms in test chain groups,
@@ -3580,9 +3473,8 @@ impl Compiler {
                                     // + sub-pattern walk) and
                                     // Record (decl-order walk +
                                     // sub-pattern walk) internally.
-                                    let decl_order = self
-                                        .checker
-                                        .payload_tys_for(enum_name, variant_name);
+                                    let decl_order =
+                                        self.checker.payload_tys_for(enum_name, variant_name);
                                     emit_pattern_binding(
                                         &self.checker,
                                         &mut arm_bindings,
@@ -3601,50 +3493,49 @@ impl Compiler {
                             // code at the outer level (consume
                             // the values via POP/STORE/UNPACK).
                             match &arm.pattern {
-                            Pattern::Binding { name } => {
-                                // Binding arm: the forward pass
-                                // already emitted `STORE 1` for
-                                // the scrutinee (at slot 1,
-                                // matching LOAD 0's push). Record
-                                // the binding here so the body's
-                                // `Identifier` lookup finds it.
-                                arm_bindings.insert(name.to_string(), 1);
+                                Pattern::Binding { name } => {
+                                    // Binding arm: the forward pass
+                                    // already emitted `STORE 1` for
+                                    // the scrutinee (at slot 1,
+                                    // matching LOAD 0's push). Record
+                                    // the binding here so the body's
+                                    // `Identifier` lookup finds it.
+                                    arm_bindings.insert(name.to_string(), 1);
+                                }
+                                Pattern::Constructor {
+                                    enum_name,
+                                    variant_name,
+                                    ..
+                                } => {
+                                    // Non-test-chain arm: emit full
+                                    // binding code at the outer
+                                    // level (consume the values via
+                                    // POP/STORE/UNPACK). The
+                                    // function handles Tuple (emit
+                                    // UNPACK + sub-pattern walk) and
+                                    // Record (decl-order walk + per-
+                                    // field recursion — including
+                                    // unbounded-depth nested record
+                                    // patterns) internally.
+                                    let decl_order =
+                                        self.checker.payload_tys_for(enum_name, variant_name);
+                                    emit_pattern_binding(
+                                        &self.checker,
+                                        &mut arm_bindings,
+                                        &mut next_slot,
+                                        &arm.pattern,
+                                        &decl_order,
+                                        &mut self.bytecode,
+                                        true,
+                                        true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
+                                    );
+                                }
+                                Pattern::Wildcard => {
+                                    // No bindings — the forward pass
+                                    // already emitted POP for the
+                                    // scrutinee.
+                                }
                             }
-                            Pattern::Constructor {
-                                enum_name,
-                                variant_name,
-                                ..
-                            } => {
-                                // Non-test-chain arm: emit full
-                                // binding code at the outer
-                                // level (consume the values via
-                                // POP/STORE/UNPACK). The
-                                // function handles Tuple (emit
-                                // UNPACK + sub-pattern walk) and
-                                // Record (decl-order walk + per-
-                                // field recursion — including
-                                // unbounded-depth nested record
-                                // patterns) internally.
-                                let decl_order = self
-                                    .checker
-                                    .payload_tys_for(enum_name, variant_name);
-                                emit_pattern_binding(
-                                    &self.checker,
-                                    &mut arm_bindings,
-                                    &mut next_slot,
-                                    &arm.pattern,
-                                    &decl_order,
-                                    &mut self.bytecode,
-                                    true,
-                                    true, // is_outer = true (forward pass handled UNPACK/JUMP_IF_MATCH)
-                                );
-                            }
-                            Pattern::Wildcard => {
-                                // No bindings — the forward pass
-                                // already emitted POP for the
-                                // scrutinee.
-                            }
-                        }
                         } // close `else` for test chain arms
 
                         // Install the per-arm bindings map so the
@@ -3652,8 +3543,7 @@ impl Compiler {
                         // resolve pattern bindings to slots 1, 2, 3,
                         // ... — matching the VM's payload-push
                         // positions. Cleared after the body emits.
-                        let saved_bindings =
-                            self.context.match_bindings.take();
+                        let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
 
                         // Emit the arm body. Borrow-checker
@@ -3851,20 +3741,18 @@ impl Compiler {
                 // instead of `LoadField` (enum-indexed). For record-
                 // shaped enum variants the existing path stays.
                 let receiver_ty = self.receiver_type(receiver);
-                let is_record = matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
+                let is_record =
+                    matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
                 if is_record {
                     // Push the field-name string on TOP of the
                     // receiver (which is already on the stack
                     // from `do_compile(receiver)` above). GetField
                     // pops the field-name (top) and the receiver,
                     // pushes the value. Use STRING+DATA encoding.
-                    bytecode.push(
-                        Byte::new(Instruction::STRING)
-                            .with_operand_u32(field.len() as u32),
-                    );
+                    bytecode
+                        .push(Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32));
                     for ch in field.chars() {
-                        bytecode
-                            .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
                     }
                     bytecode.push(Byte::new(Instruction::GetField));
                 } else {
@@ -3876,8 +3764,7 @@ impl Compiler {
                         .unwrap_or(0);
 
                     bytecode.push(
-                        Byte::new(Instruction::LoadField)
-                            .with_operand_u32(field_index as u32),
+                        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
                     );
                 }
             }
@@ -4376,7 +4263,7 @@ mod tests {
         );
     }
 
-/// Codegen test 7 (Phase 17A): in the BlockBuilder-based
+    /// Codegen test 7 (Phase 17A): in the BlockBuilder-based
     /// Match codegen, every non-last constructor arm's
     /// JUMP_IF_MATCH placeholder is bound to that arm's body
     /// offset. If the `bind_label` for some arm's label didn't
@@ -4418,7 +4305,9 @@ mod tests {
             assert!(
                 target > 0,
                 "JUMP_IF_MATCH #{} (tag={}) target should be patched to a non-zero offset; got {}",
-                i, tag, target
+                i,
+                tag,
+                target
             );
         }
     }
@@ -4589,7 +4478,7 @@ mod tests {
     /// codegen emitted them in call-site order (1, 2, 3), the
     /// payload would be in the wrong slot positions and any
     /// match destructuring would get the wrong values.
-#[test]
+    #[test]
     fn record_construct_reorders_shuffled_call_site_fields() {
         use common::Instruction;
         // The variant is declared as `Foo { x: int, y: int, z: int }`
@@ -4614,7 +4503,7 @@ fn main() {
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::CONST))
             .map(|b| b.constant(&[]) as i64)
-            .filter(|&v| v >= 1 && v <= 3)
+            .filter(|&v| (1..=3).contains(&v))
             .collect();
         assert_eq!(
             const_operands,
@@ -4640,9 +4529,8 @@ fn main() {
     #[test]
     fn record_construct_one_field_emits_correct_bytecode() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "enum E { Foo { x: int } } fn main() { let _ = E::Foo { x: 1 }; }",
-        );
+        let (bc, _pool) =
+            compile_src("enum E { Foo { x: int } } fn main() { let _ = E::Foo { x: 1 }; }");
 
         // Find the MAKE_ENUM. Its operand is tag (upper 16) and
         // arity (lower 16).

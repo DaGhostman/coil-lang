@@ -100,7 +100,7 @@ pub fn fuse_bytecode(bytecode: &mut Vec<Byte>, pool: &mut [u64]) -> Vec<FusionSi
 pub fn adjust_target(target: usize, fusion_sites: &[FusionSite]) -> usize {
     let delta: usize = fusion_sites
         .iter()
-        .filter(|s| s.orig + s.removed + 1 <= target)
+        .filter(|s| s.orig + s.removed < target)
         .map(|s| s.removed)
         .sum();
     target.saturating_sub(delta)
@@ -336,10 +336,7 @@ mod tests {
         fuse(&mut bc);
         assert_eq!(bc.len(), 2);
         assert_eq!(*bc[0].bytecode(), Instruction::BinSlotImm);
-        assert_eq!(
-            bc[0].bin_slot_imm_parts(),
-            (Instruction::SUB as u8, 0, 1)
-        );
+        assert_eq!(bc[0].bin_slot_imm_parts(), (Instruction::SUB as u8, 0, 1));
     }
 
     #[test]
@@ -352,10 +349,7 @@ mod tests {
         ];
         fuse(&mut bc);
         assert_eq!(*bc[0].bytecode(), Instruction::BinSlotImm);
-        assert_eq!(
-            bc[0].bin_slot_imm_parts(),
-            (Instruction::LEQ as u8, 2, 10)
-        );
+        assert_eq!(bc[0].bin_slot_imm_parts(), (Instruction::LEQ as u8, 2, 10));
     }
 
     #[test]
@@ -467,10 +461,7 @@ mod tests {
             .iter()
             .find(|b| *b.bytecode() == Instruction::BinSlotImm)
             .expect("bin_slot_imm fusion");
-        assert_eq!(
-            binslot.bin_slot_imm_parts(),
-            (Instruction::LEQ as u8, 0, 2)
-        );
+        assert_eq!(binslot.bin_slot_imm_parts(), (Instruction::LEQ as u8, 0, 2));
         let jmpf = bc
             .iter()
             .find(|b| *b.bytecode() == Instruction::JMPF)

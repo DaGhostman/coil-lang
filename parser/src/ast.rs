@@ -3,16 +3,11 @@ use std::{borrow::Borrow, fmt::Display};
 use chumsky::span::SimpleSpan;
 pub type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
 
-#[derive(Clone, PartialEq, Debug, Copy)]
+#[derive(Clone, PartialEq, Debug, Copy, Default)]
 pub enum Visibility {
+    #[default]
     Private,
     Public,
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Visibility::Private
-    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -460,7 +455,7 @@ impl<'a> Display for Expression<'a> {
                     .join(" ")
             ),
             Self::Group(g) => write!(f, "({})", g.1),
-            Self::Statement(s) => write!(f, "{};\n", s.1),
+            Self::Statement(s) => writeln!(f, "{};", s.1),
             Self::String(s) => write!(f, "\"{}\"", s),
             Self::Print(fmt, params) => write!(
                 f,
@@ -522,7 +517,7 @@ impl<'a> Display for Expression<'a> {
                 // inner expression via Display.
                 let ret_str = returns
                     .as_ref()
-                    .map(|ret| format!(" -> {}", &ret.1))
+                    .map(|ret| format!(" -> {}", ret.1))
                     .unwrap_or_default();
                 // Emit the function body inline. The `name`,
                 // `args.1`, `ret_str`, and `body.1` substitutions
@@ -563,7 +558,7 @@ impl<'a> Display for Expression<'a> {
             Self::Assignment(n, e) => {
                 write!(f, "{} = {}", n.1, e.1)
             }
-            Self::Noop(n) => write!(f, "@{{ {} }}@", n.1.to_string()),
+            Self::Noop(n) => write!(f, "@{{ {} }}@", n.1),
             Self::TypeAlias { name, ty } => write!(f, "type {} = {};", name, ty.1),
             // Dict literal (Phase 25) — `{ name: expr, ... }`.
             // Renders the record as a constructor-shaped string

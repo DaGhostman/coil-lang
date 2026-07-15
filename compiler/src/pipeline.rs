@@ -15,8 +15,8 @@ use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use rkyv::rancor::Error;
 
-use crate::manifest::Manifest;
 use crate::Compiler;
+use crate::manifest::Manifest;
 
 /// A queued file to compile, along with the path it was
 /// discovered under. The pipeline processes queued files
@@ -63,30 +63,30 @@ pub struct Pipeline {
     /// regardless of its path on disk. Every other
     /// file gets its path-derived namespace.
     entry_file: Option<PathBuf>,
-/// Phase 29A — parsed-source cache.
-///
-/// `discover_all` reads each file from disk to
-/// find its `use`/`mod` declarations. `compile_file`
-/// then reads the SAME file again to compile it.
-/// The cache holds the owned source text so the
-/// second `read_to_string` is avoided.
-///
-/// Implementation: an `Interner<PathBuf>` assigns
-/// each unique path a small `u32` ID; the source
-/// text is stored in a `Vec<Option<String>>` indexed
-/// by ID. Lookup is a Vec index (`O(1)`, no hash).
-/// Compared to `HashMap<PathBuf, String>` this saves
-/// the per-entry `PathBuf` hash and bucket overhead,
-/// and replaces the `String` key with a `u32` copy.
-///
-/// Caching the AST itself would avoid the
-/// second parse too, but `Output<'parser>` borrows
-/// from the source — owning the source for the
-/// entire `compile` call would require `'static`,
-/// which leaks. The `read_to_string` save is the
-/// I/O win; re-parsing is fast enough.
-source_interner: common::Interner<PathBuf>,
-source_cache: Vec<Option<String>>,
+    /// Phase 29A — parsed-source cache.
+    ///
+    /// `discover_all` reads each file from disk to
+    /// find its `use`/`mod` declarations. `compile_file`
+    /// then reads the SAME file again to compile it.
+    /// The cache holds the owned source text so the
+    /// second `read_to_string` is avoided.
+    ///
+    /// Implementation: an `Interner<PathBuf>` assigns
+    /// each unique path a small `u32` ID; the source
+    /// text is stored in a `Vec<Option<String>>` indexed
+    /// by ID. Lookup is a Vec index (`O(1)`, no hash).
+    /// Compared to `HashMap<PathBuf, String>` this saves
+    /// the per-entry `PathBuf` hash and bucket overhead,
+    /// and replaces the `String` key with a `u32` copy.
+    ///
+    /// Caching the AST itself would avoid the
+    /// second parse too, but `Output<'parser>` borrows
+    /// from the source — owning the source for the
+    /// entire `compile` call would require `'static`,
+    /// which leaks. The `read_to_string` save is the
+    /// I/O win; re-parsing is fast enough.
+    source_interner: common::Interner<PathBuf>,
+    source_cache: Vec<Option<String>>,
     compiler: Compiler,
 }
 
@@ -110,11 +110,7 @@ impl Pipeline {
     /// and Rust closure. The signature is forwarded to the HM
     /// typechecker; the closure is stored for
     /// [`Self::wire_host_natives`].
-    pub fn register_host_native<F>(
-        &mut self,
-        sig: FfiSignature,
-        func: F,
-    ) -> usize
+    pub fn register_host_native<F>(&mut self, sig: FfiSignature, func: F) -> usize
     where
         F: Fn(&mut Heap, &[common::Value]) -> Result<Option<common::Value>, FfiError>
             + Send
@@ -126,21 +122,15 @@ impl Pipeline {
         let ret = ffi_type_to_ty(sig.ret);
         self.compiler.register(&sig.name, &params, &ret);
         let id = self.host_natives.len();
-        self.host_natives.push(std::sync::Arc::new(
-            HostClosureFn::new(sig, func),
-        ));
+        self.host_natives
+            .push(std::sync::Arc::new(HostClosureFn::new(sig, func)));
         id
     }
 
     /// Register a native function's type signature (metadata
     /// only — no VM closure). Embedders that supply their own
     /// closures should prefer [`Self::register_host_native`].
-    pub fn register_native_function(
-        &mut self,
-        name: String,
-        namespace: String,
-        sig: FfiSignature,
-    ) {
+    pub fn register_native_function(&mut self, name: String, namespace: String, sig: FfiSignature) {
         let params: Vec<crate::typechecking::ty::Ty> =
             sig.args.iter().copied().map(ffi_type_to_ty).collect();
         let ret = ffi_type_to_ty(sig.ret);
@@ -184,8 +174,7 @@ impl Pipeline {
         // revision could walk up the tree looking for
         // `zero.toml`.
         let project_root = cwd.clone();
-        let manifest = Manifest::load(&project_root)
-            .expect("Failed to load zero.toml manifest");
+        let manifest = Manifest::load(&project_root).expect("Failed to load zero.toml manifest");
 
         // The prologue is `[CALL, JMP, HALT]`. The pipeline
         // patches the JMP at offset 1 to point at `main`
@@ -294,22 +283,17 @@ impl Pipeline {
                         // original dotted path.
                         let mut segments = segments;
                         segments.pop();
-                        if let Some(file) = self.manifest.resolve_use(
-                            &self.project_root,
-                            &segments,
-                            &last,
-                        ) {
+                        if let Some(file) =
+                            self.manifest
+                                .resolve_use(&self.project_root, &segments, &last)
+                        {
                             self.enqueue_file(file);
                         }
-                    } else if let Some(file) = self
-                        .manifest
-                        .resolve_mod(&self.project_root, "*")
-                    {
+                    } else if let Some(file) = self.manifest.resolve_mod(&self.project_root, "*") {
                         // `use *;` — top-level glob.
                         self.enqueue_file(file);
                     }
-                } else if let Some(file) =
-                    self.manifest.resolve_use(&self.project_root, path, name)
+                } else if let Some(file) = self.manifest.resolve_use(&self.project_root, path, name)
                 {
                     self.enqueue_file(file);
                 }
@@ -318,9 +302,7 @@ impl Pipeline {
                 // `mod foo;` — look for `foo.0s` in any
                 // root. This is the simplest resolution:
                 // the file's stem IS the module name.
-                if let Some(file) =
-                    self.manifest.resolve_mod(&self.project_root, name)
-                {
+                if let Some(file) = self.manifest.resolve_mod(&self.project_root, name) {
                     self.enqueue_file(file);
                 }
             }
@@ -392,11 +374,7 @@ impl Pipeline {
         match std::fs::read_to_string(file) {
             Ok(s) => {
                 #[cfg(debug_assertions)]
-                eprintln!(
-                    "[pipeline]   loaded {} ({} bytes)",
-                    file.display(),
-                    s.len()
-                );
+                eprintln!("[pipeline]   loaded {} ({} bytes)", file.display(), s.len());
                 self.source_cache[id] = Some(s.clone());
                 Some(s)
             }
@@ -411,12 +389,15 @@ impl Pipeline {
     /// that the compilation pass can run in
     /// dependency order.
     ///
-/// The `processed` set guards against re-enqueuing
+    /// The `processed` set guards against re-enqueuing
     /// (so the same file isn't discovered twice). The
     /// `failed` flag is set if any file fails to parse.
     fn discover_all(&mut self) {
         #[cfg(debug_assertions)]
-        eprintln!("[pipeline] scanning for files (entry={:?})", self.entry_file);
+        eprintln!(
+            "[pipeline] scanning for files (entry={:?})",
+            self.entry_file
+        );
         // Walk the worklist from the front, parsing each
         // file to find its `use`/`mod` declarations.
         // `enqueue_file` adds new dependencies to the back
@@ -469,11 +450,7 @@ impl Pipeline {
             }
             #[cfg(debug_assertions)]
             {
-                eprintln!(
-                    "[pipeline]   scanning {} (depth {})",
-                    file.display(),
-                    depth
-                );
+                eprintln!("[pipeline]   scanning {} (depth {})", file.display(), depth);
                 depth += 1;
             }
             already_scanned.push(file.clone());
@@ -490,10 +467,8 @@ impl Pipeline {
             let src = match self.read_source(&file) {
                 Some(s) => s,
                 None => {
-                    let mut msg = Message::error(
-                        format!("Failed to read file `{}`", file.display()),
-                        0..0,
-                    );
+                    let mut msg =
+                        Message::error(format!("Failed to read file `{}`", file.display()), 0..0);
                     msg.push(common::Label::new(
                         format!("file path: {}", file.display()),
                         0..0,
@@ -507,11 +482,7 @@ impl Pipeline {
             let ast = match parser.parse(src.as_str()) {
                 Ok(ast) => ast,
                 Err(errors) => {
-                    Self::render_errors(
-                        file.display().to_string(),
-                        src.as_str(),
-                        &errors,
-                    );
+                    Self::render_errors(file.display().to_string(), src.as_str(), &errors);
                     self.failed = true;
                     continue;
                 }
@@ -567,10 +538,8 @@ impl Pipeline {
         let src = match self.read_source(&file) {
             Some(s) => s,
             None => {
-                let mut msg = Message::error(
-                    format!("Failed to read file `{}`", file.display()),
-                    0..0,
-                );
+                let mut msg =
+                    Message::error(format!("Failed to read file `{}`", file.display()), 0..0);
                 msg.push(common::Label::new(
                     format!("file path: {}", file.display()),
                     0..0,
@@ -590,11 +559,7 @@ impl Pipeline {
                 // have a Message here (parse errors
                 // are chumsky Rich errors), so we
                 // construct one with the first error.
-                Self::render_errors(
-                    file.display().to_string(),
-                    src.as_str(),
-                    &errors,
-                );
+                Self::render_errors(file.display().to_string(), src.as_str(), &errors);
                 self.failed = true;
                 return;
             }
@@ -613,9 +578,7 @@ impl Pipeline {
         // the prologue on the second call). See
         // `Compiler::compile_module` for the operand
         // adjustment details.
-        let bytecode = self
-            .compiler
-            .compile_module(namespace.as_str(), &ast);
+        let bytecode = self.compiler.compile_module(namespace.as_str(), &ast);
         #[cfg(debug_assertions)]
         eprintln!(
             "[pipeline]   compiled {} → {} bytes (total: {})",
@@ -710,12 +673,13 @@ impl Pipeline {
         };
 
         let mut out = File::create(output).expect("Unable to open output file");
-        out.write(
-            rkyv::to_bytes::<rkyv::rancor::Error>(&program)
-                .unwrap()
-                .as_slice(),
-        )
-        .expect("Unable to write compiled output to file");
+        let _ = out
+            .write(
+                rkyv::to_bytes::<rkyv::rancor::Error>(&program)
+                    .unwrap()
+                    .as_slice(),
+            )
+            .expect("Unable to write compiled output to file");
     }
 
     /// Compile a parsed AST and return the bytecode
@@ -740,13 +704,10 @@ impl Pipeline {
                 *byte = Byte::new(Instruction::JMP)
                     .with_operand_u32(self.compiler.program_start_offset());
             }
-        } else if let Some(&main_offset) =
-            self.compiler.functions.get("main")
+        } else if let Some(&main_offset) = self.compiler.functions.get("main")
+            && let Some(byte) = bytecode.get_mut(1)
         {
-            if let Some(byte) = bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(main_offset as u32);
-            }
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
         }
 
         (bytecode, self.compiler.constants.clone())
@@ -773,13 +734,10 @@ impl Pipeline {
                 *byte = Byte::new(Instruction::JMP)
                     .with_operand_u32(self.compiler.program_start_offset());
             }
-        } else if let Some(&main_offset) =
-            self.compiler.functions.get("main")
+        } else if let Some(&main_offset) = self.compiler.functions.get("main")
+            && let Some(byte) = bytecode.get_mut(1)
         {
-            if let Some(byte) = bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(main_offset as u32);
-            }
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
         }
 
         Ok((bytecode, self.compiler.constants.clone()))
@@ -838,11 +796,10 @@ impl Pipeline {
                 *byte = Byte::new(Instruction::JMP)
                     .with_operand_u32(self.compiler.program_start_offset());
             }
-        } else if let Some(&main_offset) = self.compiler.functions.get("main") {
-            if let Some(byte) = self.bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(main_offset as u32);
-            }
+        } else if let Some(&main_offset) = self.compiler.functions.get("main")
+            && let Some(byte) = self.bytecode.get_mut(1)
+        {
+            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
         }
 
         // Drain any typecheck messages.
@@ -851,7 +808,10 @@ impl Pipeline {
             return Err(());
         }
 
-        Ok((std::mem::take(&mut self.bytecode), self.compiler.constants.clone()))
+        Ok((
+            std::mem::take(&mut self.bytecode),
+            self.compiler.constants.clone(),
+        ))
     }
 
     /// Borrow the list of natively-registered functions.
@@ -894,6 +854,16 @@ impl Pipeline {
             .expect("Unable to deserialize constant pool");
 
         Ok((bytecode, constants))
+    }
+}
+
+fn ffi_type_to_ty(ty: FfiType) -> crate::typechecking::ty::Ty {
+    use crate::typechecking::ty::{float, int, string, unit};
+    match ty {
+        FfiType::Int => int(),
+        FfiType::Float => float(),
+        FfiType::String => string(),
+        FfiType::Void => unit(),
     }
 }
 
@@ -990,15 +960,5 @@ mod tests {
             let _ = builder;
         }));
         assert!(result.is_ok());
-    }
-}
-
-fn ffi_type_to_ty(ty: FfiType) -> crate::typechecking::ty::Ty {
-    use crate::typechecking::ty::{float, int, string, unit};
-    match ty {
-        FfiType::Int => int(),
-        FfiType::Float => float(),
-        FfiType::String => string(),
-        FfiType::Void => unit(),
     }
 }

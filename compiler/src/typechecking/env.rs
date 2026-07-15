@@ -264,12 +264,10 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
             arity: *arity,
         },
         // Phase 24 — recurse through aggregates.
-        Ty::Tuple(tys) => {
-            Ty::Tuple(tys.iter().map(|t| substitute_vars(t, mapping)).collect())
-        }
+        Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| substitute_vars(t, mapping)).collect()),
         Ty::Array { element, length } => Ty::Array {
             element: Box::new(substitute_vars(element, mapping)),
-            length: length.clone(),
+            length: *length,
         },
         Ty::Record { fields } => Ty::Record {
             fields: fields
@@ -602,10 +600,10 @@ mod tests {
         // verification (unifying with int and bool) is Phase 4's job,
         // but at this layer we can check the structure.
         fn is_arrow_to_same_var(ty: &Ty) -> bool {
-            if let Ty::Fun(a, b) = ty {
-                if let (Ty::Var(va), Ty::Var(vb)) = (a.as_ref(), b.as_ref()) {
-                    return va == vb;
-                }
+            if let Ty::Fun(a, b) = ty
+                && let (Ty::Var(va), Ty::Var(vb)) = (a.as_ref(), b.as_ref())
+            {
+                return va == vb;
             }
             false
         }

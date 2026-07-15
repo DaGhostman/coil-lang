@@ -20,10 +20,7 @@ impl FfiSignature {
         args: Vec<FfiType>,
         ret: FfiType,
     ) -> Result<Self, FfiError> {
-        FfiSignatureBuilder::new(name)
-            .args(args)
-            .ret(ret)
-            .build()
+        FfiSignatureBuilder::new(name).args(args).ret(ret).build()
     }
 }
 

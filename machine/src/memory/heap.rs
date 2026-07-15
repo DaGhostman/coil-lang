@@ -80,16 +80,16 @@ impl Heap {
     pub fn cstr_from_addr(&self, addr: u64) -> Option<*const std::os::raw::c_char> {
         let mut current = self.head_for_lookup();
         while let Some(reference) = current {
-            if reference.addr() == addr {
-                if let crate::memory::Object::String(gc) = reference {
-                    // Build a NUL-terminated copy. The Box
-                    // leaks for the duration of the program
-                    // (we explicitly leak below).
-                    let s: std::ffi::CString =
-                        std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
-                    let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
-                    return Some(boxed.as_ptr());
-                }
+            if reference.addr() == addr
+                && let crate::memory::Object::String(gc) = reference
+            {
+                // Build a NUL-terminated copy. The Box
+                // leaks for the duration of the program
+                // (we explicitly leak below).
+                let s: std::ffi::CString =
+                    std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
+                let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
+                return Some(boxed.as_ptr());
             }
             current = reference.get_next();
         }

@@ -48,8 +48,8 @@ use super::env::{Env, TyVarCounter, instantiate};
 use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::Scheme;
-use super::ty::{EnumVariantPayloadTy, Ty, boolean, float, int, list, string, unit as unit_ty};
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
+use super::ty::{EnumVariantPayloadTy, Ty, boolean, float, int, list, string, unit as unit_ty};
 use super::unify::{UnifyError, unify_with};
 
 #[cfg(test)]
@@ -378,17 +378,19 @@ impl Checker {
             // type is left as a free type variable (it'll be
             // resolved at the call site when we see the
             // qualified name in `self.aliases`).
-            Expression::Use { path: _, name, alias } => {
+            Expression::Use {
+                path: _,
+                name,
+                alias,
+            } => {
                 let local = alias.clone().unwrap_or_else(|| name.clone());
                 // Insert a polymorphic type variable so
                 // any calls to the local name pass
                 // type-checking. The codegen resolves
                 // the actual FQN at the call site via
                 // `self.aliases`.
-                self.env.insert_top(
-                    local,
-                    Scheme::mono(Ty::Var(self.counter.fresh())),
-                );
+                self.env
+                    .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
                 unit_ty()
             }
             Expression::Module(_, _) => unit_ty(),
@@ -654,9 +656,7 @@ impl Checker {
                         None => elem_ty = Some(t_pruned),
                         Some(prev) => {
                             let prev_pruned = apply_ty_prune(&self.subst, prev);
-                            if let Err(_) =
-                                unify_with(&self.subst, &prev_pruned, &t_pruned)
-                            {
+                            if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
                                 let _ = self.error_with_help(
                                     format!(
                                         "array element type mismatch: expected `{}`, found `{}`",
@@ -695,22 +695,22 @@ impl Checker {
                         // Out-of-bounds check: only fires when the
                         // target is a *static-length* array and the
                         // index is a literal integer.
-                        if let ArrayLength::Static(n) = length {
-                            if let Expression::Integer(idx) = index_expr.1.as_ref() {
-                                let i = *idx;
-                                if i < 0 || (i as usize) >= *n {
-                                    let _ = self.error_with_help(
-                                        format!(
-                                            "array index {} out of bounds for array of length {}",
-                                            i, n
-                                        ),
-                                        range.clone(),
-                                        Some(format!(
-                                            "indices are valid in [0..{}); the array has length {}",
-                                            n, n
-                                        )),
-                                    );
-                                }
+                        if let ArrayLength::Static(n) = length
+                            && let Expression::Integer(idx) = index_expr.1.as_ref()
+                        {
+                            let i = *idx;
+                            if i < 0 || (i as usize) >= *n {
+                                let _ = self.error_with_help(
+                                    format!(
+                                        "array index {} out of bounds for array of length {}",
+                                        i, n
+                                    ),
+                                    range.clone(),
+                                    Some(format!(
+                                        "indices are valid in [0..{}); the array has length {}",
+                                        n, n
+                                    )),
+                                );
                             }
                         }
                         (**element).clone()
@@ -747,10 +747,7 @@ impl Checker {
                         let _ = self.error_with_help(
                             "cannot index non-aggregate type".to_string(),
                             range.clone(),
-                            Some(format!(
-                                "type `{}` does not support indexing",
-                                resolved
-                            )),
+                            Some(format!("type `{}` does not support indexing", resolved)),
                         );
                         Ty::Var(self.counter.fresh())
                     }
@@ -772,10 +769,7 @@ impl Checker {
                         let _ = self.error_with_help(
                             format!("Duplicate field `{}` in record literal", f.name),
                             range.clone(),
-                            Some(
-                                "record literals must have unique field names"
-                                    .to_string(),
-                            ),
+                            Some("record literals must have unique field names".to_string()),
                         );
                     }
                 }
@@ -829,7 +823,8 @@ impl Checker {
                         self.infer(arg);
                     }
                     let mut m = Message::error(
-                        "declare requires 4 arguments (lib, name, args_tuple, ret_type)".to_string(),
+                        "declare requires 4 arguments (lib, name, args_tuple, ret_type)"
+                            .to_string(),
                         range.clone(),
                     );
                     m.push(Label::new(
@@ -980,10 +975,8 @@ impl Checker {
                                 Some(format!("type `{}` is not a record-shaped enum", name)),
                             );
                         }
-                        let variants: Vec<(String, EnumVariantPayloadTy)> = variant_names
-                            .into_iter()
-                            .zip(payloads.into_iter())
-                            .collect();
+                        let variants: Vec<(String, EnumVariantPayloadTy)> =
+                            variant_names.into_iter().zip(payloads).collect();
                         self.access_field_in_sum(name, &variants, None, field, range)
                     }
                     // Phase 25 — anonymous record (dict)
@@ -992,33 +985,27 @@ impl Checker {
                     // absent — this is the diagnostic the user
                     // explicitly asked for (`x.bar` on
                     // `{ foo: 42 }` is an error).
-                    Ty::Record { fields } => {
-                        match fields.iter().find(|(n, _)| n == field) {
-                            Some((_, fty)) => fty.clone(),
-                            None => {
-                                let known: Vec<&str> =
-                                    fields.iter().map(|(n, _)| n.as_str()).collect();
-                                let msg = format!(
-                                    "Cannot find field `{}` on record `{{ {} }}`",
-                                    field,
-                                    fields
-                                        .iter()
-                                        .map(|(n, t)| format!("{}: {}", n, t))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                );
-                                let help = if known.is_empty() {
-                                    Some("the record has no fields".to_string())
-                                } else {
-                                    Some(format!(
-                                        "the record has fields: {}",
-                                        known.join(", ")
-                                    ))
-                                };
-                                self.error_with_help(msg, range, help)
-                            }
+                    Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
+                        Some((_, fty)) => fty.clone(),
+                        None => {
+                            let known: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                            let msg = format!(
+                                "Cannot find field `{}` on record `{{ {} }}`",
+                                field,
+                                fields
+                                    .iter()
+                                    .map(|(n, t)| format!("{}: {}", n, t))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            let help = if known.is_empty() {
+                                Some("the record has no fields".to_string())
+                            } else {
+                                Some(format!("the record has fields: {}", known.join(", ")))
+                            };
+                            self.error_with_help(msg, range, help)
                         }
-                    }
+                    },
                     _ => self.error_with_help(
                         format!("Cannot access field `{}` on non-record type", field),
                         range,
@@ -1060,8 +1047,7 @@ impl Checker {
             // `parse_type_name` / `lookup_at`.
             Expression::TypeAlias { name, ty } => {
                 let alias_ty = self.parse_type_name(ty);
-                self.type_aliases
-                    .insert(name.to_string(), alias_ty.clone());
+                self.type_aliases.insert(name.to_string(), alias_ty.clone());
                 // Eagerly walk the RHS for ID alignment.
                 let _ = self.infer(ty);
                 unit_ty()
@@ -1385,15 +1371,14 @@ impl Checker {
                 // a single `Integer(N)` immediately following the
                 // element-type `Identifier`. Anything else is a
                 // dynamic-length `[T]`.
-                if items.len() == 1 {
-                    if let Expression::Integer(n) = items[0].1.as_ref() {
-                        if *n >= 0 {
-                            return crate::typechecking::ty::array_fixed(
-                                self.parse_type_name_str("int"),
-                                *n as usize,
-                            );
-                        }
-                    }
+                if items.len() == 1
+                    && let Expression::Integer(n) = items[0].1.as_ref()
+                    && *n >= 0
+                {
+                    return crate::typechecking::ty::array_fixed(
+                        self.parse_type_name_str("int"),
+                        *n as usize,
+                    );
                 }
                 // Element type — parse as a (single) type annotation.
                 // For multi-element `[int, string]` we treat the
@@ -1471,10 +1456,9 @@ impl Checker {
                 enum_name,
                 variant_name,
                 fields: _,
-            } if *enum_name == "FFIType" => matches!(
-                *variant_name,
-                "Int" | "Float" | "String" | "Void"
-            ),
+            } if *enum_name == "FFIType" => {
+                matches!(*variant_name, "Int" | "Float" | "String" | "Void")
+            }
             Expression::Type(name) => matches!(
                 name.to_lowercase().as_str(),
                 "int" | "float" | "string" | "void"
@@ -1488,10 +1472,7 @@ impl Checker {
         if self.is_ffi_type_expr(expr) {
             return;
         }
-        let mut m = Message::error(
-            "Expected an FFI type tag".to_string(),
-            expr.0.into_range(),
-        );
+        let mut m = Message::error("Expected an FFI type tag".to_string(), expr.0.into_range());
         m.push(Label::new(
             "use FFIType::Int, FFIType::Float, FFIType::String, FFIType::Void, or a bare int/float/string/void type name".to_string(),
             expr.0.into_range(),
@@ -4360,7 +4341,7 @@ mod tests {
         let (mut c, _) = check("1 + 2;");
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
-        let total = c.id_table().len() as usize;
+        let total = c.id_table().len();
         assert!(total > 0);
         assert_eq!(c.cache_len(), total);
     }
@@ -4996,18 +4977,16 @@ mod tests {
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
         let resolved = apply_ty_prune(c.subst(), &ty);
-        assert_eq!(
-            resolved,
-            array_fixed(int(), 3),
-            "expected [int; 3]"
-        );
+        assert_eq!(resolved, array_fixed(int(), 3), "expected [int; 3]");
     }
 
     #[test]
     fn array_literal_heterogeneous_elements_emits_diagnostic() {
         // `[1, "x"]` should emit "array element type mismatch".
         let (_c, msgs) = check_warn("[1, \"x\"]");
-        let found = msgs.iter().any(|m| m.message().contains("element type mismatch"));
+        let found = msgs
+            .iter()
+            .any(|m| m.message().contains("element type mismatch"));
         assert!(
             found,
             "expected 'element type mismatch' diagnostic, got: {:?}",
@@ -5022,11 +5001,7 @@ mod tests {
         let src = "fn main() { let arr = [0, 1, 2]; let _ = arr[3]; }";
         let (_c, msgs) = check_warn(src);
         let found = msgs.iter().any(|m| m.message().contains("out of bounds"));
-        assert!(
-            found,
-            "expected OOB diagnostic, got: {:?}",
-            msgs
-        );
+        assert!(found, "expected OOB diagnostic, got: {:?}", msgs);
     }
 
     #[test]
@@ -5125,16 +5100,12 @@ mod tests {
         // expression parses and type-checks without error and
         // that the let-bound `d` resolves to a `Ty::Record` via
         // the env lookup.
-        let (mut c, _ty) = check(
-            "fn main() { let d = { foo: 42 }; }",
-        );
+        let (mut c, _ty) = check("fn main() { let d = { foo: 42 }; }");
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
         // The side-table records `d`'s type — verify it.
         let d_ty = c.codegen_var_type("d").cloned();
-        let d_pruned = d_ty.map(|t| {
-            crate::typechecking::subst::apply_ty_prune(c.subst(), &t)
-        });
+        let d_pruned = d_ty.map(|t| crate::typechecking::subst::apply_ty_prune(c.subst(), &t));
         assert_eq!(
             d_pruned,
             Some(crate::typechecking::ty::record(vec![(
@@ -5170,9 +5141,7 @@ mod tests {
         // `{ foo: 1, foo: 2 }` — duplicate field name.
         let src = "fn main() { let _ = { foo: 1, foo: 2 }; }";
         let (_c, msgs) = check_warn(src);
-        let found = msgs
-            .iter()
-            .any(|m| m.message().contains("Duplicate field"));
+        let found = msgs.iter().any(|m| m.message().contains("Duplicate field"));
         assert!(
             found,
             "expected duplicate-field diagnostic, got: {:?}",
@@ -5184,14 +5153,10 @@ mod tests {
     fn dict_structurally_typed_unification() {
         // Two separate `{ foo: 1 }` literals should have the
         // same record type.
-        let (mut c, ty1) = check(
-            "fn main() { let _ = { foo: 42 }; return { foo: 42 }; }",
-        );
+        let (mut c, ty1) = check("fn main() { let _ = { foo: 42 }; return { foo: 42 }; }");
         let _ = c.take_messages();
         let ty2 = {
-            let (mut c2, ty2) = check(
-                "fn main() { let _ = { foo: 42 }; return { foo: 99 }; }",
-            );
+            let (mut c2, ty2) = check("fn main() { let _ = { foo: 42 }; return { foo: 99 }; }");
             let _ = c2.take_messages();
             ty2
         };

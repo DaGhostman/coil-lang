@@ -6,7 +6,7 @@ use std::hint::black_box;
 // fib body starts at offset 3 (right after the prologue: CONST, CALL, HALT).
 const FIB_ENTRY: u32 = 3;
 
-fn fib(n: u16) -> () {
+fn fib(n: u16) {
     let leq = Instruction::LEQ as u8;
     let sub = Instruction::SUB as u8;
     let add = Instruction::ADD as u8;

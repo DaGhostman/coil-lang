@@ -168,7 +168,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
         Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| apply_ty(subst, t)).collect()),
         Ty::Array { element, length } => Ty::Array {
             element: Box::new(apply_ty(subst, element)),
-            length: length.clone(),
+            length: *length,
         },
         Ty::Record { fields } => Ty::Record {
             fields: fields

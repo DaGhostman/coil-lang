@@ -56,10 +56,7 @@ pub enum ManifestError {
     /// The manifest file could not be read (I/O error).
     Io(String),
     /// A line failed to parse (invalid syntax).
-    Parse {
-        line: usize,
-        message: String,
-    },
+    Parse { line: usize, message: String },
     /// A required section is missing.
     MissingSection(&'static str),
     /// A required key is missing from a section.
@@ -191,10 +188,7 @@ impl Manifest {
                 (section, key) => {
                     return Err(ManifestError::Parse {
                         line: line_num,
-                        message: format!(
-                            "unknown key `{}.{}`",
-                            section, key
-                        ),
+                        message: format!("unknown key `{}.{}`", section, key),
                     });
                 }
             }
@@ -228,12 +222,7 @@ impl Manifest {
     /// the LAST segment. So `sadge` in `foo.0s` has
     /// FQN `foo::sadge`, and `read` in `lib/io.0s` has
     /// FQN `lib::io::read`.
-    pub fn resolve_use(
-        &self,
-        project_root: &Path,
-        path: &[String],
-        name: &str,
-    ) -> Option<PathBuf> {
+    pub fn resolve_use(&self, project_root: &Path, path: &[String], name: &str) -> Option<PathBuf> {
         for root in &self.roots {
             let mut candidate = project_root.join(root);
             for segment in path {
@@ -255,11 +244,7 @@ impl Manifest {
     /// Resolve a `mod foo;` forward declaration to an
     /// absolute file path. Looks for `<root>/foo.0s` in
     /// each search root.
-    pub fn resolve_mod(
-        &self,
-        project_root: &Path,
-        name: &str,
-    ) -> Option<PathBuf> {
+    pub fn resolve_mod(&self, project_root: &Path, name: &str) -> Option<PathBuf> {
         for root in &self.roots {
             let candidate = project_root.join(root).join(format!("{}.0s", name));
             if candidate.exists() {
@@ -283,11 +268,7 @@ impl Manifest {
     /// root. Files outside any search root are still
     /// compilable (we use their bare stem as the namespace),
     /// but the caller is expected to handle that fallback.
-    pub fn namespace_of(
-        &self,
-        project_root: &Path,
-        file: &Path,
-    ) -> Option<String> {
+    pub fn namespace_of(&self, project_root: &Path, file: &Path) -> Option<String> {
         for root in &self.roots {
             let abs_root = project_root.join(root);
             if let Ok(rel) = file.strip_prefix(&abs_root) {
@@ -464,10 +445,7 @@ mod tests {
             path_to_namespace(Path::new("core/ffi/dload.0s")),
             "core::ffi::dload"
         );
-        assert_eq!(
-            path_to_namespace(Path::new("a/b/c.0s")),
-            "a::b::c"
-        );
+        assert_eq!(path_to_namespace(Path::new("a/b/c.0s")), "a::b::c");
     }
 
     #[test]
@@ -482,7 +460,10 @@ mod tests {
 
         let m = Manifest::default(); // roots = ["src"]
         let resolved = m.resolve_use(&tmp, &["foo".into()], "sadge");
-        assert!(resolved.is_some(), "expected to find sadge.0s in <tmp>/src/foo/");
+        assert!(
+            resolved.is_some(),
+            "expected to find sadge.0s in <tmp>/src/foo/"
+        );
         let resolved = resolved.unwrap();
         assert!(resolved.ends_with("src/foo/sadge.0s"));
 
@@ -502,7 +483,10 @@ mod tests {
             entry: None,
         };
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
-        assert!(resolved.is_some(), "expected to find foo.0s in vendor/lib_x/");
+        assert!(
+            resolved.is_some(),
+            "expected to find foo.0s in vendor/lib_x/"
+        );
         let resolved = resolved.unwrap();
         assert!(resolved.ends_with("vendor/lib_x/foo.0s"));
 
@@ -587,11 +571,7 @@ mod tests {
     fn load_reads_existing_zero_toml() {
         let tmp = std::env::temp_dir().join("zero_script_manifest_test_7");
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            tmp.join("zero.toml"),
-            "[module]\nroots = [\"./vendor\"]\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.join("zero.toml"), "[module]\nroots = [\"./vendor\"]\n").unwrap();
 
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("./vendor")]);

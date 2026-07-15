@@ -7,7 +7,9 @@ mod call;
 mod registry;
 mod signature;
 
-pub use call::{invoke_via_libffi, prepare_cif, prepare_cif_for_symbol, resolve_symbol, PreparedCall};
+pub use call::{
+    PreparedCall, invoke_via_libffi, prepare_cif, prepare_cif_for_symbol, resolve_symbol,
+};
 pub use libloading::Library;
 pub use registry::{HostClosureFn, NativeFn, Natives};
 pub use signature::{FfiError, FfiSignature, FfiSignatureBuilder};

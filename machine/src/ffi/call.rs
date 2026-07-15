@@ -1,6 +1,6 @@
 //! libffi-backed dynamic call preparation and invocation.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 
 use common::Value;
 use libffi::middle::{Arg, Cif, CodePtr, Type};
@@ -26,12 +26,8 @@ fn ffi_type_to_libffi(ty: FfiType) -> Result<Type, FfiError> {
 
 /// Build a libffi call interface from an explicit signature.
 pub fn prepare_cif(sig: &FfiSignature) -> Result<PreparedCall, FfiError> {
-    let arg_types: Result<Vec<Type>, FfiError> = sig
-        .args
-        .iter()
-        .copied()
-        .map(ffi_type_to_libffi)
-        .collect();
+    let arg_types: Result<Vec<Type>, FfiError> =
+        sig.args.iter().copied().map(ffi_type_to_libffi).collect();
     let ret_type = ffi_type_to_libffi(sig.ret)?;
     let cif = Cif::new(arg_types?, ret_type);
     Ok(PreparedCall {
@@ -52,10 +48,7 @@ pub fn prepare_cif_for_symbol(
 }
 
 /// Resolve a symbol to a callable address.
-pub fn resolve_symbol(
-    library: &libloading::Library,
-    symbol: &str,
-) -> Result<CodePtr, FfiError> {
+pub fn resolve_symbol(library: &libloading::Library, symbol: &str) -> Result<CodePtr, FfiError> {
     type FnPtr = unsafe extern "C" fn();
     let sym_bytes: &[u8] = symbol.as_bytes();
     let sym: libloading::Symbol<FnPtr> = unsafe {

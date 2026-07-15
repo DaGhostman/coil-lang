@@ -589,7 +589,6 @@ fn example_nested_records_prints_99() {
     assert_eq!(output, "99");
 }
 
-
 // ============================================================
 //  Phase 22: FFI — `extern "lib" { fn ...; }` end-to-end
 // ============================================================
@@ -632,14 +631,14 @@ fn ensure_ffi_libsum_built() {
         Ok(s) if s.success() => {
             // cc already wrote the file and updated its mtime.
             // Never use File::create here — it truncates the .so.
-            if let Ok(meta) = std::fs::metadata(&libsum_so) {
-                if meta.len() < 256 {
-                    eprintln!(
-                        "warning: {} looks truncated ({} bytes) after cc build",
-                        libsum_so.display(),
-                        meta.len()
-                    );
-                }
+            if let Ok(meta) = std::fs::metadata(&libsum_so)
+                && meta.len() < 256
+            {
+                eprintln!(
+                    "warning: {} looks truncated ({} bytes) after cc build",
+                    libsum_so.display(),
+                    meta.len()
+                );
             }
         }
         Ok(s) => {

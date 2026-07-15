@@ -359,9 +359,9 @@ impl Byte {
 
     pub fn value_u32(&self) -> u32 {
         if matches!(self.bytecode, Instruction::CALL) {
-            (self.operands & 0xFFFFFF) as u32
+            self.operands & 0xFFFFFF
         } else {
-            (self.operands & 0xFFFF) as u32
+            self.operands & 0xFFFF
         }
     }
 
@@ -431,8 +431,7 @@ impl Byte {
     /// Pack `BinSlotImm`: op in [31:24], slot in [23:16], signed
     /// immediate in [15:0].
     pub fn with_bin_slot_imm(mut self, op: u8, slot: u8, imm: i16) -> Self {
-        self.operands =
-            ((op as u32) << 24) | ((slot as u32) << 16) | (imm as u16 as u32);
+        self.operands = ((op as u32) << 24) | ((slot as u32) << 16) | (imm as u16 as u32);
         self
     }
 
@@ -513,7 +512,7 @@ impl ArchivedByte {
         if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
             self.operands = (v as i32 as u32).into();
         } else {
-            self.operands = (Self::POOL_FLAG | 0).into();
+            self.operands = Self::POOL_FLAG.into();
         }
         self
     }

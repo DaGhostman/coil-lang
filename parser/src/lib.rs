@@ -160,13 +160,10 @@ impl<'pratt> Pratt<'pratt> {
                     e.span(),
                     Box::new(Expression::Array(vec![(
                         e.span(),
-                        Box::new(Expression::Integer(n as i64)),
+                        Box::new(Expression::Integer(n)),
                     )])),
                 ),
-                None => (
-                    e.span(),
-                    Box::new(Expression::Array(vec![elem])),
-                ),
+                None => (e.span(), Box::new(Expression::Array(vec![elem]))),
             });
         // `(T1, T2, ...)` — tuple form. Reuses the
         // existing tuple_atom machinery.
@@ -178,7 +175,11 @@ impl<'pratt> Pratt<'pratt> {
             // is just an identifier, not another tuple).
             text::ident().padded().map_with(output!(Type)),
         );
-        choice((array_type, tuple_type, text::ident().padded().map_with(output!(Type))))
+        choice((
+            array_type,
+            tuple_type,
+            text::ident().padded().map_with(output!(Type)),
+        ))
     }
 
     fn expr(
@@ -434,8 +435,7 @@ impl<'pratt> Pratt<'pratt> {
                 // all parse naturally).
                 postfix(
                     Precedence::Primary as u16,
-                    expr.clone()
-                        .delimited_by(op!('['), op!(']')),
+                    expr.clone().delimited_by(op!('['), op!(']')),
                     |lhs, index, e| (e.span(), Box::new(Expression::Index(lhs, index))),
                 ),
             ))
@@ -885,14 +885,16 @@ impl<'pratt> Pratt<'pratt> {
         // Path = first ident + zero or more `::` pieces.
         keyword!("use")
             .ignore_then(segment.then(path_tail))
-            .map(|(first, rest): (&'pratt str, Vec<(SimpleSpan, Option<String>)>)| {
-                let mut out: Vec<Option<String>> = Vec::with_capacity(1 + rest.len());
-                out.push(Some(first.to_string()));
-                for (_span, opt) in rest {
-                    out.push(opt);
-                }
-                out
-            })
+            .map(
+                |(first, rest): (&'pratt str, Vec<(SimpleSpan, Option<String>)>)| {
+                    let mut out: Vec<Option<String>> = Vec::with_capacity(1 + rest.len());
+                    out.push(Some(first.to_string()));
+                    for (_span, opt) in rest {
+                        out.push(opt);
+                    }
+                    out
+                },
+            )
             // After the path: either `as alias` (alias form)
             // or nothing (concrete form). The glob marker
             // (`*`) was consumed inside the path_tail above.
@@ -924,14 +926,7 @@ impl<'pratt> Pratt<'pratt> {
                 if let Some(name) = last {
                     // Concrete import. Alias is whatever
                     // the `as` clause produced.
-                    (
-                        e.span(),
-                        Box::new(Expression::Use {
-                            path,
-                            name,
-                            alias,
-                        }),
-                    )
+                    (e.span(), Box::new(Expression::Use { path, name, alias }))
                 } else {
                     // Glob import. `alias` is always None
                     // (a glob can't be aliased — the
@@ -979,15 +974,12 @@ impl<'pratt> Pratt<'pratt> {
                 // We use a leaf Integer(0) as the inner expression.
                 // The pipeline doesn't traverse the body; the
                 // name is all that matters.
-                let inner: Output = (
-                    noop_span,
-                    Box::new(Expression::Integer(0)),
-                );
-                let body: Output = (
-                    noop_span,
-                    Box::new(Expression::Noop(inner)),
-                );
-                (e.span(), Box::new(Expression::Module(name.to_string(), body)))
+                let inner: Output = (noop_span, Box::new(Expression::Integer(0)));
+                let body: Output = (noop_span, Box::new(Expression::Noop(inner)));
+                (
+                    e.span(),
+                    Box::new(Expression::Module(name.to_string(), body)),
+                )
             })
             .labelled("mod declaration")
     }
@@ -1284,8 +1276,8 @@ impl<'pratt> Pratt<'pratt> {
         expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        use chumsky::Parser;
         use crate::ast::RecordFieldValue;
+        use chumsky::Parser;
         // Each field: `name : expr`. Bare name (without the
         // `:`) isn't supported here (the typechecker and
         // codegen always have the explicit form, and the
@@ -1535,7 +1527,7 @@ impl<'pratt> Pratt<'pratt> {
                 .allow_trailing()
                 .collect::<Vec<_>>()
                 .delimited_by(op!("{"), op!("}"))
-                .map(|fields| PatternPayload::Record(fields))
+                .map(PatternPayload::Record)
                 .labelled("record pattern payload");
 
             // `Enum::Variant(p1, p2, ...)` — the first ident must be
@@ -1642,7 +1634,7 @@ impl<'pratt> Pratt<'pratt> {
             .allow_trailing()
             .collect::<Vec<_>>()
             .delimited_by(op!("{"), op!("}"))
-            .map(|fields| EnumVariantPayload::Record(fields))
+            .map(EnumVariantPayload::Record)
             .labelled("record variant payload");
 
         let tuple_payload_decl = text::ident()
@@ -2343,11 +2335,11 @@ mod tests {
             Expression::Statement(s) => s.1.as_ref().clone(),
             other => other.clone(),
         };
-        let if_ast = match inner_stmt {
+
+        match inner_stmt {
             Expression::If(branches) => Expression::If(branches),
             other => panic!("expected If, got {:?}", other),
-        };
-        if_ast
+        }
     }
 
     #[test]

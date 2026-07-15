@@ -92,7 +92,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // them as equivalent.
         (Ty::Con(c_name), Ty::Sum { name, variants })
         | (Ty::Sum { name, variants }, Ty::Con(c_name))
-            if c_name == name && c_name == name =>
+            if c_name == name =>
         {
             // Re-borrow: the `apply_ty` at the top of this
             // function already resolved any bound vars, so
@@ -351,7 +351,10 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                 (l1, l2),
                 (super::ty::ArrayLength::Dynamic, _)
                     | (_, super::ty::ArrayLength::Dynamic)
-                    | (super::ty::ArrayLength::Static(_), super::ty::ArrayLength::Static(_))
+                    | (
+                        super::ty::ArrayLength::Static(_),
+                        super::ty::ArrayLength::Static(_)
+                    )
             );
             if !len_compatible {
                 return Err(UnifyError::Mismatch {
