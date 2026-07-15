@@ -3921,7 +3921,7 @@ impl Compiler {
         self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
-        let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode);
+        let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
         }
@@ -4251,22 +4251,25 @@ mod tests {
         use common::Instruction;
         let src = include_str!("../../examples/fib.0s");
         let (bc, _) = compile_src(src);
-        let jmpf_leq = bc
+        // fib's body fuses: `n <= 2` and the two `n - k` into
+        // `BinSlotImm`, `return 1` into `ConstReturnImm`, and the
+        // `fib(..) + fib(..)` tail into `BinReturn`.
+        let bin_slot_imm = bc
             .iter()
-            .filter(|b| *b.bytecode() == Instruction::JmpfLeqSlotImm)
+            .filter(|b| *b.bytecode() == Instruction::BinSlotImm)
             .count();
-        let sub_call = bc
+        let bin_return = bc
             .iter()
-            .filter(|b| *b.bytecode() == Instruction::SubCallSlotImm)
+            .filter(|b| *b.bytecode() == Instruction::BinReturn)
             .count();
         assert!(
-            jmpf_leq >= 1,
-            "expected at least one JmpfLeqSlotImm in fib bytecode; got {jmpf_leq}"
+            bin_slot_imm >= 3,
+            "expected at least three BinSlotImm in fib bytecode; got {bin_slot_imm}; opcodes: {:?}",
+            bc.iter().map(|b| *b.bytecode() as u8).collect::<Vec<_>>()
         );
         assert!(
-            sub_call >= 2,
-            "expected at least two SubCallSlotImm in fib bytecode; got {sub_call}; opcodes: {:?}",
-            bc.iter().map(|b| *b.bytecode() as u8).collect::<Vec<_>>()
+            bin_return >= 1,
+            "expected at least one BinReturn in fib bytecode; got {bin_return}"
         );
     }
 

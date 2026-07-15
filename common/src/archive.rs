@@ -6,7 +6,10 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// v4: 8-byte `Byte` (dropped `value` field); wide immediates
 /// live in the constant pool. Recompile from source.
 /// v5: fused opcodes `JmpfLeqSlotImm` and `SubCallSlotImm`.
-pub const ARCHIVE_VERSION: u32 = 5;
+/// v6: operator-parameterized fused opcodes `LoadReturnSlot`,
+/// `ConstReturnImm`, `BinSlotImm`, `CmpJmpf`, `BinReturn`; peephole
+/// now relocates `JUMP_IF_MATCH` pool targets.
+pub const ARCHIVE_VERSION: u32 = 6;
 
 /// Versioned wrapper for serialized bytecode. Replaces the
 /// pre-18C `ArchivedVec<ArchivedByte>` format.

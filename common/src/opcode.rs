@@ -245,17 +245,42 @@ pub enum Instruction {
 
     // ---- Phase VM perf: fused superinstructions (APPENDED) ----
     //
-    // `JmpfLeqSlotImm` — fuses `LOAD slot; CONST imm; LEQ; JMPF target`.
-    //   operands[31:24] = slot index (relative to frame.sp)
-    //   operands[23:16] = immediate (8-bit unsigned compare rhs)
-    //   operands[15:0]  = jump target when `stack[sp+slot] > imm`
+    // These are operator-parameterized: the fused opcode carries the
+    // underlying arithmetic/comparison `Instruction` discriminant in
+    // the high operand byte, so ONE opcode covers a whole family
+    // (`ADD`/`SUB`/`MUL`/`DIV`/`MOD`, all comparisons, float
+    // variants, ...) instead of a bespoke opcode per case.
     //
-    // `SubCallSlotImm` — fuses `LOAD slot; CONST imm; SUB; CALL 1,target`.
-    //   operands[31:24] = slot index
-    //   operands[23:16] = subtract immediate (8-bit unsigned)
-    //   operands[15:0]  = call target (16-bit; arity is fixed at 1)
-    JmpfLeqSlotImm,
-    SubCallSlotImm,
+    // `LoadReturnSlot` — fuses `LOAD slot; RETURN` (return a local).
+    //   operands[31:0] = slot index (relative to frame.sp)
+    //
+    // `ConstReturnImm` — fuses `CONST imm; RETURN` (return a small
+    // inline constant; pool-backed constants are not fused).
+    //   operands[31:0] = the i32 immediate (sign-extended on return)
+    //
+    // `BinSlotImm` — fuses `LOAD slot; CONST imm; <binop>`, i.e. a
+    // binary op between a local and a small inline immediate
+    // (`n - 1`, `i + 1`, `x * 2`, `n <= 2`, `k == 0`, ...).
+    //   operands[31:24] = op (an integer `Instruction` discriminant:
+    //                     ADD/SUB/MUL/DIV/MOD or a comparison)
+    //   operands[23:16] = slot index (relative to frame.sp)
+    //   operands[15:0]  = signed 16-bit immediate
+    //
+    // `CmpJmpf` — fuses `<cmp>; JMPF target`: compare the top two
+    // stack values and branch when the comparison is FALSE.
+    //   operands[31:24] = op (a comparison `Instruction`, int or float)
+    //   operands[23:16] = reserved (0)
+    //   operands[15:0]  = jump target taken when the compare is false
+    //
+    // `BinReturn` — fuses `<binop>; RETURN`: apply a binary op to the
+    // top two stack values and return the result.
+    //   operands[31:24] = op (any binary `Instruction`, int or float)
+    //   operands[23:0]  = reserved (0)
+    LoadReturnSlot,
+    ConstReturnImm,
+    BinSlotImm,
+    CmpJmpf,
+    BinReturn,
 }
 
 impl From<u8> for Instruction {
@@ -270,6 +295,13 @@ impl From<Instruction> for u8 {
     }
 }
 
+impl From<u8> for ArchivedInstruction {
+    fn from(value: u8) -> Self {
+        // `ArchivedInstruction` mirrors `Instruction`'s `#[repr(u8)]`
+        // discriminants, so the fused-op operator byte round-trips.
+        unsafe { std::mem::transmute(value) }
+    }
+}
 
 #[repr(C)]
 #[derive(Default, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -307,7 +339,10 @@ impl Byte {
     }
 
     pub fn call_parts(&self) -> (usize, usize) {
-        ((self.operands >> 24) as usize, (self.operands & 0xFFFFFF) as usize)
+        (
+            (self.operands >> 24) as usize,
+            (self.operands & 0xFFFFFF) as usize,
+        )
     }
 
     /// Legacy helper — prefer `with_call_packed`.
@@ -393,33 +428,47 @@ impl Byte {
         pool[(self.operands & 0xFFFF) as usize] as usize
     }
 
-    /// Pack `JmpfLeqSlotImm`: slot in [31:24], imm in [23:16], target in [15:0].
-    pub fn with_jmpf_leq_slot_imm(mut self, slot: u8, imm: u8, target: u16) -> Self {
-        debug_assert!(self.bytecode as u8 == Instruction::JmpfLeqSlotImm as u8);
+    /// Pack `BinSlotImm`: op in [31:24], slot in [23:16], signed
+    /// immediate in [15:0].
+    pub fn with_bin_slot_imm(mut self, op: u8, slot: u8, imm: i16) -> Self {
         self.operands =
-            ((slot as u32) << 24) | ((imm as u32) << 16) | (target as u32);
+            ((op as u32) << 24) | ((slot as u32) << 16) | (imm as u16 as u32);
         self
     }
 
-    pub fn jmpf_leq_slot_imm_parts(&self) -> (usize, u8, usize) {
-        let op = self.operands;
+    /// Unpack `BinSlotImm` into (op, slot, sign-extended immediate).
+    pub fn bin_slot_imm_parts(&self) -> (u8, usize, i64) {
+        let o = self.operands;
         (
-            ((op >> 24) & 0xFF) as usize,
-            ((op >> 16) & 0xFF) as u8,
-            (op & 0xFFFF) as usize,
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as u16 as i16 as i64,
         )
     }
 
-    /// Pack `SubCallSlotImm`: slot in [31:24], imm in [23:16], target in [15:0].
-    pub fn with_sub_call_slot_imm(mut self, slot: u8, imm: u8, target: u16) -> Self {
-        debug_assert!(self.bytecode as u8 == Instruction::SubCallSlotImm as u8);
-        self.operands =
-            ((slot as u32) << 24) | ((imm as u32) << 16) | (target as u32);
+    /// Pack `CmpJmpf`: op in [31:24], target in [15:0].
+    pub fn with_cmp_jmpf(mut self, op: u8, target: u16) -> Self {
+        self.operands = ((op as u32) << 24) | (target as u32);
         self
     }
 
-    pub fn sub_call_slot_imm_parts(&self) -> (usize, u8, usize) {
-        self.jmpf_leq_slot_imm_parts()
+    /// Unpack `CmpJmpf` into (op, target).
+    pub fn cmp_jmpf_parts(&self) -> (u8, usize) {
+        (
+            (self.operands >> 24) as u8,
+            (self.operands & 0xFFFF) as usize,
+        )
+    }
+
+    /// Pack `BinReturn`: op in [31:24].
+    pub fn with_bin_return(mut self, op: u8) -> Self {
+        self.operands = (op as u32) << 24;
+        self
+    }
+
+    /// Unpack the `BinReturn` op.
+    pub fn bin_return_op(&self) -> u8 {
+        (self.operands >> 24) as u8
     }
 }
 
@@ -429,7 +478,7 @@ impl ArchivedByte {
     pub fn new(bytecode: ArchivedInstruction) -> Self {
         Self {
             bytecode,
-            _pad: [0; 3].into(),
+            _pad: [0; 3],
             operands: Default::default(),
         }
     }
@@ -513,28 +562,41 @@ impl ArchivedByte {
         pool[(op & 0xFFFF) as usize] as usize
     }
 
-    pub fn jmpf_leq_slot_imm_parts(&self) -> (usize, u8, usize) {
-        let op: u32 = self.operands.into();
+    /// Unpack `BinSlotImm` into (op, slot, sign-extended immediate).
+    pub fn bin_slot_imm_parts(&self) -> (u8, usize, i64) {
+        let o: u32 = self.operands.into();
         (
-            ((op >> 24) & 0xFF) as usize,
-            ((op >> 16) & 0xFF) as u8,
-            (op & 0xFFFF) as usize,
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            (o & 0xFFFF) as u16 as i16 as i64,
         )
     }
 
-    pub fn sub_call_slot_imm_parts(&self) -> (usize, u8, usize) {
-        self.jmpf_leq_slot_imm_parts()
-    }
-
-    pub fn with_jmpf_leq_slot_imm(mut self, slot: u8, imm: u8, target: u16) -> Self {
-        let packed =
-            ((slot as u32) << 24) | ((imm as u32) << 16) | (target as u32);
+    pub fn with_bin_slot_imm(mut self, op: u8, slot: u8, imm: i16) -> Self {
+        let packed = ((op as u32) << 24) | ((slot as u32) << 16) | (imm as u16 as u32);
         self.operands = packed.into();
         self
     }
 
-    pub fn with_sub_call_slot_imm(self, slot: u8, imm: u8, target: u16) -> Self {
-        self.with_jmpf_leq_slot_imm(slot, imm, target)
+    /// Unpack `CmpJmpf` into (op, target).
+    pub fn cmp_jmpf_parts(&self) -> (u8, usize) {
+        let o: u32 = self.operands.into();
+        ((o >> 24) as u8, (o & 0xFFFF) as usize)
+    }
+
+    pub fn with_cmp_jmpf(mut self, op: u8, target: u16) -> Self {
+        self.operands = (((op as u32) << 24) | (target as u32)).into();
+        self
+    }
+
+    /// Unpack the `BinReturn` op.
+    pub fn bin_return_op(&self) -> u8 {
+        (u32::from(self.operands) >> 24) as u8
+    }
+
+    pub fn with_bin_return(mut self, op: u8) -> Self {
+        self.operands = ((op as u32) << 24).into();
+        self
     }
 }
 
@@ -557,12 +619,7 @@ impl std::fmt::Display for Instruction {
 #[cfg(debug_assertions)]
 impl Debug for ArchivedByte {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}({:?})",
-            self.bytecode as u8,
-            self.operands
-        )
+        write!(f, "{}({:?})", self.bytecode as u8, self.operands)
     }
 }
 
