@@ -1589,7 +1589,14 @@ impl Checker {
         // for the body is a child of the outer.
         let alpha = self.counter.fresh();
         let prev_ret = self.current_return_ty.replace(if is_coro {
-            unit_ty()
+            // A coroutine's `resume` has a single static result type
+            // covering BOTH the yielded value (each `yield e;`) and the
+            // final value produced when the body completes (`return e;`
+            // or falling off the end). `return e;` therefore unifies
+            // against the SAME yield type variable as `yield e;` — not
+            // `unit` — so `return`'s value becomes a real completion
+            // value instead of being silently dropped.
+            yield_slot.clone().unwrap_or_else(unit_ty)
         } else {
             ret_ty.clone()
         });
@@ -5277,5 +5284,50 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
             "expected yield-outside-async diagnostic, got {:?}",
             c.messages()
         );
+    }
+
+    /// `return e;` inside an `async fn` unifies against the SAME
+    /// type as `yield e;` (not `unit`) — `resume` has a single
+    /// static result type covering both the yielded values and the
+    /// final completion value, so a `return` of a matching type
+    /// typechecks cleanly.
+    #[test]
+    fn return_inside_coroutine_unifies_with_yield_type() {
+        let src = "async fn coro() { yield 1; return 42; } \
+                   fn main() { let h = coro(); }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+    }
+
+    /// A `return` whose type disagrees with the coroutine's yield
+    /// type is a real type error (soundness: `resume`'s result type
+    /// can't be both `int` and `string`).
+    #[test]
+    fn return_inside_coroutine_mismatched_type_is_diagnostic() {
+        let src = r#"async fn coro() { yield 1; return "oops"; } fn main() { let h = coro(); }"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().iter().any(|m| {
+                m.message().contains("Type mismatch")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("return value"))
+            }),
+            "expected return-value type mismatch, got {:?}",
+            c.messages()
+        );
+    }
+
+    /// A `return` with no preceding `yield` still pins the
+    /// coroutine's yield/resume type — `coroutine<int, unit>` here.
+    #[test]
+    fn return_only_coroutine_infers_yield_type_from_return() {
+        let src = "async fn coro() { return 42; } fn main() { let h = coro(); let x = resume h; }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let x_ty = c
+            .codegen_var_type("x")
+            .expect("x should be recorded in codegen_var_types");
+        assert_eq!(apply_ty_prune(c.subst(), x_ty), int());
     }
 }

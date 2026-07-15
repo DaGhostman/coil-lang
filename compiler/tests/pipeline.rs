@@ -524,3 +524,51 @@ fn parameterized_interleaved_coroutines_inline_resume_stay_independent() {
     let output = run_example_src(src);
     assert_eq!(output, "1,100,2,101,3,102");
 }
+
+/// `return e;` inside an `async fn` now produces a real completion
+/// value (previously it was silently unified against `unit` and the
+/// typechecker rejected any non-unit `return`). The value returned by
+/// `return` propagates to the `resume` call that completes the
+/// coroutine, exactly like a yielded value.
+#[test]
+fn coroutine_return_value_propagates_to_resume() {
+    let src = r#"
+        async fn counter() {
+            yield 1;
+            yield 2;
+            return 42;
+        }
+
+        fn main() {
+            let h = counter();
+            print "%i,", resume h; // yield 1
+            print "%i,", resume h; // yield 2
+            print "%i", resume h;  // return 42
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "1,2,42");
+}
+
+/// Resuming an already-Done coroutine always yields the sentinel
+/// `Value::default()` (`0`) — never the coroutine's last `return`
+/// value — since there's no error-handling protocol yet to signal
+/// "resumed after completion" and returning the stale value again
+/// would be a worse form of undefined behavior.
+#[test]
+fn resume_after_done_returns_default_not_last_return_value() {
+    let src = r#"
+        async fn counter() {
+            return 42;
+        }
+
+        fn main() {
+            let h = counter();
+            print "%i,", resume h; // return 42 (completes)
+            print "%i,", resume h; // Done -> 0, not 42
+            print "%i", resume h;  // Done -> 0, not 42
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "42,0,0");
+}

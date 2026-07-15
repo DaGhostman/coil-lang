@@ -1562,7 +1562,16 @@ impl<const S: usize> Machine<S> {
                             Self::find_object_by_addr(&self.heap, addr)
                         {
                             if gc.as_ref().state == CoroState::Done {
-                                self.stack.push(Value::from(0_i64));
+                                // Resuming an already-Done coroutine always
+                                // yields the sentinel `Value::default()`
+                                // (never the coroutine's last `return`
+                                // value). There is no error-handling
+                                // machinery yet to signal "resumed after
+                                // completion", so this keeps the behavior
+                                // well-defined rather than leaking a stale
+                                // value; a real error/Result protocol is
+                                // deferred to a later phase.
+                                self.stack.push(Value::default());
                             } else if let Some(sub) = gc.as_ref().yield_from {
                                 self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
                                     c.pending_send = send_val;
@@ -1586,7 +1595,10 @@ impl<const S: usize> Machine<S> {
                                 );
                             }
                         } else {
-                            self.stack.push(Value::from(0_i64));
+                            // Handle didn't resolve to a live coroutine
+                            // object (e.g. already freed) — same
+                            // well-defined sentinel as the Done case.
+                            self.stack.push(Value::default());
                         }
                     }
                 }

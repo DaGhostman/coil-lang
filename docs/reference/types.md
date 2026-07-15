@@ -241,6 +241,35 @@ async fn ping() -> coroutine<string, string> {
 
 Resume expression type: if `h : coroutine<Y, S>`, then `resume h` has type `Y`, and `resume h with v` requires `v : S`.
 
+`resume` has a single static result type (`Y`) covering BOTH the value
+yielded by each `yield expr;` AND the value produced when the body
+completes (`return expr;`, or falling off the end). A `return expr;`
+inside an `async fn` therefore unifies `expr`'s type against the SAME
+`Y` as every `yield` in that body — not `unit` — so the returned value
+is not discarded:
+
+```0s
+async fn counter() {
+    yield 1;
+    yield 2;
+    return 42; // completion value, type unifies with the `yield`s above
+}
+
+fn main() {
+    let h = counter();
+    resume h; // 1
+    resume h; // 2
+    resume h; // 42 (the `return` value)
+    resume h; // 0  (Done — see below, NOT 42 again)
+}
+```
+
+Resuming an already-`Done` coroutine always yields `Value::default()`
+(`0`/equivalent), never the coroutine's last `return` value — there is
+no error-handling protocol yet to signal "resumed after completion",
+so a fixed sentinel keeps the behavior well-defined instead of leaking
+a stale value.
+
 ---
 
 ## Known limitations
@@ -258,7 +287,7 @@ Resume expression type: if `h : coroutine<Y, S>`, then `resume h` has type `Y`, 
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
 | String `+` | Not in current tree — do not rely on string concatenation |
-| `async fn` return type | `return expr;` inside an `async fn` is unified against `unit`, not the declared `-> T`; omit the return-type annotation or avoid `return` in coroutine bodies |
+| `async fn` `-> T` annotation | An explicit `-> T` on an `async fn` signature is not checked against anything — the coroutine's yield type `Y` is inferred purely from its `yield`/`return` sites, not from the annotation. Omit it or write it for documentation purposes only |
 | `const` | No `const` keyword in parser — use `let` |
 
 ---

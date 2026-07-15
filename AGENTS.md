@@ -4210,3 +4210,164 @@ pipeline, up from 380 + 23).
 | `docs/*` | Reference + examples catalog |
 | `examples/coro_*.0s` | New/updated demos |
 
+## PHASE CORO-2.2 — TYPED `return` INSIDE COROUTINES + DONE-RESUME SENTINEL (COMPLETED)
+
+### Summary
+
+Addressed the two remaining user-reported gaps left over from
+CORO-2.1:
+
+1. `return expr;` inside an `async fn` was unified against `unit`
+   (silently discarding the value) rather than becoming the
+   coroutine's completion value.
+2. Resuming an already-`Done` coroutine needed to be a well-defined
+   `Value::default()`, not an accident of whatever `0_i64` happened
+   to mean at the time.
+
+### Fix 1 — `return` unifies with the yield type, not `unit`
+
+`resume h`'s STATIC type is a single `Ty` (`Y` in `coroutine<Y, S>`)
+that must cover BOTH what a `yield expr;` produces AND what the
+body's final `return expr;` (or fall-through) produces — the call
+site can't know at compile time which one a given `resume` will
+observe. The only sound fix is to require `return`'s value to have
+the SAME type as every `yield` in that body.
+
+`infer_function`'s coroutine branch used to seed
+`current_return_ty` with `unit_ty()`:
+
+```rust
+let prev_ret = self.current_return_ty.replace(if is_coro {
+    unit_ty()
+} else {
+    ret_ty.clone()
+});
+```
+
+Phase CORO-2.2 seeds it with the SAME `Ty::Var` used for
+`current_yield_ty` (captured earlier in the same function as
+`yield_slot`):
+
+```rust
+let prev_ret = self.current_return_ty.replace(if is_coro {
+    yield_slot.clone().unwrap_or_else(unit_ty)
+} else {
+    ret_ty.clone()
+});
+```
+
+No codegen change was needed — `Expression::Return`'s codegen
+already emits `<expr>, RETURN` unconditionally, and the VM's
+`RETURN` handler already propagates that value to the resumer via
+the shared-stack protocol (the same protocol used for a yielded
+value). The bug was ENTIRELY in the typechecker seeding the wrong
+unification target; codegen was already correct.
+
+A `return expr;` whose type disagrees with the body's yield type is
+now a real "Type mismatch" diagnostic (soundness — `resume` can't
+have two different result types).
+
+### Fix 2 — Done-resume sentinel made explicit
+
+The VM's `ResumeCoro` handler already pushed `Value::from(0_i64)`
+when the target coroutine's state was `CoroState::Done` — which is
+bit-for-bit identical to `Value::default()` (`Value` is a
+`#[derive(Default)]` newtype over a null pointer, and `Value::from(0)`
+constructs the same null pointer). Functionally this was ALREADY the
+requested behavior; Phase CORO-2.2 makes it textually explicit
+(`Value::default()` instead of `Value::from(0_i64)`) at both sites —
+the `Done` branch and the "handle didn't resolve to a live object"
+defensive fallback — with a comment recording the invariant: a
+`Done` coroutine's `resume` result is ALWAYS the sentinel, NEVER the
+coroutine's last `return` value, because there's no error/`Result`
+protocol yet to signal "resumed after completion" and re-returning a
+stale value would be a worse form of undefined behavior. `ObjCoroutine`
+has no field that stores "last return value" for a `Done` coroutine,
+so there's no code path that could accidentally resurrect it.
+
+### What works now
+
+```0s
+async fn counter() {
+    yield 1;
+    yield 2;
+    return 42;
+}
+
+fn main() {
+    let h = counter();
+    print "%i,", resume h; // 1
+    print "%i,", resume h; // 2
+    print "%i,", resume h; // 42 (the `return` value — previously unit-only)
+    print "%i", resume h;  // 0  (Done -> Value::default(), never 42 again)
+}
+```
+
+Output: `1,2,42,0`.
+
+### Decisions locked in (during implementation)
+
+1. **No new "R" type parameter on `coroutine<Y, S>`.** The
+   CORO-2.1 "Anything 3+ needs to know" note speculated a 3rd type
+   parameter would be needed. It wasn't — unifying `return` against
+   the EXISTING `Y` is both simpler and more correct, since
+   `resume`'s call-site type is single-valued regardless of which
+   internal path (yield vs. return) produced it.
+2. **The `async fn`'s `-> T` annotation remains unconsulted.** This
+   was already true before CORO-2.2 (the coroutine branch of
+   `infer_function` never reads `returns` — it always computes
+   `ret_ty` as `coroutine<Y, S>` for the function's OWN call-site
+   type). CORO-2.2 doesn't change this; it's documented as a
+   distinct, narrower known limitation in `docs/reference/types.md`
+   (renamed from the old, now-fixed, "return unified against unit"
+   row).
+3. **`Value::default()` used literally at both `ResumeCoro` push
+   sites**, not just the `Done` one — the "handle not found" defensive
+   fallback gets the same explicit sentinel for consistency, even
+   though it was already zero.
+
+### Diagnostics produced
+
+| Site | Message |
+|------|---------|
+| `return` type disagrees with body's `yield` type | `Type mismatch: expected `Y`, found `<return type>`` (help: `while checking `return value``) — pre-existing diagnostic machinery, now reachable for coroutines |
+
+### Files modified
+
+| File | Purpose |
+|------|---------|
+| `compiler/src/typechecking/infer.rs` | `current_return_ty` seeded from `yield_slot` (not `unit_ty()`) for coroutines; 3 new unit tests |
+| `machine/src/vm.rs` | `ResumeCoro`'s `Done` and "handle not found" branches use `Value::default()` explicitly, with invariant-documenting comments |
+| `compiler/tests/pipeline.rs` | 2 new golden tests (`coroutine_return_value_propagates_to_resume`, `resume_after_done_returns_default_not_last_return_value`) |
+| `docs/reference/types.md` | Documented `return`'s unification with `Y`; documented the Done-resume sentinel guarantee; replaced the fixed limitation row with the narrower `-> T`-annotation-unconsulted one |
+| `docs/tutorial/08-coroutines.md` | Updated the "Resuming" section's example to include a `return` + Done-resume walkthrough |
+
+### Test counts (CORO-2.2 final)
+
+| Suite | Delta |
+|-------|-------|
+| `compiler/src/typechecking/infer.rs::tests` | +3 |
+| `compiler/tests/pipeline.rs` | +2 golden |
+
+`cargo test --workspace` — all tests pass (385 lib, up from 382;
+27 pipeline, up from 25).
+
+### Anything 3+ needs to know
+
+- **`return`'s type now flows into `Y` for coroutines with NO
+  `yield` sites at all.** `async fn f() { return 42; }` infers
+  `coroutine<int, unit>` purely from the `return`. This is
+  intentional and covered by
+  `return_only_coroutine_infers_yield_type_from_return`.
+- **The auto-default fall-off-the-end path is unchanged** (still
+  emits `CONST 0; RETURN` when a coroutine body doesn't end in an
+  explicit `return`). Since `0` is a valid representation for
+  `Y = int` (and for any immediate type unified to a variable that's
+  never pinned otherwise), this doesn't regress — but a coroutine
+  whose `Y` is pinned to something like `string` by an earlier
+  `yield "x";` and that then falls off the end without a `return`
+  would still push a bogus `0` as a fake string pointer. This is the
+  SAME pre-existing gap that affects every typed (non-coroutine)
+  function with an implicit fall-through path — not something
+  introduced or fixed by CORO-2.2.
+

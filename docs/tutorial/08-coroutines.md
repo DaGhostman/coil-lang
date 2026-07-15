@@ -24,24 +24,27 @@ Calling an async function emits `MakeCoro` — it allocates a suspended coroutin
 
 ## Resuming
 
-`resume h` continues the coroutine until the next `yield` or `return`. The yielded value becomes the result of the `resume` expression.
+`resume h` continues the coroutine until the next `yield` or `return`. The yielded (or returned) value becomes the result of the `resume` expression — `resume` has a single static result type covering both.
 
 ```0s
 async fn two_step() {
     yield 10;
     yield 20;
+    return 30; // completion value — same type as the yields above
 }
 
 fn main() {
     let h = two_step();
     let a = resume h;
     let b = resume h;
+    let c = resume h;
     print "%i", a;  // 10
     print "%i", b;  // 20
+    print "%i", c;  // 30 (the `return` value)
 }
 ```
 
-Resuming a **done** coroutine returns `0` (MVP protocol).
+Resuming an already-**done** coroutine always returns `0` (`Value::default()`) — never the coroutine's last `return` value. There's no error-handling protocol yet to signal "resumed after completion", so this fixed sentinel avoids leaking a stale value (MVP protocol; a real error/`Result` mechanism is future work).
 
 `resume h` can be used inline anywhere an expression is expected, including directly as a `print` argument:
 
