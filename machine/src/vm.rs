@@ -569,7 +569,7 @@ impl<const S: usize> Machine<S> {
 
             let bc = opcode.bytecode();
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::BinReturn as u8);
+            promise!(*bc as u8 <= Instruction::BinSlotSlot as u8);
 
             match bc {
                 Instruction::POP => {
@@ -922,6 +922,40 @@ impl<const S: usize> Machine<S> {
                     let caller = self.frames.get_mut();
                     ip = caller.tell();
                     sp = caller.get();
+                }
+                // Fused `LOAD a; LOAD b; <binop>` — binary op between
+                // two locals. Pushing both slot values then running the
+                // shared `binary!` macro guarantees identical semantics
+                // (int and float arithmetic + comparisons).
+                Instruction::BinSlotSlot => {
+                    let (op, a, b) = opcode.bin_slot_slot_parts();
+                    let va = self.stack[sp + a];
+                    let vb = self.stack[sp + b];
+                    self.stack.push(va);
+                    self.stack.push(vb);
+                    match Instruction::from(op) {
+                        Instruction::ADD => binary!(self.stack, +, as_int),
+                        Instruction::SUB => binary!(self.stack, -, as_int),
+                        Instruction::MUL => binary!(self.stack, *, as_int),
+                        Instruction::DIV => binary!(self.stack, /, as_int),
+                        Instruction::MOD => binary!(self.stack, %, as_int),
+                        Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
+                        Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
+                        Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
+                        Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
+                        Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
+                        Instruction::LE => binary!(self.stack, <, raw),
+                        Instruction::LEQ => binary!(self.stack, <=, raw),
+                        Instruction::GT => binary!(self.stack, >, raw),
+                        Instruction::GEQ => binary!(self.stack, >=, raw),
+                        Instruction::EQ => binary!(self.stack, ==, raw),
+                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::LEF => binary!(self.stack, <, as_float),
+                        Instruction::LEQF => binary!(self.stack, <=, as_float),
+                        Instruction::GTF => binary!(self.stack, >, as_float),
+                        Instruction::GEQF => binary!(self.stack, >=, as_float),
+                        _ => {}
+                    }
                 }
                 // FFI / native dispatch. Pops `native.arity()`
                 // values from the operand stack (in source order:
@@ -2335,6 +2369,39 @@ mod tests {
             0,
             "out-of-bounds LoadField should leave the stack empty"
         );
+    }
+
+    /// `BinSlotSlot` applies an int binary op between two locals.
+    /// Set up slots 0 and 1 with `6` and `4`, then `SUB` → `2`.
+    #[test]
+    fn bin_slot_slot_int_subtracts_two_locals() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(6), // slot 0
+            const_int(4), // slot 1
+            Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::SUB as u8, 0, 1),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 2);
+    }
+
+    /// `BinSlotSlot` also covers float ops (both operands are slot
+    /// loads, so unlike `BinSlotImm` there's no pool-constant issue).
+    /// Slots 0 and 1 hold pooled `1.5` and `2.0`; `ADDF` → `3.5`.
+    #[test]
+    fn bin_slot_slot_float_adds_two_locals() {
+        let pool = [1.5f64.to_bits(), 2.0f64.to_bits()];
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG), // pool[0] = 1.5
+                Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG), // pool[1] = 2.0
+                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::ADDF as u8, 0, 1),
+                Byte::new(Instruction::HALT),
+            ],
+            &pool,
+        );
+        assert_eq!(vm.pop().as_float(), 3.5);
     }
 
     /// Nested enum GC test: allocate an outer enum with a

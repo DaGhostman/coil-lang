@@ -3925,20 +3925,27 @@ mod tests {
         );
     }
 
-    /// Integer arithmetic should pick `ADD`, not `ADDF`.
+    /// Integer arithmetic should pick `ADD`, not `ADDF`. Two literals
+    /// (`1 + 2`) now constant-fold to a single `CONST`, so we use two
+    /// int parameters — `a + b` compiles to a slot/slot binary op whose
+    /// packed operator must be the int `ADD` (not the float `ADDF`).
     #[test]
     fn integer_arithmetic_emits_int_opcode() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("1 + 2;");
-        let mut last_binop: Option<&Instruction> = None;
-        for b in &bc {
-            if matches!(b.bytecode(), Instruction::ADDF | Instruction::ADD) {
-                last_binop = Some(b.bytecode());
-            }
-        }
+        let (bc, _pool) = compile_src("fn add(int a, int b) -> int { return a + b; }");
+        let has_int_add = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::ADD
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::ADD as u8)
+        });
+        let has_float_add = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::ADDF
+                || (*b.bytecode() == Instruction::BinSlotSlot
+                    && b.bin_slot_slot_parts().0 == Instruction::ADDF as u8)
+        });
         assert!(
-            matches!(last_binop, Some(Instruction::ADD)),
-            "expected ADD for integer arithmetic"
+            has_int_add && !has_float_add,
+            "expected int ADD for integer arithmetic"
         );
     }
 

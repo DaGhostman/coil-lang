@@ -9,7 +9,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// v6: operator-parameterized fused opcodes `LoadReturnSlot`,
 /// `ConstReturnImm`, `BinSlotImm`, `CmpJmpf`, `BinReturn`; peephole
 /// now relocates `JUMP_IF_MATCH` pool targets.
-pub const ARCHIVE_VERSION: u32 = 6;
+/// v7: fused `BinSlotSlot` (`LOAD a; LOAD b; <op>`) and compile-time
+/// constant folding of `CONST a; CONST b; <ADD|SUB|MUL>`.
+pub const ARCHIVE_VERSION: u32 = 7;
 
 /// Versioned wrapper for serialized bytecode. Replaces the
 /// pre-18C `ArchivedVec<ArchivedByte>` format.

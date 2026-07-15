@@ -41,17 +41,25 @@
 //! | Fused opcode     | Source convoy               | Meaning                                   |
 //! |------------------|-----------------------------|-------------------------------------------|
 //! | `BinSlotImm`     | `LOAD s; CONST k; <op>`     | push `stack[s] <op> k` (int arith/compare)|
+//! | `BinSlotSlot`    | `LOAD a; LOAD b; <op>`      | push `stack[a] <op> stack[b]` (int/float) |
 //! | `CmpJmpf`        | `<cmp>; JMPF t`             | compare top two; branch to `t` if false   |
 //! | `BinReturn`      | `<binop>; RETURN`           | `return a <binop> b` (int or float)       |
 //! | `LoadReturnSlot` | `LOAD s; RETURN`            | `return stack[s]`                         |
 //! | `ConstReturnImm` | `CONST k; RETURN`           | `return k` (inline const only)            |
+//!
+//! One non-superinstruction rewrite also lives here: **constant
+//! folding** collapses `CONST a; CONST b; <ADD|SUB|MUL>` into a single
+//! `CONST (a op b)` when both are inline and the result is a
+//! non-negative `i32` (inline `CONST` cannot encode negatives — the
+//! high bit is the pool flag).
 //!
 //! Fusion is conservative: a rule bails out whenever an operand would
 //! not fit its packed field (slot above 255, immediate outside `i16`,
 //! target above `u16::MAX`, or a pool-backed `CONST`), leaving the
 //! original convoy untouched. Float slot/immediate arithmetic never
 //! fuses via `BinSlotImm` because float constants are pool-backed;
-//! float ops are still collapsed by `CmpJmpf` and `BinReturn`.
+//! float ops are still collapsed by `BinSlotSlot`, `CmpJmpf`, and
+//! `BinReturn`.
 
 use common::{Byte, Instruction};
 
@@ -200,9 +208,15 @@ fn is_bin_op(i: Instruction) -> bool {
 /// Try every fusion rule against the window, returning the fused byte
 /// and the number of original instructions it replaces.
 fn try_fuse(window: &[Byte]) -> Option<(Byte, usize)> {
-    // 3-instruction convoy first (its prefix overlaps the shorter
-    // rules, so it must win when both could match).
+    // 3-instruction convoys first (their prefix overlaps the shorter
+    // rules, so they must win when both could match).
+    if let Some(b) = try_fold_const_bin(window) {
+        return Some((b, 3));
+    }
     if let Some(b) = try_fuse_bin_slot_imm(window) {
+        return Some((b, 3));
+    }
+    if let Some(b) = try_fuse_bin_slot_slot(window) {
         return Some((b, 3));
     }
     // 2-instruction convoys.
@@ -256,6 +270,41 @@ fn try_fuse_bin_slot_imm(window: &[Byte]) -> Option<Byte> {
         return None;
     }
     Some(Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(op as u8, slot, imm))
+}
+
+/// `LOAD a; LOAD b; <binop>` → `BinSlotSlot` (int or float).
+fn try_fuse_bin_slot_slot(window: &[Byte]) -> Option<Byte> {
+    if window.len() < 3 {
+        return None;
+    }
+    let a = load_slot(&window[0])?;
+    let b = load_slot(&window[1])?;
+    let op = *window[2].bytecode();
+    if !is_bin_op(op) {
+        return None;
+    }
+    Some(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(op as u8, a, b))
+}
+
+/// `CONST a; CONST b; <ADD|SUB|MUL>` → `CONST (a op b)`, when both are
+/// inline and the result is a non-negative `i32` (inline `CONST`
+/// reserves the high bit for the pool flag, so negatives can't fold).
+fn try_fold_const_bin(window: &[Byte]) -> Option<Byte> {
+    if window.len() < 3 {
+        return None;
+    }
+    let a = const_inline_value(&window[0])? as i64;
+    let b = const_inline_value(&window[1])? as i64;
+    let result = match *window[2].bytecode() {
+        Instruction::ADD => a + b,
+        Instruction::SUB => a - b,
+        Instruction::MUL => a * b,
+        _ => return None,
+    };
+    if result < 0 || result > i32::MAX as i64 {
+        return None;
+    }
+    Some(Byte::new(Instruction::CONST).with_operand_u32(result as u32))
 }
 
 /// `<cmp>; JMPF t` → `CmpJmpf`.
@@ -362,6 +411,74 @@ mod tests {
         fuse(&mut bc);
         assert_eq!(bc.len(), 3);
         assert_eq!(*bc[0].bytecode(), Instruction::LOAD);
+    }
+
+    #[test]
+    fn fuse_bin_slot_slot_arith() {
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::LOAD).with_operand_u32(2),
+            Byte::new(Instruction::MUL),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 2);
+        assert_eq!(*bc[0].bytecode(), Instruction::BinSlotSlot);
+        assert_eq!(bc[0].bin_slot_slot_parts(), (Instruction::MUL as u8, 1, 2));
+    }
+
+    #[test]
+    fn fuse_bin_slot_slot_supports_float_ops() {
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::ADDF),
+        ];
+        fuse(&mut bc);
+        assert_eq!(*bc[0].bytecode(), Instruction::BinSlotSlot);
+        assert_eq!(bc[0].bin_slot_slot_parts(), (Instruction::ADDF as u8, 0, 1));
+    }
+
+    #[test]
+    fn load_load_not_followed_by_binop_falls_back() {
+        // `LOAD a; LOAD b; RETURN` must not become BinSlotSlot; the
+        // trailing `LOAD b; RETURN` fuses to LoadReturnSlot instead.
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::RETURN),
+        ];
+        fuse(&mut bc);
+        assert_eq!(*bc[0].bytecode(), Instruction::LOAD);
+        assert_eq!(*bc[1].bytecode(), Instruction::LoadReturnSlot);
+    }
+
+    #[test]
+    fn const_fold_add() {
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(2),
+            Byte::new(Instruction::CONST).with_const_inline(3),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 2);
+        assert_eq!(*bc[0].bytecode(), Instruction::CONST);
+        assert_eq!(bc[0].operand_u32() as i32, 5);
+    }
+
+    #[test]
+    fn const_fold_skips_negative_result() {
+        // 3 - 5 = -2 can't be an inline CONST (high bit = pool flag),
+        // so the convoy is left untouched.
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(3),
+            Byte::new(Instruction::CONST).with_const_inline(5),
+            Byte::new(Instruction::SUB),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 3);
+        assert_eq!(*bc[0].bytecode(), Instruction::CONST);
     }
 
     #[test]

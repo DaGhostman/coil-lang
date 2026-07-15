@@ -276,11 +276,21 @@ pub enum Instruction {
     // top two stack values and return the result.
     //   operands[31:24] = op (any binary `Instruction`, int or float)
     //   operands[23:0]  = reserved (0)
+    //
+    // `BinSlotSlot` — fuses `LOAD a; LOAD b; <binop>`, i.e. a binary op
+    // between two locals (`a * b`, `left + right`, ...). Unlike
+    // `BinSlotImm` this also covers float ops, since both operands are
+    // slot loads rather than a pool-backed constant.
+    //   operands[31:24] = op (any binary `Instruction`, int or float)
+    //   operands[23:16] = slot a (relative to frame.sp)
+    //   operands[15:8]  = slot b (relative to frame.sp)
+    //   operands[7:0]   = reserved (0)
     LoadReturnSlot,
     ConstReturnImm,
     BinSlotImm,
     CmpJmpf,
     BinReturn,
+    BinSlotSlot,
 }
 
 impl From<u8> for Instruction {
@@ -469,6 +479,22 @@ impl Byte {
     pub fn bin_return_op(&self) -> u8 {
         (self.operands >> 24) as u8
     }
+
+    /// Pack `BinSlotSlot`: op in [31:24], slot a in [23:16], slot b in [15:8].
+    pub fn with_bin_slot_slot(mut self, op: u8, a: u8, b: u8) -> Self {
+        self.operands = ((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8);
+        self
+    }
+
+    /// Unpack `BinSlotSlot` into (op, slot a, slot b).
+    pub fn bin_slot_slot_parts(&self) -> (u8, usize, usize) {
+        let o = self.operands;
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            ((o >> 8) & 0xFF) as usize,
+        )
+    }
 }
 
 impl ArchivedByte {
@@ -595,6 +621,21 @@ impl ArchivedByte {
 
     pub fn with_bin_return(mut self, op: u8) -> Self {
         self.operands = ((op as u32) << 24).into();
+        self
+    }
+
+    /// Unpack `BinSlotSlot` into (op, slot a, slot b).
+    pub fn bin_slot_slot_parts(&self) -> (u8, usize, usize) {
+        let o: u32 = self.operands.into();
+        (
+            (o >> 24) as u8,
+            ((o >> 16) & 0xFF) as usize,
+            ((o >> 8) & 0xFF) as usize,
+        )
+    }
+
+    pub fn with_bin_slot_slot(mut self, op: u8, a: u8, b: u8) -> Self {
+        self.operands = (((op as u32) << 24) | ((a as u32) << 16) | ((b as u32) << 8)).into();
         self
     }
 }

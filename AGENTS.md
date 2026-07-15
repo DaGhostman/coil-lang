@@ -3858,3 +3858,118 @@ machine warnings.
   argument (not derive it from cwd), so the
   pipeline doesn't need to change cwd.
 
+## PHASE VM-PERF — PEEPHOLE SUPERINSTRUCTIONS
+
+### Summary
+
+The compiler runs a peephole pass (`compiler/src/peephole.rs`)
+after codegen that fuses common opcode convoys into single
+dispatched instructions, cutting the number of times the VM's
+dispatch loop is entered. The pass relocates all inline and
+pool-backed (`JUMP_IF_MATCH`) jump/call targets so fusion never
+corrupts control flow. Every fused opcode is **operator-
+parameterized**: the underlying arithmetic/comparison
+`Instruction` discriminant is packed into the high operand byte,
+so one opcode covers a whole family (all int/float arithmetic and
+comparisons) instead of a bespoke opcode per operator. The VM
+handlers push the operands and delegate to the shared `binary!`
+macro, guaranteeing byte-identical semantics with the unfused
+sequence.
+
+### Fused opcodes
+
+| Fused opcode     | Source convoy            | Meaning                              |
+|------------------|--------------------------|--------------------------------------|
+| `BinSlotImm`     | `LOAD s; CONST k; <op>`  | `stack[s] <op> k` (int only — float consts are pool-backed) |
+| `BinSlotSlot`    | `LOAD a; LOAD b; <op>`   | `stack[a] <op> stack[b]` (int **and** float) |
+| `CmpJmpf`        | `<cmp>; JMPF t`          | compare top two, branch to `t` if false |
+| `BinReturn`      | `<binop>; RETURN`        | `return a <binop> b` (int or float)  |
+| `LoadReturnSlot` | `LOAD s; RETURN`         | `return stack[s]`                    |
+| `ConstReturnImm` | `CONST k; RETURN`        | `return k` (inline const only)       |
+
+Plus one non-superinstruction rewrite: **constant folding**
+collapses `CONST a; CONST b; <ADD|SUB|MUL>` to a single
+`CONST (a op b)` when both are inline and the result is a
+non-negative `i32` (inline `CONST` reserves the high bit as the
+pool flag, so negatives can't be encoded inline and are left
+unfused).
+
+### Operand packing
+
+- `BinSlotImm`: `[31:24]=op`, `[23:16]=slot`, `[15:0]=i16 imm`.
+- `BinSlotSlot`: `[31:24]=op`, `[23:16]=slot a`, `[15:8]=slot b`.
+- `CmpJmpf`: `[31:24]=op`, `[15:0]=u16 jump target`.
+- `BinReturn`: `[31:24]=op`.
+
+### Why `BinSlotSlot` also does floats
+
+`BinSlotImm` can't fuse float ops because a float immediate is
+pool-backed (not inline), so the `CONST` half of the convoy never
+qualifies. `BinSlotSlot`'s operands are BOTH slot loads, so there
+is no inline-const restriction — it fuses every int and float
+binary op (`a * b`, `left + right`, `x <. y`, ...).
+
+### Selection of new patterns
+
+The `BinSlotSlot` + constant-folding additions were chosen from a
+static frequency analysis of the compiled (post-fusion) bytecode
+across 15 examples (`fib`, `option`, `result`, `tree`, `record`,
+`mixed`, `let_test`, `chained`, `dict`, `aliases`,
+`nested_records`, `fizbuz`, `const`, `classes`, `gc`). After the
+existing fusions, `LOAD a; LOAD b; <op>` was the most common
+remaining executable convoy (7 sites, e.g. `x*x + y*y` in
+`record`, `width*height` in `mixed`), and `CONST a; CONST b; <op>`
+appeared as pure literal arithmetic worth folding at compile time.
+`FORMAT; PRINT` is the single most frequent pair overall but is
+I/O-bound and never in a hot loop, so it was deliberately left
+unfused (poor perf ROI).
+
+### Design decisions locked in
+
+1. **Opcodes are APPENDED to `Instruction`**, never inserted, to
+   preserve every existing `#[repr(u8)]` discriminant. `From<u8>
+   for (Archived)Instruction` decodes the packed operator byte.
+2. **VM handlers reuse the `binary!` macro** so fused ops are
+   semantically identical to the unfused convoy (int uses
+   `as_int`/`raw`, float uses `as_float`/`to_bits`).
+3. **Fusion is conservative.** A rule bails when an operand won't
+   fit its packed field (slot > 255, immediate outside `i16`,
+   target > `u16::MAX`, or a pool-backed `CONST`), leaving the
+   convoy untouched.
+4. **3-instruction convoys are tried before 2-instruction ones**
+   in `try_fuse` (their prefixes overlap the shorter rules).
+5. **Constant folding skips negative / overflowing results**
+   because inline `CONST` cannot represent them (the pool flag
+   owns the high bit).
+6. **`ARCHIVE_VERSION` is bumped on any fusion change** (now `7`)
+   so stale `.c0s` archives are rejected at load time.
+
+### Tests
+
+- `compiler/src/peephole.rs::tests` — one fusion + one skip test
+  per rule, including `fuse_bin_slot_slot_arith`,
+  `fuse_bin_slot_slot_supports_float_ops`,
+  `load_load_not_followed_by_binop_falls_back`, `const_fold_add`,
+  `const_fold_skips_negative_result`, and target-relocation
+  checks.
+- `machine/src/vm.rs::tests` —
+  `bin_slot_slot_int_subtracts_two_locals` and
+  `bin_slot_slot_float_adds_two_locals` lock in runtime semantics.
+- `integer_arithmetic_emits_int_opcode` now uses two int params
+  (`a + b`) because two literals constant-fold to a single
+  `CONST`; it asserts the packed op in `BinSlotSlot` is the int
+  `ADD`, not the float `ADDF`.
+
+### Known limitations / future work
+
+- `BinSlotImm` immediates are `i16`; wider immediates fall back to
+  the unfused `LOAD; CONST; <op>` convoy.
+- `CmpJmpf` targets are `u16` (65,535-byte arm ceiling). Widen to
+  the `value[31:0]` slot like `JUMP_IF_MATCH` if a program ever
+  approaches it.
+- Constant folding is single-pass and int-only (`ADD/SUB/MUL`,
+  non-negative result). Chained folds (`1+2+3`) fold only the
+  first pair; float and negative results are not folded.
+- `FORMAT; PRINT` fusion remains unimplemented on purpose (I/O
+  bound). Revisit only if formatting moves off the hot path.
+
