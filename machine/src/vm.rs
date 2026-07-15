@@ -5,7 +5,7 @@ use std::{
 
 use common::{
     ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte, Value,
-    promise,
+    promise, unlikely,
 };
 
 use crate::{
@@ -533,8 +533,8 @@ impl<const S: usize> Machine<S> {
             }
 
             let bc = opcode.bytecode();
-            // #[cfg(not(debug_assertions))]
-            // promise!(*bc as u8 <= Instruction::HostInvoke as u8);
+            #[cfg(not(debug_assertions))]
+            promise!(*bc as u8 <= Instruction::HostInvoke as u8);
 
             match bc {
                 Instruction::POP => {
@@ -543,7 +543,15 @@ impl<const S: usize> Machine<S> {
                 Instruction::DUPLICATE => {
                     self.stack.push(*self.stack.peek());
                 }
-                Instruction::CONST => self.stack.push(Value::from(opcode.constant(constants))),
+                Instruction::CONST => {
+                    let op = opcode.operand_u32();
+                    let raw = if unlikely(op & Byte::POOL_FLAG != 0) {
+                        constants[(op & !Byte::POOL_FLAG) as usize]
+                    } else {
+                        op as i32 as i64 as u64
+                    };
+                    self.stack.push(Value::from(raw));
+                }
                 Instruction::STORE => {
                     // Phase 15D — STORE is now effectively a
                     // no-op: it reads the value at the slot's
