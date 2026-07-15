@@ -1,23 +1,9 @@
-//! Pretty-printing for `Ty` (and `Scheme`, for diagnostics).
-//!
-//! Used by tests today and by diagnostic messages in Phase 8. Kept simple
-//! on purpose — we can add parenthesisation / precedence rules later if
-//! error messages need them.
+//! Pretty-printing for [`Ty`] and [`Scheme`] (diagnostics and tests).
 
 use std::fmt;
 
 use super::ty::{ArrayLength, EnumVariantPayloadTy, Scheme, Ty};
 
-/// Format a `Ty` the way a user would read it:
-///
-/// - `Var(t0)`           → `t0`
-/// - `Con("int")`        → `int`
-/// - `Fun(a, b)`         → `a -> b` (with parens around nested `Fun`s)
-/// - `App(Foo, [...])`   → `Foo<args>` (omits `<>` when arg list is empty)
-/// - `List(t)`           → `[t]`
-/// - `Sum { name, .. }`  → `enum Name { A, B(int), .. }` (compact)
-/// - `Constructor { .. }` → `Owner::vN` (tag-only; the pretty-printer
-///    has no env access to look up the actual variant name).
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -77,13 +63,8 @@ impl fmt::Display for Ty {
                 write!(f, " }}")
             }
             Ty::Constructor { owner, tag, .. } => {
-                // The pretty-printer has no env access — render the
-                // owner by tag. The 15C emitter (which has the
-                // checker's enum tables) does the final name lookup
-                // when emitting MAKE_ENUM.
                 write!(f, "{}::v{}", owner, tag)
             }
-            // Phase 24 — typed aggregates.
             Ty::Tuple(tys) => {
                 write!(f, "(")?;
                 for (i, t) in tys.iter().enumerate() {

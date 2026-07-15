@@ -3,7 +3,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use machine::Machine;
 use std::hint::black_box;
 
-// fib body starts at offset 3 (right after the prologue: CONST, CALL, HALT).
+// fib body starts at offset 3 (after prologue: CONST, CALL, HALT).
 const FIB_ENTRY: u32 = 3;
 
 fn fib(n: u16) {
@@ -14,19 +14,17 @@ fn fib(n: u16) {
         Byte::new(Instruction::CONST).with_const_inline(n as i32),
         Byte::new(Instruction::CALL).with_call_packed(1, FIB_ENTRY),
         Byte::new(Instruction::HALT),
-        // 3: if !(n <= 2) jump to 6 (recurse); else fall through.
+        // if !(n <= 2) jump to 6; else fall through to return 1.
         Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(leq, 0, 2),
         Byte::new(Instruction::JMPF).with_operand_u32(6),
-        // 5: base case → return 1.
         Byte::new(Instruction::ConstReturnImm).with_operand_u32(1),
-        // 6: fib(n - 1)
+        // fib(n - 1)
         Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(sub, 0, 1),
         Byte::new(Instruction::CALL).with_call_packed(1, FIB_ENTRY),
-        // 8: fib(n - 2)
+        // fib(n - 2)
         Byte::new(Instruction::LOAD).with_operand_u32(0),
         Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(sub, 0, 2),
         Byte::new(Instruction::CALL).with_call_packed(1, FIB_ENTRY),
-        // 11: return fib(n-1) + fib(n-2)
         Byte::new(Instruction::BinReturn).with_bin_return(add),
     ];
 

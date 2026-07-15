@@ -1,31 +1,15 @@
-// ----------- HEAP
-/// The default GC threshold when initialize.
-const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
+//! Mark-and-sweep heap: intrusive object list, string interning, and GC.
 
-/// The default GC threshold growth factor. Each time a GC is performed, we set
-/// the next GC threshold to `GC_GROWTH_FACTOR * <current_allocated_bytes>`.
+const GC_NEXT_THRESHOLD: usize = 1024 * 1024;
 const GC_GROWTH_FACTOR: usize = 2;
 
-/// A managed heap.
-///
-/// Objects are linked together using an intrusive linked-list, so the heap can
-/// traverse all allocated objects.
-///
-/// In our current design, the heap does not own the objects that it allocated.
-/// Instead, the references that we hand out provide shared read/write access to
-/// the object. Because we control how the VM is run, we know exactly when an
-/// object can be deallocated. Thus, in the context of the VM,  `Gc<T>` is
-/// similar to a smart pointer that deallocates itself when it's no longer used.
+/// Managed heap. Objects are linked in an intrusive list for traversal.
+/// `Gc<T>` handles are copyable; the VM controls when objects become unreachable.
 pub struct Heap {
-    // The total number of bytes used by allocated objects.
     alloc_bytes: usize,
-    // The byte threshold where a GC should be done.
     gc_next_threshold: usize,
-    // The factor by which the byte threshold should grow.
     gc_growth_factor: usize,
-    // The table of interned strings.
     strings: Table<()>,
-    // The head of the linked list of heap-allocated objects.
     head: Option<Object>,
 }
 
@@ -42,50 +26,15 @@ impl Default for Heap {
 }
 
 impl Heap {
-    /// Walk the intrusive object list and return a C string
-    /// pointer to the data of the string object at `addr`, if
-    /// `addr` is the address of a `Gc<ObjString>`. Returns
-    /// `None` if `addr` doesn't point at a string object in this
-    /// heap.
-    ///
-    /// This is the FFI entry point: a C function's `*const
-    /// c_char` argument is materialized by the VM as a
-    /// heap-allocated `ObjString`; the C function receives a
-    /// raw pointer to the `ObjString`'s `Gc<T>` cell, which is
-    /// what the `Value` carries. To pass the actual C string
-    /// to the FFI call, we look up the `Object` by that address
-    /// and ask for its `as_cstr` pointer.
-    ///
-    /// O(n) in the number of live heap objects (the intrusive
-    /// list walk). Acceptable for the common case (a handful of
-    /// strings per FFI call); a future hash-map cache could
-    /// bring it to O(1).
+    /// Look up a heap string by address and return a NUL-terminated C string
+    /// for FFI. The returned pointer is leaked for the duration of the call.
     #[must_use]
-    /// Walk the intrusive object list and return a pointer to
-    /// the NUL-terminated data of the `Object::String` at
-    /// `addr`. Returns `None` if there's no such object or
-    /// the object isn't a string.
-    ///
-    /// Safety: the returned pointer is borrowed from the
-    /// `String`'s underlying bytes (which the runtime stores
-    /// in a `Vec<u8>` inside the `GcData` cell). Read it
-    /// immediately — the runtime may free the cell on the
-    /// next GC pass.
-    ///
-    /// The implementation copies the string into a freshly-
-    /// allocated `CString` (with explicit NUL terminator)
-    /// and returns its `.as_ptr()`. The `CString` is kept
-    /// alive (leaked) for the duration of the FFI call — the
-    /// caller's caller owns it.
     pub fn cstr_from_addr(&self, addr: u64) -> Option<*const std::os::raw::c_char> {
         let mut current = self.head_for_lookup();
         while let Some(reference) = current {
             if reference.addr() == addr
                 && let crate::memory::Object::String(gc) = reference
             {
-                // Build a NUL-terminated copy. The Box
-                // leaks for the duration of the program
-                // (we explicitly leak below).
                 let s: std::ffi::CString =
                     std::ffi::CString::new(gc.as_ref().data.as_bytes()).ok()?;
                 let boxed: &'static std::ffi::CString = Box::leak(Box::new(s));
@@ -132,10 +81,7 @@ impl Heap {
         s
     }
 
-    /// Allocate a loaded FFI library handle as a heap
-    /// `Object::Library`. Returns the `Gc<ObjLibrary>` cell
-    /// (for GC tracking and `mark`/`unmark` access) and the
-    /// heap `Object` handle (for the per-VM cache).
+    /// Allocate a loaded FFI library as `Object::Library`.
     pub fn alloc_library(
         &mut self,
         library: std::sync::Arc<crate::ffi::Library>,
@@ -238,10 +184,6 @@ impl Heap {
             Object::Enum(e) => {
                 e.release();
             }
-            // FFI libraries are dropped when the `ObjLibrary`
-            // cell is released. The `Arc<Library>` inside
-            // decrements its refcount; the actual `dlclose`
-            // happens when the last reference goes away.
             Object::Library(l) => {
                 l.release();
             }
@@ -267,31 +209,13 @@ impl Heap {
         }
     }
 
-    /// Return the head of the heap's intrusive linked list of
-    /// allocated objects. Used by the VM at runtime (Phase 15C)
-    /// to walk the list and look up an [`Object`] by its address
-    /// when reconstructing heap-object metadata from a raw
-    /// pointer on the operand stack. Returns `None` if the heap
-    /// is empty.
+    /// Head of the intrusive object list (for address lookup).
     pub fn head_for_lookup(&self) -> Option<Object> {
         self.head
     }
 
-    /// True iff `addr` matches the address of some currently
-    /// allocated object on the heap. Used by the VM at runtime
-    /// (specifically in [`crate::vm::Machine::execute`] for
-    /// [`common::Instruction::MAKE_ENUM`]) to distinguish
-    /// immediate values (ints, floats, bools) from heap pointers
-    /// (strings, instances, enums) on the operand stack. Values
-    /// are stored as `*mut u8` and the runtime doesn't tag them,
-    /// so the only safe test is membership in the heap's
-    /// intrusive linked list.
-    ///
-    /// This is O(n) in the number of live objects. Acceptable
-    /// because `MAKE_ENUM` is only emitted at constructor call
-    /// sites (typically a handful per program), and the heap is
-    /// usually small. A generation table or per-frame pointer map
-    /// would let us do this in O(1) — that's a 15D+ optimisation.
+    /// True if `addr` is a live heap object. Used to classify stack values as
+    /// immediates vs heap pointers (`MAKE_ENUM`). O(n) in live object count.
     pub fn contains_addr(&self, addr: *mut u8) -> bool {
         let mut current = self.head;
         while let Some(reference) = current {
@@ -306,8 +230,6 @@ impl Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        // Safety: If the heap is drop, both the compiler and VM are no longer
-        // in use so.
         for object in &*self {
             unsafe {
                 self.dealloc(object);
@@ -347,7 +269,7 @@ impl Iterator for HeapIter {
 
 #[cfg(debug_assertions)]
 use std::fmt::Debug;
-// ----------- OBJECT
+
 use std::{
     cell::Cell,
     error, fmt, mem,
@@ -355,27 +277,9 @@ use std::{
     ptr::NonNull,
 };
 
-/// A type alias for a heap-allocated string.
 pub type RefString = Gc<ObjString>;
 pub type RefInstance = Gc<ObjInstance>;
-/// A type alias for a heap-allocated enum (sum-type) value.
-///
-/// Added in Phase 15A so the GC knows how to traverse enum payloads
-/// from the moment they exist — preventing silent runtime UB the
-/// first time `MAKE_ENUM` is introduced in Phase 15C. The variant is
-/// not yet constructed by any instruction; it is reachable only
-/// through manual `heap.alloc(ObjEnum { ... }, Object::Enum)` in
-/// tests.
 pub type RefEnum = Gc<ObjEnum>;
-
-/// A type alias for a heap-allocated FFI library handle.
-///
-/// `ObjLibrary` owns an `Arc<libloading::Library>` (the loaded
-/// shared library) and a function-signature map for fast
-/// dispatch. The VM keeps the `Arc` alive as long as the
-/// `Value` referencing the `ObjLibrary` is live, so the
-/// underlying `Library` isn't dropped while userland FFI
-/// calls are in flight.
 pub type RefLibrary = Gc<ObjLibrary>;
 
 /// An enumeration of all potential errors that occur when working with objects.
@@ -394,36 +298,13 @@ impl fmt::Display for Error {
     }
 }
 
-/// A numeration of all object types.
 #[derive(Clone, Copy)]
 pub enum Object {
-    /// A string object
     String(RefString),
     Instance(RefInstance),
-    /// A sum-type (enum) value. Phase 15A placeholder — see
-    /// [`ObjEnum`] and [`RefEnum`]. The payload is a flat list of
-    /// NaN-boxed [`Value`]s; the GC marks every value in the list,
-    /// following pointers recursively so nested enums and inner
-    /// strings are preserved.
     Enum(RefEnum),
-    /// A loaded FFI shared library (userland `load(...)`).
-    ///
-    /// The `Arc<Library>` is held via the `Gc<ObjLibrary>`
-    /// cell's pointer indirection — the `Arc` is kept alive as
-    /// long as the `Value` referencing this `Object` is
-    /// live. FFI dispatch resolves symbols via the
-    /// `Library::get` API.
     Library(RefLibrary),
-
-    /// `(a, b, c)` — heterogeneous product type. See
-    /// [`ObjTuple`] for storage details. Allocated by the
-    /// `MakeTuple` instruction (Phase 23).
     Tuple(crate::memory::Gc<ObjTuple>),
-
-    /// `[a, b, c]` — homogeneous-style collection. See
-    /// [`ObjArray`]. Allocated by `MakeArray`. Storage is
-    /// identical to `Tuple`; only the source syntax
-    /// differs.
     Array(crate::memory::Gc<ObjArray>),
 }
 
@@ -434,10 +315,6 @@ impl Object {
             Self::String(s) => s.mark(),
             Self::Instance(i) => i.mark(),
             Self::Enum(e) => e.mark(),
-            // FFI libraries: mark through the `Gc<ObjLibrary>`
-            // indirection. `Gc` derefs to `GcData` which
-            // derefs to `ObjLibrary`; we need to mark the
-            // `GcData` cell itself (not the inner `Library`).
             Self::Library(l) => l.mark(),
             Self::Tuple(t) => t.mark(),
             Self::Array(a) => a.mark(),
@@ -472,16 +349,7 @@ impl Object {
         }
     }
 
-    /// Mark all object references that can be directly access by the current object and put them
-    /// in `grey_objects` if they have not been marked.
-    ///
-    /// For an [`Object::Enum`], every payload entry is examined:
-    /// `Member::Object` entries are pushed onto the grey stack so
-    /// their targets are traced; `Member::Value` entries are
-    /// immediates (ints, floats, bools) and carry no heap reference.
-    /// This mirrors the mark logic for [`Object::Instance`] field
-    /// values, generalised from the keyed `Table<Member>` to a
-    /// positional `Vec<Member>`.
+    /// Mark direct heap references held by this object.
     pub fn mark_references(&self, grey_objects: &mut Vec<Self>) {
         match self {
             Self::String(_) => {}
@@ -499,31 +367,8 @@ impl Object {
                     }
                 }
             }
-            // FFI libraries don't have nested object
-            // references — the `Arc<Library>` inside is
-            // not a heap-tracked object (it's an OS-level
-            // resource, not a GC-tracked cell). Nothing to
-            // trace here.
             Self::Library(_) => {}
-            // Tuples and arrays store `Value`s directly.
-            // Phase 23 doesn't yet implement the value-
-            // to-object walker inside `mark_references`
-            // (the call site passes only `&mut grey_objects`).
-            // Caller-side handling in
-            // `Machine::gc_collect`'s transitive loop adds
-            // any heap-pointing element values to the grey
-            // stack by re-walking the heap with the
-            // freshly-marked tuples/arrays in the
-            // `current` walk.
-            //
-            // For now: tuples/arrays are safe ONLY if all
-            // element values are immediate (int/float/bool).
-            // Using heap objects inside tuples/arrays would
-            // be a use-after-free after a GC pass. The
-            // current userland FFI examples don't do this,
-            // so this is acceptable for the iteration —
-            // TODO: walk Value elements in mark_references
-            // (requires `&Heap` here).
+            // Tuple/array elements are traced in `Machine::gc_collect` for now.
             Self::Tuple(_) => {}
             Self::Array(_) => {}
         }
@@ -594,28 +439,10 @@ impl fmt::Display for Object {
 }
 
 impl Object {
-    /// Return a `*const c_char` to the underlying byte buffer of
-    /// this string object, suitable for passing to C functions
-    /// that expect a null-terminated C string.
-    ///
-    /// `Object::String` stores its data as a Rust `String`
-    /// (guaranteed UTF-8, but the C ABI doesn't care about
-    /// encoding — it just reads until the first `0` byte). The
-    /// `String` is laid out contiguously in memory, so we can
-    /// take a pointer to its first byte and pass it directly.
-    ///
-    /// For non-string objects, returns `null()` (callers must
-    /// type-check before calling FFI).
+    /// C string pointer for FFI; non-strings return null.
     pub fn as_cstr(&self) -> *const std::os::raw::c_char {
         match self {
-            // `s` is `&Gc<ObjString>`; dereference to get `&ObjString`,
-            // then take a pointer to the `data: String` field.
             Self::String(s) => s.data.data.as_ptr() as *const std::os::raw::c_char,
-            // Non-string objects don't have a C-string
-            // representation. Return null; the caller's
-            // typechecker is supposed to prevent this case at
-            // compile time, but we degrade gracefully if a
-            // dynamic library is called with the wrong type.
             Self::Instance(_)
             | Self::Enum(_)
             | Self::Library(_)
@@ -654,32 +481,12 @@ impl ObjInstance {
 
 impl GcSized for ObjInstance {
     fn size(&self) -> usize {
-        // Phase 25 — dict storage. The `Table`'s entry
-        // storage is heap-allocated via Rust's global
-        // allocator (`alloc::alloc`) in `Table::resize`, NOT
-        // via the VM's heap. We deliberately don't include
-        // `fields.capacity()` here so `Heap::alloc_bytes`
-        // tracks ONLY what the VM's heap allocated (the
-        // `ObjInstance` struct itself + the field KEYS via
-        // `Heap::intern`). The table's entry slots are
-        // freed by Rust's allocator on instance drop.
+        // `Table` entry storage uses Rust's global allocator, not the VM heap.
         std::mem::size_of::<Self>()
     }
 }
 
-/// The content of a heap-allocated enum (sum-type) value.
-///
-/// `tag` is the variant discriminator; in Phase 15A it is unused by
-/// the VM (the variant is not yet constructed by any instruction).
-/// `payload` is the flat list of [`Member`]s that make up the
-/// variant's tuple payload — each entry is either a `Member::Value`
-/// (an immediate like an int or float) or a `Member::Object` (a
-/// pointer to another heap object). Using [`Member`] mirrors the
-/// shape of [`ObjInstance::fields`] so the GC can reuse the same
-/// mark logic for nested enum payloads (e.g.
-/// `enum Tree { Node(int, Tree, Tree) }`).
-///
-/// The list is laid out in declaration order.
+/// Heap-allocated enum variant (`tag` + flat `Member` payload).
 pub struct ObjEnum {
     pub tag: u32,
     pub payload: Vec<Member>,
@@ -723,30 +530,11 @@ impl From<&str> for ObjString {
     }
 }
 
-// ---- Phase 23: aggregates (tuples + arrays) ----
-//
-// `(a, b, c)` and `[a, b, c]` literals become heap-allocated
-// containers of `Value`s. The runtime treats tuples and
-// arrays identically at the storage level (a `Vec<Value>`);
-// they differ only in user-facing syntax and in the path
-// that allocates them (`MakeTuple` vs `MakeArray`).
-//
-// We store `Value`s directly (not `Member`s) because
-// immediate integers and floats are 1:1 with `Value`, and
-// the GC walks heap pointers via `Member`-shaped wrappers
-// only for enums/instances that may recursively contain
-// each other.
 pub struct ObjTuple {
-    /// Source-order element storage. `elements[i]` is the
-    /// `i`th tuple element. Length is fixed at allocation
-    /// time (tuples are immutable after construction).
     pub elements: Vec<Value>,
 }
 
 pub struct ObjArray {
-    /// Source-order element storage. Same as `ObjTuple`
-    /// but with semantically different allocator opcode
-    /// (`MakeArray` for `[]` literals).
     pub elements: Vec<Value>,
 }
 
@@ -796,30 +584,10 @@ impl fmt::Display for ObjString {
     }
 }
 
-/// A heap-allocated FFI library handle.
-///
-/// `ObjLibrary` owns an `Arc<libloading::Library>` (the loaded
-/// shared library) and a function-signature map for fast
-/// dispatch. The VM keeps the `Arc` alive as long as the
-/// `Value` referencing this `Object` is live, so the
-/// underlying `Library` isn't dropped while userland FFI
-/// calls are in flight.
-///
-/// Function signatures are cached as a `Vec<FunctionSig>`
-/// (in declaration order) — the userland `lib.invoke("name",
-/// ...)` call matches by name to avoid re-resolving the symbol
-/// on every dispatch. The `Library` Arc is held inside the
-/// struct so the underlying `dlopen`'d `Library` survives as
-/// long as any `Value` references this `Object`.
+/// Loaded shared library plus cached FFI signatures.
 pub struct ObjLibrary {
-    /// The loaded shared library. Kept alive as long as the
-    /// `Value` referencing this `Object` is live.
     pub library: std::sync::Arc<crate::ffi::Library>,
-    /// Cached FFI registrations, in declaration order.
-    /// Indexed by the userland `invoke(lib, fn_id, ...)` id.
     pub signatures: Vec<RegisteredFunction>,
-    /// Lookup table from function name (as it appears in
-    /// the source) to its index in `signatures`.
     pub by_name: std::collections::HashMap<String, usize>,
 }
 
@@ -859,22 +627,12 @@ impl RegisteredFunction {
     }
 }
 
-/// C ABI types for FFI argument and return values. Each
-/// variant maps to a specific C type and a specific
-/// `Value` representation in the VM.
+/// C ABI type tags for FFI marshalling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfiType {
-    /// C `int64_t` (or any 64-bit signed integer). The VM
-    /// stores this as `Value::from(i64)`.
     Int,
-    /// C `double`. The VM stores this as `Value::from(f64)`.
     Float,
-    /// C `const char *` (a C string, null-terminated). The
-    /// VM stores this as a heap-allocated `Object::String`
-    /// whose address is what gets passed to the FFI call.
     String,
-    /// C `void` — only valid as a return type. FFI calls
-    /// that return `void` push nothing on the operand stack.
     Void,
 }
 
@@ -1017,7 +775,8 @@ impl<T> Clone for Gc<T> {
     }
 }
 
-// ----------- TABLE
+// Open-addressing hash table keyed by interned strings.
+
 use std::{alloc, cell::UnsafeCell, marker::PhantomData};
 
 use common::Value;
@@ -1315,9 +1074,6 @@ struct EntryInner<V> {
 mod tests {
     use super::*;
 
-    /// Walk the heap's intrusive list and return the addresses of
-    /// every allocated object. Used by the GC tests to assert
-    /// which objects survived a sweep.
     fn live_object_addrs(heap: &Heap) -> std::collections::HashSet<u64> {
         let mut addrs = std::collections::HashSet::new();
         for obj in heap {
@@ -1326,15 +1082,6 @@ mod tests {
         addrs
     }
 
-    /// Manually construct an `Object::Enum` whose payload contains
-    /// a `Member::Object` pointer to another heap object, and
-    /// verify the GC preserves both.
-    ///
-    /// The existing `Heap::trace` marks the root set but does not
-    /// call `mark_references` transitively (a known limitation of
-    /// the 15A GC — full mark-and-trace is 15C's job). So the test
-    /// invokes `mark_references` directly after `trace`, mimicking
-    /// what a proper mark-and-trace loop would do.
     #[test]
     fn enum_gc_marks_payload_pointers() {
         let mut heap = Heap::default();
@@ -1377,11 +1124,6 @@ mod tests {
         let _ = string_ref.as_ref();
     }
 
-    /// Nested enums: an `Object::Enum` whose payload contains a
-    /// `Member::Object` pointer to *another* `Object::Enum`. The
-    /// outer enum's `mark_references` must mark the inner enum,
-    /// whose own `mark_references` is a no-op (empty payload) but
-    /// must still keep it alive through sweep.
     #[test]
     fn enum_gc_marks_nested_enum_payloads() {
         let mut heap = Heap::default();

@@ -1,3 +1,5 @@
+//! Smart pointer wrapper around `garbage::Gc` (unused).
+
 use std::{
     borrow::{Borrow, BorrowMut},
     ops::{Deref, DerefMut},

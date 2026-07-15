@@ -1,65 +1,23 @@
 //! Post-codegen peephole fusion for common stack sequences.
 //!
-//! # What
+//! Recognised convoys collapse into operator-parameterized superinstructions
+//! (`BinSlotImm`, `BinSlotSlot`, `CmpJmpf`, `BinReturn`, etc.). The packed
+//! operator byte selects int/float arithmetic or comparison; the VM reuses
+//! the shared `binary!` macro. Fusion shrinks the stream, so jump/call targets
+//! past fused windows are relocated via [`adjust_target`] / [`patch_targets`].
 //!
-//! The single-pass code generator emits simple, orthogonal opcodes
-//! (`LOAD`, `CONST`, `ADD`, `LEQ`, `RETURN`, ...). Many of these
-//! travel in fixed little convoys — `LOAD n; CONST 1; SUB` for
-//! `n - 1`, `LEQ; JMPF` for a conditional branch, `ADD; RETURN` for
-//! `return a + b`. This pass walks the finished bytecode once and
-//! rewrites each recognised convoy into a single **superinstruction**
-//! that does the same work in one dispatch.
+//! | Fused opcode     | Source convoy               |
+//! |------------------|-----------------------------|
+//! | `BinSlotImm`     | `LOAD s; CONST k; <op>`     |
+//! | `BinSlotSlot`    | `LOAD a; LOAD b; <op>`      |
+//! | `CmpJmpf`        | `<cmp>; JMPF t`             |
+//! | `BinReturn`      | `<binop>; RETURN`           |
+//! | `LoadReturnSlot` | `LOAD s; RETURN`            |
+//! | `ConstReturnImm` | `CONST k; RETURN`           |
 //!
-//! # How
-//!
-//! The fused opcodes are *operator-parameterized*: instead of a
-//! bespoke opcode per arithmetic/comparison operator, each fused
-//! opcode stores the underlying operator's `Instruction` discriminant
-//! in its high operand byte, and the VM re-dispatches through the
-//! shared `binary!` macro. So one `BinSlotImm` opcode covers
-//! `ADD`/`SUB`/`MUL`/`DIV`/`MOD` and every integer comparison; one
-//! `BinReturn` covers all of those plus the float variants.
-//!
-//! Fusing shrinks the byte stream, so every jump / call target that
-//! points *past* a fused window must shift down by the bytes removed.
-//! [`adjust_target`] computes that shift from the recorded
-//! [`FusionSite`]s; [`patch_targets`] applies it to inline targets
-//! (`JMP` family, `CALL`, `CmpJmpf`) and to `JUMP_IF_MATCH` targets,
-//! which live in the constant pool rather than inline.
-//!
-//! # Why
-//!
-//! Fewer, fatter opcodes mean fewer trips through the interpreter's
-//! decode/dispatch overhead (bounds checks, the big `match`, ip
-//! bookkeeping) for the same program. Parameterizing by operator
-//! keeps the opcode set small while still collapsing the arithmetic,
-//! comparison, branch, and return convoys that appear in almost every
-//! function — not just one hand-picked shape.
-//!
-//! # Superinstructions
-//!
-//! | Fused opcode     | Source convoy               | Meaning                                   |
-//! |------------------|-----------------------------|-------------------------------------------|
-//! | `BinSlotImm`     | `LOAD s; CONST k; <op>`     | push `stack[s] <op> k` (int arith/compare)|
-//! | `BinSlotSlot`    | `LOAD a; LOAD b; <op>`      | push `stack[a] <op> stack[b]` (int/float) |
-//! | `CmpJmpf`        | `<cmp>; JMPF t`             | compare top two; branch to `t` if false   |
-//! | `BinReturn`      | `<binop>; RETURN`           | `return a <binop> b` (int or float)       |
-//! | `LoadReturnSlot` | `LOAD s; RETURN`            | `return stack[s]`                         |
-//! | `ConstReturnImm` | `CONST k; RETURN`           | `return k` (inline const only)            |
-//!
-//! One non-superinstruction rewrite also lives here: **constant
-//! folding** collapses `CONST a; CONST b; <ADD|SUB|MUL>` into a single
-//! `CONST (a op b)` when both are inline and the result is a
-//! non-negative `i32` (inline `CONST` cannot encode negatives — the
-//! high bit is the pool flag).
-//!
-//! Fusion is conservative: a rule bails out whenever an operand would
-//! not fit its packed field (slot above 255, immediate outside `i16`,
-//! target above `u16::MAX`, or a pool-backed `CONST`), leaving the
-//! original convoy untouched. Float slot/immediate arithmetic never
-//! fuses via `BinSlotImm` because float constants are pool-backed;
-//! float ops are still collapsed by `BinSlotSlot`, `CmpJmpf`, and
-//! `BinReturn`.
+//! Also folds `CONST a; CONST b; <ADD|SUB|MUL>` when both are inline and the
+//! result is a non-negative `i32`. Fusion bails when operands won't fit packed
+//! fields (slot > 255, imm outside `i16`, target > `u16::MAX`, pool-backed const).
 
 use common::{Byte, Instruction};
 

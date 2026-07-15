@@ -1,4 +1,4 @@
-//! Host-registered native functions with explicit signatures.
+//! Host natives registered with explicit signatures.
 
 use std::sync::Arc;
 
@@ -8,14 +8,12 @@ use crate::memory::{FfiType, Heap};
 
 use super::signature::{FfiError, FfiSignature};
 
-/// Trait implemented by every VM-callable host native function.
 pub trait NativeFn: Send + Sync {
     fn name(&self) -> &str;
     fn signature(&self) -> &FfiSignature;
     fn invoke(&self, heap: &mut Heap, args: &[Value]) -> Result<Option<Value>, FfiError>;
 }
 
-/// A host-provided Rust closure with an explicit FFI signature.
 pub struct HostClosureFn {
     signature: FfiSignature,
     func: Arc<dyn Fn(&mut Heap, &[Value]) -> Result<Option<Value>, FfiError> + Send + Sync>,
@@ -32,7 +30,6 @@ impl HostClosureFn {
         }
     }
 
-    /// Convenience builder for common int→int unary functions.
     pub fn unary_i64(
         name: impl Into<String>,
         func: impl Fn(i64) -> i64 + Send + Sync + 'static,
@@ -64,7 +61,6 @@ impl NativeFn for HostClosureFn {
     }
 }
 
-/// Registry of host-visible native functions keyed by name.
 #[derive(Default)]
 pub struct Natives {
     by_name: std::collections::HashMap<String, Arc<dyn NativeFn>>,

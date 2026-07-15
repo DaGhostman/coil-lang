@@ -1,3 +1,5 @@
+//! Stack VM, managed heap, and FFI runtime for zero-script bytecode.
+
 mod ffi;
 mod memory;
 mod opcode;

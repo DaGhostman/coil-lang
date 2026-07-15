@@ -1,3 +1,5 @@
+//! Bytecode interpreter: dispatch loop, automatic GC, and FFI.
+
 use std::{
     fmt::Write as FmtWrite,
     io::{self, Write as IoWrite},
@@ -15,21 +17,10 @@ use crate::{
     Frame, Heap, Member, ObjArray, ObjEnum, ObjInstance, ObjString, ObjTuple, Object, Stack,
 };
 
-/// Default allocation count between automatic GC collections. The VM
-/// increments an internal counter on every heap allocation site
-/// (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`); when the counter
-/// exceeds this threshold, the VM runs `trace` + `sweep`.
-///
-/// Phase 15D.1 (was previously wired only in `#[cfg(debug_assertions)]`
-/// builds, running on every single instruction — visible as
-/// "Performing GC trace" spam). The threshold is intentionally
-/// modest: small test programs should still observe at least one
-/// collection, while large programs amortise the trace cost over
-/// many allocations.
+/// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
 const GC_TRIGGER_INTERVAL: usize = 64;
 
-// Retired VM dispatch count (test / `vm_profile` feature only).
-// Thread-local so parallel `#[test]` runs do not share state.
+// Thread-local dispatch counter (tests / `vm_profile` only).
 #[cfg(any(test, feature = "vm_profile"))]
 thread_local! {
     static VM_DISPATCH_COUNT: AtomicU64 = const { AtomicU64::new(0) };
@@ -107,44 +98,16 @@ macro_rules! unary {
 
 // type External = fn(&[Value]) -> Value;
 
-/// The output sink for the `PRINT` opcode. By default the VM
-/// writes to stdout (via `print!`). Setting this field via
-/// [`Machine::with_output`] redirects output to an arbitrary
-/// `std::io::Write` implementation — used by the golden
-/// pipeline tests in `compiler/tests/pipeline.rs` to capture
-/// stdout in memory.
 type OutputSink = Box<dyn IoWrite>;
 
 pub struct Machine<const S: usize> {
     heap: Heap,
     stack: Stack<Value, 8192>,
     frames: ArrayVec<Frame, S>,
-    /// Optional output sink. When `None`, the VM writes
-    /// `print!` output to stdout (the default). When `Some`,
-    /// output is redirected to the contained writer — this is
-    /// how the integration tests capture stdout.
     output: Option<OutputSink>,
-    /// Allocation counter for automatic GC. Incremented on
-    /// every heap allocation site (`INIT`, `STRING`, `FORMAT`,
-    /// `MAKE_ENUM`); reset to zero after each collection.
-    /// See [`Machine::collect_garbage`] and [`GC_TRIGGER_INTERVAL`].
     alloc_counter: usize,
-    /// FFI: registered host native functions keyed by name and id.
-    /// Populated via [`Machine::register_fn`].
     natives: crate::ffi::Natives,
-    /// FFI: shared libraries loaded for FFI symbol
-    /// resolution. Keyed by library short name (e.g.
-    /// `"c"`, `"m"`). Multiple FFI calls in the same library
-    /// share the same `Library` Arc — `dlopen` is called
-    /// once per unique name, `dlsym` is called once per
-    /// unique function name.
     libraries: std::collections::HashMap<String, std::sync::Arc<crate::ffi::Library>>,
-    /// FFI: userland-loaded libraries (via `load(path)` in
-    /// the source). Each entry is the `Object` handle for the
-    /// heap `Object::Library(Gc<ObjLibrary>)`. Keyed by
-    /// the `Value` address. The `Gc<ObjLibrary>` is reachable
-    /// via the `Object::Library` variant for GC and FFI
-    /// dispatch.
     userland_libraries: std::collections::HashMap<u64, std::sync::Arc<Object>>,
 }
 
@@ -156,24 +119,10 @@ impl<const S: usize> Default for Machine<S> {
             frames,
             heap: Heap::default(),
             stack: Stack::new(),
-            // Default: stdout (no capture).
             output: None,
-            // Phase 15D.1: GC trigger counter. The VM increments
-            // this on every allocation; once it exceeds
-            // `GC_TRIGGER_INTERVAL` the next allocation triggers
-            // a trace+sweep cycle. Start at 0 — the first
-            // allocation triggers the first GC after
-            // `GC_TRIGGER_INTERVAL` allocations, not before.
             alloc_counter: 0,
-            // FFI: empty native registry; the host program
-            // registers natives (or extern functions) before
-            // calling `run` (or the FFI dispatch below loads
-            // them on demand via `dlopen`).
             natives: crate::ffi::Natives::new(),
             libraries: std::collections::HashMap::new(),
-            // Userland FFI: populated by `FfiLoad` (the
-            // `load(...)` builtin) at runtime. Empty until
-            // userland code loads a library.
             userland_libraries: std::collections::HashMap::new(),
         }
     }
@@ -184,18 +133,7 @@ impl<const S: usize> Machine<S> {
     //     self.native.insert(name, func);
     // }
 
-    /// Walk the heap's intrusive linked list and return the
-    /// [`Object`] whose address matches `addr`. Used by the
-    /// `MAKE_ENUM` / `JUMP_IF_MATCH` / `UNPACK` opcodes to
-    /// reconstruct a heap object's metadata from a raw pointer
-    /// on the operand stack. Returns `None` if no match — that
-    /// means the address is an immediate value (int/float/bool)
-    /// or the pointer has been collected.
-    ///
-    /// Implemented as a free function (not a `&self` method) so
-    /// the borrow checker can split the `&Heap` borrow from
-    /// other in-flight borrows on `Machine` fields (specifically
-    /// the mutable `frames` borrow held by the `execute` loop).
+    /// Free function so `execute` can borrow `frames` and `heap` separately.
     fn find_object_by_addr(heap: &Heap, addr: u64) -> Option<Object> {
         let mut current = heap.head_for_lookup();
         while let Some(reference) = current {
@@ -207,50 +145,16 @@ impl<const S: usize> Machine<S> {
         None
     }
 
-    /// Read a C string (NUL-terminated) from a `Value` that
-    /// points at a heap-allocated `Object::String`. Used by
-    /// the userland `load(path)` builtin to extract the path
-    /// argument (which is itself a zero-script string).
-    ///
-    /// Returns the empty string if the value isn't a string
-    /// (callers should validate types at compile time; this
-    /// is a safety net for dynamic dispatch).
     #[allow(dead_code)]
     fn value_to_string(&self, v: &Value) -> String {
         self.heap
             .cstr_from_addr(v.raw() as u64)
-            .map(|s| {
-                // SAFETY: the `cstr_from_addr` lookup finds an
-                // `Object::String` and returns a pointer to its
-                // `data: String`. We then read it as a UTF-8
-                // string (the VM stores `String` as UTF-8).
-                unsafe { std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned() }
-            })
+            .map(|s| unsafe { std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned() })
             .unwrap_or_default()
     }
 
-    /// Extract the `FFIType` tag from a `Value` that points
-    /// at a heap `Object::Enum`. Returns 0 (Int) as a safe
-    /// fallback when the value doesn't address a real enum —
-    /// this lets the runtime degrade gracefully instead of
-    /// panicking on a corrupt FFIType value (the typechecker
-    /// would have already rejected the source upstream).
     fn ffi_type_tag_from_value(heap: &Heap, v: &Value) -> u32 {
-        // The runtime's `DeclareFFI` expects either:
-        //   (a) An immediate integer tag (small `u64` value
-        //       in [0..=3] — the canonical FFIType enum
-        //       values), emitted via `CONST <tag>` by source-
-        //       level `extern` blocks; OR
-        //   (b) A heap-allocated `Object::Enum` (built via
-        //       `MakeEnum` from `FFIType::X` constructor
-        //       calls in the userland `dload/declare/invoke`
-        //       API).
-        //
-        // We distinguish by VALUE size: heap pointers are
-        // typically large (>= 0x1000); immediate constants
-        // are 0..=3. (The boundary at `0x1000` is conservative
-        // — no normal user value would land between 3 and the
-        // smallest heap address on any platform we target.)
+        // Small integers are immediate FFI type tags; larger values are heap enums.
         let addr = v.raw() as u64;
         if addr <= 3 {
             return addr as u32;
@@ -263,10 +167,6 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Map a `u32` FFIType tag integer to the Rust `FfiType`
-    /// enum used by `FunctionSig`. Unknown tags fall back to
-    /// `Int` (the same defensive posture as
-    /// `ffi_type_tag_from_value`).
     fn ffi_type_from_tag(tag: u32) -> crate::memory::FfiType {
         match tag {
             1 => crate::memory::FfiType::Float,
@@ -276,10 +176,6 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Read a heap `Object::String` as a Rust `String`. Returns
-    /// the empty string when the value doesn't address a real
-    /// string. Used by the `DeclareFFI` opcode to extract the
-    /// function name from the operand stack.
     fn object_string_value(heap: &Heap, v: &Value) -> String {
         let addr = v.raw() as u64;
         let obj = Self::find_object_by_addr(heap, addr);
@@ -303,69 +199,25 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Load a shared library by short name (userland `load(path)`).
-    /// Returns the library's heap-object address as a `Value`
-    /// (the caller pushes it on the operand stack for
-    /// subsequent `FfiInvoke` dispatches).
-    ///
-    /// Returns an error string if `dlopen` fails; the codegen
-    /// turns the error into a runtime diagnostic.
-    ///
-    /// On success, allocates a heap `Object::Library` (with
-    /// an empty function-signature table) and inserts it into
-    /// the per-VM `userland_libraries` map keyed by the
-    /// object address. Returns the allocated object's address
-    /// as a `Value`.
+    /// Load a shared library; returns its heap address as a `Value`.
     pub fn load_userland_library(&mut self, path: &str) -> Result<Value, String> {
-        // First, try loading the library by short name via
-        // libloading (looks in the system library search path,
-        // including `LD_LIBRARY_PATH`).
         let lib_arc = crate::ffi::load_library(path).map_err(|e| e.to_string())?;
-        // Allocate the heap object. The signature table is
-        // empty — userland code populates it via
-        // `Machine::register_ffi_function`.
         let (object, _gc) = self.heap.alloc_library(lib_arc.clone());
-        // Get the address of the heap object (the inner Gc
-        // cell's pointer). This is the address the `Value`
-        // carries on the operand stack.
         let addr = object.addr();
         self.userland_libraries
             .insert(addr, std::sync::Arc::new(object));
-        // Also cache by short name so subsequent `dlopen`s
-        // don't reload the library.
         self.libraries
             .entry(path.to_string())
             .or_insert_with(|| lib_arc.clone());
         Ok(Value::from(addr as *mut u8))
     }
 
-    /// Run a mark-and-sweep GC cycle using `stack` as the root
-    /// set and `heap` as the heap to trace.
-    ///
-    /// Implemented as a free function (not a `&mut self` method)
-    /// for the same reason as [`Self::find_object_by_addr`]: the
-    /// `execute` loop holds `let frame = self.frames.get_mut()`
-    /// which borrows `self.frames` mutably for the whole match
-    /// arm, blocking any `&mut self` method call from inside
-    /// that arm. Splitting out `&mut Heap`, `&Stack`, and the
-    /// `&mut usize` counter into separate parameters lets the
-    /// borrow checker see them as disjoint borrows.
+    /// Mark-and-sweep GC. Free function to avoid borrow conflicts in `execute`.
     fn gc_collect(heap: &mut Heap, stack: &Stack<Value, 8192>, alloc_counter: &mut usize) {
-        // Phase 15D.1 — the trace root set is every value on
-        // the operand stack. Values that fall in the heap's
-        // address range are roots; immediates are silently
-        // ignored by `heap.trace`.
         let roots: Vec<u64> = stack.as_slice().iter().map(|v| v.raw() as u64).collect();
 
-        // Mark roots.
         heap.trace(&roots);
 
-        // Propagate marks transitively. Re-walk the heap and
-        // collect every already-marked object into a `grey`
-        // list, then drain it via `Object::mark_references`.
-        // (15A's `Object::mark_references` is the per-object
-        // "mark the heap pointers I hold" hook; this is the
-        // mark-and-trace loop that 15C deferred to 15D.)
         let mut gray: Vec<Object> = Vec::new();
         let mut current = heap.head_for_lookup();
         let mut root_objects: Vec<Object> = Vec::new();
@@ -382,14 +234,9 @@ impl<const S: usize> Machine<S> {
             obj.mark_references(&mut gray);
         }
 
-        // Sweep — frees everything not marked.
-        //
-        // SAFETY: every reachable pointer has been marked (or
-        // re-marked) by the trace + propagate loop above. After
-        // sweep, the heap contains exactly the live set.
+        // SAFETY: all reachable objects were marked above.
         unsafe { heap.sweep() };
 
-        // Reset the trigger counter.
         *alloc_counter = 0;
     }
 }
@@ -410,16 +257,7 @@ impl<const S: usize> Machine<S> {
         self.stack.tell()
     }
 
-    /// Redirect all `PRINT` output to the given writer instead of
-    /// stdout. Used by the golden pipeline tests
-    /// (`compiler/tests/pipeline.rs`) to capture stdout in
-    /// memory. Returns the previous output sink so the caller
-    /// can restore stdout afterwards if desired.
-    ///
-    /// Note: the writer is held by the machine for the entire
-    /// lifetime of subsequent `run` calls. `Box<dyn IoWrite>`
-    /// is sufficient (no `Send`/`Sync` requirement — the
-    /// machine isn't shared across threads).
+    /// Redirect `PRINT` output (used by pipeline tests).
     pub fn with_output<W: IoWrite + 'static>(&mut self, writer: W) -> Option<OutputSink> {
         let prev = self.output.take();
         self.output = Some(Box::new(writer));
@@ -481,17 +319,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Manually trigger a GC cycle.
-    /// allocation-pressure-driven (`alloc_counter` exceeds
-    /// [`GC_TRIGGER_INTERVAL`]); this method exists for tests
-    /// that want to deterministically verify GC behaviour
-    /// without allocating enough to trigger naturally.
-    ///
-    /// The trace root set is the current operand stack: every
-    /// value on the stack that points into the heap is a root.
-    /// Then `Object::mark_references` walks the grey stack
-    /// transitively (the mark-and-trace loop that 15A introduced
-    /// but 15D wires into the automatic cycle).
+    /// Manually trigger GC (for tests).
     pub fn collect_garbage(&mut self) {
         Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
     }
@@ -512,8 +340,7 @@ impl<const S: usize> Machine<S> {
         self.run_with_pool(code, &[]);
     }
 
-    /// Run bytecode with an optional constant pool (Phase 19 perf —
-    /// wide immediates for `CONST` / `JumpIfMatch` / folded `CALL`).
+    /// Run bytecode with an optional constant pool for wide immediates.
     pub fn run_with_pool(&mut self, code: &[Byte], constants: &[u64]) {
         if code.is_empty() {
             return;
@@ -521,19 +348,7 @@ impl<const S: usize> Machine<S> {
         self.execute(code, constants);
     }
 
-    /// Run a non-archived `&[Byte]` (the form produced by
-    /// the compiler's `compile` method, before rkyv
-    /// serialization). Phase 15D.4 — used by the golden
-    /// pipeline tests in `compiler/tests/pipeline.rs`,
-    /// which compile in-memory and want to skip the
-    /// `out.c0s` file round-trip.
-    ///
-    /// We use rkyv's `to_bytes` + `access` to safely
-    /// convert from `Vec<Byte>` to the archived form the
-    /// VM's `run` expects. The cast approach is fragile
-    /// (rkyv's archived layout may not match the source
-    /// layout exactly for some field types), so we go
-    /// through the proper serialization path.
+    /// Run compiler-produced bytecode (archived layout, no `.c0s` round-trip).
     pub fn run_raw(&mut self, code: &[RawByte], constants: &[u64]) {
         let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
         self.run_with_pool(code, constants);
@@ -588,45 +403,8 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(raw));
                 }
                 Instruction::STORE => {
-                    // Phase 15D — STORE is now effectively a
-                    // no-op: it reads the value at the slot's
-                    // position and writes it back to the same
-                    // position. The codegen emits a `STORE`
-                    // for every `Binding` in a pattern; the
-                    // VM's `UNPACK` (and `JUMP_IF_MATCH`)
-                    // push the binding values directly into
-                    // the slot positions (because the stack
-                    // and the locals area share the same
-                    // memory), so the slot already holds the
-                    // correct value when `STORE` runs — the
-                    // read-modify-write is a no-op that
-                    // preserves the binding semantics.
-                    //
-                    // The pre-15D implementation (peek-then-
-                    // overwrite) silently kept the value on the
-                    // stack, which broke multi-payload
-                    // constructor pattern bindings: every
-                    // `STORE` would peek the same top of stack
-                    // and overwrite the same slot, leaving all
-                    // bindings with the same value (the LAST
-                    // pushed payload value). The earlier
-                    // intermediate fix (pop-then-overwrite)
-                    // shifted the bug rather than fixing it:
-                    // the first `STORE` would pop the top,
-                    // write to the slot, and the second
-                    // `STORE` would then pop the just-written
-                    // value, leaving all bindings with the
-                    // same value (the FIRST pushed payload
-                    // value).
-                    //
-                    // With this no-op semantics, the stack and
-                    // slot overlap is a feature, not a bug:
-                    // `UNPACK` puts each payload value at the
-                    // slot's position, and `STORE` confirms
-                    // the binding without disturbing the value.
-                    // let slot = sp + opcode.operand_u32() as usize;
-                    // let val = self.stack[slot];
-                    // self.stack[slot] = val;
+                    // No-op: stack and locals share memory; UNPACK/JUMP_IF_MATCH
+                    // already wrote match bindings into slot positions.
                 }
                 Instruction::LOAD => {
                     self.stack
@@ -749,8 +527,6 @@ impl<const S: usize> Machine<S> {
                             .heap
                             .alloc(ObjString::from(message.as_str()), Object::String);
 
-                        // Phase 15D.1 — bump the allocation counter
-                        // and trigger GC if past the threshold.
                         self.alloc_counter += 1;
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
                             Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
@@ -762,10 +538,6 @@ impl<const S: usize> Machine<S> {
                 Instruction::PRINT => {
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
                     let s = unsafe { &*ptr };
-                    // Phase 15D.1 — redirect output to the
-                    // configured sink if set; otherwise fall
-                    // through to stdout. The integration tests
-                    // use this to capture stdout in memory.
                     if let Some(out) = self.output.as_mut() {
                         let _ = write!(out, "{}", s);
                     } else {
@@ -801,8 +573,6 @@ impl<const S: usize> Machine<S> {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
                     let _ = r.as_mut();
 
-                    // Phase 15D.1 — bump the allocation counter
-                    // and trigger GC if past the threshold.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
                         Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
@@ -819,11 +589,7 @@ impl<const S: usize> Machine<S> {
                     ip = caller.tell();
                     sp = caller.get();
                 }
-                // Fused `LOAD slot; CONST imm; <binop>` — binary op
-                // between a local and an inline immediate. Pushing the
-                // slot value and immediate then running the shared
-                // `binary!` macro guarantees identical semantics to the
-                // unfused sequence (int arithmetic and comparisons).
+                // Fused `LOAD slot; CONST imm; <binop>`.
                 Instruction::BinSlotImm => {
                     let (op, slot, imm) = opcode.bin_slot_imm_parts();
                     let lhs = self.stack[sp + slot];
@@ -844,9 +610,7 @@ impl<const S: usize> Machine<S> {
                         _ => {}
                     }
                 }
-                // Fused `<cmp>; JMPF target` — compare the top two
-                // stack values and branch when the result is false
-                // (matching `JMPF`'s pop-if-false semantics).
+                // Fused `<cmp>; JMPF target`.
                 Instruction::CmpJmpf => {
                     let (op, target) = opcode.cmp_jmpf_parts();
                     match Instruction::from(op) {
@@ -866,8 +630,6 @@ impl<const S: usize> Machine<S> {
                         ip = target;
                     }
                 }
-                // Fused `LOAD slot; RETURN` — return a local slot
-                // directly, skipping the intermediate push/pop.
                 Instruction::LoadReturnSlot => {
                     let ret_val = self.stack[sp + opcode.operand_u32() as usize];
                     let return_sp = self.frames.pop().get();
@@ -877,8 +639,6 @@ impl<const S: usize> Machine<S> {
                     ip = caller.tell();
                     sp = caller.get();
                 }
-                // Fused `CONST imm; RETURN` — return an inline
-                // immediate constant (sign-extended like `CONST`).
                 Instruction::ConstReturnImm => {
                     let ret_val = Value::from(opcode.operand_u32() as i32 as i64 as u64);
                     let return_sp = self.frames.pop().get();
@@ -888,9 +648,6 @@ impl<const S: usize> Machine<S> {
                     ip = caller.tell();
                     sp = caller.get();
                 }
-                // Fused `<binop>; RETURN` — apply a binary op to the
-                // top two stack values (via the shared `binary!` macro)
-                // and return the result.
                 Instruction::BinReturn => {
                     match Instruction::from(opcode.bin_return_op()) {
                         Instruction::ADD => binary!(self.stack, +, as_int),
@@ -923,10 +680,6 @@ impl<const S: usize> Machine<S> {
                     ip = caller.tell();
                     sp = caller.get();
                 }
-                // Fused `LOAD a; LOAD b; <binop>` — binary op between
-                // two locals. Pushing both slot values then running the
-                // shared `binary!` macro guarantees identical semantics
-                // (int and float arithmetic + comparisons).
                 Instruction::BinSlotSlot => {
                     let (op, a, b) = opcode.bin_slot_slot_parts();
                     let va = self.stack[sp + a];
@@ -957,46 +710,12 @@ impl<const S: usize> Machine<S> {
                         _ => {}
                     }
                 }
-                // FFI / native dispatch. Pops `native.arity()`
-                // values from the operand stack (in source order:
-                // first arg is at the bottom, last is at the
-                // top) and calls the registered native function.
-                // The return value is pushed back onto the stack
-                // (or no push for void returns).
-                //
-                // The operand_u32 carries the native's name's
-                // index into a name table (populated by the
-                // host via `register_native` or by the FFI
-                // loader via `register_extern_libs`). For now
-                // the name is encoded directly in the operand
-                // bytes — the compiler writes a fixed string
-                // layout. (A name-table indirection would shrink
-                // the bytecode but is deferred until needed.)
                 Instruction::NATIVE => {
                     #[cfg(debug_assertions)]
                     eprintln!("FFI: deprecated NATIVE opcode — recompile from source");
                 }
-                // FFI library load (userland `load(path)`).
-                // Pops a string (the library path), `dlopen`s
-                // it, and pushes the resulting library object
-                // as a `Value`. The library's function signature
-                // table is empty initially — userland code
-                // declares functions by calling
-                // `Machine::register_ffi_function` (or by
-                // dispatching through a known C signature).
-                // Fails gracefully (prints a warning to
-                // stderr) if `dlopen` can't load the library.
-                //
-                // This arm inlines the `value_to_string` /
-                // `load_userland_library` work using direct
-                // field access (`self.heap`, `self.libraries`,
-                // `self.userland_libraries`) so the borrow
-                // checker can split-borrow each field from
-                // the `frame` mutable borrow held across the
-                // match block. Calling the two methods on
-                // `&self` / `&mut self` would force a whole-
-                // `self` borrow that collides with `frame`.
                 Instruction::FfiLoad => {
+                    // Inlined to split-borrow `heap`/`libraries` from `frames`.
                     let path_val = self.stack.pop();
                     let path = {
                         let addr = path_val.raw() as u64;
@@ -1031,44 +750,11 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                 }
-                // FFI invocation (userland
-                // `lib.invoke("name", [args], [types], ret_type)`).
-                // Pops the function ID (returned by
-                // `DeclareFFI`) and argument count from the
-                // operand, then the library value and `arity`
-                // argument values. Resolves the symbol in the
-                // library, marshals the args, calls the C
-                // function, and pushes the return value (or
-                // nothing for `void`).
-                //
-                // Pre-22b userland-API design note: the
-                // previous design packed `function_id` into
-                // the operand's low 16 bits (a compile-time
-                // constant for the `extern` block path). The
-                // userland-API redesign moves `function_id`
-                // onto the stack so `declare(...)` and
-                // `invoke(...)` can be wired as ordinary
-                // source-level calls. The operand now only
-                // carries `arity`.
                 Instruction::FfiInvoke => {
-                    // Phase 26 — stack discipline:
-                    //   bottom:  lib_handle
-                    //            fn_id
-                    //   top:     args_tuple_value (a heap-allocated
-                    //             Object::Tuple whose `elements` are
-                    //             the call args in source order)
-                    //
-                    // Pop the tuple (top), pop fn_id (next),
-                    // pop lib (bottom). Walk tuple elements as
-                    // the call args in source order. The tuple
-                    // is REVERSED on the run side because
-                    // MakeTuple packs source-order elements via
-                    // a `values.reverse()` (matching MakeArray /
-                    // MakeEnum's source-order convention).
                     let raw = opcode.operand_u32();
                     let _arity = (raw & 0xFFFF) as usize;
 
-                    // Pop the tuple (top of stack).
+                    // Stack (bottom → top): lib, fn_id, args_tuple.
                     let tuple_val = self.stack.pop();
                     let tuple_addr = tuple_val.raw() as u64;
 
@@ -1080,11 +766,6 @@ impl<const S: usize> Machine<S> {
                     let lib_val = self.stack.pop();
                     let lib_addr = lib_val.raw() as u64;
 
-                    // Walk the tuple for the args in source
-                    // order. Phase 23's `Index` opcode can do
-                    // this for us; use a direct walk via
-                    // `find_object_by_addr` + cast to
-                    // `Object::Tuple`.
                     let args: Vec<Value> = match Self::find_object_by_addr(&self.heap, tuple_addr) {
                         Some(crate::memory::Object::Tuple(gc)) => gc.as_ref().elements.clone(),
                         _ => Vec::new(),
@@ -1152,50 +833,11 @@ impl<const S: usize> Machine<S> {
                         Err(_) => {}
                     }
                 }
-                // FFI signature declaration (userland
-                // `declare(lib, "name", arg1_type, ..., argN_type, ret_type)`).
-                //
-                // Operand: low 16 = arity (number of *argument*
-                // type tags, NOT counting the library handle,
-                // name, or return-type tag — those are stack
-                // values).
-                //
-                // Stack at dispatch (bottom → top):
-                //   lib_handle  name_string  arg_tag_0  arg_tag_1
-                //   ... arg_tag_{arity-1}  ret_type_tag
-                //
-                // Pops: ret_type_tag, then the `arity` arg_tags
-                // (in reverse source order so reversing them
-                // gives source order), then the name string,
-                // then the lib handle. Resolves the symbol on
-                // the library, builds a `FunctionSig` from the
-                // tags (each `Object::Enum` value is read as
-                // its `tag: u32` field), registers the
-                // signature, and pushes the function id.
-                //
-                // `FFIType` tag mapping (must match the
-                // canonical `enum FFIType` source declaration
-                // AND the `FfiType` Rust enum):
-                //   0 = Int
-                //   1 = Float
-                //   2 = String
-                //   3 = Void
                 Instruction::DeclareFFI => {
                     let raw = opcode.operand_u32();
                     let _arity = (raw & 0xFFFF) as usize;
 
-                    // Phase 26 — stack discipline:
-                    //   bottom:  lib_handle
-                    //            name_string
-                    //            args_tuple_value (heap
-                    //            `Object::Tuple` whose `elements`
-                    //            are FFI-type tags in source order)
-                    //   top:     ret_type_tag
-                    //
-                    // Pop the ret_type tag (top), then walk
-                    // the tuple for `arity` arg tags (in source
-                    // order), then pop the name, then the lib
-                    // handle.
+                    // Stack (bottom → top): lib, name, args_tuple, ret_tag.
                     let ret_tag_val = self.stack.pop();
                     let ret_tag = Self::ffi_type_tag_from_value(&self.heap, &ret_tag_val);
                     let ret_type = Self::ffi_type_from_tag(ret_tag);
@@ -1204,13 +846,6 @@ impl<const S: usize> Machine<S> {
                     let args_tuple_val = self.stack.pop();
                     let args_tuple_addr = args_tuple_val.raw() as u64;
 
-                    // Walk the tuple's elements as the arg
-                    // type tags in source order. The VM's
-                    // tuple elements are `Value`s; each is
-                    // either an immediate FFI-type tag (from
-                    // `extern`-block `CONST int`) or a heap
-                    // `Object::Enum` (from userland
-                    // `FFIType::X` constructors via MakeEnum).
                     let arg_tags: Vec<u32> =
                         match Self::find_object_by_addr(&self.heap, args_tuple_addr) {
                             Some(crate::memory::Object::Tuple(gc)) => gc
@@ -1219,8 +854,6 @@ impl<const S: usize> Machine<S> {
                                 .iter()
                                 .map(|v| Self::ffi_type_tag_from_value(&self.heap, v))
                                 .collect(),
-                            // Defensive: malformed tuple — degrade
-                            // to an empty arity vector.
                             _ => Vec::new(),
                         };
                     let arg_types: Vec<crate::memory::FfiType> =
@@ -1262,11 +895,6 @@ impl<const S: usize> Machine<S> {
                     if let Some(id) = result_id {
                         self.stack.push(Value::from(id as i64));
                     } else {
-                        // Push a sentinel error value so the
-                        // stack stays balanced. -1i64 is
-                        // distinct from any valid function_id
-                        // (which is a heap handle from the
-                        // signature table).
                         self.stack.push(Value::from(-1_i64));
                     }
                 }
@@ -1297,9 +925,6 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::HALT => {
-                    // Phase 15D.1 — flush whichever output sink is
-                    // active before terminating, so captured output
-                    // is complete when the test inspects it.
                     if let Some(out) = self.output.as_mut() {
                         let _ = out.flush();
                     } else {
@@ -1317,24 +942,8 @@ impl<const S: usize> Machine<S> {
                         value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
-                    // Phase 25 — `intern` the string so
-                    // follow-up `GetField` / `SetField` /
-                    // `MakeDict` look-ups by string-content
-                    // deduplicate through the heap's strings
-                    // table (the same way `Heap::intern`
-                    // works for FFI name keys). The first
-                    // `STRING` call allocates a fresh
-                    // `ObjString`; subsequent identical
-                    // strings return the existing ref.
                     let gc_string = self.heap.intern(value);
 
-                    // Phase 15D.1 — bump the allocation counter
-                    // and trigger GC if past the threshold.
-                    // Note: `intern` only allocates on a cache
-                    // miss, so the counter is bumped inside the
-                    // hit-check. For callers we always want a
-                    // bump per `STRING` so the GC pressure
-                    // reflects total string literal volume.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
                         Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
@@ -1345,71 +954,27 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
-                    // Operands: upper 16 bits = tag, lower 16 bits = arity.
-                    //
-                    // Stack discipline: the codegen emits the
-                    // payload args in REVERSE declaration order so
-                    // that the top of the stack is `payload[0]`
-                    // (the FIRST declared arg). For a constructor
-                    // `Foo(a, b, c)`, codegen emits `CONST c;
-                    // CONST b; CONST a;` so the stack ends with
-                    // a on top, then b, then c at the bottom.
-                    //
-                    // We pop arity values: first pop = a (top),
-                    // then b, then c. The buffer ends up in
-                    // declaration order `[a, b, c]` — no
-                    // reversal needed.
-                    //
-                    // Each popped value is classified as either
-                    // immediate (int/float/bool) or heap pointer
-                    // (string/instance/enum) using
-                    // [`Heap::contains_addr`]. Immediates become
-                    // `Member::Value`; heap pointers become
-                    // `Member::Object` (the GC traces the heap
-                    // object on mark).
+                    // operands: tag (high 16), arity (low 16). Args popped top-first
+                    // into declaration order; classify each as immediate or heap pointer.
                     let operands = opcode.operand_u32();
                     let tag = operands >> 16;
                     let arity = (operands & 0xFFFF) as usize;
 
-                    // Pop arity values into a buffer. The first
-                    // pop is the top of stack (which is
-                    // declaration-order index 0); the LAST pop
-                    // is the bottom of the popped range (which
-                    // is declaration-order index `arity - 1`). The
-                    // resulting buffer is in declaration order.
                     let mut values: Vec<Value> = Vec::with_capacity(arity);
                     for _ in 0..arity {
                         if self.stack.tell() == 0 {
-                            // Stack underflow — bail without
-                            // allocating so the VM can keep running.
                             break;
                         }
                         values.push(self.stack.pop());
                     }
-                    // `values` is already in declaration order
-                    // (see the comment above). Do NOT reverse.
 
-                    // Build the payload, classifying each value
-                    // as immediate or heap pointer. Done with an
-                    // explicit loop (not `.map(|v| { ... self.heap
-                    // ... })`) so the borrow checker doesn't see
-                    // the closure as capturing `self` while the
-                    // outer loop holds `frame = self.frames.get_mut()`.
                     let mut payload: Vec<Member> = Vec::with_capacity(values.len());
                     for v in values {
                         if self.heap.contains_addr(v.raw()) {
-                            // Heap pointer → wrap as a `Member::Object`.
-                            // Reconstruct the matching `Object`
-                            // variant by address lookup against
-                            // the heap's intrusive list.
                             let addr = v.raw() as u64;
                             if let Some(o) = Self::find_object_by_addr(&self.heap, addr) {
                                 payload.push(Member::Object(o));
                             } else {
-                                // Defensive: if the lookup fails
-                                // (object already freed?), fall
-                                // back to treating as an immediate
-                                // — the GC will skip it.
                                 payload.push(Member::Value(v));
                             }
                         } else {
@@ -1420,16 +985,6 @@ impl<const S: usize> Machine<S> {
                     let obj_enum = ObjEnum { tag, payload };
                     let (object, _) = self.heap.alloc(obj_enum, Object::Enum);
 
-                    // Phase 15D.1 — bump the allocation counter
-                    // and trigger GC if past the threshold. Note
-                    // that this happens AFTER the alloc but
-                    // BEFORE the GC starts: any heap pointers on
-                    // the stack (this enum's address will be
-                    // pushed next) are live roots for the next
-                    // collection. The payload was already
-                    // classified above (each member was wrapped
-                    // as `Member::Object` or `Member::Value`),
-                    // so the GC traces it correctly.
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
                         Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
@@ -1437,17 +992,6 @@ impl<const S: usize> Machine<S> {
 
                     self.stack.push(Value::from(object.addr()));
                 }
-                // ---- Phase 23 aggregates ----
-                //
-                // `MakeTuple <arity>` / `MakeArray <arity>` pop
-                // `arity` values from the stack and allocate a
-                // fresh heap `Object::Tuple` / `Object::Array`.
-                // The codegen pushes elements in source order
-                // (top-of-stack = LAST source element), so we pop
-                // then reverse for storage. Each element is a
-                // direct `Value` (no `Member` wrapping — the
-                // tuple/array element types are uniform whereas
-                // enums distinguish by tag).
                 Instruction::MakeTuple | Instruction::MakeArray => {
                     let operands = opcode.operand_u32();
                     let arity = (operands & 0xFFFF) as usize;
@@ -1474,12 +1018,6 @@ impl<const S: usize> Machine<S> {
                     }
                     self.stack.push(Value::from(addr));
                 }
-                // `t[i]` — pops the index (top), then the
-                // target. Looks up the target as a heap
-                // tuple/array object and returns the value at
-                // index `i`. Out-of-bounds indices push `-1i64`
-                // as a sentinel (the typechecker doesn't catch
-                // this today).
                 Instruction::Index => {
                     let index_val = self.stack.pop();
                     let target_val = self.stack.pop();
@@ -1502,28 +1040,12 @@ impl<const S: usize> Machine<S> {
                                 elements[index as usize]
                             }
                         }
-                        // Non-aggregate target or stale
-                        // heap pointer: degrade to -1
-                        // rather than panicking.
                         _ => Value::from(-1_i64),
                     };
                     self.stack.push(result);
                 }
-                // ---- Phase 25: dict literal ----
-                //
-                // `MakeDict <arity>`: pop `arity * 2` values
-                // (in reverse source order). Each pair is
-                // (value, field_name_string). Allocate a fresh
-                // heap `Object::Instance` with `Table<Member>`
-                // populated, push the heap ptr.
                 Instruction::MakeDict => {
                     let arity = (opcode.operand_u32() & 0xFFFF) as usize;
-                    // Pop N pairs in reverse source order; we'll
-                    // re-insert in source order. The codegen emits
-                    // each (value, name) pair with the value PUSHED
-                    // FIRST and the field-name string ON TOP — so
-                    // at dispatch the top of the stack is the name
-                    // (last source-emitted).
                     let mut pairs: Vec<(String, Value)> = Vec::with_capacity(arity);
                     for _ in 0..arity {
                         let name_val = self.stack.pop();
@@ -1539,11 +1061,7 @@ impl<const S: usize> Machine<S> {
                     {
                         let instance: &mut ObjInstance = gc.as_mut();
                         for (name, value) in pairs {
-                            // Intern the field name; look up or
-                            // create the heap string for the key.
                             let key = self.heap.intern(name);
-                            // Classify the value as immediate or
-                            // object (same heuristic as `MakeEnum`).
                             let member = if let Some(obj) =
                                 Self::find_object_by_addr(&self.heap, value.raw() as u64)
                             {
@@ -1559,11 +1077,6 @@ impl<const S: usize> Machine<S> {
                     }
                     self.stack.push(Value::from(object.addr()));
                 }
-                // `GetField` (no operand): pops the field-name
-                // string (top), then the receiver target, and
-                // pushes the value at `target.field_name`.
-                // Missing fields push `-1i64` as a sentinel (the
-                // typechecker rejects missing fields upstream).
                 Instruction::GetField => {
                     let name_val = self.stack.pop();
                     let target_val = self.stack.pop();
@@ -1574,38 +1087,14 @@ impl<const S: usize> Machine<S> {
                             let key = self.heap.intern(name);
                             match gc.as_ref().get(key) {
                                 Some(crate::memory::Member::Value(v)) => v,
-                                Some(crate::memory::Member::Object(_)) => {
-                                    // For Phase 25 the dict only
-                                    // stores immediate values via
-                                    // `set_field`. Object-typed
-                                    // fields would need a separate
-                                    // path; degrade to -1 for now.
-                                    Value::from(-1_i64)
-                                }
+                                Some(crate::memory::Member::Object(_)) => Value::from(-1_i64),
                                 None => Value::from(-1_i64),
                             }
                         }
-                        // Non-instance target or stale heap
-                        // pointer: degrade to -1 (the typechecker
-                        // would have rejected this upstream).
                         _ => Value::from(-1_i64),
                     };
                     self.stack.push(result);
                 }
-                // `SetField` (no operand): pops the value (top),
-                // the field-name string, then the receiver
-                // target; inserts `(field_name, value)` into the
-                // receiver's `Table`.
-                //
-                // Phase 25: the runtime semantics are intentionally
-                // minimal — phase-level support for record
-                // mutation. The codegen's Access-on-LHS path
-                // emits this opcode. We pop the three stack values
-                // (name, target, value) and update the underlying
-                // instance in place. The `Table<Member>` keys by
-                // `RefString` pointer equality, so we re-intern the
-                // name to get a canonical key (STRING uses `intern`
-                // already to dedup).
                 Instruction::SetField => {
                     let name_val = self.stack.pop();
                     let target_val = self.stack.pop();
@@ -1622,70 +1111,25 @@ impl<const S: usize> Machine<S> {
                         } else {
                             crate::memory::Member::Value(value)
                         };
-                        // We can't mutate through `gc.as_ref()`,
-                        // so re-walk to find a mutable view. The
-                        // simplest path: allocate a fresh instance
-                        // with the updated entry. (In-place
-                        // mutation would need a mutable Gc API.)
+                        // In-place mutation not yet implemented; allocates a fresh instance.
                         self.alloc_counter += 1;
                         let (new_obj, _) =
                             self.heap.alloc(ObjInstance::default(), Object::Instance);
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
                             Self::gc_collect(&mut self.heap, &self.stack, &mut self.alloc_counter);
                         }
-                        // The newly-allocated instance holds the
-                        // new field. The old instance's table is
-                        // left intact (it stays alive as long as
-                        // any Value references it; subsequent
-                        // `SetField` operations on the same
-                        // receiver will encounter the same
-                        // object and re-mutate). For Phase 25
-                        // this is conservative — full in-place
-                        // mutation is a follow-up.
                         let _ = (gc_handle, new_obj, key, member);
                     }
                 }
                 Instruction::JumpIfMatch => {
-                    // Operands: upper 16 bits = expected tag
-                    // (16 bits). Lower 16 bits reserved.
-                    //
-                    // Phase 18C — target offset is now a full
-                    // 32-bit absolute bytecode offset in
-                    // `value[31:0]` (the pre-18C layout put it
-                    // in the lower 16 bits of `operands`, which
-                    // capped reachable match-arm bodies at
-                    // 65,535 bytes). See `common/src/opcode.rs`
-                    // for the new operand layout.
-                    //
-                    // Peeks the scrutinee's tag without consuming
-                    // it. If the tag matches, pops the scrutinee,
-                    // pushes the payload values in DECLARATION
-                    // order (so the first declared element is
-                    // closest to the locals area, the last is on
-                    // top), and seeks the bytecode iterator to
-                    // the target. If the tag does not match, falls
-                    // through (the scrutinee remains on the stack
-                    // for the next arm to consume via UNPACK /
-                    // STORE / POP).
-                    //
-                    // Phase 15D — the binding `STORE` is a
-                    // no-op, so `UNPACK` / `JUMP_IF_MATCH`
-                    // directly place the payload at the
-                    // binding's slot. See `Instruction::UNPACK`
-                    // for the rationale.
+                    // Tag in operands[31:16]; jump target in value[31:0].
                     let operands = opcode.operand_u32();
                     let expected_tag = operands >> 16;
 
                     if self.stack.tell() == 0 {
-                        // No scrutinee — bail.
                     } else {
                         let scrutinee_addr = self.stack.peek().raw() as u64;
 
-                        // Load the enum object. If the scrutinee
-                        // isn't a heap pointer to an Object::Enum
-                        // (e.g., a type error slipped through), the
-                        // match arm is unreachable — fall through
-                        // silently.
                         let obj_enum = Self::find_object_by_addr(&self.heap, scrutinee_addr)
                             .and_then(|o| match o {
                                 Object::Enum(e) => Some(e),
@@ -1696,9 +1140,6 @@ impl<const S: usize> Machine<S> {
                             let enum_ref = enum_ref.as_ref();
                             if enum_ref.tag == expected_tag {
                                 let target_offset = opcode.jump_if_match_target(constants);
-                                // Match — consume the scrutinee
-                                // and push the payload values in
-                                // declaration order.
                                 let _ = self.stack.pop();
                                 for member in &enum_ref.payload {
                                     let value = match member {
@@ -1709,41 +1150,15 @@ impl<const S: usize> Machine<S> {
                                 }
                                 ip = target_offset;
                             }
-                            // else: fall through; scrutinee still
-                            // on stack for the next arm.
                         }
-                        // else: scrutinee is not an enum (e.g.,
-                        // type error). Fall through silently —
-                        // the typechecker should have caught this.
                     }
                 }
                 Instruction::Unpack => {
-                    // Operands: arity (kept for symmetry with the
-                    // spec; the VM reads the real count from
-                    // `ObjEnum::payload.len()`).
-                    //
-                    // Pops the scrutinee (an `Object::Enum`) and
-                    // pushes its payload values in DECLARATION
-                    // order — i.e., the first declared payload
-                    // value ends up closest to the function's
-                    // locals area, the last is on top.
-                    //
-                    // Why DECLARATION order and not REVERSE: the
-                    // codegen's binding `STORE` is now a
-                    // no-op (Phase 15D — see `Instruction::STORE`
-                    // for the rationale). `UNPACK` pushes each
-                    // payload value directly into the binding's
-                    // slot position because the stack and the
-                    // locals area share the same memory.
-                    // Iterating the payload in declaration
-                    // order and pushing in that order places
-                    // `payload[i]` at slot `arity + i`, which
-                    // is exactly where the binding `STORE`s
-                    // expect to find it.
+                    // Pops enum scrutinee; pushes payload in declaration order
+                    // (stack/locals overlap — see STORE).
                     let _arity = opcode.operand_u32() as usize;
 
                     if self.stack.tell() == 0 {
-                        // No scrutinee — bail.
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
@@ -1763,39 +1178,15 @@ impl<const S: usize> Machine<S> {
                                 self.stack.push(value);
                             }
                         }
-                        // else: scrutinee is not an enum; silent
-                        // fallthrough (defensive — should not
-                        // happen if the typechecker is correct).
                     }
                 }
                 Instruction::LoadField => {
-                    // Operands: lower 16 bits = field_index.
-                    //
-                    // Pops the receiver (Object::Enum) and pushes
-                    // payload[field_index]. Consumes the receiver
-                    // (matches UNPACK semantics — the receiver is
-                    // no longer needed once a single field has been
-                    // extracted).
-                    //
-                    // Phase 18D — the load-field opcode backing the
-                    // field-access expression (e.g., `point.x`).
-                    // Field index is the declaration position of the
-                    // field in the record-shaped variant's payload.
-                    // The 16-bit ceiling supports 65,535 fields per
-                    // record; payloads with more fields are out of
-                    // range and would silently no-op (defensive).
                     let field_index = (opcode.operand_u32() & 0xFFFF) as usize;
 
                     if self.stack.tell() == 0 {
-                        // Stack underflow — bail.
                     } else {
                         let scrutinee_addr = self.stack.pop().raw() as u64;
 
-                        // Load the enum object. If the receiver
-                        // isn't a heap pointer to an Object::Enum
-                        // (e.g., a type error slipped through), the
-                        // access is unreachable — fall through
-                        // silently.
                         let obj_enum = Self::find_object_by_addr(&self.heap, scrutinee_addr)
                             .and_then(|o| match o {
                                 Object::Enum(e) => Some(e),
@@ -1811,46 +1202,17 @@ impl<const S: usize> Machine<S> {
                                 };
                                 self.stack.push(value);
                             }
-                            // else: field_index out of bounds — silent
-                            // no-op (defensive).
                         }
-                        // else: receiver is not an enum — silent no-op.
                     }
                 }
                 Instruction::UnpackAt => {
-                    // Operands: lower 16 bits = slot_offset (relative
-                    // to frame.sp — the position of the enum value to
-                    // unpack). Upper 16 bits = arity (redundant with
-                    // `ObjEnum::payload.len()` but kept for symmetry
-                    // with the spec).
-                    //
-                    // Phase 18B — slot-based UNPACK for nested record
-                    // patterns. The existing `Unpack` always pops the
-                    // TOP of stack, which works for top-level matches
-                    // (where the OUTER record's enum value is at the
-                    // top after the scrutinee-push) but FAILS for
-                    // nested records (where the inner record's enum
-                    // value sits at a non-top slot — pushed there by
-                    // the OUTER record's UNPACK).
-                    //
-                    // `UnpackAt slot, arity` reads the enum value at
-                    // `stack[frame.sp + slot_offset]` and writes the
-                    // payload values to consecutive positions starting
-                    // at `stack[frame.sp + slot_offset]` (overwriting
-                    // in place). The stack pointer doesn't change.
-                    //
-                    // The arity limitation (declared in
-                    // `common/src/opcode.rs`) is that the nested
-                    // record's arity must be <= the slot position in
-                    // the OUTER record — otherwise the write would
-                    // clobber the OUTER record's later fields.
+                    // Unpack enum at `sp + slot_offset` in place (nested record patterns).
                     let operands = opcode.operand_u32();
                     let slot_offset = (operands & 0xFFFF) as usize;
                     let _arity = (operands >> 16) as usize;
 
                     let slot = sp + slot_offset;
                     if slot >= self.stack.tell() {
-                        // Slot is out of bounds — bail (defensive).
                     } else {
                         let scrutinee_addr = self.stack[slot].raw() as u64;
 
@@ -1862,9 +1224,6 @@ impl<const S: usize> Machine<S> {
 
                         if let Some(enum_ref) = obj_enum {
                             let enum_ref = enum_ref.as_ref();
-                            // Write each payload value into the slot,
-                            // OVERWRITING the source enum value at
-                            // `slot` and the following positions.
                             for (i, member) in enum_ref.payload.iter().enumerate() {
                                 let value = match member {
                                     Member::Value(v) => *v,
@@ -1873,48 +1232,11 @@ impl<const S: usize> Machine<S> {
                                 self.stack[slot + i] = value;
                             }
                         }
-                        // else: scrutinee is not an enum — silent
-                        // no-op (defensive; the typechecker should
-                        // have rejected this).
                     }
                 }
                 Instruction::StorePop => {
-                    // Operands: full u32 = slot_index.
-                    //
-                    // Phase 18E — the load-bearing "store the RHS
-                    // into a let-bound variable" opcode. Pops the
-                    // top of the stack and writes it to
-                    // `frame.sp + slot_index`. The slot position
-                    // overlaps with the locals area (the stack and
-                    // the locals area share memory), so the next
-                    // `LOAD <slot_index>` will read the value.
-                    //
-                    // Distinct from `Instruction::STORE`, which is
-                    // a no-op since Phase 15D (it confirms
-                    // match-arm bindings whose values were already
-                    // pushed directly into the slot positions by
-                    // `UNPACK` / `JUMP_IF_MATCH`). `STORE_POP` is
-                    // the EXPLICIT pop-and-write opcode used by the
-                    // `let x = expr;` codegen.
-                    //
-                    // **Cursor preservation.** A naive
-                    // pop-and-write would let the cursor fall
-                    // back to `slot`, which means the NEXT
-                    // `push` would clobber the slot we just
-                    // wrote (because `push` writes to
-                    // `stack[cursor]`). For example, `let x = 5;
-                    // let y = 10;` would emit
-                    // `CONST 5; STORE_POP 0; CONST 10;
-                    // STORE_POP 1;` and without cursor
-                    // preservation the second `CONST 10` would
-                    // overwrite `stack[0]` (the slot for `x`)
-                    // before `STORE_POP 1` runs.
-                    //
-                    // Fix: after the pop, ensure the cursor is
-                    // at least `slot + 1`. This matches the
-                    // "local is allocated" semantic — once a
-                    // slot has been written, future operand
-                    // pushes go above it.
+                    // Pop TOS into `sp + slot`; advance cursor past the slot so
+                    // subsequent pushes don't clobber locals (`let x; let y;`).
                     let slot = sp + opcode.operand_u32() as usize;
                     let val = self.stack.pop();
                     self.stack[slot] = val;
@@ -1942,14 +1264,6 @@ mod tests {
         Byte::new(Instruction::MakeEnum).with_operands_u16([tag, arity])
     }
 
-    /// Build a `JUMP_IF_MATCH` byte with the given expected tag
-    /// and target offset.
-    ///
-    /// Phase 18C layout: tag in `operands[31:16]`, target in
-    /// `value[31:0]` (a full 32-bit absolute bytecode offset —
-    /// pre-18C the target was a 16-bit value in
-    /// `operands[15:0]`, which capped reachable match-arm
-    /// bodies at 65,535 bytes).
     fn jump_if_match(tag: u16, pool_idx: u16) -> Byte {
         Byte::new(Instruction::JumpIfMatch).with_operands_u16([tag, pool_idx])
     }
@@ -1960,14 +1274,10 @@ mod tests {
         Byte::new(Instruction::Unpack).with_operand_u32(arity)
     }
 
-    /// Build a `LOAD_FIELD` byte with the given field index in
-    /// the lower 16 bits of the operand (Phase 18D layout).
     fn load_field(field_index: u16) -> Byte {
         Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32)
     }
 
-    /// Build a `STORE_POP` byte with the given slot index in
-    /// the operand (Phase 18E layout).
     fn store_pop(slot: u32) -> Byte {
         Byte::new(Instruction::StorePop).with_operand_u32(slot)
     }
@@ -2061,9 +1371,6 @@ mod tests {
         Byte::new(Instruction::CONST).with_const_inline(value as i32)
     }
 
-    /// Step 1: execute `MAKE_ENUM 0 0` (zero-arity constructor).
-    /// Verify that the resulting enum has tag=0 and an empty
-    /// payload.
     #[test]
     fn make_enum_allocates_enum_with_correct_tag() {
         let mut vm = Machine::<1>::default();
@@ -2082,15 +1389,6 @@ mod tests {
         );
     }
 
-    /// Step 2: push 2 ints, execute `MAKE_ENUM 1 2`, and
-    /// verify that the payload has 2 entries in declaration
-    /// order.
-    ///
-    /// We can't directly inspect the enum from the public VM
-    /// API, but we can verify the bytecode runs to completion
-    /// (no panic, no stack underflow). The fact that we can
-    /// pop the enum back off the stack afterwards confirms
-    /// the result was pushed.
     #[test]
     fn make_enum_with_payload_populates_payload() {
         let mut vm = Machine::<4>::default();
@@ -2111,9 +1409,6 @@ mod tests {
         );
     }
 
-    /// Step 3: push an enum with tag=2, then execute
-    /// `JUMP_IF_MATCH 2 <target> 1`. Verify that the IP
-    /// advances to the target.
     #[test]
     fn jump_if_match_taken_advances_ip() {
         // Build a minimal bytecode that:
@@ -2146,21 +1441,6 @@ mod tests {
         assert_eq!(v.as_int(), 42, "JUMP_IF_MATCH did not push the payload");
     }
 
-    /// Phase 18C — verify the wide-target round-trip for
-    /// `JUMP_IF_MATCH`.
-    ///
-    /// Before 18C, `JUMP_IF_MATCH` packed both the tag and the
-    /// target offset into the 32-bit `operands` field (tag in
-    /// upper 16 bits, target in lower 16 bits), which silently
-    /// truncated any target ≥ 65,536 bytes. Phase 18C moves
-    /// the target to a full 32-bit slot in `value[31:0]`, so
-    /// targets up to 2^32 - 1 are now representable.
-    ///
-    /// This test exercises the wide-target layout without
-    /// allocating a 100,000-instruction bytecode sequence:
-    /// we just verify that `with_value_u32` / `value_u32`
-    /// round-trip a target > 65,535 and that the tag stays in
-    /// `operands[31:16]`.
     #[test]
     fn jump_if_match_wide_target_round_trips() {
         let target: u32 = 100_000;
@@ -2185,10 +1465,6 @@ mod tests {
         assert!(target > 0xFFFF, "test must exercise wide-target path");
     }
 
-    /// Step 4: push an enum with tag=2, then execute
-    /// `JUMP_IF_MATCH 5 <target> 1`. The tag doesn't match,
-    /// so the jump is NOT taken; the scrutinee remains on
-    /// the stack for the next arm.
     #[test]
     fn jump_if_match_not_taken_falls_through() {
         let mut vm = Machine::<4>::default();
@@ -2211,9 +1487,6 @@ mod tests {
         assert_eq!(v.as_int(), 99, "JUMP_IF_MATCH should have fallen through");
     }
 
-    /// Step 5: push an enum with payload=[v1, v2, v3], then
-    /// execute `UNPACK 3`. The payload is pushed onto the
-    /// stack in declaration order.
     #[test]
     fn unpack_pops_enum_and_pushes_payload() {
         let mut vm = Machine::<8>::default();
@@ -2224,12 +1497,6 @@ mod tests {
             const_int(20),
             const_int(10),
             make_enum(0, 3),
-            // UNPACK arity=3: pops enum, pushes 10, 20, 30
-            // (in declaration order). The Phase 15D binding
-            // contract uses the slot positions directly
-            // (UNPACK puts each value at the binding's slot);
-            // the order on the stack is declaration order,
-            // not reversed.
             unpack(3),
             Byte::new(Instruction::HALT),
         ]);
@@ -2239,18 +1506,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 10);
     }
 
-    /// Phase 18D — verify `LOAD_FIELD 0` extracts the first
-    /// declared field of an enum's payload.
-    ///
-    /// Build a 3-field enum with declaration-order payload
-    /// `[10, 20, 30]`. Codegen convention: push the fields in
-    /// REVERSE declaration order so the top of the stack holds
-    /// `payload[0]`. `MakeEnum` then pops arity values (top
-    /// first) into the buffer in declaration order. After
-    /// `MakeEnum`, the enum sits on the stack.
-    ///
-    /// `LoadField(0)` should pop the enum and push
-    /// `payload[0] = 10`.
     #[test]
     fn load_field_extracts_field_zero() {
         let mut vm = Machine::<8>::default();
@@ -2269,12 +1524,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 10);
     }
 
-    /// Phase 18D — verify `LOAD_FIELD 2` extracts the third
-    /// declared field (the last one) of an enum's payload.
-    ///
-    /// Same setup as `load_field_extracts_field_zero`, but
-    /// request field index 2. The VM should return
-    /// `payload[2] = 30` without disturbing any other state.
     #[test]
     fn load_field_extracts_last_field() {
         let mut vm = Machine::<8>::default();
@@ -2291,15 +1540,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 30);
     }
 
-    /// Phase 18D — verify `LOAD_FIELD` extracts the correct
-    /// field when loading a middle index (1) of a 3-field
-    /// enum's payload.
-    ///
-    /// Loads payload[1] (= 20) from an enum with payload
-    /// `[10, 20, 30]`. Distinct from
-    /// `load_field_extracts_field_zero` and
-    /// `load_field_extracts_last_field`, which exercise the
-    /// boundary indices.
     #[test]
     fn load_field_extracts_middle_field() {
         let mut vm = Machine::<8>::default();
@@ -2318,10 +1558,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 20);
     }
 
-    /// Phase 18D — verify `LOAD_FIELD` consumes the receiver
-    /// (matches `UNPACK` semantics). After `LoadField`, the
-    /// enum should no longer be on the stack — only the
-    /// extracted field should remain.
     #[test]
     fn load_field_consumes_receiver() {
         let mut vm = Machine::<4>::default();
@@ -2345,10 +1581,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 42);
     }
 
-    /// Phase 18D — verify `LOAD_FIELD` with an out-of-bounds
-    /// field index is a silent no-op (the receiver is consumed
-    /// but nothing is pushed). This matches the defensive
-    /// posture of `UNPACK` and `JUMP_IF_MATCH`.
     #[test]
     fn load_field_out_of_bounds_silent_noop() {
         let mut vm = Machine::<4>::default();
@@ -2404,15 +1636,6 @@ mod tests {
         assert_eq!(vm.pop().as_float(), 3.5);
     }
 
-    /// Nested enum GC test: allocate an outer enum with a
-    /// payload containing an inner enum (and a string). Trigger
-    /// GC and verify both inner enums are preserved.
-    ///
-    /// Since Phase 15C's full mark-and-trace isn't wired into
-    /// the VM's `trace`/`sweep` cycle yet (15D work), we use
-    /// the existing `Heap::trace` + `Object::mark_references`
-    /// helpers (used by the 15A GC tests) directly. This
-    /// mirrors what a proper mark-and-trace loop would do.
     #[test]
     fn nested_enum_gc_traces_correctly() {
         use crate::{Heap, Member, ObjString, Object};
@@ -2440,10 +1663,6 @@ mod tests {
             Object::Enum,
         );
 
-        // Treat outer_obj as the GC root. Mark it, then
-        // propagate through `mark_references` (the
-        // mark-and-trace loop that 15D will wire into the
-        // VM's automatic cycle).
         let mut gray = Vec::new();
         heap.trace(&[outer_obj.addr()]);
         outer_obj.mark_references(&mut gray);
@@ -2477,36 +1696,6 @@ mod tests {
         );
     }
 
-    /// Phase 15D.1 — end-to-end GC integration test.
-    ///
-    /// Allocate a stream of enums whose payload references an
-    /// outer "accumulator" root. Each iteration pushes the
-    /// previous accumulator, allocates a fresh enum with that
-    /// accumulator in its payload, and discards everything
-    /// except the newest accumulator. The previous accumulators
-    /// become unreachable and must be collected by the
-    /// automatic GC.
-    ///
-    /// Without automatic GC, `heap.size()` would grow linearly
-    /// with `N`. With the 15D.1 wiring, the heap should plateau
-    /// after the first GC cycle. We assert `heap.size() < N`
-    /// (loose bound) and verify the accumulator is still
-    /// reachable after `N` allocations.
-    ///
-    /// We use a private bytecode that does the equivalent of:
-    ///
-    ///   loop N times:
-    ///     push the accumulator on the stack
-    ///     MAKE_ENUM tag=1 arity=1   (wrap accumulator)
-    ///     POP the new enum
-    ///     keep only the inner accumulator
-    ///   HALT
-    ///
-    /// Concretely: each iteration allocates a new `Box`-shaped
-    /// enum whose payload is the previous accumulator's
-    /// address, then the loop overwrites the local slot with
-    /// the unwrapped inner value. The previous accumulator is
-    /// no longer reachable from any stack slot — it's garbage.
     #[test]
     fn heap_does_not_grow_unboundedly_under_repeated_alloc() {
         use std::collections::HashSet;
@@ -2557,12 +1746,6 @@ mod tests {
         let _ = vm.alloc_counter();
     }
 
-    /// Phase 15D.1 — verify the live set is preserved by an
-    /// automatic GC cycle.
-    ///
-    /// Allocate an enum, keep it on the stack across many
-    /// allocations of unrelated (unreachable) enums, and
-    /// assert the original enum survives the GC cycle.
     #[test]
     fn live_enum_survives_automatic_gc_cycle() {
         use std::collections::HashSet;
@@ -2638,13 +1821,6 @@ mod tests {
         );
     }
 
-    /// Phase 15D.4 — verify that `Machine::with_output`
-    /// redirects PRINT output to the provided writer.
-    ///
-    /// Build a small program that emits `"hello"` via PRINT,
-    /// redirect output to a `Vec<u8>` (wrapped in a tiny
-    /// `Write` impl that shares the buffer via `Rc<RefCell>`),
-    /// and assert the bytes are present.
     #[test]
     fn with_output_captures_print() {
         use std::cell::RefCell;
@@ -2693,31 +1869,6 @@ mod tests {
         assert_eq!(s, "hello");
     }
 
-    // ============================================================
-    //  Phase 18E: StorePop opcode tests
-    // ============================================================
-    //
-    // StorePop is the load-bearing "store the RHS into a let-bound
-    // variable" opcode. Distinct from STORE (which is a no-op since
-    // Phase 15D — it confirms match-arm bindings whose values were
-    // already pushed directly into the slot positions by UNPACK /
-    // JUMP_IF_MATCH).
-    //
-    // The VM's slot layout uses `frame.sp` as the base; the slot
-    // index in the operand is an offset from `frame.sp`. For the
-    // top-level frame, `frame.sp = 0`, so slot 0 is at stack[0].
-    // After `STORE_POP 0`, the value lives at stack[0]; after
-    // `LOAD 0`, it's pushed back onto the stack.
-    //
-    // These tests exercise the canonical patterns the codegen
-    // produces for `let x = expr;` (STORE_POP after the RHS,
-    // followed by LOAD when x is referenced).
-
-    /// Phase 18E — verify `STORE_POP 0` writes the top-of-stack
-    /// value to slot 0 and pops it. After the op, the stack
-    /// height is unchanged (one value popped, one slot
-    /// written). A subsequent `LOAD 0` pushes the stored
-    /// value back.
     #[test]
     fn store_pop_writes_value_to_slot_and_pops() {
         let mut vm = Machine::<4>::default();
@@ -2735,16 +1886,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 42);
     }
 
-    /// Phase 18E — verify `STORE_POP` writes to the correct
-    /// slot index. Write a different value to slot 2, then
-    /// `LOAD 2` returns that value (not whatever is at slot 0
-    /// or 1).
-    ///
-    /// This is the critical regression test: a buggy
-    /// implementation that always wrote to slot 0 would
-    /// silently corrupt the slot addressing used by
-    /// multi-binding programs like `let x = 5; let y = 10;
-    /// print x + y;`.
     #[test]
     fn store_pop_writes_to_correct_slot_index() {
         let mut vm = Machine::<4>::default();
@@ -2764,11 +1905,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 42);
     }
 
-    /// Phase 18E — verify `STORE_POP` round-trips through a
-    /// multi-binding let sequence. The canonical pattern:
-    /// `let x = 5; let y = 10;` produces two `STORE_POP`
-    /// instructions (one per binding). After both fire, both
-    /// slots hold the correct value.
     #[test]
     fn store_pop_two_bindings_preserves_both_values() {
         let mut vm = Machine::<4>::default();
@@ -2790,12 +1926,6 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 15);
     }
 
-    /// Phase 18E — verify `STORE_POP` allows re-assignment by
-    /// overwriting the slot. The `x = 10;` codegen emits
-    /// `CONST 10; STORE_POP <slot>` — the same op as a let,
-    /// because the operand-stack and locals area share memory.
-    /// A buggy implementation that confused `STORE_POP` with
-    /// `STORE` (the no-op) would leave the slot untouched.
     #[test]
     fn store_pop_overwrites_existing_slot() {
         let mut vm = Machine::<4>::default();
@@ -2810,12 +1940,6 @@ mod tests {
             load(0),
             Byte::new(Instruction::HALT),
         ]);
-        // Should be 10 — the second STORE_POP overwrote the
-        // slot. (Pre-fix this would have left x = 5 because
-        // STORE was a no-op, but x = 10; also emits DUPLICATE
-        // which would push another 10 — net result 5 + 10,
-        // but the first was the original load. The fix makes
-        // the semantics explicit: store-pop-and-overwrite.)
         assert_eq!(vm.pop().as_int(), 10);
     }
 

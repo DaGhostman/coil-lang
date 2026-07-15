@@ -1,24 +1,7 @@
-//! Substitutions: mappings from type variables to types, with `apply`,
-//! `compose`, `union`, and free-variable helpers.
+//! Substitutions: apply, compose, and free-variable helpers.
 //!
-//! A substitution is stored as a `Vec<(TyVarId, Ty)>`. Most substitutions
-//! produced by unification are tiny (single bindings) so `Vec` is fine.
-//!
-//! ## `apply` is non-recursive
-//!
-//! `apply_ty(s, Var(α))` performs **one** lookup: if `α ∈ dom(s)`, it
-//! returns `s[α]` directly (which may itself be a `Var(β)`); otherwise it
-//! returns `Var(α)` unchanged. It does not chase the chain, so
-//! `apply({α → β, β → int}, α) == Var(β)`, **not** `int`.
-//!
-//! This matches the textbook formulation in Pierce/Diehl. The reason is
-//! that `compose(s1, s2)` cannot be given a faithful set-of-pairs
-//! representation if `apply` chases chains — the textbook proof shows that
-//! a faithful `compose` is only possible with non-recursive `apply`.
-//!
-//! Callers that want a fully-resolved type for diagnostics or
-//! pretty-printing can use [`apply_ty_prune`], which reapplies until no
-//! more changes occur.
+//! `apply_ty` does a single lookup per variable (no chain chasing) so
+//! [`compose`] stays correct. Use [`apply_ty_prune`] for fully resolved types.
 
 use std::collections::HashSet;
 
@@ -112,11 +95,8 @@ impl From<Vec<(TyVarId, Ty)>> for Subst {
     }
 }
 
-/// Apply a substitution to a `Ty`.
-///
-/// Recurses through every type constructor. For `Var(v)`, if `v` is bound,
-/// the **bound type itself** is returned (single lookup) — we do not chase
-/// the chain. This is what makes [`compose`] correct.
+/// Apply a substitution to a `Ty`. For `Var(v)`, returns the bound type
+/// directly (single lookup — does not chase chains).
 pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
     match ty {
         Ty::Var(v) => match subst.get(*v) {
@@ -162,9 +142,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             tag: *tag,
             arity: *arity,
         },
-        // Phase 24 — recurse through aggregate types. The
-        // length component of `Array` and the field names of
-        // `Record` are inert (no free vars).
+        // length and field names are inert
         Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| apply_ty(subst, t)).collect()),
         Ty::Array { element, length } => Ty::Array {
             element: Box::new(apply_ty(subst, element)),
@@ -179,11 +157,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
     }
 }
 
-/// Apply a substitution repeatedly until no more changes occur.
-///
-/// Useful for diagnostics and pretty-printing. Bounded only by the
-/// structure of the substitution; under the occurs-check invariant (Phase
-/// 2), the loop terminates.
+/// Apply repeatedly until fixed point (diagnostics / pretty-printing).
 pub fn apply_ty_prune(subst: &Subst, ty: &Ty) -> Ty {
     let mut current = apply_ty(subst, ty);
     loop {
@@ -195,13 +169,8 @@ pub fn apply_ty_prune(subst: &Subst, ty: &Ty) -> Ty {
     }
 }
 
-/// Apply a substitution to a `Scheme`.
-///
-/// Quantified variables are preserved. This is correct as long as `subst`
-/// does not bind any of `s.bounds`; that invariant is maintained by
-/// `instantiate` (Phase 3) which mints fresh variables for every
-/// quantified variable before applying the substitution.
-#[allow(dead_code)] // exposed for diagnostic helpers
+/// Apply a substitution to a `Scheme`. Quantified variables are preserved.
+#[allow(dead_code)]
 pub fn apply_scheme(subst: &Subst, s: &Scheme) -> Scheme {
     Scheme {
         bounds: s.bounds.clone(),
@@ -209,24 +178,7 @@ pub fn apply_scheme(subst: &Subst, s: &Scheme) -> Scheme {
     }
 }
 
-/// Compose two substitutions: `s1 ∘ s2` applies `s2` first, then `s1`.
-///
-/// Formally: `apply(compose(s1, s2), t) == apply(s1, apply(s2, t))`.
-///
-/// Construction:
-///   1. For every `(α, t)` in `s2`, write `α → apply(s1, t)` into the
-///      result.
-///   2. Add every binding `(α, t)` from `s1` whose key is not already in
-///      the result (i.e. not shadowed by `s2`).
-///
-/// For shared keys, the result is `s1(s2(α))` — `s2`'s value wins (after
-/// `s1` is applied to it), because `s1 ∘ s2` mathematically means `s2`
-/// runs first.
-///
-/// Note: this is *not* "extend with override" semantics. Use [`union`] for
-/// that (it lets the right-hand side's bindings win, which is what
-/// Algorithm W wants when combining substitutions from recursive calls
-/// where keys are typically disjoint).
+/// Compose: `apply(compose(s1, s2), t) == apply(s1, apply(s2, t))`.
 pub fn compose(s1: &Subst, s2: &Subst) -> Subst {
     let mut result = Subst::empty();
     for (v, t) in s2.iter() {
@@ -373,8 +325,7 @@ mod tests {
         let result = apply_scheme(&s, &scheme);
         assert_eq!(result.bounds, vec![TyVarId(0)]);
         // Note: this is technically incorrect when the substitution binds a
-        // quantified variable — `instantiate` (Phase 3) is responsible for
-        // preventing that. Documented in the function's doc-comment.
+        // quantified variable — `instantiate` prevents that.
         assert_eq!(result.ty, int());
     }
 

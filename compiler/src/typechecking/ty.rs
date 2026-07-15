@@ -1,15 +1,7 @@
-//! HM types: monotypes (`Ty`), polytypes (`Scheme`), and type-variable
-//! identifiers (`TyVarId`).
+//! Monotypes ([`Ty`]), polytypes ([`Scheme`]), and type-variable ids.
 //!
-//! This is Phase 1 of the HM rewrite (see `HM_TYPECHECKER_PLAN.md`). No
-//! inference or unification lives here yet — just the data definitions and
-//! free-variable helpers.
-//!
-//! Type variables are minted by `Checker` (added in a later phase) and only
-//! remain valid for that `Checker`'s lifetime. They are stored as bare
-//! `TyVarId(u32)` values, which keeps `Ty` cheap to clone (no arenas, no
-//! refcounting). We can switch to an arena-based representation in a later
-//! phase if shared mutable state (e.g. union-find) becomes useful.
+//! Type variables are minted by [`Checker`](super::infer::Checker) and valid
+//! only for that checker's lifetime.
 
 use std::collections::HashSet;
 
@@ -36,39 +28,7 @@ impl TyVarId {
     }
 }
 
-/// Monomorphic types in the HM type system.
-///
-/// - `Var(v)` is a placeholder that will be resolved during unification.
-/// - `Con(name)` is a type constructor: `int`, `float`, `Foo`, …
-/// - `Fun(a, b)` is a function type `a -> b`.
-/// - `App(c, args)` is a type-level application, e.g. `Foo<int, string>`.
-/// - `List(inner)` is sugar over `App(Con("List"), [inner])`.
-/// - `Sum { name, variants }` is an algebraic sum type
-///   (`enum Option { None, Some(int) }`). The variant list is the
-///   source-declaration order; the `name` field is the enum's name
-///   (used for diagnostic rendering and isorecursive encoding of
-///   recursive payloads — see `infer::register_enum`).
-/// - `Constructor { owner, tag, arity }` is the type of a specific
-///   variant inside a sum. The `owner` is the parent sum type (kept
-///   as a `Box` so the `Ty` is cheap to clone). `tag` is the
-///   zero-based variant index in the owner's `variants` list;
-///   `arity` is cached to spare codegen a per-call lookup. `arity`
-///   counts the total number of fields (0 for Unit, N for Tuple/Record).
-///
-/// Phase 24 added three variants for typed aggregates:
-/// - `Tuple(Vec<Ty>)` — heterogeneous product type `(T1, T2, ...)`. Each
-///   element has its own (potentially distinct) type. The vec is in
-///   source/declaration order. The arity is fixed (length is type-level).
-/// - `Array { element, length }` — homogeneous collection `[T]` or `[T; N]`.
-///   `length` is `ArrayLength::Static(N)` for a compile-time-known length
-///   (literal `[1, 2, 3]` or `[int; 5]` annotation) and `ArrayLength::Dynamic`
-///   for runtime-determined length (function return, parameter, etc.).
-///   Static-length arrays enable compile-time out-of-bounds detection.
-/// - `Record { fields }` — anonymous dict `{ name: T, name: T, ... }`.
-///   Field names are unique within a record; structurally-equal field
-///   sets unify. Dicts are mutable (Phase 25). The fields are in
-///   declaration order at construction; the typechecker canonically
-///   sorts them lex-by-name for unification determinism.
+/// Monomorphic types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Var(TyVarId),
@@ -85,25 +45,17 @@ pub enum Ty {
         tag: u32,
         arity: usize,
     },
-    /// `(T1, T2, ..., Tn)` — heterogeneous tuple. Length is fixed.
     Tuple(Vec<Ty>),
-    /// `[T]` (dynamic length) or `[T; N]` (static length N).
     Array {
         element: Box<Ty>,
         length: ArrayLength,
     },
-    /// `{ name: T, ... }` — anonymous dict / record. Structurally typed
-    /// (Phase 25). Mutable.
     Record {
         fields: Vec<(String, Ty)>,
     },
 }
 
-/// The length component of `Ty::Array`. `Static(N)` makes the array's
-/// length a type-level constant (compile-time known) and lets the
-/// typechecker flag constant out-of-bounds indices. `Dynamic` is for
-/// arrays whose length is only known at runtime (function returns,
-/// JSON-decoded arrays, SQL results — Phase 24 user requirement).
+/// Array length: compile-time constant or runtime-known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayLength {
     Static(usize),
@@ -111,27 +63,12 @@ pub enum ArrayLength {
 }
 
 impl ArrayLength {
-    /// True iff this length is known at compile time. Used by the
-    /// typechecker's index-out-of-bounds check (Phase 24).
     pub fn is_static(&self) -> bool {
         matches!(self, ArrayLength::Static(_))
     }
 }
 
-/// The payload shape of a single `Ty::Sum` variant. Phase 17B
-/// introduced this as an EXPLICIT shape enum (not a synthetic-name
-/// trick — see the 17B red-team finding #1). The shape is preserved
-/// end-to-end through unification, pretty-printing, and codegen
-/// reordering.
-///
-/// Field naming rules:
-///
-/// - `Unit` — no fields.
-/// - `Tuple(Vec<Ty>)` — positional types, in declaration order.
-/// - `Record(Vec<(String, Ty)>)` — `(field_name, field_type)` pairs,
-///   in declaration order. Field names are needed for matching
-///   record-pattern bindings to their declaration-order slot
-///   positions and for typechecker shape-mismatch errors.
+/// Variant payload shape: unit, tuple, or record fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnumVariantPayloadTy {
     Unit,
@@ -140,8 +77,6 @@ pub enum EnumVariantPayloadTy {
 }
 
 impl EnumVariantPayloadTy {
-    /// Number of fields (0 for Unit, N for Tuple/Record). Used by
-    /// codegen to know how many stack values to push/pop.
     pub fn field_count(&self) -> usize {
         match self {
             EnumVariantPayloadTy::Unit => 0,
@@ -150,9 +85,6 @@ impl EnumVariantPayloadTy {
         }
     }
 
-    /// Iterate the field types in declaration order. Used by the
-    /// typechecker to unify record-pattern / record-call-site
-    /// shapes against the declared shape (declaration order).
     pub fn field_types(&self) -> Vec<&Ty> {
         match self {
             EnumVariantPayloadTy::Unit => Vec::new(),
@@ -161,12 +93,8 @@ impl EnumVariantPayloadTy {
         }
     }
 
-    /// `(field_name, field_type)` pairs in declaration order. The
-    /// bridge between Tuple and Record for codegen reordering —
-    /// tuple variants get synthetic names `"0"`, `"1"`, …; record
-    /// variants get their declared names. This helper is used ONLY
-    /// at the codegen level (see 17B red-team finding #1: not in
-    /// Display, unify, or the AST data structure).
+    /// Field names and types in declaration order. Tuple variants use
+    /// synthetic `"0"`, `"1"`, … names (codegen reordering only).
     pub fn field_pairs(&self) -> Vec<(String, Ty)> {
         match self {
             EnumVariantPayloadTy::Unit => Vec::new(),
@@ -307,12 +235,7 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         Ty::List(inner) => {
             go(inner, acc);
         }
-        // Sum types: the `name` field carries no free variables.
-        // Variant payload types may be polymorphic (e.g. `enum Pair
-        // { P(int, T) }` where T is fresh) so we walk them.
-        // Recursive payloads use `Ty::Con("EnumName")` for the
-        // self-reference, which has no free variables — so the
-        // recursion terminates without an explicit depth check.
+        // Recursive enum payloads use Ty::Con(name) (isorecursive encoding).
         Ty::Sum { variants, .. } => {
             for (_, payload) in variants {
                 for p in payload.field_types() {
@@ -320,16 +243,9 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
                 }
             }
         }
-        // Constructor types: the tag and arity are inert; the
-        // interesting part is the owner (which is always the parent
-        // sum type).
         Ty::Constructor { owner, .. } => {
             go(owner, acc);
         }
-        // Phase 24 aggregate types. Tuple elements and Array
-        // elements contribute free variables; Record fields
-        // contribute free variables; the lengths and field NAMES are
-        // inert (no free vars).
         Ty::Tuple(tys) => {
             for t in tys {
                 go(t, acc);

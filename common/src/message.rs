@@ -1,3 +1,5 @@
+//! Compiler diagnostic messages and source labels.
+
 use std::ops::Range;
 
 #[derive(PartialEq, Hash, Eq, Copy, Clone, Debug)]

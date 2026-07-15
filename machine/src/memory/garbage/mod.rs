@@ -1,6 +1,8 @@
+//! Alternate GC helpers (currently unused by the live heap).
+
 // pub mod collectable;
 // pub mod gc;
-// mod rc;
+mod rc;
 
 use std::cell::Cell;
 

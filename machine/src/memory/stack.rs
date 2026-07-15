@@ -1,3 +1,5 @@
+//! Fixed-size operand stack with an explicit cursor (`tell` / `seek`).
+
 use std::ops::{Index, IndexMut, Range};
 
 use common::promise;

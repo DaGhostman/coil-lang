@@ -1,3 +1,5 @@
+//! Legacy block-marking collector sketch (unused).
+
 use crate::{Object, ObjectType, String};
 
 #[derive(Default)]
@@ -25,17 +27,6 @@ impl Collector {
 
             block = unsafe { block.offset(C as isize) };
         }
-
-        // .f
-        //   match unsafe { *(ptr.offset(40) as *mut ObjectType) } {
-        //   jectType::String => {
-        //     let obj = unsafe { (*ptr as *mut String).as_ref() };
-        //
-        //   => {
-        //     println!("Not a STRING: {}", *ptr as u64);
-        //
-        //
-        // );
 
         to_free
     }

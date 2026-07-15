@@ -1,12 +1,8 @@
-//! Project manifest (`zero.toml`) parsing + module path resolution.
+//! Project manifest (`zero.toml`) parsing and module path resolution.
 //!
-//! Phase 29 — Namespaces + project-level module discovery.
-//!
-//! A `zero.toml` file at the project root declares the
-//! search roots for `use` resolution and an optional entry
-//! point. The pipeline reads the manifest, builds a list of
-//! search roots, and uses the manifest to map `a::b::c` paths
-//! in `use` statements to `<root>/a/b/c.0s` files on disk.
+//! A `zero.toml` at the project root declares search roots for `use`
+//! resolution and an optional entry point. The pipeline maps `a::b::c`
+//! paths to `<root>/a/b/c.0s` files on disk.
 //!
 //! ## Format
 //!

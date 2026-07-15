@@ -1,3 +1,5 @@
+//! Stack-like vector: inline storage for `N` elements, then heap spill.
+
 use std::ops::{Index, IndexMut};
 
 use crate::{likely, promise, unlikely};
@@ -74,7 +76,6 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
         self.current += 1;
     }
 
-    /// Set up the active frame slot and advance to the next.
     #[inline]
     pub fn setup_current_and_advance<F>(&mut self, setup: F)
     where

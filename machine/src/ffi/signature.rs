@@ -1,8 +1,7 @@
-//! Explicit FFI signature types and builder.
+//! Explicit FFI signatures.
 
 use crate::memory::FfiType;
 
-/// A fully specified C ABI signature for an FFI function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FfiSignature {
     pub name: String,
@@ -24,7 +23,6 @@ impl FfiSignature {
     }
 }
 
-/// Builder for [`FfiSignature`].
 #[derive(Debug, Default)]
 pub struct FfiSignatureBuilder {
     name: String,

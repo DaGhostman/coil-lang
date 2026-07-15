@@ -1,7 +1,16 @@
-//! FFI (Foreign Function Interface) machinery.
+//! FFI: explicit signatures and libffi dispatch (no runtime guessing).
 //!
-//! All FFI calls go through explicit [`FfiSignature`] values and libffi
-//! dynamic dispatch. There is no signature guessing at runtime.
+//! ## C ABI mapping (`FfiType` → libffi)
+//! - `Int` → `i64`
+//! - `Float` → `f64`
+//! - `String` → `const char *` (heap `ObjString` address); C returns are copied
+//! - `Void` → void (invoke pushes nothing)
+//!
+//! ## VM opcode stack (bottom → top)
+//! - **`FfiLoad`**: `path_string` → `lib_handle`
+//! - **`DeclareFFI`**: `lib`, `name`, `args_tuple` (type tags), `ret_tag` → `fn_id` (or `-1`)
+//! - **`FfiInvoke`**: `lib`, `fn_id`, `args_tuple` → return value (void: no push)
+//! - **`HostInvoke`**: `fn_id`, `args_tuple` → return value
 
 mod call;
 mod registry;
@@ -16,8 +25,6 @@ pub use signature::{FfiError, FfiSignature, FfiSignatureBuilder};
 
 use std::sync::Arc;
 
-/// Register `sig` on a loaded library object, resolving the symbol
-/// and preparing a libffi call interface at declare time.
 pub fn register_on_library(
     obj_lib: &mut crate::memory::ObjLibrary,
     sig: FfiSignature,
@@ -33,7 +40,6 @@ pub fn register_on_library(
     Ok(id)
 }
 
-/// Load a dynamic library by short name (e.g. `"c"`, `"m"`).
 pub fn load_library(name: &str) -> Result<Arc<Library>, libloading::Error> {
     let lib = unsafe { Library::new(name) }?;
     Ok(Arc::new(lib))

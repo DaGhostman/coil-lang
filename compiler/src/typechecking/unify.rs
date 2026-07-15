@@ -1,37 +1,4 @@
-//! Unification for Hindley–Milner type inference.
-//!
-//! Implements Robinson's algorithm with occurs check. [`unify_with`] takes
-//! two types and an existing substitution, and returns an extended
-//! substitution that makes the two types equal; if no such substitution
-//! exists, it returns a [`UnifyError`].
-//!
-//! ## Algorithm
-//!
-//! 1. Bring both types up to date by applying the current substitution
-//!    (single lookup per variable). This means we always see the most
-//!    recent bindings on both sides.
-//! 2. Decompose the pair:
-//!    - Same constructor (`int` with `int`, `Fun(a, b)` with `Fun(c, d)`):
-//!      unify sub-pairs in sequence, threading the accumulated
-//!      substitution.
-//!    - `Var(α)` on either side: bind `α` to the other type, after the
-//!      occurs check.
-//!    - Two identical `Var`s: trivially equal (no occurs check).
-//!    - Different constructors: `Mismatch`.
-//!
-//! `Var(α)` with itself succeeds without an occurs check.
-//!
-//! ## Errors
-//!
-//! - `Mismatch { left, right }`: the constructors are fundamentally
-//!   incompatible (`int` with `float`, `Foo` with `Bar`, mismatched arity
-//!   on `App`, …).
-//! - `Occurs { var, ty }`: binding `var` to `ty` would create an infinite
-//!   type (`α = α -> α`, `α = List<α>`, …).
-//!
-//! Spans are deliberately not carried in `UnifyError`. The infer pass
-//! (Phase 4) tracks which expression caused a unification failure and
-//! attaches the span at the diagnostic layer (Phase 8).
+//! Unification (Robinson's algorithm with occurs check).
 
 use super::subst::{Subst, apply_ty, compose};
 use super::ty::{Ty, TyVarId, ftv_ty};
@@ -86,19 +53,11 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // Same type constructor (e.g. `int` with `int`).
         (Ty::Con(a), Ty::Con(b)) if a == b => Ok(subst.clone()),
 
-        // `Ty::Con(name)` is the opaque recursive reference used
-        // by `register_enum` (see MUST-HAVE #1). When the
-        // non-recursive side is a `Sum` of the same name, treat
-        // them as equivalent.
+        // Isorecursive encoding: Ty::Con(name) matches Sum/Constructor of same name.
         (Ty::Con(c_name), Ty::Sum { name, variants })
         | (Ty::Sum { name, variants }, Ty::Con(c_name))
             if c_name == name =>
         {
-            // Re-borrow: the `apply_ty` at the top of this
-            // function already resolved any bound vars, so
-            // unbuilding the sum here is fine. We unify the sum
-            // with itself (identity) to honour the existing
-            // variants structure on both sides.
             let sum = Ty::Sum {
                 name: name.clone(),
                 variants: variants.clone(),
@@ -107,9 +66,6 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         }
         (Ty::Con(c_name), ctor @ Ty::Constructor { .. })
         | (ctor @ Ty::Constructor { .. }, Ty::Con(c_name)) => {
-            // Only unify when the constructor's owner is a sum
-            // with the same name (the `Con(name)` is the
-            // isorecursive reference to that sum).
             let owner_sum_name = match &ctor {
                 Ty::Constructor { owner, .. } => match owner.as_ref() {
                     Ty::Sum { name, .. } => Some(name.clone()),
@@ -123,8 +79,6 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                     right: Ty::Con(c_name),
                 });
             }
-            // The constructor's owner is the matching sum.
-            // Use the existing Constructor-vs-Sum arm logic.
             let owner = match &ctor {
                 Ty::Constructor { owner, .. } => owner.as_ref().clone(),
                 _ => unreachable!(),
@@ -132,7 +86,6 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             unify_with(subst, &ctor, &owner)
         }
 
-        // Function types: unify arg and return in sequence.
         (Ty::Fun(a1, b1), Ty::Fun(a2, b2)) => {
             let s = unify_with(subst, a1.as_ref(), a2.as_ref())?;
             unify_with(&s, b1.as_ref(), b2.as_ref())
@@ -158,13 +111,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             Ok(current)
         }
 
-        // Sum types: two same-named sums are equal iff their variants
-        // match in number, name (per slot), and payload arity (with
-        // matching shapes — see 17B red-team finding #5: a variant
-        // declared as tuple cannot unify with the same-named
-        // variant declared as record), with the payload types
-        // themselves unifiable. Sums of different names are always
-        // distinct.
+        // Sum types: same name, matching variant count/names/shapes.
         (
             Ty::Sum {
                 name: a,
@@ -213,10 +160,6 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                         },
                     });
                 }
-                // Shape check (17B): two same-named variants in
-                // different sums must have the same shape. Shape is
-                // matched by discriminant (Unit / Tuple / Record),
-                // not by structural arity.
                 if std::mem::discriminant(ap) != std::mem::discriminant(bp) {
                     return Err(UnifyError::Mismatch {
                         left: Ty::Sum {
@@ -238,11 +181,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             Ok(current)
         }
 
-        // Constructor against its parent sum (or vice versa). The
-        // `tag` and `arity` must agree with the sum's own
-        // declarations, then the constructor unifies with the sum
-        // (the constructor's owner should already equal the sum,
-        // so this is a sanity unify).
+        // Constructor vs parent sum (tag/arity must agree).
         (ctor @ Ty::Constructor { .. }, sum @ Ty::Sum { .. })
         | (sum @ Ty::Sum { .. }, ctor @ Ty::Constructor { .. }) => {
             // Re-borrow the constructor parts without consuming the
@@ -273,16 +212,11 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             }
             // The constructor's owner and the sum should be the
             // same type (modulo substitution). Unify to verify.
-            let _ = s_name; // the name matches because variants is keyed by it
+            let _ = s_name;
             unify_with(subst, c_owner, &sum)
         }
 
-        // Two constructors unify iff they have the same tag and
-        // their owners are unifiable. This handles pattern
-        // matching: the pattern returns the scrutinee's type
-        // (a Constructor with a specific tag) and the scrutinee
-        // is also a Constructor — both have the same tag when
-        // the pattern matches.
+        // Two constructors: same tag and unifiable owners.
         (
             Ty::Constructor {
                 owner: o1,
@@ -316,9 +250,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         (Ty::Var(v), t) => bind_var(subst, v, t),
         (t, Ty::Var(v)) => bind_var(subst, v, t),
 
-        // ---- Phase 24: aggregate types ----
-        //
-        // Tuple: same arity; pairwise unify.
+        // Tuple, array, record
         (Ty::Tuple(tys1), Ty::Tuple(tys2)) => {
             if tys1.len() != tys2.len() {
                 return Err(UnifyError::Mismatch {
@@ -332,11 +264,6 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             }
             Ok(current)
         }
-        //
-        // Array: same element type (with static-vs-dynamic length
-        // compatibility — dynamic lengths unify to the more-specific
-        // side; Static(N) vs Static(M) for N != M is a Mismatch;
-        // Static(N) vs Dynamic unifies to Static(N)).
         (
             Ty::Array {
                 element: e1,
@@ -370,11 +297,6 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             }
             unify_with(subst, e1.as_ref(), e2.as_ref())
         }
-        //
-        // Record: structurally-equal field sets unify. Fields are
-        // matched by name (not by position). Records with different
-        // field sets are a Mismatch (the user must explicitly
-        // restructure with `match` or namespace).
         (Ty::Record { fields: f1 }, Ty::Record { fields: f2 }) => {
             if f1.len() != f2.len() {
                 return Err(UnifyError::Mismatch {
@@ -382,8 +304,7 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                     right: Ty::Record { fields: f2 },
                 });
             }
-            // Sort both lists by field name for canonical comparison
-            // (the typechecker canonically sorts on construction).
+            // Sort by field name for canonical comparison
             let mut s1 = f1.clone();
             let mut s2 = f2.clone();
             s1.sort_by(|a, b| a.0.cmp(&b.0));
@@ -408,19 +329,12 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
     }
 }
 
-/// Bind a type variable to a type, with occurs check.
-///
-/// `subst` is extended with `var → ty` (the new binding is composed so
-/// that subsequent unifications see the value already resolved under
-/// `subst`).
+/// Bind `var` to `ty` after the occurs check.
 fn bind_var(subst: &Subst, var: TyVarId, ty: Ty) -> Result<Subst, UnifyError> {
     if ftv_ty(&ty).contains(&var) {
         return Err(UnifyError::Occurs { var, ty });
     }
     let new_binding = Subst::singleton(var, ty);
-    // `compose(subst, new_binding)` applies `new_binding` first, then
-    // `subst` — which means the new binding's value is eagerly resolved
-    // under `subst` before subsequent unifications see it.
     Ok(compose(subst, &new_binding))
 }
 

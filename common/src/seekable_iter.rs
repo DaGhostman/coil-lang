@@ -1,3 +1,5 @@
+//! Slice iterator with explicit cursor seek/tell.
+
 use crate::promise;
 
 pub struct SeekableIterator<'iter, T> {

@@ -1,3 +1,5 @@
+//! Call frame: instruction pointer and stack base (`sp`).
+
 impl From<(usize, usize)> for Frame {
     fn from(value: (usize, usize)) -> Self {
         Self {

@@ -1,42 +1,7 @@
-//! Hindley–Milner inference over the zero-script AST.
+//! Hindley–Milner inference (Algorithm W) over the zero-script AST.
 //!
-//! Implements Algorithm W for every `Expression` variant. Function
-//! declarations, classes, `impl` blocks, and instantiation are deferred to
-//! Phase 5; this phase covers everything else.
-//!
-//! ## Algorithm
-//!
-//! Inference is driven by [`Checker::check_program`], which sets up a top
-//! frame and calls [`Checker::infer`] on the root expression. `infer`
-//! dispatches on the AST node:
-//!
-//! - Literals return their built-in type.
-//! - Names are looked up in the environment; if found, the bound scheme
-//!   is instantiated with fresh variables; if missing, an error message
-//!   is recorded and a fresh variable is returned (so inference can
-//!   continue past the error).
-//! - Operators infer their operands, then unify them and return the
-//!   resulting type (or `bool` for comparison / logical operators).
-//! - Control flow unifies branch bodies.
-//! - `let` declarations bind in the environment; the next sibling, if it
-//!   looks like a value, is inferred and unified with the declared type.
-//! - Calls instantiate the callee, infer each argument, then thread the
-//!   curried function type — applying one argument at a time, unifying
-//!   each argument type with the function's parameter type, until the
-//!   return type is reached.
-//!
-//! ## Error recovery
-//!
-//! [`Checker`] accumulates [`common::Message`]s and continues after every
-//! error: a failed unification emits a message and substitutes a fresh
-//! variable for the result. This gives the user every problem in one
-//! pass rather than stopping at the first.
-//!
-//! ## Substitution
-//!
-//! [`Subst`] is owned by [`Checker`] and extended in place. `infer`
-//! always returns the type *under the current substitution* (via
-//! [`apply_ty`]); the substitution is never returned explicitly.
+//! [`Checker`] owns the substitution, accumulates diagnostics with error
+//! recovery, and caches inferred types keyed by pre-walk [`NodeId`]s.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -82,63 +47,28 @@ pub struct Checker {
     methods:
         std::collections::HashMap<String, std::collections::HashMap<String, (Visibility, Scheme)>>,
 
-    /// Pre-walk-minted IDs in visit order. Populated by the pre-walk
-    /// in [`check_program`](Self::check_program); consumed in lockstep
-    /// by [`infer`](Self::infer).
+    /// Pre-walk IDs consumed in lockstep by [`infer`](Self::infer).
     ids: IdTable,
 
-    /// Next index to read from [`Checker::ids`]. Reset by the pre-walk
-    /// at the start of [`check_program`](Self::check_program).
     next_id_idx: usize,
 
-    /// Span-indexed cache of inferred types. Populated as
-    /// [`infer`](Self::infer) processes each node; consulted by the
-    /// bytecode emitter (Phase 9) via [`lookup_at`](Self::lookup_at).
+    /// Span-indexed inferred types for codegen ([`lookup_at`](Self::lookup_at)).
     cache: std::collections::HashMap<NodeId, Ty>,
 
-    /// Side-table of variable name → inferred type. Populated
-    /// during `infer_function` (function arguments) and
-    /// `infer_fragment` (let-bindings). Used by the codegen to
-    /// resolve a field-access receiver's type when the infer cache
-    /// is misaligned with the pre-walk's ID table inside function
-    /// bodies (Phase 18D — `Expression::Access` codegen). Cleared
-    /// by `check_program`.
+    /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
-    /// Phase 28 — type aliases. `type_aliases[name]` = the
-    /// resolved right-hand side (a `Ty`) inserted at parse time.
-    /// `parse_type_name` consults this table before mapping an
-    /// identifier to `Ty::Con(name)`; the alias is purely
-    /// source-level (zero runtime cost).
+    /// `type Name = T` aliases (substituted at typecheck time).
     type_aliases: std::collections::HashMap<String, Ty>,
 
-    // ---- Sum-type tables (Phase 15B) ----
-    //
-    // We keep four parallel data structures for sum types. The `Vec`
-    // fields hold the source-declaration order (insertion order); the
-    // `BTreeMap` fields index by variant name for lookup. Tag values
-    // are assigned by the position in the `Vec`, NOT alphabetically —
-    // a `BTreeMap`-only representation would silently miscompile
-    // (see `MUST-HAVE #2` in the Phase 15B plan).
-    /// enum name → list of variant names in source-declaration order.
+    // Enum registry: Vec preserves source-declaration order for tags;
+    // BTreeMap indexes variant name → tag.
     enums: BTreeMap<String, Vec<String>>,
-    /// enum name → (variant name → tag index).
     enum_tags: BTreeMap<String, BTreeMap<String, u32>>,
-    /// enum name → per-variant payload shape (in source order).
-    /// Phase 17B: each entry is `EnumVariantPayloadTy` (Unit,
-    /// Tuple, or Record) — shape is recorded explicitly, not via
-    /// synthetic names. The outer index matches the tag.
     enum_payloads: BTreeMap<String, Vec<EnumVariantPayloadTy>>,
-    /// enum name → per-variant arity (in source order). Cached here
-    /// so the codegen layer (15C) doesn't have to redo the
-    /// `payloads[i].len()` lookup at every constructor site.
     enum_arities: BTreeMap<String, Vec<usize>>,
 
-    /// Deferred exhaustiveness checks. Each entry is a match site
-    /// that should be verified AFTER the main inference pass — that
-    /// way the substitution is closed and the scrutinee's final type
-    /// is observable (free type variables at the match site can
-    /// otherwise hide the resolved sum type).
+    /// Match exhaustiveness checks deferred until substitution is closed.
     pending_exhaustive: Vec<PendingExhaustive>,
 }
 
@@ -269,9 +199,7 @@ impl Checker {
             self.messages.extend(msgs);
         }
 
-        // Top frame so natives and globals have a place to bind (Phase 7).
-        // The frame is left on the stack so callers (and tests) can
-        // inspect declared bindings via [`env`](Self::env).
+        // Top frame for natives/globals; left on stack after check_program.
         self.env.push();
         let ty = self.infer(ast);
         // NOTE: the frame is intentionally NOT popped — see the
@@ -312,12 +240,6 @@ impl Checker {
         &self.subst
     }
 
-    /// Iterate the cache (id → type). Useful for tests and for the
-    /// eventual bytecode emitter integration. Phase 15D marks
-    /// this `#[allow(dead_code)]` because no current test or
-    /// call site uses it — the codegen consults the cache
-    /// directly via `lookup_at` instead. Kept for the eventual
-    /// "give me the full type environment" debugging surface.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn cache(&self) -> impl Iterator<Item = (NodeId, &Ty)> {
@@ -371,13 +293,7 @@ impl Checker {
 
             // ---- Wrappers / no-ops ----
             Expression::Noop(_) | Expression::Comment(_) => unit_ty(),
-            // `use foo::bar;` and `use foo::bar as x;` add an
-            // alias to the env. Phase 29A — without this, the
-            // typechecker would emit "Cannot find function `x`"
-            // when the user calls the aliased name. The function
-            // type is left as a free type variable (it'll be
-            // resolved at the call site when we see the
-            // qualified name in `self.aliases`).
+            // `use` — bind alias with a fresh type variable
             Expression::Use {
                 path: _,
                 name,
@@ -580,7 +496,7 @@ impl Checker {
                 self.apply_function(Some(&ident), &fun_ty, &arg_tys, range)
             }
 
-            // ---- Control flow ----
+            // ---- Match / loop / if ----
             Expression::If(branches) => self.infer_if(branches),
             Expression::Branch(cond, body) => {
                 if let Some(c) = cond {
@@ -628,10 +544,7 @@ impl Checker {
                 let _ = self.infer(path);
                 int()
             }
-            // `(a, b, c)` — tuple literal. The type checker
-            // Phase 24 — `(a, b, c)` → `Ty::Tuple([T1, T2, T3])`.
-            // Each element is inferred independently (heterogeneous
-            // product type).
+            // Tuple literal
             Expression::Tuple(items) => {
                 let mut elem_tys = Vec::with_capacity(items.len());
                 for item in items {
@@ -640,13 +553,7 @@ impl Checker {
                 }
                 tuple_ty(elem_tys)
             }
-            // Phase 24 — `[a, b, c]` → `Ty::Array { element, length }`.
-            //   - `length = Static(items.len())` when the literal's
-            //     element count is the only known value.
-            //   - `element` is the unified type of every element. If
-            //     elements have heterogeneous types, we emit the
-            //     "array element type mismatch" diagnostic and pick
-            //     the first element's type as the canonical one.
+            // Array literal (static length from item count)
             Expression::Array(items) => {
                 let mut elem_ty: Option<Ty> = None;
                 for item in items {
@@ -678,9 +585,7 @@ impl Checker {
                     array(element)
                 }
             }
-            // Phase 24 — `t[i]`. Element-type of `t`. Out-of-bounds
-            // is detected when `t` has `ArrayLength::Static(N)` and
-            // `i` is a literal integer >= N (the diagnostic).
+            // Index: static-length OOB check for literal indices
             Expression::Index(target, index_expr) => {
                 let target_ty = self.infer(target);
                 let target_ty = apply_ty_prune(&self.subst, &target_ty);
@@ -753,12 +658,7 @@ impl Checker {
                     }
                 }
             }
-            // ---- Phase 25: dict literal ----
-            //
-            // `{ name: expr, ... }` → `Ty::Record { fields }`.
-            // Structurally typed (Phase 25 user requirement):
-            // two `{ foo: int }` literals have the same type
-            // and field access unifies them.
+            // ---- Dict literals ----
             Expression::Dict(fields) => {
                 // Check for duplicate field names — diagnostic
                 // is raised BEFORE we proceed (recovery: keep
@@ -922,25 +822,6 @@ impl Checker {
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
             Expression::Access(receiver, field) => {
-                // Field access on a record-shaped enum payload
-                // (Phase 18D). The receiver's type is one of:
-                //   - `Ty::Sum { name, variants }` — a value whose
-                //     active variant isn't known statically; the
-                //     field must be uniquely declared across the
-                //     sum's record-shaped variants, OR the user
-                //     must narrow with a `match` first.
-                //   - `Ty::Constructor { tag, owner, .. }` — a
-                //     value statically known to be a specific
-                //     variant; we look up the field in that
-                //     variant's payload only.
-                //   - `Ty::Con(name)` — a name-only reference to a
-                //     user-declared type (typical for function
-                //     parameters annotated with the bare enum
-                //     name); we resolve it through the checker's
-                //     enum registry.
-                //   - Anything else (primitive, `Ty::Var`,
-                //     unresolved, …) → "Cannot access field on
-                //     non-record type".
                 let receiver_ty = self.infer(receiver);
                 let resolved = apply_ty_prune(&self.subst, &receiver_ty);
                 match &resolved {
@@ -979,12 +860,6 @@ impl Checker {
                             variant_names.into_iter().zip(payloads).collect();
                         self.access_field_in_sum(name, &variants, None, field, range)
                     }
-                    // Phase 25 — anonymous record (dict)
-                    // access. Look up the field in the record's
-                    // fields list. Emit "Cannot find field" if
-                    // absent — this is the diagnostic the user
-                    // explicitly asked for (`x.bar` on
-                    // `{ foo: 42 }` is an error).
                     Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
                         Some((_, fty)) => fty.clone(),
                         None => {
@@ -1017,39 +892,15 @@ impl Checker {
             Expression::Instantiate(class_expr, _args) => self.infer(class_expr),
             Expression::Field(_, _, _) => unit_ty(),
 
-            // ---- Phase 15A placeholders (TODO 15B) ----
-            // These keep the workspace building while the
-            // typechecker is extended to understand sum types and
-            // pattern matching. None of them are semantically
-            // correct yet; the compiler's test suite is expected
-            // to fail on enum/match/construct source until 15B
-            // lands. The HM pre-walk visits the new nodes (see
-            // `id.rs`) and mints a `NodeId` for every child, so
-            // these stubs recurse into their children (consuming
-            // those IDs to stay lockstep with the pre-walk) but
-            // discard the inferred types — the return value is
-            // just a placeholder until 15B replaces these arms
-            // with real implementations.
+            // ---- Enums / constructors / type aliases ----
             Expression::EnumDecl { name, variants } => {
-                // The pre-pass collected the variant names and
-                // arities (for collision checks). The main pass
-                // builds the actual `Ty::Sum` from the AST's
-                // payload types and registers everything with the
-                // env.
                 self.infer_enum_decl(name, variants, &range);
                 unit_ty()
             }
-            // ---- Phase 28: type alias ----
-            //
-            // `type Name = T;` — register the alias in the
-            // table. Future uses of `Name` in type annotations
-            // (and inferred expressions) are substituted by
-            // `parse_type_name` / `lookup_at`.
             Expression::TypeAlias { name, ty } => {
                 let alias_ty = self.parse_type_name(ty);
                 self.type_aliases.insert(name.to_string(), alias_ty.clone());
-                // Eagerly walk the RHS for ID alignment.
-                let _ = self.infer(ty);
+                let _ = self.infer(ty); // ID alignment
                 unit_ty()
             }
             Expression::EnumVariant { payload, .. } => {
@@ -1093,22 +944,15 @@ impl Checker {
     }
 
     // ============================================================
-    //  Span-indexed cache (Phase 6)
+    //  Type cache and lookup
     // ============================================================
 
     /// Look up the inferred type of a node by [`NodeId`].
-    ///
-    /// Returns the fully-resolved type (the substitution is applied
-    /// until it reaches a fixed point). Used by the bytecode emitter
-    /// (Phase 9) to choose between `ADD` and `ADDF` without
-    /// re-running inference.
     pub fn lookup_at(&self, id: NodeId) -> Option<Ty> {
         self.cache.get(&id).map(|t| apply_ty_prune(&self.subst, t))
     }
 
-    /// Borrow the [`IdTable`] so callers (the bytecode emitter in
-    /// Phase 9) can recover a node's [`NodeId`] by walking the AST
-    /// in pre-order and reading IDs sequentially.
+    /// Borrow the pre-walk [`IdTable`].
     pub fn id_table(&self) -> &IdTable {
         &self.ids
     }
@@ -1150,10 +994,6 @@ impl Checker {
                     };
                     self.env
                         .insert_top(name.to_string(), Scheme::mono(var_ty.clone()));
-                    // Phase 18D: record the let-bound variable's
-                    // declared type in the codegen side-table so
-                    // the codegen can resolve `name`'s type
-                    // without depending on the infer cache or env.
                     self.codegen_var_types
                         .insert(name.to_string(), var_ty.clone());
                     last_ty = unit_ty();
@@ -1176,8 +1016,6 @@ impl Checker {
                     if let Expression::Identifier(n) = name.1.as_ref() {
                         self.env
                             .insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
-                        // Phase 18D: same codegen side-table as
-                        // let-bound variables above.
                         self.codegen_var_types.insert(n.to_string(), var_ty);
                     }
                     last_ty = unit_ty();
@@ -1343,7 +1181,7 @@ impl Checker {
     /// primary underline; use them to point at related source positions
     /// (e.g., "expected type comes from here", "found type comes from
     /// here").
-    #[allow(dead_code)] // kept for future use (Phase 10+ diagnostics)
+    #[allow(dead_code)]
     fn error_with_labels(
         &mut self,
         primary_message: String,
@@ -1365,7 +1203,6 @@ impl Checker {
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
         match ann.1.as_ref() {
             Expression::Identifier(name) | Expression::Type(name) => self.parse_type_name_str(name),
-            // Phase 24 — `[T]` / `[T; N]` array type annotations.
             Expression::Array(items) => {
                 // Static-length: `[T; N]`. Look for the `; N` shape:
                 // a single `Integer(N)` immediately following the
@@ -1392,7 +1229,6 @@ impl Checker {
                 let elem_ty = self.parse_type_name_str("int");
                 crate::typechecking::ty::array(elem_ty)
             }
-            // Phase 24 — `(T1, T2, ...)` tuple type annotations.
             Expression::Tuple(items) => {
                 let mut tys = Vec::with_capacity(items.len());
                 for item in items {
@@ -1405,11 +1241,6 @@ impl Checker {
     }
 
     fn parse_type_name_str(&self, name: &str) -> Ty {
-        // Phase 28 — alias lookup first. `type IntArray = [int];`
-        // followed by `let arr: IntArray = ...` substitutes
-        // IntArray with `[int]`. Direct lookup (not
-        // case-insensitive) — the alias table is registered
-        // under the user-declared name verbatim.
         if let Some(alias_ty) = self.type_aliases.get(name) {
             return alias_ty.clone();
         }
@@ -1426,7 +1257,9 @@ impl Checker {
     }
 
     // ============================================================
-    //  Native function registration (Phase 7)
+    // ============================================================
+    //  Native registration
+    // ============================================================
     // ============================================================
 
     /// Register a native (built-in) function with the type system.
@@ -1571,21 +1404,10 @@ impl Checker {
         let _ = range;
     }
 
-    /// Process a function declaration (top-level `fn` or a method body
-    /// inside an `impl`). Implements monomorphic recursion:
-    ///
-    /// 1. Build the declared function type from the args and the
-    ///    declared return type (or a fresh variable if no return type).
-    /// 2. If `self_ty` is `Some`, prepend it (so the method becomes
-    ///    `self -> arg1 -> ... -> ret`).
-    /// 3. Allocate a fresh `α` and bind the function's name to it in
-    ///    the local scope, so recursive references inside the body
-    ///    unify with `α` before the body's view of the function is
-    ///    finalised.
-    /// 4. Push a frame, bind the arguments, run inference on the body
-    ///    (which sees `name : α`), and pop the frame.
-    /// 5. Unify `α` with the declared function type. This validates
-    ///    that the recursive calls were consistent.
+    // ============================================================
+    //  Functions (monomorphic recursion)
+    // ============================================================
+
     fn infer_function(
         &mut self,
         name: &str,
@@ -1625,10 +1447,6 @@ impl Checker {
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
-            // Phase 18D: also record in the codegen side-table so
-            // the codegen can resolve `arg_name`'s type without
-            // depending on the (potentially popped) env or the
-            // (misaligned) infer cache.
             self.codegen_var_types
                 .insert(arg_name.clone(), arg_ty.clone());
         }
@@ -1655,21 +1473,10 @@ impl Checker {
     }
 
     // ============================================================
-    //  Sum types and pattern matching (Phase 15B)
+    //  Enums and pattern matching
     // ============================================================
 
-    /// Forward-declaration pre-pass: walk the AST once and reserve
-    /// every `enum` declaration's name, variants, and arities. This
-    /// runs before the main infer pass so that constructor / match
-    /// uses that appear textually before their enum declaration
-    /// still resolve correctly.
-    ///
-    /// Returns `Err(messages)` if any duplicate or invalid
-    /// declaration is found; on `Err` the checker still has the
-    /// pre-pass's tables partially populated (caller decides whether
-    /// to continue). The main pass is robust to a missing entry —
-    /// it just leaves the offending node without a registered
-    /// type.
+    /// Pre-pass: register enum shapes before main inference (forward refs).
     fn pre_register_enums(&mut self, ast: &Output) -> Result<(), Vec<Message>> {
         let mut errors = Vec::new();
         self.pre_register_enums_walk(ast, &mut errors);
@@ -1680,16 +1487,9 @@ impl Checker {
         }
     }
 
-    /// Recursive walker for the pre-pass. Mirrors the structure of
-    /// `id::pre_walk_children` but only does work on `EnumDecl`
-    /// nodes — everything else is structural recursion. Does NOT
-    /// call `self.infer` (and so does not consume IDs from the
-    /// pre-walk table).
     fn pre_register_enums_walk(&mut self, node: &Output, errors: &mut Vec<Message>) {
         use parser::ast::EnumVariantPayload;
         match node.1.as_ref() {
-            // Phase 28 — `type X = T;` is purely source-level;
-            // walk the RHS so its children consume IDs.
             Expression::TypeAlias { ty, .. } => {
                 self.pre_register_enums_walk(ty, errors);
             }
@@ -1706,10 +1506,6 @@ impl Checker {
                     } = v.1.as_ref()
                     {
                         variant_names.push(vname.to_string());
-                        // Phase 17B: build the typed payload shape
-                        // directly from the AST shape
-                        // (`EnumVariantPayload`), recording Unit /
-                        // Tuple / Record explicitly.
                         let payload_ty = match payload {
                             EnumVariantPayload::Unit => {
                                 arities.push(0);
@@ -1974,24 +1770,8 @@ impl Checker {
             // the tree; no second arm is needed here. `EnumVariant`
             // and `Construct` are still reachable (e.g. inside a
             // function body) and just recurse.
-            Expression::EnumVariant { .. } => {
-                // Phase 17B: the variant is a wrapper for the
-                // shape-tagged payload. The pre-walk does NOT mint
-                // IDs for the `RecordFieldDecl` entries inside a
-                // record payload — they're metadata for the
-                // typechecker, not expressions.
-                // The shape itself is consumed by `pre_register_enums`
-                // through the `EnumDecl` arm above (which has
-                // already cloned the variant payloads). Nothing to
-                // do here.
-            }
-            Expression::Construct { .. } => {
-                // `Construct` carries the call-site arguments as
-                // positional `Output`s, just like a call. The
-                // pre-walk mints IDs for each argument (because
-                // they're full `Output` nodes), but the shape
-                // discriminator (Unit / Tuple / Record) is metadata.
-            }
+            Expression::EnumVariant { .. } => {}
+            Expression::Construct { .. } => {}
 
             Expression::Method(_, body) => {
                 self.pre_register_enums_walk(body, errors);
@@ -2010,12 +1790,8 @@ impl Checker {
         }
     }
 
-    /// Build a fully-formed `Ty::Sum` from an enum declaration's
-    /// AST. The pre-pass already collected the variant names,
-    /// arities, and concrete payload shapes — this method walks
-    /// the AST's payload children to keep ID consumption in
-    /// lockstep with the pre-walk, builds the `Ty::Sum`, and
-    /// registers the enum and each variant in the env.
+    // ---- Enum declarations ----
+
     fn infer_enum_decl(&mut self, name: &str, variants: &[Output], _range: &Range<usize>) {
         use parser::ast::EnumVariantPayload;
         let name_str = name.to_string();
@@ -2140,11 +1916,7 @@ impl Checker {
         }
     }
 
-    /// Type-check a constructor application: `EnumName::Variant(args)`,
-    /// `EnumName::Variant { ... }`, or `EnumName::Variant` (Unit).
-    /// Field-by-field inference with shape-mismatch detection
-    /// (17B red-team finding #5: a tuple call site against a record
-    /// declaration, or vice versa, is a type error).
+    /// Constructor application with shape/arity checking.
     fn infer_construct(
         &mut self,
         enum_name: &str,
@@ -2192,19 +1964,7 @@ impl Checker {
             .and_then(|p| p.get(tag as usize).cloned())
             .unwrap_or(EnumVariantPayloadTy::Unit);
 
-        // Shape analysis (17B red-team #5).
-        // Two failure modes:
-        //  - Arity mismatch within the same shape (e.g. tuple(2 args)
-        //    against a tuple declared with 1 field). Reported as
-        //    "expects N arguments" — the original 15B message.
-        //  - Shape mismatch across shapes (tuple vs record / unit vs
-        //    others). Reported as "payload shape mismatch" — the
-        //    17B red-team amendment #5.
-        //
-        // For record shapes, we skip the arity check and fall
-        // through to the field-by-field check, which gives more
-        // specific diagnostics (missing field `x`, unknown field
-        // `y`, etc.) instead of a generic arity error.
+        // Shape vs arity: record shapes defer to field-by-field checks.
         let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, fields) {
             (EnumVariantPayloadTy::Unit, EnumConstructPayload::Unit) => (true, false),
             (EnumVariantPayloadTy::Tuple(_), EnumConstructPayload::Tuple(args)) => {
@@ -2222,10 +1982,6 @@ impl Checker {
         };
 
         if !shape_matches {
-            // Distinguish "shape mismatch" (17B) from "arity mismatch
-            // within same shape" (15B legacy). When the shape itself
-            // is wrong, emit the new shape-mismatch diagnostic;
-            // otherwise emit the legacy arity message.
             if same_shape_with_wrong_arity {
                 return self.error(
                     format!(
@@ -2378,16 +2134,8 @@ impl Checker {
         }
     }
 
-    /// Match an expression against a list of pattern arms.
-    ///
-    /// 1. Infer the scrutinee's type.
-    /// 2. Walk each arm:
-    ///    a. Type the pattern (binding variables in a fresh env
-    ///       frame so they don't leak across arms).
-    ///    b. Unify the pattern type with the scrutinee type.
-    ///    c. Infer the body and unify it with the result type.
-    /// 3. Record coverage info for the deferred exhaustiveness
-    ///    check.
+    // ---- Match ----
+
     fn infer_match(&mut self, scrutinee: &Output, arms: &[MatchArm], range: Range<usize>) -> Ty {
         let scrutinee_ty = self.infer(scrutinee);
         let resolved_scrutinee = apply_ty_prune(&self.subst, &scrutinee_ty);
@@ -2541,20 +2289,6 @@ impl Checker {
                     .and_then(|p| p.get(tag as usize).cloned())
                     .unwrap_or(EnumVariantPayloadTy::Unit);
 
-                // 2. Shape check (17B red-team #5) — tuple vs
-                // record shape must match the declared variant.
-                // Distinguish:
-                //  - Same shape, wrong sub-pattern count
-                //    (`expected N sub-patterns, got M` — legacy
-                //    15B message).
-                //  - Different shapes (tuple vs record / unit)
-                //    (`payload shape mismatch` — 17B message).
-                //
-                // For record shapes, we skip the arity check
-                // and fall through to the field-by-field check
-                // below, which gives more specific diagnostics
-                // ("Missing field `x`" / "Unknown field `y`")
-                // instead of a generic arity error.
                 let (shape_matches, same_shape_with_wrong_arity) =
                     match (&expected_payload, payload) {
                         (EnumVariantPayloadTy::Unit, PatternPayload::Unit) => (true, false),
@@ -2954,21 +2688,19 @@ impl Checker {
     }
 
     // ============================================================
-    //  Public accessors (Phase 15B)
+    // ============================================================
+    //  Codegen helpers
+    // ============================================================
     // ============================================================
 
-    /// Look up the variant tag for `(enum_name, variant_name)`.
-    /// Returns the source-declaration-order index. Used by the
-    /// bytecode emitter (15C) to build `MAKE_ENUM` instructions.
+    /// Variant tag by enum and variant name (source-declaration order).
     pub fn tag_for(&self, enum_name: &str, variant_name: &str) -> Option<u32> {
         self.enum_tags
             .get(enum_name)
             .and_then(|t| t.get(variant_name).copied())
     }
 
-    /// Look up the payload arity for `(enum_name, variant_name)`.
-    /// Cached at registration time so codegen doesn't have to redo
-    /// the `payloads[i].len()` lookup at every constructor site.
+    /// Payload arity for `(enum_name, variant_name)`.
     pub fn arity_for(&self, enum_name: &str, variant_name: &str) -> Option<usize> {
         self.tag_for(enum_name, variant_name).and_then(|t| {
             self.enum_arities
@@ -2977,10 +2709,7 @@ impl Checker {
         })
     }
 
-    /// Iterate the variants of an enum in source-declaration
-    /// order. Each entry is `(variant_name, tag, payload_types)`.
-    /// Used by the bytecode emitter (15C) and by external
-    /// exhaustiveness tooling.
+    /// Variants in source-declaration order: `(name, tag, payload_types)`.
     pub fn enum_variants(&self, enum_name: &str) -> Option<Vec<(String, u32, Vec<Ty>)>> {
         let names = self.enums.get(enum_name)?.clone();
         let tags = self.enum_tags.get(enum_name)?.clone();
@@ -3027,28 +2756,7 @@ impl Checker {
         }
     }
 
-    /// Look up the field declaration index for `field` in
-    /// `enum_name`'s UNIQUE record-shaped variant (Phase 18D —
-    /// `Expression::Access` codegen).
-    ///
-    /// Returns `Some((variant_name, field_index))` if exactly one
-    /// variant of the enum declares a record-shaped payload
-    /// containing `field`; returns `None` otherwise.
-    ///
-    /// The HM typechecker (see
-    /// [`access_field_in_sum`](Self::access_field_in_sum))
-    /// rejects source programs where the field isn't uniquely
-    /// declared across the enum's variants — it emits "narrow
-    /// with match first" for the multi-variant case and "type
-    /// has no field `X`" for the zero-variant case. So a `None`
-    /// return at codegen time means the source had a type error
-    /// and we're emitting in recovery mode (the codegen will
-    /// emit a defensive `LoadField(0)` so the bytecode stays
-    /// well-formed for downstream checks).
-    ///
-    /// `field_index` is the declaration-position index of the
-    /// field in the variant's record payload — the same value
-    /// the VM reads from `LoadField`'s lower 16 operand bits.
+    /// Field index in a record-shaped variant (codegen).
     pub fn field_index_for(&self, enum_name: &str, field: &str) -> Option<(String, u16)> {
         let payloads = self.enum_payloads.get(enum_name)?;
         let names = self.enums.get(enum_name)?;
@@ -3068,31 +2776,7 @@ impl Checker {
         None
     }
 
-    /// Look up the declared type of a record field by enum name and
-    /// field name (Phase 19 — chained `Expression::Access` codegen).
-    ///
-    /// Returns `Some(Ty)` if exactly one record-shaped variant in
-    /// the enum declares the field; `None` otherwise. The returned
-    /// `Ty` is the field's declared type (e.g. `int` for
-    /// `enum Inner { Inner { v: int } }`).
-    ///
-    /// The codegen's `receiver_type` arm uses this to resolve
-    /// chained accesses like `p.x.v` where `p.x` is itself a
-    /// record-shaped enum: after looking up the inner receiver's
-    /// enum, it looks up the OUTER field's type in that enum. The
-    /// typechecker already verifies the chain at HM inference
-    /// time (see `access_field_in_sum`); this helper just exposes
-    /// the same registry data to the codegen without re-running
-    /// inference.
-    ///
-    /// Note: this helper does NOT check that the field is
-    /// unambiguously declared. If two record-shaped variants in
-    /// the enum both declare the field, only the FIRST match is
-    /// returned (same iteration order as `field_index_for`). The
-    /// HM typechecker would have emitted a "narrow with match
-    /// first" diagnostic upstream in that case — so a `None`
-    /// return at codegen time means the source had a type error
-    /// and we're emitting in recovery mode.
+    /// Record field type by enum and field name (chained access codegen).
     pub fn field_type_for(&self, enum_name: &str, field: &str) -> Option<Ty> {
         let payloads = self.enum_payloads.get(enum_name)?;
         for payload in payloads {
@@ -3107,45 +2791,12 @@ impl Checker {
         None
     }
 
-    /// Look up a variable's declared type from the codegen side-table
-    /// (Phase 18D — `Expression::Access` codegen helper).
-    ///
-    /// The side-table is populated during `infer_function` (function
-    /// arguments) and `infer_fragment` (let-bindings), and survives
-    /// `infer_function`'s env-pop so the codegen can resolve a
-    /// field-access receiver's type after `check_program` returns.
-    ///
-    /// Returns `None` for unknown variables and for type variables
-    /// that the typechecker never resolved (in practice: never —
-    /// function arg types are always `parse_type_name_str` results,
-    /// and let-bound types are resolved by the typechecker before
-    /// this map is queried).
+    /// Variable type from codegen side-table.
     pub fn codegen_var_type(&self, name: &str) -> Option<&Ty> {
         self.codegen_var_types.get(name)
     }
 
-    /// Compute the inferred type of an expression WITHOUT touching the
-    /// per-node cache or the `next_id_idx` counter (Phase 18D —
-    /// `Expression::Access` codegen helper).
-    ///
-    /// The codegen uses this to resolve a field-access receiver's
-    /// type when the infer cache is unavailable (e.g., the infer
-    /// pass skipped some nodes like a function's `args`, leaving
-    /// the cache misaligned with the pre-walk's ID table — see the
-    /// comment in `compiler/src/lib.rs::do_compile`'s `Expression::Access`
-    /// arm for details).
-    ///
-    /// Side-effects of calling this:
-    ///  - `self.subst` may be extended (type variables may be bound).
-    ///  - `self.env` is read but not modified.
-    ///  - The cache and `next_id_idx` are NOT touched.
-    ///
-    /// This is essentially `infer_inner` exposed at the API
-    /// boundary. Because we don't insert into the cache, the
-    /// expression's inferred type isn't reusable by other codegen
-    /// arms that rely on `lookup_at` — but for our purposes (the
-    /// Access codegen just needs the receiver's type to look up
-    /// the field index), that's fine.
+    /// Infer without updating the NodeId cache (codegen helper).
     pub fn infer_for_codegen(&mut self, expr: &Output) -> Ty {
         let saved_idx = self.next_id_idx;
         let ty = self.infer_inner(expr);
@@ -3156,28 +2807,7 @@ impl Checker {
         ty
     }
 
-    /// Type-check a field-access expression (Phase 18D).
-    ///
-    /// Shared by the three receiver-type arms of
-    /// [`infer_inner`](Self::infer_inner)'s `Expression::Access`
-    /// handling: `Ty::Sum`, `Ty::Constructor { tag, owner, .. }`
-    /// (where the owner resolves to a Sum), and `Ty::Con(name)`
-    /// (where the enum is looked up in the registry).
-    ///
-    /// `specific_tag` is `Some(tag)` when the caller knows the
-    /// active variant statically (the `Ty::Constructor` case). When
-    /// `Some`, only that variant's payload is consulted. When
-    /// `None` (the `Ty::Sum` / `Ty::Con` case), every record-shaped
-    /// variant contributes candidates:
-    ///
-    ///  - 0 candidates → error "Type `T` has no field `f`".
-    ///  - 1 candidate → return that field's type.
-    ///  - N candidates → error "narrow with match first" (return
-    ///    the first candidate's type defensively).
-    ///
-    /// When `specific_tag` is `Some`, the variant must be a
-    /// `Record` — `Tuple`/`Unit` variants emit
-    /// "Cannot access field on non-record variant".
+    /// Field access on enum record payloads (`specific_tag` narrows the variant).
     fn access_field_in_sum(
         &mut self,
         enum_name: &str,
@@ -3280,14 +2910,7 @@ fn payload_kind_name(payload: &EnumVariantPayloadTy) -> &'static str {
     }
 }
 
-/// Build a help hint for "type has no field `X`" diagnostics
-/// (Phase 18D — `Expression::Access`).
-///
-/// The hint lists the record-shaped variants and their declared
-/// field names, so the user can see what IS available. Returns
-/// `None` when no record-shaped variants exist (in which case a
-/// "record-shaped enum" hint is more useful than a list of
-/// nothing).
+/// Help hint for missing field diagnostics on record-shaped enums.
 fn build_record_field_hint(
     enum_name: &str,
     variants: &[(String, EnumVariantPayloadTy)],
@@ -3401,9 +3024,7 @@ mod tests {
         }
     }
 
-    /// Phase 24: a check variant that returns the diagnostics
-    /// instead of asserting their emptiness. Use for negative
-    /// tests (tests that EXPECT an error).
+    /// Like `check`, but returns diagnostics instead of asserting none.
     fn check_warn(src: &str) -> (Checker, Vec<common::Message>) {
         let (mut c, _ty) = check(src);
         let msgs = c.take_messages();
@@ -3756,7 +3377,7 @@ mod tests {
         assert_ok(src, int());
     }
 
-    // ---- Function declarations (Phase 5) ----
+    // ---- Function declarations ----
 
     #[test]
     fn function_declaration_with_typed_args_and_return() {
@@ -4002,7 +3623,7 @@ mod tests {
         assert_ok("{ { 42; } }", int());
     }
 
-    // ---- Native function registration (Phase 7) ----
+    // ---- Native registration ----
 
     #[test]
     fn register_native_adds_function_to_env() {
@@ -4098,7 +3719,7 @@ mod tests {
         assert!(msgs.is_empty(), "{:?}", msgs);
     }
 
-    // ---- Diagnostics (Phase 8) ----
+    // ---- Diagnostics ----
     //
     // The following tests verify that emitted `Message`s are well-formed
     // for ariadne: each carries a clear headline, a primary label at
@@ -4333,7 +3954,7 @@ mod tests {
         assert_eq!(now_ty, string());
     }
 
-    // ---- Span-indexed cache (Phase 6) ----
+    // ---- Type cache ----
 
     #[test]
     fn cache_is_populated_after_check_program() {
@@ -4436,7 +4057,7 @@ mod tests {
     }
 
     // ================================================================
-    //  Sum types and pattern matching (Phase 15B)
+    // ---- Enums and pattern matching ----
     // ================================================================
 
     // ---- Enum registration ----
@@ -4481,7 +4102,7 @@ mod tests {
 
     #[test]
     fn enum_tags_assigned_in_declaration_order() {
-        // MUST-HAVE #2: source order, NOT alphabetical.
+        // Tags follow source-declaration order, not alphabetical.
         // `enum E { Z, A, M, B }` → Z=0, A=1, M=2, B=3.
         let (mut c, _) = check("enum E { Z, A, M, B }");
         let msgs = c.take_messages();
@@ -4494,9 +4115,7 @@ mod tests {
 
     #[test]
     fn recursive_enum_typechecks() {
-        // MUST-HAVE #1: recursive payload uses `Ty::Con("Tree")`,
-        // not the unfolded `Ty::Sum`. The HM occurs check should
-        // NOT fire.
+        // Isorecursive encoding: recursive payloads use Ty::Con("Tree").
         let (mut c, _) = check("enum Tree { Leaf, Node(int, Tree, Tree) }");
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -4787,10 +4406,7 @@ mod tests {
 
     #[test]
     fn typechecker_does_not_report_unreachable_for_different_inner_patterns() {
-        // Two Result::Ok arms with different inner patterns (Some vs None)
-        // should both be considered reachable. The codegen (Phase 18A)
-        // emits an inner JUMP_IF_MATCH test chain, so the second arm IS
-        // reachable at runtime.
+        // Two Result::Ok arms with different inner patterns are both reachable.
         let src = r#"
         enum Option { None, Some(int) }
         enum Result { Ok(Option), Err(string) }
@@ -4819,7 +4435,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 18D: field access on record-shaped variants ----
+    // ---- Field access ----
 
     #[test]
     fn access_field_from_record_variant_returns_field_type() {
@@ -4954,7 +4570,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 24: typed aggregates ----
+    // ---- Typed aggregates ----
 
     #[test]
     fn tuple_literal_infers_heterogeneous_product_type() {
@@ -5090,7 +4706,7 @@ mod tests {
         assert!(found, "expected indexing-error, got: {:?}", msgs);
     }
 
-    // ---- Phase 25: dict tests ----
+    // ---- Dict tests ----
 
     #[test]
     fn dict_literal_infers_record_type() {
@@ -5118,9 +4734,7 @@ mod tests {
 
     #[test]
     fn dict_missing_field_access_emits_diagnostic() {
-        // This is the red-team critical test the user asked
-        // for: `let x = { foo: 42 }; x.bar` MUST produce an
-        // error.
+        // `{ foo: 42 }; x.bar` must error when `bar` is missing.
         let src = "fn main() { let x = { foo: 42 }; let _ = x.bar; }";
         let (_c, msgs) = check_warn(src);
         let found = msgs
@@ -5176,7 +4790,7 @@ mod tests {
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
     }
 
-    // ---- Phase 28: type alias tests ----
+    // ---- Type alias tests ----
 
     #[test]
     fn type_alias_for_tuple_is_substituted() {
@@ -5200,14 +4814,7 @@ mod tests {
 
     #[test]
     fn alias_does_not_leak_into_unrelated_declarations() {
-        // Two aliases with the same name (in different scopes) — the
-        // outer `Int` is overshadowed by the inner one. Phase 28
-        // shares the global type_aliases table (no scoping),
-        // so the OUTER declaration wins; the inner one
-        // shadows at the typechecker's `parse_type_name_str`
-        // lookup if the checker walked them in order. This
-        // test exercises the warning path (we don't pin a
-        // specific behavior yet — just that nothing PANICs).
+        // Global alias table: later declarations overwrite earlier ones.
         let src = "type Int = int; fn main() { }";
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
@@ -5259,7 +4866,7 @@ mod tests {
     }
 
     // ============================================================
-    //  Phase 19: field_type_for helper tests
+    // ---- field_type_for tests ----
     // ============================================================
     //
     // The `field_type_for` helper is the codegen-side complement
@@ -5345,11 +4952,7 @@ mod tests {
         );
     }
 
-    /// `field_type_for` returns the correct type even when the
-    /// field is itself an enum type (e.g., `Inner` here). This
-    /// is the canonical Phase 19 chained-access setup:
-    /// `enum Outer { Outer { x: Inner } }`. The helper resolves
-    /// `"x"` to `Ty::Con("Inner")`.
+    /// Chained access: field type can be another enum (`Outer.x` → `Inner`).
     #[test]
     fn field_type_for_returns_enum_type_for_nested_field() {
         let src = "enum Inner { Inner { v: int } } \

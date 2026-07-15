@@ -1,4 +1,4 @@
-//! libffi-backed dynamic call preparation and invocation.
+//! libffi call preparation and invocation.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 
@@ -9,12 +9,12 @@ use crate::memory::{FfiType, Heap, ObjString, Object};
 
 use super::signature::{FfiError, FfiSignature};
 
-/// Prepared libffi call interface plus the resolved symbol address.
 pub struct PreparedCall {
     pub cif: Cif,
     pub addr: CodePtr,
 }
 
+// ABI mapping: Int→i64, Float→f64, String→pointer, Void→void.
 fn ffi_type_to_libffi(ty: FfiType) -> Result<Type, FfiError> {
     match ty {
         FfiType::Int => Ok(Type::i64()),
@@ -24,7 +24,6 @@ fn ffi_type_to_libffi(ty: FfiType) -> Result<Type, FfiError> {
     }
 }
 
-/// Build a libffi call interface from an explicit signature.
 pub fn prepare_cif(sig: &FfiSignature) -> Result<PreparedCall, FfiError> {
     let arg_types: Result<Vec<Type>, FfiError> =
         sig.args.iter().copied().map(ffi_type_to_libffi).collect();
@@ -36,7 +35,6 @@ pub fn prepare_cif(sig: &FfiSignature) -> Result<PreparedCall, FfiError> {
     })
 }
 
-/// Resolve `symbol` in `library` and attach the address to a prepared CIF.
 pub fn prepare_cif_for_symbol(
     sig: &FfiSignature,
     library: &libloading::Library,
@@ -47,7 +45,6 @@ pub fn prepare_cif_for_symbol(
     Ok(prepared)
 }
 
-/// Resolve a symbol to a callable address.
 pub fn resolve_symbol(library: &libloading::Library, symbol: &str) -> Result<CodePtr, FfiError> {
     type FnPtr = unsafe extern "C" fn();
     let sym_bytes: &[u8] = symbol.as_bytes();
@@ -70,7 +67,6 @@ fn read_c_string_ptr(heap: &Heap, value: &Value) -> *const c_char {
     heap.cstr_from_addr(raw).unwrap_or(std::ptr::null())
 }
 
-/// Invoke a C function described by `prepared` and `sig`.
 pub fn invoke_via_libffi(
     prepared: &PreparedCall,
     sig: &FfiSignature,
@@ -104,7 +100,7 @@ pub fn invoke_via_libffi(
                 if ptr.is_null() {
                     str_storage.push(CString::new("").unwrap());
                 } else {
-                    // SAFETY: pointer came from a live ObjString in the heap.
+                    // SAFETY: `ptr` addresses a live `ObjString` on the heap.
                     let s = unsafe { CStr::from_ptr(ptr) };
                     str_storage.push(CString::new(s.to_bytes()).unwrap_or_default());
                 }
@@ -135,8 +131,7 @@ pub fn invoke_via_libffi(
             if ret.is_null() {
                 Ok(Some(Value::from(0u64)))
             } else {
-                // SAFETY: C function returned a valid C string for the duration
-                // of this read; we copy into a fresh ObjString immediately.
+                // SAFETY: `ret` is a valid C string for this read; copied into `ObjString`.
                 let s = unsafe { CStr::from_ptr(ret) };
                 let data = s.to_string_lossy();
                 let (obj, _gc) = heap.alloc(ObjString::from(data.as_ref()), Object::String);

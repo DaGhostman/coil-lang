@@ -1,15 +1,4 @@
-//! Golden-file style tests for the typechecker's diagnostic messages.
-//!
-//! These tests run the full HM inference pass over a small program and
-//! assert on the *content* of the resulting `Message`s — what they say
-//! and roughly where they point. The tests are deliberately a bit
-//! tolerant (substring matches, not exact equality) so we can tweak
-//! error wording without breaking the suite, but strict enough that a
-//! regression in the diagnostic content fails the test.
-//!
-//! The goal is to lock in the user-facing experience: a type error
-//! should produce a `Message` that points at the offending code, names
-//! the values involved, and (where useful) hints at a fix.
+//! Golden tests for typechecker diagnostic messages.
 
 use compiler::Checker;
 use parser::Pratt;
@@ -216,7 +205,7 @@ fn class_declaration_typechecks() {
     );
 }
 
-// ---- Phase 15B: sum types and pattern matching ----
+// ---- Sum types and pattern matching ----
 
 #[test]
 fn enum_decl_no_messages() {
@@ -330,7 +319,7 @@ fn format_string_percent_z_rejects_int() {
     );
 }
 
-// ---- Phase 17B: record-shape diagnostics ----
+// ---- Record-shape diagnostics ----
 
 #[test]
 fn record_construct_missing_field_diagnostic() {
@@ -439,7 +428,7 @@ fn mixed_shape_enum_with_match_uses_correct_shape() {
     );
 }
 
-// ---- Phase 18D: field-access diagnostics ----
+// ---- Field-access diagnostics ----
 
 #[test]
 fn access_field_on_non_record_produces_helpful_message() {

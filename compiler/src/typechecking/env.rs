@@ -1,35 +1,4 @@
-//! Scoped environments and let-polymorphism.
-//!
-//! [`Env`] holds the bindings in scope at some point during inference. It
-//! is a stack of [`Frame`]s; a new frame is pushed on entering a block (or
-//! any other scope) and popped on leaving. Bindings in an inner frame
-//! shadow bindings in an outer frame.
-//!
-//! [`generalize`] turns a monotype into a [`Scheme`] by quantifying over
-//! the type variables that don't appear in the environment — this is the
-//! heart of let-polymorphism. [`instantiate`] undoes it by replacing each
-//! quantified variable with a fresh one drawn from a [`TyVarCounter`].
-//!
-//! ## Example
-//!
-//! ```text
-//! let id = fn(x) x in (id 1, id true)
-//! ```
-//!
-//! 1. Infer `fn(x) x` → type `α -> α` for some fresh `α`.
-//! 2. Generalize at the `let`: since the outer env contains no `α`, the
-//!    scheme becomes `∀α. α -> α`.
-//! 3. Extend the env with `id : ∀α. α -> α`.
-//! 4. Infer `id 1`: instantiate `id` to get `α1 -> α1`, unify the argument
-//!    with `int`, so the call yields `int`.
-//! 5. Infer `id true`: instantiate again to get a *different* `α2 -> α2`,
-//!    unify with `bool`, so the call yields `bool`.
-//! 6. The pair's type is `(int, bool)` — both branches got independent
-//!    instantiations of the polymorphic `id`.
-//!
-//! This module only handles steps 1–3 and the instantiation of step 4
-//! symbolically. The full Algorithm W (unification, return-type
-//! threading, recursion) comes in Phase 4.
+//! Scoped environments and let-polymorphism ([`generalize`], [`instantiate`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,8 +7,7 @@ use super::ty::{Scheme, Ty, TyVarId, ftv_scheme, ftv_ty};
 /// A counter that mints fresh `TyVarId`s. Each call to [`TyVarCounter::fresh`]
 /// returns a distinct id.
 ///
-/// Used by [`instantiate`] (to replace quantified variables) and by the
-/// infer pass (Phase 4) to mint fresh variables during unification.
+/// Used by [`instantiate`] and inference to mint fresh type variables.
 #[derive(Debug, Default, Clone)]
 pub struct TyVarCounter {
     next: u32,
@@ -179,15 +147,8 @@ impl Env {
     }
 }
 
-/// Generalize a monotype into a polytype, quantifying over exactly the
-/// variables that appear in `ty` but not in `env`.
-///
-/// At a `let x = e`, this turns `e`'s inferred type into the scheme that
-/// `x` carries in the rest of the program — every variable that's still
-/// free in the outer environment must stay as a free variable of the
-/// scheme (it'll be bound at the use site); every other variable can be
-/// quantified, which is what makes let-polymorphism work.
-#[allow(dead_code)] // exposed for future let-polymorphism wiring
+/// Generalize: quantify type variables free in `ty` but not in `env`.
+#[allow(dead_code)]
 pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
     let env_ftv = env.ftv();
     let ty_ftv = ftv_ty(ty);
@@ -263,7 +224,6 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
             tag: *tag,
             arity: *arity,
         },
-        // Phase 24 — recurse through aggregates.
         Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| substitute_vars(t, mapping)).collect()),
         Ty::Array { element, length } => Ty::Array {
             element: Box::new(substitute_vars(element, mapping)),
@@ -597,7 +557,7 @@ mod tests {
         assert_ne!(id_at_use_1, id_at_use_2);
 
         // Both instantiations are independent α -> α shapes. Full
-        // verification (unifying with int and bool) is Phase 4's job,
+        // Full unification check is in the infer integration tests.
         // but at this layer we can check the structure.
         fn is_arrow_to_same_var(ty: &Ty) -> bool {
             if let Ty::Fun(a, b) = ty

@@ -1,3 +1,5 @@
+//! Deduping interner backed by a small inline `ArrayVec`.
+
 use std::{collections::HashMap, hash::Hash};
 
 use crate::{ArrayVec, ArrayVecIter, likely, promise};

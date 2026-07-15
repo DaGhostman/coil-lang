@@ -1,3 +1,5 @@
+//! Unused arena allocator sketch (not wired into the live VM).
+
 // use std::{
 //     alloc::Layout, borrow::{Borrow, BorrowMut}, cell::RefCell, marker::PhantomData, ops::{Deref, DerefMut}
 // };

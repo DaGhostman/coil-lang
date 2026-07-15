@@ -1,3 +1,5 @@
+//! Shared types for the zero-script compiler and VM.
+
 mod archive;
 mod array_vec;
 mod interner;

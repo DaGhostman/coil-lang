@@ -1,3 +1,5 @@
+//! Intrusive-list GC cell (unused; live heap uses `heap::Gc`).
+
 use std::cell::Cell;
 
 use common::unlikely;

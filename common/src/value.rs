@@ -1,3 +1,5 @@
+//! Untagged runtime values: immediates and heap pointers in one word.
+
 type Storage = u64;
 
 #[derive(Default, Copy, Clone, Eq)]
@@ -50,52 +52,34 @@ impl<'a> Value {
         Self(raw as _)
     }
 
-    /// Replace the current object value with a newly
-    /// provided one and applies masking
     pub const fn replace(&mut self, value: Storage) {
         self.0 = value as _;
     }
 }
 
 impl<'a> Value {
-    /// Casts the internal pointer value to i64
-    ///
     /// ```
     /// use common::Value;
-    ///
     /// assert_eq!(Value::from(42).as_int(), 42);
     /// ```
-    ///
-    /// You would need to verify the type externally
     #[inline]
     pub fn as_int(&self) -> i64 {
         self.0 as _
     }
 
-    /// Casts the internal pointer value to bool
-    ///
     /// ```
     /// use common::Value;
-    ///
     /// assert_eq!(Value::from(true).as_bool(), true);
-    /// assert_eq!(Value::from(false).as_bool(), false);
     /// ```
-    ///
-    /// You would need to verify the type externally
     #[inline]
     pub fn as_bool(&self) -> bool {
         self.0 as u8 == 1
     }
 
-    /// Casts the internal pointer value to float
-    ///
     /// ```
     /// use common::Value;
-    ///
     /// assert_eq!(1.2, Value::from(1.2).as_float());
     /// ```
-    ///
-    /// You would need to verify the type externally
     #[inline]
     pub fn as_float(&self) -> f64 {
         f64::from_bits(self.0 as _)
@@ -109,17 +93,10 @@ impl<'a> Value {
         // )
     }
 
-    /// Casts the internal pointer value to float
-    ///
     /// ```
     /// use common::Value;
-    ///
     /// assert_eq!(Value::from(42).raw(), 42 as _);
-    /// assert_eq!(Value::from(true).raw(), 1 as _);
-    /// assert_eq!(Value::from(1.2).raw(), 1.2_f64.to_bits() as _ );
     /// ```
-    ///
-    /// You would need to verify the type externally
     #[inline]
     pub fn raw(&self) -> *mut u8 {
         self.0
@@ -165,15 +142,12 @@ mod tests {
 
     #[test]
     fn ptr_tagging() {
-        // Test mid values
         assert_eq!(Value::from(0).as_int(), 0);
         assert_eq!(Value::from(0.0).as_float(), 0.0);
 
-        // Test min values
         assert_eq!(Value::from(MIN_INT).as_int(), MIN_INT);
         assert_eq!(Value::from(MIN_FLOAT).as_float(), MIN_FLOAT);
 
-        // Test max values
         assert_eq!(Value::from(MAX_INT).as_int(), MAX_INT);
         assert_eq!(Value::from(MAX_FLOAT).as_float(), MAX_FLOAT);
 

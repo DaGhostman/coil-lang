@@ -36,17 +36,9 @@ macro_rules! binary {
     };
 }
 
-/// One group of match arms that all dispatch on the same outer
-/// variant tag. Arms that share an outer tag are candidates for
-/// nested-pattern disambiguation (a runtime test on the inner
-/// payload). Arms with a unique tag, or with no tag at all
-/// (Wildcard / Binding), are in a `is_single_arm_group = true`
-/// group and need no inner test.
-///
-/// `tag` is `u32::MAX` for groups whose arm patterns are
-/// Wildcard / Binding (those are "catch-all" groups keyed by
-/// the sentinel value, since they don't dispatch on a real
-/// tag).
+// --- Match helpers ---
+
+/// Arms grouped by outer variant tag for dispatch and inner-pattern tests.
 #[derive(Debug, Clone)]
 struct TagGroup {
     tag: u32,
@@ -54,27 +46,8 @@ struct TagGroup {
     is_single_arm_group: bool,
 }
 
-/// Walk `arms` and group them by the outer tag of their pattern.
-/// Arms whose pattern is `Wildcard` or `Binding` (no tag dispatch)
-/// are grouped together under the sentinel `u32::MAX` tag. Arms
-/// whose pattern is `Constructor { enum_name, variant_name, .. }`
-/// are grouped by the tag returned by
-/// `checker.tag_for(enum_name, variant_name)`. If the typechecker
-/// has no record of the variant, the arm is bucketed under the
-/// sentinel — same fallback as Wildcard / Binding.
-/// Map a `&str` source-level FFI type name to the integer
-/// tag the runtime's [`Instruction::DeclareFFI`] reads. The
-/// mapping must match the canonical `enum FFIType` ordering
-/// in user-written source AND the `FfiType` Rust enum in
-/// the machine crate.
-///
-/// Returns `None` for unknown names so the call site can
-/// emit a diagnostic. The Phase 22b userland API embeds
-/// `FFIType::X` enum constructors and decodes the runtime
-/// tag back via `Machine::ffi_type_from_tag` (an internal
-/// helper in `vm.rs`). `extern` blocks use this
-/// `ffi_type_tag_from_str` instead, since the user's `fn
-/// name(int a) -> float` form doesn't go through the enum.
+/// Walk `arms` and bucket by outer constructor tag (`u32::MAX` for wildcard/binding).
+/// Map FFI type name strings to runtime tag integers.
 fn ffi_type_tag_from_str(name: &str) -> Option<u32> {
     match name {
         "int" => Some(0),
@@ -114,33 +87,8 @@ fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup
     groups
 }
 
-/// Does this arm need a runtime test on the inner payload, beyond
-/// the outer tag dispatch? Returns `false` for patterns that bind
-/// trivially (Wildcard, Binding, Constructor with a Unit payload),
-/// and `true` for Constructor patterns with a Tuple/Record payload
-/// that has at least one nested `Binding` or nested `Constructor`
-/// sub-pattern.
-///
-/// The codegen uses this to decide whether the inner-pattern
-/// matching needs an additional dispatch step (a second
-/// `JUMP_IF_MATCH` on the inner tag, or a tag-of-payload test) or
-/// whether the outer dispatch is enough.
-///
-/// Phase 18A: refined the predicate. Previously, any nested
-/// `Constructor` triggered a runtime test (so the test chain ran
-/// for arms like `A(Some(_))` and `A(None)` even though the inner
-/// pattern could only ever succeed or fall through trivially). Now
-/// a nested `Constructor` only triggers a test if at least one of
-/// its sub-patterns is a `Binding` or further nested `Constructor`
-/// — i.e., the inner pattern carries a value that needs to be
-/// extracted at runtime. Wildcard and Unit inner sub-patterns
-/// don't bind anything, so the runtime test would always pass and
-/// is skipped (the codegen just emits a POP to consume the
-/// discarded inner value).
-#[allow(dead_code)] // Reserved for the Phase 17C+ inner-pattern
-// runtime-test disambiguation. The current
-// forward pass only groups by outer tag and
-// does not consult this helper.
+/// True when an arm needs inner-pattern runtime tests (nested bindings/constructors).
+#[allow(dead_code)]
 fn arm_has_runtime_test(arm: &MatchArm) -> bool {
     /// Recursive helper: does the inner payload of this arm's
     /// outer Constructor pattern carry a `Binding` or further
@@ -175,32 +123,8 @@ fn arm_has_runtime_test(arm: &MatchArm) -> bool {
     }
 }
 
-/// Emits bytecode to test the inner pattern of a constructor sub-pattern
-/// in a multi-arm match group. The outer JUMP_IF_MATCH has already pushed
-/// the payload values onto the stack. This function walks the sub-patterns
-/// and emits POP (for Wildcard) or STORE+intern (for Binding). For nested
-/// Constructor sub-patterns, it emits POP as a placeholder (the nested
-/// case is out of scope for the initial implementation).
-///
-/// After emitting the sub-pattern tests, jumps to `pass_label` (if the
-/// pattern matched) or to `fail_label` (if it didn't). The last arm in
-/// a group has `pass_label = None` (always passes, reaches the arm body
-/// via fall-through after a preceding JMP fail to fail_label).
-///
-/// `checker` is passed for `tag_for` / `payload_tys_for` lookups
-/// during the recursion. Passing it by reference (rather than as
-/// closures that capture it) avoids the borrow-checker recursion
-/// limit on `&F` types.
-///
-/// `enum_name` / `variant_name`: the OUTER pattern's variant. Needed
-/// for the Record payload case to look up the record's DECLARATION
-/// order (so the test chain iterates the fields in the same slot
-/// order as the VM's `UNPACK` / `JUMP_IF_MATCH` payload-push).
-#[allow(dead_code, unused_variables)] // Reserved for the Phase 17C+ inner-pattern runtime
-// test disambiguation. Defined here for the upcoming
-// multi-arm match group dispatch work.
-// `fail_label` will be used by the failure path
-// (JMP to fail_label) once that arm is wired up.
+/// Emit inner-pattern tests after outer tag dispatch (multi-arm groups).
+#[allow(dead_code, unused_variables)]
 fn emit_inner_test<'compiler>(
     arm_idx: usize,
     checker: &Checker,
@@ -222,9 +146,7 @@ fn emit_inner_test<'compiler>(
             // fail handler.
         }
         PatternPayload::Tuple(parts) => {
-            // For each sub-pattern, emit POP (Wildcard) or STORE (Binding)
-            // or JUMP_IF_MATCH (nested Constructor with binding/nested
-            // sub-patterns — Phase 18A inner-pattern dispatch).
+            // POP/STORE for wildcards/bindings; JUMP_IF_MATCH for nested constructors.
             let mut any_nested_ctor = false;
             for sub in parts {
                 match sub {
@@ -245,30 +167,7 @@ fn emit_inner_test<'compiler>(
                         payload: sub_payload,
                         ..
                     } => {
-                        // Phase 18A: nested Constructor sub-pattern.
-                        // Emit JUMP_IF_MATCH for the inner tag so the
-                        // runtime correctly dispatches between arms that
-                        // share the OUTER tag but differ on the INNER
-                        // tag (e.g. `A(Some(v))` vs `A(None)`).
-                        //
-                        // The JUMP_IF_MATCH's on-match path jumps to
-                        // `pass_label` (the current arm's body, if Some)
-                        // — or, if this is the LAST arm in the group
-                        // (no pass_label), the last arm is reached by
-                        // fall-through after the test chain and the
-                        // JUMP_IF_MATCH is unnecessary (the last arm
-                        // is the default — it matches when all
-                        // previous inner tests failed). For the last
-                        // arm we just emit POP to consume the inner
-                        // value (no runtime test needed).
-                        //
-                        // Phase 18B (nested record patterns): if the
-                        // nested Constructor's payload is itself a
-                        // Record, recurse into it via `emit_inner_test`
-                        // (the inner record's nested Constructor fields
-                        // get their own JUMP_IF_MATCH in declaration
-                        // order). For Tuple payloads, emit JUMP_IF_MATCH
-                        // on the inner tag as before.
+                        // Nested constructor: JUMP_IF_MATCH on inner tag, or recurse for records.
                         any_nested_ctor = true;
                         if matches!(sub_payload, PatternPayload::Record(_)) {
                             // Nested record — recurse. The recursion
@@ -310,33 +209,13 @@ fn emit_inner_test<'compiler>(
                     }
                 }
             }
-            // If pass_label is Some, the test passed → JMP to arm body.
-            // If pass_label is None (last arm), no JMP needed (fall through
-            // to the fail path's next arm).
-            //
-            // Phase 18A: the inner JUMP_IF_MATCH above already jumps
-            // to pass_label on success, so we don't need a trailing
-            // JMP for arms whose inner pattern is a nested Constructor
-            // (the JUMP_IF_MATCH IS the success jump). For arms
-            // whose inner pattern has only Wildcard/Binding/Unit
-            // sub-patterns (no nested Constructor), the inner test
-            // always succeeds, so a trailing JMP to pass_label is
-            // still emitted to route to the arm body.
+            // Trailing JMP to pass_label when inner tests are all wildcards/bindings.
             if !any_nested_ctor && let Some(label) = pass_label {
                 bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
             }
         }
         PatternPayload::Record(fields) => {
-            // Walk the record's declared fields in DECLARATION
-            // order (per `payload_tys_for`). The previous
-            // implementation walked in source order — but for
-            // records, the VM's `UNPACK` / `JUMP_IF_MATCH`
-            // push payload values in DECLARATION order, not
-            // source order. The slot for the i-th declared
-            // field is `frame.sp + 1 + i`. Walking in source
-            // order would misroute POP / STORE / JUMP_IF_MATCH
-            // to the wrong slot. (Phase 18B — nested record
-            // patterns.)
+            // Walk record fields in declaration order (matches UNPACK slot layout).
             let decl_order = checker.payload_tys_for(enum_name, variant_name);
             let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
                 fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
@@ -422,10 +301,8 @@ fn emit_inner_test<'compiler>(
     }
 }
 
-/// Returns the next available slot index for a new binding.
-/// Slots start at 1 (slot 0 is reserved for the scrutinee).
-#[allow(dead_code)] // Reserved for the Phase 17C+ inner-pattern runtime
-// test disambiguation.
+/// Next free binding slot (slots start at 1; 0 is the scrutinee).
+#[allow(dead_code)]
 fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>) -> u32 {
     let mut max_slot = 0u32;
     for arm_bindings in match_bindings.values() {
@@ -450,24 +327,13 @@ struct Context {
     impementations: HashMap<String, String>,
     methods: HashMap<String, HashMap<String, String>>,
 
-    /// Per-match-arm binding map. When `Some`, the codegen is
-    /// processing the body of a match arm and this map holds the
-    /// pattern-bound names → slot positions. The slots are 1-based
-    /// (matching the VM's payload-push positions, which start at
-    /// `frame.sp + 1`). When `None`, no match is in scope and the
-    /// codegen falls back to the global `variables` Interner.
-    ///
-    /// This map exists because Phase 17B's "multi-variant matches
-    /// with binding bodies" limitation: each arm's payload lives at
-    /// the same stack slots (1..arity), but the global Interner
-    /// assigns each arm's bindings a DIFFERENT slot ID. With a
-    /// per-arm map, every arm's first binding is at slot 1, second
-    /// at slot 2, etc., so the VM's payload-push positions line up
-    /// with the STORE/LOAD operands.
+    /// Per-arm pattern bindings (slot 1..N). Overrides global `variables` in arm bodies.
     match_bindings: Option<HashMap<String, u32>>,
 
     prev: Option<Box<Self>>,
 }
+
+// --- Compiler ---
 
 pub struct Compiler {
     namespace: String,
@@ -475,32 +341,12 @@ pub struct Compiler {
 
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
-    /// Phase 29A — top-level items per namespace.
-    /// Populated by the codegen for each compiled file.
-    /// Keyed by the file's namespace (e.g. `"foo"` for
-    /// `src/foo.0s` or `""` for the entry file). The
-    /// value lists the bare item names (e.g. `["sadge",
-    /// "greet"]`).
-    ///
-    /// Used by the glob-import codegen
-    /// (`use foo::*;`) to expand the file's items into
-    /// the current scope. Populated as a side effect of
-    /// the `Expression::Function` arm.
+    /// Top-level items per namespace (for `use foo::*` glob expansion).
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
-    /// Phase 22b: runtime-emit FFI metadata for `extern` blocks.
-    /// Maps the library short name to the let-slot holding
-    /// the library handle that the runtime's `FfiLoad`
-    /// pushed. Multiple functions in one block share this
-    /// slot; different blocks load their library independently.
+    /// Let-slot holding each extern library handle.
     extern_runtime_libs: HashMap<String, u32>,
-    /// Phase 22b: per-function binding for the runtime FFI
-    /// path. Maps the source-level function name to the
-    /// (lib_slot, fn_id_slot) where `fn_id_slot` holds the
-    /// function id returned by the runtime's `DeclareFFI`
-    /// opcode. A call site that finds `name` here emits
-    /// `invoke(lib, fn_id, args)` instead of the regular
-    /// user-function `CALL/JMP` pair.
+    /// Source name → (lib_slot, fn_id_slot) for runtime FFI calls.
     extern_runtime_functions: HashMap<String, (u32, u32)>,
     /// Records which FFI library short names have already
     /// been loaded in the current compilation unit. Cleared
@@ -518,15 +364,7 @@ pub struct Compiler {
     /// `do_compile` to recover the `NodeId` of the node it's currently
     /// emitting. Reset at the start of each `compile`.
     emit_idx: usize,
-    /// Bytecode offset WHERE the prologue (CALL+JMP+HALT)
-    /// ENDS and user-program code BEGINS. Set at
-    /// construction to `self.bytecode.len()` (after the
-    /// prologue has been prepended). The runtime pipeline
-    /// patches the prologue's JMP operand to this offset (NOT
-    /// to `main_offset`) so any module-level `extern` block
-    /// bytes execute before `main`. Without this, the prologue
-    /// would skip past the extern block entirely (because
-    /// `main_offset` lands past it).
+    /// Offset where user code starts (after prologue). Extern blocks precede main.
     program_start_offset: u32,
     /// Wide immediates referenced from compact 8-byte `Byte`
     /// operands (floats, `JumpIfMatch` targets, etc.).
@@ -604,87 +442,10 @@ impl<'ctx> Context {
     }
 }
 
-/// Emit the bytecode that binds (or discards) the sub-patterns
-/// of a constructor pattern. The VM's `UNPACK` (and
-/// `JUMP_IF_MATCH`) push each payload value at consecutive stack
-/// positions starting at `frame.sp + 1`, so the slot for the
-/// Nth payload is `1 + N` (where the first payload is at slot 1).
+/// Bind or discard match-pattern sub-values. Payload slots start at 1.
 ///
-/// The bindings are recorded in `match_bindings` with their slot
-/// positions. Subsequent `LOAD`/`STORE` references in the arm
-/// body consult `match_bindings` first (see
-/// [`Compiler::lookup_slot`]), so the codegen is independent of
-/// how many OTHER arms have bindings — the slot is always 1, 2,
-/// 3, ... for the arm being processed.
-///
-/// For each sub-pattern:
-/// - `Binding { name }` — record `name → next_slot` in
-///   `match_bindings`, emit `STORE next_slot` (if `consume_values`
-///   is true), and increment `next_slot`. The STORE is a no-op
-///   (Phase 15D) that confirms the binding — the VM already pushed
-///   the value at that slot.
-/// - `Wildcard` — `POP` to discard the value (if `consume_values`
-///   is true).
-/// - `Constructor { .. }` (tuple shape) — `UNPACK <arity>` to pop
-///   the enum value and push its payload (if `consume_values` is
-///   true AND we're at a recursion level, NOT at the OUTER level
-///   — see `is_outer` below), then recurse into each sub-pattern
-///   of the inner constructor. The nested bindings continue
-///   counting from the outer `next_slot`.
-/// - `Constructor { .. }` (record shape) — walk the record's
-///   declared fields in declaration order (per `parent_decl_order`)
-///   and bind each one. Sub-patterns that are themselves
-///   constructor patterns (records or tuples) recurse; the
-///   recursive call passes the sub-pattern's own `payload_tys_for`
-///   as `parent_decl_order`, so the recursion works at UNBOUNDED
-///   depth (Phase 17B-cleanup limit #1 lifted).
-///
-/// `consume_values` (Phase 18A): controls whether the function
-/// emits POP/STORE/UNPACK for the INNER levels (recursion).
-/// When the test chain has already consumed the payload values
-/// (via POP / STORE / JUMP_IF_MATCH), the reverse pass calls
-/// this function with `consume_values = false` to skip the
-/// redundant POP/STORE/UNPACK emission at every level (the test
-/// chain handled them). Bindings are still recorded in
-/// `match_bindings` (so the body's `Identifier` lookups resolve
-/// to the correct slots) — only the bytecode emission is
-/// suppressed.
-///
-/// `is_outer` (Phase 18B — lifting the 17B-cleanup nested record
-/// limitation): distinguishes the OUTER call (from the codegen,
-/// where the forward pass has already emitted UNPACK or
-/// JUMP_IF_MATCH for the OUTER enum value) from recursive calls
-/// (where a sub-pattern is itself a Constructor with a Tuple
-/// payload that needs UNPACK). When `is_outer = true`, the
-/// function SUPPRESSES UNPACK emission (the forward pass handled
-/// it). When `is_outer = false` (recursion), the function emits
-/// UNPACK for nested Tuple constructors so their payload values
-/// reach the right slots.
-///
-/// `parent_decl_order`: the field-name → type map of the
-/// CONTAINING record pattern (the record whose fields this
-/// function is currently walking). The caller passes the
-/// appropriate `Vec<(String, Ty)>`:
-/// - For an OUTER record pattern (the pattern passed directly
-///   to this function), `parent_decl_order` is
-///   `checker.payload_tys_for(enum_name, variant_name)` — the
-///   record's declared field order.
-/// - For a sub-pattern recursion (entered from this function's
-///   own Record arm), `parent_decl_order` is the sub-pattern's
-///   own `payload_tys_for` if the sub-pattern is itself a
-///   constructor record; empty otherwise.
-///
-/// This function is called once per arm body. After it returns,
-/// the stack has been "consumed" by the binding code (POPs for
-/// wildcards, no-op STOREs for bindings) and `match_bindings`
-/// holds the name → slot mapping for the arm.
-///
-/// `checker` is passed explicitly (rather than being a method on
-/// `Compiler`) so the borrow checker doesn't see `&self.checker`
-/// (immutable) and `&mut self.bytecode` (mutable) as conflicting
-/// — the function only needs `checker` for `payload_tys_for`
-/// (and `tag_for` indirectly via the codegen), which is a
-/// disjoint read from the bytecode mutation.
+/// `consume_values`: skip POP/STORE/UNPACK when a test chain already consumed them.
+/// `is_outer`: suppress UNPACK at the outer level (forward pass already unpacked).
 fn emit_pattern_binding<'compiler>(
     checker: &Checker,
     match_bindings: &mut HashMap<String, u32>,
@@ -798,67 +559,7 @@ fn emit_pattern_binding<'compiler>(
                 }
             }
             PatternPayload::Record(fields) => {
-                // Walk the record's declared fields in
-                // DECLARATION order (per `parent_decl_order`).
-                //
-                // At the OUTER level (`is_outer = true`):
-                // record values were already pushed at
-                // consecutive stack slots by the forward
-                // pass's UNPACK (for the last arm) or
-                // JUMP_IF_MATCH (for non-last arms). There's
-                // no prefix UNPACK to emit here — just walk
-                // the fields and bind each one.
-                //
-                // At the RECURSION level (`is_outer =
-                // false`): the record's enum value sits at
-                // a non-top slot (pushed by the parent
-                // record's UNPACK / JUMP_IF_MATCH). To bind
-                // its fields, we MUST first emit `UnpackAt`
-                // with the slot position of this nested
-                // record's enum value — the slot-based
-                // UNPACK writes the payload values to
-                // consecutive positions starting from that
-                // slot, overwriting in place. (Phase 18B —
-                // the existing top-popping `Unpack` opcode
-                // doesn't work for nested records because
-                // the nested record's enum value isn't at
-                // the top of stack.)
-                //
-                // For each declared field:
-                //  - If the pattern supplies a sub-pattern
-                //    for this field, recurse into it. If the
-                //    sub-pattern is itself a constructor
-                //    record, pass ITS `payload_tys_for` as
-                //    `parent_decl_order` so the recursion
-                //    walks the inner record's fields too.
-                //    This works at UNBOUNDED depth
-                //    (Phase 17B-cleanup limit #1 lifted).
-                //  - If the pattern doesn't supply this
-                //    field (it was omitted from the record
-                //    pattern), emit POP to discard the value
-                //    so the stack stays consistent with the
-                //    declaration-order walk.
-                //
-                // The recursion propagates the OUTER
-                // `consume_values` flag: when `false` (test
-                // chain arm), the test chain's
-                // POP / JUMP_IF_MATCH has already consumed
-                // the inner values, so the recursion
-                // suppresses the redundant bytecode. When
-                // `true` (normal arm), the recursion emits
-                // bytecode normally.
-                //
-                // The recursion is ALWAYS at `is_outer = false`.
-                //
-                // The i-th field of the OUTER record
-                // (1-indexed) sits at slot `i` (after the
-                // OUTER UNPACK pushed the fields at
-                // consecutive positions starting at
-                // frame.sp + 1). We need to know this
-                // slot when emitting `UnpackAt` for the
-                // nested record's payload — the payload
-                // values are written to `slot`, `slot + 1`,
-                // ..., `slot + arity - 1`.
+                // Declaration-order walk; nested records use UnpackAt at non-top slots.
                 let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
                     fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
                 for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
@@ -893,9 +594,6 @@ fn emit_pattern_binding<'compiler>(
                                 payload: PatternPayload::Record(_),
                             } = sub_pat
                         {
-                            // `with_operands_u16` packs two
-                            // u16 values: lower = slot, upper
-                            // = arity.
                             let inner_arity =
                                 checker.payload_tys_for(sub_enum, sub_variant).len() as u16;
                             bytecode.push(
@@ -1009,7 +707,6 @@ impl Compiler {
     pub fn register(&mut self, name: &str, params: &[Ty], returns: &Ty) -> &mut Self {
         let idx = self.native.len();
         self.native.insert(name.to_string(), idx);
-        // Phase 10: only the HM checker is used now.
         self.checker.register_native(name, params, returns);
 
         self
@@ -1055,105 +752,27 @@ impl Compiler {
         )
     }
 
-    /// Extract the enum name from the inferred type of a field-access
-    /// receiver (Phase 18D — `Expression::Access` codegen; Phase 19
-    /// extends the `Access` arm for chained access).
-    ///
-    /// The receiver can be one of:
-    ///
-    ///  - `Expression::Identifier(name)` — function parameter or
-    ///    let-bound variable. The receiver's type is the side-table
-    ///    entry for `name`. We return the enum name if the type is
-    ///    `Ty::Con(n)`, `Ty::Sum { name, .. }`, or
-    ///    `Ty::Constructor { owner, .. }` (with the same recursive
-    ///    unwrapping of `owner`).
-    ///  - `Expression::Access(_, _)` — chained access (Phase 19).
-    ///    The inner access's field type is looked up via
-    ///    `field_type_for` on the inner receiver's enum. For
-    ///    `p.x.v`, this returns `Inner` (the enum that owns the
-    ///    `v` field). The OUTER `LoadField` then routes to
-    ///    `Inner::v` rather than `Outer::v`.
-    ///  - Anything else — return `None` (the codegen will emit a
-    ///    defensive `LoadField(0)`).
-    ///
-    /// We resolve the receiver's type from the **environment** (not
-    /// the infer cache) because the cache is misaligned with the
-    /// pre-walk's IDs inside function bodies — see the comment in
-    /// `Expression::Access` codegen for details.
+    /// Resolve enum name for field access via the codegen side-table.
     fn enum_name_for_receiver(&mut self, receiver: &Output) -> Option<String> {
-        // Walk the receiver AST to extract the enum name.
-        //
-        // The codegen cannot rely on the infer cache or the env
-        // here for two reasons:
-        //
-        //   1. The infer pass's `infer_function` SKIPS a
-        //      function's `args` Fragment (it uses
-        //      `parse_arg_list` instead of recursing via `infer`).
-        //      The pre-walk DOES mint IDs for args. Result: the
-        //      pre-walk's ID table and the infer cache are
-        //      MISALIGNED inside function bodies by N+1 IDs (one
-        //      for the Fragment wrapper, N for the Arguments).
-        //
-        //   2. `infer_function` POPS its frame after processing
-        //      the body, so by codegen time the env no longer
-        //      contains function arg bindings.
-        //
-        // The Checker maintains a separate `codegen_var_types`
-        // side-table (populated in `infer_function` and
-        // `infer_fragment`) that survives both issues. For chained
-        // accesses, we recurse into the inner receiver until we
-        // hit a leaf Identifier, then look up its type in the
-        // side-table. The unwrap chain (`Con` / `Sum` /
-        // `Constructor`) extracts the enum name from the type.
+        // Cannot use infer cache inside function bodies (ID misalignment) or env (frame popped).
         let ty = self.receiver_type(receiver)?;
         extract_enum_name(&ty)
     }
 
-    /// Recursively resolve a field-access receiver's type using
-    /// the checker's codegen side-table (Phase 18D; Phase 19
-    /// extends it for chained accesses).
-    ///
-    /// For an `Identifier`, the type is the side-table entry.
-    /// For a chained `Access`, the inner access's field type is
-    /// looked up via `field_type_for` on the inner receiver's
-    /// enum (Phase 19). This makes `p.x.v` work — the OUTER
-    /// access resolves via the inner receiver's enum + the
-    /// field's name.
-    ///
-    /// The typechecker is the source of truth for chained
-    /// accesses and emits a diagnostic if they don't resolve;
-    /// this helper only mirrors the typechecker's resolution
-    /// for the codegen. When `receiver_type` returns `None` for
-    /// a chained access, the codegen emits a defensive
-    /// `LoadField(0)` so the bytecode stays well-formed (the
-    /// typechecker was already consulted upstream).
+    /// Receiver type for field access (identifier side-table or chained lookup).
     fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
         match receiver.1.as_ref() {
             Expression::Identifier(name) => {
                 self.checker.codegen_var_type(name).cloned().map(|t| {
-                    // Apply the running substitution so an
-                    // unannotated `let d = { foo: 42 };` (which
-                    // minted a fresh `TyVar` and then unified it
-                    // with `Ty::Record { foo: int }`) resolves
-                    // to the actual record type. Phase 25.
+                    // Apply substitution so inferred record types resolve fully.
                     crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
                 })
             }
             Expression::Access(inner, field) => {
-                // Chained access — the inner access's type is
-                // the OUTER field's type. Recurse into `inner`
-                // to find its enum, then look up `field` in
-                // that enum's record payload. For `p.x.v`,
-                // this returns the type of `x` (e.g.
-                // `Ty::Con("Inner")` for
-                // `enum Outer { Outer { x: Inner } }`).
                 let inner_ty = self.receiver_type(inner)?;
                 if let Some(name) = extract_enum_name(&inner_ty) {
                     return self.checker.field_type_for(&name, field);
                 }
-                // Phase 25: chained record access. If the inner
-                // is `Ty::Record { fields }`, look up `field`
-                // directly. Otherwise None.
                 if let Ty::Record { fields } = &inner_ty {
                     return fields
                         .iter()
@@ -1171,66 +790,20 @@ impl Compiler {
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let mut bytecode = vec![];
-        // Phase 9: pull the next `NodeId` from the pre-walk's
-        // minting order. Both `do_compile` and `Checker::infer` walk
-        // the AST in pre-order, so the `n`-th call here consumes the
-        // `n`-th ID. We use it later for opcode selection.
         let _self_id = self.checker.id_table().ids()[self.emit_idx];
         self.emit_idx += 1;
         let (span, child) = ast;
 
         match child.borrow() {
             Expression::Comment(_) => (),
+            // --- Modules ---
             Expression::Use {
                 path: p,
                 name,
                 alias,
             } => {
-                // Phase 29A: `use foo::bar;` and
-                // `use foo::bar as x;` map the local
-                // name (or alias) to the qualified
-                // name. The qualified name is what
-                // `Expression::Call` looks up in
-                // `self.functions` (and friends).
-                //
-                // For a single-segment path like
-                // `use foo::bar;`, the qualified name
-                // is `foo::bar`. For a multi-segment
-                // path like `use a::b::c;`, the
-                // qualified name is `a::b::c`.
-                //
-                // For a glob like `use foo::bar::*;`,
-                // the pipeline pre-loaded `foo::bar`
-                // (so its top-level items are
-                // registered in `self.functions` /
-                // `self.classes` / `self.enums` /
-                // etc.). The codegen is a no-op for
-                // globs — the items are already
-                // registered under their fully
-                // qualified names; the user refers
-                // to them by that qualified name.
-                // Future work: populate the env so
-                // `bar::baz()` is implicit and the
-                // user can write `baz()` directly.
+                // Map local name → qualified FQN (or expand `use ns::*`).
                 if name == "*" {
-                    // Phase 29A — glob expansion.
-                    //
-                    // `use foo::*;` brings every top-level
-                    // item in the file `foo.0s` (namespace
-                    // `foo`) into scope. The file's
-                    // namespace is `<path joined with ::>`
-                    // (no trailing `::name` because the
-                    // `name` segment is the glob marker
-                    // `*`, not an item name).
-                    //
-                    // Items in `foo.0s` are registered in
-                    // `self.functions` with FQNs of the
-                    // form `foo::<item_name>` (one extra
-                    // segment beyond the file's namespace).
-                    // We walk `self.functions` and add an
-                    // alias for each entry whose FQN starts
-                    // with the file's namespace and has
-                    // exactly one more segment.
                     let module_ns = p.join("::");
                     let prefix = if module_ns.is_empty() {
                         // Top-level glob: `use *;` (no
@@ -1289,57 +862,17 @@ impl Compiler {
                 }
             }
             Expression::Noop(_) => (),
-            // ---- Phase 29A: `mod foo;` is a forward
-            // declaration that triggers the pipeline to
-            // load `foo.0s` (if not already loaded).
-            // The codegen is a no-op — the `Module`
-            // node's `name` is consumed by the pipeline
-            // in its `enqueue_uses` walker; the
-            // `do_compile` arm exists only to consume
-            // the NodeId (so the pre-walk and infer
-            // ID tables stay in lockstep) and to emit
-            // zero bytecode bytes.
-            Expression::Module(_, _body) => {
-                // No bytecode. The pipeline has already
-                // enqueued the file; nothing more to do.
-            }
+            // `mod foo;` — pipeline loads the file; no bytecode.
+            Expression::Module(_, _body) => {}
             Expression::Group(e) => bytecode.append(&mut self.do_compile(e)),
             Expression::Program(children) => {
                 children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
                 });
             }
+            // --- Let bindings ---
             Expression::Fragment(children) => {
-                // ---- Phase 18E: special-case `let x = expr;` ----
-                //
-                // The parser produces `Fragment([Variable(x), expr])`
-                // for `let x = expr;` (see
-                // `parser/src/lib.rs::Pratt::variable` at line 718).
-                // The naive child-by-child iteration would emit
-                // nothing for `Variable` (just `intern` the slot)
-                // followed by the RHS bytecode (which leaves the
-                // RHS value on the operand-stack top). The slot
-                // is never explicitly written, so the simple case
-                // `let x = 5; print x;` works by coincidence —
-                // slot 0 happens to coincide with the operand-stack
-                // top after the push. Reassignment via `x = 10;`
-                // uses `Expression::Assignment`, which had a buggy
-                // `STORE` (no-op since 15D) + `DUPLICATE` shape
-                // that didn't fix the slot either.
-                //
-                // The fix: when the Fragment matches the
-                // `[Variable(name), rhs]` shape, append a
-                // `STORE_POP slot` after the RHS bytecode. This
-                // is the load-bearing "store the RHS into the
-                // let-bound variable" emission. Distinct from the
-                // `STORE` used by match-arm bindings (which is a
-                // no-op since 15D — see `Instruction::STORE`).
-                //
-                // Fallback: any other Fragment shape (e.g. a
-                // bare `Variable` without an RHS, or a
-                // multi-child Fragment for some future syntax)
-                // falls through to the legacy child-by-child
-                // iteration so we don't regress unrelated cases.
+                // `let x = expr` → compile RHS, then StorePop into x's slot.
                 let mut is_let = false;
                 if children.len() == 2
                     && let Expression::Variable(name, _ty) = &children[0].1.as_ref()
@@ -1361,60 +894,7 @@ impl Compiler {
             Expression::Block(children) => {
                 let ctx = self.context.child();
                 self.context = ctx;
-                // ---- Phase 18E: extend self.bytecode directly ----
-                //
-                // Some expressions (notably `Expression::Print`,
-                // `Expression::Format`, and the various
-                // control-flow forms that need absolute jump
-                // targets) write their bytes DIRECTLY to
-                // `self.bytecode` instead of returning a `Vec<Byte>`
-                // for the caller to append. Pre-18E, Block
-                // iterated children and appended each child's
-                // returned `Vec<Byte>` to a local vec, then
-                // returned the local vec to its caller. This
-                // worked as long as the direct writers appeared
-                // LAST in a Block (their bytes landed in
-                // `self.bytecode` before Block returned its
-                // local vec — so the caller's append put the
-                // direct writer's bytes AFTER the local vec's
-                // bytes, which happened to be the desired
-                // order when the direct writer was the final
-                // statement).
-                //
-                // The Phase 18E work on `let x = expr;` exposed
-                // the limitation: a `Fragment([Variable, rhs])`
-                // child now returns `StorePop` bytes in its
-                // local vec, and an interleaved `Print` writes
-                // its bytes directly to `self.bytecode`. The
-                // resulting order is `[print_bytes,
-                // store_pop_bytes]` — print BEFORE the let —
-                // which produces wrong semantics (the print
-                // reads from an uninitialized slot).
-                //
-                // Fix: extend `self.bytecode` directly with each
-                // child's bytes. Since direct-to-self.bytecode
-                // writers (Print, Format, nested control flow)
-                // are appending to the SAME `self.bytecode` in
-                // source order, and we extend with the returned
-                // vec in source order, the bytes end up in the
-                // correct interleaved order. Block returns an
-                // empty vec (the bytes are already in
-                // `self.bytecode`); callers that append the
-                // Block's return value see a no-op (correct,
-                // because the bytes are already there).
-                //
-                // Critical invariant: anything that computes
-                // absolute positions in `self.bytecode` (e.g.,
-                // `BlockBuilder::bind_label` for JMPF/JMP
-                // operands) must do so BEFORE the Block's
-                // iteration ends. The bound positions refer
-                // to `self.bytecode` offsets that are valid
-                // for the rest of the function body's
-                // emission. This is unchanged from the
-                // pre-18E behavior — the only difference is
-                // that the Block's caller no longer appends
-                // a local vec (the local vec is always
-                // empty now).
+                // Append each child to self.bytecode (Print/control-flow emit in-place).
                 for child in children {
                     let mut bc = self.do_compile(child);
                     self.bytecode.append(&mut bc);
@@ -1428,28 +908,11 @@ impl Compiler {
                 returns: _returns,
                 body,
             } => {
-                // Phase 29A: the function's fully qualified
-                // name is `<namespace>::<name>` UNLESS the
-                // namespace is empty (the entry file) — in
-                // which case it's just `<name>`.
-                //
-                // The namespace is the file's path
-                // (e.g. `foo/sadge.0s` → namespace
-                // `foo::sadge`). A function `helper` in
-                // that file is registered as
-                // `foo::sadge::helper`. A function `main`
-                // in the entry file (namespace `""`) is
-                // registered as just `main`.
                 let qualified = if self.namespace.is_empty() {
                     name.to_string()
                 } else {
                     format!("{}::{}", self.namespace, name)
                 };
-                // Phase 29A — record this function in the
-                // current namespace's `module_items` so a
-                // later `use <this-namespace>::*;` glob can
-                // expand the function's name into the
-                // caller's scope.
                 self.module_items
                     .entry(self.namespace.clone())
                     .or_default()
@@ -1545,14 +1008,7 @@ impl Compiler {
                 self.bytecode.extend(bc);
                 self.bytecode.push(Byte::new(Instruction::FfiLoad));
             }
-            // ---- Phase 23: aggregates ----
-            //
-            // `(a, b, c)` and `[a, b, c]` literals. Compile each
-            // child (PUSHes its `Value` in source order — so the
-            // LAST source element ends up on top), then emit
-            // `MakeTuple` / `MakeArray` with arity in the low 16
-            // bits. The runtime pops `arity` values and reverses
-            // for source-order storage.
+            // --- Aggregates ---
             Expression::Tuple(items) => {
                 for c in items {
                     let mut bc = self.do_compile(c);
@@ -1569,15 +1025,7 @@ impl Compiler {
                 let arity = items.len() as u32;
                 bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(arity));
             }
-            // ---- Phase 25: dict literal ----
-            //
-            // `{ name: expr, ... }` emits each (name, value) pair
-            // in source order. The runtime walks pairs in reverse
-            // (pop the top = LAST source pair). The field-name is
-            // interned via `STRING` (which pushes a heap
-            // `Object::String` address); `MakeDict` reuses the
-            // existing `Object::Instance` storage (the string
-            // table keys the `Table<Member>`).
+            // --- Dict literals ---
             Expression::Dict(items) => {
                 // Eagerly resolve field names to strings before
                 // any bytecode emission so the byte offsets
@@ -1616,21 +1064,7 @@ impl Compiler {
                 bytecode.append(&mut index_bc);
                 bytecode.push(Byte::new(Instruction::Index));
             }
-            // ---- Phase 26: declare/invoke tuple form ----
-            //
-            // `declare(lib, name, (T1, T2), R)` — the arguments
-            // tuple is a single AST `Tuple` expression. The
-            // codegen emits each tuple element's bytecode (so
-            // each element pushes its FFI-type tag onto the
-            // stack — for the userland `FFIType::X` form this
-            // is `MakeEnum`; for the bare `int`/`string` form
-            // this is `CONST <tag>`). After the elements,
-            // `MakeTuple <arity>` allocates the tuple and
-            // pushes it as a single Value. Then the name
-            // string, then the lib handle, then `DeclareFFI`
-            // pops the tuple and walks its elements for arg
-            // tags. The ret-type tag is popped first (on top of
-            // the stack).
+            // --- FFI declare/invoke ---
             Expression::Declare(args) => {
                 if args.len() != 4 {
                     let mut m = common::Message::error(
@@ -1704,9 +1138,7 @@ impl Compiler {
                 }
             }
             Expression::Invoke(args) => {
-                // Phase 26 — `invoke(lib, fn_id, (a, b, c))`.
-                // The 3rd arg is a Tuple expression containing
-                // the runtime values.
+                // `invoke(lib, fn_id, (args...))`
                 if args.len() != 3 {
                     let mut m = common::Message::error(
                         "invoke requires arguments as a tuple in position 3 (use (a, b, ...) syntax)".to_string(),
@@ -1873,80 +1305,22 @@ impl Compiler {
 
                 bytecode.push(Byte::new(Instruction::DEC).with_operand_u32(symbol as u32));
             }
+            // --- Loop codegen ---
+            // Layout: [top] cond, JMPF→exit, body, JMP→top
             Expression::Loop { iterable, body, .. } => {
-                // Phase 17A: refactor the Loop codegen onto the
-                // placeholder-tracking `BlockBuilder` (the same
-                // primitive that drives the If codegen since 16.6).
-                // The semantics are IDENTICAL to the pre-17A
-                // version — only the placeholder tracking moves
-                // from manual `Vec`-based position tracking to
-                // `BlockBuilder`'s `bind_label` / `emit_jump_to`.
-                //
-                // Layout produced for `while cond { body }`:
-                //
-                //   [top_label]
-                //   <iterable bytecode>     ← do_compile(iterable)
-                //   JMPF → exit_label       ← exits if cond is false
-                //   [exit_label]
-                //   <body bytecode>         ← do_compile(body)
-                //   JMP → top_label         ← back-edge
-                //
-                // Bindings (handled by BlockBuilder):
-                //   top_label  → self.bytecode.len() at entry
-                //   exit_label → self.bytecode.len() after the JMPF
-                //   JMP back-edge → top_label
-                //
-                // All bytes (including any direct-to-self.bytecode
-                // emitters inside `body`, e.g. nested `Print`) land
-                // in `self.bytecode`; BlockBuilder tracks placeholder
-                // positions in that same coordinate system, so the
-                // back-edge and exit jumps are correct without any
-                // post-pass arithmetic.
                 let mut bb = BlockBuilder::new();
                 let top_label = bb.fresh_label();
                 let exit_label = bb.fresh_label();
-
-                // The top_label must be bound AFTER the back-edge
-                // JMP is emitted (so the JMP's position is in
-                // `pending[top_label]` and `bind_label` can patch
-                // it). The exit_label is bound AFTER the body
-                // (so the JMPF's position is in `pending[exit_label]`
-                // and `bind_label` can patch it).
                 let top_label_target = self.bytecode.len() as u32;
 
-                // Emit the iterable (the condition expression).
-                // Borrow-checker note: same as the body case
-                // below — stage the bytes in a local to avoid
-                // overlapping `&mut self` borrows.
                 let iter_bc = self.do_compile(iterable);
                 self.bytecode.extend(iter_bc);
 
-                // Emit a JMPF placeholder targeting exit_label.
-                // When the condition is false, the JMPF skips past
-                // the body to exit the loop.
                 bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
 
-                // Emit the body. The body is a `Block` (a
-                // sequence of statements) — `do_compile` handles
-                // the multi-statement shape. Any nested control
-                // flow inside the body emits its own jumps
-                // (using the same BlockBuilder pattern, or its
-                // own), all in the same `self.bytecode`
-                // coordinate system.
-                //
-                // Borrow-checker note: stage the body into a
-                // local first so the `&mut self` from
-                // `do_compile` doesn't overlap with the
-                // `&mut self.bytecode` from `extend`. Same
-                // pattern as the If codegen (line 677).
                 let body_bc = self.do_compile(body);
                 self.bytecode.extend(body_bc);
 
-                // Bind exit_label to the END of the body (the
-                // current bytecode position, which is right after
-                // the body). This patches the JMPF placeholder
-                // to skip past the body when the condition is
-                // false.
                 let exit_label_target = self.bytecode.len() as u32;
                 bb.bind_label(
                     exit_label,
@@ -1955,13 +1329,8 @@ impl Compiler {
                     &mut self.constants,
                 );
 
-                // Emit the back-edge JMP → top_label. When the
-                // body finishes, control jumps back to the top of
-                // the loop (where `top_label` was bound).
                 bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
 
-                // NOW bind top_label (after the back-edge JMP was
-                // emitted, so the JMP's position is in `pending`).
                 bb.bind_label(
                     top_label,
                     top_label_target,
@@ -1969,9 +1338,6 @@ impl Compiler {
                     &mut self.constants,
                 );
 
-                // Validate: every label that had a pending jump is
-                // bound. (Both `top_label` and `exit_label` were
-                // bound above, and both had pending jumps.)
                 bb.finalize()
                     .expect("BlockBuilder::finalize: all targeted labels bound");
             }
@@ -2004,15 +1370,6 @@ impl Compiler {
                     .cloned()
                     .unwrap_or_else(|| identifier.clone());
 
-                // Phase 22b: if `name` was declared by an
-                // `extern` block, dispatch to runtime
-                // `FfiInvoke` instead of a user-function
-                // `CALL/JMP`. None of this needs new AST or
-                // opcode changes — `invoke` is just
-                // `invoke(lib, fn_id, args)` where `lib` is
-                // loaded from a let-slot and `fn_id` is
-                // loaded from another (both interned at
-                // `extern_block` codegen time).
                 if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
                     // Stage arg bytecode in a local Vec to
                     // release the `&mut self.bytecode` borrow
@@ -2058,11 +1415,7 @@ impl Compiler {
                             .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                     }
 
-                    // Phase 18G perf: fold `CALL arity; JMP target`
-                    // into a single `CALL arity, target` whose target
-                    // lives in `value[31:0]`. Saves one VM dispatch
-                    // per call site (recursive functions like
-                    // `fib` pay this on every recursive call).
+                    // Packed CALL: arity + target in one opcode.
                     bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
                         args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
                         offset as u32,
@@ -2105,47 +1458,9 @@ impl Compiler {
                     self.messages.push(message);
                 }
             }
+            // --- If codegen ---
+            // Layout: c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
             Expression::If(branches) => {
-                // Phase 16.6 refactor: rewrite the If codegen using
-                // the placeholder-tracking `BlockBuilder` instead of
-                // manual placeholder-tracking via two `Vec<usize>`s.
-                // The semantics are IDENTICAL to the Phase 16.5
-                // direct-manipulation version (no behavior change) —
-                // only the implementation is cleaner.
-                //
-                // The key correctness property is that ALL bytes
-                // (including those emitted by `Print`/`Format`
-                // codegen, which targets `self.bytecode` directly)
-                // are appended to the same `self.bytecode` vector,
-                // and `BlockBuilder` tracks the positions of JMPF
-                // and JMP placeholders in that same coordinate
-                // system. This sidesteps the pre-16.5
-                // coordinate-system hazard entirely.
-                //
-                // Layout produced for `if c1 { b1 } else if c2 { b2 } else { b3 }`:
-                //   c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
-                //
-                // Bindings (handled by BlockBuilder):
-                //   JMPF1 → start of c2 (= branch_start_labels[0])
-                //   JMP1  → end_label (= end_pos)
-                //   JMPF2 → start of b3 (= branch_start_labels[1])
-                //   JMP2  → end_label (= end_pos)
-                //
-                // Layout for a single-branch `if c { b }`:
-                //   c, JMPF, b, [end]
-                //
-                // Binding: JMPF → end_label (= end_pos).
-
-                // Pre-allocate labels for the START of each non-last
-                // branch. These are the targets of the PREVIOUS
-                // branch's JMPF — when we begin emitting branch `i`,
-                // we bind `branch_start_labels[i - 1]` to the
-                // current bytecode position (which is the start of
-                // branch `i`). The last branch's start has no
-                // pre-allocated label (it never serves as a JMPF
-                // target because nothing falls through into it from
-                // an earlier branch — only `else` does, and `else`
-                // has no preceding JMPF in this design).
                 let mut bb = BlockBuilder::new();
                 let end_label = bb.fresh_label();
                 let mut branch_start_labels: Vec<Option<crate::block_builder::Label>> =
@@ -2176,19 +1491,7 @@ impl Compiler {
                         bb.bind_label(prev_label, target, &mut self.bytecode, &mut self.constants);
                     }
 
-                    // Emit the condition (if any) followed by a JMPF
-                    // placeholder. The JMPF target is the start of
-                    // the NEXT branch (if not the last), or end_label
-                    // (if last). The last branch's start label is
-                    // `None`, so `unwrap_or(end_label)` falls back to
-                    // end_label.
-                    //
-                    // Bug #1 fix (Phase 16.5): the JMPF is emitted
-                    // UNCONDITIONALLY for every branch with a
-                    // condition, including the last branch. The
-                    // pre-16.5 codegen skipped the JMPF for
-                    // single-branch `if`, which meant the body was
-                    // ALWAYS executed regardless of the condition.
+                    // Emit cond then JMPF (including single-branch if).
                     if let Some(cond) = cond_opt {
                         let cond_bc = self.do_compile(cond);
                         self.bytecode.extend(cond_bc);
@@ -2196,19 +1499,7 @@ impl Compiler {
                         bb.emit_jump_to(jmpf_target, BbJumpKind::JumpIfFalse, &mut self.bytecode);
                     }
 
-                    // Emit the body AFTER the cond + JMPF so the
-                    // body lands at the right position in
-                    // self.bytecode. (`Print` emits directly to
-                    // self.bytecode, but the bytes are appended here
-                    // via the call to `do_compile(body)`.)
-                    //
-                    // Bug #2 fix (Phase 16.5): in the pre-16.5
-                    // codegen, the body was eagerly compiled BEFORE
-                    // the cond + JMPF landed in self.bytecode, so
-                    // its bytes appeared before the JMPF. The JMPF
-                    // operand was computed relative to a
-                    // `self.bytecode.len()` snapshot that no longer
-                    // matched the actual layout.
+                    // Body after cond+JMPF so Print/nested control-flow offsets stay correct.
                     let body_bc = self.do_compile(body);
                     self.bytecode.extend(body_bc);
 
@@ -2399,10 +1690,7 @@ impl Compiler {
                 self.context.constants.insert(symbol, false);
             }
             Expression::Assignment(lhs, value) => {
-                // Phase 25 — `d.field = expr` form for record
-                // mutation. Detect via `Access(_, _)` on the
-                // LHS and emit a `SetField` sequence instead of
-                // the legacy `STORE_POP` for plain variables.
+                // Dict field assignment: value, target, field name → SetField.
                 let lhs_is_access = matches!(lhs.1.as_ref(), Expression::Access(_, _));
                 if lhs_is_access {
                     if let Expression::Access(target_expr, field) = lhs.1.as_ref() {
@@ -2468,24 +1756,6 @@ impl Compiler {
                             }
                         }
 
-                        // ---- Phase 18E: let-bound variable re-assignment ----
-                        //
-                        // Pre-18E codegen emitted `STORE` (a no-op
-                        // since Phase 15D — see `Instruction::STORE`)
-                        // + `DUPLICATE`. The combination was buggy:
-                        // the `STORE` didn't write the new value into
-                        // the slot (it just confirmed whatever was
-                        // already there from `UNPACK` /
-                        // `JUMP_IF_MATCH`), and the `DUPLICATE`
-                        // pushed a second copy of the value onto the
-                        // stack without ever correcting the slot.
-                        //
-                        // Post-18E codegen emits `STORE_POP slot` —
-                        // the load-bearing pop-and-write opcode
-                        // introduced in this phase. The new value
-                        // lands at the slot; the cursor stays past
-                        // the slot so subsequent pushes don't
-                        // clobber it.
                         let mut expr = self.do_compile(value);
 
                         bytecode.append(&mut expr);
@@ -2506,41 +1776,12 @@ impl Compiler {
                 }
             }
 
-            // ---- Phase 15A: sum types and pattern matching ----
-            //
-            // The HM typechecker (15B) handles all type-level
-            // validation (enum registration, constructor arity
-            // checks, exhaustiveness). The codegen (15C) is only
-            // responsible for emitting the matching bytecode.
-            //
-            // ID alignment: the pre-walk in
-            // `crate::typechecking::id::pre_walk_children` mints
-            // NodeIds for `EnumDecl` (1), each `EnumVariant`
-            // node (1 per variant), each `Expression::Type`
-            // payload (1 per payload type), the `Construct`
-            // node (1), and each of its `args` (1 per arg). The
-            // `Match` arm bodies each get 1 ID. Patterns do NOT
-            // mint IDs (see `pre_walk_pattern`). The codegen
-            // below consumes exactly that many IDs by recursing
-            // via `self.do_compile`.
+            // --- Sum types, extern, construct ---
             Expression::ExternBlock {
                 library,
                 declarations,
             } => {
-                // Phase 22b runtime-emit FFI block.
-                //
-                // We append directly to `self.bytecode` (NOT
-                // to the local `bytecode` Vec this match arm
-                // would otherwise return), matching how
-                // `Expression::Function` emits its body. The
-                // prologue's `JMP` targets the offset of main
-                // in `self.bytecode` at the moment main is
-                // emitted — if we wrote to the local Vec, the
-                // extern bytes would land AFTER main's body
-                // and never execute.
-                //
-                // 1. Synthesize a let-slot for the library
-                //    handle (shared by every fn in this block).
+                // Append to self.bytecode so extern bytes run before main.
                 let lib_slot =
                     if let Some(&existing) = self.extern_runtime_libs.get(library.as_str()) {
                         existing
@@ -2591,7 +1832,7 @@ impl Compiler {
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
                             if let Expression::Argument(type_expr, _param_name) = arg.1.as_ref() {
-                                // Phase 24: the type is now a
+                                // the type is now a
                                 // full Output. For the FFI
                                 // extern-block path we only
                                 // support bare identifiers
@@ -2672,10 +1913,6 @@ impl Compiler {
                 }
             }
             Expression::TypeAlias { ty, .. } => {
-                // Phase 28 — `type X = T;` is metadata only;
-                // the alias is substituted at typecheck time.
-                // Recurse into the RHS so its children
-                // consume IDs (matching the pre-walk).
                 bytecode.append(&mut self.do_compile(ty));
             }
             Expression::EnumVariant { payload, .. } => {
@@ -2683,7 +1920,7 @@ impl Compiler {
                 // (or `RecordFieldDecl`'s value type). We don't
                 // emit bytecode — the variant's payload shape is
                 // metadata that's already registered with the
-                // typechecker (15B). Phase 17B: the payload is
+                // typechecker (15B). the payload is
                 // `EnumVariantPayload` (Unit / Tuple / Record);
                 // only Tuple and Record have children to walk.
                 use parser::ast::EnumVariantPayload;
@@ -2723,21 +1960,7 @@ impl Compiler {
                     .arity_for(enum_name, variant_name)
                     .expect("Construct: arity missing from typechecker");
 
-                // Phase 17B: the declared field order is the
-                // source-of-truth for the on-stack order (the VM's
-                // MAKE_ENUM pops arity values and stores them in
-                // pop order — so the FIRST popped ends up at
-                // payload[0]).
-                //
-                // - Tuple: the call-site positional args ARE
-                //   already in declaration order. Emit in
-                //   REVERSE so the top of stack holds args[0].
-                // - Record: the call-site may supply fields in
-                //   ANY order. Look up the declared order from
-                //   `payload_tys_for`, then walk the user's
-                //   fields by name in DECLARATION order. Emit in
-                //   REVERSE declaration order so the top of stack
-                //   holds the value for `decl_fields[0]`.
+                // Emit args in reverse declaration order for MAKE_ENUM stack discipline.
                 match fields {
                     EnumConstructPayload::Unit => {}
                     EnumConstructPayload::Tuple(args) => {
@@ -2769,140 +1992,17 @@ impl Compiler {
                     Byte::new(Instruction::MakeEnum).with_operands_u16([tag as u16, arity as u16]),
                 );
             }
+            // --- Match codegen (threaded layout) ---
+            // Forward: scrutinee, JUMP_IF_MATCH cascade, last-arm UNPACK/POP/STORE.
+            // Reverse: arm bindings + bodies; non-first arms JMP to end.
             Expression::Match { scrutinee, arms } => {
-                // ---- Match codegen (Phase 15C) ----
-                //
-                // Strategy (canonical "threaded code" / "jump
-                // table" layout):
-                //
-                //   1. Emit the scrutinee (leaves it on the stack).
-                //   2. For each non-last arm with a constructor
-                //      pattern, emit a `JUMP_IF_MATCH <tag,
-                //      target, arity>` placeholder.
-                //   3. For the LAST arm (or any wildcard/binding
-                //      arm reached by fall-through), emit the
-                //      scrutinee-consumer:
-                //        - Constructor last arm: `UNPACK <arity>`.
-                //        - Wildcard: `POP` to discard.
-                //        - Binding: `STORE <symbol>` to bind.
-                //   4. In REVERSE source order, emit each arm's
-                //      binding code (STORE/POP for sub-patterns)
-                //      followed by the arm body. For every
-                //      non-FIRST arm (in source order) emit a
-                //      `JMP <end>` placeholder after the body so
-                //      it doesn't fall through into the next
-                //      body. The LAST arm body has no JMP after
-                //      it — execution proceeds to the
-                //      JMP-to-end of the previous arm and exits
-                //      the match.
-                //   5. Patch JUMP_IF_MATCH placeholders to point
-                //      to each arm body's absolute offset, and
-                //      JMP-to-end placeholders to point to the
-                //      END of the match (just past the FIRST arm
-                //      body in source order).
-                //
-                // Resulting bytecode (for `match x { A => a,
-                // B => b, C => c }`):
-                //
-                //   <scrutinee bytecode>
-                //   JUMP_IF_MATCH tag_A, target_body_A, _
-                //   JUMP_IF_MATCH tag_B, target_body_B, _
-                //   UNPACK arity_C
-                //   body_c            ← reached by fall-through
-                //   JMP end            ← skipped after body_c
-                //   body_b            ← reached via JUMP_IF_MATCH B
-                //   JMP end            ← skipped after body_b
-                //   body_a            ← reached via JUMP_IF_MATCH A
-                //   ← match end here
-
                 if arms.is_empty() {
-                    // No arms — emit the scrutinee so the stack
-                    // doesn't accumulate a dangling value, then
-                    // POP it.
                     bytecode.append(&mut self.do_compile(scrutinee));
                     bytecode.push(Byte::new(Instruction::POP));
                 } else {
-                    // Phase 17A: refactor the Match codegen onto
-                    // the placeholder-tracking `BlockBuilder` (the
-                    // same primitive that drives the If codegen
-                    // since 16.6 and the Loop codegen since this
-                    // phase). The semantics are IDENTICAL to the
-                    // pre-17A 15C version — only the placeholder
-                    // tracking moves from manual
-                    // `Vec<usize>`-based position tracking to
-                    // `BlockBuilder`'s `bind_label` /
-                    // `emit_jump_to`.
-                    //
-                    // We use the canonical "threaded code" /
-                    // "jump table" layout. Bytecode is:
-                    //
-                    //   1. Emit the scrutinee (leaves it on
-                    //      the stack).
-                    //   2. For each non-last arm with a
-                    //      constructor pattern, emit a
-                    //      `JUMP_IF_MATCH tag, 0` placeholder
-                    //      targeting a pre-allocated `Label`
-                    //      for that arm.
-                    //   3. For the LAST arm (or any
-                    //      wildcard/binding arm), emit the
-                    //      scrutinee-consumer: `UNPACK arity`
-                    //      (constructor last arm), `POP`
-                    //      (wildcard), or `STORE symbol`
-                    //      (binding).
-                    //   4. Emit the LAST arm's binding code
-                    //      (STORE / POP for sub-patterns).
-                    //   5. Emit the LAST arm's body.
-                    //   6. (No JMP needed after the last arm.)
-                    //   7. For arm N-1, N-2, ..., 1 (in
-                    //      REVERSE source order):
-                    //      a. Bind the arm's pre-allocated
-                    //         `Label` (if any) to the current
-                    //         bytecode position (start of this
-                    //         arm's binding+body). This
-                    //         patches the JUMP_IF_MATCH
-                    //         placeholder emitted in step 2.
-                    //      b. Emit binding code.
-                    //      c. Emit the arm body.
-                    //      d. Emit JMP-to-end placeholder
-                    //         (targeting `end_label`).
-                    //   8. Finally, emit arm 0's binding code
-                    //      and body (no JMP after — arm 0 is
-                    //      the last body in the bytecode, so
-                    //      nothing to skip).
-                    //
-                    // After emission we bind `end_label` to
-                    // the absolute offset just past all the
-                    // arm bodies (= the END of the match),
-                    // which patches every JMP-to-end
-                    // placeholder. Then `finalize()` validates
-                    // that every targeted label is bound.
-
                     let mut bb = BlockBuilder::new();
-                    // The END of the match — bound below to
-                    // `self.bytecode.len()` after the last
-                    // arm body is emitted.
                     let end_label = bb.fresh_label();
 
-                    // Pre-allocate a `Label` for each arm that
-                    // will emit a `JUMP_IF_MATCH` placeholder
-                    // (i.e., each non-last constructor arm).
-                    // The JUMP_IF_MATCH emitted in the forward
-                    // pass targets this label; the label is
-                    // bound in the reverse pass when we start
-                    // emitting that arm's binding+body.
-                    //
-                    // Note: the forward pass below only EMITS a
-                    // JUMP_IF_MATCH for the first arm of each
-                    // non-last tag group (so a multi-arm group
-                    // gets one JUMP_IF_MATCH, not N). The
-                    // `arm_labels` Vec still allocates a label
-                    // for every non-last constructor arm so the
-                    // reverse pass's `if let Some(label) =
-                    // arm_labels[i]` arm is unchanged — the
-                    // labels for the 2nd, 3rd, … arm of a
-                    // multi-arm group are bound but never
-                    // targeted, which is allowed by
-                    // `BlockBuilder::finalize`.
                     let arm_labels: Vec<Option<crate::block_builder::Label>> = arms
                         .iter()
                         .enumerate()
@@ -2916,104 +2016,16 @@ impl Compiler {
                         })
                         .collect();
 
-                    // Group arms by outer variant tag. Arms
-                    // sharing the same outer tag are dispatched
-                    // by a single `JUMP_IF_MATCH` in the
-                    // forward pass; the future inner-pattern
-                    // runtime test (Phase 17C+) will live in
-                    // the first arm of each group. See
-                    // `group_arms_by_outer_tag` (lines 60-87)
-                    // for the full algorithm and the sentinel
-                    // `u32::MAX` handling for Wildcard/Binding
-                    // arms.
                     let tag_groups = group_arms_by_outer_tag(arms, &self.checker);
 
-                    // Step 1: scrutinee.
                     let scrutinee_bc = self.do_compile(scrutinee);
                     self.bytecode.extend(scrutinee_bc);
 
-                    // Step 2 + 3: emit one `JUMP_IF_MATCH` per
-                    // non-last tag group, then the
-                    // scrutinee-consumer for the last arm (in
-                    // the last group).
-                    //
-                    // We iterate `tag_groups` instead of
-                    // `arms` so that arms sharing the same
-                    // outer tag are dispatched by a single
-                    // JUMP_IF_MATCH (the future inner-pattern
-                    // runtime test will live in the first arm
-                    // of the group).
-                    //
-                    // For the COMMON case — each group is
-                    // single-arm (every arm's outer tag is
-                    // unique) and no arm has a runtime test —
-                    // this produces byte-for-byte identical
-                    // bytecode to the per-arm iteration: one
-                    // JUMP_IF_MATCH per non-last group, plus
-                    // the last arm's scrutinee-consumer
-                    // (UNPACK for the last Constructor arm,
-                    // POP for the last Wildcard arm, STORE 1
-                    // for the last Binding arm). The non-last
-                    // group's first arm's `Label` is the
-                    // JUMP_IF_MATCH target (it's the same
-                    // label the pre-grouped codegen would
-                    // have used, since single-arm groups have
-                    // exactly one arm).
-                    //
-                    // For the MULTI-ARM group case (two or
-                    // more arms sharing the same outer tag),
-                    // the bytecode differs from the pre-17C
-                    // version: the forward pass emits one
-                    // JUMP_IF_MATCH per group instead of one
-                    // per non-last arm. The reverse pass is
-                    // unchanged, so the arm bodies are still
-                    // emitted in reverse source order; the
-                    // first arm of the group is reached by
-                    // the JUMP_IF_MATCH, and subsequent arms
-                    // in the group are reached by fall-through
-                    // from the previous arm's body. The
-                    // inner-pattern runtime test that
-                    // disambiguates them is a 17C+
-                    // enhancement (the first arm's body will
-                    // emit a second JUMP_IF_MATCH on the
-                    // inner tag, or a tag-of-payload test).
-                    //
-                    // Phase 18A: emit JUMP_IF_MATCH for the
-                    // LAST group too when it's multi-arm
-                    // (Case 5 in the Phase 18A spec). The
-                    // last-group UNPACK for the last arm is
-                    // only emitted when the entire match is
-                    // "common-case" (no multi-arm groups
-                    // anywhere). If any group is multi-arm,
-                    // every group gets a JUMP_IF_MATCH so the
-                    // multi-arm group's test chain can fire
-                    // after the outer dispatch.
-                    //
-                    // Borrow-checker note: stage the `tag`
-                    // from `self.checker` into the
-                    // `TagGroup` (via `group_arms_by_outer_tag`)
-                    // before the `&mut self.bytecode` borrows
-                    // that follow. The checker borrows are
-                    // short-lived (each `.tag_for` / `.arity_for`
-                    // returns an owned value), so the local
-                    // staging keeps the borrow checker happy
-                    // without changing semantics.
+                    // Forward pass: outer-tag dispatch + last-arm scrutinee consumer.
                     let any_multi_arm_group = tag_groups.iter().any(|g| g.arm_indices.len() > 1);
                     for (g_idx, group) in tag_groups.iter().enumerate() {
                         let is_last_group = g_idx == tag_groups.len() - 1;
                         if !is_last_group || any_multi_arm_group {
-                            // Non-last group, or any group in a
-                            // match that has a multi-arm group
-                            // (Phase 18A): emit one JUMP_IF_MATCH
-                            // targeting the first arm's `Label`.
-                            // The label is bound in the reverse
-                            // pass when we start emitting that
-                            // arm's binding+body. For the common
-                            // case (single-arm groups), the
-                            // first arm IS the only arm, and
-                            // the label is the same one the
-                            // pre-grouped codegen would have
-                            // targeted.
                             let first_arm_idx = group.arm_indices[0];
                             let label = arm_labels[first_arm_idx]
                                 .expect("non-last group's first arm must have a Label");
@@ -3075,7 +2087,7 @@ impl Compiler {
                                     // (matching LOAD 0's push
                                     // position).
                                     //
-                                    // Phase 17B: the binding
+                                    // the binding
                                     // is recorded in
                                     // `match_bindings` by the
                                     // reverse pass, so the
@@ -3087,7 +2099,7 @@ impl Compiler {
                                     // 0 always pushes to
                                     // frame.sp + 1, and the
                                     // STORE is a no-op
-                                    // (Phase 15D).
+                                    // .
                                     let _ = name;
                                     self.bytecode
                                         .push(Byte::new(Instruction::STORE).with_operand_u32(1));
@@ -3155,7 +2167,7 @@ impl Compiler {
                     let mut test_chain_first_arms: std::collections::HashSet<usize> =
                         std::collections::HashSet::new();
                     // All arms that participate in a test chain
-                    // group (Phase 18A). The reverse pass uses
+                    // group . The reverse pass uses
                     // this set to decide whether to skip
                     // POP/STORE/UNPACK emission in
                     // `emit_pattern_binding` — the test chain
@@ -3212,10 +2224,6 @@ impl Compiler {
                             &mut self.constants,
                         );
                         test_chain_first_arms.insert(first_arm_idx);
-                        // Mark ALL arms in this group as
-                        // belonging to a test chain. The reverse
-                        // pass uses this to skip POP/STORE
-                        // emission (Phase 18A POP-quirk fix).
                         for &arm_idx in &group.arm_indices {
                             test_chain_arms.insert(arm_idx);
                         }
@@ -3377,56 +2385,14 @@ impl Compiler {
                             );
                         }
 
-                        // Emit binding code for this arm's
-                        // sub-patterns.
-                        //
-                        // Phase 17B: the slot order is DECLARATION
-                        // order (the VM's `JUMP_IF_MATCH` /
-                        // `UNPACK` push payload values in
-                        // declaration order), so:
-                        // - Tuple: walk the pattern in source order
-                        //   (= declaration order).
-                        // - Record: walk the DECLARATION order and
-                        //   look up the pattern by name. The
-                        //   pattern may supply fields in a
-                        //   different order — that doesn't change
-                        //   the slot order, only which sub-pattern
-                        //   binds to which slot.
-                        //
-                        // Phase 17B fix for multi-variant binding
-                        // bodies: the binding slots are recorded
-                        // in a per-arm `match_bindings` map (not
-                        // the global Interner), starting at slot 1
-                        // for the first payload position. The map
-                        // is consulted by `Identifier` / `Assignment`
-                        // lookups in the arm body.
+                        // Per-arm binding slots (slot 1 = first payload).
+                        // Payload order follows declaration order; record
+                        // patterns may list fields in any source order.
                         let mut arm_bindings: HashMap<String, u32> = HashMap::new();
                         let mut next_slot: u32 = 1;
-                        // Phase 18A: arms in a test chain group
-                        // have their payload values already
-                        // consumed by the test chain pass (Step
-                        // 3.5). The reverse pass must NOT
-                        // re-emit POP/STORE/UNPACK for those
-                        // values — doing so would double-pop
-                        // the inner Unit sub-patterns (the latent
-                        // POP quirk the Phase 18A fix addresses).
-                        //
-                        // We use `consume_values = false` to
-                        // signal "values were already consumed by
-                        // the test chain" — `emit_pattern_binding`
-                        // skips the bytecode emission for the
-                        // OUTER level (UNPACK / POP / STORE for
-                        // the OUTER sub-patterns) but still
-                        // RECORDS the bindings in
-                        // `arm_bindings` (for the body's
-                        // `Identifier` lookups). The inner
-                        // recursion uses `consume_values = true`
-                        // (per the `emit_pattern_binding`
-                        // contract) — the inner values were
-                        // pushed by the test chain's
-                        // JUMP_IF_MATCH, and the inner
-                        // UNPACK/STORE/POP is harmless when the
-                        // values are already at the right slots.
+                        // Test-chain arms: payload already on stack from
+                        // the forward pass — use `consume_values = false`
+                        // to record bindings without re-emitting UNPACK/POP.
                         let in_test_chain = test_chain_arms.contains(&i);
                         if let Some(bindings) = match_bindings_per_arm.get(&i) {
                             // This arm is in a test chain
@@ -3627,119 +2593,14 @@ impl Compiler {
                         .expect("BlockBuilder::finalize: all targeted labels bound");
                 }
             }
-            // TODO: Not reachable from real source — Phase 15A's
-            // Decision C preserves this AST node for
-            // backwards compatibility, but the parser maps both
-            // `_` and `default` to `Pattern::Wildcard` (not
-            // `Expression::Default`). This arm exists to consume
-            // the NodeId for ID alignment; if the parser ever
-            // produces `Expression::Default`, the right behavior
-            // is to emit a `POP` (the legacy codegen treated it
-            // as a wildcard).
+            // Parser maps `_`/`default` to Pattern::Wildcard; arm consumes NodeId only.
             Expression::Default(_) => (),
 
-            // ---- Phase 18D: field-access codegen ----
-            //
-            // `point.x` parses as `Expression::Access(receiver,
-            // "x")`. The pre-walk mints a NodeId for the receiver
-            // (the `Access` node itself consumes the same ID as
-            // the receiver — see `typechecking/id.rs` and the
-            // `infer_inner` arm for `Expression::Access`, which
-            // resolves the field through the receiver's type).
-            //
-            // The codegen layout is:
-            //
-            //   <receiver bytecode>  ← do_compile(receiver)
-            //   LoadField field_index
-            //
-            // The receiver is left on the stack by the recursive
-            // call; `LoadField` pops it and pushes
-            // `payload[field_index]` (matching `Unpack`'s
-            // consume-receiver semantics — the receiver itself is
-            // gone after the access).
-            //
-            // The receiver's inferred type tells us which enum
-            // owns the field; the HM typechecker already verified
-            // the access is legal (uniquely-named field, correct
-            // record shape, etc.). We just need the field_index
-            // to build the `LoadField` operand.
-            //
-            // Recovery: if the typechecker rejected the access
-            // (e.g., ambiguous field, no such field, non-record
-            // type), the receiver type isn't a Sum/Constructor/Con
-            // that names an enum. We still emit a LoadField(0)
-            // so the bytecode is well-formed (and the VM's
-            // out-of-bounds no-op on LoadField will silently
-            // skip). The diagnostic is already on the checker.
+            // --- Field access ---
+            // receiver bytecode + LoadField(index) or GetField(name) for dicts.
             Expression::Access(receiver, field) => {
-                // Phase 18D: field-access codegen (Phase 19:
-                // chained-access support).
-                //
-                // `point.x` parses as `Expression::Access(receiver,
-                // "x")`. The codegen layout is:
-                //
-                //   <receiver bytecode>  ← do_compile(receiver)
-                //   LoadField field_index
-                //
-                // The receiver is left on the stack by the
-                // recursive call; `LoadField` pops it and pushes
-                // `payload[field_index]` (matching `Unpack`'s
-                // consume-receiver semantics — the receiver
-                // itself is gone after the access).
-                //
-                // The HM typechecker already verified the access
-                // is legal (uniquely-named field, correct record
-                // shape, etc.). We just need the `field_index` to
-                // build the `LoadField` operand, which requires
-                // knowing the receiver's enum name.
-                //
-                // **Chained accesses (Phase 19).** For `p.x.v`,
-                // the codegen first emits `<p bytecode>;
-                // LoadField(idx_x)` (the inner access), then
-                // `<p.x bytecode>; LoadField(idx_v)` (the OUTER
-                // access). The OUTER access's receiver is
-                // `Access(p, "x")` — `enum_name_for_receiver`
-                // recurses through `receiver_type`, which looks
-                // up the inner receiver's enum (`Outer`) in the
-                // side-table, then calls `field_type_for("Outer",
-                // "x")` to get the type of `x` (`Ty::Con("Inner")`),
-                // then extracts `Inner` from that. The OUTER
-                // `LoadField(idx_v)` is then indexed against
-                // `Inner`, not `Outer` — so `v`'s declaration
-                // position (in `Inner`) is used.
-                //
-                // **Resolving the receiver's type at codegen
-                // time.** The pre-walk and infer pass visit nodes
-                // in slightly different orders inside function
-                // bodies — `infer_function` SKIPS a function's
-                // `args` Fragment (it uses `parse_arg_list` to
-                // read arg types directly instead of recursing
-                // through `infer`), creating an N+1 ID offset
-                // between the pre-walk's ID table and the infer
-                // cache. And `infer_function` POPS its frame
-                // after processing the body, so function args
-                // are gone from the env by codegen time. Both
-                // effects rule out `lookup_at(receiver_id)` and
-                // direct env lookup.
-                //
-                // Instead we use the checker's
-                // `codegen_var_types` side-table — populated by
-                // `infer_function` and `infer_fragment` — which
-                // survives both issues. See
-                // [`enum_name_for_receiver`] for details.
-                //
-                // Recovery: if the receiver is not a simple
-                // Identifier (function call, …) or the side-table
-                // lookup fails, we emit a defensive `LoadField(0)`
-                // so the bytecode stays well-formed for downstream
-                // checks. The typechecker's diagnostic (if any)
-                // was already emitted upstream.
                 bytecode.append(&mut self.do_compile(receiver));
 
-                // Phase 25 — detect `Ty::Record` (anonymous dict)
-                // receivers and route to `GetField` (string-keyed)
-                // instead of `LoadField` (enum-indexed). For record-
-                // shaped enum variants the existing path stays.
                 let receiver_ty = self.receiver_type(receiver);
                 let is_record =
                     matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
@@ -3793,9 +2654,6 @@ impl Compiler {
         let ns = self.namespace.clone();
         self.namespace = module.to_string();
 
-        // Phase 9: run HM inference up-front. The cache populated here
-        // is consulted by `do_compile` for opcode selection (e.g.,
-        // `ADD` vs `ADDF`).
         self.emit_idx = 0;
         self.constants.clear();
         let _program_ty = self.checker.check_program(ast);
@@ -3803,8 +2661,6 @@ impl Compiler {
         let mut program = self.do_compile(ast);
         self.namespace = ns.to_string();
 
-        // Drain the HM checker's messages into the pipeline-visible
-        // message list. The legacy typechecker is gone (Phase 10).
         self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
@@ -3815,63 +2671,22 @@ impl Compiler {
         self.program_start_offset =
             peephole::adjust_target(self.program_start_offset as usize, &fusion_sites) as u32;
 
-        // Phase 29A: callers (the pipeline) need only the
-        // NEW bytes produced by this call, not the
-        // cumulative bytecode. The legacy `self.bytecode.clone()`
-        // return value was correct for single-file
-        // programs (where the caller used `compile_test` /
-        // `compile_src` and expected the prologue + body),
-        // but caused duplication in multi-file programs.
-        //
-        // For backward compatibility with `compile_test` /
-        // `compile_src`, we still return the cumulative
-        // bytecode here. The pipeline (which uses
-        // `compile_src_from_file` + the new
-        // `compile_module` method below) takes the diff.
         self.bytecode.clone()
     }
 
-    /// Phase 29A: compile a module and return ONLY the new
-    /// bytes (not the cumulative bytecode). The pipeline
-    /// uses this for multi-file programs. The returned
-    /// bytes have JMP/CALL operands in absolute form —
-    /// both the compiler's `self.bytecode` and the
-    /// pipeline's `self.bytecode` start with the same
-    /// 3-byte prologue, so absolute operands are valid
-    /// in both contexts.
-    ///
-    /// This is the multi-file-aware counterpart to
-    /// `compile`. Single-file entry points (`compile_test`,
-    /// `compile_src`) still use `compile`.
+    /// Return only bytes appended by this compile (multi-file pipeline).
     pub fn compile_module<'compiler>(
         &mut self,
         module: &str,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
-        // Phase 29A: capture the offset BEFORE the compile
-        // so we can take only the new bytes.
         let pre_compile_len = self.bytecode.len();
         let _ = self.compile(module, ast);
-        // The new bytes are `self.bytecode[pre_compile_len..]`.
-        // Their operands are absolute offsets in
-        // `self.bytecode`. Both the compiler and the
-        // pipeline start with the same 3-byte prologue,
-        // so absolute operands are valid in both contexts
-        // — no operand adjustment is needed.
         self.bytecode[pre_compile_len..].to_vec()
     }
 }
 
-/// Recursively unwrap a `Ty` to extract the enum name (Phase 18D
-/// — `Expression::Access` codegen helper).
-///
-/// Handles:
-///  - `Ty::Con(name)` → returns `Some(name)`.
-///  - `Ty::Sum { name, .. }` → returns `Some(name)`.
-///  - `Ty::Constructor { owner, .. }` → recurses into `owner`.
-///
-/// Returns `None` for primitive types, type variables, function
-/// types, and other shapes that aren't enum references.
+/// Extract enum name from `Ty::Con` / `Ty::Sum` / nested `Ty::Constructor`.
 fn extract_enum_name(ty: &crate::typechecking::ty::Ty) -> Option<String> {
     use crate::typechecking::ty::Ty;
     match ty {
@@ -3905,7 +2720,7 @@ mod tests {
     }
 
     /// Float arithmetic should pick `ADDF` (float) instead of `ADD`
-    /// (int) — that's the whole point of the Phase 9 cache lookup.
+    /// (int) — that's the whole point of the cache lookup.
     #[test]
     fn float_arithmetic_emits_float_opcode() {
         use common::Instruction;
@@ -3988,7 +2803,7 @@ mod tests {
     }
 
     // ============================================================
-    //  Phase 15C: sum types and pattern matching codegen
+    // sum types and pattern matching codegen
     // ============================================================
 
     /// Codegen test 1: a constructor call emits a `MAKE_ENUM`
@@ -4019,10 +2834,10 @@ mod tests {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int) } \
-             match Option::Some(1) { \
-                 Option::None() => 0, \
-                 Option::Some(v) => v, \
-             };",
+ match Option::Some(1) { \
+ Option::None() => 0, \
+ Option::Some(v) => v, \
+ };",
         );
 
         // Two arms, both constructor. Two JUMP_IF_MATCH should
@@ -4054,8 +2869,8 @@ mod tests {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int) } \
-             let x = Option::Some(42); \
-             match x { _ => 42 };",
+ let x = Option::Some(42); \
+ match x { _ => 42 };",
         );
 
         // The wildcard arm is the LAST (and only) arm, reached
@@ -4071,7 +2886,7 @@ mod tests {
         );
     }
 
-    /// Codegen test 4 (Phase 15D.5 — LOW #5): a `match` with a
+    /// Codegen test 4 (LOW #5): a `match` with a
     /// NESTED constructor pattern (`Result::Ok(Option::Some(v))`)
     /// emits at least 2 `UNPACK`s — one for the outer `Result::Ok`
     /// and one for the inner `Option::Some`. The codegen
@@ -4083,11 +2898,11 @@ mod tests {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int) } \
-             enum Result { Ok(Option), Err(string) } \
-             match Result::Ok(Option::Some(1)) { \
-                 Result::Err(_) => 0, \
-                 Result::Ok(Option::Some(v)) => v, \
-             };",
+ enum Result { Ok(Option), Err(string) } \
+ match Result::Ok(Option::Some(1)) { \
+ Result::Err(_) => 0, \
+ Result::Ok(Option::Some(v)) => v, \
+ };",
         );
 
         // The outer match arm (`Result::Ok(Option::Some(v))`) is
@@ -4118,7 +2933,7 @@ mod tests {
     }
 
     // ============================================================
-    //  VM perf: peephole superinstruction fusion
+    // VM perf: peephole superinstruction fusion
     // ============================================================
 
     #[test]
@@ -4168,7 +2983,7 @@ mod tests {
     }
 
     // ============================================================
-    //  Phase 17A: BlockBuilder for Loop and Match codegen
+    // BlockBuilder for Loop and Match codegen
     // ============================================================
     //
     // The 17A refactor moves both the Loop and Match codegen
@@ -4186,7 +3001,7 @@ mod tests {
     // value), and the program would either infinite-loop or
     // jump to the prologue.
 
-    /// Codegen test 5 (Phase 17A): a `while` loop emits
+    /// Codegen test 5 : a `while` loop emits
     /// the structural shape expected by the
     /// BlockBuilder-based codegen — at least 1 JMPF (the
     /// exit condition) and at least 1 JMP (the back-edge).
@@ -4197,11 +3012,11 @@ mod tests {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
-                 let i = 0; \
-                 while (i < 3) { \
-                     i = i + 1; \
-                 } \
-             }",
+ let i = 0; \
+ while (i < 3) { \
+ i = i + 1; \
+ } \
+ }",
         );
 
         // The loop emits: <iterable>, JMPF, <body>, JMP→top.
@@ -4225,7 +3040,7 @@ mod tests {
         );
     }
 
-    /// Codegen test 6 (Phase 17A): the loop's JMP back-edge
+    /// Codegen test 6 : the loop's JMP back-edge
     /// TARGETS the start of the loop, not the prologue. If
     /// the BlockBuilder's `bind_label` for `top_label` were
     /// missed, the JMP would either point at the prologue
@@ -4239,11 +3054,11 @@ mod tests {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
-                 let i = 0; \
-                 while (i < 3) { \
-                     i = i + 1; \
-                 } \
-             }",
+ let i = 0; \
+ while (i < 3) { \
+ i = i + 1; \
+ } \
+ }",
         );
 
         // The loop has exactly one JMPF (the exit) and
@@ -4261,7 +3076,7 @@ mod tests {
         // iterable, not to the very first byte). The
         // body is what `compile_src` returns, so offset
         // 0 is the start of `main` (no prologue in the
-        // returned slice — see the Phase 29A changes
+        // returned slice — see the changes
         // to `Compiler::compile`).
         assert!(
             jmp_target > 0,
@@ -4270,7 +3085,7 @@ mod tests {
         );
     }
 
-    /// Codegen test 7 (Phase 17A): in the BlockBuilder-based
+    /// Codegen test 7 : in the BlockBuilder-based
     /// Match codegen, every non-last constructor arm's
     /// JUMP_IF_MATCH placeholder is bound to that arm's body
     /// offset. If the `bind_label` for some arm's label didn't
@@ -4280,7 +3095,7 @@ mod tests {
     /// `BlockBuilder` placeholder value), and the VM would
     /// jump to the prologue — crashing with a `HALT`.
     ///
-    /// Phase 18C — the JUMP_IF_MATCH target lives in
+    /// the JUMP_IF_MATCH target lives in
     /// `value[31:0]` (a full 32-bit absolute bytecode offset),
     /// NOT in the lower 16 bits of `operands`. The tag is in
     /// `operands[31:16]` (lower 16 bits reserved).
@@ -4289,10 +3104,10 @@ mod tests {
         use common::Instruction;
         let (bc, pool) = compile_src(
             "enum Option { None, Some(int) } \
-             match Option::Some(1) { \
-                 Option::None() => 0, \
-                 Option::Some(v) => v, \
-             };",
+ match Option::Some(1) { \
+ Option::None() => 0, \
+ Option::Some(v) => v, \
+ };",
         );
 
         // Find every JUMP_IF_MATCH. For each, the target
@@ -4319,7 +3134,7 @@ mod tests {
         }
     }
 
-    /// Codegen test 8 (Phase 17A): in the BlockBuilder-based
+    /// Codegen test 8 : in the BlockBuilder-based
     /// Match codegen, the `end_label` is correctly bound to
     /// the position just past the FIRST arm body in source
     /// order. The JMP-to-end placeholder (emitted after
@@ -4332,18 +3147,18 @@ mod tests {
     /// (one for each non-first arm's JMP-to-end), AND that
     /// the LAST arm body has no JMP after it (it's reached
     /// by fall-through from the previous arm's JMP-to-end).
-    /// The pre-17A 15C codegen produced this exact same
+    /// The 15C codegen produced this exact same
     /// shape; the 17A refactor preserves it.
     #[test]
     fn match_jmp_to_end_placeholders_are_patched_to_end_label() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int), Maybe(int) } \
-             match Option::Some(1) { \
-                 Option::None() => 0, \
-                 Option::Some(v) => v, \
-                 Option::Maybe(w) => w, \
-             };",
+ match Option::Some(1) { \
+ Option::None() => 0, \
+ Option::Some(v) => v, \
+ Option::Maybe(w) => w, \
+ };",
         );
 
         // 3 arms → 2 non-first arms → 2 JMP-to-end
@@ -4388,7 +3203,7 @@ mod tests {
         );
     }
 
-    /// Codegen test 9 (Phase 17A): a `match` inside a `while`
+    /// Codegen test 9 : a `match` inside a `while`
     /// loop body — the canonical nested-control-flow
     /// scenario for the BlockBuilder-based codegen. The
     /// 16.5/16.6 If-in-If scenario was the regression that
@@ -4414,16 +3229,16 @@ mod tests {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int) } \
-             fn main() { \
-                 let x = Option::Some(0); \
-                 let i = 0; \
-                 while (i < 3) { \
-                     return match x { \
-                         Option::None() => 0, \
-                         Option::Some(v) => v, \
-                     }; \
-                 } \
-             }",
+ fn main() { \
+ let x = Option::Some(0); \
+ let i = 0; \
+ while (i < 3) { \
+ return match x { \
+ Option::None() => 0, \
+ Option::Some(v) => v, \
+ }; \
+ } \
+ }",
         );
 
         let jmpf_count = bc
@@ -4465,7 +3280,7 @@ mod tests {
     }
 
     // ============================================================
-    //  Phase 17B: record-payload codegen tests
+    // record-payload codegen tests
     // ============================================================
     //
     // The 17B spec listed 6 record-payload codegen tests. The
@@ -4475,7 +3290,7 @@ mod tests {
     // `record_construct_reorders_shuffled_call_site_fields` test
     // that locks in the record-field reordering behavior.
 
-    /// Codegen test 10 (Phase 17B): the red-team's canonical
+    /// Codegen test 10 : the red-team's canonical
     /// record-payload reorder test. The variant is declared as
     /// `Foo { x: int, y: int, z: int }` and the user calls it
     /// with shuffled fields `Foo { z: 1, x: 2, y: 3 }`. The
@@ -4497,7 +3312,7 @@ mod tests {
         let (bc, _pool) = compile_src(
             r#"enum E { Foo { x: int, y: int, z: int } }
 fn main() {
-    print "%i", E::Foo { z: 1, x: 2, y: 3 };
+ print "%i", E::Foo { z: 1, x: 2, y: 3 };
 }"#,
         );
 
@@ -4516,7 +3331,7 @@ fn main() {
             const_operands,
             vec![1, 3, 2],
             "Record fields must be emitted in REVERSE declaration order \
-             so MAKE_ENUM pops them into declaration order at payload[0..]"
+ so MAKE_ENUM pops them into declaration order at payload[0..]"
         );
 
         // Verify MAKE_ENUM has the right tag and arity.
@@ -4530,7 +3345,7 @@ fn main() {
         assert_eq!(arity, 3, "expected arity=3 for Foo {{ x, y, z }}");
     }
 
-    /// Codegen test 11 (Phase 17B): a record construct with one
+    /// Codegen test 11 : a record construct with one
     /// field emits exactly 1 CONST followed by MAKE_ENUM with
     /// arity=1.
     #[test]
@@ -4562,7 +3377,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 12 (Phase 17B): a match pattern with
+    /// Codegen test 12 : a match pattern with
     /// SHUFFLED record fields (`{ y: b, x: a }`) emits STORE
     /// opcodes in DECLARATION order — a first, then b. If the
     /// codegen emitted in pattern-source order, the bindings
@@ -4581,13 +3396,13 @@ fn main() {
         // binding code is not optimized away.
         let (bc, _pool) = compile_src(
             "enum E { Foo { x: int, y: int, z: int } } \
-             fn main() { \
-                 let e = E::Foo { x: 1, y: 2, z: 3 }; \
-                 let v = match e { \
-                     E::Foo { y: _, x: a } => a, \
-                 }; \
-                 print \"%i\", v; \
-             }",
+ fn main() { \
+ let e = E::Foo { x: 1, y: 2, z: 3 }; \
+ let v = match e { \
+ E::Foo { y: _, x: a } => a, \
+ }; \
+ print \"%i\", v; \
+ }",
         );
 
         // The match has one arm. The STORE for `a` should
@@ -4620,7 +3435,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 13 (Phase 17B): a mixed-shape enum with
+    /// Codegen test 13 : a mixed-shape enum with
     /// Unit + Tuple + Record variants compiles with the
     /// correct tags and arities for each variant.
     #[test]
@@ -4630,11 +3445,11 @@ fn main() {
         // bytecode (the codegen is silent on unused `let _`).
         let (bc, _pool) = compile_src(
             "enum E { A, B(int), C { x: int } } \
-             fn main() { \
-                 print \"%i\", E::A; \
-                 print \"%i\", E::B(1); \
-                 print \"%i\", E::C { x: 2 }; \
-             }",
+ fn main() { \
+ print \"%i\", E::A; \
+ print \"%i\", E::B(1); \
+ print \"%i\", E::C { x: 2 }; \
+ }",
         );
 
         // Find all MAKE_ENUM ops (one per construct call,
@@ -4665,11 +3480,11 @@ fn main() {
             tags_arities,
             vec![(0, 0), (1, 1), (2, 1)],
             "expected MAKE_ENUM ops at (tag=0, arity=0) for A (unit), \
-             (tag=1, arity=1) for B(int), and (tag=2, arity=1) for C record variant"
+ (tag=1, arity=1) for B(int), and (tag=2, arity=1) for C record variant"
         );
     }
 
-    /// Codegen test 14 (Phase 17B): a record pattern with a
+    /// Codegen test 14 : a record pattern with a
     /// wildcard field (`_`) emits a POP for the wildcard
     /// sub-pattern instead of a STORE.
     #[test]
@@ -4677,12 +3492,12 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum E { Foo { x: int, y: int } } \
-             fn main() { \
-                 let e = E::Foo { x: 1, y: 2 }; \
-                 match e { \
-                     E::Foo { x: _, y: v } => v, \
-                 }; \
-             }",
+ fn main() { \
+ let e = E::Foo { x: 1, y: 2 }; \
+ match e { \
+ E::Foo { x: _, y: v } => v, \
+ }; \
+ }",
         );
 
         // The wildcard `x: _` produces POP in the binding code.
@@ -4699,7 +3514,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 15 (Phase 17B): a unit-variant match arm
+    /// Codegen test 15 : a unit-variant match arm
     /// (`Empty`) does NOT emit UNPACK (the variant has no
     /// payload). It emits a POP to discard the scrutinee.
     #[test]
@@ -4710,13 +3525,13 @@ fn main() {
         // not UNPACK.
         let (bc, _pool) = compile_src(
             "enum E { Empty, Foo(int) } \
-             fn main() { \
-                 let e = E::Empty; \
-                 match e { \
-                     E::Empty => 0, \
-                     E::Foo(_) => 1, \
-                 }; \
-             }",
+ fn main() { \
+ let e = E::Empty; \
+ match e { \
+ E::Empty => 0, \
+ E::Foo(_) => 1, \
+ }; \
+ }",
         );
 
         // Exactly 1 UNPACK (for the Foo arm, which is the
@@ -4747,10 +3562,10 @@ fn main() {
     }
 
     // ============================================================
-    //  Phase 18A: inner-pattern dispatch regression tests
+    // inner-pattern dispatch regression tests
     // ============================================================
     //
-    // Phase 18A fixes the inner-pattern dispatch for multi-arm match
+    // fixes the inner-pattern dispatch for multi-arm match
     // groups that share the same OUTER variant tag but differ on the
     // INNER sub-pattern. Before 18A, the codegen emitted POP
     // placeholders for nested Constructor sub-patterns in the test
@@ -4760,18 +3575,18 @@ fn main() {
     // runtime inner tag would have picked a different arm).
     //
     // After 18A:
-    //   - `arm_has_runtime_test` is more selective — it only flags
-    //     arms whose inner sub-patterns carry a `Binding` or further
-    //     nested `Constructor` (i.e., the inner pattern actually
-    //     binds a value that needs runtime extraction).
-    //   - `emit_inner_test` emits a real `JUMP_IF_MATCH` for the
-    //     inner tag instead of a POP placeholder, so the runtime
-    //     correctly picks the arm whose inner tag matches.
-    //   - The forward pass keeps the existing behavior (one
-    //     JUMP_IF_MATCH per non-last group + UNPACK for the last
-    //     arm of the last group) — the common case (1 arm per tag,
-    //     all binding/wildcard sub-patterns) produces byte-for-byte
-    //     identical bytecode.
+    // - `arm_has_runtime_test` is more selective — it only flags
+    // arms whose inner sub-patterns carry a `Binding` or further
+    // nested `Constructor` (i.e., the inner pattern actually
+    // binds a value that needs runtime extraction).
+    // - `emit_inner_test` emits a real `JUMP_IF_MATCH` for the
+    // inner tag instead of a POP placeholder, so the runtime
+    // correctly picks the arm whose inner tag matches.
+    // - The forward pass keeps the existing behavior (one
+    // JUMP_IF_MATCH per non-last group + UNPACK for the last
+    // arm of the last group) — the common case (1 arm per tag,
+    // all binding/wildcard sub-patterns) produces byte-for-byte
+    // identical bytecode.
     //
     // These five tests pin down the new behavior at the codegen
     // level. The end-to-end runtime behavior is verified separately
@@ -4780,7 +3595,7 @@ fn main() {
     // `examples/result.0s` after it's extended to two `Result::Ok`
     // arms).
 
-    /// Codegen test 16 (Phase 18A): Case 4 — a multi-arm match
+    /// Codegen test 16 : Case 4 — a multi-arm match
     /// group with two arms sharing the outer tag and BOTH arms
     /// having inner Constructor sub-patterns with bindings emits
     /// ≥2 JUMP_IF_MATCH (one for the outer tag dispatch, one for
@@ -4794,14 +3609,14 @@ fn main() {
         // Binding sub-pattern, which triggers the new test chain.
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int) } \
-             enum E { A(Option) } \
-             fn main() { \
-                 let x = E::A(Option::Some(42)); \
-                 let _ = match x { \
-                     E::A(Option::Some(v)) => v, \
-                     E::A(Option::None) => 0, \
-                 }; \
-             }",
+ enum E { A(Option) } \
+ fn main() { \
+ let x = E::A(Option::Some(42)); \
+ let _ = match x { \
+ E::A(Option::Some(v)) => v, \
+ E::A(Option::None) => 0, \
+ }; \
+ }",
         );
         let jimp_count = bc
             .iter()
@@ -4823,7 +3638,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 17 (Phase 18A): Case 1 — wildcard inner
+    /// Codegen test 17 : Case 1 — wildcard inner
     /// sub-patterns DON'T trigger the new test chain. The runtime
     /// always accepts a wildcard, so a runtime inner test would be
     /// redundant; the codegen keeps the existing layout (just one
@@ -4839,14 +3654,14 @@ fn main() {
         // the codegen keeps the existing layout.
         let (bc, _pool) = compile_src(
             "enum Option { None, Some(int) } \
-             enum E { A(Option) } \
-             fn main() { \
-                 let x = E::A(Option::None); \
-                 let _ = match x { \
-                     E::A(Option::None) => 1, \
-                     E::A(Option::Some(_)) => 2, \
-                 }; \
-             }",
+ enum E { A(Option) } \
+ fn main() { \
+ let x = E::A(Option::None); \
+ let _ = match x { \
+ E::A(Option::None) => 1, \
+ E::A(Option::Some(_)) => 2, \
+ }; \
+ }",
         );
         let jimp_count = bc
             .iter()
@@ -4859,13 +3674,13 @@ fn main() {
         );
     }
 
-    /// Codegen test 18 (Phase 18A): Case 2 — Binding inner
+    /// Codegen test 18 : Case 2 — Binding inner
     /// sub-patterns at the OUTER level (i.e., simple bindings like
     /// `A(v)` with no nested Constructor) DON'T trigger the new
     /// test chain. The codegen keeps the existing layout.
     ///
     /// The user's source for this test uses nested Constructor
-    /// sub-patterns to match the Phase 18A description
+    /// sub-patterns to match the description
     /// (`E::A(Option::Some(v))`, `E::A(Option::None)`). With the
     /// refined `arm_has_runtime_test`, the `Some(v)` arm DOES
     /// trigger a test chain (its inner pattern has a Binding).
@@ -4894,13 +3709,13 @@ fn main() {
         // that sub-pattern, which is a Binding → no runtime test).
         let (bc, _pool) = compile_src(
             "enum E { A(int), B(int) } \
-             fn main() { \
-                 let x = E::A(5); \
-                 let _ = match x { \
-                     E::A(v) => v, \
-                     E::B(v) => v, \
-                 }; \
-             }",
+ fn main() { \
+ let x = E::A(5); \
+ let _ = match x { \
+ E::A(v) => v, \
+ E::B(v) => v, \
+ }; \
+ }",
         );
         let jimp_count = bc
             .iter()
@@ -4909,7 +3724,7 @@ fn main() {
         // For a 2-arm match with unique outer tags, the existing
         // behavior is one JUMP_IF_MATCH (for the non-last arm) + one
         // UNPACK (for the last arm's scrutinee-consumer). The
-        // simple-binding case is unaffected by Phase 18A.
+        // simple-binding case is unaffected by .
         assert_eq!(
             jimp_count, 1,
             "expected 1 JUMP_IF_MATCH (simple bindings keep the existing layout); got {}",
@@ -4917,9 +3732,9 @@ fn main() {
         );
     }
 
-    /// Codegen test 19 (Phase 18A): Case 5 — a match with two
+    /// Codegen test 19 : Case 5 — a match with two
     /// tag groups where one group is multi-arm emits one
-    /// JUMP_IF_MATCH per GROUP (not per arm). The pre-18A codegen
+    /// JUMP_IF_MATCH per GROUP (not per arm). The codegen
     /// emitted one JUMP_IF_MATCH per non-last arm, which would have
     /// produced 2 JUMP_IF_MATCH (one per non-last arm: arm 0 for A
     /// is non-last, arm 1 for B is non-last). After 18A the
@@ -4938,14 +3753,14 @@ fn main() {
         // its arm body).
         let (bc, _pool) = compile_src(
             "enum E { A, B } \
-             fn main() { \
-                 let x = E::A; \
-                 let _ = match x { \
-                     E::A => 1, \
-                     E::B => 2, \
-                     E::A => 3, \
-                 }; \
-             }",
+ fn main() { \
+ let x = E::A; \
+ let _ = match x { \
+ E::A => 1, \
+ E::B => 2, \
+ E::A => 3, \
+ }; \
+ }",
         );
         let jimp_count = bc
             .iter()
@@ -4958,7 +3773,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 20 (Phase 18A): verifies that the test chain
+    /// Codegen test 20 : verifies that the test chain
     /// correctly populates the per-arm `match_bindings` map for
     /// arms with inner Binding sub-patterns. The arm body for the
     /// `Some(v)` arm must be able to read `v` (via `LOAD v`),
@@ -4987,14 +3802,14 @@ fn main() {
         // `v` reference resolves to the slot JUMP_IF_MATCH pushed
         // the inner int into.
         let src = "enum Option { None, Some(int) } \
-                   enum E { A(Option) } \
-                   fn main() { \
-                       let x = E::A(Option::Some(42)); \
-                       let _ = match x { \
-                           E::A(Option::Some(v)) => v, \
-                           E::A(Option::None) => 0, \
-                       }; \
-                   }";
+ enum E { A(Option) } \
+ fn main() { \
+ let x = E::A(Option::Some(42)); \
+ let _ = match x { \
+ E::A(Option::Some(v)) => v, \
+ E::A(Option::None) => 0, \
+ }; \
+ }";
         let ast = Pratt::default().parse(src).expect("parse failed");
         let bc = Compiler::default().compile("test", &ast);
         // The bytecode must include the outer JUMP_IF_MATCH (for A)
@@ -5011,7 +3826,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 21 (Phase 18A — POP-quirk fix): the
+    /// Codegen test 21 (POP-quirk fix): the
     /// reverse pass's `emit_pattern_binding` must NOT emit a
     /// redundant POP for the inner Unit sub-pattern when the
     /// test chain has already consumed the value. Pre-fix, the
@@ -5033,9 +3848,9 @@ fn main() {
     /// pattern (where the first arm triggers the test chain and
     /// the second arm's inner pattern is Unit), the resulting
     /// bytecode has:
-    ///   - 2 JUMP_IF_MATCH (outer Result::Ok + inner Option::Some)
-    ///   - 1 POP for the inner Unit sub-pattern (the test
-    ///     chain's POP, not the reverse pass's redundant POP).
+    /// - 2 JUMP_IF_MATCH (outer Result::Ok + inner Option::Some)
+    /// - 1 POP for the inner Unit sub-pattern (the test
+    /// chain's POP, not the reverse pass's redundant POP).
     ///
     /// The pre-fix codegen would have emitted 2 POPs for the
     /// inner Unit sub-pattern (1 from the test chain + 1 from
@@ -5048,22 +3863,22 @@ fn main() {
         // Constructor with a Binding → triggers the test chain).
         // The second arm's inner pattern is `Option::None` (Unit
         // sub-pattern). The test chain emits:
-        //   - 1 JUMP_IF_MATCH for the outer Result::Ok
-        //   - 1 JUMP_IF_MATCH for the inner Option::Some
-        //   - 1 POP for the inner Option::None (Unit, no pass label)
+        // - 1 JUMP_IF_MATCH for the outer Result::Ok
+        // - 1 JUMP_IF_MATCH for the inner Option::Some
+        // - 1 POP for the inner Option::None (Unit, no pass label)
         //
         // The reverse pass, post-fix, emits 0 POPs for the
         // inner Unit sub-pattern (the test chain handled it).
         // Pre-fix, the reverse pass would emit 1 redundant POP.
         let src = "enum Option { None, Some(int) } \
-                   enum Result { Ok(Option), Err(string) } \
-                   fn main() { \
-                       let x = Result::Ok(Option::Some(42)); \
-                       let _ = match x { \
-                           Result::Ok(Option::Some(v)) => v, \
-                           Result::Ok(Option::None) => 0, \
-                       }; \
-                   }";
+ enum Result { Ok(Option), Err(string) } \
+ fn main() { \
+ let x = Result::Ok(Option::Some(42)); \
+ let _ = match x { \
+ Result::Ok(Option::Some(v)) => v, \
+ Result::Ok(Option::None) => 0, \
+ }; \
+ }";
         let ast = Pratt::default().parse(src).expect("parse failed");
         let bc = Compiler::default().compile("test", &ast);
 
@@ -5099,15 +3914,15 @@ fn main() {
     }
 
     // ============================================================
-    //  Phase 18D: field-access codegen tests
+    // field-access codegen tests
     // ============================================================
     //
-    // The Phase 18D spec locked in 2 codegen tests for the new
+    // The spec locked in 2 codegen tests for the new
     // `Expression::Access` arm. Both verify the bytecode SHAPE
     // (MakeEnum → LoadField) and the operand (field_index) so the
     // runtime extraction reads the right slot.
 
-    /// Codegen test 22 (Phase 18D): a simple field access on a
+    /// Codegen test 22 : a simple field access on a
     /// function parameter emits `MakeEnum` (for the construct in
     /// `main`) followed by `LoadField(0)` (the first field, `x`)
     /// in the function body. If the codegen skipped the receiver
@@ -5118,8 +3933,8 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
-             fn get_x(Point p) -> int { return p.x; } \
-             fn main() { print \"%i\", get_x(Point::Point { x: 42, y: 7 }); }",
+ fn get_x(Point p) -> int { return p.x; } \
+ fn main() { print \"%i\", get_x(Point::Point { x: 42, y: 7 }); }",
         );
 
         // Exactly 1 LoadField (in the get_x function body).
@@ -5146,7 +3961,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 23 (Phase 18D): a field access on a DIFFERENT
+    /// Codegen test 23 : a field access on a DIFFERENT
     /// field of the same record emits `LoadField(1)` — the
     /// declaration position of `y`. The red-team flagged this as
     /// a critical regression test: a buggy codegen that always
@@ -5161,12 +3976,12 @@ fn main() {
         // emits LoadField(1).
         let (bc, _pool) = compile_src(
             "enum Point { Origin, Point { x: int, y: int } } \
-             fn x_coord(Point p) -> int { return p.x; } \
-             fn y_coord(Point p) -> int { return p.y; } \
-             fn main() { \
-                 print \"%i\", x_coord(Point::Point { x: 5, y: 12 }); \
-                 print \"%i\", y_coord(Point::Point { x: 5, y: 12 }); \
-             }",
+ fn x_coord(Point p) -> int { return p.x; } \
+ fn y_coord(Point p) -> int { return p.y; } \
+ fn main() { \
+ print \"%i\", x_coord(Point::Point { x: 5, y: 12 }); \
+ print \"%i\", y_coord(Point::Point { x: 5, y: 12 }); \
+ }",
         );
 
         // Exactly 2 LoadField (one per function body).
@@ -5199,11 +4014,11 @@ fn main() {
     }
 
     // ============================================================
-    //  Phase 18E: let-bound variable codegen tests
+    // let-bound variable codegen tests
     // ============================================================
     //
-    // Phase 18E fixes the `let x = expr;` codegen bug — the
-    // pre-18E `Expression::Variable` codegen emitted no bytecode,
+    // fixes the `let x = expr;` codegen bug — the
+    // `Expression::Variable` codegen emitted no bytecode,
     // so the slot was never explicitly written. The simple case
     // `let x = 5; print x;` worked by coincidence (slot 0
     // coincided with the operand-stack top). Reassignment via
@@ -5220,8 +4035,8 @@ fn main() {
     // (re-assignment picks up the new value, multiple bindings
     // are preserved).
 
-    /// Codegen test 24 (Phase 18E): a simple `let x = expr; print x;`
-    /// emits exactly one `STORE_POP` (the load-bearing store of the
+    /// Codegen test 24 : a simple `let x = expr; print x;`
+    /// emits exactly one `STORE_POP` (the store of the
     /// RHS into `x`'s slot) in addition to the RHS's `CONST`.
     #[test]
     fn let_x_then_print_x_emits_store_pop() {
@@ -5256,7 +4071,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 25 (Phase 18E): two `let` bindings in the same
+    /// Codegen test 25 : two `let` bindings in the same
     /// scope emit two `STORE_POP`s — one per binding, with
     /// distinct slot operands (0 and 1).
     #[test]
@@ -5264,10 +4079,10 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
-                 let x = 5; \
-                 let y = 10; \
-                 print \"%i\", x + y; \
-             }",
+ let x = 5; \
+ let y = 10; \
+ print \"%i\", x + y; \
+ }",
         );
 
         let store_pops: Vec<u32> = bc
@@ -5290,23 +4105,23 @@ fn main() {
         );
     }
 
-    /// Codegen test 26 (Phase 18E): `x = 10;` re-assignment emits
-    /// `STORE_POP slot` (the new load-bearing opcode) — NOT the
-    /// pre-18E `STORE` (a no-op since Phase 15D) + `DUPLICATE`
-    /// shape. The pre-18E codegen would emit `STORE` here, which
+    /// Codegen test 26 : `x = 10;` re-assignment emits
+    /// `STORE_POP slot` (the new opcode) — NOT the
+    /// `STORE` (a no-op since ) + `DUPLICATE`
+    /// shape. The codegen would emit `STORE` here, which
     /// is the red-team's critical regression signature.
     #[test]
     fn let_x_reassignment_emits_store_pop_not_store() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
-                 let x = 5; \
-                 x = 10; \
-             }",
+ let x = 5; \
+ x = 10; \
+ }",
         );
 
         // At least one STORE_POP — the re-assignment for
-        // `x = 10`. The pre-18E codegen would have used
+        // `x = 10`. The codegen would have used
         // STORE here instead.
         let store_pop_count = bc
             .iter()
@@ -5334,10 +4149,10 @@ fn main() {
     }
 
     // ============================================================
-    //  Phase 19: chained field-access codegen tests
+    // chained field-access codegen tests
     // ============================================================
     //
-    // Phase 19 fixes the chained-access limitation: `p.x.v` (where
+    // fixes the chained-access limitation: `p.x.v` (where
     // `p.x` is itself a record-shaped enum) now resolves to the
     // INNER enum's field, not the OUTER enum's. The bytecode
     // shape for a chained access is the same as for two
@@ -5346,11 +4161,11 @@ fn main() {
     // SECOND `LoadField` is indexed against the INNER enum, not
     // the OUTER one.
 
-    /// Codegen test 27 (Phase 19): a chained field access
+    /// Codegen test 27 : a chained field access
     /// (`p.x.v` where `x: Inner`, `v: int`) emits exactly TWO
     /// `LoadField` opcodes in the function body — one for the
     /// inner access (`x`) and one for the OUTER access (`v`).
-    /// The pre-19 codegen would emit only one `LoadField`
+    /// The codegen would emit only one `LoadField`
     /// (followed by a defensive `LoadField(0)` for the OUTER),
     /// silently miscompiling the OUTER access.
     #[test]
@@ -5358,9 +4173,9 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { Inner { v: int } } \
-             enum Outer { Outer { x: Inner, y: int } } \
-             fn get_x_v(Outer o) -> int { return o.x.v; } \
-             fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 }); }",
+ enum Outer { Outer { x: Inner, y: int } } \
+ fn get_x_v(Outer o) -> int { return o.x.v; } \
+ fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 }); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.v`)
@@ -5376,9 +4191,9 @@ fn main() {
         );
     }
 
-    /// Codegen test 28 (Phase 19): the SECOND `LoadField`'s
+    /// Codegen test 28 : the SECOND `LoadField`'s
     /// operand is `0` — `v`'s declaration index in the INNER
-    /// `Inner` enum, NOT something from `Outer`. The pre-19
+    /// `Inner` enum, NOT something from `Outer`. The earlier
     /// codegen would emit `LoadField(0)` as a defensive
     /// fallback, which happens to coincide with `v`'s index
     /// here, so this test alone wouldn't catch the bug. The
@@ -5388,9 +4203,9 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { Inner { v: int, w: int } } \
-             enum Outer { Outer { x: Inner, y: int } } \
-             fn get_x_v(Outer o) -> int { return o.x.v; } \
-             fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
+ enum Outer { Outer { x: Inner, y: int } } \
+ fn get_x_v(Outer o) -> int { return o.x.v; } \
+ fn main() { print \"%i\", get_x_v(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
         );
 
         // Exactly 2 LoadField in the function body.
@@ -5405,8 +4220,8 @@ fn main() {
         );
 
         // Collect every LoadField operand. We expect:
-        //   - First LoadField(0)  — Outer's `x` field index.
-        //   - Second LoadField(0) — Inner's `v` field index.
+        // - First LoadField(0) — Outer's `x` field index.
+        // - Second LoadField(0) — Inner's `v` field index.
         // (Both happen to be 0 because `x` is Outer's first
         // declared field and `v` is Inner's first declared
         // field. The order is determined by the source-order
@@ -5424,12 +4239,12 @@ fn main() {
         );
     }
 
-    /// Codegen test 29 (Phase 19): the critical regression
+    /// Codegen test 29 : the critical regression
     /// test. When the OUTER access's field is at a DIFFERENT
     /// declaration position in the INNER enum than it would
     /// be in the OUTER enum, the codegen must pick the INNER
     /// position. Setup: `Inner.w` is at index 1 (not 0); the
-    /// pre-19 codegen would emit `LoadField(0)` for the OUTER
+    /// codegen would emit `LoadField(0)` for the OUTER
     /// access, silently reading `v` when the user asked for
     /// `w`.
     ///
@@ -5443,9 +4258,9 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { Inner { v: int, w: int } } \
-             enum Outer { Outer { x: Inner, y: int } } \
-             fn get_x_w(Outer o) -> int { return o.x.w; } \
-             fn main() { print \"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
+ enum Outer { Outer { x: Inner, y: int } } \
+ fn get_x_w(Outer o) -> int { return o.x.w; } \
+ fn main() { print \"%i\", get_x_w(Outer::Outer { x: Inner::Inner { v: 42, w: 99 }, y: 7 }); }",
         );
 
         // Exactly 2 LoadField (one for `o.x`, one for `o.x.w`).
@@ -5460,10 +4275,10 @@ fn main() {
         );
 
         // Collect every LoadField operand. We expect:
-        //   - First LoadField(0)  — Outer's `x` field index.
-        //   - Second LoadField(1) — Inner's `w` field index
-        //     (NOT Outer's `y` index — which would be 1 in
-        //     Outer but isn't what the user asked for).
+        // - First LoadField(0) — Outer's `x` field index.
+        // - Second LoadField(1) — Inner's `w` field index
+        // (NOT Outer's `y` index — which would be 1 in
+        // Outer but isn't what the user asked for).
         let field_indices: Vec<u32> = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::LoadField))
@@ -5478,17 +4293,17 @@ fn main() {
     }
 
     // ============================================================
-    //  Phase 18B: nested record patterns — codegen tests
+    // nested record patterns — codegen tests
     // ============================================================
     //
-    // Phase 18B lifts the Phase 17B-cleanup limitation #1
+    // lifts the -cleanup limitation #1
     // (nested record patterns inside an arm body are rejected).
-    // The pre-18B codegen emitted a POP for an inner record
+    // The codegen emitted a POP for an inner record
     // pattern instead of walking its declared fields, so the
     // binding slot for the inner record's fields was never
     // populated and the arm body read garbage values.
     //
-    // These tests guard the Phase 18B codegen for the four
+    // These tests guard the codegen for the four
     // nested-record scenarios called out in the spec:
     //
     // 1. Nested record in tuple: `Result::Ok(Inner { v })`.
@@ -5503,7 +4318,7 @@ fn main() {
     // every record, which would compile and run but bind to
     // the wrong slots).
 
-    /// Codegen test 23 (Phase 18B): a record pattern inside a
+    /// Codegen test 23 : a record pattern inside a
     /// tuple pattern (`Result::Ok(Inner::I { v })`) compiles
     /// cleanly. Pre-18B, the inner `Inner::I { v }` was
     /// silently swallowed (a single POP was emitted for the
@@ -5515,18 +4330,18 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
-             enum Result { Ok(Inner), Err(string) } \
-             match Result::Ok(Inner::I { v: 42 }) { \
-                 Result::Err(_) => 0, \
-                 Result::Ok(Inner::I { v }) => v, \
-             };",
+ enum Result { Ok(Inner), Err(string) } \
+ match Result::Ok(Inner::I { v: 42 }) { \
+ Result::Err(_) => 0, \
+ Result::Ok(Inner::I { v }) => v, \
+ };",
         );
 
         // The OUTER Result::Ok is the last arm (Err is first),
         // so it consumes the scrutinee via UNPACK (not
         // JUMP_IF_MATCH). The INNER Inner::I is a nested
         // constructor with a record payload — the codegen
-        // emits UNPACK for the inner record (Phase 18B), then
+        // emits UNPACK for the inner record , then
         // walks the inner record's declared fields in
         // decl_order and emits STORE for the Binding `v`.
         //
@@ -5539,11 +4354,11 @@ fn main() {
             .count();
         assert!(
             store_count >= 1,
-            "expected at least one STORE for the inner Binding `v`; got {} (pre-18B would emit 0)",
+            "expected at least one STORE for the inner Binding `v`; got {} (would emit 0)",
             store_count
         );
 
-        // The inner record's UNPACK must be present (Phase 18B
+        // The inner record's UNPACK must be present (
         // walks the inner record's declared fields).
         let unpack_count = bc
             .iter()
@@ -5556,7 +4371,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 24 (Phase 18B): a record pattern inside a
+    /// Codegen test 24 : a record pattern inside a
     /// record pattern (`Result::Ok { x: Inner::I { v } }`).
     /// The codegen walks BOTH the OUTER record's and the
     /// INNER record's declared fields in decl_order. Pre-18B,
@@ -5566,11 +4381,11 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
-             enum Result { Ok { x: Inner }, Err(string) } \
-             match Result::Ok { x: Inner::I { v: 42 } } { \
-                 Result::Err(_) => 0, \
-                 Result::Ok { x: Inner::I { v } } => v, \
-             };",
+ enum Result { Ok { x: Inner }, Err(string) } \
+ match Result::Ok { x: Inner::I { v: 42 } } { \
+ Result::Err(_) => 0, \
+ Result::Ok { x: Inner::I { v } } => v, \
+ };",
         );
 
         // The OUTER Result::Ok is the last arm, so the
@@ -5594,7 +4409,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 25 (Phase 18B): depth-3 nested constructor
+    /// Codegen test 25 : depth-3 nested constructor
     /// patterns (`Foo::Bar(Baz::Qux { a: W::W { v } })`).
     /// The codegen recurses at unbounded depth — three levels
     /// of nested constructor patterns, with the innermost being
@@ -5605,12 +4420,12 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum W { W { v: int } } \
-             enum Baz { Qux { a: W } } \
-             enum Foo { Bar(Baz), Other } \
-             match Foo::Bar(Baz::Qux { a: W::W { v: 99 } }) { \
-                 Foo::Other => 0, \
-                 Foo::Bar(Baz::Qux { a: W::W { v } }) => v, \
-             };",
+ enum Baz { Qux { a: W } } \
+ enum Foo { Bar(Baz), Other } \
+ match Foo::Bar(Baz::Qux { a: W::W { v: 99 } }) { \
+ Foo::Other => 0, \
+ Foo::Bar(Baz::Qux { a: W::W { v } }) => v, \
+ };",
         );
 
         // The innermost Binding `v` must produce at least
@@ -5629,7 +4444,7 @@ fn main() {
         );
     }
 
-    /// Codegen test 26 (Phase 18B): a record pattern with an
+    /// Codegen test 26 : a record pattern with an
     /// OMITTED field (`Inner::I { }` instead of `Inner::I { v }`)
     /// emits a POP for the missing field (to keep the stack
     /// consistent with the decl_order walk). Pre-18B, the inner
@@ -5639,11 +4454,11 @@ fn main() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
-             enum Result { Ok(Inner), Err(string) } \
-             match Result::Ok(Inner::I { v: 42 }) { \
-                 Result::Err(_) => 0, \
-                 Result::Ok(Inner::I { }) => 99, \
-             };",
+ enum Result { Ok(Inner), Err(string) } \
+ match Result::Ok(Inner::I { v: 42 }) { \
+ Result::Err(_) => 0, \
+ Result::Ok(Inner::I { }) => 99, \
+ };",
         );
 
         // The pattern omits the `v` field. The codegen walks

@@ -1,3 +1,5 @@
+//! Operand stack, call frames, and mark-and-sweep heap.
+
 // mod allocator;
 mod frame;
 // pub mod garbage;

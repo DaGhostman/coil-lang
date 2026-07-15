@@ -1,76 +1,19 @@
-//! Deferred-target bytecode emission for control flow.
+//! Deferred-target jump patching for control-flow codegen.
 //!
-//! `BlockBuilder` is a placeholder-tracking utility for the codegen pass.
-//! It does NOT own a byte buffer — all bytes are emitted to an external
-//! `Vec<Byte>` (typically `Compiler::bytecode`). BlockBuilder tracks the
-//! positions of placeholder jumps in that external buffer, and patches
-//! their operands when `bind_label` is called.
+//! `BlockBuilder` does not own a byte buffer. All bytes go to an external
+//! `Vec<Byte>` (typically `Compiler::bytecode`); `pending` records absolute
+//! placeholder positions in that buffer and `bind_label` patches them.
+//! This avoids coordinate mismatches when nested emitters (e.g. `Print`)
+//! write directly to `Compiler::bytecode`.
 //!
-//! # Why no local byte buffer?
-//!
-//! The pre-fix design had each `BlockBuilder` own a local `Vec<Byte>`
-//! with an absolute `base` offset. Nested control flow "just worked"
-//! because each child builder was constructed with a base derived from
-//! the parent's local buffer position. In practice this was brittle:
-//!
-//! - `Print` (and `Format`) emit directly to `Compiler::bytecode`,
-//!   NOT to the BlockBuilder's local buffer. A nested `if` inside a
-//!   `print` argument has its body land in `Compiler::bytecode` while
-//!   the BlockBuilder still thinks the body is at `base + local_len`.
-//! - JMPF / JMP placeholders inside a BlockBuilder end up with the
-//!   wrong absolute target if their body was redirected to
-//!   `Compiler::bytecode` mid-emission.
-//!
-//! The fix: BlockBuilder never owns bytes. All bytes go to an external
-//! `Vec<Byte>`; positions recorded in `pending` are absolute positions
-//! in THAT external buffer. Patching on `bind_label` is therefore
-//! trivially correct — no coordinate-system conversion, no `relocate`
-//! post-pass, no nested-control-flow hazard.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let mut bb = BlockBuilder::new();
-//! let mut bytecode: Vec<Byte> = Vec::new();
-//!
-//! // Emit <cond>; placeholder JMPF; will patch to `target` later.
-//! bytecode.extend(self.do_compile(cond));
-//! let jmpf = bb.emit_jump(JumpKind::JumpIfFalse, &mut bytecode);
-//!
-//! // Emit <body>.
-//! bytecode.extend(self.do_compile(body));
-//!
-//! // Patch the JMPF to point at the current end of bytecode.
-//! let end_pos = bytecode.len() as u32;
-//! bb.bind_label(jmpf, end_pos, &mut bytecode);
-//! ```
-//!
-//! # Validation
-//!
-//! [`BlockBuilder::finalize`] returns `Err(BlockError::UnboundLabel(_))`
-//! if any label was targeted by an emitted jump but never bound via
-//! [`BlockBuilder::bind_label`]. Production codegen should `expect()`
-//! the result (a failure here is a programmer error, not a user error).
-//!
-//! # Idempotency
-//!
-//! `bind_label` is **idempotent in this design**: calling it again on
-//! the same label re-patches every pending jump targeting the label
-//! with the new target. (This is intentionally simpler than the
-//! pre-fix non-idempotent design — re-binding is a common case for
-//! forward jumps that move as the body grows, and the simpler
-//! semantics avoids the `rebind_label` distinction.)
+//! `bind_label` is idempotent: rebinding updates every jump to that label.
+//! [`BlockBuilder::finalize`] errors if a targeted label was never bound.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{Byte, Instruction};
 
-/// Opaque handle for a forward-jump target. Two `BlockBuilder`s must
-/// never share labels (label IDs are globally unique within a single
-/// `BlockBuilder`).
-///
-/// We use a separate `Label` type (not `common::Label`, which is for
-/// ariadne diagnostics) to avoid confusion in the codegen.
+/// Opaque forward-jump target (distinct from ariadne's `common::Label`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Label(u32);
 
@@ -83,15 +26,7 @@ impl Label {
     }
 }
 
-/// What kind of jump to emit. Carries enough info to construct the
-/// placeholder. The `target` operand is filled in at `bind_label`
-/// time.
-///
-/// `JumpIfMatch::arity` is accepted for API symmetry with the
-/// instruction's full layout, but the operand only stores the `tag`
-/// (upper 16 bits) and the target offset (lower 16 bits). The VM
-/// reads the real arity from the enum at runtime — see the comment
-/// in `common/src/opcode.rs` for the operand layout.
+/// Jump placeholder kind. The target operand is patched at `bind_label`.
 #[allow(dead_code)] // JumpIfTrue / JumpIfMatch are reserved for future Match codegen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum JumpKind {
@@ -131,52 +66,11 @@ impl std::fmt::Display for BlockError {
 
 impl std::error::Error for BlockError {}
 
-/// A placeholder-tracking utility for deferred-target control-flow
-/// jumps.
-///
-/// # Design
-///
-/// `BlockBuilder` does NOT own a byte buffer. All emitted jumps are
-/// pushed to an external `Vec<Byte>` (typically `Compiler::bytecode`).
-/// The positions of these jumps are recorded in `pending` as ABSOLUTE
-/// positions in that external buffer. When `bind_label` is called,
-/// every pending jump targeting the bound label has its operand
-/// patched to the new target position.
-///
-/// Because positions are tracked in a single coordinate system
-/// (the external buffer), nested control flow "just works": a child
-/// `BlockBuilder` shares the parent's external buffer, so its
-/// placeholders record positions in the same `bytecode.len()`
-/// coordinate system. There is no `relocate` post-pass, no `base`
-/// field, no coordinate-system conversion.
-///
-/// # Invariant
-///
-/// Every [`BlockBuilder::emit_jump`] and
-/// [`BlockBuilder::emit_jump_to`] call allocates or targets a label.
-/// The label must eventually be bound via [`BlockBuilder::bind_label`],
-/// or [`BlockBuilder::finalize`] returns [`BlockError::UnboundLabel`].
-///
-/// # Idempotency of `bind_label`
-///
-/// `bind_label` is **idempotent**: calling it again on the same
-/// label re-patches every pending jump targeting that label with the
-/// new target position. This is useful for forward jumps that move
-/// as the body grows (e.g., a `for` loop body that grows after the
-/// loop header is emitted).
 pub struct BlockBuilder {
-    /// For each label id, the list of absolute positions in the
-    /// external `Vec<Byte>` where jumps targeting this label were
-    /// emitted. The list is NOT cleared by `bind_label` — instead,
-    /// `bind_label` re-patches every position in the list. This is
-    /// the mechanism that makes `bind_label` idempotent.
+    /// label id → bytecode positions of jumps targeting that label
     pending: BTreeMap<u32, Vec<usize>>,
-    /// Set of label ids that have been bound via `bind_label`.
-    /// Used by `finalize` to detect allocated-and-emitted-but-never-
-    /// bound labels. A label that was allocated via `fresh_label`
-    /// but never targeted by any jump is allowed (it's harmless).
+    /// labels that have been bound at least once
     bound: BTreeSet<u32>,
-    /// Monotonically increasing label id allocator.
     next_label_id: u32,
 }
 
@@ -414,9 +308,7 @@ mod tests {
     /// `bind_label(label, 100_000, &mut bc)`, the byte's
     /// `operands` have tag=5 in the upper 16 bits (lower 16
     /// bits reserved) and `value[31:0]` is the patched 32-bit
-    /// target. Phase 18C widened the target from 16 bits to
-    /// 32 bits — this test uses a target > 65,535 to exercise
-    /// the wide-target path.
+    /// target (> 65,535 exercises the wide-target path).
     #[test]
     fn bind_label_preserves_jump_if_match_tag() {
         let mut bb = BlockBuilder::new();
@@ -647,7 +539,7 @@ mod tests {
     /// Emit a jump, bind, then emit another jump targeting the
     /// SAME label. The second emit appends a new entry to
     /// `pending`. A subsequent `bind_label` re-patches BOTH
-    /// jumps. This is the load-bearing idempotency case.
+    /// Rebinding updates all jumps to the same label.
     #[test]
     fn emit_jump_to_after_bind_label_records_new_pending() {
         let mut bb = BlockBuilder::new();

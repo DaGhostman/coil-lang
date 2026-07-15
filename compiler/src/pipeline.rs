@@ -63,35 +63,13 @@ pub struct Pipeline {
     /// regardless of its path on disk. Every other
     /// file gets its path-derived namespace.
     entry_file: Option<PathBuf>,
-    /// Phase 29A — parsed-source cache.
-    ///
-    /// `discover_all` reads each file from disk to
-    /// find its `use`/`mod` declarations. `compile_file`
-    /// then reads the SAME file again to compile it.
-    /// The cache holds the owned source text so the
-    /// second `read_to_string` is avoided.
-    ///
-    /// Implementation: an `Interner<PathBuf>` assigns
-    /// each unique path a small `u32` ID; the source
-    /// text is stored in a `Vec<Option<String>>` indexed
-    /// by ID. Lookup is a Vec index (`O(1)`, no hash).
-    /// Compared to `HashMap<PathBuf, String>` this saves
-    /// the per-entry `PathBuf` hash and bucket overhead,
-    /// and replaces the `String` key with a `u32` copy.
-    ///
-    /// Caching the AST itself would avoid the
-    /// second parse too, but `Output<'parser>` borrows
-    /// from the source — owning the source for the
-    /// entire `compile` call would require `'static`,
-    /// which leaks. The `read_to_string` save is the
-    /// I/O win; re-parsing is fast enough.
+    /// Parsed-source cache: avoids re-reading files between discovery and compile.
     source_interner: common::Interner<PathBuf>,
     source_cache: Vec<Option<String>>,
     compiler: Compiler,
 }
 
-/// A native function declaration registered by the host
-/// (Phase 29A — `Pipeline::register_native_function`).
+/// Native function declaration registered by the host.
 #[derive(Debug, Clone)]
 pub struct NativeDecl {
     pub name: String,
@@ -747,24 +725,7 @@ impl Pipeline {
     /// resulting bytecode, resolving `use` and `mod`
     /// declarations by reading the referenced files from disk.
     ///
-    /// Phase 29A — the new test entry point. Unlike
-    /// [`compile_src`](Self::compile_src), this method:
-    /// 1. Reads the source from `file` (rather than taking
-    ///    a source string in memory).
-    /// 2. Walks the AST to discover `use` and `mod`
-    ///    declarations.
-    /// 3. Resolves each declaration via
-    ///    [`Manifest::resolve_module`] and reads the
-    ///    referenced files (BFS).
-    /// 4. Compiles each file in worklist order, with the
-    ///    file's derived namespace.
-    /// 5. Returns the combined bytecode of all files.
-    ///
-    /// Used by the namespace integration tests
-    /// (`compiler/tests/namespace.rs`) and by any
-    /// downstream user that wants the new project-style
-    /// module discovery without writing a `.c0s` file to
-    /// disk.
+    /// Multi-file entry point: discovers and compiles the module graph from disk.
     pub fn compile_src_from_file(&mut self, file: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let entry = PathBuf::from(file);
         self.entry_file = Some(entry.clone());
@@ -814,9 +775,7 @@ impl Pipeline {
         ))
     }
 
-    /// Borrow the list of natively-registered functions.
-    /// Phase 29A — used by the host to register natives
-    /// with the VM at startup.
+    /// Borrow host-registered native function metadata.
     pub fn natives(&self) -> &[NativeDecl] {
         &self.natives
     }
