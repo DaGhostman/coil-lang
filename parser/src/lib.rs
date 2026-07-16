@@ -855,6 +855,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.if_(stmt.clone()),
                 self.block(stmt.clone()),
                 self.variable().then_ignore(op!(';')),
+                self.constant().then_ignore(op!(';')),
                 self.expr_statement(),
                 self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
@@ -1258,6 +1259,21 @@ impl<'pratt> Pratt<'pratt> {
                 if let Some(v) = val {
                     result.push(v);
                 }
+                (e.span(), Box::new(Expression::Fragment(result)))
+            })
+    }
+
+    fn constant(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("const")
+            .ignore_then(text::ident().map_with(output!(Identifier)))
+            .then(op!(":").ignore_then(self.type_annotation()).or_not())
+            .then_ignore(op!("="))
+            .then(self.expr())
+            .map_with(|((name, ty), val), e| {
+                let result = vec![(e.span(), Box::new(Expression::Constant(name, ty))), val];
                 (e.span(), Box::new(Expression::Fragment(result)))
             })
     }
@@ -1879,6 +1895,37 @@ mod tests {
                 other => panic!("expected for statement, got {:?}", other),
             },
             other => panic!("expected statement wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn const_keyword_parses_to_constant_fragment() {
+        let ast = decl_ast!("const answer = 42;");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::Fragment(children) => {
+                    assert_eq!(children.len(), 2);
+                    match children[0].1.as_ref() {
+                        Expression::Constant(name, ty) => {
+                            assert!(ty.is_none());
+                            match name.1.as_ref() {
+                                Expression::Identifier(name) => assert_eq!(*name, "answer"),
+                                other => panic!("expected const identifier, got {:?}", other),
+                            }
+                        }
+                        other => panic!("expected Constant, got {:?}", other),
+                    }
+                    match children[1].1.as_ref() {
+                        Expression::Expr(inner) => match inner.1.as_ref() {
+                            Expression::Integer(value) => assert_eq!(*value, 42),
+                            other => panic!("expected integer initializer, got {:?}", other),
+                        },
+                        other => panic!("expected expression initializer, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Fragment, got {:?}", other),
+            },
+            other => panic!("expected Statement, got {:?}", other),
         }
     }
 

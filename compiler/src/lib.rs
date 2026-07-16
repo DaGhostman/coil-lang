@@ -1229,22 +1229,31 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(child));
                 });
             }
-            // --- Let bindings ---
+            // --- Let / const bindings ---
             Expression::Fragment(children) => {
-                // `let x = expr` → compile RHS, then StorePop into x's slot.
-                let mut is_let = false;
-                if children.len() == 2
-                    && let Expression::Variable(name, _ty) = &children[0].1.as_ref()
-                {
-                    let slot = self.context.variables.intern(name.to_string()) as u32;
-                    // Emit the RHS.
-                    let mut rhs_bc = self.do_compile(&children[1]);
-                    bytecode.append(&mut rhs_bc);
-                    // Append the explicit store-pop-and-write.
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
-                    is_let = true;
+                // `let x = expr` / `const x = expr` → compile RHS, then
+                // StorePop into x's slot.
+                let mut is_binding = false;
+                if children.len() == 2 {
+                    let binding = match children[0].1.as_ref() {
+                        Expression::Variable(name, _ty) => Some((name.to_string(), false)),
+                        Expression::Constant(name, _ty) => Some((self.resolve_variable(name), true)),
+                        _ => None,
+                    };
+                    if let Some((name, is_const)) = binding {
+                        let slot = self.context.variables.intern(name.clone()) as u32;
+                        if is_const {
+                            self.context.constants.insert(slot as usize, true);
+                        }
+                        // Emit the RHS.
+                        let mut rhs_bc = self.do_compile(&children[1]);
+                        bytecode.append(&mut rhs_bc);
+                        // Append the explicit store-pop-and-write.
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                        is_binding = true;
+                    }
                 }
-                if !is_let {
+                if !is_binding {
                     children.iter().for_each(|child| {
                         bytecode.append(&mut self.do_compile(child));
                     });

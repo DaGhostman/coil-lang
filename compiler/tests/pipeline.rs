@@ -140,6 +140,12 @@ fn example_aliases_prints_3_4_7() {
 }
 
 #[test]
+fn example_const_prints_42hi() {
+    let output = run_example("examples/const.0s");
+    assert_eq!(output, "42hi");
+}
+
+#[test]
 fn example_mixed_prints_zero_circle_square_triangle() {
     let output = run_example("examples/mixed.0s");
     assert_eq!(output, "025122");

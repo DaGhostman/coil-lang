@@ -3,7 +3,7 @@
 //! [`Checker`] owns the substitution, accumulates diagnostics with error
 //! recovery, and caches inferred types keyed by pre-walk [`NodeId`]s.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use common::{Label, Message};
@@ -60,6 +60,10 @@ pub struct Checker {
 
     /// `type Name = T` aliases (substituted at typecheck time).
     type_aliases: std::collections::HashMap<String, Ty>,
+
+    /// Names declared with `const`, tracked per lexical scope so assignment
+    /// diagnostics can distinguish immutable bindings from mutable `let`s.
+    const_scopes: Vec<HashSet<String>>,
 
     // Enum registry: Vec preserves source-declaration order for tags;
     // BTreeMap indexes variant name → tag.
@@ -194,6 +198,7 @@ impl Checker {
             cache: std::collections::HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
             type_aliases: std::collections::HashMap::new(),
+            const_scopes: vec![HashSet::new()],
             enums: BTreeMap::new(),
             enum_tags: BTreeMap::new(),
             enum_payloads: BTreeMap::new(),
@@ -249,6 +254,8 @@ impl Checker {
         self.cache.clear();
         self.codegen_var_types.clear();
         self.type_aliases.clear();
+        self.const_scopes.clear();
+        self.const_scopes.push(HashSet::new());
         self.enums.clear();
         self.enum_tags.clear();
         self.enum_payloads.clear();
@@ -280,7 +287,7 @@ impl Checker {
         }
 
         // Top frame for natives/globals; left on stack after check_program.
-        self.env.push();
+        self.push_scope();
         let ty = self.infer(ast);
         // NOTE: the frame is intentionally NOT popped — see the
         // doc-comment above.
@@ -324,6 +331,33 @@ impl Checker {
     #[allow(dead_code)]
     pub(crate) fn cache(&self) -> impl Iterator<Item = (NodeId, &Ty)> {
         self.cache.iter().map(|(k, v)| (*k, v))
+    }
+
+    fn push_scope(&mut self) {
+        self.env.push();
+        self.const_scopes.push(HashSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        let _ = self.env.pop();
+        let _ = self.const_scopes.pop();
+    }
+
+    fn insert_const_binding(&mut self, name: impl Into<String>) {
+        if self.const_scopes.is_empty() {
+            self.const_scopes.push(HashSet::new());
+        }
+        self.const_scopes
+            .last_mut()
+            .expect("const scope should exist")
+            .insert(name.into());
+    }
+
+    fn is_const_binding(&self, name: &str) -> bool {
+        self.const_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 
     fn coroutine_type(&self, yield_ty: Ty, send_ty: Ty) -> Ty {
@@ -445,12 +479,12 @@ impl Checker {
             // bindings visible after inference. Block introduces its
             // own scope.
             Expression::Block(children) => {
-                self.env.push();
+                self.push_scope();
                 let mut last_ty = unit_ty();
                 for child in children {
                     last_ty = self.infer(child);
                 }
-                self.env.pop();
+                self.pop_scope();
                 last_ty
             }
             Expression::Program(children) => {
@@ -489,7 +523,8 @@ impl Checker {
                         );
                     }
                 };
-                self.env.insert_top(ident, Scheme::mono(var_ty));
+                self.env.insert_top(ident.clone(), Scheme::mono(var_ty));
+                self.insert_const_binding(ident);
                 unit_ty()
             }
 
@@ -1367,7 +1402,24 @@ impl Checker {
                     if let Expression::Identifier(n) = name.1.as_ref() {
                         self.env
                             .insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
-                        self.codegen_var_types.insert(n.to_string(), var_ty);
+                        self.codegen_var_types
+                            .insert(n.to_string(), var_ty.clone());
+                        self.insert_const_binding(n.to_string());
+                        if i + 1 < children.len() {
+                            let next = &children[i + 1];
+                            if !is_declaration_like(next) {
+                                let val_ty = self.infer(next);
+                                self.unify(
+                                    &var_ty,
+                                    &val_ty,
+                                    &child.0.into_range(),
+                                    "const binding",
+                                );
+                                let pruned = apply_ty_prune(&self.subst, &var_ty);
+                                self.codegen_var_types.insert(n.to_string(), pruned);
+                                i += 1;
+                            }
+                        }
                     }
                     last_ty = unit_ty();
                 }
@@ -1408,7 +1460,20 @@ impl Checker {
             Expression::Identifier(n) => {
                 let ident = n.to_string();
                 match self.env.lookup(&ident).cloned() {
-                    Some(s) => instantiate(&s, &mut self.counter),
+                    Some(s) => {
+                        let ty = instantiate(&s, &mut self.counter);
+                        if self.is_const_binding(&ident) {
+                            let mut msg = Message::error(
+                                format!("Cannot assign to constant `{}`", ident),
+                                range,
+                            );
+                            msg.with_help(
+                                "constants are immutable after their initializer".to_string(),
+                            );
+                            self.messages.push(msg);
+                        }
+                        ty
+                    }
                     None => self.error_with_help(
                         format!("Cannot assign to undeclared variable `{}`", ident),
                         range,
@@ -1942,7 +2007,7 @@ impl Checker {
                 .insert_top(owner.to_string(), Scheme::mono(owner_ty.clone()));
         }
 
-        self.env.push();
+        self.push_scope();
         self.env
             .insert_top("self".to_string(), Scheme::mono(owner_ty.clone()));
 
@@ -1978,7 +2043,7 @@ impl Checker {
             }
         }
 
-        self.env.pop();
+        self.pop_scope();
         let _ = range;
     }
 
@@ -2070,7 +2135,7 @@ impl Checker {
         self.env
             .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
 
-        self.env.push();
+        self.push_scope();
         if let Some(self_ty) = self_ty {
             // Method receiver — side-table for codegen Access/Call.
             self.codegen_var_types
@@ -2083,7 +2148,7 @@ impl Checker {
                 .insert(arg_name.clone(), arg_ty.clone());
         }
         let _ = self.infer(body);
-        self.env.pop();
+        self.pop_scope();
 
         if is_coro {
             self.async_depth = prev_async;
@@ -2853,7 +2918,7 @@ impl Checker {
         for arm in arms {
             // Step 1: each arm gets a fresh env frame so the
             // pattern's bindings don't leak.
-            self.env.push();
+            self.push_scope();
 
             // Step 2: type the pattern, binding variables. The
             // pattern AST doesn't carry its own range today, so we
@@ -2891,7 +2956,7 @@ impl Checker {
             }
 
             // Step 6: pop the per-arm env frame.
-            self.env.pop();
+            self.pop_scope();
         }
 
         self.current_match_lhs = prev;
@@ -4664,6 +4729,17 @@ mod tests {
             "help should suggest `let undeclared;`, got: {:?}",
             help
         );
+    }
+
+    #[test]
+    fn assignment_to_const_emits_immutability_diagnostic() {
+        let (mut c, _) = check("const x = 1; x = 2;");
+        let msgs = c.take_messages();
+        let msg = msgs
+            .iter()
+            .find(|m| m.message().contains("Cannot assign to constant `x`"));
+        assert!(msg.is_some(), "got: {:?}", msgs);
+        assert!(msg.unwrap().help().is_some(), "missing help");
     }
 
     #[test]
