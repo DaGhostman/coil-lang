@@ -84,7 +84,7 @@ field_decl      ::= IDENT ':' type
 Examples:
 
 ```0s
-enum Option { None, Some(int) }
+enum Tree { Leaf, Node(int, Tree, Tree) }
 enum Point { Origin, Point { x: int, y: int } }
 enum Tree { Leaf, Node(int, Tree, Tree) }
 ```

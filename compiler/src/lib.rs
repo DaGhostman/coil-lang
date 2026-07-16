@@ -3875,7 +3875,7 @@ mod tests {
     #[test]
     fn construct_emits_make_enum_with_correct_tag_and_arity() {
         use common::Instruction;
-        let (bc, _pool) = compile_src("enum Option { None, Some(int) } let x = Option::Some(42);");
+        let (bc, _pool) = compile_src("let x = Option::Some(42);");
 
         // Find the MAKE_ENUM instruction. Its operands encode
         // (tag, arity) — for `Option::Some(42)`, tag=1, arity=1.
@@ -3896,8 +3896,7 @@ mod tests {
     fn match_emits_jump_if_match_cascade() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int) } \
- match Option::Some(1) { \
+            "match Option::Some(1) { \
  Option::None() => 0, \
  Option::Some(v) => v, \
  };",
@@ -3931,8 +3930,7 @@ mod tests {
     fn wildcard_match_arm_emits_pop() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int) } \
- let x = Option::Some(42); \
+            "let x = Option::Some(42); \
  match x { _ => 42 };",
         );
 
@@ -3960,9 +3958,7 @@ mod tests {
     fn match_with_nested_constructor_pattern_emits_unpack_cascade() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int) } \
- enum Result { Ok(Option), Err(string) } \
- match Result::Ok(Option::Some(1)) { \
+            "match Result::Ok(Option::Some(1)) { \
  Result::Err(_) => 0, \
  Result::Ok(Option::Some(v)) => v, \
  };",
@@ -4372,8 +4368,7 @@ sum = sum + i; \
     fn match_jump_if_match_targets_are_patched_to_arm_offsets() {
         use common::Instruction;
         let (bc, pool) = compile_src(
-            "enum Option { None, Some(int) } \
- match Option::Some(1) { \
+            "match Option::Some(1) { \
  Option::None() => 0, \
  Option::Some(v) => v, \
  };",
@@ -4422,11 +4417,11 @@ sum = sum + i; \
     fn match_jmp_to_end_placeholders_are_patched_to_end_label() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int), Maybe(int) } \
- match Option::Some(1) { \
- Option::None() => 0, \
- Option::Some(v) => v, \
- Option::Maybe(w) => w, \
+            "enum Choice { Empty, Value(int), Maybe(int) } \
+ match Choice::Value(1) { \
+ Choice::Empty() => 0, \
+ Choice::Value(v) => v, \
+ Choice::Maybe(w) => w, \
  };",
         );
 
@@ -4497,8 +4492,7 @@ sum = sum + i; \
     fn nested_match_in_loop_emits_expected_opcodes() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int) } \
- fn main() { \
+            "fn main() { \
  let x = Option::Some(0); \
  let i = 0; \
  while (i < 3) { \
@@ -4874,8 +4868,7 @@ fn main() {
         // inner pattern is `Option::Some(v)` — a Constructor with a
         // Binding sub-pattern, which triggers the new test chain.
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int) } \
- enum E { A(Option) } \
+            "enum E { A(Option) } \
  fn main() { \
  let x = E::A(Option::Some(42)); \
  let _ = match x { \
@@ -4919,8 +4912,7 @@ fn main() {
         // returns false for both arms. No test chain is emitted;
         // the codegen keeps the existing layout.
         let (bc, _pool) = compile_src(
-            "enum Option { None, Some(int) } \
- enum E { A(Option) } \
+            "enum E { A(Option) } \
  fn main() { \
  let x = E::A(Option::None); \
  let _ = match x { \
@@ -5067,8 +5059,7 @@ fn main() {
         // must populate `match_bindings_per_arm` so the arm body's
         // `v` reference resolves to the slot JUMP_IF_MATCH pushed
         // the inner int into.
-        let src = "enum Option { None, Some(int) } \
- enum E { A(Option) } \
+        let src = "enum E { A(Option) } \
  fn main() { \
  let x = E::A(Option::Some(42)); \
  let _ = match x { \
@@ -5136,9 +5127,7 @@ fn main() {
         // The reverse pass, post-fix, emits 0 POPs for the
         // inner Unit sub-pattern (the test chain handled it).
         // Pre-fix, the reverse pass would emit 1 redundant POP.
-        let src = "enum Option { None, Some(int) } \
- enum Result { Ok(Option), Err(string) } \
- fn main() { \
+        let src = "fn main() { \
  let x = Result::Ok(Option::Some(42)); \
  let _ = match x { \
  Result::Ok(Option::Some(v)) => v, \
@@ -5629,7 +5618,6 @@ print \"%i\", len(a); \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
- enum Result { Ok(Inner), Err(string) } \
  match Result::Ok(Inner::I { v: 42 }) { \
  Result::Err(_) => 0, \
  Result::Ok(Inner::I { v }) => v, \
@@ -5680,10 +5668,10 @@ print \"%i\", len(a); \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
- enum Result { Ok { x: Inner }, Err(string) } \
- match Result::Ok { x: Inner::I { v: 42 } } { \
- Result::Err(_) => 0, \
- Result::Ok { x: Inner::I { v } } => v, \
+ enum Wrap { Good { x: Inner }, Bad(string) } \
+ match Wrap::Good { x: Inner::I { v: 42 } } { \
+ Wrap::Bad(_) => 0, \
+ Wrap::Good { x: Inner::I { v } } => v, \
  };",
         );
 
@@ -5753,7 +5741,6 @@ print \"%i\", len(a); \
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "enum Inner { I { v: int } } \
- enum Result { Ok(Inner), Err(string) } \
  match Result::Ok(Inner::I { v: 42 }) { \
  Result::Err(_) => 0, \
  Result::Ok(Inner::I { }) => 99, \

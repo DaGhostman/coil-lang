@@ -280,16 +280,15 @@ fn example_let_reassignment_works() {
 #[test]
 fn let_match_binds_arm_value() {
     let src = r#"
-        enum Opt { None, Some(int) }
         fn main() {
-            let x = match Opt::None {
-                Opt::None => 7,
-                Opt::Some(v) => v,
+            let x = match Option::None {
+                Option::None => 7,
+                Option::Some(v) => v,
             };
             print "%i", x;
-            let y = match Opt::Some(42) {
-                Opt::None => 0,
-                Opt::Some(v) => v,
+            let y = match Option::Some(42) {
+                Option::None => 0,
+                Option::Some(v) => v,
             };
             print "%i", y;
         }
