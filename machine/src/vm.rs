@@ -968,8 +968,8 @@ impl<const S: usize> Machine<S> {
                     if params_count != 0 {
                         let mut params = ArrayVec::<Value, 8>::default();
 
-                        for idx in (0..params_count as usize).rev() {
-                            params[idx] = self.stack.pop();
+                        for _ in 0..params_count as usize {
+                            params.push(self.stack.pop());
                         }
 
                         let ptr = self.stack.pop().as_ptr::<ObjString>();

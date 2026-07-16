@@ -429,6 +429,20 @@ impl<'a> Display for Expression<'a> {
                             .join(", ")
                     ))
             ),
+            Self::Format(fmt, params) => write!(
+                f,
+                "format {}{}",
+                fmt.borrow().1,
+                params
+                    .clone()
+                    .map_or(String::default(), |p: Vec<Output<'a>>| format!(
+                        ", {}",
+                        p.iter()
+                            .map(|p| p.1.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    ))
+            ),
             Self::Dload(path) => write!(f, "dload({})", path.1),
             Self::Done(handle) => write!(f, "done({})", handle.1),
             Self::Tuple(items) => write!(

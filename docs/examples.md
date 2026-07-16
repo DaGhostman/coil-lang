@@ -50,6 +50,27 @@ fn main() {
 
 ---
 
+### `examples/string_fmt.0s`
+
+**Demonstrates:** String concatenation with `+` and the `format` expression returning a string.
+
+```0s
+fn main() {
+    let a = "hello";
+    let b = "world";
+    print "%s", a + " " + b;
+    let s = format "%i-%s", 42, "x";
+    print "%s", s;
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/string_fmt.0s` |
+| **Output** | `hello world42-x` |
+
+---
+
 ### `examples/let_test.0s`
 
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).

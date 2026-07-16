@@ -845,8 +845,13 @@ impl Compiler {
     }
 
     fn emit_field_name(&self, bytecode: &mut Vec<Byte>, field: &str) {
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32));
-        for ch in field.chars() {
+        Self::emit_raw_string_literal(bytecode, field);
+    }
+
+    fn emit_raw_string_literal(bytecode: &mut Vec<Byte>, value: &str) {
+        bytecode
+            .push(Byte::new(Instruction::STRING).with_operand_u32(value.chars().count() as u32));
+        for ch in value.chars() {
             bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
         }
     }
@@ -863,13 +868,57 @@ impl Compiler {
             .map(|s| s as u32)
     }
 
-    fn is_float_ty(&self, node: &Output) -> bool {
+    fn is_float_ty(&self, _node: &Output) -> bool {
         let id = self.checker.id_table().ids()[self.emit_idx];
         matches!(
             self.checker.lookup_at(id),
             Some(crate::typechecking::ty::Ty::Con(ref name))
                 if name == crate::typechecking::ty::FLOAT
         )
+    }
+
+    fn is_string_expr(&self, node: &Output) -> bool {
+        matches!(
+            self.codegen_expr_ty(node),
+            Some(Ty::Con(ref name)) if name == crate::typechecking::ty::STRING
+        )
+    }
+
+    fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
+        match node.1.as_ref() {
+            Expression::String(_) | Expression::Format(_, _) => {
+                Some(Ty::Con(crate::typechecking::ty::STRING.into()))
+            }
+            Expression::Identifier(name) => self
+                .checker
+                .codegen_var_type(name)
+                .cloned()
+                .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
+            Expression::Add(lhs, rhs) if self.is_string_expr(lhs) && self.is_string_expr(rhs) => {
+                Some(Ty::Con(crate::typechecking::ty::STRING.into()))
+            }
+            Expression::Access(receiver, field) => {
+                let receiver_ty = self.receiver_type(receiver)?;
+                if let Ty::Record { fields } = &receiver_ty {
+                    return fields
+                        .iter()
+                        .find(|(name, _)| name == field)
+                        .map(|(_, ty)| ty.clone());
+                }
+                if let Ty::Con(name) = &receiver_ty {
+                    if self.checker.is_class(name) {
+                        return self.checker.class_field_ty(name, field).cloned();
+                    }
+                }
+                extract_enum_name(&receiver_ty)
+                    .and_then(|name| self.checker.field_type_for(&name, field))
+            }
+            Expression::Expr(inner)
+            | Expression::Group(inner)
+            | Expression::Statement(inner)
+            | Expression::ExprStatement(inner) => self.codegen_expr_ty(inner),
+            _ => None,
+        }
     }
 
     fn binop_for_assign_op(op: parser::ast::AssignOp, is_float: bool) -> Instruction {
@@ -987,6 +1036,18 @@ impl Compiler {
         op: parser::ast::AssignOp,
         rhs: &Output,
     ) {
+        if matches!(op, parser::ast::AssignOp::Add)
+            && self.is_string_expr(target)
+            && self.is_string_expr(rhs)
+        {
+            Self::emit_raw_string_literal(bytecode, "%s%s");
+            let _ = self.emit_read_lvalue(bytecode, target);
+            bytecode.append(&mut self.do_compile(rhs));
+            bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
+            self.emit_write_lvalue(bytecode, target, false);
+            return;
+        }
+
         if let Expression::Index(arr, idx) = target.1.as_ref() {
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
@@ -2149,12 +2210,19 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::ADDF
+                if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
+                    Self::emit_raw_string_literal(&mut bytecode, "%s%s");
+                    bytecode.append(&mut self.do_compile(lhs));
+                    bytecode.append(&mut self.do_compile(rhs));
+                    bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
                 } else {
-                    Instruction::ADD
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::ADDF
+                    } else {
+                        Instruction::ADD
+                    }));
+                }
             }
             Expression::Sub(lhs, rhs) => {
                 let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
@@ -3475,6 +3543,28 @@ mod tests {
         assert!(
             has_int_add && !has_float_add,
             "expected int ADD for integer arithmetic"
+        );
+    }
+
+    #[test]
+    fn string_addition_emits_format_not_add() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("\"a\" + \"b\";");
+
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::FORMAT)),
+            "expected string addition to lower through FORMAT"
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::ADD
+                    | Instruction::ADDF
+                    | Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+            )),
+            "string addition should not emit numeric addition opcodes"
         );
     }
 

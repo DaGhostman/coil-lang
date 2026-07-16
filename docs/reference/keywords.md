@@ -15,6 +15,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `while` | Statement | Loop while condition true | [Syntax — Statements](syntax.md#statements) |
 | `return` | Statement | Exit function with value | [Syntax — Statements](syntax.md#statements) |
 | `print` | Statement / I/O | Print to stdout | [Built-ins](built-ins.md#print) |
+| `format` | Expression / I/O | Build a formatted string | [Built-ins](built-ins.md#format) |
 | `enum` | Declaration | Sum type definition | [Types — Sum types](types.md#sum-types--enums-tysum) |
 | `match` | Expression | Pattern match | [Syntax — Patterns](syntax.md#patterns-match) |
 | `default` | Pattern | Wildcard arm (same as `_`) | [Syntax — Patterns](syntax.md#patterns-match) |
@@ -64,7 +65,7 @@ Appear inside `{ ... }` blocks via `statement()`.
 ## Expression / literal keywords
 
 ```
-match | new | true | false | dload | declare | invoke | yield | resume
+match | new | true | false | format | dload | declare | invoke | yield | resume
 ```
 
 Parsed as **atoms** before the generic `ident()` rule so they are never treated as variable names.
@@ -98,7 +99,6 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 | Word | Notes |
 |------|-------|
 | `const` | AST node exists; no `const` keyword in parser — use `let` |
-| `format` | Internal AST for format-string codegen; no user-facing keyword |
 | `async` | Coroutine opcodes in VM; parser not wired |
 | `yield` | Same |
 | `resume` | Same |

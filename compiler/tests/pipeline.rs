@@ -146,6 +146,24 @@ fn example_const_prints_42hi() {
 }
 
 #[test]
+fn string_fmt_example_prints_concatenated_and_formatted_strings() {
+    let output = run_example("examples/string_fmt.0s");
+    assert_eq!(output, "hello world42-x");
+}
+
+#[test]
+fn string_plus_equal_updates_binding() {
+    let output = run_example_src(
+        r#"fn main() {
+            let s = "a";
+            s += "b";
+            print "%s", s;
+        }"#,
+    );
+    assert_eq!(output, "ab");
+}
+
+#[test]
 fn example_mixed_prints_zero_circle_square_triangle() {
     let output = run_example("examples/mixed.0s");
     assert_eq!(output, "025122");

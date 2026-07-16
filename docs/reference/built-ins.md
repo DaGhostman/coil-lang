@@ -11,13 +11,14 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | Builtin | Kind | Purpose |
 |---------|------|---------|
 | `print` | Statement | Write to stdout |
+| `format` | Expression | Build a formatted string |
 | `dload` | Expression | `dlopen` a shared library |
 | `declare` | Expression | Register FFI function signature |
 | `invoke` | Expression | Call registered FFI function |
 | `done` | Expression | `true` if a coroutine handle is finished |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
-Internal (not user syntax): `FORMAT` opcode used by `print` with specifiers; `Expression::Format` in AST without a `format` keyword.
+Internal: the `FORMAT` opcode powers both `print` and the `format` expression.
 
 ---
 
@@ -70,6 +71,23 @@ print "100%% complete";   // literal percent via %%
 2. `PRINT` pops the string and writes to stdout (or a redirected writer in tests).
 
 See [Tutorial 01](../tutorial/01-basics.md) for introductory usage.
+
+---
+
+## `format`
+
+### Syntax
+
+```
+format_expr ::= 'format' STRING (',' expr)*
+```
+
+`format` uses the same specifier rules as `print`, but returns the formatted `string` instead of writing to stdout.
+
+```0s
+let s = format "%i-%s", 42, "x";
+print "%s", s; // 42-x
+```
 
 ---
 
@@ -235,7 +253,7 @@ There is **no general standard library** yet. The following are **not** built-in
 | Category | Examples |
 |----------|----------|
 | Collections API | `len`, `push`, `sort`, iterators |
-| String ops | concat (`+`), slice, trim (except `print` formatting) |
+| String ops | slice, trim |
 | Math | `sin`, `sqrt`, `random` |
 | File I/O | `read_file`, `write_file` |
 | Networking | sockets, HTTP |

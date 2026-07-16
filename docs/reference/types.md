@@ -16,6 +16,8 @@ zero-script uses **Hindley–Milner (Algorithm W)** type inference with optional
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
+Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print`.
+
 ---
 
 ## Type constructors (`Ty::Con`)

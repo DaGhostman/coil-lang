@@ -14,7 +14,9 @@ use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::Scheme;
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
-use super::ty::{EnumVariantPayloadTy, Ty, boolean, float, int, list, string, unit as unit_ty};
+use super::ty::{
+    EnumVariantPayloadTy, STRING, Ty, boolean, float, int, list, string, unit as unit_ty,
+};
 use super::unify::{UnifyError, unify_with};
 
 #[cfg(test)]
@@ -768,7 +770,7 @@ impl Checker {
             }
             Expression::Format(fmt, params) => {
                 self.infer_print(fmt, params, range, "format");
-                unit_ty()
+                string()
             }
 
             // ---- Userland FFI builtins ----
@@ -1435,6 +1437,18 @@ impl Checker {
     fn infer_arith(&mut self, lhs: &Output, rhs: &Output, range: Range<usize>, op: &str) -> Ty {
         let lt = self.infer(lhs);
         let rt = self.infer(rhs);
+        if op == "+" {
+            let lp = apply_ty_prune(&self.subst, &lt);
+            let rp = apply_ty_prune(&self.subst, &rt);
+            let left_string = is_string_ty(&lp);
+            let right_string = is_string_ty(&rp);
+            if left_string && right_string {
+                return string();
+            }
+            if left_string || right_string {
+                return self.unify(&lt, &rt, &range, "operands of `+`");
+            }
+        }
         self.unify(&lt, &rt, &range, &format!("operands of `{}`", op))
     }
 
@@ -3758,6 +3772,10 @@ fn format_specifier_type(spec: char) -> &'static str {
     }
 }
 
+fn is_string_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Con(name) if name == STRING)
+}
+
 /// True if `ty` (already resolved under the substitution) is the
 /// type expected by `spec`.
 fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
@@ -5288,6 +5306,26 @@ mod tests {
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn addition_of_strings_is_string() {
+        assert_ok("\"hello\" + \"world\"", string());
+    }
+
+    #[test]
+    fn string_plus_int_errors() {
+        let msgs = assert_messages("\"hello\" + 42;");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "expected string+int type mismatch, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_expression_returns_string() {
+        assert_ok("format \"%i-%s\", 42, \"x\"", string());
     }
 
     // ---- Inner-pattern reachability ----

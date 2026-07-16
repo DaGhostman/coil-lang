@@ -47,7 +47,7 @@ Forms **not** in the Pratt table but still tight-binding:
 
 | Operator | Types | Result | VM op (int / float) |
 |----------|-------|--------|---------------------|
-| `+` | `int` / `float` (both same) | same | `ADD` / `ADDF` |
+| `+` | `int` / `float` (both same), or `string` + `string` | same | `ADD` / `ADDF`; strings lower through `FORMAT "%s%s"` |
 | `-` | `int` / `float` | same | `SUB` / `SUBF` |
 | `*` | `int` / `float` | same | `MUL` / `MULF` |
 | `/` | `int` / `float` | same | `DIV` / `DIVF` |
@@ -56,7 +56,14 @@ Forms **not** in the Pratt table but still tight-binding:
 
 Mixed `int` and `float` operands → **type error** at compile time.
 
-String concatenation with `+` is **not** implemented in the current language tree.
+String concatenation uses `+`:
+
+```0s
+let s = "hello" + " " + "world";
+s += "!";
+```
+
+Mixing `string` with a non-string operand is a compile-time type error.
 
 ---
 

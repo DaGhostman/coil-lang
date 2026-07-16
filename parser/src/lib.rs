@@ -189,6 +189,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.invoke_(expr.clone()),
                 self.resume_(expr.clone()),
                 self.yield_expr_(expr.clone()),
+                self.format_expr(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
@@ -687,6 +688,27 @@ impl<'pratt> Pratt<'pratt> {
                     .or_not(),
             )
             .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Print(fmt, params))))
+    }
+
+    fn format_expr<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("format")
+            .labelled("format expression")
+            .ignore_then(self.string())
+            .then(
+                expr.separated_by(op!(','))
+                    .allow_leading()
+                    .collect::<Vec<_>>()
+                    .or_not(),
+            )
+            .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Format(fmt, params))))
     }
 
     // ============================================================
@@ -1827,6 +1849,20 @@ mod tests {
         stmt!("print \"Hello, World!\";");
         stmt!("defer { print \"%i\", 42; }");
         stmt!("while x < 10 { x = x + 1; }");
+    }
+
+    #[test]
+    fn format_keyword_parses_as_expression() {
+        same!("format \"%i-%s\", 42, \"x\"");
+        let ast = expr_ast!("format \"%i-%s\", 42, \"x\"");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Format(_, Some(params)) => assert_eq!(params.len(), 2),
+            other => panic!("expected format expression, got {:?}", other),
+        }
     }
 
     #[test]
