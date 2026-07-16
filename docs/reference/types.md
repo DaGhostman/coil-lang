@@ -277,7 +277,6 @@ a stale value.
 | Area | Limitation |
 |------|------------|
 | Type aliases | No lexical scoping; duplicate names silently overwrite |
-| Records | `SetField` mutation is limited — prefer fresh `MakeDict` values for reliable semantics |
 | Classes | Nominal typing partial; limited runtime method dispatch |
 | FFI | Only `int`, `float`, `string`, `void` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | No user-defined generic types |

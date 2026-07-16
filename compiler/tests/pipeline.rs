@@ -286,6 +286,22 @@ fn dict_string_field_round_trips() {
     assert_eq!(output, "hi9");
 }
 
+/// Phase P1: in-place dict mutation via `d.field = value` then re-read.
+#[test]
+fn dict_mutation_round_trips() {
+    let src = r#"
+        fn main() {
+            let d = { foo: 1, name: "a" };
+            d.foo = 99;
+            d.name = "z";
+            print "%i", d.foo;
+            print "%s", d.name;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "99z");
+}
+
 #[test]
 fn example_let_chained_bindings_works() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
