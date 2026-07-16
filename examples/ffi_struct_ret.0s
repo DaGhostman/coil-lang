@@ -1,0 +1,21 @@
+// examples/ffi_struct_ret.0s — FFI struct return via make_point.
+//
+// Output: 34  (Point { x: 3, y: 4 } fields)
+
+extern struct Point {
+    x: int32,
+    y: int32,
+};
+
+fn main() {
+    let lib = dload("libsum.so");
+    let make_id = declare(
+        lib,
+        "make_point",
+        (FFIType::Int32, FFIType::Int32),
+        Point,
+    );
+    let p = invoke(lib, make_id, (3, 4));
+    print "%i", p.x;
+    print "%i", p.y;
+}

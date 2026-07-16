@@ -48,3 +48,25 @@ typedef int64_t (*int64_fn_int64)(int64_t);
 int64_t apply_cb(int64_fn_int64 cb, int64_t x) {
     return cb(x);
 }
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+} Point;
+
+/// Return a small C struct by value (for FFI struct-return tests).
+Point make_point(int32_t x, int32_t y) {
+    Point p;
+    p.x = x;
+    p.y = y;
+    return p;
+}
+
+static int64_t doubler(int64_t x) {
+    return x * 2;
+}
+
+/// Return a C function pointer (opaque Ptr / Callback to zero-script).
+int64_fn_int64 get_doubler(void) {
+    return &doubler;
+}

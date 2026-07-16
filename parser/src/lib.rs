@@ -1251,23 +1251,30 @@ impl<'pratt> Pratt<'pratt> {
         expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // A tuple is `at_least(2)` items separated by commas,
-        // OR exactly 1 item with a trailing comma. Either way,
-        // a comma must be present inside the parens.
+        // A tuple is:
+        //   - `()` (empty — used by zero-arity FFI declare/invoke),
+        //   - `at_least(2)` items separated by commas, or
+        //   - exactly 1 item with a trailing comma.
+        // Non-empty forms still require a comma so `(1)` stays a group.
         use chumsky::Parser;
+        let empty = op!('(')
+            .ignore_then(op!(')'))
+            .to(Vec::new())
+            .labelled("empty tuple");
         let two_or_more = expr
             .clone()
             .separated_by(op!(','))
             .allow_trailing()
             .at_least(2)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .delimited_by(op!('('), op!(')'));
         let one_with_trailing = expr
             .clone()
             .then_ignore(op!(','))
             .map(|e| vec![e])
-            .labelled("single-element tuple");
-        choice((two_or_more, one_with_trailing))
             .delimited_by(op!('('), op!(')'))
+            .labelled("single-element tuple");
+        choice((empty, two_or_more, one_with_trailing))
             .map_with(|items, e| (e.span(), Box::new(Expression::Tuple(items))))
             .labelled("tuple")
     }

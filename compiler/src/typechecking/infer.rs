@@ -91,6 +91,10 @@ pub struct Checker {
 
     /// Callback signature descriptors (index = aux id on `FFIType::Callback`).
     callback_sigs: Vec<CallbackSigDef>,
+
+    /// Return type recorded for `let id = declare(..., ret)` bindings so
+    /// subsequent `invoke(..., id, ...)` can refine its result type.
+    ffi_fn_ret_tys: HashMap<String, Ty>,
 }
 
 /// C-layout struct registered via `extern struct Name { ... }`.
@@ -202,6 +206,7 @@ impl Checker {
             yield_receives_used: false,
             c_structs: Vec::new(),
             callback_sigs: Vec::new(),
+            ffi_fn_ret_tys: HashMap::new(),
         };
         checker.register_builtin_ffi_type();
         checker
@@ -250,6 +255,7 @@ impl Checker {
         self.enum_arities.clear();
         self.c_structs.clear();
         self.callback_sigs.clear();
+        self.ffi_fn_ret_tys.clear();
         self.pending_exhaustive.clear();
         self.async_functions.clear();
         self.async_depth = 0;
@@ -879,11 +885,11 @@ impl Checker {
                     self.infer(&args[0]);
                     self.infer(&args[1]);
                     match args[2].1.as_ref() {
-                        Expression::Tuple(items) => {
-                            for item in items {
-                                self.infer(item);
-                                self.require_ffi_type_expr(item);
-                            }
+                        Expression::Tuple(_) => {
+                            // Consume the Tuple node + each element as
+                            // FFI type tags (not values). Bare names like
+                            // `Point` / `int32` are type tags here.
+                            self.infer_ffi_type_expr(&args[2]);
                         }
                         _ => {
                             let mut m = Message::error(
@@ -899,8 +905,7 @@ impl Checker {
                             self.messages.push(m);
                         }
                     }
-                    self.infer(&args[3]);
-                    self.require_ffi_type_expr(&args[3]);
+                    self.infer_ffi_type_expr(&args[3]);
                 } else {
                     for arg in args {
                         self.infer(arg);
@@ -919,14 +924,19 @@ impl Checker {
                 int()
             }
             // `invoke(lib, fn_id, (v1, v2, ...))` — calls a
-            // previously-declared function and pushes its
-            // return value (or nothing for `void`). Returns
-            // `int` (the codegen doesn't narrow further — the
-            // user knows what they registered).
+            // previously-declared function. Result type is refined
+            // from `let id = declare(..., ret)` when `fn_id` is that
+            // binding; otherwise falls back to `int`.
             Expression::Invoke(args) => {
+                let mut ret_ty = int();
                 if args.len() == 3 {
                     self.infer(&args[0]);
                     self.infer(&args[1]);
+                    if let Expression::Identifier(name) = args[1].1.as_ref() {
+                        if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
+                            ret_ty = ty.clone();
+                        }
+                    }
                     match args[2].1.as_ref() {
                         Expression::Tuple(items) => {
                             for item in items {
@@ -960,7 +970,7 @@ impl Checker {
                     ));
                     self.messages.push(m);
                 }
-                int()
+                ret_ty
             }
 
             // ---- Defer / coroutines / list ----
@@ -1320,6 +1330,21 @@ impl Checker {
                             }
                             let val_ty = self.infer(next);
                             self.unify(&var_ty, &val_ty, &child.0.into_range(), "let binding");
+                            // Keep the side-table in sync with the unified type
+                            // so Access codegen sees Record/enum types, not the
+                            // pre-unify fresh variable.
+                            let pruned = apply_ty_prune(&self.subst, &var_ty);
+                            self.codegen_var_types
+                                .insert(name.to_string(), pruned);
+                            // `let id = declare(...)` may wrap Declare in
+                            // ExprStatement/Statement — unwrap before matching.
+                            let init = unwrap_expr_wrappers(next);
+                            if let Expression::Declare(dargs) = init.1.as_ref() {
+                                if dargs.len() == 4 {
+                                    let ret = self.ty_from_ffi_type_expr(&dargs[3]);
+                                    self.ffi_fn_ret_tys.insert(name.to_string(), ret);
+                                }
+                            }
                             i += 1;
                         }
                     }
@@ -1770,6 +1795,88 @@ impl Checker {
             expr.0.into_range(),
         ));
         self.messages.push(m);
+    }
+
+    /// Infer an FFI type-tag expression (declare arg/ret positions).
+    ///
+    /// Consumes NodeIds in pre-walk order without treating bare names
+    /// like `Point` / `int32` as value lookups. Nested Tuple / Array /
+    /// Construct children are walked the same way (or via normal
+    /// `infer` for `FFIType::X` constructors, which are real enum
+    /// constructs).
+    fn infer_ffi_type_expr(&mut self, expr: &Output) {
+        self.require_ffi_type_expr(expr);
+        match expr.1.as_ref() {
+            Expression::Identifier(_) | Expression::Type(_) => {
+                let id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                let ty = self.ty_from_ffi_type_expr(expr);
+                self.cache.insert(id, ty);
+            }
+            Expression::Tuple(items) => {
+                let id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                self.cache.insert(id, unit_ty());
+                for item in items {
+                    self.infer_ffi_type_expr(item);
+                }
+            }
+            Expression::Array(items) => {
+                let id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                self.cache.insert(id, unit_ty());
+                for item in items {
+                    // Element annotations are `Type` / nested forms.
+                    self.infer_ffi_type_expr(item);
+                }
+            }
+            // `FFIType::Int`, etc. — real Construct nodes; use normal infer
+            // so enum constructor typing + child IDs stay aligned.
+            _ => {
+                let _ = self.infer(expr);
+            }
+        }
+    }
+
+    /// Map an FFI type tag expression to the language `Ty` used for
+    /// `invoke` result typing (void → unit, structs → structural record).
+    fn ty_from_ffi_type_expr(&self, expr: &Output) -> Ty {
+        use common::tag;
+        match self.ffi_type_tag_from_output(expr) {
+            Some((t, _)) if t == tag::VOID => unit_ty(),
+            Some((t, _)) if t == tag::FLOAT => float(),
+            Some((t, _)) if t == tag::STRING => string(),
+            Some((t, _)) if t == tag::BOOL => boolean(),
+            Some((t, id)) if t == tag::STRUCT => {
+                if let Some(def) = self.c_structs.get(id as usize) {
+                    let fields = def
+                        .fields
+                        .iter()
+                        .map(|(name, enc)| {
+                            let tag = if *enc <= tag::STRUCT {
+                                *enc
+                            } else {
+                                *enc & 0xFFFF
+                            };
+                            let fty = match tag {
+                                t if t == tag::FLOAT => float(),
+                                t if t == tag::STRING => string(),
+                                t if t == tag::BOOL => boolean(),
+                                t if t == tag::VOID => unit_ty(),
+                                // int / int32 / ptr / … — treat as int at the
+                                // language level (narrow C widths are ABI-only).
+                                _ => int(),
+                            };
+                            (name.clone(), fty)
+                        })
+                        .collect();
+                    crate::typechecking::ty::record(fields)
+                } else {
+                    int()
+                }
+            }
+            _ => int(),
+        }
     }
 
     // ============================================================
@@ -3591,6 +3698,18 @@ fn is_yield_expression(node: &Output) -> bool {
         Expression::Yield(_) => true,
         Expression::Expr(e) | Expression::Group(e) => is_yield_expression(e),
         _ => false,
+    }
+}
+
+/// Peel `Expr` / `Group` / `Statement` / `ExprStatement` wrappers so
+/// fragment initializers can match the underlying `Declare` / `Invoke`.
+fn unwrap_expr_wrappers<'a>(node: &'a Output<'a>) -> &'a Output<'a> {
+    match node.1.as_ref() {
+        Expression::Expr(e)
+        | Expression::Group(e)
+        | Expression::Statement(e)
+        | Expression::ExprStatement(e) => unwrap_expr_wrappers(e),
+        _ => node,
     }
 }
 
@@ -5804,4 +5923,45 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn declare_struct_ret_recorded_for_invoke_typing() {
+        let src = r#"
+extern struct Point {
+    x: int32,
+    y: int32,
+};
+
+fn main() {
+    let lib = dload("libsum.so");
+    let make_id = declare(
+        lib,
+        "make_point",
+        (FFIType::Int32, FFIType::Int32),
+        Point,
+    );
+    let p = invoke(lib, make_id, (3, 4));
+    print "%i", p.x;
+    print "%i", p.y;
 }
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let ret = c
+            .ffi_fn_ret_tys
+            .get("make_id")
+            .expect("declare binding should record ret Ty");
+        match ret {
+            Ty::Record { fields } => {
+                assert!(fields.iter().any(|(n, _)| n == "x"));
+                assert!(fields.iter().any(|(n, _)| n == "y"));
+            }
+            other => panic!("expected Record ret, got {other}"),
+        }
+    }
+}
+

@@ -699,6 +699,38 @@ fn example_ffi_callback_prints_42() {
 }
 
 #[test]
+fn example_ffi_struct_return_prints_34() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let libsum = workspace_root.join("examples/libsum.so");
+    // Force rebuild so make_point is available after sum.c updates.
+    let _ = std::fs::remove_file(&libsum);
+    ensure_ffi_libsum_built();
+    if !libsum.exists() {
+        eprintln!("skipping: libsum.so not built");
+        return;
+    }
+    let output = run_ffi_example_with_lib("examples/ffi_struct_ret.0s", &libsum);
+    assert_eq!(output, "34");
+}
+
+#[test]
+fn example_ffi_callback_return_prints_1() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let libsum = workspace_root.join("examples/libsum.so");
+    ensure_ffi_libsum_built();
+    if !libsum.exists() {
+        eprintln!("skipping: libsum.so not built");
+        return;
+    }
+    let output = run_ffi_example_with_lib("examples/ffi_callback_ret.0s", &libsum);
+    assert_eq!(output, "1");
+}
+
+#[test]
 fn example_operators_prints_expected() {
     let output = run_example("examples/operators.0s");
     assert_eq!(output, "801125428falsetrue3");
@@ -751,3 +783,4 @@ fn example_perf_coro_ping_prints_expected() {
     let output = run_example("examples/perf/coro_ping.0s");
     assert_eq!(output, "124750");
 }
+
