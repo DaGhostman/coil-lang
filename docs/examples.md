@@ -387,6 +387,28 @@ fn read_x_v(Outer o) -> int {
 
 Tuples, arrays, dicts, and `type` aliases.
 
+### `examples/array_grow.0s`
+
+**Demonstrates:** Growing arrays with `push`, reading the runtime length with `len`, and indexing appended elements.
+
+```0s
+fn main() {
+    let a = [1, 2];
+    push(a, 3);
+    push(a, 4);
+    print "%i", len(a);
+    print "%i", a[0];
+    print "%i", a[3];
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/array_grow.0s` |
+| **Output** | `414` |
+
+---
+
 ### `examples/dict.0s`
 
 **Demonstrates:** Anonymous structurally typed records (`{ foo: 42, bar: 100 }`) and field read via `d.foo`.
@@ -674,6 +696,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `mixed.0s` | Enums | `025122` |
 | `nested_records.0s` | Enums | `99` |
 | `chained.0s` | Enums / fields | `427` |
+| `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
 | `operators.0s` | Operators | `801125428falsetrue3` |

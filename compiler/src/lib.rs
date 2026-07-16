@@ -1298,7 +1298,9 @@ impl Compiler {
                 if children.len() == 2 {
                     let binding = match children[0].1.as_ref() {
                         Expression::Variable(name, _ty) => Some((name.to_string(), false)),
-                        Expression::Constant(name, _ty) => Some((self.resolve_variable(name), true)),
+                        Expression::Constant(name, _ty) => {
+                            Some((self.resolve_variable(name), true))
+                        }
                         _ => None,
                     };
                     if let Some((name, is_const)) = binding {
@@ -1996,6 +1998,50 @@ impl Compiler {
                         self.messages.push(message);
                     }
                 } else {
+                    if let Expression::Identifier(raw) = name.1.as_ref() {
+                        if *raw == "push" {
+                            let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                            if let Some(items) = args
+                                && items.len() == 2
+                            {
+                                bytecode.append(&mut self.do_compile(&items[0]));
+                                bytecode.append(&mut self.do_compile(&items[1]));
+                                bytecode.push(Byte::new(Instruction::ArrayPush));
+                            } else {
+                                let mut message = Message::error(
+                                    "Invalid push call".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(DiagLabel::new(
+                                    format!("push expects 2 arguments, got {}", provided),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
+                            return bytecode;
+                        }
+                        if *raw == "len" {
+                            let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                            if let Some(items) = args
+                                && items.len() == 1
+                            {
+                                bytecode.append(&mut self.do_compile(&items[0]));
+                                bytecode.push(Byte::new(Instruction::ArrayLen));
+                            } else {
+                                let mut message = Message::error(
+                                    "Invalid len call".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(DiagLabel::new(
+                                    format!("len expects 1 argument, got {}", provided),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
+                            return bytecode;
+                        }
+                    }
+
                     let identifier = self.resolve_variable_checked(name);
                     let n = self
                         .aliases
@@ -5152,6 +5198,39 @@ fn main() {
             store_count, 0,
             "expected zero STORE instructions for `let` / assignment; got {}",
             store_count
+        );
+    }
+
+    // ============================================================
+    // growing array builtin codegen tests
+    // ============================================================
+
+    #[test]
+    fn array_push_and_len_builtins_emit_array_opcodes() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let a = [1, 2]; \
+push(a, 3); \
+print \"%i\", len(a); \
+}",
+        );
+
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayPush)),
+            "expected `push(a, 3)` to emit ArrayPush"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
+            "expected `len(a)` to emit ArrayLen"
+        );
+        assert!(
+            !bc.iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3
+            }),
+            "push/len builtins should not lower to ordinary CALL instructions"
         );
     }
 

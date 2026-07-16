@@ -743,6 +743,14 @@ impl Checker {
                     Expression::Identifier(n) => n.to_string(),
                     _ => return self.error("Invalid call target".to_string(), range),
                 };
+
+                if ident == "push" {
+                    return self.infer_array_push(args.as_deref(), range);
+                }
+                if ident == "len" {
+                    return self.infer_array_len(args.as_deref(), range);
+                }
+
                 let scheme = self.env.lookup(&ident).cloned();
                 let fun_ty = match scheme {
                     Some(s) => instantiate(&s, &mut self.counter),
@@ -1441,8 +1449,7 @@ impl Checker {
                     if let Expression::Identifier(n) = name.1.as_ref() {
                         self.env
                             .insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
-                        self.codegen_var_types
-                            .insert(n.to_string(), var_ty.clone());
+                        self.codegen_var_types.insert(n.to_string(), var_ty.clone());
                         self.insert_const_binding(n.to_string());
                         if i + 1 < children.len() {
                             let next = &children[i + 1];
@@ -1649,6 +1656,97 @@ impl Checker {
             self.unify(&first_ty, &t, &elem.0.into_range(), "list element");
         }
         list(first_ty)
+    }
+
+    fn infer_array_push(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
+        let args = args.unwrap_or(&[]);
+        if args.len() != 2 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                format!("push expects 2 arguments, got {}", args.len()),
+                range,
+                Some("use `push(array, value)`".to_string()),
+            );
+        }
+
+        let array_ty = self.infer(&args[0]);
+        let value_ty = self.infer(&args[1]);
+        let resolved = apply_ty_prune(&self.subst, &array_ty);
+        match resolved {
+            Ty::Array { element, .. } => {
+                self.unify(
+                    element.as_ref(),
+                    &value_ty,
+                    &args[1].0.into_range(),
+                    "push element",
+                );
+                let elem = apply_ty_prune(&self.subst, element.as_ref());
+                let dynamic = array(elem);
+                if let Expression::Identifier(name) = args[0].1.as_ref() {
+                    self.env
+                        .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
+                    self.codegen_var_types
+                        .insert((*name).to_string(), dynamic.clone());
+                }
+                dynamic
+            }
+            Ty::Var(v) => {
+                let elem = Ty::Var(self.counter.fresh());
+                let dynamic = array(elem.clone());
+                self.unify(&Ty::Var(v), &dynamic, &args[0].0.into_range(), "push array");
+                self.unify(&elem, &value_ty, &args[1].0.into_range(), "push element");
+                let dynamic = apply_ty_prune(&self.subst, &dynamic);
+                if let Expression::Identifier(name) = args[0].1.as_ref() {
+                    self.env
+                        .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
+                    self.codegen_var_types
+                        .insert((*name).to_string(), dynamic.clone());
+                }
+                dynamic
+            }
+            other => self.error_with_help(
+                "push expects an array as its first argument".to_string(),
+                args[0].0.into_range(),
+                Some(format!("found `{}`; use `push(array, value)`", other)),
+            ),
+        }
+    }
+
+    fn infer_array_len(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
+        let args = args.unwrap_or(&[]);
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                format!("len expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `len(array)`".to_string()),
+            );
+        }
+
+        let target_ty = self.infer(&args[0]);
+        let resolved = apply_ty_prune(&self.subst, &target_ty);
+        match resolved {
+            Ty::Array { .. } => int(),
+            Ty::Var(v) => {
+                let elem = Ty::Var(self.counter.fresh());
+                self.unify(
+                    &Ty::Var(v),
+                    &array(elem),
+                    &args[0].0.into_range(),
+                    "len array",
+                );
+                int()
+            }
+            other => self.error_with_help(
+                "len expects an array".to_string(),
+                args[0].0.into_range(),
+                Some(format!("found `{}`; use `len(array)`", other)),
+            ),
+        }
     }
 
     /// Thread a curried function type through a list of argument types,
@@ -5613,6 +5711,38 @@ mod tests {
                    fn main() { let arr = get_array(); let _ = arr[10]; }";
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn push_promotes_static_array_to_dynamic_for_later_indexing() {
+        let src = "fn main() { let arr = [0, 1]; push(arr, 2); let _ = arr[2]; }";
+        let (_c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn push_rejects_element_type_mismatch() {
+        let src = "fn main() { let arr = [0, 1]; push(arr, \"x\"); }";
+        let (_c, msgs) = check_warn(src);
+        let found = msgs.iter().any(|m| m.message().contains("Type mismatch"));
+        assert!(
+            found,
+            "expected push element type mismatch, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn len_of_array_returns_int() {
+        assert_ok("len([0, 1])", int());
+    }
+
+    #[test]
+    fn len_rejects_non_array() {
+        let src = "fn main() { let x = 1; len(x); }";
+        let (_c, msgs) = check_warn(src);
+        let found = msgs.iter().any(|m| m.message().contains("len expects an array"));
+        assert!(found, "expected len non-array diagnostic, got: {:?}", msgs);
     }
 
     #[test]

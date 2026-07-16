@@ -128,6 +128,12 @@ fn example_dict_prints_42_100_42() {
 }
 
 #[test]
+fn example_array_grow_prints_len_first_and_last() {
+    let output = run_example("examples/array_grow.0s");
+    assert_eq!(output, "414");
+}
+
+#[test]
 fn example_classes_prints_7458() {
     let output = run_example("examples/classes.0s");
     assert_eq!(output, "7458");

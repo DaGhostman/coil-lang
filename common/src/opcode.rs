@@ -153,6 +153,11 @@ pub enum Instruction {
 
     /// Coroutine done-check: pop handle, push `true` if `CoroState::Done`.
     DoneCoro,
+
+    /// ArrayPush: stack `array, value` (TOS = value) -> same array after in-place append.
+    /// ArrayLen: stack `array` -> int length.
+    ArrayPush,
+    ArrayLen,
 }
 
 impl From<u8> for Instruction {
@@ -371,11 +376,7 @@ impl Byte {
 
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
         let o = self.operands;
-        (
-            (o >> 3) as usize,
-            (o & 0b100) != 0,
-            (o & 0b010) != 0,
-        )
+        ((o >> 3) as usize, (o & 0b100) != 0, (o & 0b010) != 0)
     }
 }
 
@@ -543,11 +544,7 @@ impl ArchivedByte {
 
     pub fn inc_dec_parts(&self) -> (usize, bool, bool) {
         let o: u32 = self.operands.into();
-        (
-            (o >> 3) as usize,
-            (o & 0b100) != 0,
-            (o & 0b010) != 0,
-        )
+        ((o >> 3) as usize, (o & 0b100) != 0, (o & 0b010) != 0)
     }
 
     pub fn with_inc_dec(mut self, slot: u32, prefix: bool, is_float: bool) -> Self {

@@ -12,6 +12,8 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 |---------|------|---------|
 | `print` | Statement | Write to stdout |
 | `format` | Expression | Build a formatted string |
+| `push` | Expression | Append to an array in place and return the array |
+| `len` | Expression | Return an array length |
 | `dload` | Expression | `dlopen` a shared library |
 | `declare` | Expression | Register FFI function signature |
 | `invoke` | Expression | Call registered FFI function |
@@ -71,6 +73,31 @@ print "100%% complete";   // literal percent via %%
 2. `PRINT` pops the string and writes to stdout (or a redirected writer in tests).
 
 See [Tutorial 01](../tutorial/01-basics.md) for introductory usage.
+
+---
+
+## `push` and `len`
+
+Array helpers compiled as built-in calls.
+
+```0s
+push(arr, value)
+len(arr)
+```
+
+| Builtin | Argument types | Returns | Behavior |
+|---------|----------------|---------|----------|
+| `push` | `[T]`, `T` | `[T]` | Appends to the heap array in place and returns the same array for chaining |
+| `len` | `[T]` | `int` | Returns the current runtime length |
+
+`push` promotes a fixed-length array binding to dynamic array type for later checks, so indexing a newly appended literal position is accepted after the push:
+
+```0s
+let a = [1, 2];
+push(a, 3);
+print "%i", len(a); // 3
+print "%i", a[2];  // 3
+```
 
 ---
 

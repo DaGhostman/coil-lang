@@ -112,6 +112,16 @@ let xs = [1, 2, 3];        // [int; 3]
 fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 ```
 
+### Growing arrays
+
+Use `push(arr, value)` to append in place. The value must match the array's element type. The call returns the same array as a dynamic `[T]`, and `len(arr)` returns its current runtime length as `int`.
+
+```0s
+let xs = [1, 2];   // starts as [int; 2]
+push(xs, 3);       // xs is treated as dynamic [int] afterwards
+print "%i", len(xs);
+```
+
 ### Indexing
 
 | Target | Compile-time index | Runtime index |
