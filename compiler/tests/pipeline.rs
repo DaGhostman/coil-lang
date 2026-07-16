@@ -72,35 +72,26 @@ fn example_option_prints_42() {
 
 #[test]
 fn example_result_prints_42_and_neg1() {
-    // Typechecker flags duplicate outer tags; compile without typecheck.
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/result.0s");
-    let src = std::fs::read_to_string(&full)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
-
-    let mut pipeline = compiler::Pipeline::new();
-    let parser = parser::Pratt::default();
-    let ast = parser.parse(&src).expect("result.0s should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &ast);
-
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
-    let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
-
-    let _ = machine.restore_output();
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    let output = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
-
+    let output = run_example("examples/result.0s");
     assert_eq!(output, "420-1");
+}
+
+#[test]
+fn example_raise_try_prints_10_neg() {
+    let output = run_example("examples/raise_try.0s");
+    assert_eq!(output, "10,neg");
+}
+
+#[test]
+fn example_coalesce_prints_bar_hi_7_9() {
+    let output = run_example("examples/coalesce.0s");
+    assert_eq!(output, "bar,hi,7,9");
+}
+
+#[test]
+fn example_optional_chain_prints_42_0() {
+    let output = run_example("examples/optional_chain.0s");
+    assert_eq!(output, "42,0");
 }
 
 #[test]

@@ -15,7 +15,8 @@ use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::Scheme;
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
-    EnumVariantPayloadTy, STRING, Ty, boolean, float, int, list, string, unit as unit_ty,
+    EnumVariantPayloadTy, STRING, Ty, boolean, float, int, is_option_ty, is_result_ty, list,
+    option_inner, option_ty, result_ok_err, result_ty, string, unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
 
@@ -105,6 +106,18 @@ pub struct Checker {
     /// Return type recorded for `let id = declare(..., ret)` bindings so
     /// subsequent `invoke(..., id, ...)` can refine its result type.
     ffi_fn_ret_tys: HashMap<String, Ty>,
+
+    /// Enclosing function is in Result mode: bare `return` wraps `Ok`,
+    /// `raise` produces `Err`. Holds `(Ok_ty, Err_ty)`.
+    fn_result_mode: Option<(Ty, Ty)>,
+
+    /// Enclosing function is in Option mode: `?` propagates `None`.
+    fn_option_mode: Option<Ty>,
+
+    /// Functions whose success returns must be Ok-wrapped at codegen.
+    result_mode_fns: HashSet<String>,
+    /// Function names whose return type is (or was inferred as) `Option<_>`.
+    option_mode_fns: HashSet<String>,
 }
 
 /// C-layout struct registered via `extern struct Name { ... }`.
@@ -218,9 +231,19 @@ impl Checker {
             c_structs: Vec::new(),
             callback_sigs: Vec::new(),
             ffi_fn_ret_tys: HashMap::new(),
+            fn_result_mode: None,
+            fn_option_mode: None,
+            result_mode_fns: HashSet::new(),
+            option_mode_fns: HashSet::new(),
         };
-        checker.register_builtin_ffi_type();
+        checker.register_builtin_enums();
         checker
+    }
+
+    /// Pre-register compiler-built-in enums (`FFIType`, `Option`, `Result`).
+    fn register_builtin_enums(&mut self) {
+        self.register_builtin_ffi_type();
+        self.register_builtin_option_result();
     }
 
     /// Pre-register the compiler-built-in `FFIType` enum with fixed tags.
@@ -241,6 +264,60 @@ impl Checker {
         self.enum_tags.insert(name.clone(), tag_map);
         self.enum_payloads.insert(name.clone(), payloads);
         self.enum_arities.insert(name, arities);
+    }
+
+    /// Pre-register polymorphic `Option` / `Result`. Payload slots use
+    /// placeholder `Con` names that are freshened at each construct /
+    /// pattern / annotation site.
+    fn register_builtin_option_result(&mut self) {
+        use common::{
+            BUILTIN_OPTION_ENUM, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_ENUM,
+            BUILTIN_RESULT_VARIANTS,
+        };
+
+        // Option { None, Some(T) }
+        {
+            let name = BUILTIN_OPTION_ENUM.to_string();
+            let variant_names: Vec<String> = BUILTIN_OPTION_VARIANTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let payloads = vec![
+                EnumVariantPayloadTy::Unit,
+                EnumVariantPayloadTy::Tuple(vec![Ty::Con("__T".into())]),
+            ];
+            let arities = vec![0, 1];
+            let mut tag_map = BTreeMap::new();
+            for (i, vn) in variant_names.iter().enumerate() {
+                tag_map.insert(vn.clone(), i as u32);
+            }
+            self.enums.insert(name.clone(), variant_names);
+            self.enum_tags.insert(name.clone(), tag_map);
+            self.enum_payloads.insert(name.clone(), payloads);
+            self.enum_arities.insert(name, arities);
+        }
+
+        // Result { Ok(T), Err(E) }
+        {
+            let name = BUILTIN_RESULT_ENUM.to_string();
+            let variant_names: Vec<String> = BUILTIN_RESULT_VARIANTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let payloads = vec![
+                EnumVariantPayloadTy::Tuple(vec![Ty::Con("__T".into())]),
+                EnumVariantPayloadTy::Tuple(vec![Ty::Con("__E".into())]),
+            ];
+            let arities = vec![1, 1];
+            let mut tag_map = BTreeMap::new();
+            for (i, vn) in variant_names.iter().enumerate() {
+                tag_map.insert(vn.clone(), i as u32);
+            }
+            self.enums.insert(name.clone(), variant_names);
+            self.enum_tags.insert(name.clone(), tag_map);
+            self.enum_payloads.insert(name.clone(), payloads);
+            self.enum_arities.insert(name, arities);
+        }
     }
 
     /// Run inference over `ast`. Returns the inferred type of the root
@@ -276,9 +353,13 @@ impl Checker {
         self.current_yield_ty = None;
         self.current_send_ty = None;
         self.yield_receives_used = false;
+        self.fn_result_mode = None;
+        self.fn_option_mode = None;
+        self.result_mode_fns.clear();
+        self.option_mode_fns.clear();
 
-        // Built-in FFIType survives the per-program enum reset.
-        self.register_builtin_ffi_type();
+        // Built-in enums survive the per-program enum reset.
+        self.register_builtin_enums();
 
         // Mint NodeIds for every AST node (pre-walk). The visit order
         // matches `infer`'s recursion, so the IDs line up.
@@ -804,6 +885,134 @@ impl Checker {
                     self.unify(&ret, &ty, &e.0.into_range(), "return value");
                 }
                 ty
+            }
+
+            // ---- raise / ? / ?? / ?. ----
+            Expression::Raise(e) => {
+                let err_ty = self.infer(e);
+                let ok_ty = self.ensure_result_mode(&err_ty, &e.0.into_range());
+                // `raise` is diverging for the current expression;
+                // give it the Ok type so it can appear in expression
+                // position (e.g. as a branch value).
+                ok_ty
+            }
+
+            Expression::Try(inner) => {
+                let inner_ty = self.infer(inner);
+                let resolved = apply_ty_prune(&self.subst, &inner_ty);
+                if let Some((ok, err)) = result_ok_err(&resolved) {
+                    let _ = self.ensure_result_mode(&err, &range);
+                    ok
+                } else if is_option_ty(&resolved) {
+                    let inner = option_inner(&resolved)
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    self.ensure_option_mode(&inner, &range);
+                    inner
+                } else if matches!(resolved, Ty::Var(_)) {
+                    // Not yet pinned — assume Result and let later
+                    // unifications fill Ok/Err (or fail).
+                    let ok = Ty::Var(self.counter.fresh());
+                    let err = Ty::Var(self.counter.fresh());
+                    let result = result_ty(ok.clone(), err.clone());
+                    self.unify(&inner_ty, &result, &range, "try operand");
+                    let _ = self.ensure_result_mode(&err, &range);
+                    ok
+                } else {
+                    self.error(
+                        ErrorCode::InvalidTry,
+                        format!(
+                            "`?` requires Option or Result, found `{}`",
+                            resolved
+                        ),
+                        range,
+                    )
+                }
+            }
+
+            Expression::Coalesce(lhs, rhs) => {
+                let lhs_ty = self.infer(lhs);
+                let resolved = apply_ty_prune(&self.subst, &lhs_ty);
+                let payload = if let Some((ok, _)) = result_ok_err(&resolved) {
+                    ok
+                } else if is_option_ty(&resolved) {
+                    option_inner(&resolved)
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()))
+                } else if matches!(resolved, Ty::Var(_)) {
+                    // Prefer Option for free vars under `??`.
+                    let inner = Ty::Var(self.counter.fresh());
+                    self.unify(
+                        &lhs_ty,
+                        &option_ty(inner.clone()),
+                        &lhs.0.into_range(),
+                        "coalesce lhs",
+                    );
+                    inner
+                } else {
+                    return self.error(
+                        ErrorCode::InvalidCoalesce,
+                        format!(
+                            "`??` requires Option or Result, found `{}`",
+                            resolved
+                        ),
+                        range,
+                    );
+                };
+                let rhs_ty = self.infer(rhs);
+                self.unify(&payload, &rhs_ty, &rhs.0.into_range(), "coalesce rhs");
+                payload
+            }
+
+            Expression::OptionalAccess(receiver, field) => {
+                let recv_ty = self.infer(receiver);
+                let resolved = apply_ty_prune(&self.subst, &recv_ty);
+                let inner = if is_option_ty(&resolved) {
+                    option_inner(&resolved)
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()))
+                } else if matches!(resolved, Ty::Var(_)) {
+                    let inner = Ty::Var(self.counter.fresh());
+                    self.unify(
+                        &recv_ty,
+                        &option_ty(inner.clone()),
+                        &receiver.0.into_range(),
+                        "optional access receiver",
+                    );
+                    inner
+                } else {
+                    return self.error(
+                        ErrorCode::InvalidOptionalAccess,
+                        format!(
+                            "`?.` requires Option, found `{}`",
+                            resolved
+                        ),
+                        range,
+                    );
+                };
+                // Resolve field on the inner type (enum record / dict).
+                let field_ty = self.field_type_from_ty(&inner, field, &range);
+                option_ty(field_ty)
+            }
+
+            Expression::TypeApp { name, args } => {
+                // Appears in type-annotation positions; treat like Type.
+                if common::is_builtin_option_enum(name) {
+                    let inner = args
+                        .first()
+                        .map(|a| self.parse_type_name(a))
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    option_ty(inner)
+                } else if common::is_builtin_result_enum(name) {
+                    let ok = args
+                        .first()
+                        .map(|a| self.parse_type_name(a))
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    let err = args
+                        .get(1)
+                        .map(|a| self.parse_type_name(a))
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    result_ty(ok, err)
+                } else {
+                    Ty::Con(name.to_string())
+                }
             }
 
             // ---- I/O ----
@@ -1876,6 +2085,28 @@ impl Checker {
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
         match ann.1.as_ref() {
             Expression::Identifier(name) | Expression::Type(name) => self.parse_type_name_str(name),
+            Expression::TypeApp { name, args } => {
+                if common::is_builtin_option_enum(name) {
+                    let inner = args
+                        .first()
+                        .map(|a| self.parse_type_name(a))
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    return option_ty(inner);
+                }
+                if common::is_builtin_result_enum(name) {
+                    let ok = args
+                        .first()
+                        .map(|a| self.parse_type_name(a))
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    let err = args
+                        .get(1)
+                        .map(|a| self.parse_type_name(a))
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    return result_ty(ok, err);
+                }
+                // Unknown generic — fall back to Con(name).
+                Ty::Con(name.to_string())
+            }
             Expression::Array(items) => {
                 // Static-length: `[T; N]`. Look for the `; N` shape:
                 // a single `Integer(N)` immediately following the
@@ -1913,7 +2144,7 @@ impl Checker {
         }
     }
 
-    fn parse_type_name_str(&self, name: &str) -> Ty {
+    fn parse_type_name_str(&mut self, name: &str) -> Ty {
         for frame in self.type_aliases.iter().rev() {
             if let Some(alias_ty) = frame.get(name) {
                 return alias_ty.clone();
@@ -1927,8 +2158,20 @@ impl Checker {
             "bool" => boolean(),
             "string" => string(),
             "void" => unit_ty(),
+            "option" => option_ty(Ty::Var(self.counter.fresh())),
+            "result" => result_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             _ => Ty::Con(name.to_string()),
         }
+    }
+
+    /// Whether codegen should Ok-wrap bare returns for `fn_name`.
+    pub fn fn_is_result_mode(&self, fn_name: &str) -> bool {
+        self.result_mode_fns.contains(fn_name)
+    }
+
+    /// Whether `fn_name` returns (or was inferred to return) `Option<_>`.
+    pub fn fn_is_option_mode(&self, fn_name: &str) -> bool {
+        self.option_mode_fns.contains(fn_name)
     }
 
     // ============================================================
@@ -2247,18 +2490,27 @@ impl Checker {
         // code. The body sees it too because the new frame we push
         // for the body is a child of the outer.
         let alpha = self.counter.fresh();
-        let prev_ret = self.current_return_ty.replace(if is_coro {
-            // A coroutine's `resume` has a single static result type
-            // covering BOTH the yielded value (each `yield e;`) and the
-            // final value produced when the body completes (`return e;`
-            // or falling off the end). `return e;` therefore unifies
-            // against the SAME yield type variable as `yield e;` — not
-            // `unit` — so `return`'s value becomes a real completion
-            // value instead of being silently dropped.
+
+        // Result/Option mode from an annotated return type. Bare
+        // `return v` unifies against the Ok / payload slot; the
+        // function's own type remains `Result<T,E>` / `Option<T>`.
+        let prev_result_mode = self.fn_result_mode.take();
+        let prev_option_mode = self.fn_option_mode.take();
+        let return_slot = if is_coro {
             yield_slot.clone().unwrap_or_else(unit_ty)
+        } else if let Some((ok, err)) = result_ok_err(&ret_ty) {
+            self.fn_result_mode = Some((ok.clone(), err));
+            ok
+        } else if is_option_ty(&ret_ty) {
+            if let Some(inner) = option_inner(&ret_ty) {
+                self.fn_option_mode = Some(inner);
+            }
+            ret_ty.clone()
         } else {
             ret_ty.clone()
-        });
+        };
+
+        let prev_ret = self.current_return_ty.replace(return_slot);
         let prev_yield = self.current_yield_ty.take();
         let prev_send = self.current_send_ty.take();
         let prev_yield_receives = self.yield_receives_used;
@@ -2316,11 +2568,43 @@ impl Checker {
                 };
             }
             self.yield_receives_used = prev_yield_receives;
+        } else if let Some((ok, err)) = self.fn_result_mode.clone() {
+            // Body used raise/? — rebuild fun_ty with Result return.
+            let ok = apply_ty_prune(&self.subst, &ok);
+            let err = apply_ty_prune(&self.subst, &err);
+            let result_ret = result_ty(ok, err);
+            fun_ty = result_ret.clone();
+            for (_, arg_ty) in arg_tys.iter().rev() {
+                fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+            }
+            if let Some(self_ty) = self_ty {
+                fun_ty = Ty::Fun(Box::new(self_ty.clone()), Box::new(fun_ty));
+            }
+            self.result_mode_fns.insert(name.to_string());
+            let _ = result_ret;
+        } else if let Some(inner) = self.fn_option_mode.clone() {
+            let inner = apply_ty_prune(&self.subst, &inner);
+            let opt_ret = option_ty(inner);
+            // If annotated/inferred return was already Option, keep
+            // fun_ty; otherwise rebuild.
+            let resolved_ret = apply_ty_prune(&self.subst, &ret_ty);
+            if !is_option_ty(&resolved_ret) {
+                fun_ty = opt_ret;
+                for (_, arg_ty) in arg_tys.iter().rev() {
+                    fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+                }
+                if let Some(self_ty) = self_ty {
+                    fun_ty = Ty::Fun(Box::new(self_ty.clone()), Box::new(fun_ty));
+                }
+            }
+            self.option_mode_fns.insert(name.to_string());
         }
         self.current_yield_ty = prev_yield;
         self.current_send_ty = prev_send;
 
         self.current_return_ty = prev_ret;
+        self.fn_result_mode = prev_result_mode;
+        self.fn_option_mode = prev_option_mode;
         self.unify(&Ty::Var(alpha), &fun_ty, range, "function type");
         fun_ty
     }
@@ -2408,14 +2692,15 @@ impl Checker {
                     }
                 }
 
-                // Check 1: duplicate enum name (including built-in FFIType).
-                if common::is_builtin_ffi_enum(&name_str) {
+                // Check 1: duplicate enum name (including built-ins).
+                if common::is_builtin_enum(&name_str) {
                     let mut msg = Message::error(
-                        ErrorCode::GenericTypeError, format!("Cannot redeclare built-in enum `{}`", name_str),
+                        ErrorCode::DuplicateEnum,
+                        format!("Cannot redeclare built-in enum `{}`", name_str),
                         node.0.into_range(),
                     );
                     msg.with_help(format!(
-                        "`{}` is provided by the compiler; use `FFIType::Variant` without declaring the enum",
+                        "`{}` is provided by the compiler; use it without declaring the enum",
                         name_str
                     ));
                     errors.push(msg);
@@ -2503,6 +2788,8 @@ impl Checker {
             | Expression::ExprStatement(e)
             | Expression::Return(e)
             | Expression::ImplicitReturn(e)
+            | Expression::Raise(e)
+            | Expression::Try(e)
             | Expression::Yield(e)
             | Expression::YieldFrom(e)
             | Expression::Negate(e)
@@ -2513,6 +2800,12 @@ impl Checker {
             | Expression::Defer(e)
             | Expression::Member(e) => {
                 self.pre_register_enums_walk(e, errors);
+            }
+
+            Expression::TypeApp { args, .. } => {
+                for a in args {
+                    self.pre_register_enums_walk(a, errors);
+                }
             }
 
             Expression::CompoundAssign(name, _, value) => {
@@ -2543,7 +2836,8 @@ impl Checker {
             | Expression::Le(l, r)
             | Expression::Gt(l, r)
             | Expression::Leq(l, r)
-            | Expression::Geq(l, r) => {
+            | Expression::Geq(l, r)
+            | Expression::Coalesce(l, r) => {
                 self.pre_register_enums_walk(l, errors);
                 self.pre_register_enums_walk(r, errors);
             }
@@ -2680,7 +2974,7 @@ impl Checker {
             Expression::Method(_, body) => {
                 self.pre_register_enums_walk(body, errors);
             }
-            Expression::Access(receiver, _) => {
+            Expression::Access(receiver, _) | Expression::OptionalAccess(receiver, _) => {
                 self.pre_register_enums_walk(receiver, errors);
             }
             Expression::Instantiate(class, args) => {
@@ -2862,11 +3156,21 @@ impl Checker {
             .get(&enum_str)
             .and_then(|a| a.get(tag as usize).copied())
             .unwrap_or(0);
-        let expected_payload = self
-            .enum_payloads
-            .get(&enum_str)
-            .and_then(|p| p.get(tag as usize).cloned())
-            .unwrap_or(EnumVariantPayloadTy::Unit);
+
+        // Polymorphic builtins: mint fresh payload vars so each
+        // construct site gets an independent Option<T> / Result<T,E>.
+        let (expected_payload, poly_sum_owner) =
+            if common::is_poly_builtin_enum(&enum_str) {
+                let (payload, owner) = self.fresh_poly_construct_payload(&enum_str, &variant_str);
+                (payload, Some(owner))
+            } else {
+                let payload = self
+                    .enum_payloads
+                    .get(&enum_str)
+                    .and_then(|p| p.get(tag as usize).cloned())
+                    .unwrap_or(EnumVariantPayloadTy::Unit);
+                (payload, None)
+            };
 
         // Shape vs arity: record shapes defer to field-by-field checks.
         let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, fields) {
@@ -3018,17 +3322,23 @@ impl Checker {
         // Build the result. The owner is the full `Ty::Sum` so
         // later unifications (in match patterns) can compare tag
         // and arity directly.
-        let sum_ty = Ty::Sum {
-            name: enum_str.clone(),
-            variants: self
-                .enum_payloads
-                .get(&enum_str)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .zip(self.enums.get(&enum_str).cloned().unwrap_or_default())
-                .map(|(p, n)| (n, p))
-                .collect(),
+        let sum_ty = if let Some(owner) = poly_sum_owner {
+            // Re-read payload types after unify so Ok/Some carry
+            // the concrete argument type.
+            apply_ty_prune(&self.subst, &owner)
+        } else {
+            Ty::Sum {
+                name: enum_str.clone(),
+                variants: self
+                    .enum_payloads
+                    .get(&enum_str)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .zip(self.enums.get(&enum_str).cloned().unwrap_or_default())
+                    .map(|(p, n)| (n, p))
+                    .collect(),
+            }
         };
 
         Ty::Constructor {
@@ -3036,6 +3346,84 @@ impl Checker {
             tag,
             arity,
         }
+    }
+
+    /// Fresh `Option`/`Result` payload + owning Sum for a construct site.
+    fn fresh_poly_construct_payload(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+    ) -> (EnumVariantPayloadTy, Ty) {
+        if common::is_builtin_option_enum(enum_name) {
+            let t = Ty::Var(self.counter.fresh());
+            let owner = option_ty(t.clone());
+            let payload = if variant_name == "Some" {
+                EnumVariantPayloadTy::Tuple(vec![t])
+            } else {
+                EnumVariantPayloadTy::Unit
+            };
+            (payload, owner)
+        } else {
+            let t = Ty::Var(self.counter.fresh());
+            let e = Ty::Var(self.counter.fresh());
+            let owner = result_ty(t.clone(), e.clone());
+            let payload = if variant_name == "Ok" {
+                EnumVariantPayloadTy::Tuple(vec![t])
+            } else {
+                EnumVariantPayloadTy::Tuple(vec![e])
+            };
+            (payload, owner)
+        }
+    }
+
+    /// Payload type for a pattern arm: prefer the scrutinee Sum's
+    /// concrete payloads for poly builtins, else the registry.
+    fn poly_or_registry_payload(
+        &mut self,
+        enum_name: &str,
+        tag: u32,
+        expected_ty: &Ty,
+        pattern_range: &Range<usize>,
+    ) -> Option<EnumVariantPayloadTy> {
+        let resolved = apply_ty_prune(&self.subst, expected_ty);
+        let sum = match &resolved {
+            Ty::Sum { name, variants } if name == enum_name => Some(variants.clone()),
+            Ty::Constructor { owner, .. } => match owner.as_ref() {
+                Ty::Sum { name, variants } if name == enum_name => Some(variants.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(variants) = sum {
+            if let Some((_, payload)) = variants.get(tag as usize) {
+                return Some(payload.clone());
+            }
+        }
+        if common::is_poly_builtin_enum(enum_name) {
+            // Scrutinee not yet pinned — freshen a full Option/Result
+            // and unify so bindings share type vars with the scrutinee.
+            let owner = if common::is_builtin_option_enum(enum_name) {
+                option_ty(Ty::Var(self.counter.fresh()))
+            } else {
+                result_ty(
+                    Ty::Var(self.counter.fresh()),
+                    Ty::Var(self.counter.fresh()),
+                )
+            };
+            self.unify(
+                expected_ty,
+                &owner,
+                pattern_range,
+                "poly builtin pattern scrutinee",
+            );
+            let resolved = apply_ty_prune(&self.subst, &owner);
+            if let Ty::Sum { variants, .. } = resolved {
+                return variants.get(tag as usize).map(|(_, p)| p.clone());
+            }
+        }
+        self.enum_payloads
+            .get(enum_name)
+            .and_then(|p| p.get(tag as usize).cloned())
     }
 
     // ---- Match ----
@@ -3188,9 +3576,7 @@ impl Checker {
                     .and_then(|a| a.get(tag as usize).copied())
                     .unwrap_or(0);
                 let expected_payload = self
-                    .enum_payloads
-                    .get(&enum_str)
-                    .and_then(|p| p.get(tag as usize).cloned())
+                    .poly_or_registry_payload(&enum_str, tag, expected_ty, pattern_range)
                     .unwrap_or(EnumVariantPayloadTy::Unit);
 
                 let (shape_matches, same_shape_with_wrong_arity) =
@@ -3693,6 +4079,159 @@ impl Checker {
             }
         }
         None
+    }
+
+    /// Enter or refine Result mode for the enclosing function.
+    /// Returns the Ok payload type `T`.
+    fn ensure_result_mode(&mut self, err_ty: &Ty, range: &Range<usize>) -> Ty {
+        if self.fn_option_mode.is_some() {
+            return self.error(
+                ErrorCode::ConflictingErrorType,
+                "cannot mix Option `?` and Result `raise`/`?` in the same function".into(),
+                range.clone(),
+            );
+        }
+        if let Some((ok, err)) = self.fn_result_mode.clone() {
+            self.unify(&err, err_ty, range, "error type");
+            return apply_ty_prune(&self.subst, &ok);
+        }
+        if let Some(ret) = self.current_return_ty.clone() {
+            let resolved = apply_ty_prune(&self.subst, &ret);
+            if let Some((ok, err)) = result_ok_err(&resolved) {
+                self.fn_result_mode = Some((ok.clone(), err.clone()));
+                self.unify(&err, err_ty, range, "error type");
+                self.current_return_ty = Some(ok.clone());
+                return ok;
+            }
+            if is_option_ty(&resolved) {
+                return self.error(
+                    ErrorCode::ConflictingErrorType,
+                    "function returns Option; cannot use Result `raise`/`?`".into(),
+                    range.clone(),
+                );
+            }
+            // Pin a free / non-Result return to Result<ok, err>.
+            let ok = Ty::Var(self.counter.fresh());
+            let result = result_ty(ok.clone(), err_ty.clone());
+            self.unify(&ret, &result, range, "result return type");
+            self.fn_result_mode = Some((ok.clone(), err_ty.clone()));
+            self.current_return_ty = Some(ok.clone());
+            ok
+        } else {
+            self.error(
+                ErrorCode::InvalidTry,
+                "`raise` / `?` outside of a function".into(),
+                range.clone(),
+            )
+        }
+    }
+
+    /// Enter or refine Option mode for the enclosing function.
+    fn ensure_option_mode(&mut self, inner_ty: &Ty, range: &Range<usize>) {
+        if self.fn_result_mode.is_some() {
+            self.error(
+                ErrorCode::ConflictingErrorType,
+                "cannot mix Result `raise`/`?` and Option `?` in the same function".into(),
+                range.clone(),
+            );
+            return;
+        }
+        if let Some(inner) = self.fn_option_mode.clone() {
+            self.unify(&inner, inner_ty, range, "option payload");
+            return;
+        }
+        if let Some(ret) = self.current_return_ty.clone() {
+            let resolved = apply_ty_prune(&self.subst, &ret);
+            if is_option_ty(&resolved) {
+                if let Some(existing) = option_inner(&resolved) {
+                    self.unify(&existing, inner_ty, range, "option payload");
+                }
+                self.fn_option_mode = Some(inner_ty.clone());
+                return;
+            }
+            if is_result_ty(&resolved) {
+                self.error(
+                    ErrorCode::ConflictingErrorType,
+                    "function returns Result; cannot use Option `?`".into(),
+                    range.clone(),
+                );
+                return;
+            }
+            let opt = option_ty(inner_ty.clone());
+            self.unify(&ret, &opt, range, "option return type");
+            self.fn_option_mode = Some(inner_ty.clone());
+        } else {
+            self.error(
+                ErrorCode::InvalidTry,
+                "`?` outside of a function".into(),
+                range.clone(),
+            );
+        }
+    }
+
+    /// Resolve `ty.field` for optional chaining (inner of Option).
+    fn field_type_from_ty(&mut self, ty: &Ty, field: &str, range: &Range<usize>) -> Ty {
+        let resolved = apply_ty_prune(&self.subst, ty);
+        match &resolved {
+            Ty::Sum { name, variants } => {
+                self.access_field_in_sum(name, variants, None, field, range.clone())
+            }
+            Ty::Constructor { tag, owner, .. } => match owner.as_ref() {
+                Ty::Sum { name, variants } => {
+                    self.access_field_in_sum(name, variants, Some(*tag), field, range.clone())
+                }
+                _ => self.error(
+                    ErrorCode::UnknownField,
+                    format!("Cannot access field `{}`", field),
+                    range.clone(),
+                ),
+            },
+            Ty::Record { fields } => {
+                if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                    fty.clone()
+                } else {
+                    self.error(
+                        ErrorCode::UnknownField,
+                        format!("Cannot find field `{}` on record", field),
+                        range.clone(),
+                    )
+                }
+            }
+            Ty::Con(name) => {
+                if let Some(fty) = self.class_field_ty(name, field) {
+                    fty.clone()
+                } else if let Some(fty) = self.field_type_for(name, field) {
+                    fty
+                } else {
+                    self.error(
+                        ErrorCode::UnknownField,
+                        format!("Cannot find field `{}` on `{}`", field, name),
+                        range.clone(),
+                    )
+                }
+            }
+            // Unpinned Option payload (e.g. `Option::None` alone): unify
+            // with a structural record that has this field so `none?.v`
+            // typechecks and pins `T` for coalesce / later use.
+            Ty::Var(_) => {
+                let field_ty = Ty::Var(self.counter.fresh());
+                let record = Ty::Record {
+                    fields: vec![(field.to_string(), field_ty.clone())],
+                };
+                self.unify(
+                    &resolved,
+                    &record,
+                    range,
+                    "optional access field on unpinned Option payload",
+                );
+                field_ty
+            }
+            _ => self.error(
+                ErrorCode::UnknownField,
+                format!("Cannot access field `{}` on non-record type", field),
+                range.clone(),
+            ),
+        }
     }
 
     /// Variable type from codegen side-table.
@@ -4935,7 +5474,7 @@ mod tests {
         // threading `arm.body.0.into_range()` through `infer_pattern`,
         // the diagnostic for a wrong-arity pattern should anchor
         // somewhere inside the source — NOT at byte 0.
-        let src = "let x = Option::Some(1); match x { Option::Some(a, b) => 0 }; enum Option { None, Some(int) }";
+        let src = "let x = Option::Some(1); match x { Option::Some(a, b) => 0 };";
         let (mut c, _) = check(src);
         let src_len = src.len();
         let msgs = c.take_messages();
@@ -5109,12 +5648,12 @@ mod tests {
 
     #[test]
     fn enum_with_payload_registers_constructor() {
-        // After registration, `Option::Some` is bound as a curried
+        // After registration, `Box::Full` is bound as a curried
         // function in the env: `int -> Constructor`.
-        let (mut c, _) = check("enum Option { None, Some(int) }");
+        let (mut c, _) = check("enum Box { Empty, Full(int) }");
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
-        let scheme = c.env().lookup("Option::Some").expect("not bound");
+        let scheme = c.env().lookup("Box::Full").expect("not bound");
         let ty = apply_ty_prune(c.subst(), &scheme.ty);
         assert_eq!(
             ty,
@@ -5122,10 +5661,10 @@ mod tests {
                 Box::new(int()),
                 Box::new(Ty::Constructor {
                     owner: Box::new(Ty::Sum {
-                        name: "Option".into(),
+                        name: "Box".into(),
                         variants: vec![
-                            ("None".into(), EnumVariantPayloadTy::Unit),
-                            ("Some".into(), EnumVariantPayloadTy::Tuple(vec![int()])),
+                            ("Empty".into(), EnumVariantPayloadTy::Unit),
+                            ("Full".into(), EnumVariantPayloadTy::Tuple(vec![int()])),
                         ],
                     }),
                     tag: 1,
@@ -5200,12 +5739,12 @@ mod tests {
         // consume exactly the same number of IDs (via `self.infer`)
         // so the cache lines up with the id table.
         //
-        // Concretely: `enum Option { None, Some(int) }` produces
-        //   1 (EnumDecl) + 2 (variants) + 1 (Some's payload type) = 4
+        // Concretely: `enum Color { Red, Green(int) }` produces
+        //   1 (EnumDecl) + 2 (variants) + 1 (Green's payload type) = 4
         // pre-walk IDs, and `infer` must consume all 4. The cache
         // therefore has the same length as the id table.
         for src in &[
-            "enum Option { None, Some(int) }",
+            "enum Color { Red, Green(int) }",
             "enum E { A, B, C }",
             "enum Tree { Leaf, Node(int, Tree, Tree) }",
         ] {
@@ -5240,7 +5779,7 @@ mod tests {
     #[test]
     fn constructor_call_with_wrong_arity_is_error() {
         // Option::Some takes 1 arg, called with 2.
-        let src = "Option::Some(1, 2); enum Option { None, Some(int) }";
+        let src = "Option::Some(1, 2)";
         let msgs = assert_messages(src);
         assert!(
             msgs.iter()
@@ -5252,7 +5791,7 @@ mod tests {
 
     #[test]
     fn constructor_call_with_correct_arity_typechecks() {
-        let src = "Option::Some(42); enum Option { None, Some(int) }";
+        let src = "Option::Some(42)";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -5278,7 +5817,7 @@ mod tests {
 
     #[test]
     fn unknown_variant_on_known_enum_is_error() {
-        let src = "Option::Purlpe(1); enum Option { None, Some(int) }";
+        let src = "Option::Purlpe(1)";
         let msgs = assert_messages(src);
         assert!(
             msgs.iter()
@@ -5295,7 +5834,7 @@ mod tests {
         // Enum declarations are top-level statements (no trailing
         // `;`) and must appear at the end of a sequence of
         // statements. Zero-arity constructors require `()`.
-        let src = "let x = Option::Some(1); match x { Option::None() => 0, Option::Some(v) => v }; enum Option { None, Some(int) }";
+        let src = "let x = Option::Some(1); match x { Option::None() => 0, Option::Some(v) => v };";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -5303,7 +5842,7 @@ mod tests {
 
     #[test]
     fn match_with_wildcard_no_exhaustiveness_error() {
-        let src = "let x = Option::Some(1); match x { _ => 0 }; enum Option { None, Some(int) }";
+        let src = "let x = Option::Some(1); match x { _ => 0 };";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -5311,7 +5850,7 @@ mod tests {
 
     #[test]
     fn match_non_exhaustive_reports_missing() {
-        let src = "let x = Option::None(); match x { Option::None() => 0 }; enum Option { None, Some(int) }";
+        let src = "let x = Option::None(); match x { Option::None() => 0 };";
         let msgs = assert_messages(src);
         assert!(
             msgs.iter()
@@ -5332,7 +5871,7 @@ mod tests {
 
     #[test]
     fn match_with_unreachable_arm_reports() {
-        let src = "let x = Option::None(); match x { Option::None() => 0, Option::None() => 1 }; enum Option { None, Some(int) }";
+        let src = "let x = Option::None(); match x { Option::None() => 0, Option::None() => 1 };";
         let msgs = assert_messages(src);
         assert!(
             msgs.iter().any(|m| m.message().contains("Unreachable arm")),
@@ -5345,7 +5884,7 @@ mod tests {
     fn match_pattern_binding_does_not_leak() {
         // `v` is bound inside the arm; referencing it after the
         // match should error.
-        let src = "let x = Option::Some(1); match x { Option::Some(v) => 0 }; v; enum Option { None, Some(int) }";
+        let src = "let x = Option::Some(1); match x { Option::Some(v) => 0 }; v";
         let msgs = assert_messages(src);
         // The `v` reference after the match is unknown.
         assert!(
@@ -5376,7 +5915,7 @@ mod tests {
     fn forward_reference_to_constructor_works() {
         // The enum is declared AFTER the use; the pre-pass makes
         // this work.
-        let src = "let x = Option::Some(1); enum Option { None, Some(int) }";
+        let src = "let x = Option::Some(1)";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -5418,7 +5957,7 @@ mod tests {
     fn format_string_with_constructor_value_errors_on_percent_s() {
         // Red-team critical: passing a `Constructor` (a sum) where
         // a string is expected must be flagged.
-        let src = "print \"%s\", Option::Some(1); enum Option { None, Some(int) }";
+        let src = "print \"%s\", Option::Some(1)";
         let msgs = assert_messages(src);
         assert!(
             msgs.iter().any(|m| m.message().contains("requires string")),
@@ -5431,7 +5970,7 @@ mod tests {
     fn format_string_with_constructor_via_match_works() {
         // The match arm's body must be inferable as a string, and
         // print "%s", s should accept it.
-        let src = "let s = match Option::Some(1) { Option::None() => \"none\", Option::Some(_) => \"some\" }; print \"%s\", s; enum Option { None, Some(int) }";
+        let src = "let s = match Option::Some(1) { Option::None() => \"none\", Option::Some(_) => \"some\" }; print \"%s\", s";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -5463,8 +6002,6 @@ mod tests {
     fn typechecker_does_not_report_unreachable_for_different_inner_patterns() {
         // Two Result::Ok arms with different inner patterns are both reachable.
         let src = r#"
-        enum Option { None, Some(int) }
-        enum Result { Ok(Option), Err(string) }
         fn unwrap(Result r) -> int {
             return match r {
                 Result::Ok(Option::Some(v)) => v,
@@ -6293,5 +6830,165 @@ fn main() {
             }
             other => panic!("expected Record ret, got {other}"),
         }
+    }
+
+    // ---- Error handling: raise / ? / ?? / ?. ----
+
+    #[test]
+    fn raise_infers_result_mode_and_wraps_success() {
+        let src = r#"
+fn f(int n) {
+    if n == 0 { raise "zero"; }
+    return n;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.fn_is_result_mode("f"));
+    }
+
+    #[test]
+    fn raise_with_explicit_non_result_return_errors() {
+        let msgs = assert_messages(
+            r#"fn f() -> int { raise "x"; return 1; }"#,
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::TypeMismatch)
+                    || m.message().contains("Type mismatch")
+                    || m.message().contains("Result")
+            }),
+            "expected raise vs -> int error, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn try_on_non_option_result_is_hard_error() {
+        let msgs = assert_messages(r#"fn f() -> int { let x = 1; return x?; }"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::InvalidTry)),
+            "expected InvalidTry (E0114), got: {:?}",
+            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn try_on_result_propagates_ok_payload() {
+        let src = r#"
+fn inner() { raise "e"; return 1; }
+fn outer() {
+    let v = inner()?;
+    return v;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.fn_is_result_mode("outer"));
+    }
+
+    #[test]
+    fn mismatched_error_types_conflict() {
+        let msgs = assert_messages(
+            r#"
+fn a() { raise "s"; return 1; }
+fn b() { raise 1; return 2; }
+fn c() {
+    let _x = a()?;
+    let _y = b()?;
+    return 0;
+}
+"#,
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::ConflictingErrorType)
+                    || m.message().contains("Type mismatch")
+                    || m.message().contains("error type")
+            }),
+            "expected single-E conflict, got: {:?}",
+            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn coalesce_option_and_result_typecheck() {
+        let src = r#"
+fn main() {
+    let a = Option::None ?? "bar";
+    let b = Result::Err("boom") ?? 7;
+    print "%s", a;
+    print "%i", b;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn coalesce_on_non_option_result_errors() {
+        let msgs = assert_messages(r#"fn main() { let x = 1 ?? 2; }"#);
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::InvalidCoalesce)),
+            "expected InvalidCoalesce (E0115), got: {:?}",
+            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn optional_access_on_option_ok() {
+        let src = r#"
+fn main() {
+    let o = Option::Some({ v: 1 });
+    let n = o?.v;
+    print "%i", n ?? 0;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn optional_access_on_result_errors() {
+        let msgs = assert_messages(
+            r#"fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::InvalidOptionalAccess)),
+            "expected InvalidOptionalAccess (E0116), got: {:?}",
+            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn user_cannot_redeclare_builtin_option() {
+        let msgs = assert_messages(r#"enum Option { None, Some(int) }"#);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::DuplicateEnum)
+                    || m.message().contains("Duplicate enum")
+            }),
+            "expected Duplicate enum for Option, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 }

@@ -25,6 +25,8 @@ use reporting::{ErrorCode, Label, Message};
 #[repr(u16)]
 enum Precedence {
     Assign,
+    /// `??` null-coalesce (between Or and Assign).
+    Coalesce,
     Or,
     Xor,
     And,
@@ -130,42 +132,56 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         use chumsky::Parser;
-        // `[T]` or `[T; N]` — array form. `T` is the
-        // element type; `N` (optional) is a non-negative
-        // integer for static-length arrays.
-        let array_type = text::ident()
-            .padded()
-            .map_with(output!(Type))
-            .then(
-                // Optional `; N` for static length.
-                op!(";")
-                    .ignore_then(
-                        text::int(10)
-                            .to_slice()
-                            .from_str::<i64>()
-                            .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0)),
-                    )
-                    .or_not(),
-            )
-            .delimited_by(op!('['), op!(']'))
-            .map_with(|(elem, n_opt), e| match n_opt {
-                Some(n) => (
-                    e.span(),
-                    Box::new(Expression::Array(vec![(
+        recursive(|type_ann| {
+            // `[T]` or `[T; N]` — array form. `T` is the
+            // element type; `N` (optional) is a non-negative
+            // integer for static-length arrays.
+            // Element names inside `[T]` stay simple idents (matches
+            // the pre-generic array annotation shape).
+            let array_type = text::ident()
+                .padded()
+                .map_with(output!(Type))
+                .then(
+                    op!(";")
+                        .ignore_then(
+                            text::int(10)
+                                .to_slice()
+                                .from_str::<i64>()
+                                .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0)),
+                        )
+                        .or_not(),
+                )
+                .delimited_by(op!('['), op!(']'))
+                .map_with(|(elem, n_opt), e| match n_opt {
+                    Some(n) => (
                         e.span(),
-                        Box::new(Expression::Integer(n)),
-                    )])),
-                ),
-                None => (e.span(), Box::new(Expression::Array(vec![elem]))),
-            });
-        // `(T1, T2, ...)` — tuple form. Reuses the
-        // existing tuple_atom machinery.
-        let tuple_type = self.tuple_atom(text::ident().padded().map_with(output!(Type)));
-        choice((
-            array_type,
-            tuple_type,
-            text::ident().padded().map_with(output!(Type)),
-        ))
+                        Box::new(Expression::Array(vec![(
+                            e.span(),
+                            Box::new(Expression::Integer(n)),
+                        )])),
+                    ),
+                    None => (e.span(), Box::new(Expression::Array(vec![elem]))),
+                });
+            // `(T1, T2, ...)` — tuple form.
+            let tuple_type = self.tuple_atom(type_ann.clone());
+            // `Name` or `Name<T, U>` — bare type / generic application.
+            let named_type = text::ident()
+                .padded()
+                .then(
+                    type_ann
+                        .clone()
+                        .separated_by(op!(','))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(op!('<'), op!('>'))
+                        .or_not(),
+                )
+                .map_with(|(name, args_opt), e| match args_opt {
+                    Some(args) => (e.span(), Box::new(Expression::TypeApp { name, args })),
+                    None => (e.span(), Box::new(Expression::Type(name))),
+                });
+            choice((array_type, tuple_type, named_type))
+        })
     }
 
     fn expr(
@@ -189,6 +205,10 @@ impl<'pratt> Pratt<'pratt> {
                 self.invoke_(expr.clone()),
                 self.resume_(expr.clone()),
                 self.yield_expr_(expr.clone()),
+                // `raise expr` as an expression atom (also a statement).
+                keyword!("raise")
+                    .ignore_then(expr.clone())
+                    .map_with(|inner, e| (e.span(), Box::new(Expression::Raise(inner)))),
                 self.format_expr(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
@@ -394,6 +414,12 @@ impl<'pratt> Pratt<'pratt> {
                 infix(left(Precedence::Term as u16), op!('+'), |lhs, _, rhs, e| {
                     (e.span(), Box::new(Expression::Add(lhs, rhs)))
                 }),
+                // `??` between Or and Assign (right-associative).
+                infix(
+                    right(Precedence::Coalesce as u16),
+                    op!("??"),
+                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Coalesce(lhs, rhs))),
+                ),
                 postfix(
                     Precedence::Primary as u16,
                     choice((op!("++"), op!("--"))),
@@ -412,10 +438,24 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     },
                 ),
+                // `?.field` before bare `.` / `?` so the digraph wins.
+                postfix(
+                    Precedence::Primary as u16,
+                    just("?.").ignore_then(text::ident()),
+                    |lhs, field, e| {
+                        (e.span(), Box::new(Expression::OptionalAccess(lhs, field)))
+                    },
+                ),
                 postfix(
                     Precedence::Primary as u16,
                     just('.').ignore_then(text::ident()),
                     |lhs, field, e| (e.span(), Box::new(Expression::Access(lhs, field))),
+                ),
+                // Postfix `?` must not steal the first `?` of `??`.
+                postfix(
+                    Precedence::Primary as u16,
+                    just('?').then_ignore(just('?').not()),
+                    |lhs, _, e| (e.span(), Box::new(Expression::Try(lhs))),
                 ),
                 postfix(
                     Precedence::Primary as u16,
@@ -828,6 +868,16 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|result, e| (e.span(), Box::new(Expression::Return(result))))
     }
 
+    fn raise_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("raise")
+            .labelled("raise")
+            .ignore_then(self.expr())
+            .map_with(|result, e| (e.span(), Box::new(Expression::Raise(result))))
+    }
+
     fn comment(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -882,6 +932,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.expr_statement(),
                 self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
+                self.raise_().then_ignore(op!(';')),
                 self.yield_().then_ignore(op!(';')),
                 self.comment(),
             ))
@@ -2952,6 +3003,128 @@ mod tests {
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_error_handling {
+    use super::*;
+    use chumsky::Parser;
+
+    macro_rules! expr {
+        ($case: expr) => {{
+            let p = Pratt::default();
+            p.expr()
+                .parse($case)
+                .into_result()
+                .unwrap_or_else(|e| panic!("parse failed for `{}`: {:?}", $case, e))
+                .1
+                .to_string()
+        }};
+    }
+
+    macro_rules! same_try {
+        ($case: literal) => {
+            assert_eq!($case.to_string(), expr!($case));
+        };
+    }
+
+    #[test]
+    fn raise_parses_as_raise_expression() {
+        let src = "raise \"boom\"";
+        let result = Pratt::default().expr().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Raise(inner) => assert_eq!(inner.1.to_string(), "\"boom\""),
+                other => panic!("expected Raise, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn postfix_try_parses_to_try() {
+        same_try!("x?");
+        let result = Pratt::default().expr().parse("x?").into_result();
+        match result {
+            Ok((_span, expr)) => assert!(matches!(expr.as_ref(), Expression::Try(_))),
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn coalesce_parses_and_is_right_associative() {
+        assert_eq!(expr!("a ?? b ?? c"), "a ?? b ?? c");
+        let result = Pratt::default().expr().parse("a ?? b ?? c").into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Coalesce(lhs, rhs) => {
+                    assert!(matches!(lhs.1.as_ref(), Expression::Identifier("a")));
+                    assert!(matches!(rhs.1.as_ref(), Expression::Coalesce(_, _)));
+                }
+                other => panic!("expected right-assoc Coalesce, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn optional_access_parses_to_optional_access() {
+        let result = Pratt::default().expr().parse("x?.y").into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::OptionalAccess(recv, field) => {
+                    assert!(matches!(recv.1.as_ref(), Expression::Identifier("x")));
+                    assert_eq!(*field, "y");
+                }
+                other => panic!("expected OptionalAccess, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn try_and_optional_access_bind_tighter_than_coalesce() {
+        assert_eq!(expr!("a? ?? b"), "a? ?? b");
+        assert_eq!(expr!("a?.x ?? b"), "a?.x ?? b");
+    }
+
+    #[test]
+    fn coalesce_binds_tighter_than_assignment() {
+        // `a = b ?? c` is Assignment(a, Coalesce(b, c)), not Coalesce(Assign(...), c).
+        let result = Pratt::default().expr().parse("a = b ?? c").into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Assignment(_, rhs) => {
+                    assert!(matches!(rhs.1.as_ref(), Expression::Coalesce(_, _)));
+                }
+                other => panic!("expected Assignment with Coalesce rhs, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn coalesce_binds_looser_than_or() {
+        assert_eq!(expr!("a || b ?? c"), "a || b ?? c");
+        let result = Pratt::default().expr().parse("a || b ?? c").into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::Coalesce(lhs, _) => {
+                    assert!(matches!(lhs.1.as_ref(), Expression::Or(_, _)));
+                }
+                other => panic!("expected Coalesce of Or, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn error_handling_display_round_trips() {
+        same_try!("raise 1");
+        same_try!("x?");
+        same_try!("a ?? b");
+        same_try!("o?.f");
     }
 }
 

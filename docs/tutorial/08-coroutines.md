@@ -44,7 +44,7 @@ fn main() {
 }
 ```
 
-Resuming an already-**done** coroutine always returns `0` (`Value::default()`) — never the coroutine's last `return` value. There's no error-handling protocol yet to signal "resumed after completion", so this fixed sentinel avoids leaking a stale value (MVP protocol; a real error/`Result` mechanism is future work).
+Resuming an already-**done** coroutine always returns `0` (`Value::default()`) — never the coroutine's last `return` value. There's no dedicated “resumed after completion” error channel on the handle itself, so this fixed sentinel avoids leaking a stale value. For ordinary fallible functions, use built-in [`Result` / `raise` / `?`](09-error-handling.md).
 
 Use `done(h)` to ask whether a handle has completed (returns `bool`):
 

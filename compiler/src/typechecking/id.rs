@@ -72,12 +72,20 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Argument(_, _)
         | Expression::Field(_, _, _) => {}
 
+        Expression::TypeApp { args, .. } => {
+            for a in args {
+                pre_walk(a, table);
+            }
+        }
+
         Expression::Expr(e)
         | Expression::Group(e)
         | Expression::Statement(e)
         | Expression::ExprStatement(e)
         | Expression::Return(e)
         | Expression::ImplicitReturn(e)
+        | Expression::Raise(e)
+        | Expression::Try(e)
         | Expression::Yield(e)
         | Expression::YieldFrom(e)
         | Expression::Negate(e)
@@ -116,7 +124,8 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Le(l, r)
         | Expression::Gt(l, r)
         | Expression::Leq(l, r)
-        | Expression::Geq(l, r) => {
+        | Expression::Geq(l, r)
+        | Expression::Coalesce(l, r) => {
             pre_walk(l, table);
             pre_walk(r, table);
         }
@@ -292,7 +301,9 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
 
         Expression::Method(_, body) => pre_walk(body, table),
 
-        Expression::Access(receiver, _) => pre_walk(receiver, table),
+        Expression::Access(receiver, _) | Expression::OptionalAccess(receiver, _) => {
+            pre_walk(receiver, table)
+        }
 
         Expression::Instantiate(class, args) => {
             pre_walk(class, table);

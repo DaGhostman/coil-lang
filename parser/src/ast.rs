@@ -46,14 +46,27 @@ pub enum Expression<'expr> {
     Argument(Output<'expr>, &'expr str),
     Identifier(&'expr str),
     Type(&'expr str),
+    /// Generic type application in annotations: `Option<int>`, `Result<int, string>`.
+    TypeApp {
+        name: &'expr str,
+        args: Vec<Output<'expr>>,
+    },
     Comment(&'expr str),
     Print(Output<'expr>, Option<Vec<Output<'expr>>>),
     Format(Output<'expr>, Option<Vec<Output<'expr>>>),
     Return(Output<'expr>),
     ImplicitReturn(Output<'expr>),
+    /// `raise expr` — early-return `Err(expr)` from a Result-mode function.
+    Raise(Output<'expr>),
     Yield(Output<'expr>),
     YieldFrom(Output<'expr>),
     Resume(Output<'expr>, Option<Output<'expr>>),
+    /// Postfix `expr?` — propagate `Err`/`None` from Result/Option.
+    Try(Output<'expr>),
+    /// `lhs ?? rhs` — coalesce: Some/Ok unwrap, None/Err → rhs.
+    Coalesce(Output<'expr>, Output<'expr>),
+    /// `expr?.field` — optional field access on `Option`.
+    OptionalAccess(Output<'expr>, &'expr str),
     Negate(Output<'expr>),
     Not(Output<'expr>),
     LogicalNot(Output<'expr>),
@@ -653,11 +666,25 @@ impl<'a> Display for Expression<'a> {
             Self::Access(receiver, field) => {
                 write!(f, "{}.{}", receiver.1, field)
             }
+            Self::OptionalAccess(receiver, field) => {
+                write!(f, "{}?.{}", receiver.1, field)
+            }
+            Self::Try(inner) => write!(f, "{}?", inner.1),
+            Self::Coalesce(lhs, rhs) => write!(f, "{} ?? {}", lhs.1, rhs.1),
+            Self::Raise(inner) => write!(f, "raise {}", inner.1),
             Self::Yield(inner) => write!(f, "yield {}", inner.1),
             Self::YieldFrom(inner) => write!(f, "yield from {}", inner.1),
             Self::Resume(target, None) => write!(f, "resume {}", target.1),
             Self::Resume(target, Some(arg)) => write!(f, "resume {} with {}", target.1, arg.1),
             Self::Type(n) => write!(f, "{}", n),
+            Self::TypeApp { name, args } => {
+                let args_s = args
+                    .iter()
+                    .map(|a| a.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "{}<{}>", name, args_s)
+            }
             e => write!(f, "<unhandled: {:?}>", e),
         }
     }

@@ -237,7 +237,7 @@ fn class_declaration_typechecks() {
 #[test]
 fn enum_decl_no_messages() {
     // A bare `enum` declaration produces no diagnostic.
-    let (_ty, msgs) = check("enum Option { None, Some(int) }");
+    let (_ty, msgs) = check("enum Color { Red, Green(int) }");
     assert!(
         msgs.is_empty(),
         "enum declaration should produce no messages, got: {:?}",
@@ -248,7 +248,7 @@ fn enum_decl_no_messages() {
 #[test]
 fn match_with_all_variants_no_messages() {
     // All variants covered → no diagnostic.
-    let src = "let x = Option::Some(1); match x { Option::None() => 0, Option::Some(v) => v }; enum Option { None, Some(int) }";
+    let src = "let x = Option::Some(1); match x { Option::None() => 0, Option::Some(v) => v };";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.is_empty(),
@@ -261,7 +261,7 @@ fn match_with_all_variants_no_messages() {
 fn non_exhaustive_match_emits_diagnostic() {
     // One arm missing the `Some` variant → "Non-exhaustive" error.
     let src =
-        "let x = Option::None(); match x { Option::None() => 0 }; enum Option { None, Some(int) }";
+        "let x = Option::None(); match x { Option::None() => 0 };";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.iter().any(|m| m.contains("Non-exhaustive match")),
@@ -273,7 +273,7 @@ fn non_exhaustive_match_emits_diagnostic() {
 #[test]
 fn unreachable_arm_emits_diagnostic() {
     // Two arms covering the same tag → second is unreachable.
-    let src = "let x = Option::None(); match x { Option::None() => 0, Option::None() => 1 }; enum Option { None, Some(int) }";
+    let src = "let x = Option::None(); match x { Option::None() => 0, Option::None() => 1 };";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.iter().any(|m| m.contains("Unreachable arm")),
@@ -302,7 +302,7 @@ fn unknown_constructor_in_pattern_errors() {
 
 #[test]
 fn constructor_wrong_arity_errors() {
-    let src = "Option::Some(1, 2); enum Option { None, Some(int) }";
+    let src = "Option::Some(1, 2);";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.iter()
@@ -543,5 +543,39 @@ fn binding_yield_outside_async_fn_reports_diagnostic() {
         msgs.iter().any(|m| m.contains("yield outside async")),
         "expected yield-outside-async diagnostic for binding yield, got: {:?}",
         msgs
+    );
+}
+
+#[test]
+fn try_on_int_has_stable_invalid_try_code() {
+    let msgs = check_messages("fn f() -> int { let x = 1; return x?; }");
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::InvalidTry)),
+        "expected ErrorCode::InvalidTry (E0114), got: {:?}",
+        msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn coalesce_on_int_has_stable_invalid_coalesce_code() {
+    let msgs = check_messages("fn main() { let x = 1 ?? 2; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidCoalesce)),
+        "expected ErrorCode::InvalidCoalesce (E0115), got: {:?}",
+        msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn optional_access_on_result_has_stable_code() {
+    let msgs = check_messages(
+        "fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::InvalidOptionalAccess)),
+        "expected ErrorCode::InvalidOptionalAccess (E0116), got: {:?}",
+        msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
 }

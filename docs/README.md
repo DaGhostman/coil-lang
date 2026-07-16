@@ -41,6 +41,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
+| Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |
 | Tuples, arrays (`push` / `len`), dicts (anonymous records) | Supported |
 | Type aliases (`type Name = T;`, lexically scoped) | Supported |
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
@@ -69,6 +70,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `zero.toml` |
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
 | [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from` |
+| [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 
 Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
 
