@@ -1610,7 +1610,9 @@ impl<const S: usize> Machine<S> {
                             let key = self.heap.intern(name);
                             match gc.as_ref().get(key) {
                                 Some(crate::memory::Member::Value(v)) => v,
-                                Some(crate::memory::Member::Object(_)) => Value::from(-1_i64),
+                                // Heap objects (strings, nested dicts, enums, …)
+                                // — push the address, same as LoadField/Unpack.
+                                Some(crate::memory::Member::Object(o)) => Value::from(o.addr()),
                                 None => Value::from(-1_i64),
                             }
                         }
@@ -2503,6 +2505,61 @@ mod tests {
             .into_inner();
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "hello");
+    }
+
+    /// GetField must return heap-object field values (strings,
+    /// nested dicts, …) by address — not the `-1` sentinel used
+    /// for missing fields. Pre-P0 returned `-1` for `Member::Object`.
+    #[test]
+    fn get_field_returns_heap_object_field() {
+        let mut vm = Machine::<16>::default();
+        // STRING 2 "hi"  → heap string
+        // STRING 1 "s"   → field name
+        // MakeDict 1     → { s: "hi" }
+        // DUPLICATE
+        // STRING 1 "s"
+        // GetField       → should push the "hi" string address
+        // PRINT
+        // HALT
+        let mut bytecode: Vec<Byte> = Vec::new();
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(2));
+        for ch in "hi".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
+        for ch in "s".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
+        bytecode.push(Byte::new(Instruction::DUPLICATE));
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
+        for ch in "s".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::GetField));
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        vm.run(&bytecode);
+        let _ = vm.restore_output();
+        let bytes = std::rc::Rc::try_unwrap(buf)
+            .expect("VM still holds a reference to the buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
+        assert_eq!(s, "hi", "GetField should return the stored string, not -1");
     }
 
     #[test]

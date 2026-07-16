@@ -729,9 +729,30 @@ impl Compiler {
     ) -> String {
         match variable.1.borrow() {
             Expression::Identifier(n) => n.to_string(),
-            f => {
-                let _ = f;
-                todo!("Function name as expression")
+            _ => String::new(),
+        }
+    }
+
+    /// Like `resolve_variable`, but records a diagnostic when the
+    /// expression is not an identifier (replaces the old `todo!`).
+    fn resolve_variable_checked<'compiler>(
+        &mut self,
+        variable: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) -> String {
+        match variable.1.borrow() {
+            Expression::Identifier(n) => n.to_string(),
+            other => {
+                let span = variable.0;
+                let mut m = Message::error(
+                    "Cannot use this expression as a variable name".to_string(),
+                    span.into_range(),
+                );
+                m.push(DiagLabel::new(
+                    format!("expected an identifier, found `{other}`"),
+                    span.into_range(),
+                ));
+                self.messages.push(m);
+                String::new()
             }
         }
     }
@@ -1625,7 +1646,7 @@ impl Compiler {
                 self.functions = functions;
             }
             Expression::Instantiate(class, _args) => {
-                let name = self.resolve_variable(class);
+                let name = self.resolve_variable_checked(class);
                 bytecode.push(
                     Byte::new(Instruction::INIT)
                         .with_operand_u32(self.context.classes[&name].len() as u32),
@@ -1700,7 +1721,7 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
-                let identifier = self.resolve_variable(name);
+                let identifier = self.resolve_variable_checked(name);
                 let n = self
                     .aliases
                     .get(&identifier)
@@ -2908,50 +2929,17 @@ impl Compiler {
                         }
                     }
 
-                    // Emit CONST + RETURN at the match's tail.
+                    // Bind `end_label` to fallthrough with the arm
+                    // value still on the stack (Phase P0 — let x =
+                    // match). Do NOT emit RETURN here: that made
+                    // Match a function terminus so Fragment's
+                    // trailing StorePop was unreachable.
                     //
-                    // The match codegen leaves the body's value
-                    // on the stack at the end of the FIRST
-                    // (source) arm — which is the LAST arm in
-                    // bytecode order (reached by fallthrough).
-                    // The JMP-end placeholders from the non-FIRST
-                    // arms jump to a position past body_a where
-                    // the body's value is RETURNed.
-                    //
-                    // Why emit CONST + RETURN here:
-                    //   1. The function codegen's auto-additions
-                    //      check `last != RETURN` and add
-                    //      `CONST 0; RETURN` if not. Emitting
-                    //      our own RETURN avoids the duplicate
-                    //      CONST 0 (which would clobber the
-                    //      body's value with 0).
-                    //   2. The JMP-end placeholders need a real
-                    //      RETURN at their target — not just a
-                    //      position in the bytecode — otherwise
-                    //      the body's value on the stack would
-                    //      leak past the function's epilogue.
-                    //
-                    // end_pos points to the position of the
-                    // RETURN (one BEFORE the end of self.bytecode,
-                    // because bytecode_len() is a count, not an
-                    // index).
-                    // Emit a RETURN at the match's tail. The
-                    // body_a's last byte is followed by this
-                    // RETURN, so the body's value (on the stack)
-                    // is RETURNed. The non-first arms' JMP-end
-                    // placeholders target this RETURN (via
-                    // end_label bound to its position), so their
-                    // values are RETURNed directly without
-                    // clobbering.
-                    //
-                    // The function codegen's auto-additions
-                    // check `last != RETURN` and skip the
-                    // duplicate CONST + RETURN. end_pos points to
-                    // the position of the RETURN (one BEFORE the
-                    // end of self.bytecode, because bytecode_len()
-                    // is a count, not an index).
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
-                    let end_pos = (self.bytecode.len() - 1) as u32;
+                    // `return match { … }` still works because
+                    // Expression::Return emits its own RETURN after
+                    // the child. Bare Match as a statement is
+                    // discarded by ExprStatement's POP.
+                    let end_pos = self.bytecode.len() as u32;
                     bb.bind_label(end_label, end_pos, &mut self.bytecode, &mut self.constants);
 
                     // Validate: every label that had a

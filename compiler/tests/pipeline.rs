@@ -247,6 +247,45 @@ fn example_let_reassignment_works() {
     assert_eq!(output, "51020");
 }
 
+/// Phase P0: `let x = match { … }` must bind the arm value via
+/// StorePop. Pre-fix Match emitted RETURN at end_label, so the
+/// StorePop was unreachable and prints never ran / saw 0.
+#[test]
+fn let_match_binds_arm_value() {
+    let src = r#"
+        enum Opt { None, Some(int) }
+        fn main() {
+            let x = match Opt::None {
+                Opt::None => 7,
+                Opt::Some(v) => v,
+            };
+            print "%i", x;
+            let y = match Opt::Some(42) {
+                Opt::None => 0,
+                Opt::Some(v) => v,
+            };
+            print "%i", y;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "742");
+}
+
+/// Phase P0: dict fields that hold heap objects (strings) must
+/// round-trip through GetField.
+#[test]
+fn dict_string_field_round_trips() {
+    let src = r#"
+        fn main() {
+            let d = { name: "hi", n: 9 };
+            print "%s", d.name;
+            print "%i", d.n;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "hi9");
+}
+
 #[test]
 fn example_let_chained_bindings_works() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
