@@ -4373,3 +4373,56 @@ Output: `1,2,42,0`.
   function with an implicit fall-through path — not something
   introduced or fixed by CORO-2.2.
 
+## Cursor Cloud specific instructions
+
+Durable, non-obvious notes for developing this Rust workspace in the
+Cursor Cloud environment. Standard commands live in
+[`docs/getting-started.md`](docs/getting-started.md); this section only
+records gotchas.
+
+### Toolchain
+
+- The crates use `edition = "2024"`, which requires **Rust >= 1.85**.
+  The environment's default toolchain is set to `stable` via `rustup`
+  (currently 1.97). The repo pins no `rust-toolchain.toml`, so if
+  `cargo` reports `feature `edition2024` is required`, the active
+  toolchain is too old — run `rustup default stable`.
+
+### Build / lint / test / run
+
+- **Build:** `cargo build --workspace` (dev) or
+  `cargo build --release --workspace`. Only three pre-existing parser
+  warnings plus a few `machine`/`compiler` warnings are expected; the
+  build is otherwise clean.
+- **Lint / check:** use `cargo check --workspace` (warnings-only, the
+  de-facto lint gate referenced throughout this file). **`cargo clippy`
+  does NOT pass out of the box** — it hits a pre-existing
+  `#[deny(clippy::mut_from_ref)]` error on
+  `Gc::payload_mut(&self) -> &mut T` in `machine/src/memory/heap.rs`.
+  That is a code characteristic, not an environment problem.
+- **Test:** `cargo test --workspace` (~576 tests). Note the
+  `compiler` integration suites `tests/pipeline.rs` and
+  `tests/perf_metrics.rs` each take ~25-30s (they compile+run every
+  example / benchmark), so the full run takes a couple of minutes.
+- **Run a program:** `cargo run -- examples/<name>.0s`. The CLI caches
+  compiled bytecode in `out.c0s` in the CWD; **delete `out.c0s` before
+  re-running a different source or after editing** (e.g.
+  `rm -f out.c0s`), otherwise you execute stale bytecode.
+
+### Dev-build stdout noise
+
+- **Debug (`cargo run` / `cargo build`) builds print heap `alloc`/`free`
+  traces to STDOUT** (guarded by `#[cfg(debug_assertions)]` in
+  `machine/src/memory/heap.rs`). These interleave with real program
+  output. For clean output when demonstrating a program, build/run with
+  `--release` (`./target/release/zero-script examples/<name>.0s`).
+
+### FFI
+
+- `libffi` (system `libffi-dev`) is required for the FFI paths and is
+  preinstalled in this environment; the FFI unit tests (`machine`) and
+  pipeline golden tests (`strlen`, `ffi_sum`) pass. The standalone
+  `examples/strlen.0s` CLI run may **segfault** — that is a pre-existing
+  runtime issue in the example path, not an environment/setup problem
+  (the equivalent FFI logic passes in the test suite).
+
