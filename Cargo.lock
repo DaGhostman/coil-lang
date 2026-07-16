@@ -787,6 +787,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reporting"
+version = "0.1.0"
+dependencies = [
+ "ariadne",
+ "common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rkyv"
 version = "0.8.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
