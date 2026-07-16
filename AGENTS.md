@@ -19,7 +19,7 @@
 - Single-pass stack codegen in `compiler/src/lib.rs` is the only compilation path; register-VM migration was removed.
 - Coroutines (Phase 1–2): `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` via `MakeCoro`/`ResumeCoro`/`YieldCoro`/`YieldFromCoro`; `coroutine<Y, S>` types; resume-after-done returns `Value::default()`.
 - FFI uses compile-time `extern` blocks and runtime `dload`/`declare`/`invoke` with libffi; `FFIType` is a compiler builtin with fixed tags; `resolve_library` resolves paths via entry-script `base_dir`, `zero.toml` `[ffi] search_paths`, and system search; supports Ptr (arrays/tuples), C structs, and callbacks via `FfiSignatureBuilder`.
-- `ARCHIVE_VERSION` is 10; bump on incompatible bytecode, tag, or opcode changes.
+- `ARCHIVE_VERSION` is 15; bump on incompatible bytecode, tag, or opcode changes.
 - `fib(32)` in `examples/fib.0s` is the primary performance regression benchmark (expected output `2178309`).
 - The CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
 
@@ -4426,3 +4426,99 @@ records gotchas.
   runtime issue in the example path, not an environment/setup problem
   (the equivalent FFI logic passes in the test suite).
 
+
+## PHASE P0–P2 — FEATURE COMPLETION (COMPLETED)
+
+### Summary
+
+Closed P0 correctness bugs, finished P1 (dicts, classes, coroutines,
+FFI returns, multi-file CLI), then shipped P2 scripting ergonomics
+(loops, strings/`format`, `const`, growing arrays, scoped aliases).
+`ARCHIVE_VERSION` is **15**.
+
+### Phase 0 — P0 correctness
+
+- **Match as expression:** Match codegen no longer emits `RETURN` at
+  `end_label`. Arm values stay on the stack for Fragment `StorePop`
+  (`let x = match …`). End-label `DUPLICATE; POP` is a peephole fusion
+  barrier so a following `return match` does not fuse into
+  `ConstReturnImm` incorrectly.
+- **GetField:** `Member::Object` pushes the heap object address (same
+  as `LoadField` / `Unpack`); missing field still returns `-1`.
+- **`resolve_variable`:** Emits a diagnostic instead of `todo!`.
+
+### Phase 1 — Dicts
+
+- In-place `SetField` + GetField Object path: nested string/enum fields
+  and `d.foo = 10` mutation work end-to-end. Docs no longer warn that
+  mutation is a no-op.
+
+### Phase 2 — Classes
+
+- Typechecker + codegen for positional ctor args, field
+  `GetField`/`SetField`, and method `CALL` with `self` at slot 0.
+- Parser: `impl` methods via `.repeated()` (no commas required).
+- `examples/classes.0s` → `7458`.
+
+### Phase 3 — Coroutines
+
+- Builtin `done(h)` → `bool` via `DoneCoro`.
+- `async fn -> T` unifies declared `T` with yield/return slot `Y`.
+- `examples/coro_done.0s` → `falsefalsetrue`.
+
+### Phase 4 — FFI returns + invoke typing
+
+- Struct returns: libffi buffer → record (`ObjInstance`) by field name.
+- Callback returns: opaque `Ptr` address.
+- `invoke` result type comes from `declare`'s recorded `ret` (side
+  table; unwrap `ExprStatement`/`Statement` wrappers on `let id =
+  declare(...)`).
+- Examples: `ffi_struct_ret.0s` (`34`), `ffi_callback_ret.0s` (`1`).
+
+### Phase 5 — Multi-file CLI
+
+- `src/main.rs` uses `Pipeline::compile_src_from_file`.
+- Recompile on missing/corrupt archive, version mismatch, or newer
+  entry mtime. `find_project_root` walks up for `zero.toml`.
+- Workspace `zero.toml` roots include `./examples/src` for modules.
+
+### Phase 6 — Loops
+
+- `break` / `continue` via `loop_stack` + `BlockBuilder`.
+- C-style `for (init; cond; step)` desugars to `while` with continue
+  targeting the step. `examples/for_break.0s` → `18`.
+
+### Phase 7 — Strings + `format`
+
+- `string + string` → `FORMAT "%s%s"`.
+- User-facing `format` keyword leaves a string on the stack (no
+  `PRINT`). `examples/string_fmt.0s` → `hello world42-x`.
+- FORMAT arg pop order fixed to source order.
+
+### Phase 8 — `const`
+
+- Parser `const name = expr;` → `Expression::Constant`.
+- `examples/const.0s` → `42hi`.
+
+### Phase 9 — Growing arrays
+
+- Opcodes `ArrayPush` / `ArrayLen`; builtins `push` / `len`.
+- `examples/array_grow.0s` → `414`. Bumped `ARCHIVE_VERSION` to **15**.
+
+### Phase 10 — Scoped type aliases
+
+- Stack of alias maps on `Checker`; push/pop with function/block
+  frames. Same-frame duplicate → diagnostic; inner may shadow outer.
+
+### Phase 11 — Docs sync
+
+- Feature matrix / keywords / syntax / types / built-ins / examples
+  catalog updated for the above. `AGENTS.md` learned fact:
+  `ARCHIVE_VERSION` **15**.
+
+### Critical regressions
+
+- `cargo test --workspace`
+- `cargo run -- examples/fib.0s` → `2178309`
+- `cargo run -- examples/modules.0s` / `classes.0s` / `for_break.0s`
+- Pipeline goldens: fizbuz, coroutines, FFI, dict, arrays

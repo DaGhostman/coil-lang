@@ -4574,7 +4574,8 @@ mod tests {
 
     #[test]
     fn instantiate_returns_class_type() {
-        let src = "class Foo { name: String, } let x = new Foo(); x";
+        // Positional ctor args match class fields in declaration order.
+        let src = r#"class Foo { name: string, } let x = new Foo("hi"); x"#;
         let (mut c, ty) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -4586,14 +4587,11 @@ mod tests {
 
     #[test]
     fn class_impl_and_instantiate_combined() {
-        // Pulls the existing example together:
-        //   class Foo { name: String, }
-        //   impl Foo { fn sadge() -> int { return 42; } }
-        //   fn main() { print "%i", (2 * 2 + 3); let x = new Foo(); }
-        let src = "\
-            class Foo { name: String, } \
-            impl Foo { fn sadge() -> int { return 42; } } \
-            fn main() { let x = new Foo(); }";
+        let src = r#"
+            class Foo { name: string, }
+            impl Foo { fn sadge() -> int { return 42; } }
+            fn main() { let x = new Foo("hi"); }
+        "#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);

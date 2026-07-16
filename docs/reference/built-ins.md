@@ -251,7 +251,7 @@ print "%i", invoke(lib, sum_id, (40, 2));
 
 ### Typechecker note
 
-`invoke` is typed as `int` at inference time regardless of declared return type. The programmer is responsible for consistency with `declare`.
+`invoke` returns the type recorded from the matching `declare(..., ret)` (or `unit` for `void`). Bind the `declare` result with `let id = declare(...)` so the side table can refine later `invoke` calls.
 
 ---
 
@@ -279,12 +279,12 @@ There is **no general standard library** yet. The following are **not** built-in
 
 | Category | Examples |
 |----------|----------|
-| Collections API | `len`, `push`, `sort`, iterators |
-| String ops | slice, trim |
+| Collections API | `sort`, iterators (`push` / `len` are builtins) |
+| String ops | slice, trim (concat via `+` and `format` are supported) |
 | Math | `sin`, `sqrt`, `random` |
 | File I/O | `read_file`, `write_file` |
 | Networking | sockets, HTTP |
-| Concurrency | threads, async/await (parser not wired) |
+| Concurrency | OS threads (stackful coroutines via `async` / `yield` / `resume` / `done` are supported) |
 | Memory | `alloc`, `free` |
 
 Use **FFI** to call C libraries for these capabilities, or **host natives** when embedding the VM in Rust.

@@ -1,7 +1,8 @@
 # VM Performance Saturation Pass
 
-`ARCHIVE_VERSION` bumped to **13** for new fused opcodes `BinSlotImmJmpf` and
-`LogNotJmpf`.
+`ARCHIVE_VERSION` was bumped to **13** for fused opcodes `BinSlotImmJmpf` and
+`LogNotJmpf`. Current tree is **15** (also includes `DoneCoro`, `ArrayPush` /
+`ArrayLen`, and later fusion work).
 
 ## Baseline corpus
 

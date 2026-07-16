@@ -4946,22 +4946,22 @@ fn main() {
             jimp_count
         );
 
-        // Exactly 1 POP for the inner Unit sub-pattern. The
-        // pre-fix codegen would have emitted 2 (one from the
-        // test chain, one from the reverse pass's redundant
-        // binding code for the inner Unit pattern).
+        // POPs expected:
+        // - 1 from the test chain for the inner Unit (`Option::None`)
+        // - 1 from Match's end-label `DUPLICATE; POP` fusion barrier
+        //   (Phase P0 — keeps peephole from fusing last-arm CONST with
+        //   a following RETURN). The reverse pass must NOT add a third
+        //   redundant POP for the Unit sub-pattern.
         //
-        // Note: `let _ = match x { ... }` is an Assignment
-        // (no ExprStatement wrapper), so it doesn't add a POP.
-        // The total is 1 POP (the test chain's POP for the
-        // inner Unit sub-pattern). Pre-fix, it would be 2.
+        // Note: `let _ = match x { ... }` is an Assignment (no
+        // ExprStatement wrapper), so it doesn't add another POP.
         let pop_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::POP))
             .count();
         assert_eq!(
-            pop_count, 1,
-            "expected exactly 1 POP (test chain's inner Unit POP; the reverse pass's redundant POP is suppressed); got {}",
+            pop_count, 2,
+            "expected 2 POPs (test-chain Unit + match end barrier); got {} (3+ means reverse-pass double-pop regression)",
             pop_count
         );
     }

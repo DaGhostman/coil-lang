@@ -289,18 +289,16 @@ a stale value.
 
 | Area | Limitation |
 |------|------------|
-| Type aliases | Lexically scoped; duplicate names in the same scope are rejected |
-| Classes | Nominal typing partial; limited runtime method dispatch |
-| FFI | Only `int`, `float`, `string`, `void` — see [FFI tutorial](../tutorial/07-ffi.md) |
+| Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer |
+| Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
+| FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | No user-defined generic types |
 | Higher-kinded types | Not supported |
 | Effect system | No linear/ownership types |
-| `invoke` typing | Result type not refined from `declare` signature |
+| Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
-| String `+` | Not in current tree — do not rely on string concatenation |
 | `async fn` `-> T` annotation | When present, `T` is unified with the coroutine yield/return type `Y` (same slot as `yield` / `return` / `resume`). A mismatch is a type error. |
-| `const` | No `const` keyword in parser — use `let` |
 
 ---
 
