@@ -4522,3 +4522,13 @@ FFI returns, multi-file CLI), then shipped P2 scripting ergonomics
 - `cargo run -- examples/fib.0s` → `2178309`
 - `cargo run -- examples/modules.0s` / `classes.0s` / `for_break.0s`
 - Pipeline goldens: fizbuz, coroutines, FFI, dict, arrays
+
+### Release-build note (post-landing fix)
+
+VM `execute` used `promise!(opcode <= YieldFromCoro)` under
+`#[cfg(not(debug_assertions))]`, which lowers to
+`assert_unchecked`. Opcodes appended after `YieldFromCoro`
+(`StoreIndex`, `LogNot`, `DoneCoro`, `ArrayPush`, `ArrayLen`, …)
+were therefore UB in `--release`, breaking array mutation,
+`push`/`len`, and `done(h)`. The ceiling is now `ArrayLen` and
+**must be bumped whenever a new `Instruction` variant is appended**.
