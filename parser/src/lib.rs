@@ -3011,15 +3011,26 @@ mod tests_error_handling {
     use super::*;
     use chumsky::Parser;
 
+    /// Unwrap the outer `Expression::Expr` wrapper the Pratt root often adds.
+    fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+        match expr {
+            Expression::Expr((_, inner)) => unwrap_expr(inner),
+            other => other,
+        }
+    }
+
+    fn parse_expr(src: &str) -> Box<Expression<'_>> {
+        Pratt::default()
+            .expr()
+            .parse(src)
+            .into_result()
+            .unwrap_or_else(|e| panic!("parse failed for `{}`: {:?}", src, e))
+            .1
+    }
+
     macro_rules! expr {
         ($case: expr) => {{
-            let p = Pratt::default();
-            p.expr()
-                .parse($case)
-                .into_result()
-                .unwrap_or_else(|e| panic!("parse failed for `{}`: {:?}", $case, e))
-                .1
-                .to_string()
+            parse_expr($case).to_string()
         }};
     }
 
@@ -3031,55 +3042,50 @@ mod tests_error_handling {
 
     #[test]
     fn raise_parses_as_raise_expression() {
-        let src = "raise \"boom\"";
-        let result = Pratt::default().expr().parse(src).into_result();
-        match result {
-            Ok((_span, expr)) => match expr.as_ref() {
-                Expression::Raise(inner) => assert_eq!(inner.1.to_string(), "\"boom\""),
-                other => panic!("expected Raise, got {:?}", other),
-            },
-            Err(e) => panic!("parse failed: {:?}", e),
+        match unwrap_expr(parse_expr("raise \"boom\"").as_ref()) {
+            Expression::Raise(inner) => assert_eq!(inner.1.to_string(), "\"boom\""),
+            other => panic!("expected Raise, got {:?}", other),
         }
     }
 
     #[test]
     fn postfix_try_parses_to_try() {
         same_try!("x?");
-        let result = Pratt::default().expr().parse("x?").into_result();
-        match result {
-            Ok((_span, expr)) => assert!(matches!(expr.as_ref(), Expression::Try(_))),
-            Err(e) => panic!("parse failed: {:?}", e),
-        }
+        assert!(matches!(
+            unwrap_expr(parse_expr("x?").as_ref()),
+            Expression::Try(_)
+        ));
     }
 
     #[test]
     fn coalesce_parses_and_is_right_associative() {
         assert_eq!(expr!("a ?? b ?? c"), "a ?? b ?? c");
-        let result = Pratt::default().expr().parse("a ?? b ?? c").into_result();
-        match result {
-            Ok((_span, expr)) => match expr.as_ref() {
-                Expression::Coalesce(lhs, rhs) => {
-                    assert!(matches!(lhs.1.as_ref(), Expression::Identifier("a")));
-                    assert!(matches!(rhs.1.as_ref(), Expression::Coalesce(_, _)));
-                }
-                other => panic!("expected right-assoc Coalesce, got {:?}", other),
-            },
-            Err(e) => panic!("parse failed: {:?}", e),
+        match unwrap_expr(parse_expr("a ?? b ?? c").as_ref()) {
+            Expression::Coalesce(lhs, rhs) => {
+                assert!(matches!(
+                    unwrap_expr(lhs.1.as_ref()),
+                    Expression::Identifier("a")
+                ));
+                assert!(matches!(
+                    unwrap_expr(rhs.1.as_ref()),
+                    Expression::Coalesce(_, _)
+                ));
+            }
+            other => panic!("expected right-assoc Coalesce, got {:?}", other),
         }
     }
 
     #[test]
     fn optional_access_parses_to_optional_access() {
-        let result = Pratt::default().expr().parse("x?.y").into_result();
-        match result {
-            Ok((_span, expr)) => match expr.as_ref() {
-                Expression::OptionalAccess(recv, field) => {
-                    assert!(matches!(recv.1.as_ref(), Expression::Identifier("x")));
-                    assert_eq!(*field, "y");
-                }
-                other => panic!("expected OptionalAccess, got {:?}", other),
-            },
-            Err(e) => panic!("parse failed: {:?}", e),
+        match unwrap_expr(parse_expr("x?.y").as_ref()) {
+            Expression::OptionalAccess(recv, field) => {
+                assert!(matches!(
+                    unwrap_expr(recv.1.as_ref()),
+                    Expression::Identifier("x")
+                ));
+                assert_eq!(*field, "y");
+            }
+            other => panic!("expected OptionalAccess, got {:?}", other),
         }
     }
 
@@ -3092,30 +3098,25 @@ mod tests_error_handling {
     #[test]
     fn coalesce_binds_tighter_than_assignment() {
         // `a = b ?? c` is Assignment(a, Coalesce(b, c)), not Coalesce(Assign(...), c).
-        let result = Pratt::default().expr().parse("a = b ?? c").into_result();
-        match result {
-            Ok((_span, expr)) => match expr.as_ref() {
-                Expression::Assignment(_, rhs) => {
-                    assert!(matches!(rhs.1.as_ref(), Expression::Coalesce(_, _)));
-                }
-                other => panic!("expected Assignment with Coalesce rhs, got {:?}", other),
-            },
-            Err(e) => panic!("parse failed: {:?}", e),
+        match unwrap_expr(parse_expr("a = b ?? c").as_ref()) {
+            Expression::Assignment(_, rhs) => {
+                assert!(matches!(
+                    unwrap_expr(rhs.1.as_ref()),
+                    Expression::Coalesce(_, _)
+                ));
+            }
+            other => panic!("expected Assignment with Coalesce rhs, got {:?}", other),
         }
     }
 
     #[test]
     fn coalesce_binds_looser_than_or() {
         assert_eq!(expr!("a || b ?? c"), "a || b ?? c");
-        let result = Pratt::default().expr().parse("a || b ?? c").into_result();
-        match result {
-            Ok((_span, expr)) => match expr.as_ref() {
-                Expression::Coalesce(lhs, _) => {
-                    assert!(matches!(lhs.1.as_ref(), Expression::Or(_, _)));
-                }
-                other => panic!("expected Coalesce of Or, got {:?}", other),
-            },
-            Err(e) => panic!("parse failed: {:?}", e),
+        match unwrap_expr(parse_expr("a || b ?? c").as_ref()) {
+            Expression::Coalesce(lhs, _) => {
+                assert!(matches!(unwrap_expr(lhs.1.as_ref()), Expression::Or(_, _)));
+            }
+            other => panic!("expected Coalesce of Or, got {:?}", other),
         }
     }
 
