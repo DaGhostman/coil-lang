@@ -20,7 +20,7 @@ use chumsky::{
     prelude::{choice, just, none_of, recursive},
     text,
 };
-use common::{Label, Message};
+use reporting::{ErrorCode, Label, Message};
 
 #[repr(u16)]
 enum Precedence {
@@ -1723,7 +1723,7 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    pub fn parse(&self, input: &'pratt str) -> Result<Output<'pratt>, common::Message> {
+    pub fn parse(&self, input: &'pratt str) -> Result<Output<'pratt>, Message> {
         match self
             .declaration()
             .repeated()
@@ -1734,8 +1734,11 @@ impl<'pratt> Pratt<'pratt> {
             .into_result()
         {
             Err(errs) => {
-                let mut message =
-                    Message::error("Parse error".to_string(), std::ops::Range::default());
+                let mut message = Message::error(
+                    ErrorCode::ParseError,
+                    "Parse error".to_string(),
+                    std::ops::Range::default(),
+                );
 
                 errs.iter().for_each(|err| {
                     message.push(Label::new(err.to_string(), err.span().into_range()));

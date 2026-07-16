@@ -1,0 +1,202 @@
+//! Stable diagnostic error codes for zero-script.
+
+/// Stable machine-readable diagnostic code.
+///
+/// Codes are grouped by family:
+/// - `E00xx` — parse / syntax
+/// - `E01xx` — name resolution & types
+/// - `E02xx` — enums / match / constructs
+/// - `E03xx` — format strings & builtins
+/// - `E04xx` — aggregates / records / FFI tags
+/// - `E08xx` — codegen
+/// - `E09xx` — CLI / I/O / archive
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorCode {
+    // --- Parse (E00xx) ---
+    ParseError,
+
+    // --- Name resolution & types (E01xx) ---
+    UnknownValue,
+    UnknownFunction,
+    TypeMismatch,
+    InfiniteType,
+    NotAFunction,
+    TooManyArguments,
+    UndeclaredAssignment,
+    InvalidAssignment,
+    VariableRedeclaration,
+    ConstantRedeclaration,
+    UnknownType,
+    ReturnMismatch,
+    YieldOutsideAsync,
+    ResumeTypeMismatch,
+    GenericTypeError,
+
+    // --- Enums / match / constructs (E02xx) ---
+    DuplicateEnum,
+    DuplicateConstructor,
+    UnknownEnum,
+    UnknownVariant,
+    ConstructorArity,
+    PayloadShapeMismatch,
+    MissingField,
+    UnknownField,
+    DuplicateField,
+    NonExhaustiveMatch,
+    UnreachableArm,
+    UnknownConstructorPattern,
+    AmbiguousField,
+
+    // --- Format / print (E03xx) ---
+    FormatSpecifierMismatch,
+    FormatArityMismatch,
+
+    // --- Aggregates / FFI (E04xx) ---
+    IndexOutOfBounds,
+    CannotIndex,
+    ArrayElementMismatch,
+    InvalidFfiType,
+    DeclareArity,
+    InvokeArity,
+
+    // --- Codegen (E08xx) ---
+    UnknownExpression,
+    CodegenError,
+
+    // --- CLI / I/O (E09xx) ---
+    IoError,
+    ArchiveVersionMismatch,
+    InvalidCliFlags,
+    MissingInputFile,
+}
+
+impl ErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseError => "E0001",
+            Self::UnknownValue => "E0100",
+            Self::UnknownFunction => "E0101",
+            Self::TypeMismatch => "E0102",
+            Self::InfiniteType => "E0103",
+            Self::NotAFunction => "E0104",
+            Self::TooManyArguments => "E0105",
+            Self::UndeclaredAssignment => "E0106",
+            Self::InvalidAssignment => "E0107",
+            Self::VariableRedeclaration => "E0108",
+            Self::ConstantRedeclaration => "E0109",
+            Self::UnknownType => "E0110",
+            Self::ReturnMismatch => "E0111",
+            Self::YieldOutsideAsync => "E0112",
+            Self::ResumeTypeMismatch => "E0113",
+            Self::GenericTypeError => "E0119",
+            Self::DuplicateEnum => "E0200",
+            Self::DuplicateConstructor => "E0201",
+            Self::UnknownEnum => "E0202",
+            Self::UnknownVariant => "E0203",
+            Self::ConstructorArity => "E0204",
+            Self::PayloadShapeMismatch => "E0205",
+            Self::MissingField => "E0206",
+            Self::UnknownField => "E0207",
+            Self::DuplicateField => "E0208",
+            Self::NonExhaustiveMatch => "E0209",
+            Self::UnreachableArm => "E0210",
+            Self::UnknownConstructorPattern => "E0211",
+            Self::AmbiguousField => "E0212",
+            Self::FormatSpecifierMismatch => "E0300",
+            Self::FormatArityMismatch => "E0301",
+            Self::IndexOutOfBounds => "E0400",
+            Self::CannotIndex => "E0401",
+            Self::ArrayElementMismatch => "E0402",
+            Self::InvalidFfiType => "E0403",
+            Self::DeclareArity => "E0404",
+            Self::InvokeArity => "E0405",
+            Self::UnknownExpression => "E0800",
+            Self::CodegenError => "E0801",
+            Self::IoError => "E0900",
+            Self::ArchiveVersionMismatch => "E0901",
+            Self::InvalidCliFlags => "E0902",
+            Self::MissingInputFile => "E0903",
+        }
+    }
+
+    /// Numeric form for LSP `Diagnostic.code` (number variant).
+    pub fn as_number(self) -> i32 {
+        let s = self.as_str();
+        s.trim_start_matches('E').parse().unwrap_or(0)
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ParseError => "parse error",
+            Self::UnknownValue => "cannot find value in this scope",
+            Self::UnknownFunction => "cannot find function",
+            Self::TypeMismatch => "type mismatch",
+            Self::InfiniteType => "infinite type",
+            Self::NotAFunction => "not a function",
+            Self::TooManyArguments => "too many arguments",
+            Self::UndeclaredAssignment => "assignment to undeclared variable",
+            Self::InvalidAssignment => "invalid assignment target",
+            Self::VariableRedeclaration => "variable redeclaration",
+            Self::ConstantRedeclaration => "constant redeclaration",
+            Self::UnknownType => "unknown type",
+            Self::ReturnMismatch => "return type mismatch",
+            Self::YieldOutsideAsync => "yield outside async fn",
+            Self::ResumeTypeMismatch => "resume type mismatch",
+            Self::GenericTypeError => "type error",
+            Self::DuplicateEnum => "duplicate enum",
+            Self::DuplicateConstructor => "duplicate constructor",
+            Self::UnknownEnum => "unknown enum",
+            Self::UnknownVariant => "unknown variant",
+            Self::ConstructorArity => "constructor arity mismatch",
+            Self::PayloadShapeMismatch => "payload shape mismatch",
+            Self::MissingField => "missing field",
+            Self::UnknownField => "unknown field",
+            Self::DuplicateField => "duplicate field",
+            Self::NonExhaustiveMatch => "non-exhaustive match",
+            Self::UnreachableArm => "unreachable match arm",
+            Self::UnknownConstructorPattern => "unknown constructor in pattern",
+            Self::AmbiguousField => "ambiguous field access",
+            Self::FormatSpecifierMismatch => "format specifier type mismatch",
+            Self::FormatArityMismatch => "format argument count mismatch",
+            Self::IndexOutOfBounds => "index out of bounds",
+            Self::CannotIndex => "cannot index non-aggregate",
+            Self::ArrayElementMismatch => "array element type mismatch",
+            Self::InvalidFfiType => "invalid FFI type",
+            Self::DeclareArity => "declare argument mismatch",
+            Self::InvokeArity => "invoke argument mismatch",
+            Self::UnknownExpression => "unknown expression in codegen",
+            Self::CodegenError => "codegen error",
+            Self::IoError => "I/O error",
+            Self::ArchiveVersionMismatch => "bytecode archive version mismatch",
+            Self::InvalidCliFlags => "invalid CLI flags",
+            Self::MissingInputFile => "missing input file",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_are_unique_strings() {
+        let all = [
+            ErrorCode::ParseError,
+            ErrorCode::UnknownValue,
+            ErrorCode::TypeMismatch,
+            ErrorCode::ArchiveVersionMismatch,
+            ErrorCode::MissingInputFile,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for c in all {
+            assert!(seen.insert(c.as_str()), "duplicate {}", c.as_str());
+            assert!(c.as_number() > 0);
+        }
+    }
+}

@@ -87,6 +87,7 @@ Look up syntax and semantics when you already know what you need.
 | [Built-ins](reference/built-ins.md) | `print`, `format`, FFI builtins, natives |
 | [Modules](reference/modules.md) | Namespace rules, `use` resolution |
 | [Project config](reference/project-config.md) | `zero.toml` manifest format |
+| [Error codes](reference/error-codes.md) | Stable `E####` diagnostic codes, SARIF / LSP flags |
 
 ### Examples catalog
 

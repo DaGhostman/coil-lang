@@ -719,6 +719,7 @@ fn example_ffi_callback_prints_42() {
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
     let libsum = workspace_root.join("examples/libsum.so");
+    ensure_ffi_libsum_built();
     if !libsum.exists() {
         eprintln!("skipping: libsum.so not built");
         return;
@@ -733,8 +734,8 @@ fn example_ffi_struct_return_prints_34() {
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
     let libsum = workspace_root.join("examples/libsum.so");
-    // Force rebuild so make_point is available after sum.c updates.
-    let _ = std::fs::remove_file(&libsum);
+    // Rebuild when sum.c is newer (mtime check inside ensure_*). Do not
+    // delete libsum.so here — other FFI tests in this file race on that path.
     ensure_ffi_libsum_built();
     if !libsum.exists() {
         eprintln!("skipping: libsum.so not built");

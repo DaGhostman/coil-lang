@@ -1,0 +1,9 @@
+[package]
+name = "reporting"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariadne = { version = "0.6.0", features = ["auto-color"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

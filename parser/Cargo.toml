@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+reporting = { path = "../reporting" }
 chumsky = { version = "0.12", features = ["lexical-numbers", "memoization", "pratt"] }

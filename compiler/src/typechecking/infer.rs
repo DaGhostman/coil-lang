@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use common::{Label, Message};
+use reporting::{ErrorCode, Label, Message};
 use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
 
 use super::env::{Env, TyVarCounter, instantiate};
@@ -370,7 +370,7 @@ impl Checker {
             .unwrap_or(false);
 
         if duplicate {
-            let mut msg = Message::error(format!("Duplicate type alias `{}`", name), range);
+            let mut msg = Message::error(ErrorCode::GenericTypeError, format!("Duplicate type alias `{}`", name), range);
             msg.with_help("type aliases may shadow names only from an outer scope".to_string());
             self.messages.push(msg);
             return;
@@ -438,7 +438,7 @@ impl Checker {
                 match scheme {
                     Some(s) => instantiate(&s, &mut self.counter),
                     None => {
-                        self.error(format!("Cannot find value `{}` in this scope", name), range)
+                        self.error(ErrorCode::UnknownValue, format!("Cannot find value `{}` in this scope", name), range)
                     }
                 }
             }
@@ -556,7 +556,7 @@ impl Checker {
                     Expression::Identifier(n) => n.to_string(),
                     _ => {
                         return self.error_with_help(
-                            "Invalid constant name".to_string(),
+                            ErrorCode::GenericTypeError, "Invalid constant name".to_string(),
                             range,
                             Some("a constant name must be an identifier".to_string()),
                         );
@@ -670,7 +670,7 @@ impl Checker {
                     Ty::Con(name) if name == "bool" || name == "int" => boolean(),
                     _ => {
                         let _ = self.error_with_help(
-                            "Logical NOT requires a `bool` or `int` operand".to_string(),
+                            ErrorCode::GenericTypeError, "Logical NOT requires a `bool` or `int` operand".to_string(),
                             e.0.into_range(),
                             Some(format!(
                                 "found `{pruned}`; use `~` for bitwise negation on integers"
@@ -685,7 +685,7 @@ impl Checker {
                 let pruned = apply_ty_prune(&self.subst, &ty);
                 if !matches!(pruned, Ty::Con(ref n) if n == "int" || n == "float") {
                     let _ = self.error_with_help(
-                        "Increment/decrement requires a numeric lvalue".to_string(),
+                        ErrorCode::GenericTypeError, "Increment/decrement requires a numeric lvalue".to_string(),
                         range,
                         Some(
                             "only `int` and `float` variables, fields, and indices support ++/--"
@@ -703,8 +703,7 @@ impl Checker {
                     let owner = match &resolved {
                         Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
                         _ => {
-                            return self.error_with_help(
-                                format!("Cannot call method `{}` on non-class type", method),
+                            return self.error_with_help(ErrorCode::NotAFunction, format!("Cannot call method `{}` on non-class type", method),
                                 range,
                                 Some("method calls require a class instance receiver".to_string()),
                             );
@@ -718,8 +717,7 @@ impl Checker {
                     {
                         Some(s) => s,
                         None => {
-                            return self.error(
-                                format!("Cannot find method `{}` on class `{}`", method, owner),
+                            return self.error(ErrorCode::UnknownFunction, format!("Cannot find method `{}` on class `{}`", method, owner),
                                 range,
                             );
                         }
@@ -741,7 +739,7 @@ impl Checker {
 
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
-                    _ => return self.error("Invalid call target".to_string(), range),
+                    _ => return self.error(ErrorCode::UnknownFunction, "Invalid call target".to_string(), range),
                 };
 
                 if ident == "push" {
@@ -754,7 +752,7 @@ impl Checker {
                 let scheme = self.env.lookup(&ident).cloned();
                 let fun_ty = match scheme {
                     Some(s) => instantiate(&s, &mut self.counter),
-                    None => return self.error(format!("Cannot find function `{}`", ident), range),
+                    None => return self.error(ErrorCode::UnknownFunction, format!("Cannot find function `{}`", ident), range),
                 };
 
                 let arg_tys: Vec<Ty> = match args {
@@ -860,7 +858,7 @@ impl Checker {
                             let prev_pruned = apply_ty_prune(&self.subst, prev);
                             if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
                                 let _ = self.error_with_help(
-                                    format!(
+                                    ErrorCode::TypeMismatch, format!(
                                         "array element type mismatch: expected `{}`, found `{}`",
                                         prev_pruned,
                                         t_pruned
@@ -901,7 +899,7 @@ impl Checker {
                             let i = *idx;
                             if i < 0 || (i as usize) >= *n {
                                 let _ = self.error_with_help(
-                                    format!(
+                                    ErrorCode::IndexOutOfBounds, format!(
                                         "array index {} out of bounds for array of length {}",
                                         i, n
                                     ),
@@ -924,7 +922,7 @@ impl Checker {
                             let i = *idx;
                             if i < 0 || (i as usize) >= tys.len() {
                                 let _ = self.error_with_help(
-                                    format!(
+                                    ErrorCode::IndexOutOfBounds, format!(
                                         "tuple index {} out of bounds for tuple of length {}",
                                         i,
                                         tys.len()
@@ -945,7 +943,7 @@ impl Checker {
                     _ => {
                         // Non-aggregate target: emit a diagnostic.
                         let _ = self.error_with_help(
-                            "cannot index non-aggregate type".to_string(),
+                            ErrorCode::CannotIndex, "cannot index non-aggregate type".to_string(),
                             range.clone(),
                             Some(format!("type `{}` does not support indexing", resolved)),
                         );
@@ -962,7 +960,7 @@ impl Checker {
                 for f in fields {
                     if seen.insert(f.name.to_string(), ()).is_some() {
                         let _ = self.error_with_help(
-                            format!("Duplicate field `{}` in record literal", f.name),
+                            ErrorCode::DuplicateField, format!("Duplicate field `{}` in record literal", f.name),
                             range.clone(),
                             Some("record literals must have unique field names".to_string()),
                         );
@@ -999,7 +997,7 @@ impl Checker {
                         }
                         _ => {
                             let mut m = Message::error(
-                                "declare(...) third argument must be an arguments tuple (T1, T2, ...)"
+                                ErrorCode::DeclareArity, "declare(...) third argument must be an arguments tuple (T1, T2, ...)"
                                     .to_string(),
                                 args[2].0.into_range(),
                             );
@@ -1017,7 +1015,7 @@ impl Checker {
                         self.infer(arg);
                     }
                     let mut m = Message::error(
-                        "declare requires 4 arguments (lib, name, args_tuple, ret_type)"
+                        ErrorCode::DeclareArity, "declare requires 4 arguments (lib, name, args_tuple, ret_type)"
                             .to_string(),
                         range.clone(),
                     );
@@ -1051,7 +1049,7 @@ impl Checker {
                         }
                         _ => {
                             let mut m = Message::error(
-                                "invoke(...) third argument must be an arguments tuple (v1, v2, ...)"
+                                ErrorCode::InvokeArity, "invoke(...) third argument must be an arguments tuple (v1, v2, ...)"
                                     .to_string(),
                                 args[2].0.into_range(),
                             );
@@ -1067,7 +1065,7 @@ impl Checker {
                         self.infer(arg);
                     }
                     let mut m = Message::error(
-                        "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
+                        ErrorCode::InvokeArity, "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
                         range.clone(),
                     );
                     m.push(Label::new(
@@ -1087,7 +1085,7 @@ impl Checker {
             Expression::Yield(e) => {
                 if self.async_depth == 0 {
                     return self.error_with_help(
-                        "yield outside async function".to_string(),
+                        ErrorCode::YieldOutsideAsync, "yield outside async function".to_string(),
                         range,
                         Some("yield may only appear inside an async fn body".to_string()),
                     );
@@ -1105,7 +1103,7 @@ impl Checker {
             Expression::YieldFrom(e) => {
                 if self.async_depth == 0 {
                     return self.error_with_help(
-                        "yield from outside async function".to_string(),
+                        ErrorCode::YieldOutsideAsync, "yield from outside async function".to_string(),
                         range,
                         Some("yield from may only appear inside an async fn body".to_string()),
                     );
@@ -1178,7 +1176,7 @@ impl Checker {
                                 self.access_field_in_sum(name, variants, Some(*tag), field, range)
                             }
                             _ => self.error_with_help(
-                                format!("Cannot access field `{}` on non-record type", field),
+                                ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
                                 range,
                                 Some(
                                     "only values of record-shaped enum types expose fields"
@@ -1197,8 +1195,7 @@ impl Checker {
                             }
                             let known: Vec<&str> =
                                 fields.iter().map(|(_, n, _)| n.as_str()).collect();
-                            return self.error_with_help(
-                                format!("Cannot find field `{}` on class `{}`", field, name),
+                            return self.error_with_help(ErrorCode::UnknownField, format!("Cannot find field `{}` on class `{}`", field, name),
                                 range,
                                 Some(format!("the class has fields: {}", known.join(", "))),
                             );
@@ -1209,7 +1206,7 @@ impl Checker {
                         let payloads = self.enum_payloads.get(name).cloned().unwrap_or_default();
                         if variant_names.is_empty() {
                             return self.error_with_help(
-                                format!("Cannot access field `{}` on non-record type", field),
+                                ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
                                 range,
                                 Some(format!("type `{}` is not a record-shaped enum", name)),
                             );
@@ -1236,11 +1233,11 @@ impl Checker {
                             } else {
                                 Some(format!("the record has fields: {}", known.join(", ")))
                             };
-                            self.error_with_help(msg, range, help)
+                            self.error_with_help(ErrorCode::GenericTypeError, msg, range, help)
                         }
                     },
                     _ => self.error_with_help(
-                        format!("Cannot access field `{}` on non-record type", field),
+                        ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
                         range,
                         Some("only values of record-shaped enum types expose fields".to_string()),
                     ),
@@ -1252,14 +1249,13 @@ impl Checker {
                 let class_name = match &resolved {
                     Ty::Con(n) => n.clone(),
                     _ => {
-                        return self.error("Cannot instantiate non-class type".to_string(), range);
+                        return self.error(ErrorCode::NotAFunction, "Cannot instantiate non-class type".to_string(), range);
                     }
                 };
                 if let Some(fields) = self.classes.get(&class_name).cloned() {
                     let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
                     if provided.len() != fields.len() {
-                        let _ = self.error_with_help(
-                            format!(
+                        let _ = self.error_with_help(ErrorCode::ConstructorArity, format!(
                                 "Constructor `{}` expects {} arguments, got {}",
                                 class_name,
                                 fields.len(),
@@ -1298,7 +1294,7 @@ impl Checker {
                 let span = expr.0.into_range();
                 if self.c_structs.iter().any(|s| s.name == decl.name) {
                     self.messages.push(Message::error(
-                        format!("Duplicate extern struct `{}`", decl.name),
+                        ErrorCode::GenericTypeError, format!("Duplicate extern struct `{}`", decl.name),
                         span.clone(),
                     ));
                 } else {
@@ -1521,8 +1517,7 @@ impl Checker {
                     Some(s) => {
                         let ty = instantiate(&s, &mut self.counter);
                         if self.is_const_binding(&ident) {
-                            let mut msg = Message::error(
-                                format!("Cannot assign to constant `{}`", ident),
+                            let mut msg = Message::error(ErrorCode::FormatSpecifierMismatch, format!("Cannot assign to constant `{}`", ident),
                                 range,
                             );
                             msg.with_help(
@@ -1533,7 +1528,7 @@ impl Checker {
                         ty
                     }
                     None => self.error_with_help(
-                        format!("Cannot assign to undeclared variable `{}`", ident),
+                        ErrorCode::UndeclaredAssignment, format!("Cannot assign to undeclared variable `{}`", ident),
                         range,
                         Some(format!("try declaring it first with `let {};`", ident)),
                     ),
@@ -1549,7 +1544,7 @@ impl Checker {
                             let known: Vec<&str> =
                                 fields.iter().map(|(n, _)| n.as_str()).collect();
                             self.error_with_help(
-                                format!("Cannot find field `{}` on record", field),
+                                ErrorCode::UnknownField, format!("Cannot find field `{}` on record", field),
                                 range,
                                 Some(format!("the record has fields: {}", known.join(", "))),
                             )
@@ -1562,8 +1557,7 @@ impl Checker {
                             None => {
                                 let known: Vec<&str> =
                                     fields.iter().map(|(_, n, _)| n.as_str()).collect();
-                                self.error_with_help(
-                                    format!("Cannot find field `{}` on class `{}`", field, name),
+                                self.error_with_help(ErrorCode::UnknownField, format!("Cannot find field `{}` on class `{}`", field, name),
                                     range,
                                     Some(format!("the class has fields: {}", known.join(", "))),
                                 )
@@ -1571,7 +1565,7 @@ impl Checker {
                         }
                     }
                     _ => self.error_with_help(
-                        "Invalid assignment target".to_string(),
+                        ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
                         range,
                         Some(
                             "only variables, dict fields, class fields, and array elements may be assigned"
@@ -1591,7 +1585,7 @@ impl Checker {
                             if let Expression::Integer(i) = idx.1.as_ref() {
                                 if *i < 0 || (*i as usize) >= *n {
                                     let _ = self.error_with_help(
-                                        format!(
+                                        ErrorCode::IndexOutOfBounds, format!(
                                             "array index {} out of bounds for array of length {}",
                                             i, n
                                         ),
@@ -1604,19 +1598,19 @@ impl Checker {
                         (**element).clone()
                     }
                     Ty::Tuple(_) => self.error_with_help(
-                        "Invalid assignment target".to_string(),
+                        ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
                         range,
                         Some("tuple elements are immutable".to_string()),
                     ),
                     _ => self.error_with_help(
-                        "Invalid assignment target".to_string(),
+                        ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
                         range,
                         Some("only array elements may be indexed for assignment".to_string()),
                     ),
                 }
             }
             _ => self.error_with_help(
-                "Invalid assignment target".to_string(),
+                ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
                 range,
                 Some(
                     "the left-hand side must be a variable, dict field, or array index".to_string(),
@@ -1664,8 +1658,7 @@ impl Checker {
             for arg in args {
                 let _ = self.infer(arg);
             }
-            return self.error_with_help(
-                format!("push expects 2 arguments, got {}", args.len()),
+            return self.error_with_help(ErrorCode::ConstructorArity, format!("push expects 2 arguments, got {}", args.len()),
                 range,
                 Some("use `push(array, value)`".to_string()),
             );
@@ -1706,8 +1699,7 @@ impl Checker {
                 }
                 dynamic
             }
-            other => self.error_with_help(
-                "push expects an array as its first argument".to_string(),
+            other => self.error_with_help(ErrorCode::ConstructorArity, "push expects an array as its first argument".to_string(),
                 args[0].0.into_range(),
                 Some(format!("found `{}`; use `push(array, value)`", other)),
             ),
@@ -1720,8 +1712,7 @@ impl Checker {
             for arg in args {
                 let _ = self.infer(arg);
             }
-            return self.error_with_help(
-                format!("len expects 1 argument, got {}", args.len()),
+            return self.error_with_help(ErrorCode::ConstructorArity, format!("len expects 1 argument, got {}", args.len()),
                 range,
                 Some("use `len(array)`".to_string()),
             );
@@ -1741,8 +1732,7 @@ impl Checker {
                 );
                 int()
             }
-            other => self.error_with_help(
-                "len expects an array".to_string(),
+            other => self.error_with_help(ErrorCode::ConstructorArity, "len expects an array".to_string(),
                 args[0].0.into_range(),
                 Some(format!("found `{}`; use `len(array)`", other)),
             ),
@@ -1780,7 +1770,7 @@ impl Checker {
                     // had more arguments than the function accepts.
                     let actual = format!("{}", apply_ty_prune(&self.subst, &pruned));
                     return self.error_with_help(
-                        match name {
+                        ErrorCode::GenericTypeError, match name {
                             Some(n) => format!(
                                 "Function `{}` was called with too many arguments \
                                  (it accepts {}, but argument #{} was given)",
@@ -1815,12 +1805,12 @@ impl Checker {
                 apply_ty(&self.subst, t1)
             }
             Err(UnifyError::Mismatch { left, right }) => self.error_with_help(
-                format!("Type mismatch: expected `{}`, found `{}`", left, right),
+                ErrorCode::TypeMismatch, format!("Type mismatch: expected `{}`, found `{}`", left, right),
                 range.clone(),
                 Some(format!("while checking `{}`", ctx)),
             ),
             Err(UnifyError::Occurs { var, ty }) => self.error_with_help(
-                format!("Cannot construct infinite type `{}`", ty),
+                ErrorCode::InfiniteType, format!("Cannot construct infinite type `{}`", ty),
                 range.clone(),
                 Some(format!(
                     "the type variable `t{}` would occur in its own definition",
@@ -1835,8 +1825,8 @@ impl Checker {
     /// This is the simplest form: a single message with a primary
     /// label at `range`. No help hint, no secondary labels. For richer
     /// diagnostics use [`error_with_help`] or [`error_with_labels`].
-    fn error(&mut self, message: String, range: Range<usize>) -> Ty {
-        self.messages.push(Message::error(message, range));
+    fn error(&mut self, code: ErrorCode, message: String, range: Range<usize>) -> Ty {
+        self.messages.push(Message::error(code, message, range));
         Ty::Var(self.counter.fresh())
     }
 
@@ -1845,11 +1835,12 @@ impl Checker {
     /// The hint is shown beneath the underline by ariadne's renderer.
     fn error_with_help(
         &mut self,
+        code: ErrorCode,
         message: String,
         range: Range<usize>,
         help: Option<String>,
     ) -> Ty {
-        let mut msg = Message::error(message, range);
+        let mut msg = Message::error(code, message, range);
         if let Some(h) = help {
             msg.with_help(h);
         }
@@ -1865,12 +1856,13 @@ impl Checker {
     #[allow(dead_code)]
     fn error_with_labels(
         &mut self,
+        code: ErrorCode,
         primary_message: String,
         primary_range: Range<usize>,
         secondary: Vec<(String, Range<usize>)>,
         help: Option<String>,
     ) -> Ty {
-        let mut msg = Message::error(primary_message, primary_range);
+        let mut msg = Message::error(code, primary_message, primary_range);
         for (label_text, range) in secondary {
             msg.push(Label::new(label_text, range));
         }
@@ -2015,7 +2007,7 @@ impl Checker {
         if self.is_ffi_type_expr(expr) {
             return;
         }
-        let mut m = Message::error("Expected an FFI type tag".to_string(), expr.0.into_range());
+        let mut m = Message::error(ErrorCode::InvalidFfiType, "Expected an FFI type tag".to_string(), expr.0.into_range());
         m.push(Label::new(
             "use FFIType::Int, FFIType::Ptr, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
             expr.0.into_range(),
@@ -2119,7 +2111,7 @@ impl Checker {
                     Expression::Identifier(n) => n.to_string(),
                     _ => {
                         self.messages.push(Message::error(
-                            "Invalid field name".to_string(),
+                            ErrorCode::GenericTypeError, "Invalid field name".to_string(),
                             field.0.into_range(),
                         ));
                         continue;
@@ -2129,7 +2121,7 @@ impl Checker {
                 field_info.push((*vis, fname_str, ty));
             } else {
                 self.messages.push(Message::error(
-                    "Expected a field declaration".to_string(),
+                    ErrorCode::GenericTypeError, "Expected a field declaration".to_string(),
                     field.0.into_range(),
                 ));
             }
@@ -2187,7 +2179,7 @@ impl Checker {
                         .insert(name.to_string(), (*vis, Scheme::mono(fun_ty)));
                 } else {
                     self.messages.push(Message::error(
-                        "Method body must be a function".to_string(),
+                        ErrorCode::GenericTypeError, "Method body must be a function".to_string(),
                         method.0.into_range(),
                     ));
                 }
@@ -2419,7 +2411,7 @@ impl Checker {
                 // Check 1: duplicate enum name (including built-in FFIType).
                 if common::is_builtin_ffi_enum(&name_str) {
                     let mut msg = Message::error(
-                        format!("Cannot redeclare built-in enum `{}`", name_str),
+                        ErrorCode::GenericTypeError, format!("Cannot redeclare built-in enum `{}`", name_str),
                         node.0.into_range(),
                     );
                     msg.with_help(format!(
@@ -2431,7 +2423,7 @@ impl Checker {
                 }
                 if self.enums.contains_key(&name_str) {
                     let mut msg = Message::error(
-                        format!("Duplicate enum `{}`", name_str),
+                        ErrorCode::DuplicateEnum, format!("Duplicate enum `{}`", name_str),
                         node.0.into_range(),
                     );
                     msg.with_help(format!(
@@ -2448,7 +2440,7 @@ impl Checker {
                     let taken = self.enum_tags.values().any(|tags| tags.contains_key(vn));
                     if taken {
                         let mut msg = Message::error(
-                            format!(
+                            ErrorCode::DuplicateConstructor, format!(
                                 "Duplicate constructor `{}` (also declared by another enum)",
                                 vn
                             ),
@@ -2845,7 +2837,7 @@ impl Checker {
             Some(t) => t.clone(),
             None => {
                 return self.error(
-                    format!("Cannot find enum `{}` in this scope", enum_str),
+                    ErrorCode::UnknownEnum, format!("Cannot find enum `{}` in this scope", enum_str),
                     range,
                 );
             }
@@ -2856,7 +2848,7 @@ impl Checker {
             Some(t) => *t,
             None => {
                 return self.error(
-                    format!(
+                    ErrorCode::UnknownVariant, format!(
                         "Cannot find variant `{}` on enum `{}`",
                         variant_str, enum_str
                     ),
@@ -2896,7 +2888,7 @@ impl Checker {
         if !shape_matches {
             if same_shape_with_wrong_arity {
                 return self.error(
-                    format!(
+                    ErrorCode::ConstructorArity, format!(
                         "Constructor `{}::{}` expects {} arguments, got {}",
                         enum_str,
                         variant_str,
@@ -2911,7 +2903,7 @@ impl Checker {
                 );
             }
             return self.error_with_help(
-                format!(
+                ErrorCode::PayloadShapeMismatch, format!(
                     "Constructor `{}::{}` payload shape mismatch (declared as {}, called as {})",
                     enum_str,
                     variant_str,
@@ -2961,7 +2953,7 @@ impl Checker {
                 for p in parts {
                     if call_site.insert(p.name, &p.value).is_some() {
                         return self.error_with_help(
-                            format!(
+                            ErrorCode::DuplicateField, format!(
                                 "Duplicate field `{}` in record constructor `{}::{}`",
                                 p.name, enum_str, variant_str,
                             ),
@@ -2979,7 +2971,7 @@ impl Checker {
                         Some(a) => *a,
                         None => {
                             return self.error_with_help(
-                                format!(
+                                ErrorCode::MissingField, format!(
                                     "Missing field `{}` in record constructor `{}::{}`",
                                     decl_name, enum_str, variant_str,
                                 ),
@@ -3004,7 +2996,7 @@ impl Checker {
                 for p in parts {
                     if !decl_fields.iter().any(|(dn, _)| dn == p.name) {
                         return self.error_with_help(
-                            format!(
+                            ErrorCode::UnknownField, format!(
                                 "Unknown field `{}` in record constructor `{}::{}`",
                                 p.name, enum_str, variant_str,
                             ),
@@ -3063,7 +3055,7 @@ impl Checker {
 
         if arms.is_empty() {
             self.current_match_lhs = prev;
-            return self.error("match has no arms".to_string(), range);
+            return self.error(ErrorCode::GenericTypeError, "match has no arms".to_string(), range);
         }
 
         for arm in arms {
@@ -3181,7 +3173,7 @@ impl Checker {
                         // expected type so the arm body is still
                         // processed.
                         self.messages.push(Message::error(
-                            format!(
+                            ErrorCode::UnknownConstructorPattern, format!(
                                 "Pattern references unknown constructor `{}::{}`",
                                 enum_str, variant_str
                             ),
@@ -3219,7 +3211,7 @@ impl Checker {
                 if !shape_matches {
                     if same_shape_with_wrong_arity {
                         return self.error_with_help(
-                            format!(
+                            ErrorCode::GenericTypeError, format!(
                                 "Constructor pattern `{}::{}` expects {} sub-patterns, got {}",
                                 enum_str,
                                 variant_str,
@@ -3235,7 +3227,7 @@ impl Checker {
                         );
                     }
                     return self.error_with_help(
-                        format!(
+                        ErrorCode::PayloadShapeMismatch, format!(
                             "Constructor pattern `{}::{}` payload shape mismatch (declared as {}, pattern uses {})",
                             enum_str,
                             variant_str,
@@ -3275,7 +3267,7 @@ impl Checker {
                         for pf in fields {
                             if pattern_site.insert(pf.name, &pf.pattern).is_some() {
                                 return self.error_with_help(
-                                    format!(
+                                    ErrorCode::DuplicateField, format!(
                                         "Duplicate field `{}` in record pattern `{}::{}`",
                                         pf.name, enum_str, variant_str,
                                     ),
@@ -3292,7 +3284,7 @@ impl Checker {
                                 Some(p) => *p,
                                 None => {
                                     return self.error_with_help(
-                                        format!(
+                                        ErrorCode::MissingField, format!(
                                             "Missing field `{}` in record pattern `{}::{}`",
                                             decl_name, enum_str, variant_str,
                                         ),
@@ -3310,7 +3302,7 @@ impl Checker {
                         for pf in fields {
                             if !decl_fields.iter().any(|(dn, _)| dn == pf.name) {
                                 return self.error_with_help(
-                                    format!(
+                                    ErrorCode::UnknownField, format!(
                                         "Unknown field `{}` in record pattern `{}::{}`",
                                         pf.name, enum_str, variant_str,
                                     ),
@@ -3454,7 +3446,7 @@ impl Checker {
                     // Duplicate (tag, inner coverage) — this arm
                     // is unreachable.
                     self.messages.push(Message::error(
-                        "Unreachable arm: this pattern is matched by an earlier arm".to_string(),
+                        ErrorCode::UnreachableArm, "Unreachable arm: this pattern is matched by an earlier arm".to_string(),
                         arm.range.clone(),
                     ));
                 }
@@ -3496,7 +3488,7 @@ impl Checker {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let mut msg = Message::error(
-                    format!("Non-exhaustive match: variants not covered: {}", names),
+                    ErrorCode::NonExhaustiveMatch, format!("Non-exhaustive match: variants not covered: {}", names),
                     pending.match_range.clone(),
                 );
                 msg.with_help(
@@ -3549,7 +3541,7 @@ impl Checker {
                             let arg_ty_pruned = apply_ty_prune(&self.subst, &arg_ty);
                             if !type_matches_specifier(&arg_ty_pruned, spec) {
                                 let mut msg = Message::error(
-                                    format!(
+                                    ErrorCode::FormatSpecifierMismatch, format!(
                                         "Format specifier `%{}` requires {}, found {}",
                                         spec, expected, arg_ty_pruned
                                     ),
@@ -3567,7 +3559,7 @@ impl Checker {
                             // Specifier with no arg — also an
                             // error.
                             let mut msg = Message::error(
-                                format!(
+                                ErrorCode::GenericTypeError, format!(
                                     "Format string has more specifiers than arguments \
                                      (`%{}` is argument #{})",
                                     spec,
@@ -3771,7 +3763,7 @@ impl Checker {
             let variant_idx = tag as usize;
             if variant_idx >= variants.len() {
                 return self.error_with_help(
-                    format!("Cannot access field `{}` on non-record type", field),
+                    ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
                     range,
                     Some("only values of record-shaped enum types expose fields".to_string()),
                 );
@@ -3788,13 +3780,13 @@ impl Checker {
                     // the field.
                     let hint = build_record_field_hint(enum_name, variants);
                     self.error_with_help(
-                        format!("Type `{}` has no field `{}`", enum_name, field),
+                        ErrorCode::GenericTypeError, format!("Type `{}` has no field `{}`", enum_name, field),
                         range,
                         hint,
                     )
                 }
                 _ => self.error_with_help(
-                    format!("Cannot access field `{}` on non-record variant", field),
+                    ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record variant", field),
                     range,
                     Some(format!(
                         "variant `{}::{}` is {}; only record-shaped variants expose named fields",
@@ -3821,7 +3813,7 @@ impl Checker {
                 0 => {
                     let hint = build_record_field_hint(enum_name, variants);
                     self.error_with_help(
-                        format!("Type `{}` has no field `{}`", enum_name, field),
+                        ErrorCode::GenericTypeError, format!("Type `{}` has no field `{}`", enum_name, field),
                         range,
                         hint,
                     )
@@ -3829,7 +3821,7 @@ impl Checker {
                 1 => candidates[0].clone(),
                 _ => {
                     self.error_with_help(
-                        format!(
+                        ErrorCode::GenericTypeError, format!(
                             "Field `{}` exists in multiple variants of `{}`; \
                              narrow with match first",
                             field, enum_name
@@ -4006,7 +3998,7 @@ mod tests {
     }
 
     /// Like `check`, but returns diagnostics instead of asserting none.
-    fn check_warn(src: &str) -> (Checker, Vec<common::Message>) {
+    fn check_warn(src: &str) -> (Checker, Vec<Message>) {
         let (mut c, _ty) = check(src);
         let msgs = c.take_messages();
         (c, msgs)
