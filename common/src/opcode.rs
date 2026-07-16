@@ -158,6 +158,29 @@ pub enum Instruction {
     /// ArrayLen: stack `array` -> int length.
     ArrayPush,
     ArrayLen,
+
+    // Generics runtime — append-only.
+    /// CallIndirect: [31:0] arity; stack: [args..., target_offset] TOS = u32 code offset
+    CallIndirect,
+    /// BoxValue: [15:0] ValueTag as u16; pop raw value → push Object::Boxed pointer
+    BoxValue,
+    /// UnboxValue: [15:0] expected ValueTag; pop Boxed → push payload or leave default on mismatch
+    UnboxValue,
+    /// MakePolyFn: [31:0] entry offset; push Object::PolyFn
+    MakePolyFn,
+    /// DynAdd / DynSub / DynMul / DynDiv / DynMod — pop b, a (boxed or immediate); push result
+    DynAdd,
+    DynSub,
+    DynMul,
+    DynDiv,
+    DynMod,
+    /// DynCmp: [7:0] kind (0=Le,1=Leq,2=Gt,3=Geq); pop b,a; push bool
+    DynCmp,
+    /// DynEq / DynNe — pop b,a; push bool
+    DynEq,
+    DynNe,
+    /// DynPrint — pop one boxed/immediate; write Display-ish to output (int/float/bool/string)
+    DynPrint,
 }
 
 impl From<u8> for Instruction {

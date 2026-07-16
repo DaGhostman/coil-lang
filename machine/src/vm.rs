@@ -16,9 +16,10 @@ use common::{
 };
 
 use crate::{
-    CStructLayout, CoroState, Frame, Heap, Member, ObjArray, ObjCoroutine, ObjEnum, ObjInstance,
-    ObjString, ObjTuple, Object, RefCoroutine, Stack,
+    CStructLayout, CoroState, Frame, Heap, Member, ObjArray, ObjBoxed, ObjCoroutine, ObjEnum,
+    ObjInstance, ObjPolyFn, ObjString, ObjTuple, Object, RefCoroutine, Stack,
 };
+use common::ValueTag;
 
 /// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
 const GC_TRIGGER_INTERVAL: usize = 64;
@@ -882,7 +883,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::ArrayLen as u8);
+            promise!(*bc as u8 <= Instruction::DynPrint as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1958,6 +1959,297 @@ impl<const S: usize> Machine<S> {
                         self.stack.push(Value::from(is_done));
                     }
                 }
+                Instruction::CallIndirect => {
+                    // Stack layout: [arg0, arg1, ..., argN-1, target_offset]
+                    // operand = arity
+                    let arity = opcode.operand_u32() as usize;
+                    // TOS = target offset (stored as int)
+                    let target = self.stack.pop().as_int() as usize;
+                    let return_ip = ip; // return to next instruction
+                    let callee_sp = self.stack.tell() - arity;
+                    self.frames.get_mut().seek(return_ip);
+                    self.frames
+                        .setup_current_and_advance(|frame| frame.set(callee_sp));
+                    sp = callee_sp;
+                    ip = target;
+                }
+                Instruction::BoxValue => {
+                    let tag = (opcode.operand_u32() & 0xFFFF) as u16;
+                    let v = self.stack.pop();
+                    let addr = v.raw() as u64;
+                    let payload = if addr != 0
+                        && self.heap.contains_addr(addr as *mut u8)
+                    {
+                        if let Some(obj) =
+                            Self::find_object_by_addr(&self.heap, addr)
+                        {
+                            Member::Object(obj)
+                        } else {
+                            Member::Value(v)
+                        }
+                    } else {
+                        Member::Value(v)
+                    };
+                    let boxed = ObjBoxed { tag, payload };
+                    let (object, _) = self.heap.alloc(boxed, Object::Boxed);
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(object.addr()));
+                }
+                Instruction::UnboxValue => {
+                    let expected_tag = (opcode.operand_u32() & 0xFFFF) as u16;
+                    let v = self.stack.pop();
+                    let addr = v.raw() as u64;
+                    let result = if let Some(Object::Boxed(gc)) =
+                        Self::find_object_by_addr(&self.heap, addr)
+                    {
+                        let b = gc.as_ref();
+                        if b.tag == expected_tag {
+                            match &b.payload {
+                                Member::Value(inner) => *inner,
+                                Member::Object(o) => Value::from(o.addr()),
+                            }
+                        } else {
+                            Value::default()
+                        }
+                    } else {
+                        Value::default()
+                    };
+                    self.stack.push(result);
+                }
+                Instruction::MakePolyFn => {
+                    let entry = opcode.operand_u32();
+                    let pfn = ObjPolyFn {
+                        entry,
+                        type_arity: 0,
+                    };
+                    let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(object.addr()));
+                }
+                Instruction::DynAdd
+                | Instruction::DynSub
+                | Instruction::DynMul
+                | Instruction::DynDiv
+                | Instruction::DynMod => {
+                    /// Classify a value into (ValueTag, payload-Value).
+                    /// Uses `Heap::find_object_by_addr` (O(1) via addr index).
+                    fn classify_dyn(v: Value, heap: &Heap) -> (ValueTag, Value) {
+                        let addr = v.raw() as u64;
+                        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
+                            if let Some(obj) = heap.find_object_by_addr(addr) {
+                                return match obj {
+                                    Object::Boxed(gc) => {
+                                        let b = gc.as_ref();
+                                        let tag = ValueTag::from_u16(b.tag)
+                                            .unwrap_or(ValueTag::Int);
+                                        let inner = match &b.payload {
+                                            Member::Value(iv) => *iv,
+                                            Member::Object(o) => Value::from(o.addr()),
+                                        };
+                                        (tag, inner)
+                                    }
+                                    Object::String(_) => (ValueTag::String, v),
+                                    _ => (ValueTag::Int, v),
+                                };
+                            }
+                        }
+                        (ValueTag::Int, v)
+                    }
+
+                    let b_val = self.stack.pop();
+                    let a_val = self.stack.pop();
+                    let (a_tag, a_inner) = classify_dyn(a_val, &self.heap);
+                    let (b_tag, b_inner) = classify_dyn(b_val, &self.heap);
+
+                    let bc_instr = opcode.bytecode();
+                    let result: Value = match (a_tag, b_tag) {
+                        (ValueTag::Float, _) | (_, ValueTag::Float) => {
+                            let af = a_inner.as_float();
+                            let bf = b_inner.as_float();
+                            let r = match bc_instr {
+                                Instruction::DynAdd => af + bf,
+                                Instruction::DynSub => af - bf,
+                                Instruction::DynMul => af * bf,
+                                Instruction::DynDiv => af / bf,
+                                Instruction::DynMod => af % bf,
+                                _ => unreachable!(),
+                            };
+                            Value::from(r)
+                        }
+                        (ValueTag::String, ValueTag::String)
+                            if matches!(bc_instr, Instruction::DynAdd) =>
+                        {
+                            let sa = Self::object_string_value(&self.heap, &a_inner);
+                            let sb = Self::object_string_value(&self.heap, &b_inner);
+                            let concat = sa + &sb;
+                            let (obj, _) = self.heap.alloc(
+                                ObjString::from(concat.as_str()),
+                                Object::String,
+                            );
+                            self.alloc_counter += 1;
+                            if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                                Self::gc_collect(
+                                    &mut self.heap,
+                                    &self.stack,
+                                    &self.resume_stack,
+                                    &mut self.alloc_counter,
+                                );
+                            }
+                            Value::from(obj.addr())
+                        }
+                        _ => {
+                            let ai = a_inner.as_int();
+                            let bi = b_inner.as_int();
+                            let r = match bc_instr {
+                                Instruction::DynAdd => ai.wrapping_add(bi),
+                                Instruction::DynSub => ai.wrapping_sub(bi),
+                                Instruction::DynMul => ai.wrapping_mul(bi),
+                                Instruction::DynDiv => {
+                                    if bi == 0 { 0 } else { ai / bi }
+                                }
+                                Instruction::DynMod => {
+                                    if bi == 0 { 0 } else { ai % bi }
+                                }
+                                _ => unreachable!(),
+                            };
+                            Value::from(r)
+                        }
+                    };
+                    self.stack.push(result);
+                }
+                Instruction::DynCmp => {
+                    fn classify_int_dyn(v: Value, heap: &Heap) -> i64 {
+                        let addr = v.raw() as u64;
+                        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
+                            if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
+                                return match &gc.as_ref().payload {
+                                    Member::Value(iv) => iv.as_int(),
+                                    Member::Object(_) => 0,
+                                };
+                            }
+                        }
+                        v.as_int()
+                    }
+                    let kind = opcode.operand_u32() & 0xFF;
+                    let b_val = self.stack.pop();
+                    let a_val = self.stack.pop();
+                    let ai = classify_int_dyn(a_val, &self.heap);
+                    let bi = classify_int_dyn(b_val, &self.heap);
+                    let result = match kind {
+                        0 => ai < bi,   // Le
+                        1 => ai <= bi,  // Leq
+                        2 => ai > bi,   // Gt
+                        3 => ai >= bi,  // Geq
+                        _ => false,
+                    };
+                    self.stack.push(Value::from(result));
+                }
+                Instruction::DynEq | Instruction::DynNe => {
+                    fn classify_raw_dyn(v: Value, heap: &Heap) -> u64 {
+                        let addr = v.raw() as u64;
+                        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
+                            if let Some(Object::Boxed(gc)) = heap.find_object_by_addr(addr) {
+                                return match &gc.as_ref().payload {
+                                    Member::Value(iv) => iv.raw() as u64,
+                                    Member::Object(o) => o.addr(),
+                                };
+                            }
+                        }
+                        v.raw() as u64
+                    }
+                    let b_val = self.stack.pop();
+                    let a_val = self.stack.pop();
+                    let ar = classify_raw_dyn(a_val, &self.heap);
+                    let br = classify_raw_dyn(b_val, &self.heap);
+                    let eq = ar == br;
+                    let result = if matches!(opcode.bytecode(), Instruction::DynEq) {
+                        eq
+                    } else {
+                        !eq
+                    };
+                    self.stack.push(Value::from(result));
+                }
+                Instruction::DynPrint => {
+                    let v = self.stack.pop();
+                    let addr = v.raw() as u64;
+                    let text = if !v.raw().is_null()
+                        && self.heap.contains_addr(v.raw())
+                    {
+                        if let Some(obj) = self.heap.find_object_by_addr(addr) {
+                            match obj {
+                                Object::Boxed(gc) => {
+                                    let b = gc.as_ref();
+                                    match ValueTag::from_u16(b.tag) {
+                                        Some(ValueTag::Int) => {
+                                            match &b.payload {
+                                                Member::Value(iv) => iv.as_int().to_string(),
+                                                _ => "?".to_string(),
+                                            }
+                                        }
+                                        Some(ValueTag::Float) => {
+                                            match &b.payload {
+                                                Member::Value(iv) => {
+                                                    format!("{:.?}", iv.as_float())
+                                                }
+                                                _ => "?".to_string(),
+                                            }
+                                        }
+                                        Some(ValueTag::Bool) => {
+                                            match &b.payload {
+                                                Member::Value(iv) => {
+                                                    if iv.as_int() != 0 { "true" } else { "false" }
+                                                        .to_string()
+                                                }
+                                                _ => "?".to_string(),
+                                            }
+                                        }
+                                        Some(ValueTag::String) => {
+                                            match &b.payload {
+                                                Member::Object(o) => {
+                                                    Self::object_string_value(
+                                                        &self.heap,
+                                                        &Value::from(o.addr()),
+                                                    )
+                                                }
+                                                Member::Value(iv) => {
+                                                    Self::object_string_value(&self.heap, iv)
+                                                }
+                                            }
+                                        }
+                                        _ => "?".to_string(),
+                                    }
+                                }
+                                Object::String(gc) => gc.as_ref().data.clone(),
+                                _ => "?".to_string(),
+                            }
+                        } else {
+                            "?".to_string()
+                        }
+                    } else {
+                        v.as_int().to_string()
+                    };
+                    if let Some(out) = self.output.as_mut() {
+                        let _ = write!(out, "{text}");
+                    } else {
+                        print!("{text}");
+                    }
+                }
                 _ => return false,
             }
         }
@@ -2998,5 +3290,103 @@ mod tests {
             Byte::new(Instruction::RETURN),
         ]);
         assert_eq!(vm.pop().as_int(), 99);
+    }
+
+    // ── Generics runtime opcode tests ────────────────────────────────────────
+
+    /// `CallIndirect` pops a target offset from the stack and jumps to it,
+    /// treating the remaining stack entries as the callee's arguments.
+    ///
+    /// Layout:
+    ///   0: CONST 42        (arg0)
+    ///   1: CONST 4         (target = bytecode offset 4)
+    ///   2: CallIndirect    (arity=1)
+    ///   3: HALT
+    ///   4: LOAD 0          (callee: load arg0)
+    ///   5: RETURN
+    #[test]
+    fn call_indirect_jumps_to_target() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(42),
+            const_int(4),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            // callee at offset 4
+            load(0),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// `BoxValue` wraps a raw integer in an `Object::Boxed` heap cell;
+    /// `UnboxValue` recovers the payload when tags match.
+    #[test]
+    fn box_unbox_int_roundtrip() {
+        let int_tag: u32 = 0; // ValueTag::Int
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(99),
+            Byte::new(Instruction::BoxValue).with_operand_u32(int_tag),
+            Byte::new(Instruction::UnboxValue).with_operand_u32(int_tag),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 99);
+    }
+
+    /// `MakePolyFn` allocates a heap object and pushes a non-null address.
+    #[test]
+    fn make_polyfn_allocates() {
+        let mut vm = Machine::<8>::default();
+        // entry offset 0 — irrelevant for the allocation test.
+        vm.run(&[
+            Byte::new(Instruction::MakePolyFn).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        let addr = vm.pop();
+        assert!(
+            addr.raw() as u64 != 0,
+            "MakePolyFn should push a non-null heap pointer"
+        );
+    }
+
+    /// `DynAdd` with two boxed integers yields their sum as an unboxed int.
+    #[test]
+    fn dyn_add_ints() {
+        let int_tag: u32 = 0; // ValueTag::Int
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            Byte::new(Instruction::BoxValue).with_operand_u32(int_tag),
+            const_int(32),
+            Byte::new(Instruction::BoxValue).with_operand_u32(int_tag),
+            Byte::new(Instruction::DynAdd),
+            Byte::new(Instruction::HALT),
+        ]);
+        // DynAdd on two Int-tagged boxed values returns an unboxed int.
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// `DynAdd` with two boxed floats yields their sum as an unboxed float.
+    #[test]
+    fn dyn_add_floats() {
+        let float_tag: u32 = 1; // ValueTag::Float
+        let pool = [1.5f64.to_bits(), 2.5f64.to_bits()];
+        let mut vm = Machine::<8>::default();
+        vm.run_with_pool(
+            &[
+                // push 1.5 (pool[0])
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::BoxValue).with_operand_u32(float_tag),
+                // push 2.5 (pool[1])
+                Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG),
+                Byte::new(Instruction::BoxValue).with_operand_u32(float_tag),
+                Byte::new(Instruction::DynAdd),
+                Byte::new(Instruction::HALT),
+            ],
+            &pool,
+        );
+        // 1.5 + 2.5 = 4.0
+        assert_eq!(vm.pop().as_float(), 4.0);
     }
 }

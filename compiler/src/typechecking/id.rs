@@ -182,12 +182,12 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
                 pre_walk(b, table);
             }
         }
-        Expression::Implementation(_, _, methods) => {
+        Expression::Implementation { methods, .. } => {
             for m in methods {
                 pre_walk(m, table);
             }
         }
-        Expression::Class(_, fields) => {
+        Expression::Class { fields, .. } => {
             for f in fields {
                 pre_walk(f, table);
             }
@@ -311,6 +311,19 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
                 for arg in a {
                     pre_walk(arg, table);
                 }
+            }
+        }
+
+        // New generic-system nodes — no ID-table children needed yet.
+        Expression::Forall { ty, .. } => pre_walk(ty, table),
+        Expression::TypeClass { methods, .. } => {
+            for m in methods {
+                pre_walk(m, table);
+            }
+        }
+        Expression::TypeClassImpl { methods, .. } => {
+            for m in methods {
+                pre_walk(m, table);
             }
         }
     }

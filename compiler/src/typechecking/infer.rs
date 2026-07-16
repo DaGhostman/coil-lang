@@ -1356,15 +1356,16 @@ impl Checker {
                 args,
                 returns,
                 body,
+                ..
             } => {
                 self.infer_function(name, args, returns.as_ref(), body, &range, None, *is_coro);
                 unit_ty()
             }
-            Expression::Implementation(_, owner, methods) => {
+            Expression::Implementation { owner, methods, .. } => {
                 self.infer_impl(owner, methods, &range);
                 unit_ty()
             }
-            Expression::Class(name, fields) => {
+            Expression::Class { name, fields, .. } => {
                 self.register_class(name, fields, &range);
                 unit_ty()
             }
@@ -1488,11 +1489,11 @@ impl Checker {
             Expression::Field(_, _, _) => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
-            Expression::EnumDecl { name, variants } => {
+            Expression::EnumDecl { name, variants, .. } => {
                 self.infer_enum_decl(name, variants, &range);
                 unit_ty()
             }
-            Expression::TypeAlias { name, ty } => {
+            Expression::TypeAlias { name, ty, .. } => {
                 let alias_ty = self.parse_type_name(ty);
                 self.register_type_alias(name, alias_ty, range);
                 let _ = self.infer(ty); // ID alignment
@@ -2405,6 +2406,7 @@ impl Checker {
                     args,
                     returns,
                     body: func_body,
+                    ..
                 } = body.1.as_ref()
                 {
                     let fun_ty = self.infer_function(
@@ -2644,7 +2646,7 @@ impl Checker {
             Expression::TypeAlias { ty, .. } => {
                 self.pre_register_enums_walk(ty, errors);
             }
-            Expression::EnumDecl { name, variants } => {
+            Expression::EnumDecl { name, variants, .. } => {
                 let name_str = name.to_string();
                 let mut variant_names = Vec::new();
                 let mut arities = Vec::new();
@@ -2894,12 +2896,12 @@ impl Checker {
                     self.pre_register_enums_walk(b, errors);
                 }
             }
-            Expression::Implementation(_, _, methods) => {
+            Expression::Implementation { methods, .. } => {
                 for m in methods {
                     self.pre_register_enums_walk(m, errors);
                 }
             }
-            Expression::Class(_, fields) => {
+            Expression::Class { fields, .. } => {
                 for f in fields {
                     self.pre_register_enums_walk(f, errors);
                 }
@@ -2983,6 +2985,19 @@ impl Checker {
                     for arg in a {
                         self.pre_register_enums_walk(arg, errors);
                     }
+                }
+            }
+
+            // New generic-system nodes — recurse into children.
+            Expression::Forall { ty, .. } => self.pre_register_enums_walk(ty, errors),
+            Expression::TypeClass { methods, .. } => {
+                for m in methods {
+                    self.pre_register_enums_walk(m, errors);
+                }
+            }
+            Expression::TypeClassImpl { methods, .. } => {
+                for m in methods {
+                    self.pre_register_enums_walk(m, errors);
                 }
             }
         }

@@ -1392,6 +1392,7 @@ impl Compiler {
                 args,
                 returns: _returns,
                 body,
+                ..
             } => {
                 let qualified = if self.namespace.is_empty() {
                     name.to_string()
@@ -1783,7 +1784,7 @@ impl Compiler {
                 let has_send = if arg.is_some() { 1u32 } else { 0u32 };
                 bytecode.push(Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send));
             }
-            Expression::Class(name, state) => {
+            Expression::Class { name, fields: state, .. } => {
                 self.context.classes.insert(
                     name.to_string(),
                     state
@@ -1799,7 +1800,7 @@ impl Compiler {
                 );
                 self.context.symbols.intern(name.to_string());
             }
-            Expression::Implementation(_what, owner, methods) => {
+            Expression::Implementation { owner, methods, .. } => {
                 let saved_ns = self.namespace.clone();
                 self.namespace = owner.to_string();
 
@@ -2671,7 +2672,7 @@ impl Compiler {
                         .insert(fn_name.clone(), (lib_slot, fn_id_slot));
                 }
             }
-            Expression::EnumDecl { name: _, variants } => {
+            Expression::EnumDecl { name: _, variants, .. } => {
                 // Recurse into each variant. Each variant's
                 // `do_compile` consumes 1 ID (for the variant
                 // itself) and then descends into each payload's
