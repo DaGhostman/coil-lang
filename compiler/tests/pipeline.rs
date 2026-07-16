@@ -128,6 +128,12 @@ fn example_dict_prints_42_100_42() {
 }
 
 #[test]
+fn example_classes_prints_7458() {
+    let output = run_example("examples/classes.0s");
+    assert_eq!(output, "7458");
+}
+
+#[test]
 fn example_aliases_prints_3_4_7() {
     let output = run_example("examples/aliases.0s");
     assert_eq!(output, "347");

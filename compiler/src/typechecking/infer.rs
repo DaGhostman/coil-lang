@@ -609,6 +609,49 @@ impl Checker {
                 pruned
             }
             Expression::Call { name, args } => {
+                // Method call: `recv.method(args)` — Access callee.
+                if let Expression::Access(recv, method) = name.1.as_ref() {
+                    let recv_ty = self.infer(recv);
+                    let resolved = apply_ty_prune(&self.subst, &recv_ty);
+                    let owner = match &resolved {
+                        Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
+                        _ => {
+                            return self.error_with_help(
+                                format!("Cannot call method `{}` on non-class type", method),
+                                range,
+                                Some("method calls require a class instance receiver".to_string()),
+                            );
+                        }
+                    };
+                    let scheme = match self
+                        .methods
+                        .get(&owner)
+                        .and_then(|m| m.get(*method))
+                        .map(|(_, s)| s.clone())
+                    {
+                        Some(s) => s,
+                        None => {
+                            return self.error(
+                                format!("Cannot find method `{}` on class `{}`", method, owner),
+                                range,
+                            );
+                        }
+                    };
+                    let fun_ty = instantiate(&scheme, &mut self.counter);
+                    let mut arg_tys = vec![recv_ty];
+                    if let Some(a) = args {
+                        for arg in a {
+                            arg_tys.push(self.infer(arg));
+                        }
+                    }
+                    return self.apply_function(
+                        Some(&format!("{}::{}", owner, method)),
+                        &fun_ty,
+                        &arg_tys,
+                        range,
+                    );
+                }
+
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
                     _ => return self.error("Invalid call target".to_string(), range),
@@ -1033,6 +1076,21 @@ impl Checker {
                         }
                     }
                     Ty::Con(name) => {
+                        // Class instance field access.
+                        if let Some(fields) = self.classes.get(name) {
+                            if let Some((_, _, fty)) =
+                                fields.iter().find(|(_, fname, _)| fname == field)
+                            {
+                                return fty.clone();
+                            }
+                            let known: Vec<&str> =
+                                fields.iter().map(|(_, n, _)| n.as_str()).collect();
+                            return self.error_with_help(
+                                format!("Cannot find field `{}` on class `{}`", field, name),
+                                range,
+                                Some(format!("the class has fields: {}", known.join(", "))),
+                            );
+                        }
                         // Bare type name — resolve via the
                         // checker's enum registry.
                         let variant_names = self.enums.get(name).cloned().unwrap_or_default();
@@ -1076,7 +1134,40 @@ impl Checker {
                     ),
                 }
             }
-            Expression::Instantiate(class_expr, _args) => self.infer(class_expr),
+            Expression::Instantiate(class_expr, args) => {
+                let class_ty = self.infer(class_expr);
+                let resolved = apply_ty_prune(&self.subst, &class_ty);
+                let class_name = match &resolved {
+                    Ty::Con(n) => n.clone(),
+                    _ => {
+                        return self.error(
+                            "Cannot instantiate non-class type".to_string(),
+                            range,
+                        );
+                    }
+                };
+                if let Some(fields) = self.classes.get(&class_name).cloned() {
+                    let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
+                    if provided.len() != fields.len() {
+                        let _ = self.error_with_help(
+                            format!(
+                                "Constructor `{}` expects {} arguments, got {}",
+                                class_name,
+                                fields.len(),
+                                provided.len()
+                            ),
+                            range,
+                            Some("pass one argument per class field, in declaration order".to_string()),
+                        );
+                    } else {
+                        for (arg, (_, _, fty)) in provided.iter().zip(fields.iter()) {
+                            let aty = self.infer(arg);
+                            self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
+                        }
+                    }
+                }
+                Ty::Con(class_name)
+            }
             Expression::Field(_, _, _) => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
@@ -1297,11 +1388,26 @@ impl Checker {
                             )
                         }
                     },
+                    Ty::Con(name) if self.classes.contains_key(name) => {
+                        let fields = self.classes.get(name).unwrap();
+                        match fields.iter().find(|(_, fname, _)| fname == field) {
+                            Some((_, _, fty)) => fty.clone(),
+                            None => {
+                                let known: Vec<&str> =
+                                    fields.iter().map(|(_, n, _)| n.as_str()).collect();
+                                self.error_with_help(
+                                    format!("Cannot find field `{}` on class `{}`", field, name),
+                                    range,
+                                    Some(format!("the class has fields: {}", known.join(", "))),
+                                )
+                            }
+                        }
+                    }
                     _ => self.error_with_help(
                         "Invalid assignment target".to_string(),
                         range,
                         Some(
-                            "only variables, dict fields, and array elements may be assigned"
+                            "only variables, dict fields, class fields, and array elements may be assigned"
                                 .to_string(),
                         ),
                     ),
@@ -1828,6 +1934,11 @@ impl Checker {
             .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
 
         self.env.push();
+        if let Some(self_ty) = self_ty {
+            // Method receiver — side-table for codegen Access/Call.
+            self.codegen_var_types
+                .insert("self".to_string(), self_ty.clone());
+        }
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
@@ -3230,6 +3341,37 @@ impl Checker {
         self.codegen_var_types.get(name)
     }
 
+    /// True if `name` is a registered class.
+    pub fn is_class(&self, name: &str) -> bool {
+        self.classes.contains_key(name)
+    }
+
+    /// Declared type of a class field (codegen / Access).
+    pub fn class_field_ty(&self, class: &str, field: &str) -> Option<&Ty> {
+        self.classes
+            .get(class)?
+            .iter()
+            .find(|(_, fname, _)| fname == field)
+            .map(|(_, _, ty)| ty)
+    }
+
+    /// Class fields in declaration order: `(name, Ty)`.
+    pub fn class_fields(&self, class: &str) -> Option<Vec<(String, Ty)>> {
+        self.classes.get(class).map(|fields| {
+            fields
+                .iter()
+                .map(|(_, name, ty)| (name.clone(), ty.clone()))
+                .collect()
+        })
+    }
+
+    /// Method FQN lookup helper — returns whether the method exists.
+    pub fn has_method(&self, owner: &str, method: &str) -> bool {
+        self.methods
+            .get(owner)
+            .is_some_and(|m| m.contains_key(method))
+    }
+
     /// True if `name` was declared as `async fn`.
     pub fn is_async_function(&self, name: &str) -> bool {
         self.async_functions.contains(name)
@@ -4072,6 +4214,44 @@ mod tests {
         assert!(msgs.is_empty(), "{:?}", msgs);
         assert!(c.classes.contains_key("Foo"));
         assert!(c.methods.get("Foo").unwrap().contains_key("sadge"));
+    }
+
+    #[test]
+    fn class_method_call_typechecks() {
+        let src = "\
+            class Point { x: int, y: int, } \
+            impl Point { fn sum() -> int { return self.x + self.y; } } \
+            fn main() { let p = new Point(1, 3); p.sum(); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn class_unknown_field_errors() {
+        let src = "\
+            class Point { x: int, } \
+            fn main() { let p = new Point(1); p.z; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("field")),
+            "expected unknown-field diagnostic, got {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn class_ctor_arity_mismatch_errors() {
+        let src = "\
+            class Point { x: int, y: int, } \
+            fn main() { let p = new Point(1); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            !msgs.is_empty(),
+            "expected ctor arity diagnostic"
+        );
     }
 
     // ---- Recursive method (inside an impl) ----

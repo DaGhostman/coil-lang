@@ -1107,9 +1107,10 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("impl")
             .ignore_then(text::ident())
             .then(
+                // Methods are full `fn` declarations — separate them by
+                // juxtaposition (newlines / whitespace), not commas.
                 self.method_decl(stmt)
-                    .separated_by(op!(','))
-                    .allow_trailing()
+                    .repeated()
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
@@ -2718,6 +2719,30 @@ mod tests {
                 other => panic!("expected Module, got {:?}", other),
             },
             Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod debug_classes {
+    use super::*;
+    #[test]
+    fn parse_classes_example() {
+        let src = include_str!("../../examples/classes.0s");
+        let p = Pratt::default();
+        match p.parse(src) {
+            Ok(ast) => println!("OK ast kind top"),
+            Err(e) => panic!("PARSE FAIL: {e:?}"),
+        }
+    }
+    #[test]
+    fn parse_classes_with_commas() {
+        let src = std::fs::read_to_string("/tmp/classes_comma.0s").unwrap();
+        let p = Pratt::default();
+        match p.parse(&src) {
+            Ok(_) => println!("COMMA OK"),
+            Err(e) => panic!("COMMA FAIL: {e:?}"),
         }
     }
 }

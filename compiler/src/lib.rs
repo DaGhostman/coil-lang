@@ -374,6 +374,10 @@ pub struct Compiler {
 
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
+
+    /// True while compiling an `impl` method — Function resets locals
+    /// and reserves slot 0 for `self`.
+    compiling_method: bool,
 }
 
 impl Default for Compiler {
@@ -409,6 +413,7 @@ impl Default for Compiler {
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
+            compiling_method: false,
         }
     }
 }
@@ -1070,6 +1075,11 @@ impl Compiler {
             }
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;
+                if let Ty::Con(name) = &inner_ty {
+                    if self.checker.is_class(name) {
+                        return self.checker.class_field_ty(name, field).cloned();
+                    }
+                }
                 if let Some(name) = extract_enum_name(&inner_ty) {
                     return self.checker.field_type_for(&name, field);
                 }
@@ -1221,6 +1231,15 @@ impl Compiler {
                 self.functions.insert(qualified.clone(), self.bytecode.len());
                 if *is_coro {
                     self.coroutine_fns.insert(qualified);
+                }
+
+                // Methods get a fresh slot map with `self` at 0 so
+                // CALL's receiver lands on LOAD 0. Free functions keep
+                // the shared Interner (extern/lib slots are allocated
+                // into it before `main`).
+                if self.compiling_method {
+                    self.context.variables = Interner::default();
+                    self.context.variables.intern("self".to_string());
                 }
 
                 let mut a = self.do_compile(args);
@@ -1613,49 +1632,72 @@ impl Compiler {
                 );
                 self.context.symbols.intern(name.to_string());
             }
-            Expression::Implementation(what, owner, methods) => {
-                let namespace = self.namespace.clone();
-                let functions = self.functions.clone();
+            Expression::Implementation(_what, owner, methods) => {
+                let saved_ns = self.namespace.clone();
+                self.namespace = owner.to_string();
 
-                self.namespace.push_str(what);
-
-                for func in methods {
-                    self.functions.drain();
-                    self.do_compile(func);
-
-                    for method in self.functions.keys() {
-                        self.context
-                            .methods
-                            .entry(owner.to_string())
-                            .and_modify(|e| {
-                                e.insert(what.to_string(), method.clone());
-                            })
-                            .or_insert_with(|| {
-                                let mut h = HashMap::default();
-                                h.insert(what.to_string(), method.clone());
-                                h
-                            });
+                for method_node in methods {
+                    match method_node.1.borrow() {
+                        Expression::Method(_, body) => {
+                            if let Expression::Function { name, .. } = body.1.borrow() {
+                                let fqn = format!("{}::{}", owner, name);
+                                self.compiling_method = true;
+                                self.do_compile(body);
+                                self.compiling_method = false;
+                                self.context
+                                    .methods
+                                    .entry(owner.to_string())
+                                    .or_default()
+                                    .insert(name.to_string(), fqn);
+                            } else {
+                                self.compiling_method = true;
+                                self.do_compile(body);
+                                self.compiling_method = false;
+                            }
+                        }
+                        _ => {
+                            self.do_compile(method_node);
+                        }
                     }
                 }
 
                 self.context
                     .impementations
-                    .insert(what.to_string(), owner.to_string());
-
-                self.namespace = namespace;
-                self.functions = functions;
+                    .insert(owner.to_string(), owner.to_string());
+                self.namespace = saved_ns;
             }
-            Expression::Instantiate(class, _args) => {
+            Expression::Method(_vis, body) => {
+                self.compiling_method = true;
+                bytecode.append(&mut self.do_compile(body));
+                self.compiling_method = false;
+            }
+            Expression::Instantiate(class, args) => {
                 let name = self.resolve_variable_checked(class);
+                let fields = self
+                    .context
+                    .classes
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
                 bytecode.push(
-                    Byte::new(Instruction::INIT)
-                        .with_operand_u32(self.context.classes[&name].len() as u32),
+                    Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32),
                 );
-                // bytecode.push(Byte::new(Instruction::SET).with_operand_u32(operand);
-                // let s = self;
-                // self.functions.get(k);
-
-                // bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(0));
+                // SetField stack order is value, target, name (same as
+                // Assignment to Access). Stash the instance, then for
+                // each ctor arg emit that sequence and discard the
+                // value SetField pushes back.
+                let tmp_inst = self.alloc_temp_slot();
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_inst));
+                if let Some(arg_list) = args {
+                    for (arg, (fname, _)) in arg_list.iter().zip(fields.iter()) {
+                        bytecode.append(&mut self.do_compile(arg));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
+                        self.emit_field_name(&mut bytecode, fname);
+                        bytecode.push(Byte::new(Instruction::SetField));
+                        bytecode.push(Byte::new(Instruction::POP));
+                    }
+                }
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
             }
             Expression::Adjust { op, prefix, target } => {
                 self.emit_adjust(&mut bytecode, target, *op, *prefix);
@@ -1721,6 +1763,55 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
+                // Method call: `recv.method(args)`.
+                if let Expression::Access(recv, method) = name.1.borrow() {
+                    let recv_ty = self.receiver_type(recv);
+                    let owner = match &recv_ty {
+                        Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n) => {
+                            n.clone()
+                        }
+                        _ => String::new(),
+                    };
+                    let fqn = self
+                        .context
+                        .methods
+                        .get(&owner)
+                        .and_then(|m| m.get(*method))
+                        .cloned();
+                    if let Some(fqn) = fqn {
+                        if let Some(offset) = self.functions.get(&fqn).copied() {
+                            // Push receiver first (slot 0), then args.
+                            bytecode.append(&mut self.do_compile(recv));
+                            let mut nargs = 0u32;
+                            if let Some(items) = args {
+                                for arg in items {
+                                    bytecode.append(&mut self.do_compile(arg));
+                                    nargs += 1;
+                                }
+                            }
+                            bytecode.push(
+                                Byte::new(Instruction::CALL)
+                                    .with_call_packed(1 + nargs, offset as u32),
+                            );
+                        } else {
+                            let mut message =
+                                Message::error("Unknown method".to_string(), span.into_range());
+                            message.push(DiagLabel::new(
+                                format!("Unable to call unknown method '{}'", fqn),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
+                        }
+                    } else {
+                        let mut message =
+                            Message::error("Unknown method".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!("Unable to call method '{}' on '{}'", method, owner),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
+                } else {
                 let identifier = self.resolve_variable_checked(name);
                 let n = self
                     .aliases
@@ -1794,6 +1885,7 @@ impl Compiler {
                     ));
                     self.messages.push(message);
                 }
+                } // end non-method Call
             }
             Expression::Argument(_, n) => {
                 let _ = self.context.variables.intern(n.to_string());
@@ -2929,17 +3021,25 @@ impl Compiler {
                         }
                     }
 
-                    // Bind `end_label` to fallthrough with the arm
-                    // value still on the stack (Phase P0 — let x =
+                    // Bind `end_label` to a join pad that leaves the
+                    // arm value on the stack (Phase P0 — let x =
                     // match). Do NOT emit RETURN here: that made
                     // Match a function terminus so Fragment's
                     // trailing StorePop was unreachable.
+                    //
+                    // Emit DUPLICATE; POP as a fusion barrier so a
+                    // trailing arm `CONST k` is not peephole-fused
+                    // with a following `RETURN` from `return match`
+                    // (that fusion left JMP-to-end targeting the
+                    // removed RETURN slot and skipped the return).
                     //
                     // `return match { … }` still works because
                     // Expression::Return emits its own RETURN after
                     // the child. Bare Match as a statement is
                     // discarded by ExprStatement's POP.
                     let end_pos = self.bytecode.len() as u32;
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push(Byte::new(Instruction::POP));
                     bb.bind_label(end_label, end_pos, &mut self.bytecode, &mut self.constants);
 
                     // Validate: every label that had a
@@ -2952,24 +3052,25 @@ impl Compiler {
             Expression::Default(_) => (),
 
             // --- Field access ---
-            // receiver bytecode + LoadField(index) or GetField(name) for dicts.
+            // receiver bytecode + LoadField(index) or GetField(name) for
+            // dicts / class instances.
             Expression::Access(receiver, field) => {
                 bytecode.append(&mut self.do_compile(receiver));
 
                 let receiver_ty = self.receiver_type(receiver);
                 let is_record =
                     matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
-                if is_record {
+                let is_class = matches!(
+                    &receiver_ty,
+                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
+                );
+                if is_record || is_class {
                     // Push the field-name string on TOP of the
                     // receiver (which is already on the stack
                     // from `do_compile(receiver)` above). GetField
                     // pops the field-name (top) and the receiver,
-                    // pushes the value. Use STRING+DATA encoding.
-                    bytecode
-                        .push(Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32));
-                    for ch in field.chars() {
-                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                    }
+                    // pushes the value.
+                    self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::GetField));
                 } else {
                     let enum_name = self.enum_name_for_receiver(receiver);
@@ -2983,6 +3084,10 @@ impl Compiler {
                         Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
                     );
                 }
+            }
+
+            Expression::Field(_, _, _) => {
+                // Class field decls are metadata only — consumed for ID alignment.
             }
 
             _expr => {
