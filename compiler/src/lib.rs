@@ -9,7 +9,8 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, encode_tag_operand, likely, tag, unlikely};
+use common::{Byte, Instruction, Interner, Value, encode_tag_operand, likely, tag, unlikely};
+use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind};
 use parser::{
@@ -18,6 +19,7 @@ use parser::{
 };
 
 pub use pipeline::*;
+pub use reporting::{ErrorCode, Label, Message, MessageKind};
 pub use typechecking::{CallbackSigDef, Checker, CStructDef, Ty};
 
 macro_rules! unary {
@@ -1377,11 +1379,11 @@ impl Compiler {
             // --- FFI declare/invoke ---
             Expression::Declare(args) => {
                 if args.len() != 4 {
-                    let mut m = common::Message::error(
-                        "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)".to_string(),
+                    let mut m = Message::error(
+                       ErrorCode::DeclareArity, "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)".to_string(),
                         span.into_range(),
                     );
-                    m.push(common::Label::new(
+                    m.push(DiagLabel::new(
                         format!(
                             "expected 4 arguments (lib, name, args_tuple, ret_type); got {}",
                             args.len()
@@ -1406,12 +1408,12 @@ impl Compiler {
                     let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
                         Expression::Tuple(items) => items.to_vec(),
                         _ => {
-                            let mut m = common::Message::error(
-                                "declare(...) arguments tuple must be (T1, T2, ...) syntax"
+                            let mut m = Message::error(
+                               ErrorCode::DeclareArity, "declare(...) arguments tuple must be (T1, T2, ...) syntax"
                                     .to_string(),
                                 args_tuple.0.into_range(),
                             );
-                            m.push(common::Label::new(
+                            m.push(DiagLabel::new(
                                 "wrap the arg types in parentheses — (FFIType::Int, FFIType::Float)".to_string(),
                                 args_tuple.0.into_range(),
                             ));
@@ -1456,11 +1458,11 @@ impl Compiler {
             Expression::Invoke(args) => {
                 // `invoke(lib, fn_id, (args...))`
                 if args.len() != 3 {
-                    let mut m = common::Message::error(
-                        "invoke requires arguments as a tuple in position 3 (use (a, b, ...) syntax)".to_string(),
+                    let mut m = Message::error(
+                       ErrorCode::InvokeArity, "invoke requires arguments as a tuple in position 3 (use (a, b, ...) syntax)".to_string(),
                         span.into_range(),
                     );
-                    m.push(common::Label::new(
+                    m.push(DiagLabel::new(
                         format!(
                             "expected 3 arguments (lib, fn_id, args_tuple); got {}",
                             args.len()
@@ -1478,11 +1480,11 @@ impl Compiler {
                     let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
                         Expression::Tuple(items) => items.to_vec(),
                         _ => {
-                            let mut m = common::Message::error(
-                                "invoke(...) arguments must be a tuple in position 3".to_string(),
+                            let mut m = Message::error(
+                               ErrorCode::InvokeArity, "invoke(...) arguments must be a tuple in position 3".to_string(),
                                 args_tuple.0.into_range(),
                             );
-                            m.push(common::Label::new(
+                            m.push(DiagLabel::new(
                                 "wrap the arg values in parentheses — (40, 2)".to_string(),
                                 args_tuple.0.into_range(),
                             ));
@@ -1766,7 +1768,7 @@ impl Compiler {
                     }
                 } else {
                     let mut message =
-                        Message::error("Unknown function".to_string(), span.into_range());
+                        Message::error(ErrorCode::UnknownFunction, "Unknown function".to_string(), span.into_range());
                     message.push(DiagLabel::new(
                         format!("Unable to call unknown function '{}'", n),
                         span.into_range(),
@@ -1794,7 +1796,7 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                 } else {
                     let mut message =
-                        Message::error("Unknown variable".to_string(), span.into_range());
+                        Message::error(ErrorCode::UnknownValue, "Unknown variable".to_string(), span.into_range());
                     message.push(DiagLabel::new(
                         format!("Unknown variable '{}'", n),
                         span.into_range(),
@@ -2042,7 +2044,7 @@ impl Compiler {
             Expression::Variable(name, _ty) => {
                 if unlikely(self.context.variables.contains(&name.to_string())) {
                     let mut message =
-                        Message::error("Variable redeclaration".to_string(), span.into_range());
+                        Message::error(ErrorCode::VariableRedeclaration, "Variable redeclaration".to_string(), span.into_range());
                     message.push(DiagLabel::new(
                         format!("Variable '{}' already declared", name),
                         span.into_range(),
@@ -2056,7 +2058,7 @@ impl Compiler {
                 let name = self.resolve_variable(name);
                 if self.context.variables.contains(&name) {
                     let mut message =
-                        Message::error("Constand redeclaration".to_string(), span.into_range());
+                        Message::error(ErrorCode::VariableRedeclaration, "Constand redeclaration".to_string(), span.into_range());
                     message.push(DiagLabel::new(
                         format!("Constant '{}' already declared", name),
                         span.into_range(),
@@ -2113,7 +2115,7 @@ impl Compiler {
                                     });
                                 } else {
                                     let mut message = Message::error(
-                                        "Assignment error".to_string(),
+                                        ErrorCode::GenericTypeError, "Assignment error".to_string(),
                                         span.into_range(),
                                     );
                                     message.push(DiagLabel::new(
@@ -2132,7 +2134,7 @@ impl Compiler {
                             );
                         } else {
                             let mut message = Message::error(
-                                "Undefined variable".to_string(),
+                                ErrorCode::GenericTypeError, "Undefined variable".to_string(),
                                 span.into_range(),
                             );
                             message.push(DiagLabel::new(
@@ -2214,11 +2216,11 @@ impl Compiler {
                                     arg_type_tags.push(tag);
                                 } else {
                                     self.messages.push({
-                                        let mut m = common::Message::error(
-                                            "Unknown FFI argument type".to_string(),
+                                        let mut m = Message::error(
+                                           ErrorCode::GenericTypeError, "Unknown FFI argument type".to_string(),
                                             arg.0.into_range(),
                                         );
-                                        m.push(common::Label::new(
+                                        m.push(DiagLabel::new(
                                             "use FFIType::X, a bare type name, [T], (T, U), or an extern struct".to_string(),
                                             arg.0.into_range(),
                                         ));
@@ -2228,11 +2230,11 @@ impl Compiler {
                                 }
                             } else {
                                 self.messages.push({
-                                    let mut m = common::Message::error(
-                                        "Extern fn argument must be `name: type` form".to_string(),
+                                    let mut m = Message::error(
+                                       ErrorCode::GenericTypeError, "Extern fn argument must be `name: type` form".to_string(),
                                         arg.0.into_range(),
                                     );
-                                    m.push(common::Label::new(
+                                    m.push(DiagLabel::new(
                                         "got an unexpected expression".to_string(),
                                         arg.0.into_range(),
                                     ));
@@ -2999,7 +3001,7 @@ impl Compiler {
 
             _expr => {
                 let mut message =
-                    Message::error("Unknown expression".to_string(), span.into_range());
+                    Message::error(ErrorCode::UnknownExpression, "Unknown expression".to_string(), span.into_range());
                 message.push(DiagLabel::new(
                     "Unable to compile expression".to_string(),
                     span.into_range(),

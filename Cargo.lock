@@ -205,10 +205,10 @@ dependencies = [
 name = "compiler"
 version = "0.1.0"
 dependencies = [
- "ariadne",
  "common",
  "machine",
  "parser",
+ "reporting",
  "rkyv",
 ]
 
@@ -618,6 +618,7 @@ version = "0.1.0"
 dependencies = [
  "chumsky",
  "common",
+ "reporting",
 ]
 
 [[package]]
@@ -791,7 +792,6 @@ name = "reporting"
 version = "0.1.0"
 dependencies = [
  "ariadne",
- "common",
  "serde",
  "serde_json",
 ]
@@ -1172,12 +1172,12 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 name = "zero-script"
 version = "0.1.0"
 dependencies = [
- "ariadne",
  "common",
  "compiler",
  "criterion",
  "machine",
  "parser",
+ "reporting",
  "rkyv",
 ]
 

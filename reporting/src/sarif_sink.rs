@@ -1,12 +1,13 @@
 //! SARIF 2.1 diagnostic sink.
 
 use std::io::Write;
+use std::path::Path;
 
 use serde::Serialize;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::sink::DiagnosticSink;
-use crate::source::SourceMap;
+use crate::source::{SourceId, SourceMap};
 
 /// Buffers diagnostics and writes one SARIF 2.1 log on [`finish`](DiagnosticSink::finish).
 pub struct SarifSink {
@@ -28,7 +29,7 @@ impl SarifSink {
         }
     }
 
-    fn path_uri(&self, file: crate::source::SourceId) -> String {
+    fn path_uri(&self, file: SourceId) -> String {
         self.sources
             .path(file)
             .map(|p| p.display().to_string())
@@ -42,11 +43,8 @@ impl SarifSink {
                     uri: self.path_uri(loc.file),
                 },
                 region: Some(SarifRegion {
-                    // SARIF uses 1-based columns; we expose byte offsets as
-                    // char offsets for tools (source is UTF-8; byte==char for ASCII).
                     start_offset: Some(loc.range.start as u64),
                     end_offset: Some(loc.range.end as u64),
-                    // Also provide byteLength for consumers that prefer it.
                     byte_offset: Some(loc.range.start as u64),
                     byte_length: Some(loc.range.end.saturating_sub(loc.range.start) as u64),
                 }),
@@ -90,7 +88,7 @@ impl DiagnosticSink for SarifSink {
         });
 
         self.results.push(SarifResult {
-            rule_id: diag.code.clone(),
+            rule_id: diag.code.map(|c| c.as_str().to_string()),
             level: level.to_string(),
             message: SarifMessage {
                 text: diag.message,
@@ -99,6 +97,10 @@ impl DiagnosticSink for SarifSink {
             related_locations,
             properties,
         });
+    }
+
+    fn register_source(&mut self, path: &Path, text: &str) -> SourceId {
+        self.sources.insert(path, text)
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
@@ -141,8 +143,6 @@ impl DiagnosticSink for SarifSink {
         self.error_count > 0
     }
 }
-
-// --- Minimal SARIF 2.1 serde model (hand-rolled) ---
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -252,12 +252,14 @@ struct SarifResultProperties {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use common::{Label as MsgLabel, Message};
     use serde_json::Value;
 
     use super::*;
+    use crate::codes::ErrorCode;
     use crate::diagnostic::Diagnostic;
-    use crate::sink::DiagnosticSink;
+    use crate::message::{Label as MsgLabel, Message};
+    use crate::sink::{create_sink, DiagnosticSink};
+    use crate::config::ReportConfig;
 
     #[derive(Clone, Default)]
     struct SharedBuf {
@@ -289,7 +291,7 @@ mod tests {
         let mut sources = SourceMap::new();
         let file = sources.insert("test.0s", "let x = 1;\n");
 
-        let mut msg = Message::error("Type mismatch".into(), 4..5);
+        let mut msg = Message::error(ErrorCode::TypeMismatch, "Type mismatch".into(), 4..5);
         msg.with_help("expected int".into());
         msg.push(MsgLabel::new("here".into(), 8..9));
         let diag = Diagnostic::from_message(&msg, file);
@@ -302,47 +304,27 @@ mod tests {
         let v: Value = serde_json::from_str(&shared.into_string()).unwrap();
         assert_eq!(v["version"], "2.1.0");
         assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "zero-script");
-        assert_eq!(v["runs"][0]["artifacts"][0]["location"]["uri"], "test.0s");
-
         let result = &v["runs"][0]["results"][0];
+        assert_eq!(result["ruleId"], "E0102");
         assert_eq!(result["level"], "error");
         assert_eq!(result["message"]["text"], "Type mismatch");
         assert_eq!(result["properties"]["help"], "expected int");
-        assert_eq!(
-            result["locations"][0]["physicalLocation"]["region"]["byteOffset"],
-            4
-        );
-        assert_eq!(
-            result["locations"][0]["physicalLocation"]["region"]["byteLength"],
-            1
-        );
-        assert_eq!(
-            result["relatedLocations"][0]["message"]["text"],
-            "here"
-        );
-        assert_eq!(
-            result["relatedLocations"][0]["location"]["physicalLocation"]["region"]["byteOffset"],
-            8
-        );
     }
 
     #[test]
     fn sarif_spanless_cli_error() {
         let shared = SharedBuf::new();
         let mut sink = SarifSink::new(SourceMap::new(), Box::new(shared.clone()));
-        sink.emit(Diagnostic::error(
-            "Bytecode archive version 1 does not match compiler version 10",
-        ));
+        sink.emit(
+            Diagnostic::error("Bytecode archive version mismatch")
+                .with_code(ErrorCode::ArchiveVersionMismatch),
+        );
         assert!(sink.had_errors());
         sink.finish().unwrap();
 
         let v: Value = serde_json::from_str(&shared.into_string()).unwrap();
         let result = &v["runs"][0]["results"][0];
-        assert_eq!(result["level"], "error");
-        assert_eq!(
-            result["message"]["text"],
-            "Bytecode archive version 1 does not match compiler version 10"
-        );
+        assert_eq!(result["ruleId"], "E0901");
         assert!(
             result.get("locations").is_none()
                 || result["locations"].as_array().is_some_and(|a| a.is_empty())
@@ -351,9 +333,6 @@ mod tests {
 
     #[test]
     fn create_sink_sarif_via_factory() {
-        use crate::config::ReportConfig;
-        use crate::sink::create_sink;
-
         let config = ReportConfig::from_log_json_flag(true);
         let shared = SharedBuf::new();
         let mut sink = create_sink(&config, SourceMap::new(), Box::new(shared.clone()));

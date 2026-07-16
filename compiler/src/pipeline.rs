@@ -6,13 +6,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ariadne::{Color, Config, IndexType, Label, LabelAttach, Report, ReportKind, sources};
-use common::{
-    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Message,
-    MessageKind,
-};
+use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction};
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
+use reporting::{
+    create_sink, Diagnostic, DiagnosticSink, ErrorCode, Label, Message, ReportConfig, SourceId,
+    SourceMap,
+};
 use rkyv::rancor::Error;
 
 use crate::Compiler;
@@ -67,6 +67,10 @@ pub struct Pipeline {
     source_interner: common::Interner<PathBuf>,
     source_cache: Vec<Option<String>>,
     compiler: Compiler,
+    /// Owned diagnostic sink (pretty / SARIF / LSP).
+    sink: Box<dyn DiagnosticSink>,
+    /// How many compiler messages have already been emitted to [`Self::sink`].
+    messages_emitted: usize,
 }
 
 /// Native function declaration registered by the host.
@@ -182,6 +186,14 @@ impl Pipeline {
     }
 
     pub fn new() -> Self {
+        Self::with_reporter(ReportConfig::default(), Box::new(std::io::stderr()))
+    }
+
+    /// Construct a pipeline with an explicit diagnostic sink config and writer.
+    ///
+    /// Used by the CLI (`--log-json` / `--log-lsp`) and by unit tests that
+    /// capture rendered diagnostics into a buffer.
+    pub fn with_reporter(config: ReportConfig, writer: Box<dyn Write + Send>) -> Self {
         let cwd = std::env::current_dir().expect("Unable to determine current working directory");
         // The project root is the cwd for now. A future
         // revision could walk up the tree looking for
@@ -212,43 +224,49 @@ impl Pipeline {
             source_interner: common::Interner::default(),
             source_cache: Vec::new(),
             compiler: Compiler::default(),
+            sink: create_sink(&config, SourceMap::new(), writer),
+            messages_emitted: 0,
         }
     }
 
-    fn render_errors(filename: String, source: &str, message: &Message) {
-        let mut sources = sources([(filename.clone(), source)]);
-
-        let mut report = Report::build(
-            match message.kind() {
-                MessageKind::ERROR => ReportKind::Error,
-                MessageKind::WARNING => ReportKind::Warning,
-                MessageKind::INFO => ReportKind::Custom("Info", Color::BrightBlue),
-            },
-            (filename.clone(), message.range().clone()),
-        )
-        .with_message(message.message())
-        .with_config(
-            Config::new()
-                .with_index_type(IndexType::Byte)
-                .with_underlines(true)
-                .with_label_attach(LabelAttach::End)
-                .with_multiline_arrows(true)
-                .with_compact(false),
-        );
-
-        for label in message.labels() {
-            report = report.with_label(
-                Label::new((filename.to_string(), label.range().clone()))
-                    .with_message(label.to_string())
-                    .with_color(Color::Primary),
-            );
+    /// Register `source` under `path` and emit a single producer [`Message`].
+    fn emit_message(&mut self, path: &Path, source: &str, message: &Message) {
+        let file_id = self.sink.register_source(path, source);
+        self.sink.emit(Diagnostic::from_message(message, file_id));
+        if self.sink.had_errors() {
+            self.failed = true;
         }
+    }
 
-        if let Some(tip) = message.help() {
-            report = report.with_help(tip);
+    /// Emit compiler messages that have not yet been forwarded to the sink.
+    fn emit_new_messages(&mut self, file_id: SourceId) {
+        let all = self.compiler.get_messages();
+        let pending: Vec<Message> = all[self.messages_emitted..].to_vec();
+        self.messages_emitted = all.len();
+        for msg in &pending {
+            self.sink.emit(Diagnostic::from_message(msg, file_id));
         }
+        if self.sink.had_errors() {
+            self.failed = true;
+        }
+    }
 
-        report.finish().eprint(&mut sources).unwrap()
+    /// Emit a CLI / I/O style error with no source span.
+    pub fn emit_spanless_error(&mut self, code: ErrorCode, message: impl Into<String>) {
+        self.sink
+            .emit(Diagnostic::error(message).with_code(code));
+        self.failed = true;
+    }
+
+    /// Flush the diagnostic sink (required for SARIF / LSP buffered formats).
+    pub fn finish_reporting(&mut self) -> std::io::Result<()> {
+        self.sink.finish()
+    }
+
+    /// True if any error diagnostic was emitted or a hard pipeline failure
+    /// was recorded (e.g. unreadable source file).
+    pub fn had_errors(&self) -> bool {
+        self.failed || self.sink.had_errors()
     }
 
     /// First pass: walk the AST and enqueue every
@@ -480,13 +498,16 @@ impl Pipeline {
             let src = match self.read_source(&file) {
                 Some(s) => s,
                 None => {
-                    let mut msg =
-                        Message::error(format!("Failed to read file `{}`", file.display()), 0..0);
-                    msg.push(common::Label::new(
+                    let mut msg = Message::error(
+                        ErrorCode::IoError,
+                        format!("Failed to read file `{}`", file.display()),
+                        0..0,
+                    );
+                    msg.push(Label::new(
                         format!("file path: {}", file.display()),
                         0..0,
                     ));
-                    self.compiler.messages.push(msg);
+                    self.emit_message(&file, "", &msg);
                     self.failed = true;
                     continue;
                 }
@@ -495,7 +516,7 @@ impl Pipeline {
             let ast = match parser.parse(src.as_str()) {
                 Ok(ast) => ast,
                 Err(errors) => {
-                    Self::render_errors(file.display().to_string(), src.as_str(), &errors);
+                    self.emit_message(&file, src.as_str(), &errors);
                     self.failed = true;
                     continue;
                 }
@@ -551,13 +572,16 @@ impl Pipeline {
         let src = match self.read_source(&file) {
             Some(s) => s,
             None => {
-                let mut msg =
-                    Message::error(format!("Failed to read file `{}`", file.display()), 0..0);
-                msg.push(common::Label::new(
+                let mut msg = Message::error(
+                    ErrorCode::IoError,
+                    format!("Failed to read file `{}`", file.display()),
+                    0..0,
+                );
+                msg.push(Label::new(
                     format!("file path: {}", file.display()),
                     0..0,
                 ));
-                self.compiler.messages.push(msg);
+                self.emit_message(&file, "", &msg);
                 self.failed = true;
                 return;
             }
@@ -567,12 +591,7 @@ impl Pipeline {
         let ast = match parser.parse(src.as_str()) {
             Ok(ast) => ast,
             Err(errors) => {
-                // Parse errors are reported via the
-                // standard ariadne pipeline. We don't
-                // have a Message here (parse errors
-                // are chumsky Rich errors), so we
-                // construct one with the first error.
-                Self::render_errors(file.display().to_string(), src.as_str(), &errors);
+                self.emit_message(&file, src.as_str(), &errors);
                 self.failed = true;
                 return;
             }
@@ -606,9 +625,11 @@ impl Pipeline {
         // via function-name lookup at call time.
         self.bytecode.extend(bytecode);
 
-        // Surface any compiler-emitted diagnostics.
-        for message in self.compiler.get_messages() {
-            Self::render_errors(file.display().to_string(), src.as_str(), message);
+        // Surface any newly emitted compiler diagnostics.
+        let file_id = self.sink.register_source(&file, src.as_str());
+        self.emit_new_messages(file_id);
+        if self.had_errors() {
+            self.failed = true;
         }
     }
 
@@ -728,14 +749,21 @@ impl Pipeline {
 
     pub fn compile_src(&mut self, src: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let parser = Pratt::default();
-        let ast = parser.parse(src).map_err(|_| ())?;
+        let path = Path::new("<input>");
+        let ast = match parser.parse(src) {
+            Ok(ast) => ast,
+            Err(err) => {
+                self.emit_message(path, src, &err);
+                return Err(());
+            }
+        };
 
         let mut bytecode = self.compiler.compile("", &ast);
 
-        // Drain any typecheck messages — for golden tests,
-        // we expect the example to be well-typed.
-        let messages = self.compiler.get_messages();
-        if !messages.is_empty() {
+        // Register source and drain typecheck / codegen diagnostics via the sink.
+        let file_id = self.sink.register_source(path, src);
+        self.emit_new_messages(file_id);
+        if self.had_errors() {
             return Err(());
         }
 
@@ -782,7 +810,7 @@ impl Pipeline {
             self.compile_file(item, is_entry);
         }
 
-        if self.failed {
+        if self.failed || self.had_errors() {
             return Err(());
         }
 
@@ -798,9 +826,8 @@ impl Pipeline {
             *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
         }
 
-        // Drain any typecheck messages.
-        let messages = self.compiler.get_messages();
-        if !messages.is_empty() {
+        // In-memory API: any diagnostic (error or warning) is a failure.
+        if !self.compiler.get_messages().is_empty() {
             return Err(());
         }
 
@@ -873,96 +900,115 @@ fn ffi_type_to_ty(ty: FfiType) -> crate::typechecking::ty::Ty {
 
 #[cfg(test)]
 mod tests {
-    /// End-to-end: build a `Message` via the HM checker and feed it
-    /// through `render_errors`. We verify that ariadne can build a
-    /// `Report` from our well-formed `Message` (with secondary labels
-    /// and a help hint) without panicking. Capturing stderr is fiddly
-    /// in stable Rust, so we just exercise the report-building path.
-    #[test]
-    fn ariadne_handles_rich_message() {
-        use ariadne::{
-            Color, Config, IndexType, Label as AriaLabel, LabelAttach, Report, ReportKind,
-        };
-        use common::{Label, Message, MessageKind};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
 
-        // Build a Message with primary range, secondary label, and help.
-        let mut msg = Message::new(
-            MessageKind::ERROR,
-            "Type mismatch: expected `int`, found `string`".to_string(),
-            5..10,
-        );
-        msg.push(Label::new(
-            "expected `int` comes from here".to_string(),
-            5..8,
-        ));
-        msg.with_help("while checking `assignment`".to_string());
+    use reporting::{ErrorCode, Message, MessageKind, ReportConfig, ReportFormat};
 
-        // The render_errors path is private, but the report-building
-        // step is identical. We rebuild it here.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut builder = Report::build(
-                ReportKind::Error,
-                ("test.0s".to_string(), msg.range().clone()),
-            )
-            .with_config(
-                Config::new()
-                    .with_index_type(IndexType::Byte)
-                    .with_underlines(true)
-                    .with_label_attach(LabelAttach::End)
-                    .with_multiline_arrows(true)
-                    .with_compact(false),
-            );
-            for label in msg.labels() {
-                builder = builder.with_label(
-                    AriaLabel::new(("test.0s".to_string(), label.range().clone()))
-                        .with_message(label.to_string())
-                        .with_color(Color::Primary),
-                );
-            }
+    use super::Pipeline;
 
-            if let Some(tip) = msg.help() {
-                builder = builder.with_help(tip);
-            }
-
-            let _ = builder.finish();
-        }));
-
-        assert!(result.is_ok(), "ariadne panicked on a well-formed message");
+    /// Cloneable in-memory writer so tests can inspect sink output.
+    #[derive(Clone, Default)]
+    struct SharedBuf {
+        inner: Arc<Mutex<Vec<u8>>>,
     }
 
-    /// The help hint should be included in the rendered report. We
-    /// verify by reaching into ariadne's internals is too invasive;
-    /// instead we just check that calling `with_help` followed by
-    /// `finish` doesn't panic.
+    impl SharedBuf {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn into_string(self) -> String {
+            String::from_utf8_lossy(&self.inner.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn ariadne_handles_message_with_help() {
-        use ariadne::{Config, IndexType, LabelAttach, Report, ReportKind};
-        use common::{Message, MessageKind};
+    fn with_reporter_emits_message_to_pretty_sink() {
+        let shared = SharedBuf::new();
+        let mut pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(shared.clone()));
 
-        let mut msg = Message::new(
-            MessageKind::WARNING,
-            "this variable is unused".to_string(),
-            0..5,
+        // Type mismatch on assignment — should surface via the pretty sink.
+        let src = r#"
+fn main() {
+    let x = 1;
+    x = "hi";
+}
+"#;
+        let result = pipeline.compile_src(src);
+        assert!(result.is_err());
+        pipeline.finish_reporting().unwrap();
+
+        let out = shared.into_string();
+        assert!(
+            out.contains("Type mismatch") || out.contains("E0102"),
+            "expected type-mismatch diagnostic in sink output, got: {out:?}"
         );
-        msg.with_help("consider prefixing with `_`".to_string());
+        // Also exercise the E01xx family path with an unknown function.
+        let shared2 = SharedBuf::new();
+        let mut pipeline2 =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(shared2.clone()));
+        let _ = pipeline2.compile_src("fn main() { nope(); }");
+        pipeline2.finish_reporting().unwrap();
+        let out2 = shared2.into_string();
+        assert!(
+            out2.contains("E0101") || out2.contains("Cannot find function"),
+            "expected E0101 / unknown-function diagnostic, got: {out2:?}"
+        );
+        assert!(pipeline.had_errors());
+        assert!(pipeline2.had_errors());
+    }
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let builder = Report::build(
-                ReportKind::Warning,
-                ("test.0s".to_string(), msg.range().clone()),
-            )
-            .with_config(
-                Config::new()
-                    .with_index_type(IndexType::Byte)
-                    .with_underlines(true)
-                    .with_label_attach(LabelAttach::End)
-                    .with_multiline_arrows(true)
-                    .with_compact(false),
-            )
-            .with_help(msg.help().as_ref().unwrap())
-            .finish();
-            let _ = builder;
-        }));
-        assert!(result.is_ok());
+    #[test]
+    fn emit_spanless_error_records_error() {
+        let shared = SharedBuf::new();
+        let mut pipeline =
+            Pipeline::with_reporter(ReportConfig::default(), Box::new(shared.clone()));
+        pipeline.emit_spanless_error(ErrorCode::IoError, "failed to open archive");
+        assert!(pipeline.had_errors());
+        pipeline.finish_reporting().unwrap();
+
+        let out = shared.into_string();
+        assert!(out.contains("failed to open archive"));
+        assert!(out.contains("E0900") || out.contains("error"));
+    }
+
+    #[test]
+    fn message_kind_still_distinguishes_error_and_warning() {
+        let err = Message::error(ErrorCode::TypeMismatch, "boom".into(), 0..1);
+        let warn = Message::warn(ErrorCode::UnknownValue, "unused".into(), 0..1);
+        assert_eq!(*err.kind(), MessageKind::ERROR);
+        assert_eq!(*warn.kind(), MessageKind::WARNING);
+    }
+
+    #[test]
+    fn create_sink_sarif_round_trip() {
+        let shared = SharedBuf::new();
+        let config = ReportConfig::new(ReportFormat::Sarif);
+        let mut pipeline = Pipeline::with_reporter(config, Box::new(shared.clone()));
+
+        // Unknown value → E0100.
+        let src = r#"fn main() { print "%i", missing; }"#;
+        let _ = pipeline.compile_src(src);
+        pipeline.finish_reporting().unwrap();
+
+        let out = shared.into_string();
+        assert!(
+            out.contains("E0100") || out.contains(r#""ruleId":"E0100"#),
+            "expected SARIF ruleId E0100, got: {out:?}"
+        );
+        assert!(pipeline.had_errors());
     }
 }

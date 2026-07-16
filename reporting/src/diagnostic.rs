@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 
+use crate::codes::ErrorCode;
 use crate::source::SourceId;
 
 /// Severity of a diagnostic.
@@ -27,14 +28,14 @@ impl Location {
     }
 }
 
-/// Secondary span annotation attached to a diagnostic.
+/// Secondary span annotation attached to a [`Diagnostic`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Label {
+pub struct RelatedLabel {
     pub location: Location,
     pub message: String,
 }
 
-impl Label {
+impl RelatedLabel {
     pub fn new(location: Location, message: impl Into<String>) -> Self {
         Self {
             location,
@@ -49,10 +50,9 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub location: Option<Location>,
-    pub labels: Vec<Label>,
+    pub labels: Vec<RelatedLabel>,
     pub help: Option<String>,
-    /// Reserved for stable error codes (`E0001`); unused in v1.
-    pub code: Option<String>,
+    pub code: Option<ErrorCode>,
 }
 
 impl Diagnostic {
@@ -83,13 +83,11 @@ impl Diagnostic {
         Self::new(Severity::Note, message)
     }
 
-    /// Attach a primary location.
     pub fn at(mut self, file: SourceId, range: Range<usize>) -> Self {
         self.location = Some(Location::new(file, range));
         self
     }
 
-    /// Explicitly clear any primary location (runtime/CLI errors).
     pub fn without_location(mut self) -> Self {
         self.location = None;
         self
@@ -100,12 +98,12 @@ impl Diagnostic {
         self
     }
 
-    pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.code = Some(code.into());
+    pub fn with_code(mut self, code: ErrorCode) -> Self {
+        self.code = Some(code);
         self
     }
 
-    pub fn with_label(mut self, label: Label) -> Self {
+    pub fn with_label(mut self, label: RelatedLabel) -> Self {
         self.labels.push(label);
         self
     }

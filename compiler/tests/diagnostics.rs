@@ -1,6 +1,6 @@
 //! Golden tests for typechecker diagnostic messages.
 
-use compiler::Checker;
+use compiler::{Checker, ErrorCode, Message};
 use parser::Pratt;
 
 /// Parse `src`, run the HM checker, and return both the root type and
@@ -14,6 +14,13 @@ fn check(src: &str) -> (String, Vec<String>) {
     (format!("{}", ty), msg_strings)
 }
 
+fn check_messages(src: &str) -> Vec<Message> {
+    let ast = Pratt::default().parse(src).expect("parse failed");
+    let mut c = Checker::new();
+    let _ = c.check_program(&ast);
+    c.take_messages()
+}
+
 #[test]
 fn unknown_identifier_reports_helpful_message() {
     let (_ty, msgs) = check("x;");
@@ -21,6 +28,26 @@ fn unknown_identifier_reports_helpful_message() {
         msgs.iter().any(|m| m.contains("Cannot find value `x`")),
         "expected 'Cannot find value `x`' in messages, got: {:?}",
         msgs
+    );
+}
+
+#[test]
+fn unknown_identifier_has_stable_error_code() {
+    let msgs = check_messages("x;");
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::UnknownValue)),
+        "expected ErrorCode::UnknownValue (E0100), got: {:?}",
+        msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn type_mismatch_has_stable_error_code() {
+    let msgs = check_messages(r#"let x: int = "hello";"#);
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
+        "expected ErrorCode::TypeMismatch (E0102), got: {:?}",
+        msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
 }
 

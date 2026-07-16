@@ -1,6 +1,7 @@
 //! Pretty (ariadne) diagnostic sink.
 
 use std::io::Write;
+use std::path::Path;
 
 use ariadne::{
     sources, Color, Config, IndexType, Label as AriadneLabel, LabelAttach, Report, ReportKind,
@@ -8,7 +9,7 @@ use ariadne::{
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::sink::DiagnosticSink;
-use crate::source::SourceMap;
+use crate::source::{SourceId, SourceMap};
 
 /// Renders each diagnostic immediately as an ariadne report.
 pub struct AriadneSink {
@@ -33,7 +34,11 @@ impl AriadneSink {
             Severity::Info => "info",
             Severity::Note => "note",
         };
-        write!(self.writer, "{kind}: {}", diag.message)?;
+        if let Some(code) = diag.code {
+            write!(self.writer, "{kind}[{code}]: {}", diag.message)?;
+        } else {
+            write!(self.writer, "{kind}: {}", diag.message)?;
+        }
         if let Some(help) = &diag.help {
             write!(self.writer, "\nhelp: {help}")?;
         }
@@ -62,8 +67,14 @@ impl AriadneSink {
             Severity::Note => ReportKind::Custom("Note", Color::BrightBlue),
         };
 
+        let message = if let Some(code) = diag.code {
+            format!("[{code}] {}", diag.message)
+        } else {
+            diag.message.clone()
+        };
+
         let mut report = Report::build(kind, (filename.clone(), loc.range.clone()))
-            .with_message(&diag.message)
+            .with_message(&message)
             .with_config(
                 Config::new()
                     .with_index_type(IndexType::Byte)
@@ -115,9 +126,12 @@ impl DiagnosticSink for AriadneSink {
             self.write_spanless(&diag)
         };
         if let Err(err) = result {
-            // Rendering failures must not panic the compiler; surface on stderr.
             let _ = writeln!(std::io::stderr(), "reporting: failed to render diagnostic: {err}");
         }
+    }
+
+    fn register_source(&mut self, path: &Path, text: &str) -> SourceId {
+        self.sources.insert(path, text)
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
@@ -135,7 +149,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::diagnostic::{Label, Location};
+    use crate::codes::ErrorCode;
+    use crate::diagnostic::{Location, RelatedLabel};
 
     #[derive(Clone, Default)]
     struct SharedBuf {
@@ -148,8 +163,7 @@ mod tests {
         }
 
         fn into_string(self) -> String {
-            let bytes = self.inner.lock().unwrap().clone();
-            String::from_utf8_lossy(&bytes).into_owned()
+            String::from_utf8_lossy(&self.inner.lock().unwrap()).into_owned()
         }
     }
 
@@ -173,8 +187,9 @@ mod tests {
 
         sink.emit(
             Diagnostic::error("Type mismatch")
+                .with_code(ErrorCode::TypeMismatch)
                 .at(file, 8..12)
-                .with_label(Label::new(
+                .with_label(RelatedLabel::new(
                     Location::new(file, 8..12),
                     "found string",
                 ))
@@ -182,7 +197,6 @@ mod tests {
         );
         sink.finish().unwrap();
         assert!(sink.had_errors());
-        // Ariadne wrote something (exact layout is not stable across versions).
         assert!(!shared.into_string().is_empty());
     }
 
@@ -190,11 +204,23 @@ mod tests {
     fn pretty_sink_renders_spanless_diagnostic() {
         let shared = SharedBuf::new();
         let mut sink = AriadneSink::new(SourceMap::new(), Box::new(shared.clone()));
-        sink.emit(Diagnostic::error("Bytecode archive version mismatch"));
+        sink.emit(
+            Diagnostic::error("Bytecode archive version mismatch")
+                .with_code(ErrorCode::ArchiveVersionMismatch),
+        );
         sink.finish().unwrap();
 
         let out = shared.into_string();
-        assert!(out.contains("error: Bytecode archive version mismatch"));
+        assert!(out.contains("E0901"));
+        assert!(out.contains("Bytecode archive version mismatch"));
         assert!(sink.had_errors());
+    }
+
+    #[test]
+    fn register_source_updates_map() {
+        let shared = SharedBuf::new();
+        let mut sink = AriadneSink::new(SourceMap::new(), Box::new(shared));
+        let id = sink.register_source(Path::new("a.0s"), "fn main() {}");
+        assert_eq!(id.as_u32(), 0);
     }
 }
