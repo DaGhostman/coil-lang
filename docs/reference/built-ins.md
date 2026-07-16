@@ -18,7 +18,22 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `declare` | Expression | Register FFI function signature |
 | `invoke` | Expression | Call registered FFI function |
 | `done` | Expression | `true` if a coroutine handle is finished |
+| `Option` / `Result` | Types | Compiler-built-in sum types (not user-redeclarable) |
+| `FFIType` | Type | Compiler-built-in FFI tag enum |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
+
+---
+
+## `Option` and `Result`
+
+Pre-registered enums with fixed tags:
+
+| Enum | Variants | Tags |
+|------|----------|------|
+| `Option` | `None`, `Some(T)` | 0, 1 |
+| `Result` | `Ok(T)`, `Err(E)` | 0, 1 |
+
+Use constructors / `match` as usual, plus `raise`, `?`, `??`, and `?.` — see [Tutorial: Error handling](../tutorial/09-error-handling.md).
 
 Internal: the `FORMAT` opcode powers both `print` and the `format` expression.
 

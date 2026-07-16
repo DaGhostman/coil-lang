@@ -1,41 +1,6 @@
-// examples/result.0s — sum-of-sum demonstrating nested match + Result<Option<int>>
-//
-// Three patterns: `Result::Ok(Option::Some(v))` (nested
-// constructor with a binding), `Result::Ok(Option::None)`
-// (nested constructor with Unit), and `Result::Err(_)`
-// (wildcard). Two arms share the outer tag `Result::Ok`,
-// differing on the inner `Option` tag — this exercises the
-// Phase 18A inner-pattern dispatch fix. The test chain in
-// the codegen runs the inner `JUMP_IF_MATCH` for `Some`
-// vs `None` so the right arm body runs based on the
-// runtime inner tag.
-//
-// Each `print` exercises one match arm at runtime:
-//   - `Result::Ok(Option::Some(42))` → matches the
-//     `Result::Ok(Option::Some(v))` arm, v=42.
-//   - `Result::Ok(Option::None)`     → matches the
-//     `Result::Ok(Option::None)` arm, returns 0.
-//   - `Result::Err("oops")`           → matches the
-//     wildcard Err arm, returns -1.
-//
-// The `Result::Ok(Option::None)` arm has a Unit inner
-// sub-pattern. Pre-Phase-18A-fix, the test chain would
-// emit a POP for the inner Unit sub-pattern AND the
-// reverse pass's `emit_pattern_binding` would emit a
-// SECOND POP, leaving the stack with one too few values.
-// The Phase 18A fix tracks arms in test chain groups and
-// passes `consume_values = false` to the reverse pass's
-// `emit_pattern_binding`, suppressing the redundant POP.
-enum Option {
-    None,
-    Some(int),
-}
-
-enum Result {
-    Ok(Option),
-    Err(string),
-}
-
+// Built-in Result + Option — nested match with two Ok arms
+// (inner Some vs None) plus Err. Exercises Phase 18A inner-pattern
+// dispatch. Output: 420-1
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -45,7 +10,7 @@ fn unwrap_result(Result r) -> int {
 }
 
 fn main() {
-    print "%i", unwrap_result(Result::Ok(Option::Some(42)));    // 42
-    print "%i", unwrap_result(Result::Ok(Option::None));         // 0
-    print "%i", unwrap_result(Result::Err("oops"));             // -1
+    print "%i", unwrap_result(Result::Ok(Option::Some(42)));
+    print "%i", unwrap_result(Result::Ok(Option::None));
+    print "%i", unwrap_result(Result::Err("oops"));
 }

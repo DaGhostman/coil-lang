@@ -257,14 +257,9 @@ Sum types with unit, tuple, and record-shaped payloads.
 
 ### `examples/option.0s`
 
-**Demonstrates:** Simple enum (`Option`), constructor calls, and `match` with a binding arm.
+**Demonstrates:** Built-in `Option`, constructor calls, and `match` with a binding arm.
 
 ```0s
-enum Option {
-    None,
-    Some(int),
-}
-
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -286,14 +281,9 @@ fn main() {
 
 ### `examples/result.0s`
 
-**Demonstrates:** Nested enums (`Result` wrapping `Option`), multiple `match` arms sharing an outer tag with different inner patterns, and inner-pattern dispatch at runtime.
+**Demonstrates:** Built-in `Result` wrapping `Option`, multiple `match` arms sharing an outer tag with different inner patterns, and inner-pattern dispatch at runtime.
 
 ```0s
-enum Result {
-    Ok(Option),
-    Err(string),
-}
-
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -313,6 +303,53 @@ fn main() {
 |---|---|
 | **Run** | `cargo run -- examples/result.0s` |
 | **Output** | `420-1` |
+
+---
+
+### `examples/raise_try.0s`
+
+**Demonstrates:** `raise`, postfix `?`, and inferred `Result` return (implicit `Ok` wrapping).
+
+```0s
+fn parse_pos(int n, int is_neg) {
+    if is_neg == 1 {
+        raise "neg";
+    }
+    return n;
+}
+
+fn double_pos(int n, int is_neg) {
+    let v = parse_pos(n, is_neg)?;
+    return v * 2;
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/raise_try.0s` |
+| **Output** | `10,neg` |
+
+---
+
+### `examples/coalesce.0s`
+
+**Demonstrates:** `??` on `Option` and `Result` (`Err` is swallowed on Result).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/coalesce.0s` |
+| **Output** | `bar,hi,7,9` |
+
+---
+
+### `examples/optional_chain.0s`
+
+**Demonstrates:** `?.` optional field access on `Option` plus `??` fallback.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/optional_chain.0s` |
+| **Output** | `42,0` |
 
 ---
 

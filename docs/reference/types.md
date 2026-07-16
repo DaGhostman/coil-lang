@@ -22,16 +22,24 @@ Strings support `+` / `+=` with other strings. The `format` expression returns `
 
 ## Type constructors (`Ty::Con`)
 
-Any identifier that is not a primitive becomes an opaque type constructor:
-
-```0s
-enum Option { None, Some(int) }
-// Option is Ty::Con("Option") when referenced before full sum info
-```
-
-User-defined **class** names also register as `Ty::Con(name)`.
+Any identifier that is not a primitive becomes an opaque type constructor. User-defined **class** names also register as `Ty::Con(name)`.
 
 Recursive enum references use isorecursive `Con(name)` inside variant payloads (not unfolded `Sum`), so recursive types like `Tree` are expressible without infinite-type errors during inference.
+
+---
+
+## Built-in `Option` and `Result`
+
+The compiler pre-registers polymorphic sum types (same mechanism as `FFIType`). **Do not redeclare them** — a user `enum Option` / `enum Result` is a duplicate-enum error.
+
+| Type | Variants (tag order) | Annotation |
+|------|----------------------|------------|
+| `Option` | `None` (0), `Some(T)` (1) | `Option` / `Option<T>` |
+| `Result` | `Ok(T)` (0), `Err(E)` (1) | `Result` / `Result<T, E>` |
+
+Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`). Error-handling operators (`raise`, `?`, `??`, `?.`) are documented in [Operators](operators.md) and [Tutorial 09](../tutorial/09-error-handling.md).
+
+**Result mode:** a function that uses `raise` or Result-`?` has return type `Result<T, E>`; success `return` values are implicitly wrapped as `Ok`. One `E` per function.
 
 ---
 
@@ -51,20 +59,20 @@ fn add(int a, int b) -> int { return a + b; }
 Declared with `enum Name { variants }`:
 
 ```0s
-enum Result {
-    Ok(int),
-    Err(string),
+enum Tree {
+    Leaf,
+    Node(int, Tree, Tree),
 }
 ```
 
-Internal shape:
+Internal shape (illustrative):
 
 ```
 Ty::Sum {
-    name: "Result",
+    name: "Tree",
     variants: [
-        ("Ok", Tuple([int])),
-        ("Err", Tuple([string])),
+        ("Leaf", Unit),
+        ("Node", Tuple([int, Con("Tree"), Con("Tree")])),
     ],
 }
 ```
@@ -77,7 +85,7 @@ Ty::Sum {
 | Tuple | `Some(int)` | `Tuple([int])` |
 | Record | `Point { x: int, y: int }` | `Record([("x", int), ("y", int)])` |
 
-Constructors in expressions and patterns use qualified form: `Option::Some(42)`, `Point::Point { x: 1, y: 2 }`.
+Constructors in expressions and patterns use qualified form: `Option::Some(42)` (builtin), `Point::Point { x: 1, y: 2 }` (user enum).
 
 ### Constructor types (`Ty::Constructor`)
 

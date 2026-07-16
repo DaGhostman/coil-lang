@@ -8,12 +8,12 @@ This chapter builds on [Types and Variables](02-types-and-variables.md). Record-
 
 ## Declaring an enum
 
-An enum groups related variants under one type name:
+An enum groups related variants under one type name. For the common “maybe” / “success or failure” shapes, prefer the **compiler-built-in** [`Option` and `Result`](09-error-handling.md) — do not redeclare those names.
 
 ```0s
-enum Option {
-    None,
-    Some(int),
+enum Tree {
+    Leaf,
+    Node(int, Tree, Tree),
 }
 ```
 
@@ -34,8 +34,8 @@ A single enum can mix all three shapes. See [Mixed-shape enums](#mixed-shape-enu
 Use `Enum::Variant` to build a value:
 
 ```0s
-Option::None              // unit variant
-Option::Some(42)          // tuple variant with one int payload
+Tree::Leaf                // unit variant
+Option::Some(42)          // built-in Option — tuple payload
 ```
 
 ### Empty parentheses mean unit
@@ -115,16 +115,11 @@ Because `match` is an expression, it can appear anywhere a value is expected —
 
 ---
 
-## Worked example: `Option`
+## Worked example: built-in `Option`
 
-From `examples/option.0s`:
+From `examples/option.0s` (`Option` is a compiler builtin — no local `enum` declaration):
 
 ```0s
-enum Option {
-    None,
-    Some(int),
-}
-
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -140,6 +135,8 @@ fn main() {
 **Expected output:** `42`
 
 The `match` covers both variants. The `Some(v)` arm binds the inner `int` to `v` and returns it directly.
+
+For `raise` / `?` / `??` / `?.`, see [Error handling](09-error-handling.md).
 
 ---
 
@@ -193,16 +190,6 @@ This matches a `Result::Ok` whose inner `Option` is `Some`, binding `v` to the i
 When **multiple arms share the same outer variant** but differ on the inner pattern, the runtime dispatches on the inner tag at match time. From `examples/result.0s`:
 
 ```0s
-enum Option {
-    None,
-    Some(int),
-}
-
-enum Result {
-    Ok(Option),
-    Err(string),
-}
-
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -217,6 +204,8 @@ fn main() {
     print "%i", unwrap_result(Result::Err("oops"));
 }
 ```
+
+(`Option` and `Result` are compiler builtins — no local `enum` declarations.)
 
 **Expected output:** `420-1`
 

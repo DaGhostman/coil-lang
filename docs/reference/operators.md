@@ -8,8 +8,9 @@ Associativity:
 |-------|-----------|---------------|
 | Additive `+` `-` | Term level | **Left** |
 | Most other binary | | **Right** |
+| Coalesce `??` | Between `\|\|` and assignment | **Right** |
 | Assignment `=` | | **Right** |
-| Postfix `++` `--` `.` `[]` | | N/A (postfix) |
+| Postfix `++` `--` `.` `?.` `[]` `?` | | N/A (postfix) |
 | Prefix `-` `+` `~` | | N/A (prefix) |
 
 ---
@@ -18,7 +19,7 @@ Associativity:
 
 | Precedence | Operators / forms | Notes |
 |------------|-------------------|-------|
-| **Primary (postfix)** | `expr++`, `expr--`, `expr.field`, `expr[index]` | Tightest — postfix on atoms |
+| **Primary (postfix)** | `expr++`, `expr--`, `expr.field`, `expr?.field`, `expr[index]`, `expr?` | Tightest — postfix on atoms |
 | **Prefix unary** | `-expr`, `+expr`, `~expr` | Numeric negation, no-op plus, bitwise NOT |
 | **Exponentiation** | `**` | Right-associative |
 | **Multiplicative** | `*`, `/`, `%` | Right-associative |
@@ -30,6 +31,7 @@ Associativity:
 | **Logical AND** | `&&` | Both operands `bool` → `bool` |
 | **Logical OR** | `\|\|` | Both operands `bool` → `bool` |
 | **Comparison** | `==`, `!=`, `<`, `<=`, `>`, `>=` | Operands same type → `bool` |
+| **Coalesce** | `??` | Right-associative; Option / Result only (see below) |
 | **Assignment** | `=`, `+=`, `-=`, … | Lowest — right-associative |
 
 Forms **not** in the Pratt table but still tight-binding:
@@ -168,6 +170,28 @@ Field resolution:
 |---------------|-----------|
 | Enum record variant | `LoadField` (index by declaration order) |
 | Dict / `{ }` record | `GetField` (string key) |
+
+---
+
+## Error-handling operators (`?`, `?.`, `??`)
+
+Desugared to `match` / `return` / `MakeEnum` — no new opcodes. See [Tutorial: Error handling](../tutorial/09-error-handling.md).
+
+| Operator | Form | Operand | Result type | Notes |
+|----------|------|---------|-------------|-------|
+| Try | `x?` | `Result<T,E>` or `Option<T>` | `T` | Propagates `Err` / `None` via early `return`; hard error otherwise (E0114) |
+| Optional access | `a?.field` | `Option<R>` with field `U` | `Option<U>` | Option-only; Result → E0116 |
+| Coalesce | `a ?? b` | `Option<T>` or `Result<T,E>` | `T` | RHS must unify with `T`; **`??` on Result swallows `Err`** (document / prefer `?` when failure matters) |
+
+Precedence sketch:
+
+```
+a?.x ?? b? ?? c   // (a?.x) ?? ((b?) ?? c)   — ?? is right-associative
+a || b ?? c       // (a || b) ?? c
+a = b ?? c        // a = (b ?? c)
+```
+
+`raise expr` is a keyword expression (not a Pratt operator); it produces `Err(expr)` and requires result mode.
 
 ---
 

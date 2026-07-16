@@ -177,6 +177,87 @@ pub fn unit() -> Ty {
     Ty::Con(UNIT.into())
 }
 
+/// Build `Option<T>` as a sum type (`None` | `Some(T)`).
+pub fn option_ty(inner: Ty) -> Ty {
+    Ty::Sum {
+        name: common::BUILTIN_OPTION_ENUM.into(),
+        variants: vec![
+            ("None".into(), EnumVariantPayloadTy::Unit),
+            ("Some".into(), EnumVariantPayloadTy::Tuple(vec![inner])),
+        ],
+    }
+}
+
+/// Build `Result<T, E>` as a sum type (`Ok(T)` | `Err(E)`).
+pub fn result_ty(ok: Ty, err: Ty) -> Ty {
+    Ty::Sum {
+        name: common::BUILTIN_RESULT_ENUM.into(),
+        variants: vec![
+            ("Ok".into(), EnumVariantPayloadTy::Tuple(vec![ok])),
+            ("Err".into(), EnumVariantPayloadTy::Tuple(vec![err])),
+        ],
+    }
+}
+
+/// Extract `T` from `Option<T>` (Sum or Constructor owner).
+pub fn option_inner(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Sum { name, variants } if name == common::BUILTIN_OPTION_ENUM => {
+            for (vn, payload) in variants {
+                if vn == "Some" {
+                    return payload.field_types().into_iter().next().cloned();
+                }
+            }
+            None
+        }
+        Ty::Constructor { owner, .. } => option_inner(owner),
+        Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM => None,
+        _ => None,
+    }
+}
+
+/// Extract `(T, E)` from `Result<T, E>`.
+pub fn result_ok_err(ty: &Ty) -> Option<(Ty, Ty)> {
+    match ty {
+        Ty::Sum { name, variants } if name == common::BUILTIN_RESULT_ENUM => {
+            let mut ok = None;
+            let mut err = None;
+            for (vn, payload) in variants {
+                let field = payload.field_types().into_iter().next().cloned();
+                if vn == "Ok" {
+                    ok = field;
+                } else if vn == "Err" {
+                    err = field;
+                }
+            }
+            match (ok, err) {
+                (Some(o), Some(e)) => Some((o, e)),
+                _ => None,
+            }
+        }
+        Ty::Constructor { owner, .. } => result_ok_err(owner),
+        _ => None,
+    }
+}
+
+/// True when `ty` is (or owns) the built-in `Option` sum.
+pub fn is_option_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::Sum { name, .. } | Ty::Con(name) => name == common::BUILTIN_OPTION_ENUM,
+        Ty::Constructor { owner, .. } => is_option_ty(owner),
+        _ => false,
+    }
+}
+
+/// True when `ty` is (or owns) the built-in `Result` sum.
+pub fn is_result_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::Sum { name, .. } | Ty::Con(name) => name == common::BUILTIN_RESULT_ENUM,
+        Ty::Constructor { owner, .. } => is_result_ty(owner),
+        _ => false,
+    }
+}
+
 /// Build the `List<t>` type.
 pub fn list(inner: Ty) -> Ty {
     Ty::List(Box::new(inner))

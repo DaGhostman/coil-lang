@@ -1,8 +1,4 @@
-enum Option {
-    None,
-    Some(int),
-}
-
+// Built-in Option — unwrap via match.
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,

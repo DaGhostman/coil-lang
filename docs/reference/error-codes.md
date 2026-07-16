@@ -32,6 +32,10 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0111` | `ReturnMismatch` | Return type mismatch |
 | `E0112` | `YieldOutsideAsync` | `yield` outside `async fn` |
 | `E0113` | `ResumeTypeMismatch` | Resume / send type mismatch |
+| `E0114` | `InvalidTry` | `?` on non-Option/non-Result, or outside a function |
+| `E0115` | `InvalidCoalesce` | `??` on non-Option/non-Result |
+| `E0116` | `InvalidOptionalAccess` | `?.` on non-Option (e.g. Result) |
+| `E0117` | `ConflictingErrorType` | Mixed Option/Result modes or conflicting `E` in one function |
 | `E0119` | `GenericTypeError` | Other type error |
 | `E0200`–`E0212` | Enum / match family | Duplicate enum, unknown variant, non-exhaustive match, field errors, … |
 | `E0300`–`E0301` | Format family | Specifier / arity mismatch |
