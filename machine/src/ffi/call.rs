@@ -191,6 +191,96 @@ fn pack_struct(
     Ok(())
 }
 
+fn field_byte_size(fty: FfiType, layouts: &[CStructLayout]) -> Result<usize, FfiError> {
+    Ok(match fty {
+        FfiType::Int | FfiType::UInt64 | FfiType::Float => 8,
+        FfiType::Int32 | FfiType::UInt32 => 4,
+        FfiType::Int16 | FfiType::UInt16 => 2,
+        FfiType::Int8 | FfiType::UInt8 | FfiType::Bool => 1,
+        FfiType::Struct(id) => {
+            let layout = layouts
+                .get(id as usize)
+                .ok_or_else(|| FfiError::Unsupported(format!("unknown nested struct id {id}")))?;
+            struct_byte_size(layout, layouts)?
+        }
+        other => {
+            return Err(FfiError::Unsupported(format!(
+                "field type `{other:?}` not supported in struct size"
+            )));
+        }
+    })
+}
+
+fn struct_byte_size(layout: &CStructLayout, layouts: &[CStructLayout]) -> Result<usize, FfiError> {
+    let mut total = 0usize;
+    for (_, fty) in &layout.fields {
+        total += field_byte_size(*fty, layouts)?;
+    }
+    Ok(total)
+}
+
+fn read_field_bytes(
+    buf: &[u8],
+    offset: usize,
+    fty: FfiType,
+    heap: &mut Heap,
+    layouts: &[CStructLayout],
+) -> Result<(Value, usize), FfiError> {
+    let size = field_byte_size(fty, layouts)?;
+    if offset + size > buf.len() {
+        return Err(FfiError::Unsupported(
+            "struct return buffer too small".into(),
+        ));
+    }
+    let slice = &buf[offset..offset + size];
+    let val = match fty {
+        FfiType::Int => Value::from(i64::from_ne_bytes(slice.try_into().unwrap())),
+        FfiType::UInt64 => Value::from(u64::from_ne_bytes(slice.try_into().unwrap()) as i64),
+        FfiType::Float => Value::from(f64::from_ne_bytes(slice.try_into().unwrap())),
+        FfiType::Int32 => Value::from(i32::from_ne_bytes(slice.try_into().unwrap()) as i64),
+        FfiType::UInt32 => Value::from(u32::from_ne_bytes(slice.try_into().unwrap()) as i64),
+        FfiType::Int16 => Value::from(i16::from_ne_bytes(slice.try_into().unwrap()) as i64),
+        FfiType::UInt16 => Value::from(u16::from_ne_bytes(slice.try_into().unwrap()) as i64),
+        FfiType::Int8 => Value::from(slice[0] as i8 as i64),
+        FfiType::UInt8 => Value::from(slice[0] as i64),
+        FfiType::Bool => Value::from(slice[0] != 0),
+        FfiType::Struct(id) => {
+            let sub = layouts
+                .get(id as usize)
+                .ok_or_else(|| FfiError::Unsupported(format!("unknown nested struct id {id}")))?;
+            unpack_struct(heap, sub, layouts, slice)?
+        }
+        other => {
+            return Err(FfiError::Unsupported(format!(
+                "field type `{other:?}` not supported in struct unpack"
+            )));
+        }
+    };
+    Ok((val, size))
+}
+
+fn unpack_struct(
+    heap: &mut Heap,
+    layout: &CStructLayout,
+    layouts: &[CStructLayout],
+    buf: &[u8],
+) -> Result<Value, FfiError> {
+    use crate::memory::ObjInstance;
+    let (obj, mut gc) = heap.alloc(ObjInstance::default(), Object::Instance);
+    let mut offset = 0usize;
+    for (fname, fty) in &layout.fields {
+        let (val, nbytes) = read_field_bytes(buf, offset, *fty, heap, layouts)?;
+        offset += nbytes;
+        let key = heap.intern(fname.clone());
+        let member = match heap.find_object_by_addr(val.raw() as u64) {
+            Some(o) => Member::Object(o),
+            None => Member::Value(val),
+        };
+        gc.as_mut().set(key, member);
+    }
+    Ok(Value::from(obj.addr()))
+}
+
 fn array_buffer_from_value(
     heap: &Heap,
     value: &Value,
@@ -382,9 +472,36 @@ pub fn invoke_via_libffi(
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret as u64)))
         }
-        FfiType::Struct(_) | FfiType::Callback(_) => Err(FfiError::Unsupported(
-            "struct/callback return types not yet supported".into(),
-        )),
+        // Opaque function pointer — same representation as Ptr. Re-invoking
+        // requires a host/`declare` of the pointed-to symbol; no trampoline
+        // is built from a returned callback address in this phase.
+        FfiType::Callback(_) => {
+            let ret = unsafe { prepared.cif.call::<*mut c_void>(prepared.addr, &ffi_args) };
+            copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
+            Ok(Some(Value::from(ret as u64)))
+        }
+        FfiType::Struct(id) => {
+            let layouts: Vec<CStructLayout> = ctx.layouts().to_vec();
+            let layout = layouts
+                .get(id as usize)
+                .ok_or_else(|| FfiError::Unsupported(format!("unknown struct layout id {id}")))?
+                .clone();
+            let nbytes = struct_byte_size(&layout, &layouts)?;
+            // libffi may write at least a full register; pad the buffer.
+            let buf_len = nbytes.max(std::mem::size_of::<usize>());
+            let mut ret_buf = vec![0u8; buf_len];
+            unsafe {
+                libffi::raw::ffi_call(
+                    prepared.cif.as_raw_ptr(),
+                    Some(*prepared.addr.as_safe_fun()),
+                    ret_buf.as_mut_ptr() as *mut c_void,
+                    ffi_args.as_ptr() as *mut *mut c_void,
+                );
+            }
+            copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
+            let val = unpack_struct(ctx.heap(), &layout, &layouts, &ret_buf[..nbytes])?;
+            Ok(Some(val))
+        }
     }
 }
 

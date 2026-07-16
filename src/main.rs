@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::exit;
+use std::time::SystemTime;
 
 use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte};
 use compiler::Pipeline;
@@ -68,6 +70,7 @@ fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: impl Into<St
 }
 
 fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
+    // Multi-file entry: discovers `use` / `mod` via zero.toml.
     let (bytecode, constants) = match pipeline.compile_src_from_file(filename) {
         Ok(ok) => ok,
         Err(()) => {
@@ -100,12 +103,46 @@ fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
     }
 }
 
+fn archive_mtime(path: &str) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
+    match (archive_mtime(archive), archive_mtime(filename)) {
+        (Some(arch), Some(src)) => src > arch,
+        _ => false,
+    }
+}
+
+fn try_load_archive(path: &str) -> Result<(Vec<Byte>, Vec<u64>), LoadErr> {
+    let mut f = std::fs::File::open(path).map_err(|_| LoadErr::Missing)?;
+    let mut buffer = Vec::with_capacity(1024);
+    f.read_to_end(&mut buffer).map_err(|_| LoadErr::Corrupt)?;
+    let archived =
+        rkyv::access::<ArchivedArchivedProgram, Error>(&buffer).map_err(|_| LoadErr::Corrupt)?;
+    let version = u32::from(archived.version);
+    if version != ARCHIVE_VERSION {
+        return Err(LoadErr::Version(version));
+    }
+    let bytecode = rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode)
+        .map_err(|_| LoadErr::Corrupt)?;
+    let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
+        .map_err(|_| LoadErr::Corrupt)?;
+    Ok((bytecode, constants))
+}
+
+#[derive(Debug)]
+enum LoadErr {
+    Missing,
+    Corrupt,
+    Version(u32),
+}
+
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let cli = match parse_args(&raw_args) {
         Ok(c) => c,
         Err(msg) => {
-            // No pipeline yet — use a throwaway pretty sink for the flag error.
             let config = ReportConfig::default();
             let mut pipeline = Pipeline::with_reporter(config, Box::new(std::io::stderr()));
             let code = if msg.contains("mutually") || msg.contains("unrecognized") {
@@ -129,81 +166,46 @@ fn main() {
     let format = config.format;
     let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
 
-    let out_path = "out.c0s";
-    let needs_compile = match std::fs::exists(out_path) {
-        Ok(exists) => !exists,
-        Err(e) => fail_and_exit(
-            &mut pipeline,
-            ErrorCode::IoError,
-            format!("Unable to determine if `{out_path}` exists: {e}"),
-        ),
+    const OUT: &str = "out.c0s";
+
+    let cached = try_load_archive(OUT);
+    let recompile = match &cached {
+        Err(LoadErr::Missing) => true,
+        Err(LoadErr::Corrupt) => true,
+        Err(LoadErr::Version(v)) => {
+            // Stale archive: recompile rather than hard-fail (main #8 behavior).
+            eprintln!(
+                "Bytecode archive version {} does not match compiler version {}. Recompiling.",
+                v, ARCHIVE_VERSION
+            );
+            true
+        }
+        Ok(_) => source_newer_than_archive(&cli.filename, OUT),
     };
 
-    if needs_compile {
-        compile_to_archive(&mut pipeline, &cli.filename, out_path);
+    if recompile {
+        let _ = std::fs::remove_file(OUT);
+        compile_to_archive(&mut pipeline, &cli.filename, OUT);
     }
 
-    let mut f = match std::fs::File::open(out_path) {
-        Ok(f) => f,
-        Err(e) => fail_and_exit(
-            &mut pipeline,
-            ErrorCode::IoError,
-            format!("Unable to open `{out_path}`: {e}"),
-        ),
-    };
-
-    let mut buffer = Vec::with_capacity(1024);
-    if let Err(e) = f.read_to_end(&mut buffer) {
-        fail_and_exit(
-            &mut pipeline,
-            ErrorCode::IoError,
-            format!("Unable to read `{out_path}`: {e}"),
-        );
-    }
-
-    let archived = match rkyv::access::<ArchivedArchivedProgram, Error>(&buffer) {
-        Ok(a) => a,
-        Err(e) => fail_and_exit(
-            &mut pipeline,
-            ErrorCode::IoError,
-            format!("Unable to decode bytecode archive: {e}"),
-        ),
-    };
-
-    if archived.version != ARCHIVE_VERSION {
-        fail_and_exit(
-            &mut pipeline,
-            ErrorCode::ArchiveVersionMismatch,
-            format!(
-                "Bytecode archive version {} does not match compiler version {}. Please recompile from source.",
-                archived.version, ARCHIVE_VERSION
+    let (bytecode, constants) = if recompile {
+        match try_load_archive(OUT) {
+            Ok(ok) => ok,
+            Err(_) => fail_and_exit(
+                &mut pipeline,
+                ErrorCode::IoError,
+                "Unable to load freshly compiled archive",
             ),
-        );
-    }
-
-    let bytecode = match rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode) {
-        Ok(b) => b,
-        Err(e) => fail_and_exit(
-            &mut pipeline,
-            ErrorCode::IoError,
-            format!("Unable to deserialize bytecode: {e}"),
-        ),
-    };
-    let constants = match rkyv::deserialize::<Vec<u64>, Error>(&archived.constants) {
-        Ok(c) => c,
-        Err(e) => fail_and_exit(
-            &mut pipeline,
-            ErrorCode::IoError,
-            format!("Unable to deserialize constant pool: {e}"),
-        ),
+        }
+    } else {
+        cached.expect("archive checked above")
     };
 
-    // Successful compile/load: flush any buffered sink (no-op for pretty).
     if let Err(e) = pipeline.finish_reporting() {
         eprintln!("warning: failed to flush diagnostics: {e}");
     }
 
-    let entry = std::path::Path::new(&cli.filename);
+    let entry = Path::new(&cli.filename);
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, Some(entry));
     machine.run_raw(&bytecode, &constants);

@@ -16,6 +16,8 @@ zero-script uses **Hindley–Milner (Algorithm W)** type inference with optional
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
+Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print`.
+
 ---
 
 ## Type constructors (`Ty::Con`)
@@ -110,6 +112,16 @@ let xs = [1, 2, 3];        // [int; 3]
 fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 ```
 
+### Growing arrays
+
+Use `push(arr, value)` to append in place. The value must match the array's element type. The call returns the same array as a dynamic `[T]`, and `len(arr)` returns its current runtime length as `int`.
+
+```0s
+let xs = [1, 2];   // starts as [int; 2]
+push(xs, 3);       // xs is treated as dynamic [int] afterwards
+print "%i", len(xs);
+```
+
 ### Indexing
 
 | Target | Compile-time index | Runtime index |
@@ -149,8 +161,9 @@ fn id(UserId x) -> UserId { return x; }
 
 | Property | Behavior |
 |----------|----------|
-| Scope | Global per compilation unit (no block scoping yet) |
-| Shadowing | Later alias with same name overwrites |
+| Scope | Lexical: program, function, and block scopes |
+| Shadowing | Inner scopes may shadow outer aliases |
+| Duplicate names | Duplicate alias in the same scope is a diagnostic |
 | RHS | Any `type_annotation` form |
 
 ---
@@ -276,19 +289,16 @@ a stale value.
 
 | Area | Limitation |
 |------|------------|
-| Type aliases | No lexical scoping; duplicate names silently overwrite |
-| Records | `SetField` mutation is limited — prefer fresh `MakeDict` values for reliable semantics |
-| Classes | Nominal typing partial; limited runtime method dispatch |
-| FFI | Only `int`, `float`, `string`, `void` — see [FFI tutorial](../tutorial/07-ffi.md) |
+| Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer |
+| Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
+| FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | No user-defined generic types |
 | Higher-kinded types | Not supported |
 | Effect system | No linear/ownership types |
-| `invoke` typing | Result type not refined from `declare` signature |
+| Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
-| String `+` | Not in current tree — do not rely on string concatenation |
-| `async fn` `-> T` annotation | An explicit `-> T` on an `async fn` signature is not checked against anything — the coroutine's yield type `Y` is inferred purely from its `yield`/`return` sites, not from the annotation. Omit it or write it for documentation purposes only |
-| `const` | No `const` keyword in parser — use `let` |
+| `async fn` `-> T` annotation | When present, `T` is unified with the coroutine yield/return type `Y` (same slot as `yield` / `return` / `resume`). A mismatch is a type error. |
 
 ---
 

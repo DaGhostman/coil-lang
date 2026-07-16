@@ -28,27 +28,28 @@ See [Getting Started](getting-started.md) for prerequisites, project layout, and
 1. **Parse** — the Pratt parser reads `.0s` source into an AST.
 2. **Typecheck** — Algorithm W (Hindley–Milner) infers types and reports source-anchored diagnostics.
 3. **Codegen** — the compiler emits stack bytecode, then runs a peephole fusion pass.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **9**) and written to `out.c0s` on first run.
+4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **15**) and written to `out.c0s` on first run.
 5. **Execute** — the VM loads the archive and runs `main`.
 
-Re-run the same binary without deleting `out.c0s` to reuse the cached compile. Delete `out.c0s` (or bump the archive version) to force a fresh compile.
+Re-run the same binary without deleting `out.c0s` to reuse the cached compile. Delete `out.c0s` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source.
 
 ## Language at a glance
 
 | Area | Status |
 |------|--------|
 | Primitives | `int`, `float`, `string`, `bool` |
-| Functions, `let`, `if`/`else`, `while` | Supported |
+| Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
+| `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
-| Tuples, arrays, dicts (anonymous records) | Supported |
-| Type aliases (`type Name = T;`) | Supported |
-| Modules / namespaces (`use`, `mod`) | Supported (multi-file projects) |
+| Tuples, arrays (`push` / `len`), dicts (anonymous records) | Supported |
+| Type aliases (`type Name = T;`, lexically scoped) | Supported |
+| Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
-| FFI (`extern` blocks, `dload`/`declare`/`invoke`) | Supported (requires libffi) |
-| Classes | Partial (declaration / `new`; limited runtime) |
-| Coroutines (`async`, `yield`, `resume`, `yield from`) | Supported |
-| String concat via `+` | **Not implemented** |
-| `format` as a user keyword | **Not implemented** (use `print "%i", x` style) |
+| FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
+| Classes (`class` / `impl` / `new`, fields, methods) | Supported |
+| Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
+| String concat via `+` | Supported (`string + string` → `string`) |
+| `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
 Browse runnable demos in [Examples](examples.md).
 
@@ -69,7 +70,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
 | [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from` |
 
-Classes (`class`, `impl`, `new`) are partially supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
+Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
 
 Start here: [Getting Started](getting-started.md)
 

@@ -63,6 +63,8 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Identifier(_)
         | Expression::Type(_)
         | Expression::Default(_)
+        | Expression::Break
+        | Expression::Continue
         | Expression::Use { .. }
         | Expression::Module(_, _)
         | Expression::Variable(_, _)
@@ -146,6 +148,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             }
         }
         Expression::Dload(path) => pre_walk(path, table),
+        Expression::Done(handle) => pre_walk(handle, table),
         Expression::Tuple(items) => {
             for c in items {
                 pre_walk(c, table);
@@ -211,6 +214,22 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             pre_walk(body, table);
             if let Some(i) = identifier {
                 pre_walk(i, table);
+            }
+        }
+
+        Expression::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            if let Some(init) = init {
+                pre_walk(init, table);
+            }
+            pre_walk(cond, table);
+            pre_walk(body, table);
+            if let Some(step) = step {
+                pre_walk(step, table);
             }
         }
 

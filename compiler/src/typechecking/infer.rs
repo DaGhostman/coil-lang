@@ -3,7 +3,7 @@
 //! [`Checker`] owns the substitution, accumulates diagnostics with error
 //! recovery, and caches inferred types keyed by pre-walk [`NodeId`]s.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use reporting::{ErrorCode, Label, Message};
@@ -14,7 +14,9 @@ use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::Scheme;
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
-use super::ty::{EnumVariantPayloadTy, Ty, boolean, float, int, list, string, unit as unit_ty};
+use super::ty::{
+    EnumVariantPayloadTy, STRING, Ty, boolean, float, int, list, string, unit as unit_ty,
+};
 use super::unify::{UnifyError, unify_with};
 
 #[cfg(test)]
@@ -59,7 +61,15 @@ pub struct Checker {
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
     /// `type Name = T` aliases (substituted at typecheck time).
-    type_aliases: std::collections::HashMap<String, Ty>,
+    ///
+    /// Mirrors lexical scopes: lookup walks from the innermost frame
+    /// outward, and duplicate declarations are rejected only within
+    /// the current frame.
+    type_aliases: Vec<HashMap<String, Ty>>,
+
+    /// Names declared with `const`, tracked per lexical scope so assignment
+    /// diagnostics can distinguish immutable bindings from mutable `let`s.
+    const_scopes: Vec<HashSet<String>>,
 
     // Enum registry: Vec preserves source-declaration order for tags;
     // BTreeMap indexes variant name → tag.
@@ -91,6 +101,10 @@ pub struct Checker {
 
     /// Callback signature descriptors (index = aux id on `FFIType::Callback`).
     callback_sigs: Vec<CallbackSigDef>,
+
+    /// Return type recorded for `let id = declare(..., ret)` bindings so
+    /// subsequent `invoke(..., id, ...)` can refine its result type.
+    ffi_fn_ret_tys: HashMap<String, Ty>,
 }
 
 /// C-layout struct registered via `extern struct Name { ... }`.
@@ -189,7 +203,8 @@ impl Checker {
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
-            type_aliases: std::collections::HashMap::new(),
+            type_aliases: vec![HashMap::new()],
+            const_scopes: vec![HashSet::new()],
             enums: BTreeMap::new(),
             enum_tags: BTreeMap::new(),
             enum_payloads: BTreeMap::new(),
@@ -202,6 +217,7 @@ impl Checker {
             yield_receives_used: false,
             c_structs: Vec::new(),
             callback_sigs: Vec::new(),
+            ffi_fn_ret_tys: HashMap::new(),
         };
         checker.register_builtin_ffi_type();
         checker
@@ -244,12 +260,16 @@ impl Checker {
         self.cache.clear();
         self.codegen_var_types.clear();
         self.type_aliases.clear();
+        self.type_aliases.push(HashMap::new());
+        self.const_scopes.clear();
+        self.const_scopes.push(HashSet::new());
         self.enums.clear();
         self.enum_tags.clear();
         self.enum_payloads.clear();
         self.enum_arities.clear();
         self.c_structs.clear();
         self.callback_sigs.clear();
+        self.ffi_fn_ret_tys.clear();
         self.pending_exhaustive.clear();
         self.async_functions.clear();
         self.async_depth = 0;
@@ -274,7 +294,7 @@ impl Checker {
         }
 
         // Top frame for natives/globals; left on stack after check_program.
-        self.env.push();
+        self.push_scope();
         let ty = self.infer(ast);
         // NOTE: the frame is intentionally NOT popped — see the
         // doc-comment above.
@@ -318,6 +338,65 @@ impl Checker {
     #[allow(dead_code)]
     pub(crate) fn cache(&self) -> impl Iterator<Item = (NodeId, &Ty)> {
         self.cache.iter().map(|(k, v)| (*k, v))
+    }
+
+    fn push_scope(&mut self) {
+        self.env.push();
+        self.const_scopes.push(HashSet::new());
+        self.type_aliases.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        let _ = self.env.pop();
+        let _ = self.const_scopes.pop();
+        if self.type_aliases.len() > 1 {
+            let _ = self.type_aliases.pop();
+        } else if let Some(frame) = self.type_aliases.last_mut() {
+            frame.clear();
+        } else {
+            self.type_aliases.push(HashMap::new());
+        }
+    }
+
+    fn register_type_alias(&mut self, name: &str, alias_ty: Ty, range: Range<usize>) {
+        if self.type_aliases.is_empty() {
+            self.type_aliases.push(HashMap::new());
+        }
+
+        let duplicate = self
+            .type_aliases
+            .last()
+            .map(|frame| frame.contains_key(name))
+            .unwrap_or(false);
+
+        if duplicate {
+            let mut msg = Message::error(ErrorCode::GenericTypeError, format!("Duplicate type alias `{}`", name), range);
+            msg.with_help("type aliases may shadow names only from an outer scope".to_string());
+            self.messages.push(msg);
+            return;
+        }
+
+        self.type_aliases
+            .last_mut()
+            .expect("type alias scope should exist")
+            .insert(name.to_string(), alias_ty);
+    }
+
+    fn insert_const_binding(&mut self, name: impl Into<String>) {
+        if self.const_scopes.is_empty() {
+            self.const_scopes.push(HashSet::new());
+        }
+        self.const_scopes
+            .last_mut()
+            .expect("const scope should exist")
+            .insert(name.into());
+    }
+
+    fn is_const_binding(&self, name: &str) -> bool {
+        self.const_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 
     fn coroutine_type(&self, yield_ty: Ty, send_ty: Ty) -> Ty {
@@ -369,7 +448,10 @@ impl Checker {
             Expression::Type(name) => self.parse_type_name_str(name),
 
             // ---- Wrappers / no-ops ----
-            Expression::Noop(_) | Expression::Comment(_) => unit_ty(),
+            Expression::Noop(_)
+            | Expression::Comment(_)
+            | Expression::Break
+            | Expression::Continue => unit_ty(),
             // `use` — bind alias with a fresh type variable
             Expression::Use {
                 path: _,
@@ -436,12 +518,12 @@ impl Checker {
             // bindings visible after inference. Block introduces its
             // own scope.
             Expression::Block(children) => {
-                self.env.push();
+                self.push_scope();
                 let mut last_ty = unit_ty();
                 for child in children {
                     last_ty = self.infer(child);
                 }
-                self.env.pop();
+                self.pop_scope();
                 last_ty
             }
             Expression::Program(children) => {
@@ -480,7 +562,8 @@ impl Checker {
                         );
                     }
                 };
-                self.env.insert_top(ident, Scheme::mono(var_ty));
+                self.env.insert_top(ident.clone(), Scheme::mono(var_ty));
+                self.insert_const_binding(ident);
                 unit_ty()
             }
 
@@ -500,26 +583,27 @@ impl Checker {
                     let _ = unify_with(&self.subst, &target_ty, &int());
                     let _ = unify_with(&self.subst, &val_ty, &int());
                 } else {
-                    self.unify(&target_ty, &val_ty, &range, &format!("operands of `{}=`", op_name));
+                    self.unify(
+                        &target_ty,
+                        &val_ty,
+                        &range,
+                        &format!("operands of `{}=`", op_name),
+                    );
                 }
                 apply_ty_prune(&self.subst, &target_ty)
             }
 
             Expression::Assignment(name, value) => {
                 // `x = resume x` overwrites the coroutine handle with the yield value.
-                if let (
-                    Expression::Identifier(var_name),
-                    Expression::Resume(target, None),
-                ) = (name.1.as_ref(), value.1.as_ref())
+                if let (Expression::Identifier(var_name), Expression::Resume(target, None)) =
+                    (name.1.as_ref(), value.1.as_ref())
                 {
                     if let Expression::Identifier(target_name) = target.1.as_ref() {
                         if var_name == target_name {
                             let val_ty = self.infer(value);
                             if self.env.lookup(var_name).is_some() {
-                                self.env.insert_top(
-                                    var_name.to_string(),
-                                    Scheme::mono(val_ty.clone()),
-                                );
+                                self.env
+                                    .insert_top(var_name.to_string(), Scheme::mono(val_ty.clone()));
                                 self.codegen_var_types
                                     .insert(var_name.to_string(), val_ty.clone());
                             }
@@ -603,16 +687,68 @@ impl Checker {
                     let _ = self.error_with_help(
                         ErrorCode::GenericTypeError, "Increment/decrement requires a numeric lvalue".to_string(),
                         range,
-                        Some("only `int` and `float` variables, fields, and indices support ++/--".to_string()),
+                        Some(
+                            "only `int` and `float` variables, fields, and indices support ++/--"
+                                .to_string(),
+                        ),
                     );
                 }
                 pruned
             }
             Expression::Call { name, args } => {
+                // Method call: `recv.method(args)` — Access callee.
+                if let Expression::Access(recv, method) = name.1.as_ref() {
+                    let recv_ty = self.infer(recv);
+                    let resolved = apply_ty_prune(&self.subst, &recv_ty);
+                    let owner = match &resolved {
+                        Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
+                        _ => {
+                            return self.error_with_help(ErrorCode::NotAFunction, format!("Cannot call method `{}` on non-class type", method),
+                                range,
+                                Some("method calls require a class instance receiver".to_string()),
+                            );
+                        }
+                    };
+                    let scheme = match self
+                        .methods
+                        .get(&owner)
+                        .and_then(|m| m.get(*method))
+                        .map(|(_, s)| s.clone())
+                    {
+                        Some(s) => s,
+                        None => {
+                            return self.error(ErrorCode::UnknownFunction, format!("Cannot find method `{}` on class `{}`", method, owner),
+                                range,
+                            );
+                        }
+                    };
+                    let fun_ty = instantiate(&scheme, &mut self.counter);
+                    let mut arg_tys = vec![recv_ty];
+                    if let Some(a) = args {
+                        for arg in a {
+                            arg_tys.push(self.infer(arg));
+                        }
+                    }
+                    return self.apply_function(
+                        Some(&format!("{}::{}", owner, method)),
+                        &fun_ty,
+                        &arg_tys,
+                        range,
+                    );
+                }
+
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
                     _ => return self.error(ErrorCode::UnknownFunction, "Invalid call target".to_string(), range),
                 };
+
+                if ident == "push" {
+                    return self.infer_array_push(args.as_deref(), range);
+                }
+                if ident == "len" {
+                    return self.infer_array_len(args.as_deref(), range);
+                }
+
                 let scheme = self.env.lookup(&ident).cloned();
                 let fun_ty = match scheme {
                     Some(s) => instantiate(&s, &mut self.counter),
@@ -643,6 +779,23 @@ impl Checker {
                 let _ = self.infer(body);
                 unit_ty()
             }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    let _ = self.infer(init);
+                }
+                let cond_ty = self.infer(cond);
+                self.unify(&cond_ty, &boolean(), &cond.0.into_range(), "for condition");
+                let _ = self.infer(body);
+                if let Some(step) = step {
+                    let _ = self.infer(step);
+                }
+                unit_ty()
+            }
 
             // ---- Return ----
             Expression::Return(e) | Expression::ImplicitReturn(e) => {
@@ -660,7 +813,7 @@ impl Checker {
             }
             Expression::Format(fmt, params) => {
                 self.infer_print(fmt, params, range, "format");
-                unit_ty()
+                string()
             }
 
             // ---- Userland FFI builtins ----
@@ -674,6 +827,15 @@ impl Checker {
             Expression::Dload(path) => {
                 let _ = self.infer(path);
                 int()
+            }
+            // `done(h)` — true when coroutine handle `h` is Done.
+            Expression::Done(handle) => {
+                let handle_ty = self.infer(handle);
+                let y_var = Ty::Var(self.counter.fresh());
+                let s_var = Ty::Var(self.counter.fresh());
+                let coro_ty = self.coroutine_type(y_var, s_var);
+                self.unify(&handle_ty, &coro_ty, &range, "done argument");
+                boolean()
             }
             // Tuple literal
             Expression::Tuple(items) => {
@@ -827,11 +989,11 @@ impl Checker {
                     self.infer(&args[0]);
                     self.infer(&args[1]);
                     match args[2].1.as_ref() {
-                        Expression::Tuple(items) => {
-                            for item in items {
-                                self.infer(item);
-                                self.require_ffi_type_expr(item);
-                            }
+                        Expression::Tuple(_) => {
+                            // Consume the Tuple node + each element as
+                            // FFI type tags (not values). Bare names like
+                            // `Point` / `int32` are type tags here.
+                            self.infer_ffi_type_expr(&args[2]);
                         }
                         _ => {
                             let mut m = Message::error(
@@ -847,8 +1009,7 @@ impl Checker {
                             self.messages.push(m);
                         }
                     }
-                    self.infer(&args[3]);
-                    self.require_ffi_type_expr(&args[3]);
+                    self.infer_ffi_type_expr(&args[3]);
                 } else {
                     for arg in args {
                         self.infer(arg);
@@ -867,14 +1028,19 @@ impl Checker {
                 int()
             }
             // `invoke(lib, fn_id, (v1, v2, ...))` — calls a
-            // previously-declared function and pushes its
-            // return value (or nothing for `void`). Returns
-            // `int` (the codegen doesn't narrow further — the
-            // user knows what they registered).
+            // previously-declared function. Result type is refined
+            // from `let id = declare(..., ret)` when `fn_id` is that
+            // binding; otherwise falls back to `int`.
             Expression::Invoke(args) => {
+                let mut ret_ty = int();
                 if args.len() == 3 {
                     self.infer(&args[0]);
                     self.infer(&args[1]);
+                    if let Expression::Identifier(name) = args[1].1.as_ref() {
+                        if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
+                            ret_ty = ty.clone();
+                        }
+                    }
                     match args[2].1.as_ref() {
                         Expression::Tuple(items) => {
                             for item in items {
@@ -908,7 +1074,7 @@ impl Checker {
                     ));
                     self.messages.push(m);
                 }
-                int()
+                ret_ty
             }
 
             // ---- Defer / coroutines / list ----
@@ -945,12 +1111,7 @@ impl Checker {
                 let inner_ty = self.infer(e);
                 let (y_var, s_var) = (Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh()));
                 let expected = self.coroutine_type(y_var.clone(), s_var.clone());
-                self.unify(
-                    &inner_ty,
-                    &expected,
-                    &range,
-                    "yield from target",
-                );
+                self.unify(&inner_ty, &expected, &range, "yield from target");
                 if let Some(yield_ty) = self.current_yield_ty.clone() {
                     self.unify(&yield_ty, &y_var, &range, "yield from yield type");
                 }
@@ -987,15 +1148,7 @@ impl Checker {
                 returns,
                 body,
             } => {
-                self.infer_function(
-                    name,
-                    args,
-                    returns.as_ref(),
-                    body,
-                    &range,
-                    None,
-                    *is_coro,
-                );
+                self.infer_function(name, args, returns.as_ref(), body, &range, None, *is_coro);
                 unit_ty()
             }
             Expression::Implementation(_, owner, methods) => {
@@ -1033,6 +1186,20 @@ impl Checker {
                         }
                     }
                     Ty::Con(name) => {
+                        // Class instance field access.
+                        if let Some(fields) = self.classes.get(name) {
+                            if let Some((_, _, fty)) =
+                                fields.iter().find(|(_, fname, _)| fname == field)
+                            {
+                                return fty.clone();
+                            }
+                            let known: Vec<&str> =
+                                fields.iter().map(|(_, n, _)| n.as_str()).collect();
+                            return self.error_with_help(ErrorCode::UnknownField, format!("Cannot find field `{}` on class `{}`", field, name),
+                                range,
+                                Some(format!("the class has fields: {}", known.join(", "))),
+                            );
+                        }
                         // Bare type name — resolve via the
                         // checker's enum registry.
                         let variant_names = self.enums.get(name).cloned().unwrap_or_default();
@@ -1076,7 +1243,39 @@ impl Checker {
                     ),
                 }
             }
-            Expression::Instantiate(class_expr, _args) => self.infer(class_expr),
+            Expression::Instantiate(class_expr, args) => {
+                let class_ty = self.infer(class_expr);
+                let resolved = apply_ty_prune(&self.subst, &class_ty);
+                let class_name = match &resolved {
+                    Ty::Con(n) => n.clone(),
+                    _ => {
+                        return self.error(ErrorCode::NotAFunction, "Cannot instantiate non-class type".to_string(), range);
+                    }
+                };
+                if let Some(fields) = self.classes.get(&class_name).cloned() {
+                    let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
+                    if provided.len() != fields.len() {
+                        let _ = self.error_with_help(ErrorCode::ConstructorArity, format!(
+                                "Constructor `{}` expects {} arguments, got {}",
+                                class_name,
+                                fields.len(),
+                                provided.len()
+                            ),
+                            range,
+                            Some(
+                                "pass one argument per class field, in declaration order"
+                                    .to_string(),
+                            ),
+                        );
+                    } else {
+                        for (arg, (_, _, fty)) in provided.iter().zip(fields.iter()) {
+                            let aty = self.infer(arg);
+                            self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
+                        }
+                    }
+                }
+                Ty::Con(class_name)
+            }
             Expression::Field(_, _, _) => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
@@ -1086,7 +1285,7 @@ impl Checker {
             }
             Expression::TypeAlias { name, ty } => {
                 let alias_ty = self.parse_type_name(ty);
-                self.type_aliases.insert(name.to_string(), alias_ty.clone());
+                self.register_type_alias(name, alias_ty, range);
                 let _ = self.infer(ty); // ID alignment
                 unit_ty()
             }
@@ -1220,6 +1419,20 @@ impl Checker {
                             }
                             let val_ty = self.infer(next);
                             self.unify(&var_ty, &val_ty, &child.0.into_range(), "let binding");
+                            // Keep the side-table in sync with the unified type
+                            // so Access codegen sees Record/enum types, not the
+                            // pre-unify fresh variable.
+                            let pruned = apply_ty_prune(&self.subst, &var_ty);
+                            self.codegen_var_types.insert(name.to_string(), pruned);
+                            // `let id = declare(...)` may wrap Declare in
+                            // ExprStatement/Statement — unwrap before matching.
+                            let init = unwrap_expr_wrappers(next);
+                            if let Expression::Declare(dargs) = init.1.as_ref() {
+                                if dargs.len() == 4 {
+                                    let ret = self.ty_from_ffi_type_expr(&dargs[3]);
+                                    self.ffi_fn_ret_tys.insert(name.to_string(), ret);
+                                }
+                            }
                             i += 1;
                         }
                     }
@@ -1232,7 +1445,23 @@ impl Checker {
                     if let Expression::Identifier(n) = name.1.as_ref() {
                         self.env
                             .insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
-                        self.codegen_var_types.insert(n.to_string(), var_ty);
+                        self.codegen_var_types.insert(n.to_string(), var_ty.clone());
+                        self.insert_const_binding(n.to_string());
+                        if i + 1 < children.len() {
+                            let next = &children[i + 1];
+                            if !is_declaration_like(next) {
+                                let val_ty = self.infer(next);
+                                self.unify(
+                                    &var_ty,
+                                    &val_ty,
+                                    &child.0.into_range(),
+                                    "const binding",
+                                );
+                                let pruned = apply_ty_prune(&self.subst, &var_ty);
+                                self.codegen_var_types.insert(n.to_string(), pruned);
+                                i += 1;
+                            }
+                        }
                     }
                     last_ty = unit_ty();
                 }
@@ -1248,6 +1477,18 @@ impl Checker {
     fn infer_arith(&mut self, lhs: &Output, rhs: &Output, range: Range<usize>, op: &str) -> Ty {
         let lt = self.infer(lhs);
         let rt = self.infer(rhs);
+        if op == "+" {
+            let lp = apply_ty_prune(&self.subst, &lt);
+            let rp = apply_ty_prune(&self.subst, &rt);
+            let left_string = is_string_ty(&lp);
+            let right_string = is_string_ty(&rp);
+            if left_string && right_string {
+                return string();
+            }
+            if left_string || right_string {
+                return self.unify(&lt, &rt, &range, "operands of `+`");
+            }
+        }
         self.unify(&lt, &rt, &range, &format!("operands of `{}`", op))
     }
 
@@ -1273,7 +1514,19 @@ impl Checker {
             Expression::Identifier(n) => {
                 let ident = n.to_string();
                 match self.env.lookup(&ident).cloned() {
-                    Some(s) => instantiate(&s, &mut self.counter),
+                    Some(s) => {
+                        let ty = instantiate(&s, &mut self.counter);
+                        if self.is_const_binding(&ident) {
+                            let mut msg = Message::error(ErrorCode::FormatSpecifierMismatch, format!("Cannot assign to constant `{}`", ident),
+                                range,
+                            );
+                            msg.with_help(
+                                "constants are immutable after their initializer".to_string(),
+                            );
+                            self.messages.push(msg);
+                        }
+                        ty
+                    }
                     None => self.error_with_help(
                         ErrorCode::UndeclaredAssignment, format!("Cannot assign to undeclared variable `{}`", ident),
                         range,
@@ -1297,11 +1550,25 @@ impl Checker {
                             )
                         }
                     },
+                    Ty::Con(name) if self.classes.contains_key(name) => {
+                        let fields = self.classes.get(name).unwrap();
+                        match fields.iter().find(|(_, fname, _)| fname == field) {
+                            Some((_, _, fty)) => fty.clone(),
+                            None => {
+                                let known: Vec<&str> =
+                                    fields.iter().map(|(_, n, _)| n.as_str()).collect();
+                                self.error_with_help(ErrorCode::UnknownField, format!("Cannot find field `{}` on class `{}`", field, name),
+                                    range,
+                                    Some(format!("the class has fields: {}", known.join(", "))),
+                                )
+                            }
+                        }
+                    }
                     _ => self.error_with_help(
                         ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
                         range,
                         Some(
-                            "only variables, dict fields, and array elements may be assigned"
+                            "only variables, dict fields, class fields, and array elements may be assigned"
                                 .to_string(),
                         ),
                     ),
@@ -1383,6 +1650,93 @@ impl Checker {
             self.unify(&first_ty, &t, &elem.0.into_range(), "list element");
         }
         list(first_ty)
+    }
+
+    fn infer_array_push(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
+        let args = args.unwrap_or(&[]);
+        if args.len() != 2 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(ErrorCode::ConstructorArity, format!("push expects 2 arguments, got {}", args.len()),
+                range,
+                Some("use `push(array, value)`".to_string()),
+            );
+        }
+
+        let array_ty = self.infer(&args[0]);
+        let value_ty = self.infer(&args[1]);
+        let resolved = apply_ty_prune(&self.subst, &array_ty);
+        match resolved {
+            Ty::Array { element, .. } => {
+                self.unify(
+                    element.as_ref(),
+                    &value_ty,
+                    &args[1].0.into_range(),
+                    "push element",
+                );
+                let elem = apply_ty_prune(&self.subst, element.as_ref());
+                let dynamic = array(elem);
+                if let Expression::Identifier(name) = args[0].1.as_ref() {
+                    self.env
+                        .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
+                    self.codegen_var_types
+                        .insert((*name).to_string(), dynamic.clone());
+                }
+                dynamic
+            }
+            Ty::Var(v) => {
+                let elem = Ty::Var(self.counter.fresh());
+                let dynamic = array(elem.clone());
+                self.unify(&Ty::Var(v), &dynamic, &args[0].0.into_range(), "push array");
+                self.unify(&elem, &value_ty, &args[1].0.into_range(), "push element");
+                let dynamic = apply_ty_prune(&self.subst, &dynamic);
+                if let Expression::Identifier(name) = args[0].1.as_ref() {
+                    self.env
+                        .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
+                    self.codegen_var_types
+                        .insert((*name).to_string(), dynamic.clone());
+                }
+                dynamic
+            }
+            other => self.error_with_help(ErrorCode::ConstructorArity, "push expects an array as its first argument".to_string(),
+                args[0].0.into_range(),
+                Some(format!("found `{}`; use `push(array, value)`", other)),
+            ),
+        }
+    }
+
+    fn infer_array_len(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
+        let args = args.unwrap_or(&[]);
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(ErrorCode::ConstructorArity, format!("len expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `len(array)`".to_string()),
+            );
+        }
+
+        let target_ty = self.infer(&args[0]);
+        let resolved = apply_ty_prune(&self.subst, &target_ty);
+        match resolved {
+            Ty::Array { .. } => int(),
+            Ty::Var(v) => {
+                let elem = Ty::Var(self.counter.fresh());
+                self.unify(
+                    &Ty::Var(v),
+                    &array(elem),
+                    &args[0].0.into_range(),
+                    "len array",
+                );
+                int()
+            }
+            other => self.error_with_help(ErrorCode::ConstructorArity, "len expects an array".to_string(),
+                args[0].0.into_range(),
+                Some(format!("found `{}`; use `len(array)`", other)),
+            ),
+        }
     }
 
     /// Thread a curried function type through a list of argument types,
@@ -1560,8 +1914,10 @@ impl Checker {
     }
 
     fn parse_type_name_str(&self, name: &str) -> Ty {
-        if let Some(alias_ty) = self.type_aliases.get(name) {
-            return alias_ty.clone();
+        for frame in self.type_aliases.iter().rev() {
+            if let Some(alias_ty) = frame.get(name) {
+                return alias_ty.clone();
+            }
         }
         // Built-in type names are matched case-insensitively so the
         // user can write `String`, `STRING`, etc.
@@ -1659,6 +2015,88 @@ impl Checker {
         self.messages.push(m);
     }
 
+    /// Infer an FFI type-tag expression (declare arg/ret positions).
+    ///
+    /// Consumes NodeIds in pre-walk order without treating bare names
+    /// like `Point` / `int32` as value lookups. Nested Tuple / Array /
+    /// Construct children are walked the same way (or via normal
+    /// `infer` for `FFIType::X` constructors, which are real enum
+    /// constructs).
+    fn infer_ffi_type_expr(&mut self, expr: &Output) {
+        self.require_ffi_type_expr(expr);
+        match expr.1.as_ref() {
+            Expression::Identifier(_) | Expression::Type(_) => {
+                let id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                let ty = self.ty_from_ffi_type_expr(expr);
+                self.cache.insert(id, ty);
+            }
+            Expression::Tuple(items) => {
+                let id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                self.cache.insert(id, unit_ty());
+                for item in items {
+                    self.infer_ffi_type_expr(item);
+                }
+            }
+            Expression::Array(items) => {
+                let id = self.ids.ids()[self.next_id_idx];
+                self.next_id_idx += 1;
+                self.cache.insert(id, unit_ty());
+                for item in items {
+                    // Element annotations are `Type` / nested forms.
+                    self.infer_ffi_type_expr(item);
+                }
+            }
+            // `FFIType::Int`, etc. — real Construct nodes; use normal infer
+            // so enum constructor typing + child IDs stay aligned.
+            _ => {
+                let _ = self.infer(expr);
+            }
+        }
+    }
+
+    /// Map an FFI type tag expression to the language `Ty` used for
+    /// `invoke` result typing (void → unit, structs → structural record).
+    fn ty_from_ffi_type_expr(&self, expr: &Output) -> Ty {
+        use common::tag;
+        match self.ffi_type_tag_from_output(expr) {
+            Some((t, _)) if t == tag::VOID => unit_ty(),
+            Some((t, _)) if t == tag::FLOAT => float(),
+            Some((t, _)) if t == tag::STRING => string(),
+            Some((t, _)) if t == tag::BOOL => boolean(),
+            Some((t, id)) if t == tag::STRUCT => {
+                if let Some(def) = self.c_structs.get(id as usize) {
+                    let fields = def
+                        .fields
+                        .iter()
+                        .map(|(name, enc)| {
+                            let tag = if *enc <= tag::STRUCT {
+                                *enc
+                            } else {
+                                *enc & 0xFFFF
+                            };
+                            let fty = match tag {
+                                t if t == tag::FLOAT => float(),
+                                t if t == tag::STRING => string(),
+                                t if t == tag::BOOL => boolean(),
+                                t if t == tag::VOID => unit_ty(),
+                                // int / int32 / ptr / … — treat as int at the
+                                // language level (narrow C widths are ABI-only).
+                                _ => int(),
+                            };
+                            (name.clone(), fty)
+                        })
+                        .collect();
+                    crate::typechecking::ty::record(fields)
+                } else {
+                    int()
+                }
+            }
+            _ => int(),
+        }
+    }
+
     // ============================================================
 
     /// Register a class: store its name and the (visibility, name,
@@ -1712,7 +2150,7 @@ impl Checker {
                 .insert_top(owner.to_string(), Scheme::mono(owner_ty.clone()));
         }
 
-        self.env.push();
+        self.push_scope();
         self.env
             .insert_top("self".to_string(), Scheme::mono(owner_ty.clone()));
 
@@ -1748,7 +2186,7 @@ impl Checker {
             }
         }
 
-        self.env.pop();
+        self.pop_scope();
         let _ = range;
     }
 
@@ -1770,6 +2208,17 @@ impl Checker {
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
             let send_ty = Ty::Var(self.counter.fresh());
+            // Honor `async fn -> T`: unify declared T with the yield/
+            // return slot so annotation mismatches are diagnosed.
+            if let Some(r) = returns {
+                let declared = self.parse_type_name(r);
+                self.unify(
+                    &yield_ty,
+                    &declared,
+                    &r.0.into_range(),
+                    "async fn return type",
+                );
+            }
             let coro = self.coroutine_type(yield_ty.clone(), send_ty.clone());
             (coro, Some(yield_ty), Some(send_ty))
         } else {
@@ -1829,7 +2278,12 @@ impl Checker {
         self.env
             .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
 
-        self.env.push();
+        self.push_scope();
+        if let Some(self_ty) = self_ty {
+            // Method receiver — side-table for codegen Access/Call.
+            self.codegen_var_types
+                .insert("self".to_string(), self_ty.clone());
+        }
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
@@ -1837,7 +2291,7 @@ impl Checker {
                 .insert(arg_name.clone(), arg_ty.clone());
         }
         let _ = self.infer(body);
-        self.env.pop();
+        self.pop_scope();
 
         if is_coro {
             self.async_depth = prev_async;
@@ -1847,12 +2301,7 @@ impl Checker {
                 let resolved_yield = apply_ty_prune(&self.subst, &yield_ty);
                 let mut resolved_send = apply_ty_prune(&self.subst, &send_ty);
                 if !self.yield_receives_used {
-                    self.unify(
-                        &resolved_send,
-                        &unit_ty(),
-                        range,
-                        "coroutine send type",
-                    );
+                    self.unify(&resolved_send, &unit_ty(), range, "coroutine send type");
                     resolved_send = unit_ty();
                 }
                 fun_ty = {
@@ -2037,6 +2486,8 @@ impl Checker {
             | Expression::Identifier(_)
             | Expression::Type(_)
             | Expression::Default(_)
+            | Expression::Break
+            | Expression::Continue
             | Expression::Use { .. }
             | Expression::Module(_, _)
             | Expression::Variable(_, _)
@@ -2124,6 +2575,7 @@ impl Checker {
                 }
             }
             Expression::Dload(path) => self.pre_register_enums_walk(path, errors),
+            Expression::Done(handle) => self.pre_register_enums_walk(handle, errors),
             Expression::Tuple(items) => {
                 for c in items {
                     self.pre_register_enums_walk(c, errors);
@@ -2189,6 +2641,22 @@ impl Checker {
                 self.pre_register_enums_walk(body, errors);
                 if let Some(i) = identifier {
                     self.pre_register_enums_walk(i, errors);
+                }
+            }
+
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    self.pre_register_enums_walk(init, errors);
+                }
+                self.pre_register_enums_walk(cond, errors);
+                self.pre_register_enums_walk(body, errors);
+                if let Some(step) = step {
+                    self.pre_register_enums_walk(step, errors);
                 }
             }
 
@@ -2593,7 +3061,7 @@ impl Checker {
         for arm in arms {
             // Step 1: each arm gets a fresh env frame so the
             // pattern's bindings don't leak.
-            self.env.push();
+            self.push_scope();
 
             // Step 2: type the pattern, binding variables. The
             // pattern AST doesn't carry its own range today, so we
@@ -2631,7 +3099,7 @@ impl Checker {
             }
 
             // Step 6: pop the per-arm env frame.
-            self.env.pop();
+            self.pop_scope();
         }
 
         self.current_match_lhs = prev;
@@ -3232,6 +3700,37 @@ impl Checker {
         self.codegen_var_types.get(name)
     }
 
+    /// True if `name` is a registered class.
+    pub fn is_class(&self, name: &str) -> bool {
+        self.classes.contains_key(name)
+    }
+
+    /// Declared type of a class field (codegen / Access).
+    pub fn class_field_ty(&self, class: &str, field: &str) -> Option<&Ty> {
+        self.classes
+            .get(class)?
+            .iter()
+            .find(|(_, fname, _)| fname == field)
+            .map(|(_, _, ty)| ty)
+    }
+
+    /// Class fields in declaration order: `(name, Ty)`.
+    pub fn class_fields(&self, class: &str) -> Option<Vec<(String, Ty)>> {
+        self.classes.get(class).map(|fields| {
+            fields
+                .iter()
+                .map(|(_, name, ty)| (name.clone(), ty.clone()))
+                .collect()
+        })
+    }
+
+    /// Method FQN lookup helper — returns whether the method exists.
+    pub fn has_method(&self, owner: &str, method: &str) -> bool {
+        self.methods
+            .get(owner)
+            .is_some_and(|m| m.contains_key(method))
+    }
+
     /// True if `name` was declared as `async fn`.
     pub fn is_async_function(&self, name: &str) -> bool {
         self.async_functions.contains(name)
@@ -3402,6 +3901,10 @@ fn format_specifier_type(spec: char) -> &'static str {
     }
 }
 
+fn is_string_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Con(name) if name == STRING)
+}
+
 /// True if `ty` (already resolved under the substitution) is the
 /// type expected by `spec`.
 fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
@@ -3433,15 +3936,29 @@ fn is_yield_expression(node: &Output) -> bool {
     }
 }
 
+/// Peel `Expr` / `Group` / `Statement` / `ExprStatement` wrappers so
+/// fragment initializers can match the underlying `Declare` / `Invoke`.
+fn unwrap_expr_wrappers<'a>(node: &'a Output<'a>) -> &'a Output<'a> {
+    match node.1.as_ref() {
+        Expression::Expr(e)
+        | Expression::Group(e)
+        | Expression::Statement(e)
+        | Expression::ExprStatement(e) => unwrap_expr_wrappers(e),
+        _ => node,
+    }
+}
+
 /// True for nodes that look like declarations / no-ops rather than
 /// initializers. Used by [`Checker::infer_fragment`] to decide whether
 /// to consume the next sibling as a `let` initializer.
 fn is_declaration_like(node: &Output) -> bool {
+    let node = unwrap_expr_wrappers(node);
     matches!(
         node.1.as_ref(),
         Expression::Variable(..)
             | Expression::Constant(..)
             | Expression::Assignment(..)
+            | Expression::TypeAlias { .. }
             | Expression::Comment(..)
             | Expression::Use { .. }
             | Expression::Noop(..)
@@ -4049,7 +4566,8 @@ mod tests {
 
     #[test]
     fn instantiate_returns_class_type() {
-        let src = "class Foo { name: String, } let x = new Foo(); x";
+        // Positional ctor args match class fields in declaration order.
+        let src = r#"class Foo { name: string, } let x = new Foo("hi"); x"#;
         let (mut c, ty) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
@@ -4061,19 +4579,51 @@ mod tests {
 
     #[test]
     fn class_impl_and_instantiate_combined() {
-        // Pulls the existing example together:
-        //   class Foo { name: String, }
-        //   impl Foo { fn sadge() -> int { return 42; } }
-        //   fn main() { print "%i", (2 * 2 + 3); let x = new Foo(); }
-        let src = "\
-            class Foo { name: String, } \
-            impl Foo { fn sadge() -> int { return 42; } } \
-            fn main() { let x = new Foo(); }";
+        let src = r#"
+            class Foo { name: string, }
+            impl Foo { fn sadge() -> int { return 42; } }
+            fn main() { let x = new Foo("hi"); }
+        "#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
         assert!(c.classes.contains_key("Foo"));
         assert!(c.methods.get("Foo").unwrap().contains_key("sadge"));
+    }
+
+    #[test]
+    fn class_method_call_typechecks() {
+        let src = "\
+            class Point { x: int, y: int, } \
+            impl Point { fn sum() -> int { return self.x + self.y; } } \
+            fn main() { let p = new Point(1, 3); p.sum(); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn class_unknown_field_errors() {
+        let src = "\
+            class Point { x: int, } \
+            fn main() { let p = new Point(1); p.z; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("field")),
+            "expected unknown-field diagnostic, got {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn class_ctor_arity_mismatch_errors() {
+        let src = "\
+            class Point { x: int, y: int, } \
+            fn main() { let p = new Point(1); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(!msgs.is_empty(), "expected ctor arity diagnostic");
     }
 
     // ---- Recursive method (inside an impl) ----
@@ -4326,6 +4876,17 @@ mod tests {
             "help should suggest `let undeclared;`, got: {:?}",
             help
         );
+    }
+
+    #[test]
+    fn assignment_to_const_emits_immutability_diagnostic() {
+        let (mut c, _) = check("const x = 1; x = 2;");
+        let msgs = c.take_messages();
+        let msg = msgs
+            .iter()
+            .find(|m| m.message().contains("Cannot assign to constant `x`"));
+        assert!(msg.is_some(), "got: {:?}", msgs);
+        assert!(msg.unwrap().help().is_some(), "missing help");
     }
 
     #[test]
@@ -4876,6 +5437,26 @@ mod tests {
         assert!(msgs.is_empty(), "{:?}", msgs);
     }
 
+    #[test]
+    fn addition_of_strings_is_string() {
+        assert_ok("\"hello\" + \"world\"", string());
+    }
+
+    #[test]
+    fn string_plus_int_errors() {
+        let msgs = assert_messages("\"hello\" + 42;");
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "expected string+int type mismatch, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_expression_returns_string() {
+        assert_ok("format \"%i-%s\", 42, \"x\"", string());
+    }
+
     // ---- Inner-pattern reachability ----
 
     #[test]
@@ -5123,6 +5704,38 @@ mod tests {
     }
 
     #[test]
+    fn push_promotes_static_array_to_dynamic_for_later_indexing() {
+        let src = "fn main() { let arr = [0, 1]; push(arr, 2); let _ = arr[2]; }";
+        let (_c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn push_rejects_element_type_mismatch() {
+        let src = "fn main() { let arr = [0, 1]; push(arr, \"x\"); }";
+        let (_c, msgs) = check_warn(src);
+        let found = msgs.iter().any(|m| m.message().contains("Type mismatch"));
+        assert!(
+            found,
+            "expected push element type mismatch, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn len_of_array_returns_int() {
+        assert_ok("len([0, 1])", int());
+    }
+
+    #[test]
+    fn len_rejects_non_array() {
+        let src = "fn main() { let x = 1; len(x); }";
+        let (_c, msgs) = check_warn(src);
+        let found = msgs.iter().any(|m| m.message().contains("len expects an array"));
+        assert!(found, "expected len non-array diagnostic, got: {:?}", msgs);
+    }
+
+    #[test]
     fn tuple_constant_index_oob_emits_diagnostic() {
         // `let t = (1, 2); t[5]` — tuple length 2, index 5.
         let src = "fn main() { let t = (1, 2); let _ = t[5]; }";
@@ -5288,8 +5901,49 @@ mod tests {
 
     #[test]
     fn alias_does_not_leak_into_unrelated_declarations() {
-        // Global alias table: later declarations overwrite earlier ones.
         let src = "type Int = int; fn main() { }";
+        let (_c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn function_body_alias_can_shadow_outer_alias() {
+        let src = r#"
+            type Value = int;
+            fn main() {
+                type Value = string;
+                let s: Value = "ok";
+            }
+            fn id(Value x) -> int { return x; }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn duplicate_type_alias_in_same_scope_errors() {
+        let src = "type Id = int; type Id = string; fn main() { }";
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Duplicate type alias `Id`")),
+            "expected duplicate alias diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn block_scoped_alias_does_not_leak() {
+        let src = r#"
+            type Local = int;
+            fn main() {
+                if true {
+                    type Local = string;
+                    let s: Local = "ok";
+                }
+                let n: Local = 1;
+            }
+        "#;
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
     }
@@ -5494,14 +6148,12 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
     fn yield_from_requires_coroutine_target() {
         let (c, _) = check("async fn bad() { yield from 1; }");
         assert!(
-            c.messages()
-                .iter()
-                .any(|m| {
-                    m.message().contains("Type mismatch")
-                        && m.help()
-                            .as_ref()
-                            .is_some_and(|h| h.contains("yield from target"))
-                }),
+            c.messages().iter().any(|m| {
+                m.message().contains("Type mismatch")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("yield from target"))
+            }),
             "expected yield-from type error, got {:?}",
             c.messages()
         );
@@ -5509,9 +6161,8 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
 
     #[test]
     fn resume_expression_returns_yield_type() {
-        let (c, _) = check(
-            "async fn coro() { yield 1; } fn main() { let h = coro(); let x = resume h; }",
-        );
+        let (c, _) =
+            check("async fn coro() { yield 1; } fn main() { let h = coro(); let x = resume h; }");
         assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
         let x_ty = c
             .codegen_var_type("x")
@@ -5574,5 +6225,73 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
             .codegen_var_type("x")
             .expect("x should be recorded in codegen_var_types");
         assert_eq!(apply_ty_prune(c.subst(), x_ty), int());
+    }
+
+    #[test]
+    fn done_builtin_typechecks_to_bool() {
+        let src = "async fn c() { yield 1; } fn main() { let h = c(); let d = done(h); }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let d_ty = c.codegen_var_type("d").expect("d should be recorded");
+        assert_eq!(apply_ty_prune(c.subst(), d_ty), boolean());
+    }
+
+    #[test]
+    fn async_fn_return_annotation_unifies_with_yield() {
+        let src = "async fn c() -> int { yield 1; return 2; } fn main() { let h = c(); }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+    }
+
+    #[test]
+    fn async_fn_return_annotation_mismatch_errors() {
+        let src = "async fn c() -> string { yield 1; } fn main() { let h = c(); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "expected annotation mismatch, got {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn declare_struct_ret_recorded_for_invoke_typing() {
+        let src = r#"
+extern struct Point {
+    x: int32,
+    y: int32,
+};
+
+fn main() {
+    let lib = dload("libsum.so");
+    let make_id = declare(
+        lib,
+        "make_point",
+        (FFIType::Int32, FFIType::Int32),
+        Point,
+    );
+    let p = invoke(lib, make_id, (3, 4));
+    print "%i", p.x;
+    print "%i", p.y;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let ret = c
+            .ffi_fn_ret_tys
+            .get("make_id")
+            .expect("declare binding should record ret Ty");
+        match ret {
+            Ty::Record { fields } => {
+                assert!(fields.iter().any(|(n, _)| n == "x"));
+                assert!(fields.iter().any(|(n, _)| n == "y"));
+            }
+            other => panic!("expected Record ret, got {other}"),
+        }
     }
 }

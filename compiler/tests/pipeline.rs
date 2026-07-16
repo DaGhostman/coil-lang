@@ -128,9 +128,45 @@ fn example_dict_prints_42_100_42() {
 }
 
 #[test]
+fn example_array_grow_prints_len_first_and_last() {
+    let output = run_example("examples/array_grow.0s");
+    assert_eq!(output, "414");
+}
+
+#[test]
+fn example_classes_prints_7458() {
+    let output = run_example("examples/classes.0s");
+    assert_eq!(output, "7458");
+}
+
+#[test]
 fn example_aliases_prints_3_4_7() {
     let output = run_example("examples/aliases.0s");
     assert_eq!(output, "347");
+}
+
+#[test]
+fn example_const_prints_42hi() {
+    let output = run_example("examples/const.0s");
+    assert_eq!(output, "42hi");
+}
+
+#[test]
+fn string_fmt_example_prints_concatenated_and_formatted_strings() {
+    let output = run_example("examples/string_fmt.0s");
+    assert_eq!(output, "hello world42-x");
+}
+
+#[test]
+fn string_plus_equal_updates_binding() {
+    let output = run_example_src(
+        r#"fn main() {
+            let s = "a";
+            s += "b";
+            print "%s", s;
+        }"#,
+    );
+    assert_eq!(output, "ab");
 }
 
 #[test]
@@ -245,6 +281,61 @@ fn let_binding_emits_store_pop_in_bytecode() {
 fn example_let_reassignment_works() {
     let output = run_example("examples/let_test.0s");
     assert_eq!(output, "51020");
+}
+
+/// Phase P0: `let x = match { … }` must bind the arm value via
+/// StorePop. Pre-fix Match emitted RETURN at end_label, so the
+/// StorePop was unreachable and prints never ran / saw 0.
+#[test]
+fn let_match_binds_arm_value() {
+    let src = r#"
+        enum Opt { None, Some(int) }
+        fn main() {
+            let x = match Opt::None {
+                Opt::None => 7,
+                Opt::Some(v) => v,
+            };
+            print "%i", x;
+            let y = match Opt::Some(42) {
+                Opt::None => 0,
+                Opt::Some(v) => v,
+            };
+            print "%i", y;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "742");
+}
+
+/// Phase P0: dict fields that hold heap objects (strings) must
+/// round-trip through GetField.
+#[test]
+fn dict_string_field_round_trips() {
+    let src = r#"
+        fn main() {
+            let d = { name: "hi", n: 9 };
+            print "%s", d.name;
+            print "%i", d.n;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "hi9");
+}
+
+/// Phase P1: in-place dict mutation via `d.field = value` then re-read.
+#[test]
+fn dict_mutation_round_trips() {
+    let src = r#"
+        fn main() {
+            let d = { foo: 1, name: "a" };
+            d.foo = 99;
+            d.name = "z";
+            print "%i", d.foo;
+            print "%s", d.name;
+        }
+    "#;
+    let output = run_example_src(src);
+    assert_eq!(output, "99z");
 }
 
 #[test]
@@ -410,9 +501,8 @@ fn example_ffi_sum_via_dlopen_prints_42() {
         &format!("dload(\"{}\")", lib_abs.display()),
     );
 
-    let result = std::panic::catch_unwind(|| {
-        run_example_src_with_entry(&src, Some(full.as_path()))
-    });
+    let result =
+        std::panic::catch_unwind(|| run_example_src_with_entry(&src, Some(full.as_path())));
     let output = match result {
         Ok(s) => s,
         Err(_) => {
@@ -477,6 +567,12 @@ fn example_coro_send_prints_hello() {
 fn example_coro_yield_from_prints_012() {
     let output = run_example("examples/coro_yield_from.0s");
     assert_eq!(output, "012");
+}
+
+#[test]
+fn example_coro_done_prints_false_false_true() {
+    let output = run_example("examples/coro_done.0s");
+    assert_eq!(output, "falsefalsetrue");
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument
@@ -623,12 +719,45 @@ fn example_ffi_callback_prints_42() {
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
     let libsum = workspace_root.join("examples/libsum.so");
+    ensure_ffi_libsum_built();
     if !libsum.exists() {
         eprintln!("skipping: libsum.so not built");
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_callback.0s", &libsum);
     assert_eq!(output, "42");
+}
+
+#[test]
+fn example_ffi_struct_return_prints_34() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let libsum = workspace_root.join("examples/libsum.so");
+    // Rebuild when sum.c is newer (mtime check inside ensure_*). Do not
+    // delete libsum.so here — other FFI tests in this file race on that path.
+    ensure_ffi_libsum_built();
+    if !libsum.exists() {
+        eprintln!("skipping: libsum.so not built");
+        return;
+    }
+    let output = run_ffi_example_with_lib("examples/ffi_struct_ret.0s", &libsum);
+    assert_eq!(output, "34");
+}
+
+#[test]
+fn example_ffi_callback_return_prints_1() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("compiler crate must have a parent (workspace root)");
+    let libsum = workspace_root.join("examples/libsum.so");
+    ensure_ffi_libsum_built();
+    if !libsum.exists() {
+        eprintln!("skipping: libsum.so not built");
+        return;
+    }
+    let output = run_ffi_example_with_lib("examples/ffi_callback_ret.0s", &libsum);
+    assert_eq!(output, "1");
 }
 
 #[test]
@@ -653,6 +782,12 @@ fn example_while_loop_accumulates_correctly() {
         "#,
     );
     assert_eq!(output, "4950");
+}
+
+#[test]
+fn example_for_break_prints_18() {
+    let output = run_example("examples/for_break.0s");
+    assert_eq!(output, "18");
 }
 
 #[test]

@@ -114,6 +114,22 @@ Indexing uses the same `arr[i]` syntax as tuples.
 
 - No compile-time out-of-bounds check. Runtime access may return a sentinel value if the index is invalid.
 
+### Growing arrays with `push` and `len`
+
+`push(arr, value)` appends to an array in place and returns the same array, so existing references see the new element. `len(arr)` returns the current runtime length.
+
+```0s
+fn main() {
+    let a = [1, 2];
+    push(a, 3);
+    push(a, 4);
+    print "%i", len(a); // 4
+    print "%i", a[3];  // 4
+}
+```
+
+The pushed value must have the same type as the existing elements. After a successful push, a fixed literal array such as `[int; 2]` is treated as dynamic `[int]` for later indexing checks.
+
 ---
 
 ## Dicts (anonymous records)
@@ -182,10 +198,10 @@ fn main() {
 
 Aliases are substituted at **typecheck time** only. They have **zero runtime cost** — no extra bytecode is emitted.
 
-Current limitations:
+Scoping rules:
 
-- Aliases are **global** within a file (no scoped aliases yet).
-- Declaring `type X = T;` twice with the same name silently overwrites the earlier definition.
+- Aliases are lexical: a block or function may define an alias that shadows an outer alias.
+- Declaring `type X = T;` twice in the same scope is a typechecking diagnostic.
 
 See `examples/aliases.0s` for a complete runnable example.
 
@@ -215,6 +231,7 @@ See `examples/aliases.0s` for a complete runnable example.
 
 | File | Demonstrates |
 |------|--------------|
+| `examples/array_grow.0s` | Growing arrays with `push` and `len` |
 | `examples/dict.0s` | Dict literals and field access |
 | `examples/aliases.0s` | Type aliases with tuples |
 | `examples/record.0s` | Enum record variants (contrast with dicts) |

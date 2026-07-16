@@ -1,0 +1,8 @@
+fn main() {
+    let a = [1, 2];
+    push(a, 3);
+    push(a, 4);
+    print "%i", len(a);
+    print "%i", a[0];
+    print "%i", a[3];
+}
