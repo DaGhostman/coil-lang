@@ -9,16 +9,19 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, encode_tag_operand, likely, tag, unlikely};
+use common::{
+    Byte, Instruction, Interner, Label as DiagLabel, Message, Value, encode_tag_operand, likely,
+    tag, unlikely,
+};
 
-use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind};
+use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
 use parser::{
     SimpleSpan,
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
 };
 
 pub use pipeline::*;
-pub use typechecking::{CallbackSigDef, Checker, CStructDef, Ty};
+pub use typechecking::{CStructDef, CallbackSigDef, Checker, Ty};
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -52,9 +55,7 @@ fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u3
 }
 
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
-    bytecode.push(
-        Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)),
-    );
+    bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
 }
 
 fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup> {
@@ -375,6 +376,12 @@ pub struct Compiler {
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
 
+    /// Active loop labels: `(continue_target, break_target)`.
+    loop_stack: Vec<(BbLabel, BbLabel)>,
+
+    /// Active loop patchers. Break/continue emit through the innermost builder.
+    loop_bbs: Vec<BlockBuilder>,
+
     /// True while compiling an `impl` method — Function resets locals
     /// and reserves slot 0 for `self`.
     compiling_method: bool,
@@ -413,6 +420,8 @@ impl Default for Compiler {
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
+            loop_stack: Vec::new(),
+            loop_bbs: Vec::new(),
             compiling_method: false,
         }
     }
@@ -712,6 +721,46 @@ impl Compiler {
             .map(|s| s as u32)
     }
 
+    fn discard_statement_value(bytecode: &mut Vec<Byte>) {
+        if matches!(
+            bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::DUPLICATE)
+        ) {
+            // If it was supposed to add `POP` but prev is `DUP`
+            // then remove the DUP as well
+            bytecode.pop();
+        } else if matches!(
+            bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::StorePop | Instruction::SetField | Instruction::StoreIndex)
+        ) {
+            // `x = expr;` / compound updates already consumed the
+            // RHS via StorePop/SetField/StoreIndex — no trailing POP.
+        } else if !matches!(
+            bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
+        ) {
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+    }
+
+    fn emit_loop_jump(
+        &mut self,
+        target: Option<BbLabel>,
+        keyword: &str,
+        range: std::ops::Range<usize>,
+    ) {
+        if let (Some(label), Some(bb)) = (target, self.loop_bbs.last_mut()) {
+            bb.emit_jump_to(label, BbJumpKind::Unconditional, &mut self.bytecode);
+        } else {
+            let mut message = Message::error(format!("{} outside of loop", keyword), range.clone());
+            message.push(DiagLabel::new(
+                format!("`{}` can only be used inside a loop", keyword),
+                range,
+            ));
+            self.messages.push(message);
+        }
+    }
+
     pub fn get_messages(&self) -> &Vec<Message> {
         &self.messages
     }
@@ -808,7 +857,10 @@ impl Compiler {
                 return Some(slot);
             }
         }
-        self.context.variables.key(&name.to_string()).map(|s| s as u32)
+        self.context
+            .variables
+            .key(&name.to_string())
+            .map(|s| s as u32)
     }
 
     fn is_float_ty(&self, node: &Output) -> bool {
@@ -820,10 +872,7 @@ impl Compiler {
         )
     }
 
-    fn binop_for_assign_op(
-        op: parser::ast::AssignOp,
-        is_float: bool,
-    ) -> Instruction {
+    fn binop_for_assign_op(op: parser::ast::AssignOp, is_float: bool) -> Instruction {
         use parser::ast::AssignOp;
         match (op, is_float) {
             (AssignOp::Add, false) => Instruction::ADD,
@@ -1228,7 +1277,8 @@ impl Compiler {
                     .entry(self.namespace.clone())
                     .or_default()
                     .push(name.to_string());
-                self.functions.insert(qualified.clone(), self.bytecode.len());
+                self.functions
+                    .insert(qualified.clone(), self.bytecode.len());
                 if *is_coro {
                     self.coroutine_fns.insert(qualified);
                 }
@@ -1270,9 +1320,6 @@ impl Compiler {
             }
             Expression::ExprStatement(child) => {
                 bytecode.append(&mut self.do_compile(child));
-                // Do not add pop if previous instruction is `DUP` since they both cancel eachother
-                // out
-                //
                 // Also skip the POP for a bare `yield expr;` / `yield from expr;`
                 // statement. The parser's `expr_statement()` alternative matches
                 // `yield` before the dedicated (POP-free) `self.yield_()` statement
@@ -1286,29 +1333,7 @@ impl Compiler {
                 // inside another expression (e.g. `print "%i", resume h;`),
                 // that top-of-stack value belongs to the RESUMER (e.g. the
                 // format string), not the coroutine — corrupting it.
-                if matches!(
-                    bytecode.last().map(|b| b.bytecode()),
-                    Some(Instruction::DUPLICATE)
-                ) {
-                    // If it was supposed to add `POP` but prev is `DUP`
-                    // then remove the DUP as well
-                    bytecode.pop();
-                } else if matches!(
-                    bytecode.last().map(|b| b.bytecode()),
-                    Some(
-                        Instruction::StorePop
-                            | Instruction::SetField
-                            | Instruction::StoreIndex
-                    )
-                ) {
-                    // `x = expr;` / compound updates already consumed the
-                    // RHS via StorePop/SetField/StoreIndex — no trailing POP.
-                } else if !matches!(
-                    bytecode.last().map(|b| b.bytecode()),
-                    Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
-                ) {
-                    bytecode.push(Byte::new(Instruction::POP));
-                }
+                Self::discard_statement_value(&mut bytecode);
             }
             Expression::Print(format, params) => {
                 // The Print handler emits to `self.bytecode`
@@ -1617,9 +1642,7 @@ impl Compiler {
                 }
                 bytecode.append(&mut self.do_compile(target));
                 let has_send = if arg.is_some() { 1u32 } else { 0u32 };
-                bytecode.push(
-                    Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send),
-                );
+                bytecode.push(Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send));
             }
             Expression::Class(name, state) => {
                 self.context.classes.insert(
@@ -1678,15 +1701,8 @@ impl Compiler {
             }
             Expression::Instantiate(class, args) => {
                 let name = self.resolve_variable_checked(class);
-                let fields = self
-                    .context
-                    .classes
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_default();
-                bytecode.push(
-                    Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32),
-                );
+                let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
+                bytecode.push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
                 // SetField stack order is value, target, name (same as
                 // Assignment to Access). Stash the instance, then for
                 // each ctor arg emit that sequence and discard the
@@ -1723,8 +1739,17 @@ impl Compiler {
 
                 bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
 
+                self.loop_stack.push((top_label, exit_label));
+                self.loop_bbs.push(bb);
                 let body_bc = self.do_compile(body);
                 self.bytecode.extend(body_bc);
+                let mut bb = self
+                    .loop_bbs
+                    .pop()
+                    .expect("loop builder stack balanced for while");
+                self.loop_stack
+                    .pop()
+                    .expect("loop label stack balanced for while");
 
                 bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
 
@@ -1745,6 +1770,90 @@ impl Compiler {
 
                 bb.finalize()
                     .expect("BlockBuilder::finalize: all targeted labels bound");
+            }
+            // --- C-style for codegen ---
+            // Layout: init, [top] cond, JMPF→exit, body, [continue] step, JMP→top, [exit]
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    let mut init_bc = self.do_compile(init);
+                    Self::discard_statement_value(&mut init_bc);
+                    self.bytecode.extend(init_bc);
+                }
+
+                let mut bb = BlockBuilder::new();
+                let top_label = bb.fresh_label();
+                let continue_label = bb.fresh_label();
+                let exit_label = bb.fresh_label();
+                let top_label_target = self.bytecode.len() as u32;
+
+                let cond_bc = self.do_compile(cond);
+                self.bytecode.extend(cond_bc);
+
+                bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+                self.loop_stack.push((continue_label, exit_label));
+                self.loop_bbs.push(bb);
+                let body_bc = self.do_compile(body);
+                self.bytecode.extend(body_bc);
+                let mut bb = self
+                    .loop_bbs
+                    .pop()
+                    .expect("loop builder stack balanced for for");
+                self.loop_stack
+                    .pop()
+                    .expect("loop label stack balanced for for");
+
+                let continue_target = self.bytecode.len() as u32;
+                bb.bind_label(
+                    continue_label,
+                    continue_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+
+                if let Some(step) = step {
+                    let mut step_bc = self.do_compile(step);
+                    Self::discard_statement_value(&mut step_bc);
+                    self.bytecode.extend(step_bc);
+                }
+
+                bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+                let exit_label_target = self.bytecode.len() as u32;
+                bb.bind_label(
+                    exit_label,
+                    exit_label_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+                bb.bind_label(
+                    top_label,
+                    top_label_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+
+                bb.finalize()
+                    .expect("BlockBuilder::finalize: all targeted labels bound");
+            }
+            Expression::Break => {
+                if let Some((_, break_label)) = self.loop_stack.last().copied() {
+                    self.emit_loop_jump(Some(break_label), "break", span.into_range());
+                } else {
+                    self.emit_loop_jump(None, "break", span.into_range());
+                }
+            }
+            Expression::Continue => {
+                if let Some((continue_label, _)) = self.loop_stack.last().copied() {
+                    self.emit_loop_jump(Some(continue_label), "continue", span.into_range());
+                } else {
+                    self.emit_loop_jump(None, "continue", span.into_range());
+                }
             }
             Expression::Defer(child) => {
                 let mut body = vec![Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)];
@@ -1817,79 +1926,80 @@ impl Compiler {
                         self.messages.push(message);
                     }
                 } else {
-                let identifier = self.resolve_variable_checked(name);
-                let n = self
-                    .aliases
-                    .get(&identifier)
-                    .cloned()
-                    .unwrap_or_else(|| identifier.clone());
+                    let identifier = self.resolve_variable_checked(name);
+                    let n = self
+                        .aliases
+                        .get(&identifier)
+                        .cloned()
+                        .unwrap_or_else(|| identifier.clone());
 
-                if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
-                    // Stage arg bytecode in a local Vec to
-                    // release the `&mut self.bytecode` borrow
-                    // before the loop calls `self.do_compile`.
-                    let mut arg_bc = Vec::new();
-                    let arity = if let Some(items) = args {
-                        for arg in items {
-                            arg_bc.append(&mut self.do_compile(arg));
+                    if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
+                        // Stage arg bytecode in a local Vec to
+                        // release the `&mut self.bytecode` borrow
+                        // before the loop calls `self.do_compile`.
+                        let mut arg_bc = Vec::new();
+                        let arity = if let Some(items) = args {
+                            for arg in items {
+                                arg_bc.append(&mut self.do_compile(arg));
+                            }
+                            items.len()
+                        } else {
+                            0
+                        };
+                        self.bytecode
+                            .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
+                        self.bytecode
+                            .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
+                        self.bytecode.append(&mut arg_bc);
+                        self.bytecode
+                            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                        self.bytecode
+                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
+                    } else if let Some(&native_id) = self.native.get(&n) {
+                        let mut arg_bc = Vec::new();
+                        let arity = if let Some(items) = args {
+                            for arg in items {
+                                arg_bc.append(&mut self.do_compile(arg));
+                            }
+                            items.len()
+                        } else {
+                            0
+                        };
+                        self.bytecode
+                            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                        self.bytecode.append(&mut arg_bc);
+                        self.bytecode
+                            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                        self.bytecode.push(
+                            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
+                        );
+                    } else if let Some(offset) = self.functions.get(&n).copied() {
+                        if let Some(args) = args {
+                            args.iter()
+                                .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                         }
-                        items.len()
-                    } else {
-                        0
-                    };
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
-                    self.bytecode.append(&mut arg_bc);
-                    self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
-                    self.bytecode
-                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
-                } else if let Some(&native_id) = self.native.get(&n) {
-                    let mut arg_bc = Vec::new();
-                    let arity = if let Some(items) = args {
-                        for arg in items {
-                            arg_bc.append(&mut self.do_compile(arg));
-                        }
-                        items.len()
-                    } else {
-                        0
-                    };
-                    self.bytecode
-                        .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-                    self.bytecode.append(&mut arg_bc);
-                    self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
-                    self.bytecode
-                        .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
-                } else if let Some(offset) = self.functions.get(&n).copied() {
-                    if let Some(args) = args {
-                        args.iter()
-                            .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
-                    }
 
-                    if self.coroutine_fns.contains(&n) {
-                        bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
-                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                            offset as u32,
-                        ));
+                        if self.coroutine_fns.contains(&n) {
+                            bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
+                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                                offset as u32,
+                            ));
+                        } else {
+                            // Packed CALL: arity + target in one opcode.
+                            bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
+                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                                offset as u32,
+                            ));
+                        }
                     } else {
-                        // Packed CALL: arity + target in one opcode.
-                        bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
-                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                            offset as u32,
+                        let mut message =
+                            Message::error("Unknown function".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!("Unable to call unknown function '{}'", n),
+                            span.into_range(),
                         ));
+                        self.messages.push(message);
                     }
-                } else {
-                    let mut message =
-                        Message::error("Unknown function".to_string(), span.into_range());
-                    message.push(DiagLabel::new(
-                        format!("Unable to call unknown function '{}'", n),
-                        span.into_range(),
-                    ));
-                    self.messages.push(message);
-                }
                 } // end non-method Call
             }
             Expression::Argument(_, n) => {
@@ -2186,89 +2296,83 @@ impl Compiler {
 
                 self.context.constants.insert(symbol, false);
             }
-            Expression::Assignment(lhs, value) => {
-                match lhs.1.as_ref() {
-                    Expression::Access(target_expr, field) => {
-                        bytecode.append(&mut self.do_compile(value));
-                        bytecode.append(&mut self.do_compile(target_expr));
-                        self.emit_field_name(&mut bytecode, field);
-                        bytecode.push(Byte::new(Instruction::SetField));
-                    }
-                    Expression::Index(arr, idx) => {
-                        let tmp_arr = self.alloc_temp_slot();
-                        let tmp_idx = self.alloc_temp_slot();
-                        let tmp_val = self.alloc_temp_slot();
-                        bytecode.append(&mut self.do_compile(value));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-                        bytecode.append(&mut self.do_compile(arr));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
-                        bytecode.append(&mut self.do_compile(idx));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
-                        bytecode.push(Byte::new(Instruction::StoreIndex));
-                    }
-                    Expression::Identifier(name) => {
-                        self.context.assignments.insert(name.to_string(), true);
-                        let symbol_opt = if let Some(map) = &self.context.match_bindings {
-                            if let Some(&slot) = map.get(*name) {
-                                Some(slot as usize)
-                            } else {
-                                self.context.variables.key(&name.to_string())
-                            }
+            Expression::Assignment(lhs, value) => match lhs.1.as_ref() {
+                Expression::Access(target_expr, field) => {
+                    bytecode.append(&mut self.do_compile(value));
+                    bytecode.append(&mut self.do_compile(target_expr));
+                    self.emit_field_name(&mut bytecode, field);
+                    bytecode.push(Byte::new(Instruction::SetField));
+                }
+                Expression::Index(arr, idx) => {
+                    let tmp_arr = self.alloc_temp_slot();
+                    let tmp_idx = self.alloc_temp_slot();
+                    let tmp_val = self.alloc_temp_slot();
+                    bytecode.append(&mut self.do_compile(value));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                    bytecode.append(&mut self.do_compile(arr));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                    bytecode.append(&mut self.do_compile(idx));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                    bytecode.push(Byte::new(Instruction::StoreIndex));
+                }
+                Expression::Identifier(name) => {
+                    self.context.assignments.insert(name.to_string(), true);
+                    let symbol_opt = if let Some(map) = &self.context.match_bindings {
+                        if let Some(&slot) = map.get(*name) {
+                            Some(slot as usize)
                         } else {
                             self.context.variables.key(&name.to_string())
-                        };
-
-                        if let Some(symbol) = symbol_opt {
-                            if unlikely(self.context.constants.contains_key(&symbol)) {
-                                let assigned =
-                                    likely(*self.context.constants.get(&symbol).unwrap());
-                                if !assigned {
-                                    self.context.constants.entry(symbol).and_modify(|state| {
-                                        *state = true;
-                                    });
-                                } else {
-                                    let mut message = Message::error(
-                                        "Assignment error".to_string(),
-                                        span.into_range(),
-                                    );
-                                    message.push(DiagLabel::new(
-                                        format!(
-                                            "Unable to assign to an already assigned constant '{}'",
-                                            name
-                                        ),
-                                        span.into_range(),
-                                    ));
-                                    self.messages.push(message);
-                                }
-                            }
-                            bytecode.append(&mut self.do_compile(value));
-                            bytecode.push(
-                                Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32),
-                            );
-                        } else {
-                            let mut message = Message::error(
-                                "Undefined variable".to_string(),
-                                span.into_range(),
-                            );
-                            message.push(DiagLabel::new(
-                                format!(
-                                    "Unable to assign to a non-existing variable/constant '{}'",
-                                    name
-                                ),
-                                span.into_range(),
-                            ));
-                            self.messages.push(message);
                         }
-                    }
-                    _ => {
+                    } else {
+                        self.context.variables.key(&name.to_string())
+                    };
+
+                    if let Some(symbol) = symbol_opt {
+                        if unlikely(self.context.constants.contains_key(&symbol)) {
+                            let assigned = likely(*self.context.constants.get(&symbol).unwrap());
+                            if !assigned {
+                                self.context.constants.entry(symbol).and_modify(|state| {
+                                    *state = true;
+                                });
+                            } else {
+                                let mut message = Message::error(
+                                    "Assignment error".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(DiagLabel::new(
+                                    format!(
+                                        "Unable to assign to an already assigned constant '{}'",
+                                        name
+                                    ),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
+                        }
                         bytecode.append(&mut self.do_compile(value));
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode
+                            .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
+                    } else {
+                        let mut message =
+                            Message::error("Undefined variable".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!(
+                                "Unable to assign to a non-existing variable/constant '{}'",
+                                name
+                            ),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
                     }
                 }
-            }
+                _ => {
+                    bytecode.append(&mut self.do_compile(value));
+                    bytecode.push(Byte::new(Instruction::POP));
+                }
+            },
 
             // --- Sum types, extern, construct ---
             Expression::ExternBlock {
@@ -3121,6 +3225,8 @@ impl Compiler {
 
         self.emit_idx = 0;
         self.temp_counter = 0;
+        self.loop_stack.clear();
+        self.loop_bbs.clear();
         self.constants.clear();
         let _program_ty = self.checker.check_program(ast);
 
@@ -3188,19 +3294,15 @@ mod tests {
     #[test]
     fn async_call_emits_make_coro_not_call() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "async fn coro() { yield 1; } fn main() { let h = coro(); }",
-        );
+        let (bc, _pool) = compile_src("async fn coro() { yield 1; } fn main() { let h = coro(); }");
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::MakeCoro)),
             "expected MakeCoro for async fn call"
         );
         assert!(
-            !bc.iter().any(|b| {
-                matches!(b.bytecode(), Instruction::CALL)
-                    && b.call_parts().1 > 3
-            }),
+            !bc.iter()
+                .any(|b| { matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3 }),
             "async fn call site should not use CALL"
         );
     }
@@ -3208,9 +3310,8 @@ mod tests {
     #[test]
     fn yield_and_resume_emit_coroutine_opcodes() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "async fn coro() { yield 1; } fn main() { let h = coro(); resume h; }",
-        );
+        let (bc, _pool) =
+            compile_src("async fn coro() { yield 1; } fn main() { let h = coro(); resume h; }");
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::YieldCoro)),
@@ -3296,7 +3397,10 @@ mod tests {
         assert_eq!(yield_positions.len(), 2, "expected two YieldCoro sites");
         for pos in yield_positions {
             assert!(
-                !matches!(bc.get(pos + 1).map(|b| b.bytecode()), Some(Instruction::POP)),
+                !matches!(
+                    bc.get(pos + 1).map(|b| b.bytecode()),
+                    Some(Instruction::POP)
+                ),
                 "bare `yield expr;` must not be followed by POP (would corrupt the next resume)"
             );
         }
@@ -3312,7 +3416,10 @@ mod tests {
             .position(|b| matches!(b.bytecode(), Instruction::YieldFromCoro))
             .expect("expected YieldFromCoro");
         assert!(
-            !matches!(bc.get(pos + 1).map(|b| b.bytecode()), Some(Instruction::POP)),
+            !matches!(
+                bc.get(pos + 1).map(|b| b.bytecode()),
+                Some(Instruction::POP)
+            ),
             "bare `yield from expr;` must not be followed by POP"
         );
     }
@@ -3690,9 +3797,7 @@ mod tests {
             .position(|b| {
                 matches!(
                     b.bytecode(),
-                    Instruction::CmpJmpf
-                        | Instruction::BinSlotImm
-                        | Instruction::BinSlotImmJmpf
+                    Instruction::CmpJmpf | Instruction::BinSlotImm | Instruction::BinSlotImmJmpf
                 )
             })
             .expect("while condition should emit a fused or partial-fused compare");
@@ -3788,6 +3893,61 @@ mod tests {
         assert_eq!(
             dup_before_store, 0,
             "identifier assignment should not emit DUPLICATE before STORE_POP"
+        );
+    }
+
+    #[test]
+    fn for_with_break_and_continue_emits_patched_jumps() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let sum = 0; \
+for (let i = 0; i < 10; i = i + 1) { \
+if i == 3 { continue; } \
+if i == 7 { break; } \
+sum = sum + i; \
+} \
+}",
+        );
+
+        let jmp_targets: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JMP))
+            .map(|b| b.operand_u32())
+            .collect();
+
+        assert!(
+            jmp_targets.len() >= 3,
+            "expected continue, break, and back-edge JMPs; got {:?}",
+            jmp_targets
+        );
+        assert!(
+            jmp_targets.iter().all(|target| *target != 0),
+            "loop jump placeholders should be patched: {:?}",
+            jmp_targets
+        );
+    }
+
+    #[test]
+    fn break_and_continue_outside_loop_emit_diagnostics() {
+        let ast = Pratt::default()
+            .parse("fn main() { break; continue; }")
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        compiler.compile("", &ast);
+        let rendered = compiler
+            .get_messages()
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("break outside of loop"),
+            "expected break diagnostic, got {rendered}"
+        );
+        assert!(
+            rendered.contains("continue outside of loop"),
+            "expected continue diagnostic, got {rendered}"
         );
     }
 

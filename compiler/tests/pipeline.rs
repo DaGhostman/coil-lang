@@ -471,9 +471,8 @@ fn example_ffi_sum_via_dlopen_prints_42() {
         &format!("dload(\"{}\")", lib_abs.display()),
     );
 
-    let result = std::panic::catch_unwind(|| {
-        run_example_src_with_entry(&src, Some(full.as_path()))
-    });
+    let result =
+        std::panic::catch_unwind(|| run_example_src_with_entry(&src, Some(full.as_path())));
     let output = match result {
         Ok(s) => s,
         Err(_) => {
@@ -755,6 +754,12 @@ fn example_while_loop_accumulates_correctly() {
 }
 
 #[test]
+fn example_for_break_prints_18() {
+    let output = run_example("examples/for_break.0s");
+    assert_eq!(output, "18");
+}
+
+#[test]
 fn example_perf_numeric_prints_expected_sum() {
     let output = run_example("examples/perf/numeric.0s");
     assert_eq!(output, "1999000");
@@ -783,4 +788,3 @@ fn example_perf_coro_ping_prints_expected() {
     let output = run_example("examples/perf/coro_ping.0s");
     assert_eq!(output, "124750");
 }
-

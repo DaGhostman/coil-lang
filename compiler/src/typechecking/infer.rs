@@ -375,7 +375,10 @@ impl Checker {
             Expression::Type(name) => self.parse_type_name_str(name),
 
             // ---- Wrappers / no-ops ----
-            Expression::Noop(_) | Expression::Comment(_) => unit_ty(),
+            Expression::Noop(_)
+            | Expression::Comment(_)
+            | Expression::Break
+            | Expression::Continue => unit_ty(),
             // `use` — bind alias with a fresh type variable
             Expression::Use {
                 path: _,
@@ -506,26 +509,27 @@ impl Checker {
                     let _ = unify_with(&self.subst, &target_ty, &int());
                     let _ = unify_with(&self.subst, &val_ty, &int());
                 } else {
-                    self.unify(&target_ty, &val_ty, &range, &format!("operands of `{}=`", op_name));
+                    self.unify(
+                        &target_ty,
+                        &val_ty,
+                        &range,
+                        &format!("operands of `{}=`", op_name),
+                    );
                 }
                 apply_ty_prune(&self.subst, &target_ty)
             }
 
             Expression::Assignment(name, value) => {
                 // `x = resume x` overwrites the coroutine handle with the yield value.
-                if let (
-                    Expression::Identifier(var_name),
-                    Expression::Resume(target, None),
-                ) = (name.1.as_ref(), value.1.as_ref())
+                if let (Expression::Identifier(var_name), Expression::Resume(target, None)) =
+                    (name.1.as_ref(), value.1.as_ref())
                 {
                     if let Expression::Identifier(target_name) = target.1.as_ref() {
                         if var_name == target_name {
                             let val_ty = self.infer(value);
                             if self.env.lookup(var_name).is_some() {
-                                self.env.insert_top(
-                                    var_name.to_string(),
-                                    Scheme::mono(val_ty.clone()),
-                                );
+                                self.env
+                                    .insert_top(var_name.to_string(), Scheme::mono(val_ty.clone()));
                                 self.codegen_var_types
                                     .insert(var_name.to_string(), val_ty.clone());
                             }
@@ -609,7 +613,10 @@ impl Checker {
                     let _ = self.error_with_help(
                         "Increment/decrement requires a numeric lvalue".to_string(),
                         range,
-                        Some("only `int` and `float` variables, fields, and indices support ++/--".to_string()),
+                        Some(
+                            "only `int` and `float` variables, fields, and indices support ++/--"
+                                .to_string(),
+                        ),
                     );
                 }
                 pruned
@@ -690,6 +697,23 @@ impl Checker {
                 let it = self.infer(iterable);
                 self.unify(&it, &boolean(), &iterable.0.into_range(), "while condition");
                 let _ = self.infer(body);
+                unit_ty()
+            }
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    let _ = self.infer(init);
+                }
+                let cond_ty = self.infer(cond);
+                self.unify(&cond_ty, &boolean(), &cond.0.into_range(), "for condition");
+                let _ = self.infer(body);
+                if let Some(step) = step {
+                    let _ = self.infer(step);
+                }
                 unit_ty()
             }
 
@@ -1007,12 +1031,7 @@ impl Checker {
                 let inner_ty = self.infer(e);
                 let (y_var, s_var) = (Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh()));
                 let expected = self.coroutine_type(y_var.clone(), s_var.clone());
-                self.unify(
-                    &inner_ty,
-                    &expected,
-                    &range,
-                    "yield from target",
-                );
+                self.unify(&inner_ty, &expected, &range, "yield from target");
                 if let Some(yield_ty) = self.current_yield_ty.clone() {
                     self.unify(&yield_ty, &y_var, &range, "yield from yield type");
                 }
@@ -1049,15 +1068,7 @@ impl Checker {
                 returns,
                 body,
             } => {
-                self.infer_function(
-                    name,
-                    args,
-                    returns.as_ref(),
-                    body,
-                    &range,
-                    None,
-                    *is_coro,
-                );
+                self.infer_function(name, args, returns.as_ref(), body, &range, None, *is_coro);
                 unit_ty()
             }
             Expression::Implementation(_, owner, methods) => {
@@ -1159,10 +1170,7 @@ impl Checker {
                 let class_name = match &resolved {
                     Ty::Con(n) => n.clone(),
                     _ => {
-                        return self.error(
-                            "Cannot instantiate non-class type".to_string(),
-                            range,
-                        );
+                        return self.error("Cannot instantiate non-class type".to_string(), range);
                     }
                 };
                 if let Some(fields) = self.classes.get(&class_name).cloned() {
@@ -1176,7 +1184,10 @@ impl Checker {
                                 provided.len()
                             ),
                             range,
-                            Some("pass one argument per class field, in declaration order".to_string()),
+                            Some(
+                                "pass one argument per class field, in declaration order"
+                                    .to_string(),
+                            ),
                         );
                     } else {
                         for (arg, (_, _, fty)) in provided.iter().zip(fields.iter()) {
@@ -1334,8 +1345,7 @@ impl Checker {
                             // so Access codegen sees Record/enum types, not the
                             // pre-unify fresh variable.
                             let pruned = apply_ty_prune(&self.subst, &var_ty);
-                            self.codegen_var_types
-                                .insert(name.to_string(), pruned);
+                            self.codegen_var_types.insert(name.to_string(), pruned);
                             // `let id = declare(...)` may wrap Declare in
                             // ExprStatement/Statement — unwrap before matching.
                             let init = unwrap_expr_wrappers(next);
@@ -2083,12 +2093,7 @@ impl Checker {
                 let resolved_yield = apply_ty_prune(&self.subst, &yield_ty);
                 let mut resolved_send = apply_ty_prune(&self.subst, &send_ty);
                 if !self.yield_receives_used {
-                    self.unify(
-                        &resolved_send,
-                        &unit_ty(),
-                        range,
-                        "coroutine send type",
-                    );
+                    self.unify(&resolved_send, &unit_ty(), range, "coroutine send type");
                     resolved_send = unit_ty();
                 }
                 fun_ty = {
@@ -2273,6 +2278,8 @@ impl Checker {
             | Expression::Identifier(_)
             | Expression::Type(_)
             | Expression::Default(_)
+            | Expression::Break
+            | Expression::Continue
             | Expression::Use { .. }
             | Expression::Module(_, _)
             | Expression::Variable(_, _)
@@ -2426,6 +2433,22 @@ impl Checker {
                 self.pre_register_enums_walk(body, errors);
                 if let Some(i) = identifier {
                     self.pre_register_enums_walk(i, errors);
+                }
+            }
+
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    self.pre_register_enums_walk(init, errors);
+                }
+                self.pre_register_enums_walk(cond, errors);
+                self.pre_register_enums_walk(body, errors);
+                if let Some(step) = step {
+                    self.pre_register_enums_walk(step, errors);
                 }
             }
 
@@ -4388,10 +4411,7 @@ mod tests {
             fn main() { let p = new Point(1); }";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
-        assert!(
-            !msgs.is_empty(),
-            "expected ctor arity diagnostic"
-        );
+        assert!(!msgs.is_empty(), "expected ctor arity diagnostic");
     }
 
     // ---- Recursive method (inside an impl) ----
@@ -5812,14 +5832,12 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
     fn yield_from_requires_coroutine_target() {
         let (c, _) = check("async fn bad() { yield from 1; }");
         assert!(
-            c.messages()
-                .iter()
-                .any(|m| {
-                    m.message().contains("Type mismatch")
-                        && m.help()
-                            .as_ref()
-                            .is_some_and(|h| h.contains("yield from target"))
-                }),
+            c.messages().iter().any(|m| {
+                m.message().contains("Type mismatch")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("yield from target"))
+            }),
             "expected yield-from type error, got {:?}",
             c.messages()
         );
@@ -5827,9 +5845,8 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
 
     #[test]
     fn resume_expression_returns_yield_type() {
-        let (c, _) = check(
-            "async fn coro() { yield 1; } fn main() { let h = coro(); let x = resume h; }",
-        );
+        let (c, _) =
+            check("async fn coro() { yield 1; } fn main() { let h = coro(); let x = resume h; }");
         assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
         let x_ty = c
             .codegen_var_type("x")
@@ -5899,9 +5916,7 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
         let src = "async fn c() { yield 1; } fn main() { let h = c(); let d = done(h); }";
         let (c, _) = check(src);
         assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
-        let d_ty = c
-            .codegen_var_type("d")
-            .expect("d should be recorded");
+        let d_ty = c.codegen_var_type("d").expect("d should be recorded");
         assert_eq!(apply_ty_prune(c.subst(), d_ty), boolean());
     }
 
@@ -5964,4 +5979,3 @@ fn main() {
         }
     }
 }
-

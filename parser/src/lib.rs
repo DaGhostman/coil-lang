@@ -160,9 +160,7 @@ impl<'pratt> Pratt<'pratt> {
             });
         // `(T1, T2, ...)` — tuple form. Reuses the
         // existing tuple_atom machinery.
-        let tuple_type = self.tuple_atom(
-            text::ident().padded().map_with(output!(Type)),
-        );
+        let tuple_type = self.tuple_atom(text::ident().padded().map_with(output!(Type)));
         choice((
             array_type,
             tuple_type,
@@ -283,12 +281,7 @@ impl<'pratt> Pratt<'pratt> {
                 ),
                 infix(
                     right(Precedence::Compare as u16),
-                    choice((
-                        op!(">="),
-                        op!("<="),
-                        op!(">"),
-                        op!("<"),
-                    )),
+                    choice((op!(">="), op!("<="), op!(">"), op!("<"))),
                     |lhs, op, rhs, e| {
                         (
                             e.span(),
@@ -316,11 +309,9 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     },
                 ),
-                infix(
-                    right(Precedence::Xor as u16),
-                    op!('^'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Xor(lhs, rhs))),
-                ),
+                infix(right(Precedence::Xor as u16), op!('^'), |lhs, _, rhs, e| {
+                    (e.span(), Box::new(Expression::Xor(lhs, rhs)))
+                }),
                 infix(
                     right(Precedence::Assign as u16),
                     choice((
@@ -480,9 +471,7 @@ impl<'pratt> Pratt<'pratt> {
         let arg = self
             .type_annotation()
             .then(text::ident().padded())
-            .map_with(|(ty, name), e| {
-                (e.span(), Box::new(Expression::Argument(ty, name)))
-            });
+            .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
 
         arg.separated_by(op!(','))
             .allow_trailing()
@@ -592,6 +581,39 @@ impl<'pratt> Pratt<'pratt> {
                     Box::new(Expression::Loop {
                         identifier: None,
                         iterable,
+                        body,
+                    }),
+                )
+            })
+    }
+
+    fn for_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let init = choice((self.variable(), self.expr())).or_not();
+        let step = self.expr().or_not();
+        keyword!("for")
+            .ignore_then(
+                init.then_ignore(op!(";"))
+                    .then(self.expr())
+                    .then_ignore(op!(";"))
+                    .then(step)
+                    .delimited_by(op!("("), op!(")")),
+            )
+            .then(self.block(stmt))
+            .map_with(|(((init, cond), step), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::For {
+                        init,
+                        cond,
+                        step,
                         body,
                     }),
                 )
@@ -802,12 +824,33 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(output!(ExprStatement))
     }
 
+    fn break_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("break")
+            .then_ignore(op!(";"))
+            .map_with(|_, e| (e.span(), Box::new(Expression::Break)))
+    }
+
+    fn continue_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("continue")
+            .then_ignore(op!(";"))
+            .map_with(|_, e| (e.span(), Box::new(Expression::Continue)))
+    }
+
     fn statement(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         recursive(|stmt| {
             choice((
+                self.break_(),
+                self.continue_(),
+                self.for_(stmt.clone()),
                 self.while_(stmt.clone()),
                 self.if_(stmt.clone()),
                 self.block(stmt.clone()),
@@ -1771,6 +1814,75 @@ mod tests {
     }
 
     #[test]
+    fn break_and_continue_parse_as_statements() {
+        let break_ast = decl_ast!("break;");
+        match break_ast {
+            Expression::Statement(inner) => {
+                assert!(matches!(inner.1.as_ref(), Expression::Break));
+            }
+            other => panic!("expected break statement, got {:?}", other),
+        }
+
+        let continue_ast = decl_ast!("continue;");
+        match continue_ast {
+            Expression::Statement(inner) => {
+                assert!(matches!(inner.1.as_ref(), Expression::Continue));
+            }
+            other => panic!("expected continue statement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn c_style_for_parses_let_init_and_step() {
+        let ast = decl_ast!("for (let i = 0; i < 10; i = i + 1) { continue; }");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    assert!(matches!(
+                        init.as_ref().map(|i| i.1.as_ref()),
+                        Some(Expression::Fragment(_))
+                    ));
+                    assert!(matches!(cond.1.as_ref(), Expression::Expr(_)));
+                    assert!(matches!(
+                        step.as_ref().map(|s| s.1.as_ref()),
+                        Some(Expression::Expr(_))
+                    ));
+                    assert!(matches!(body.1.as_ref(), Expression::Block(_)));
+                }
+                other => panic!("expected for statement, got {:?}", other),
+            },
+            other => panic!("expected statement wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn c_style_for_allows_empty_init_and_step() {
+        let ast = decl_ast!("for (; keep_going; ) { break; }");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    assert!(init.is_none());
+                    assert!(matches!(cond.1.as_ref(), Expression::Expr(_)));
+                    assert!(step.is_none());
+                    assert!(matches!(body.1.as_ref(), Expression::Block(_)));
+                }
+                other => panic!("expected for statement, got {:?}", other),
+            },
+            other => panic!("expected statement wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn pratt_test_fn_declaration() {
         assert_eq!(
             "fn main() -> void {\nprint \"Hello, %s\", 42;\n}",
@@ -2454,11 +2566,7 @@ mod tests {
     fn parse_async_fn_round_trips() {
         let ast = decl_ast!("async fn coro() { yield 1; }");
         match ast {
-            Expression::Function {
-                name,
-                is_coro,
-                ..
-            } => {
+            Expression::Function { name, is_coro, .. } => {
                 assert_eq!(name, "coro");
                 assert!(is_coro);
             }
@@ -2759,7 +2867,6 @@ mod tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod debug_classes {

@@ -214,6 +214,23 @@ while (i < 3) {
 
 The condition is re-evaluated before each iteration. As with `if`, the condition must be boolean — `while 42 { ... }` is rejected by the typechecker.
 
+Use `break;` to leave the nearest loop and `continue;` to jump to the next iteration.
+
+### `for` loops
+
+C-style `for` loops combine an optional initializer, a required boolean condition, an optional step expression, and a block body:
+
+```0s
+let sum = 0;
+for (let i = 0; i < 10; i = i + 1) {
+    if i == 3 { continue; }
+    if i == 7 { break; }
+    sum = sum + i;
+}
+```
+
+For this example, `sum` becomes `18` (`0 + 1 + 2 + 4 + 5 + 6`).
+
 ---
 
 ## Blocks

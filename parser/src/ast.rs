@@ -150,6 +150,15 @@ pub enum Expression<'expr> {
         args: Option<Vec<Output<'expr>>>,
     },
 
+    Break,
+    Continue,
+    For {
+        init: Option<Output<'expr>>,
+        cond: Output<'expr>,
+        step: Option<Output<'expr>>,
+        body: Output<'expr>,
+    },
+
     Loop {
         identifier: Option<Output<'expr>>,
         iterable: Output<'expr>,
@@ -502,6 +511,18 @@ impl<'a> Display for Expression<'a> {
                     },
                     body.1
                 )
+            }
+            Self::Break => write!(f, "break"),
+            Self::Continue => write!(f, "continue"),
+            Self::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                let init = init.as_ref().map(|i| i.1.to_string()).unwrap_or_default();
+                let step = step.as_ref().map(|s| s.1.to_string()).unwrap_or_default();
+                write!(f, "for ({}; {}; {}) {{\n{}}}", init, cond.1, step, body.1)
             }
             Self::Assignment(n, e) => {
                 write!(f, "{} = {}", n.1, e.1)
