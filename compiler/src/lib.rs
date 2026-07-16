@@ -384,6 +384,10 @@ pub struct Compiler {
     /// True while compiling an `impl` method — Function resets locals
     /// and reserves slot 0 for `self`.
     compiling_method: bool,
+
+    /// True while compiling a function whose return type is inferred
+    /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
+    compiling_result_mode: bool,
 }
 
 impl Default for Compiler {
@@ -422,6 +426,7 @@ impl Default for Compiler {
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
             compiling_method: false,
+            compiling_result_mode: false,
         }
     }
 }
@@ -911,6 +916,32 @@ impl Compiler {
                 extract_enum_name(&receiver_ty)
                     .and_then(|name| self.checker.field_type_for(&name, field))
             }
+            Expression::OptionalAccess(receiver, field) => {
+                use crate::typechecking::ty::{is_option_ty, option_inner, option_ty};
+                let recv_ty = self.codegen_expr_ty(receiver)?;
+                let inner = if is_option_ty(&recv_ty) {
+                    option_inner(&recv_ty)?
+                } else {
+                    return None;
+                };
+                let field_ty = if let Ty::Record { fields } = &inner {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == field)
+                        .map(|(_, ty)| ty.clone())
+                } else if let Ty::Con(name) = &inner {
+                    if self.checker.is_class(name) {
+                        self.checker.class_field_ty(name, field).cloned()
+                    } else {
+                        extract_enum_name(&inner)
+                            .and_then(|n| self.checker.field_type_for(&n, field))
+                    }
+                } else {
+                    extract_enum_name(&inner)
+                        .and_then(|n| self.checker.field_type_for(&n, field))
+                }?;
+                Some(option_ty(field_ty))
+            }
             Expression::Expr(inner)
             | Expression::Group(inner)
             | Expression::Statement(inner)
@@ -1203,6 +1234,30 @@ impl Compiler {
         }
     }
 
+    /// True when `expr` is (or produces) the built-in `Option` sum.
+    fn expr_is_option(&self, expr: &Output) -> bool {
+        use crate::typechecking::ty::is_option_ty;
+        match expr.1.as_ref() {
+            Expression::Construct { enum_name, .. } => common::is_builtin_option_enum(enum_name),
+            Expression::Group(inner) | Expression::Expr(inner) => self.expr_is_option(inner),
+            _ => self
+                .codegen_expr_ty(expr)
+                .map(|t| is_option_ty(&t))
+                .unwrap_or(false),
+        }
+    }
+
+    /// Wrap the top-of-stack value as `Ok(v)` (Result) or `Some(v)` (Option).
+    fn emit_ok_or_some_wrap(bytecode: &mut Vec<Byte>, is_option: bool) {
+        let tag = if is_option { 1u16 } else { 0u16 }; // Some=1, Ok=0
+        bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([tag, 1]));
+    }
+
+    /// Wrap the top-of-stack value as `Result::Err(e)`.
+    fn emit_result_err(bytecode: &mut Vec<Byte>) {
+        bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([1, 1])); // Err tag=1 arity=1
+    }
+
     fn do_compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
@@ -1353,14 +1408,19 @@ impl Compiler {
                     self.coroutine_fns.insert(qualified);
                 }
 
-                // Methods get a fresh slot map with `self` at 0 so
-                // CALL's receiver lands on LOAD 0. Free functions keep
-                // the shared Interner (extern/lib slots are allocated
-                // into it before `main`).
+                // Fresh slot map per function so locals start at 0
+                // (or 1 with `self`) for this frame. Sharing one
+                // Interner across functions made later `let`s use high
+                // slots; `StorePop` then left holes and match bindings
+                // at slot 1 read garbage. Extern preload slots live in
+                // the entry frame (bytecode before `main`).
+                self.context.variables = Interner::default();
                 if self.compiling_method {
-                    self.context.variables = Interner::default();
                     self.context.variables.intern("self".to_string());
                 }
+
+                let prev_result_mode = self.compiling_result_mode;
+                self.compiling_result_mode = self.checker.fn_is_result_mode(name);
 
                 let mut a = self.do_compile(args);
 
@@ -1382,8 +1442,13 @@ impl Compiler {
                         Instruction::CONST,
                         Value::default().raw() as _,
                     ));
+                    if self.compiling_result_mode {
+                        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+                    }
                     self.bytecode.push(Byte::new(Instruction::RETURN));
                 }
+
+                self.compiling_result_mode = prev_result_mode;
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -1694,6 +1759,10 @@ impl Compiler {
                 // }
 
                 bytecode.append(&mut self.do_compile(expr));
+                // Result-mode functions: bare `return v` becomes `Ok(v)`.
+                if self.compiling_result_mode {
+                    Self::emit_ok_or_some_wrap(&mut bytecode, false);
+                }
                 if !matches!(child.borrow(), Expression::ImplicitReturn(_)) {
                     bytecode.push(Byte::new(Instruction::RETURN));
                 }
@@ -3315,6 +3384,155 @@ impl Compiler {
 
             Expression::Field(_, _, _) => {
                 // Class field decls are metadata only — consumed for ID alignment.
+            }
+
+            // --- Error-handling operators (desugar to MakeEnum / JumpIfMatch) ---
+            Expression::Raise(expr) => {
+                // `raise e` → push e, wrap Err(e), RETURN.
+                // Emit to self.bytecode so nested absolute jumps stay valid.
+                let expr_bc = self.do_compile(expr);
+                self.bytecode.extend(expr_bc);
+                Self::emit_result_err(&mut self.bytecode);
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+            Expression::Try(inner) => {
+                // `e?` → if Ok/Some, leave payload; else RETURN the failure.
+                let is_option = self.expr_is_option(inner);
+                let success_tag: u32 = if is_option { 1 } else { 0 }; // Some=1, Ok=0
+
+                let inner_bc = self.do_compile(inner);
+                self.bytecode.extend(inner_bc);
+
+                let mut bb = BlockBuilder::new();
+                let success = bb.fresh_label();
+                bb.emit_jump_to(
+                    success,
+                    BbJumpKind::JumpIfMatch {
+                        tag: success_tag,
+                        arity: 1,
+                    },
+                    &mut self.bytecode,
+                );
+                // Miss: failure value still on stack — propagate via RETURN.
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+
+                let success_pos = self.bytecode.len() as u32;
+                bb.bind_label(
+                    success,
+                    success_pos,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+                bb.finalize()
+                    .expect("BlockBuilder::finalize: Try success label bound");
+                // Payload left on stack for the caller (e.g. StorePop).
+            }
+            Expression::Coalesce(lhs, rhs) => {
+                // `a ?? b` → Ok/Some payload, else evaluate b.
+                let is_option = self.expr_is_option(lhs);
+                let success_tag: u32 = if is_option { 1 } else { 0 };
+
+                let lhs_bc = self.do_compile(lhs);
+                self.bytecode.extend(lhs_bc);
+
+                let mut bb = BlockBuilder::new();
+                let success = bb.fresh_label();
+                let end = bb.fresh_label();
+                bb.emit_jump_to(
+                    success,
+                    BbJumpKind::JumpIfMatch {
+                        tag: success_tag,
+                        arity: 1,
+                    },
+                    &mut self.bytecode,
+                );
+                // Miss: discard failure, evaluate rhs, jump to end.
+                self.bytecode.push(Byte::new(Instruction::POP));
+                let rhs_bc = self.do_compile(rhs);
+                self.bytecode.extend(rhs_bc);
+                bb.emit_jump_to(end, BbJumpKind::Unconditional, &mut self.bytecode);
+
+                let success_pos = self.bytecode.len() as u32;
+                bb.bind_label(
+                    success,
+                    success_pos,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+                // Success: payload already on stack from JumpIfMatch.
+                let end_pos = self.bytecode.len() as u32;
+                bb.bind_label(end, end_pos, &mut self.bytecode, &mut self.constants);
+                bb.finalize()
+                    .expect("BlockBuilder::finalize: Coalesce labels bound");
+            }
+            Expression::OptionalAccess(receiver, field) => {
+                // `opt?.field` → None if opt is None, else Some(opt.field).
+                let recv_bc = self.do_compile(receiver);
+                self.bytecode.extend(recv_bc);
+
+                let mut bb = BlockBuilder::new();
+                let success = bb.fresh_label();
+                let end = bb.fresh_label();
+                bb.emit_jump_to(
+                    success,
+                    BbJumpKind::JumpIfMatch {
+                        tag: 1, // Some
+                        arity: 1,
+                    },
+                    &mut self.bytecode,
+                );
+                // Miss: None stays on stack; skip field access.
+                bb.emit_jump_to(end, BbJumpKind::Unconditional, &mut self.bytecode);
+
+                let success_pos = self.bytecode.len() as u32;
+                bb.bind_label(
+                    success,
+                    success_pos,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+
+                // Payload (inner of Some) on stack — read `.field` then re-wrap Some.
+                use crate::typechecking::ty::{is_option_ty, option_inner};
+                let inner_ty = self.codegen_expr_ty(receiver).and_then(|t| {
+                    if is_option_ty(&t) {
+                        option_inner(&t)
+                    } else {
+                        None
+                    }
+                });
+                let is_record =
+                    matches!(&inner_ty, Some(crate::typechecking::Ty::Record { .. }));
+                let is_class = matches!(
+                    &inner_ty,
+                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
+                );
+                if is_record || is_class {
+                    Self::emit_raw_string_literal(&mut self.bytecode, field);
+                    self.bytecode.push(Byte::new(Instruction::GetField));
+                } else {
+                    let enum_name = inner_ty.as_ref().and_then(extract_enum_name);
+                    let field_index = enum_name
+                        .as_ref()
+                        .and_then(|name| self.checker.field_index_for(name, field))
+                        .map(|(_variant, idx)| idx)
+                        .unwrap_or(0);
+                    self.bytecode.push(
+                        Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
+                    );
+                }
+                Self::emit_ok_or_some_wrap(&mut self.bytecode, true);
+
+                let end_pos = self.bytecode.len() as u32;
+                bb.bind_label(end, end_pos, &mut self.bytecode, &mut self.constants);
+                bb.finalize()
+                    .expect("BlockBuilder::finalize: OptionalAccess labels bound");
+            }
+            Expression::TypeApp { args, .. } => {
+                // Type-position only — consume child IDs, emit no bytes.
+                for arg in args {
+                    let _ = self.do_compile(arg);
+                }
             }
 
             _expr => {
