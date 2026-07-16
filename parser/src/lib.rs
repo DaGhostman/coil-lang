@@ -876,6 +876,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.while_(stmt.clone()),
                 self.if_(stmt.clone()),
                 self.block(stmt.clone()),
+                self.type_alias(),
                 self.variable().then_ignore(op!(';')),
                 self.constant().then_ignore(op!(';')),
                 self.expr_statement(),

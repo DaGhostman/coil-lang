@@ -283,9 +283,9 @@ Aliases are **purely compile-time**: they expand during typechecking and have **
 
 Rules of thumb:
 
-- Declare aliases at the top level: `type Name = T;`
+- Declare aliases where they are used: `type Name = T;`
 - The right-hand side can be any type annotation form: primitives, tuples, arrays, fixed arrays, or class names.
-- Later declarations with the same name overwrite earlier ones (no scoped aliases yet).
+- Inner blocks may shadow outer aliases; duplicate aliases in the same scope are rejected.
 
 Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — Aggregates](../tutorial/05-aggregates.md). See `examples/aliases.0s` for a runnable example.
 

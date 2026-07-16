@@ -182,10 +182,10 @@ fn main() {
 
 Aliases are substituted at **typecheck time** only. They have **zero runtime cost** — no extra bytecode is emitted.
 
-Current limitations:
+Scoping rules:
 
-- Aliases are **global** within a file (no scoped aliases yet).
-- Declaring `type X = T;` twice with the same name silently overwrites the earlier definition.
+- Aliases are lexical: a block or function may define an alias that shadows an outer alias.
+- Declaring `type X = T;` twice in the same scope is a typechecking diagnostic.
 
 See `examples/aliases.0s` for a complete runnable example.
 

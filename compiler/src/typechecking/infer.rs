@@ -61,7 +61,11 @@ pub struct Checker {
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
     /// `type Name = T` aliases (substituted at typecheck time).
-    type_aliases: std::collections::HashMap<String, Ty>,
+    ///
+    /// Mirrors lexical scopes: lookup walks from the innermost frame
+    /// outward, and duplicate declarations are rejected only within
+    /// the current frame.
+    type_aliases: Vec<HashMap<String, Ty>>,
 
     /// Names declared with `const`, tracked per lexical scope so assignment
     /// diagnostics can distinguish immutable bindings from mutable `let`s.
@@ -199,7 +203,7 @@ impl Checker {
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
-            type_aliases: std::collections::HashMap::new(),
+            type_aliases: vec![HashMap::new()],
             const_scopes: vec![HashSet::new()],
             enums: BTreeMap::new(),
             enum_tags: BTreeMap::new(),
@@ -256,6 +260,7 @@ impl Checker {
         self.cache.clear();
         self.codegen_var_types.clear();
         self.type_aliases.clear();
+        self.type_aliases.push(HashMap::new());
         self.const_scopes.clear();
         self.const_scopes.push(HashSet::new());
         self.enums.clear();
@@ -338,11 +343,43 @@ impl Checker {
     fn push_scope(&mut self) {
         self.env.push();
         self.const_scopes.push(HashSet::new());
+        self.type_aliases.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
         let _ = self.env.pop();
         let _ = self.const_scopes.pop();
+        if self.type_aliases.len() > 1 {
+            let _ = self.type_aliases.pop();
+        } else if let Some(frame) = self.type_aliases.last_mut() {
+            frame.clear();
+        } else {
+            self.type_aliases.push(HashMap::new());
+        }
+    }
+
+    fn register_type_alias(&mut self, name: &str, alias_ty: Ty, range: Range<usize>) {
+        if self.type_aliases.is_empty() {
+            self.type_aliases.push(HashMap::new());
+        }
+
+        let duplicate = self
+            .type_aliases
+            .last()
+            .map(|frame| frame.contains_key(name))
+            .unwrap_or(false);
+
+        if duplicate {
+            let mut msg = Message::error(format!("Duplicate type alias `{}`", name), range);
+            msg.with_help("type aliases may shadow names only from an outer scope".to_string());
+            self.messages.push(msg);
+            return;
+        }
+
+        self.type_aliases
+            .last_mut()
+            .expect("type alias scope should exist")
+            .insert(name.to_string(), alias_ty);
     }
 
     fn insert_const_binding(&mut self, name: impl Into<String>) {
@@ -1244,7 +1281,7 @@ impl Checker {
             }
             Expression::TypeAlias { name, ty } => {
                 let alias_ty = self.parse_type_name(ty);
-                self.type_aliases.insert(name.to_string(), alias_ty.clone());
+                self.register_type_alias(name, alias_ty, range);
                 let _ = self.infer(ty); // ID alignment
                 unit_ty()
             }
@@ -1787,8 +1824,10 @@ impl Checker {
     }
 
     fn parse_type_name_str(&self, name: &str) -> Ty {
-        if let Some(alias_ty) = self.type_aliases.get(name) {
-            return alias_ty.clone();
+        for frame in self.type_aliases.iter().rev() {
+            if let Some(alias_ty) = frame.get(name) {
+                return alias_ty.clone();
+            }
         }
         // Built-in type names are matched case-insensitively so the
         // user can write `String`, `STRING`, etc.
@@ -3823,11 +3862,13 @@ fn unwrap_expr_wrappers<'a>(node: &'a Output<'a>) -> &'a Output<'a> {
 /// initializers. Used by [`Checker::infer_fragment`] to decide whether
 /// to consume the next sibling as a `let` initializer.
 fn is_declaration_like(node: &Output) -> bool {
+    let node = unwrap_expr_wrappers(node);
     matches!(
         node.1.as_ref(),
         Expression::Variable(..)
             | Expression::Constant(..)
             | Expression::Assignment(..)
+            | Expression::TypeAlias { .. }
             | Expression::Comment(..)
             | Expression::Use { .. }
             | Expression::Noop(..)
@@ -5740,8 +5781,49 @@ mod tests {
 
     #[test]
     fn alias_does_not_leak_into_unrelated_declarations() {
-        // Global alias table: later declarations overwrite earlier ones.
         let src = "type Int = int; fn main() { }";
+        let (_c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn function_body_alias_can_shadow_outer_alias() {
+        let src = r#"
+            type Value = int;
+            fn main() {
+                type Value = string;
+                let s: Value = "ok";
+            }
+            fn id(Value x) -> int { return x; }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn duplicate_type_alias_in_same_scope_errors() {
+        let src = "type Id = int; type Id = string; fn main() { }";
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Duplicate type alias `Id`")),
+            "expected duplicate alias diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn block_scoped_alias_does_not_leak() {
+        let src = r#"
+            type Local = int;
+            fn main() {
+                if true {
+                    type Local = string;
+                    let s: Local = "ok";
+                }
+                let n: Local = 1;
+            }
+        "#;
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
     }

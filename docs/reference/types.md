@@ -151,8 +151,9 @@ fn id(UserId x) -> UserId { return x; }
 
 | Property | Behavior |
 |----------|----------|
-| Scope | Global per compilation unit (no block scoping yet) |
-| Shadowing | Later alias with same name overwrites |
+| Scope | Lexical: program, function, and block scopes |
+| Shadowing | Inner scopes may shadow outer aliases |
+| Duplicate names | Duplicate alias in the same scope is a diagnostic |
 | RHS | Any `type_annotation` form |
 
 ---
@@ -278,7 +279,7 @@ a stale value.
 
 | Area | Limitation |
 |------|------------|
-| Type aliases | No lexical scoping; duplicate names silently overwrite |
+| Type aliases | Lexically scoped; duplicate names in the same scope are rejected |
 | Classes | Nominal typing partial; limited runtime method dispatch |
 | FFI | Only `int`, `float`, `string`, `void` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | No user-defined generic types |
