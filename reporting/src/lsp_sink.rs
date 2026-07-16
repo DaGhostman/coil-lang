@@ -220,7 +220,6 @@ mod tests {
 
     use super::*;
     use crate::codes::ErrorCode;
-    use crate::diagnostic::{Location, RelatedLabel};
     use crate::message::{Label as MsgLabel, Message};
 
     #[derive(Clone, Default)]
