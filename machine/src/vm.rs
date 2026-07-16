@@ -878,8 +878,11 @@ impl<const S: usize> Machine<S> {
             }
 
             let bc = opcode.bytecode();
+            // Release-only optimizer hint: must track the LAST `Instruction`
+            // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
+            // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::YieldFromCoro as u8);
+            promise!(*bc as u8 <= Instruction::ArrayLen as u8);
 
             match bc {
                 Instruction::POP => {
