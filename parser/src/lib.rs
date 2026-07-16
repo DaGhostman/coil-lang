@@ -186,6 +186,7 @@ impl<'pratt> Pratt<'pratt> {
                 // otherwise match `self.call(...)` as ordinary
                 // function calls to non-existent functions.
                 self.dload(expr.clone()),
+                self.done_(expr.clone()),
                 self.declare(expr.clone()),
                 self.invoke_(expr.clone()),
                 self.resume_(expr.clone()),
@@ -698,6 +699,35 @@ impl<'pratt> Pratt<'pratt> {
                 (
                     e.span(),
                     Box::new(Expression::Dload(args.into_iter().next().unwrap())),
+                )
+            })
+    }
+
+    /// `done(handle)` — true when a coroutine has completed.
+    fn done_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::keyword("done")
+            .labelled("done builtin")
+            .ignore_then(
+                expr.clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .at_least(1)
+                    .at_most(1)
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('('), op!(')')),
+            )
+            .map_with(|args, e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Done(args.into_iter().next().unwrap())),
                 )
             })
     }

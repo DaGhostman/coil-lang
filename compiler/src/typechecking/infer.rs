@@ -718,6 +718,15 @@ impl Checker {
                 let _ = self.infer(path);
                 int()
             }
+            // `done(h)` — true when coroutine handle `h` is Done.
+            Expression::Done(handle) => {
+                let handle_ty = self.infer(handle);
+                let y_var = Ty::Var(self.counter.fresh());
+                let s_var = Ty::Var(self.counter.fresh());
+                let coro_ty = self.coroutine_type(y_var, s_var);
+                self.unify(&handle_ty, &coro_ty, &range, "done argument");
+                boolean()
+            }
             // Tuple literal
             Expression::Tuple(items) => {
                 let mut elem_tys = Vec::with_capacity(items.len());
@@ -1874,6 +1883,17 @@ impl Checker {
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
             let send_ty = Ty::Var(self.counter.fresh());
+            // Honor `async fn -> T`: unify declared T with the yield/
+            // return slot so annotation mismatches are diagnosed.
+            if let Some(r) = returns {
+                let declared = self.parse_type_name(r);
+                self.unify(
+                    &yield_ty,
+                    &declared,
+                    &r.0.into_range(),
+                    "async fn return type",
+                );
+            }
             let coro = self.coroutine_type(yield_ty.clone(), send_ty.clone());
             (coro, Some(yield_ty), Some(send_ty))
         } else {
@@ -2233,6 +2253,7 @@ impl Checker {
                 }
             }
             Expression::Dload(path) => self.pre_register_enums_walk(path, errors),
+            Expression::Done(handle) => self.pre_register_enums_walk(handle, errors),
             Expression::Tuple(items) => {
                 for c in items {
                     self.pre_register_enums_walk(c, errors);
@@ -5752,5 +5773,35 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
             .codegen_var_type("x")
             .expect("x should be recorded in codegen_var_types");
         assert_eq!(apply_ty_prune(c.subst(), x_ty), int());
+    }
+
+    #[test]
+    fn done_builtin_typechecks_to_bool() {
+        let src = "async fn c() { yield 1; } fn main() { let h = c(); let d = done(h); }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let d_ty = c
+            .codegen_var_type("d")
+            .expect("d should be recorded");
+        assert_eq!(apply_ty_prune(c.subst(), d_ty), boolean());
+    }
+
+    #[test]
+    fn async_fn_return_annotation_unifies_with_yield() {
+        let src = "async fn c() -> int { yield 1; return 2; } fn main() { let h = c(); }";
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+    }
+
+    #[test]
+    fn async_fn_return_annotation_mismatch_errors() {
+        let src = "async fn c() -> string { yield 1; } fn main() { let h = c(); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "expected annotation mismatch, got {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 }

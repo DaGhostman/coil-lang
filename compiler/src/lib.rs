@@ -1358,6 +1358,11 @@ impl Compiler {
                 self.bytecode.extend(bc);
                 self.bytecode.push(Byte::new(Instruction::FfiLoad));
             }
+            Expression::Done(handle) => {
+                let bc = self.do_compile(handle);
+                self.bytecode.extend(bc);
+                self.bytecode.push(Byte::new(Instruction::DoneCoro));
+            }
             // --- Aggregates ---
             Expression::Tuple(items) => {
                 for c in items {

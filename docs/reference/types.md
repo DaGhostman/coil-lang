@@ -286,7 +286,7 @@ a stale value.
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
 | String `+` | Not in current tree — do not rely on string concatenation |
-| `async fn` `-> T` annotation | An explicit `-> T` on an `async fn` signature is not checked against anything — the coroutine's yield type `Y` is inferred purely from its `yield`/`return` sites, not from the annotation. Omit it or write it for documentation purposes only |
+| `async fn` `-> T` annotation | When present, `T` is unified with the coroutine yield/return type `Y` (same slot as `yield` / `return` / `resume`). A mismatch is a type error. |
 | `const` | No `const` keyword in parser — use `let` |
 
 ---

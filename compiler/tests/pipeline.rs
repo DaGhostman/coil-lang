@@ -540,6 +540,12 @@ fn example_coro_yield_from_prints_012() {
     assert_eq!(output, "012");
 }
 
+#[test]
+fn example_coro_done_prints_false_false_true() {
+    let output = run_example("examples/coro_done.0s");
+    assert_eq!(output, "falsefalsetrue");
+}
+
 /// Regression guard: `resume h` used INLINE as a `print` argument
 /// (no intermediate `let` binding) must not corrupt the operand
 /// stack. Pre-fix, the bare `yield expr;` statement's spurious

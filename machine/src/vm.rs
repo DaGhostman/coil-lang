@@ -1881,6 +1881,19 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                 }
+                Instruction::DoneCoro => {
+                    if self.stack.tell() == 0 {
+                        self.stack.push(Value::from(false));
+                    } else {
+                        let handle = self.stack.pop();
+                        let addr = handle.raw() as u64;
+                        let is_done = matches!(
+                            Self::find_object_by_addr(&self.heap, addr),
+                            Some(Object::Coroutine(gc)) if gc.as_ref().state == CoroState::Done
+                        );
+                        self.stack.push(Value::from(is_done));
+                    }
+                }
                 _ => return false,
             }
         }

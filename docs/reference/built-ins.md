@@ -14,6 +14,7 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `dload` | Expression | `dlopen` a shared library |
 | `declare` | Expression | Register FFI function signature |
 | `invoke` | Expression | Call registered FFI function |
+| `done` | Expression | `true` if a coroutine handle is finished |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
 Internal (not user syntax): `FORMAT` opcode used by `print` with specifiers; `Expression::Format` in AST without a `format` keyword.
@@ -101,6 +102,36 @@ let lib = dload("libsum.so");
 - Requires libffi-enabled build.
 - Prefer full paths when cwd is unpredictable.
 - Same mechanism as the string in `extern "..." { ... }` blocks.
+
+---
+
+## `done`
+
+Test whether a coroutine handle has finished.
+
+### Syntax
+
+```0s
+done(handle_expr)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `handle_expr` | `coroutine<Y, S>` | Handle from calling an `async fn` |
+
+### Returns
+
+`bool` — `true` after the coroutine body has returned (or fallen off the end); `false` while still suspended at a `yield` or before the first `resume`.
+
+### Example
+
+```0s
+let h = counter();
+print "%z", done(h); // false
+resume h;
+resume h;            // completes
+print "%z", done(h); // true
+```
 
 ---
 

@@ -112,6 +112,9 @@ pub enum Expression<'expr> {
     /// Dynamic library load: `dload(path)`.
     Dload(Output<'expr>),
 
+    /// Coroutine completion check: `done(handle)`.
+    Done(Output<'expr>),
+
     /// Runtime FFI registration: `declare(lib, name, args_tuple, ret_type)`.
     Declare(Vec<Output<'expr>>),
 
@@ -418,6 +421,7 @@ impl<'a> Display for Expression<'a> {
                     ))
             ),
             Self::Dload(path) => write!(f, "dload({})", path.1),
+            Self::Done(handle) => write!(f, "done({})", handle.1),
             Self::Tuple(items) => write!(
                 f,
                 "({})",

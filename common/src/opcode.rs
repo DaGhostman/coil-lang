@@ -150,6 +150,9 @@ pub enum Instruction {
 
     /// Logical NOT: bool or int (zero vs non-zero) → bool.
     LogNot,
+
+    /// Coroutine done-check: pop handle, push `true` if `CoroState::Done`.
+    DoneCoro,
 }
 
 impl From<u8> for Instruction {

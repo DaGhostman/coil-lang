@@ -146,6 +146,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             }
         }
         Expression::Dload(path) => pre_walk(path, table),
+        Expression::Done(handle) => pre_walk(handle, table),
         Expression::Tuple(items) => {
             for c in items {
                 pre_walk(c, table);
