@@ -251,9 +251,10 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 | Limitation | Detail |
 |------------|--------|
-| Four FFI primitives only | No structs, pointers, or callbacks in the type system |
 | Explicit signatures | Wrong arity or tag → runtime failure or `-1` from `declare` |
-| `invoke` return typing | Typechecker treats `invoke` as `int`; you must match what you declared |
+| Struct returns | `extern struct` + `declare(..., Point)` returns a record; fields via `.x` |
+| Callback returns | Opaque `Ptr` / function address — no auto-trampoline; re-`declare` to call |
+| `invoke` return typing | Refined from `let id = declare(..., ret)` when `fn_id` is that binding; else `int` |
 
 ### Safety
 
@@ -262,7 +263,7 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 | **Memory safety** | FFI bypasses the typechecker at the C boundary. Buggy C code can corrupt the VM process. |
 | **No sandbox** | `dload` runs with the host process privileges. Only load libraries you trust. |
 | **Symbol collisions** | `dlsym` resolves by name; duplicate weak symbols can bind unexpectedly. |
-| **Platform ABI** | libffi maps to the platform C ABI. Struct padding, calling conventions, and 32 vs 64 bit must match your C compiler — stick to primitive-only signatures. |
+| **Platform ABI** | libffi maps to the platform C ABI. Struct padding and calling conventions must match your C compiler. Prefer `int32`/`int64` field widths that match the C layout. |
 | **String lifetimes** | Do not let C retain script string pointers; do not return dangling `char *` from C. |
 
 ### Operational

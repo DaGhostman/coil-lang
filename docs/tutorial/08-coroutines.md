@@ -46,6 +46,17 @@ fn main() {
 
 Resuming an already-**done** coroutine always returns `0` (`Value::default()`) — never the coroutine's last `return` value. There's no error-handling protocol yet to signal "resumed after completion", so this fixed sentinel avoids leaking a stale value (MVP protocol; a real error/`Result` mechanism is future work).
 
+Use `done(h)` to ask whether a handle has completed (returns `bool`):
+
+```0s
+let h = two_step();
+print "%z", done(h); // false
+resume h;
+resume h;
+resume h;            // completes
+print "%z", done(h); // true
+```
+
 `resume h` can be used inline anywhere an expression is expected, including directly as a `print` argument:
 
 ```0s

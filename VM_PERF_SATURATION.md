@@ -1,7 +1,8 @@
 # VM Performance Saturation Pass
 
-`ARCHIVE_VERSION` bumped to **13** for new fused opcodes `BinSlotImmJmpf` and
-`LogNotJmpf`.
+`ARCHIVE_VERSION` was bumped to **13** for fused opcodes `BinSlotImmJmpf` and
+`LogNotJmpf`. Current tree is **15** (also includes `DoneCoro`, `ArrayPush` /
+`ArrayLen`, and later fusion work).
 
 ## Baseline corpus
 
@@ -68,8 +69,7 @@ Peephole also extends `is_bin_op` / `is_int_bin_op` for `Pow`, `BITAND`, `BITOR`
 
 ## Known limitations
 
-- **`let x = match { … }` binding** returns `0` / wrong values (pre-existing). `match_sum` is kept for bytecode/dispatch measurement only; end-to-end golden is intentionally omitted until the binding bug is fixed.
-- **`match_sum` CLI output** may be wrong; use `cargo test -p compiler --test perf_metrics perf_match_sum` for shape checks.
+- **`let x = match { … }` binding** — fixed in P0 (Match no longer emits `RETURN` at `end_label`; arm value stays on the stack for `StorePop`). `match_sum` end-to-end output is valid when used with `return match` (as in the example).
 
 ## Verification
 

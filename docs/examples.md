@@ -8,7 +8,7 @@ cargo run -- examples/<file>.0s
 
 Delete `out.c0s` after editing source to force recompilation.
 
-> **Note:** The default CLI compiles a **single file** in memory. Programs with `use` / `mod` need multi-file compilation via the pipeline API (see [Modules](#modules--namespaces) below). FFI examples need **libffi** and sometimes a built shared library.
+> **Note:** The CLI uses multi-file discovery (`Pipeline::compile_src_from_file`) when a `zero.toml` is present, so `use` / `mod` examples such as `modules.0s` work from `cargo run`. FFI examples need **libffi** and sometimes a built shared library (`examples/libsum.so`).
 
 ---
 
@@ -50,6 +50,27 @@ fn main() {
 
 ---
 
+### `examples/string_fmt.0s`
+
+**Demonstrates:** String concatenation with `+` and the `format` expression returning a string.
+
+```0s
+fn main() {
+    let a = "hello";
+    let b = "world";
+    print "%s", a + " " + b;
+    let s = format "%i-%s", 42, "x";
+    print "%s", s;
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/string_fmt.0s` |
+| **Output** | `hello world42-x` |
+
+---
+
 ### `examples/let_test.0s`
 
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).
@@ -74,23 +95,44 @@ fn main() {
 
 ### `examples/const.0s`
 
-**Demonstrates:** Function calls mixed with arithmetic; uses `%u` format for unsigned-style integer printing.
+**Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
 
 ```0s
-fn sum(int a, int b) -> int {
-    return a + b;
-}
-
 fn main() {
-    print "%u", 2 + 2 + sum(2 + 2);
-    print "%u", 2 + 2 + 2 + 2;
+    const answer = 42;
+    print "%i", answer;
+    const greeting = "hi";
+    print "%s", greeting;
 }
 ```
 
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/const.0s` |
-| **Status** | As written, `sum(2 + 2)` passes only one argument — the typechecker reports an arity error. The second `print` line alone would print `8` once fixed. |
+| **Output** | `42hi` |
+
+---
+
+### `examples/for_break.0s`
+
+**Demonstrates:** C-style `for` with `continue` and `break` (sum `0+1+2+4+5+6` = `18`).
+
+```0s
+fn main() {
+    let sum = 0;
+    for (let i = 0; i < 10; i = i + 1) {
+        if i == 3 { continue; }
+        if i == 7 { break; }
+        sum = sum + i;
+    }
+    print "%i", sum;
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_break.0s` |
+| **Output** | `18` |
 
 ---
 
@@ -366,6 +408,28 @@ fn read_x_v(Outer o) -> int {
 
 Tuples, arrays, dicts, and `type` aliases.
 
+### `examples/array_grow.0s`
+
+**Demonstrates:** Growing arrays with `push`, reading the runtime length with `len`, and indexing appended elements.
+
+```0s
+fn main() {
+    let a = [1, 2];
+    push(a, 3);
+    push(a, 4);
+    print "%i", len(a);
+    print "%i", a[0];
+    print "%i", a[3];
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/array_grow.0s` |
+| **Output** | `414` |
+
+---
+
 ### `examples/dict.0s`
 
 **Demonstrates:** Anonymous structurally typed records (`{ foo: 42, bar: 100 }`) and field read via `d.foo`.
@@ -519,45 +583,83 @@ print "%i", invoke(lib, sum_id, (40, 2));
 
 ### `examples/sum.c`
 
-**Demonstrates:** C companion source for `ffi_sum.0s` (not a zero-script file).
+**Demonstrates:** C companion source for `ffi_sum.0s`, `ffi_struct_ret.0s`, and `ffi_callback_ret.0s` (not a zero-script file).
 
 ```c
 int sum(int a, int b) { return a + b; }
+/* also: make_point, get_doubler, … */
 ```
 
 | | |
 |---|---|
-| **Compile** | `cc -shared -fPIC -o libsum.so examples/sum.c` |
+| **Compile** | `cc -shared -fPIC -o examples/libsum.so examples/sum.c` |
 
 ---
 
-## Classes (partial)
+### `examples/ffi_struct_ret.0s`
+
+**Demonstrates:** `extern struct` return from C unpacked into a record (`p.x` / `p.y`).
+
+| | |
+|---|---|
+| **Run** | Build `examples/libsum.so`, then `cargo run -- examples/ffi_struct_ret.0s` |
+| **Output** | `34` |
+
+---
+
+### `examples/ffi_callback_ret.0s`
+
+**Demonstrates:** Opaque function-pointer return (`FFIType::Ptr`); prints `1` if non-null.
+
+| | |
+|---|---|
+| **Run** | Build `examples/libsum.so`, then `cargo run -- examples/ffi_callback_ret.0s` |
+| **Output** | `1` |
+
+---
+
+### `examples/ffi_callback.0s` / `examples/ffi_array.0s`
+
+**Demonstrates:** Callback trampolines and pointer/array FFI shapes (see source). Require `libsum.so` / libffi.
+
+---
+
+## Classes
 
 ### `examples/classes.0s`
 
-**Demonstrates:** `class` declaration, `impl` method, `new Foo()`; class features are **partial** — most field/method usage remains commented out.
+**Demonstrates:** Positional ctor args, field read/write, and method calls (`self`).
 
 ```0s
-class Foo {
-    name: String,
+class Point {
+    x: int,
+    y: int,
 }
 
-impl Foo {
-    fn sadge() -> int {
-        return 42;
+impl Point {
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+
+    fn set_x(int n) {
+        self.x = n;
     }
 }
 
 fn main() {
     print "%i", (2 * 2 + 3);
-    let x = new Foo();
+    let p = new Point(1, 3);
+    print "%i", p.sum();
+    p.set_x(5);
+    print "%i", p.x;
+    print "%i", p.sum();
 }
 ```
 
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/classes.0s` |
-| **Output** | `7` |
+| **Output** | `7458` |
 
 ---
 
@@ -631,7 +733,16 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
-## Not implemented / broken examples
+### `examples/coro_done.0s`
+
+**Demonstrates:** `done(h)` builtin — `false` while suspended, `true` after completion.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/coro_done.0s` |
+| **Output** | `falsefalsetrue` |
+
+---
 
 ## Quick reference table
 
@@ -639,8 +750,10 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 |------|----------|-------------------|
 | `print_literal.0s` | Basics | `hello` |
 | `format_literal.0s` | Basics | `42` |
+| `string_fmt.0s` | Basics | `hello world42-x` |
 | `let_test.0s` | Basics | `51020` |
-| `const.0s` | Basics | Type error (arity); fix `sum` call to run |
+| `const.0s` | Basics | `42hi` |
+| `for_break.0s` | Basics | `18` |
 | `fizbuz.0s` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
 | `fib.0s` | Basics | `2178309` |
 | `bench.0s` | Basics | `12\n` |
@@ -653,21 +766,25 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `mixed.0s` | Enums | `025122` |
 | `nested_records.0s` | Enums | `99` |
 | `chained.0s` | Enums / fields | `427` |
+| `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
-| `modules.0s` | Modules | `1a4\n45` (needs module setup) |
+| `modules.0s` | Modules | `1a4\n45` |
 | `src/foo/sadge.0s` | Modules | (support file) |
 | `src/foo.0s` | Modules | (support file) |
 | `strlen.0s` | FFI | `5` |
 | `ffi_sum.0s` | FFI | `42` |
+| `ffi_struct_ret.0s` | FFI | `34` |
+| `ffi_callback_ret.0s` | FFI | `1` |
 | `sum.c` | FFI | (C source, not `.0s`) |
-| `classes.0s` | Classes | `7` |
+| `classes.0s` | Classes | `7458` |
 | `coro.0s` | Coroutines | (see source) |
 | `coro_gen.0s` | Coroutines | `012` |
 | `coro_send.0s` | Coroutines | `hello` |
 | `coro_yield_from.0s` | Coroutines | `012` |
 | `coro_interleave.0s` | Coroutines | `10,100,101,11,12,102` |
+| `coro_done.0s` | Coroutines | `falsefalsetrue` |
 
 ## Running tests that mirror examples
 

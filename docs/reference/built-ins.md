@@ -11,12 +11,16 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | Builtin | Kind | Purpose |
 |---------|------|---------|
 | `print` | Statement | Write to stdout |
+| `format` | Expression | Build a formatted string |
+| `push` | Expression | Append to an array in place and return the array |
+| `len` | Expression | Return an array length |
 | `dload` | Expression | `dlopen` a shared library |
 | `declare` | Expression | Register FFI function signature |
 | `invoke` | Expression | Call registered FFI function |
+| `done` | Expression | `true` if a coroutine handle is finished |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
-Internal (not user syntax): `FORMAT` opcode used by `print` with specifiers; `Expression::Format` in AST without a `format` keyword.
+Internal: the `FORMAT` opcode powers both `print` and the `format` expression.
 
 ---
 
@@ -72,6 +76,48 @@ See [Tutorial 01](../tutorial/01-basics.md) for introductory usage.
 
 ---
 
+## `push` and `len`
+
+Array helpers compiled as built-in calls.
+
+```0s
+push(arr, value)
+len(arr)
+```
+
+| Builtin | Argument types | Returns | Behavior |
+|---------|----------------|---------|----------|
+| `push` | `[T]`, `T` | `[T]` | Appends to the heap array in place and returns the same array for chaining |
+| `len` | `[T]` | `int` | Returns the current runtime length |
+
+`push` promotes a fixed-length array binding to dynamic array type for later checks, so indexing a newly appended literal position is accepted after the push:
+
+```0s
+let a = [1, 2];
+push(a, 3);
+print "%i", len(a); // 3
+print "%i", a[2];  // 3
+```
+
+---
+
+## `format`
+
+### Syntax
+
+```
+format_expr ::= 'format' STRING (',' expr)*
+```
+
+`format` uses the same specifier rules as `print`, but returns the formatted `string` instead of writing to stdout.
+
+```0s
+let s = format "%i-%s", 42, "x";
+print "%s", s; // 42-x
+```
+
+---
+
 ## `dload`
 
 Load a native shared library at runtime.
@@ -101,6 +147,36 @@ let lib = dload("libsum.so");
 - Requires libffi-enabled build.
 - Prefer full paths when cwd is unpredictable.
 - Same mechanism as the string in `extern "..." { ... }` blocks.
+
+---
+
+## `done`
+
+Test whether a coroutine handle has finished.
+
+### Syntax
+
+```0s
+done(handle_expr)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `handle_expr` | `coroutine<Y, S>` | Handle from calling an `async fn` |
+
+### Returns
+
+`bool` — `true` after the coroutine body has returned (or fallen off the end); `false` while still suspended at a `yield` or before the first `resume`.
+
+### Example
+
+```0s
+let h = counter();
+print "%z", done(h); // false
+resume h;
+resume h;            // completes
+print "%z", done(h); // true
+```
 
 ---
 
@@ -175,7 +251,7 @@ print "%i", invoke(lib, sum_id, (40, 2));
 
 ### Typechecker note
 
-`invoke` is typed as `int` at inference time regardless of declared return type. The programmer is responsible for consistency with `declare`.
+`invoke` returns the type recorded from the matching `declare(..., ret)` (or `unit` for `void`). Bind the `declare` result with `let id = declare(...)` so the side table can refine later `invoke` calls.
 
 ---
 
@@ -203,12 +279,12 @@ There is **no general standard library** yet. The following are **not** built-in
 
 | Category | Examples |
 |----------|----------|
-| Collections API | `len`, `push`, `sort`, iterators |
-| String ops | concat (`+`), slice, trim (except `print` formatting) |
+| Collections API | `sort`, iterators (`push` / `len` are builtins) |
+| String ops | slice, trim (concat via `+` and `format` are supported) |
 | Math | `sin`, `sqrt`, `random` |
 | File I/O | `read_file`, `write_file` |
 | Networking | sockets, HTTP |
-| Concurrency | threads, async/await (parser not wired) |
+| Concurrency | OS threads (stackful coroutines via `async` / `yield` / `resume` / `done` are supported) |
 | Memory | `alloc`, `free` |
 
 Use **FFI** to call C libraries for these capabilities, or **host natives** when embedding the VM in Rust.

@@ -130,20 +130,21 @@ See [FFI tutorial](../tutorial/07-ffi.md).
 class_decl ::= 'class' IDENT '{' field_decl (',' field_decl)* ','? '}'
 field_decl ::= 'pub'? IDENT ':' type
 
-impl_decl  ::= 'impl' IDENT '{' method_decl (',' method_decl)* ','? '}'
+impl_decl  ::= 'impl' IDENT '{' method_decl* '}'
 method_decl ::= 'pub'? function_decl
 ```
 
 Example:
 
 ```0s
-class Foo { pub name: string, count: int }
+class Foo { pub name: string, count: int, }
 impl Foo {
     pub fn bump() -> int { return 1; }
+    fn name_len() -> int { return 0; }
 }
 ```
 
-Classes are partially supported at runtime — see [Getting Started](../getting-started.md).
+Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s`.
 
 ### Defer
 
@@ -161,9 +162,13 @@ Inside `{ ... }` blocks:
 
 ```
 statement ::= while_stmt
+            | for_stmt
+            | break_stmt
+            | continue_stmt
             | if_stmt
             | block
             | let_stmt
+            | const_stmt
             | expr_stmt
             | print_stmt
             | return_stmt
@@ -173,11 +178,15 @@ statement ::= while_stmt
 | Statement | Syntax |
 |-----------|--------|
 | `let` | `let IDENT (':' type_annotation)? ('=' expr)? ';'` |
+| `const` | `const IDENT (':' type_annotation)? '=' expr ';'` |
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return expr ';'` |
 | `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
+| `for` | `for '(' init ';' cond ';' step ')' block` (C-style; desugars to `while`) |
+| `break` | `break ';'` (innermost loop) |
+| `continue` | `continue ';'` (jumps to `for` step / `while` condition) |
 | `if` | `if expr block ('else' (block \| if_stmt))?` |
 | Block | `'{' statement* '}'` |
 
@@ -341,15 +350,12 @@ With `zero.toml`, the pipeline discovers dependencies via `use` / `mod` and comp
 
 ## Not yet in the grammar
 
-These appear in planning docs or internal AST nodes but are **not** parsed from source today:
+These appear in planning docs but are **not** parsed from source today:
 
 | Feature | Status |
 |---------|--------|
-| `const` declarations | AST support only; use `let` |
-| `format` as keyword | Use `print "%i", x` |
-| `async` / `yield` / `resume` | Coroutine opcodes exist; parser keywords not wired |
 | `case` as alias for `match` | Not registered |
-| String concat `+` | Not in current typechecker/codegen tree |
+| Iterator `for x in …` | Not implemented — use C-style `for` or `while` |
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 

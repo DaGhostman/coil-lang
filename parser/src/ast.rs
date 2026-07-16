@@ -112,6 +112,9 @@ pub enum Expression<'expr> {
     /// Dynamic library load: `dload(path)`.
     Dload(Output<'expr>),
 
+    /// Coroutine completion check: `done(handle)`.
+    Done(Output<'expr>),
+
     /// Runtime FFI registration: `declare(lib, name, args_tuple, ret_type)`.
     Declare(Vec<Output<'expr>>),
 
@@ -145,6 +148,15 @@ pub enum Expression<'expr> {
     Call {
         name: Output<'expr>,
         args: Option<Vec<Output<'expr>>>,
+    },
+
+    Break,
+    Continue,
+    For {
+        init: Option<Output<'expr>>,
+        cond: Output<'expr>,
+        step: Option<Output<'expr>>,
+        body: Output<'expr>,
     },
 
     Loop {
@@ -417,7 +429,22 @@ impl<'a> Display for Expression<'a> {
                             .join(", ")
                     ))
             ),
+            Self::Format(fmt, params) => write!(
+                f,
+                "format {}{}",
+                fmt.borrow().1,
+                params
+                    .clone()
+                    .map_or(String::default(), |p: Vec<Output<'a>>| format!(
+                        ", {}",
+                        p.iter()
+                            .map(|p| p.1.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    ))
+            ),
             Self::Dload(path) => write!(f, "dload({})", path.1),
+            Self::Done(handle) => write!(f, "done({})", handle.1),
             Self::Tuple(items) => write!(
                 f,
                 "({})",
@@ -498,6 +525,18 @@ impl<'a> Display for Expression<'a> {
                     },
                     body.1
                 )
+            }
+            Self::Break => write!(f, "break"),
+            Self::Continue => write!(f, "continue"),
+            Self::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                let init = init.as_ref().map(|i| i.1.to_string()).unwrap_or_default();
+                let step = step.as_ref().map(|s| s.1.to_string()).unwrap_or_default();
+                write!(f, "for ({}; {}; {}) {{\n{}}}", init, cond.1, step, body.1)
             }
             Self::Assignment(n, e) => {
                 write!(f, "{} = {}", n.1, e.1)

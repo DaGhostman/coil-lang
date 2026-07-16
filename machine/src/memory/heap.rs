@@ -163,6 +163,16 @@ impl Heap {
         }
     }
 
+    /// Adjust tracked heap bytes after an in-place grow/shrink of a managed
+    /// object's internal Rust allocation (for example `ObjArray.elements`).
+    pub fn account_resize(&mut self, old_size: usize, new_size: usize) {
+        if new_size >= old_size {
+            self.alloc_bytes += new_size - old_size;
+        } else {
+            self.alloc_bytes -= old_size - new_size;
+        }
+    }
+
     /// Deallocates an object.
     ///
     /// ## Safety

@@ -16,7 +16,7 @@ use common::{
 };
 
 use crate::{
-    CoroState, CStructLayout, Frame, Heap, Member, ObjArray, ObjCoroutine, ObjEnum, ObjInstance,
+    CStructLayout, CoroState, Frame, Heap, Member, ObjArray, ObjCoroutine, ObjEnum, ObjInstance,
     ObjString, ObjTuple, Object, RefCoroutine, Stack,
 };
 
@@ -181,11 +181,7 @@ impl<const S: usize> Machine<S> {
         self.ffi_search_paths = search_paths;
     }
 
-    pub fn with_ffi_paths(
-        mut self,
-        base_dir: Option<PathBuf>,
-        search_paths: Vec<PathBuf>,
-    ) -> Self {
+    pub fn with_ffi_paths(mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) -> Self {
         self.base_dir = base_dir;
         self.ffi_search_paths = search_paths;
         self
@@ -261,7 +257,7 @@ impl<const S: usize> Machine<S> {
         sig: &crate::ffi::FfiSignature,
         args: &[Value],
     ) -> Result<Vec<Value>, crate::ffi::FfiError> {
-        use crate::ffi::{callback_cif, make_int_callback, VmCallFn};
+        use crate::ffi::{VmCallFn, callback_cif, make_int_callback};
         use crate::memory::FfiType;
         let mut out = args.to_vec();
         let vm_ptr = self as *mut Self as *mut c_void;
@@ -451,7 +447,12 @@ impl<const S: usize> Machine<S> {
 
     /// Manually trigger GC (for tests).
     pub fn collect_garbage(&mut self) {
-        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+        Self::gc_collect(
+            &mut self.heap,
+            &self.stack,
+            &self.resume_stack,
+            &mut self.alloc_counter,
+        );
     }
 
     fn with_coroutine_mut(&self, addr: u64, f: impl FnOnce(&mut ObjCoroutine)) {
@@ -472,7 +473,11 @@ impl<const S: usize> Machine<S> {
         let mut current = self.heap.head_for_lookup();
         while let Some(reference) = current {
             if let Object::Coroutine(gc) = reference {
-                if gc.as_ref().yield_from.as_ref().is_some_and(|d| d.as_ptr() as u64 == sub_addr)
+                if gc
+                    .as_ref()
+                    .yield_from
+                    .as_ref()
+                    .is_some_and(|d| d.as_ptr() as u64 == sub_addr)
                 {
                     return Some(gc.clone());
                 }
@@ -499,7 +504,10 @@ impl<const S: usize> Machine<S> {
         let current_depth = self.frames.len();
         let mut saved_frames = Vec::new();
         for idx in (frame_depth + 1)..current_depth {
-            saved_frames.push((self.frames[idx].tell(), self.frames[idx].get().saturating_sub(base_sp)));
+            saved_frames.push((
+                self.frames[idx].tell(),
+                self.frames[idx].get().saturating_sub(base_sp),
+            ));
         }
         if saved_frames.is_empty() {
             saved_frames.push((ip, sp.saturating_sub(base_sp)));
@@ -624,7 +632,11 @@ impl<const S: usize> Machine<S> {
     }
 
     fn yield_coroutine(&mut self, ip: &mut usize, sp: &mut usize, yield_val: Value) {
-        let Some(ctx) = self.resume_stack.last().map(|c| (c.coro, c.base_sp, c.frame_depth)) else {
+        let Some(ctx) = self
+            .resume_stack
+            .last()
+            .map(|c| (c.coro, c.base_sp, c.frame_depth))
+        else {
             self.stack.push(yield_val);
             return;
         };
@@ -676,7 +688,13 @@ impl<const S: usize> Machine<S> {
         self.resume_stack.pop();
     }
 
-    fn start_yield_from(&mut self, ip: &mut usize, sp: &mut usize, sub: RefCoroutine, code: &[Byte]) {
+    fn start_yield_from(
+        &mut self,
+        ip: &mut usize,
+        sp: &mut usize,
+        sub: RefCoroutine,
+        code: &[Byte],
+    ) {
         let Some(outer_ctx) = self.resume_stack.last().copied() else {
             return;
         };
@@ -860,8 +878,11 @@ impl<const S: usize> Machine<S> {
             }
 
             let bc = opcode.bytecode();
+            // Release-only optimizer hint: must track the LAST `Instruction`
+            // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
+            // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::YieldFromCoro as u8);
+            promise!(*bc as u8 <= Instruction::ArrayLen as u8);
 
             match bc {
                 Instruction::POP => {
@@ -914,8 +935,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::NOT => unary!(self.stack, !, as_int),
                 Instruction::LogNot => {
                     let val = self.stack.pop();
-                    self.stack
-                        .push(Value::from(!(val.as_int() != 0)));
+                    self.stack.push(Value::from(!(val.as_int() != 0)));
                 }
                 Instruction::NEG => unary!(self.stack, -, as_int),
                 Instruction::AND => binary!(self.stack, &&, as_bool),
@@ -968,8 +988,8 @@ impl<const S: usize> Machine<S> {
                     if params_count != 0 {
                         let mut params = ArrayVec::<Value, 8>::default();
 
-                        for idx in (0..params_count as usize).rev() {
-                            params[idx] = self.stack.pop();
+                        for _ in 0..params_count as usize {
+                            params.push(self.stack.pop());
                         }
 
                         let ptr = self.stack.pop().as_ptr::<ObjString>();
@@ -1052,7 +1072,12 @@ impl<const S: usize> Machine<S> {
 
                         self.alloc_counter += 1;
                         if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                            Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                            Self::gc_collect(
+                                &mut self.heap,
+                                &self.stack,
+                                &self.resume_stack,
+                                &mut self.alloc_counter,
+                            );
                         }
 
                         self.stack.push(Value::from(obj.addr()));
@@ -1098,7 +1123,12 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
                     }
 
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
@@ -1270,18 +1300,10 @@ impl<const S: usize> Machine<S> {
                         Instruction::GEQ => Value::from((va.raw() >= vb.raw()) as i64),
                         Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
                         Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
-                        Instruction::LEF => {
-                            Value::from((va.as_float() < vb.as_float()) as i64)
-                        }
-                        Instruction::LEQF => {
-                            Value::from((va.as_float() <= vb.as_float()) as i64)
-                        }
-                        Instruction::GTF => {
-                            Value::from((va.as_float() > vb.as_float()) as i64)
-                        }
-                        Instruction::GEQF => {
-                            Value::from((va.as_float() >= vb.as_float()) as i64)
-                        }
+                        Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
+                        Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
+                        Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
+                        Instruction::GEQF => Value::from((va.as_float() >= vb.as_float()) as i64),
                         _ => Value::default(),
                     };
                     self.stack.push(result);
@@ -1469,7 +1491,12 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
                     }
 
                     self.stack
@@ -1510,7 +1537,12 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
                     }
 
                     self.stack.push(Value::from(object.addr()));
@@ -1537,7 +1569,12 @@ impl<const S: usize> Machine<S> {
                         object.addr()
                     };
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
                     }
                     self.stack.push(Value::from(addr));
                 }
@@ -1596,7 +1633,12 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
                     }
                     self.stack.push(Value::from(object.addr()));
                 }
@@ -1610,7 +1652,9 @@ impl<const S: usize> Machine<S> {
                             let key = self.heap.intern(name);
                             match gc.as_ref().get(key) {
                                 Some(crate::memory::Member::Value(v)) => v,
-                                Some(crate::memory::Member::Object(_)) => Value::from(-1_i64),
+                                // Heap objects (strings, nested dicts, enums, …)
+                                // — push the address, same as LoadField/Unpack.
+                                Some(crate::memory::Member::Object(o)) => Value::from(o.addr()),
                                 None => Value::from(-1_i64),
                             }
                         }
@@ -1654,6 +1698,37 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                     self.stack.push(value);
+                }
+                Instruction::ArrayPush => {
+                    // Stack discipline matches `StoreIndex`: codegen emits
+                    // `array` then `value`, so dispatch pops value first,
+                    // mutates the heap array in place, and returns the array
+                    // address for chaining (`push(push(a, 1), 2)`).
+                    let value = self.stack.pop();
+                    let target_val = self.stack.pop();
+                    let target_addr = target_val.raw() as u64;
+                    if let Some(crate::memory::Object::Array(mut gc)) =
+                        Self::find_object_by_addr(&self.heap, target_addr)
+                    {
+                        let old_bytes =
+                            gc.as_ref().elements.capacity() * std::mem::size_of::<Value>();
+                        gc.as_mut().elements.push(value);
+                        let new_bytes =
+                            gc.as_ref().elements.capacity() * std::mem::size_of::<Value>();
+                        if old_bytes != new_bytes {
+                            self.heap.account_resize(old_bytes, new_bytes);
+                        }
+                    }
+                    self.stack.push(target_val);
+                }
+                Instruction::ArrayLen => {
+                    let target_val = self.stack.pop();
+                    let target_addr = target_val.raw() as u64;
+                    let len = match Self::find_object_by_addr(&self.heap, target_addr) {
+                        Some(crate::memory::Object::Array(gc)) => gc.as_ref().elements.len(),
+                        _ => 0,
+                    };
+                    self.stack.push(Value::from(len as i64));
                 }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; jump target in value[31:0].
@@ -1800,7 +1875,12 @@ impl<const S: usize> Machine<S> {
 
                     self.alloc_counter += 1;
                     if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(&mut self.heap, &self.stack, &self.resume_stack, &mut self.alloc_counter);
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
                     }
 
                     self.stack.push(Value::from(object.addr()));
@@ -1834,23 +1914,9 @@ impl<const S: usize> Machine<S> {
                                 self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
                                     c.pending_send = send_val;
                                 });
-                                self.resume_coroutine(
-                                    &mut ip,
-                                    &mut sp,
-                                    sub,
-                                    send_val,
-                                    code,
-                                    true,
-                                );
+                                self.resume_coroutine(&mut ip, &mut sp, sub, send_val, code, true);
                             } else {
-                                self.resume_coroutine(
-                                    &mut ip,
-                                    &mut sp,
-                                    gc,
-                                    send_val,
-                                    code,
-                                    true,
-                                );
+                                self.resume_coroutine(&mut ip, &mut sp, gc, send_val, code, true);
                             }
                         } else {
                             // Handle didn't resolve to a live coroutine
@@ -1879,6 +1945,19 @@ impl<const S: usize> Machine<S> {
                         }
                     }
                 }
+                Instruction::DoneCoro => {
+                    if self.stack.tell() == 0 {
+                        self.stack.push(Value::from(false));
+                    } else {
+                        let handle = self.stack.pop();
+                        let addr = handle.raw() as u64;
+                        let is_done = matches!(
+                            Self::find_object_by_addr(&self.heap, addr),
+                            Some(Object::Coroutine(gc)) if gc.as_ref().state == CoroState::Done
+                        );
+                        self.stack.push(Value::from(is_done));
+                    }
+                }
                 _ => return false,
             }
         }
@@ -1888,7 +1967,9 @@ impl<const S: usize> Machine<S> {
 
 #[cfg(test)]
 mod tests {
-    use common::{ArchivedByte as Byte, ArchivedInstruction as Instruction, Byte as RawByte, Value};
+    use common::{
+        ArchivedByte as Byte, ArchivedInstruction as Instruction, Byte as RawByte, Value,
+    };
 
     use super::{dispatch_count, reset_dispatch_count};
     use crate::{Heap, Machine, ObjEnum};
@@ -2005,6 +2086,32 @@ mod tests {
     /// `MAKE_ENUM` and `JUMP_IF_MATCH`.
     fn const_int(value: i64) -> Byte {
         Byte::new(Instruction::CONST).with_const_inline(value as i32)
+    }
+
+    #[test]
+    fn array_push_grows_in_place_and_len_reports_new_size() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(1),
+            const_int(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(3),
+            Byte::new(Instruction::ArrayPush),
+            Byte::new(Instruction::DUPLICATE),
+            Byte::new(Instruction::ArrayLen),
+            Byte::new(Instruction::HALT),
+        ]);
+
+        assert_eq!(vm.pop().as_int(), 3);
+
+        vm.run(&[
+            Byte::new(Instruction::DUPLICATE),
+            const_int(2),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 3);
     }
 
     #[test]
@@ -2264,7 +2371,11 @@ mod tests {
             &[
                 Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG), // pool[0] = 1.5
                 Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG), // pool[1] = 2.0
-                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(Instruction::ADDF as u8, 0, 1),
+                Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+                    Instruction::ADDF as u8,
+                    0,
+                    1,
+                ),
                 Byte::new(Instruction::HALT),
             ],
             &pool,
@@ -2505,6 +2616,61 @@ mod tests {
         assert_eq!(s, "hello");
     }
 
+    /// GetField must return heap-object field values (strings,
+    /// nested dicts, …) by address — not the `-1` sentinel used
+    /// for missing fields. Pre-P0 returned `-1` for `Member::Object`.
+    #[test]
+    fn get_field_returns_heap_object_field() {
+        let mut vm = Machine::<16>::default();
+        // STRING 2 "hi"  → heap string
+        // STRING 1 "s"   → field name
+        // MakeDict 1     → { s: "hi" }
+        // DUPLICATE
+        // STRING 1 "s"
+        // GetField       → should push the "hi" string address
+        // PRINT
+        // HALT
+        let mut bytecode: Vec<Byte> = Vec::new();
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(2));
+        for ch in "hi".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
+        for ch in "s".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
+        bytecode.push(Byte::new(Instruction::DUPLICATE));
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(1));
+        for ch in "s".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::GetField));
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        vm.run(&bytecode);
+        let _ = vm.restore_output();
+        let bytes = std::rc::Rc::try_unwrap(buf)
+            .expect("VM still holds a reference to the buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
+        assert_eq!(s, "hi", "GetField should return the stored string, not -1");
+    }
+
     #[test]
     fn store_pop_writes_value_to_slot_and_pops() {
         let mut vm = Machine::<4>::default();
@@ -2643,24 +2809,19 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     fn vm_callback_apply_cb_doubles() {
         use crate::ffi::{
-            callback_cif, invoke_via_libffi, make_int_callback, prepare_cif_for_symbol,
-            resolve_library, FfiSignature, InvokeContext,
+            FfiSignature, InvokeContext, callback_cif, invoke_via_libffi, make_int_callback,
+            prepare_cif_for_symbol, resolve_library,
         };
         use crate::memory::FfiType;
         use std::ffi::c_void;
 
-        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/libsum.so");
+        let lib_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/libsum.so");
         if !lib_path.exists() {
             eprintln!("skipping: libsum.so not built");
             return;
         }
-        let lib = resolve_library(
-            lib_path.to_str().unwrap(),
-            None,
-            &[],
-        )
-        .expect("load libsum.so");
+        let lib = resolve_library(lib_path.to_str().unwrap(), None, &[]).expect("load libsum.so");
 
         let mut vm = Machine::<512>::default();
         install_program(

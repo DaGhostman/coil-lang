@@ -9,16 +9,19 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use common::{Byte, Instruction, Interner, Label as DiagLabel, Message, Value, encode_tag_operand, likely, tag, unlikely};
+use common::{
+    Byte, Instruction, Interner, Label as DiagLabel, Message, Value, encode_tag_operand, likely,
+    tag, unlikely,
+};
 
-use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind};
+use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
 use parser::{
     SimpleSpan,
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
 };
 
 pub use pipeline::*;
-pub use typechecking::{CallbackSigDef, Checker, CStructDef, Ty};
+pub use typechecking::{CStructDef, CallbackSigDef, Checker, Ty};
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -52,9 +55,7 @@ fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u3
 }
 
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
-    bytecode.push(
-        Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)),
-    );
+    bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
 }
 
 fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup> {
@@ -374,6 +375,16 @@ pub struct Compiler {
 
     /// Counter for compiler-generated temporary slots.
     temp_counter: u32,
+
+    /// Active loop labels: `(continue_target, break_target)`.
+    loop_stack: Vec<(BbLabel, BbLabel)>,
+
+    /// Active loop patchers. Break/continue emit through the innermost builder.
+    loop_bbs: Vec<BlockBuilder>,
+
+    /// True while compiling an `impl` method — Function resets locals
+    /// and reserves slot 0 for `self`.
+    compiling_method: bool,
 }
 
 impl Default for Compiler {
@@ -409,6 +420,9 @@ impl Default for Compiler {
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
+            loop_stack: Vec::new(),
+            loop_bbs: Vec::new(),
+            compiling_method: false,
         }
     }
 }
@@ -707,6 +721,46 @@ impl Compiler {
             .map(|s| s as u32)
     }
 
+    fn discard_statement_value(bytecode: &mut Vec<Byte>) {
+        if matches!(
+            bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::DUPLICATE)
+        ) {
+            // If it was supposed to add `POP` but prev is `DUP`
+            // then remove the DUP as well
+            bytecode.pop();
+        } else if matches!(
+            bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::StorePop | Instruction::SetField | Instruction::StoreIndex)
+        ) {
+            // `x = expr;` / compound updates already consumed the
+            // RHS via StorePop/SetField/StoreIndex — no trailing POP.
+        } else if !matches!(
+            bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
+        ) {
+            bytecode.push(Byte::new(Instruction::POP));
+        }
+    }
+
+    fn emit_loop_jump(
+        &mut self,
+        target: Option<BbLabel>,
+        keyword: &str,
+        range: std::ops::Range<usize>,
+    ) {
+        if let (Some(label), Some(bb)) = (target, self.loop_bbs.last_mut()) {
+            bb.emit_jump_to(label, BbJumpKind::Unconditional, &mut self.bytecode);
+        } else {
+            let mut message = Message::error(format!("{} outside of loop", keyword), range.clone());
+            message.push(DiagLabel::new(
+                format!("`{}` can only be used inside a loop", keyword),
+                range,
+            ));
+            self.messages.push(message);
+        }
+    }
+
     pub fn get_messages(&self) -> &Vec<Message> {
         &self.messages
     }
@@ -729,9 +783,30 @@ impl Compiler {
     ) -> String {
         match variable.1.borrow() {
             Expression::Identifier(n) => n.to_string(),
-            f => {
-                let _ = f;
-                todo!("Function name as expression")
+            _ => String::new(),
+        }
+    }
+
+    /// Like `resolve_variable`, but records a diagnostic when the
+    /// expression is not an identifier (replaces the old `todo!`).
+    fn resolve_variable_checked<'compiler>(
+        &mut self,
+        variable: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) -> String {
+        match variable.1.borrow() {
+            Expression::Identifier(n) => n.to_string(),
+            other => {
+                let span = variable.0;
+                let mut m = Message::error(
+                    "Cannot use this expression as a variable name".to_string(),
+                    span.into_range(),
+                );
+                m.push(DiagLabel::new(
+                    format!("expected an identifier, found `{other}`"),
+                    span.into_range(),
+                ));
+                self.messages.push(m);
+                String::new()
             }
         }
     }
@@ -770,8 +845,13 @@ impl Compiler {
     }
 
     fn emit_field_name(&self, bytecode: &mut Vec<Byte>, field: &str) {
-        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32));
-        for ch in field.chars() {
+        Self::emit_raw_string_literal(bytecode, field);
+    }
+
+    fn emit_raw_string_literal(bytecode: &mut Vec<Byte>, value: &str) {
+        bytecode
+            .push(Byte::new(Instruction::STRING).with_operand_u32(value.chars().count() as u32));
+        for ch in value.chars() {
             bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
         }
     }
@@ -782,10 +862,13 @@ impl Compiler {
                 return Some(slot);
             }
         }
-        self.context.variables.key(&name.to_string()).map(|s| s as u32)
+        self.context
+            .variables
+            .key(&name.to_string())
+            .map(|s| s as u32)
     }
 
-    fn is_float_ty(&self, node: &Output) -> bool {
+    fn is_float_ty(&self, _node: &Output) -> bool {
         let id = self.checker.id_table().ids()[self.emit_idx];
         matches!(
             self.checker.lookup_at(id),
@@ -794,10 +877,51 @@ impl Compiler {
         )
     }
 
-    fn binop_for_assign_op(
-        op: parser::ast::AssignOp,
-        is_float: bool,
-    ) -> Instruction {
+    fn is_string_expr(&self, node: &Output) -> bool {
+        matches!(
+            self.codegen_expr_ty(node),
+            Some(Ty::Con(ref name)) if name == crate::typechecking::ty::STRING
+        )
+    }
+
+    fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
+        match node.1.as_ref() {
+            Expression::String(_) | Expression::Format(_, _) => {
+                Some(Ty::Con(crate::typechecking::ty::STRING.into()))
+            }
+            Expression::Identifier(name) => self
+                .checker
+                .codegen_var_type(name)
+                .cloned()
+                .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
+            Expression::Add(lhs, rhs) if self.is_string_expr(lhs) && self.is_string_expr(rhs) => {
+                Some(Ty::Con(crate::typechecking::ty::STRING.into()))
+            }
+            Expression::Access(receiver, field) => {
+                let receiver_ty = self.receiver_type(receiver)?;
+                if let Ty::Record { fields } = &receiver_ty {
+                    return fields
+                        .iter()
+                        .find(|(name, _)| name == field)
+                        .map(|(_, ty)| ty.clone());
+                }
+                if let Ty::Con(name) = &receiver_ty {
+                    if self.checker.is_class(name) {
+                        return self.checker.class_field_ty(name, field).cloned();
+                    }
+                }
+                extract_enum_name(&receiver_ty)
+                    .and_then(|name| self.checker.field_type_for(&name, field))
+            }
+            Expression::Expr(inner)
+            | Expression::Group(inner)
+            | Expression::Statement(inner)
+            | Expression::ExprStatement(inner) => self.codegen_expr_ty(inner),
+            _ => None,
+        }
+    }
+
+    fn binop_for_assign_op(op: parser::ast::AssignOp, is_float: bool) -> Instruction {
         use parser::ast::AssignOp;
         match (op, is_float) {
             (AssignOp::Add, false) => Instruction::ADD,
@@ -912,6 +1036,18 @@ impl Compiler {
         op: parser::ast::AssignOp,
         rhs: &Output,
     ) {
+        if matches!(op, parser::ast::AssignOp::Add)
+            && self.is_string_expr(target)
+            && self.is_string_expr(rhs)
+        {
+            Self::emit_raw_string_literal(bytecode, "%s%s");
+            let _ = self.emit_read_lvalue(bytecode, target);
+            bytecode.append(&mut self.do_compile(rhs));
+            bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
+            self.emit_write_lvalue(bytecode, target, false);
+            return;
+        }
+
         if let Expression::Index(arr, idx) = target.1.as_ref() {
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
@@ -1049,6 +1185,11 @@ impl Compiler {
             }
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;
+                if let Ty::Con(name) = &inner_ty {
+                    if self.checker.is_class(name) {
+                        return self.checker.class_field_ty(name, field).cloned();
+                    }
+                }
                 if let Some(name) = extract_enum_name(&inner_ty) {
                     return self.checker.field_type_for(&name, field);
                 }
@@ -1149,22 +1290,33 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(child));
                 });
             }
-            // --- Let bindings ---
+            // --- Let / const bindings ---
             Expression::Fragment(children) => {
-                // `let x = expr` → compile RHS, then StorePop into x's slot.
-                let mut is_let = false;
-                if children.len() == 2
-                    && let Expression::Variable(name, _ty) = &children[0].1.as_ref()
-                {
-                    let slot = self.context.variables.intern(name.to_string()) as u32;
-                    // Emit the RHS.
-                    let mut rhs_bc = self.do_compile(&children[1]);
-                    bytecode.append(&mut rhs_bc);
-                    // Append the explicit store-pop-and-write.
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
-                    is_let = true;
+                // `let x = expr` / `const x = expr` → compile RHS, then
+                // StorePop into x's slot.
+                let mut is_binding = false;
+                if children.len() == 2 {
+                    let binding = match children[0].1.as_ref() {
+                        Expression::Variable(name, _ty) => Some((name.to_string(), false)),
+                        Expression::Constant(name, _ty) => {
+                            Some((self.resolve_variable(name), true))
+                        }
+                        _ => None,
+                    };
+                    if let Some((name, is_const)) = binding {
+                        let slot = self.context.variables.intern(name.clone()) as u32;
+                        if is_const {
+                            self.context.constants.insert(slot as usize, true);
+                        }
+                        // Emit the RHS.
+                        let mut rhs_bc = self.do_compile(&children[1]);
+                        bytecode.append(&mut rhs_bc);
+                        // Append the explicit store-pop-and-write.
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                        is_binding = true;
+                    }
                 }
-                if !is_let {
+                if !is_binding {
                     children.iter().for_each(|child| {
                         bytecode.append(&mut self.do_compile(child));
                     });
@@ -1197,9 +1349,19 @@ impl Compiler {
                     .entry(self.namespace.clone())
                     .or_default()
                     .push(name.to_string());
-                self.functions.insert(qualified.clone(), self.bytecode.len());
+                self.functions
+                    .insert(qualified.clone(), self.bytecode.len());
                 if *is_coro {
                     self.coroutine_fns.insert(qualified);
+                }
+
+                // Methods get a fresh slot map with `self` at 0 so
+                // CALL's receiver lands on LOAD 0. Free functions keep
+                // the shared Interner (extern/lib slots are allocated
+                // into it before `main`).
+                if self.compiling_method {
+                    self.context.variables = Interner::default();
+                    self.context.variables.intern("self".to_string());
                 }
 
                 let mut a = self.do_compile(args);
@@ -1230,9 +1392,6 @@ impl Compiler {
             }
             Expression::ExprStatement(child) => {
                 bytecode.append(&mut self.do_compile(child));
-                // Do not add pop if previous instruction is `DUP` since they both cancel eachother
-                // out
-                //
                 // Also skip the POP for a bare `yield expr;` / `yield from expr;`
                 // statement. The parser's `expr_statement()` alternative matches
                 // `yield` before the dedicated (POP-free) `self.yield_()` statement
@@ -1246,29 +1405,7 @@ impl Compiler {
                 // inside another expression (e.g. `print "%i", resume h;`),
                 // that top-of-stack value belongs to the RESUMER (e.g. the
                 // format string), not the coroutine — corrupting it.
-                if matches!(
-                    bytecode.last().map(|b| b.bytecode()),
-                    Some(Instruction::DUPLICATE)
-                ) {
-                    // If it was supposed to add `POP` but prev is `DUP`
-                    // then remove the DUP as well
-                    bytecode.pop();
-                } else if matches!(
-                    bytecode.last().map(|b| b.bytecode()),
-                    Some(
-                        Instruction::StorePop
-                            | Instruction::SetField
-                            | Instruction::StoreIndex
-                    )
-                ) {
-                    // `x = expr;` / compound updates already consumed the
-                    // RHS via StorePop/SetField/StoreIndex — no trailing POP.
-                } else if !matches!(
-                    bytecode.last().map(|b| b.bytecode()),
-                    Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
-                ) {
-                    bytecode.push(Byte::new(Instruction::POP));
-                }
+                Self::discard_statement_value(&mut bytecode);
             }
             Expression::Print(format, params) => {
                 // The Print handler emits to `self.bytecode`
@@ -1317,6 +1454,11 @@ impl Compiler {
                 let bc = self.do_compile(path);
                 self.bytecode.extend(bc);
                 self.bytecode.push(Byte::new(Instruction::FfiLoad));
+            }
+            Expression::Done(handle) => {
+                let bc = self.do_compile(handle);
+                self.bytecode.extend(bc);
+                self.bytecode.push(Byte::new(Instruction::DoneCoro));
             }
             // --- Aggregates ---
             Expression::Tuple(items) => {
@@ -1572,9 +1714,7 @@ impl Compiler {
                 }
                 bytecode.append(&mut self.do_compile(target));
                 let has_send = if arg.is_some() { 1u32 } else { 0u32 };
-                bytecode.push(
-                    Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send),
-                );
+                bytecode.push(Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send));
             }
             Expression::Class(name, state) => {
                 self.context.classes.insert(
@@ -1592,49 +1732,65 @@ impl Compiler {
                 );
                 self.context.symbols.intern(name.to_string());
             }
-            Expression::Implementation(what, owner, methods) => {
-                let namespace = self.namespace.clone();
-                let functions = self.functions.clone();
+            Expression::Implementation(_what, owner, methods) => {
+                let saved_ns = self.namespace.clone();
+                self.namespace = owner.to_string();
 
-                self.namespace.push_str(what);
-
-                for func in methods {
-                    self.functions.drain();
-                    self.do_compile(func);
-
-                    for method in self.functions.keys() {
-                        self.context
-                            .methods
-                            .entry(owner.to_string())
-                            .and_modify(|e| {
-                                e.insert(what.to_string(), method.clone());
-                            })
-                            .or_insert_with(|| {
-                                let mut h = HashMap::default();
-                                h.insert(what.to_string(), method.clone());
-                                h
-                            });
+                for method_node in methods {
+                    match method_node.1.borrow() {
+                        Expression::Method(_, body) => {
+                            if let Expression::Function { name, .. } = body.1.borrow() {
+                                let fqn = format!("{}::{}", owner, name);
+                                self.compiling_method = true;
+                                self.do_compile(body);
+                                self.compiling_method = false;
+                                self.context
+                                    .methods
+                                    .entry(owner.to_string())
+                                    .or_default()
+                                    .insert(name.to_string(), fqn);
+                            } else {
+                                self.compiling_method = true;
+                                self.do_compile(body);
+                                self.compiling_method = false;
+                            }
+                        }
+                        _ => {
+                            self.do_compile(method_node);
+                        }
                     }
                 }
 
                 self.context
                     .impementations
-                    .insert(what.to_string(), owner.to_string());
-
-                self.namespace = namespace;
-                self.functions = functions;
+                    .insert(owner.to_string(), owner.to_string());
+                self.namespace = saved_ns;
             }
-            Expression::Instantiate(class, _args) => {
-                let name = self.resolve_variable(class);
-                bytecode.push(
-                    Byte::new(Instruction::INIT)
-                        .with_operand_u32(self.context.classes[&name].len() as u32),
-                );
-                // bytecode.push(Byte::new(Instruction::SET).with_operand_u32(operand);
-                // let s = self;
-                // self.functions.get(k);
-
-                // bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(0));
+            Expression::Method(_vis, body) => {
+                self.compiling_method = true;
+                bytecode.append(&mut self.do_compile(body));
+                self.compiling_method = false;
+            }
+            Expression::Instantiate(class, args) => {
+                let name = self.resolve_variable_checked(class);
+                let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
+                bytecode.push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
+                // SetField stack order is value, target, name (same as
+                // Assignment to Access). Stash the instance, then for
+                // each ctor arg emit that sequence and discard the
+                // value SetField pushes back.
+                let tmp_inst = self.alloc_temp_slot();
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_inst));
+                if let Some(arg_list) = args {
+                    for (arg, (fname, _)) in arg_list.iter().zip(fields.iter()) {
+                        bytecode.append(&mut self.do_compile(arg));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
+                        self.emit_field_name(&mut bytecode, fname);
+                        bytecode.push(Byte::new(Instruction::SetField));
+                        bytecode.push(Byte::new(Instruction::POP));
+                    }
+                }
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
             }
             Expression::Adjust { op, prefix, target } => {
                 self.emit_adjust(&mut bytecode, target, *op, *prefix);
@@ -1655,8 +1811,17 @@ impl Compiler {
 
                 bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
 
+                self.loop_stack.push((top_label, exit_label));
+                self.loop_bbs.push(bb);
                 let body_bc = self.do_compile(body);
                 self.bytecode.extend(body_bc);
+                let mut bb = self
+                    .loop_bbs
+                    .pop()
+                    .expect("loop builder stack balanced for while");
+                self.loop_stack
+                    .pop()
+                    .expect("loop label stack balanced for while");
 
                 bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
 
@@ -1677,6 +1842,90 @@ impl Compiler {
 
                 bb.finalize()
                     .expect("BlockBuilder::finalize: all targeted labels bound");
+            }
+            // --- C-style for codegen ---
+            // Layout: init, [top] cond, JMPF→exit, body, [continue] step, JMP→top, [exit]
+            Expression::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                if let Some(init) = init {
+                    let mut init_bc = self.do_compile(init);
+                    Self::discard_statement_value(&mut init_bc);
+                    self.bytecode.extend(init_bc);
+                }
+
+                let mut bb = BlockBuilder::new();
+                let top_label = bb.fresh_label();
+                let continue_label = bb.fresh_label();
+                let exit_label = bb.fresh_label();
+                let top_label_target = self.bytecode.len() as u32;
+
+                let cond_bc = self.do_compile(cond);
+                self.bytecode.extend(cond_bc);
+
+                bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+                self.loop_stack.push((continue_label, exit_label));
+                self.loop_bbs.push(bb);
+                let body_bc = self.do_compile(body);
+                self.bytecode.extend(body_bc);
+                let mut bb = self
+                    .loop_bbs
+                    .pop()
+                    .expect("loop builder stack balanced for for");
+                self.loop_stack
+                    .pop()
+                    .expect("loop label stack balanced for for");
+
+                let continue_target = self.bytecode.len() as u32;
+                bb.bind_label(
+                    continue_label,
+                    continue_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+
+                if let Some(step) = step {
+                    let mut step_bc = self.do_compile(step);
+                    Self::discard_statement_value(&mut step_bc);
+                    self.bytecode.extend(step_bc);
+                }
+
+                bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+                let exit_label_target = self.bytecode.len() as u32;
+                bb.bind_label(
+                    exit_label,
+                    exit_label_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+                bb.bind_label(
+                    top_label,
+                    top_label_target,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+
+                bb.finalize()
+                    .expect("BlockBuilder::finalize: all targeted labels bound");
+            }
+            Expression::Break => {
+                if let Some((_, break_label)) = self.loop_stack.last().copied() {
+                    self.emit_loop_jump(Some(break_label), "break", span.into_range());
+                } else {
+                    self.emit_loop_jump(None, "break", span.into_range());
+                }
+            }
+            Expression::Continue => {
+                if let Some((continue_label, _)) = self.loop_stack.last().copied() {
+                    self.emit_loop_jump(Some(continue_label), "continue", span.into_range());
+                } else {
+                    self.emit_loop_jump(None, "continue", span.into_range());
+                }
             }
             Expression::Defer(child) => {
                 let mut body = vec![Byte::new(Instruction::JMP).with_operand_u32(u32::MAX)];
@@ -1700,79 +1949,174 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
-                let identifier = self.resolve_variable(name);
-                let n = self
-                    .aliases
-                    .get(&identifier)
-                    .cloned()
-                    .unwrap_or_else(|| identifier.clone());
-
-                if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
-                    // Stage arg bytecode in a local Vec to
-                    // release the `&mut self.bytecode` borrow
-                    // before the loop calls `self.do_compile`.
-                    let mut arg_bc = Vec::new();
-                    let arity = if let Some(items) = args {
-                        for arg in items {
-                            arg_bc.append(&mut self.do_compile(arg));
+                // Method call: `recv.method(args)`.
+                if let Expression::Access(recv, method) = name.1.borrow() {
+                    let recv_ty = self.receiver_type(recv);
+                    let owner = match &recv_ty {
+                        Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n) => {
+                            n.clone()
                         }
-                        items.len()
-                    } else {
-                        0
+                        _ => String::new(),
                     };
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
-                    self.bytecode.append(&mut arg_bc);
-                    self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
-                    self.bytecode
-                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
-                } else if let Some(&native_id) = self.native.get(&n) {
-                    let mut arg_bc = Vec::new();
-                    let arity = if let Some(items) = args {
-                        for arg in items {
-                            arg_bc.append(&mut self.do_compile(arg));
+                    let fqn = self
+                        .context
+                        .methods
+                        .get(&owner)
+                        .and_then(|m| m.get(*method))
+                        .cloned();
+                    if let Some(fqn) = fqn {
+                        if let Some(offset) = self.functions.get(&fqn).copied() {
+                            // Push receiver first (slot 0), then args.
+                            bytecode.append(&mut self.do_compile(recv));
+                            let mut nargs = 0u32;
+                            if let Some(items) = args {
+                                for arg in items {
+                                    bytecode.append(&mut self.do_compile(arg));
+                                    nargs += 1;
+                                }
+                            }
+                            bytecode.push(
+                                Byte::new(Instruction::CALL)
+                                    .with_call_packed(1 + nargs, offset as u32),
+                            );
+                        } else {
+                            let mut message =
+                                Message::error("Unknown method".to_string(), span.into_range());
+                            message.push(DiagLabel::new(
+                                format!("Unable to call unknown method '{}'", fqn),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
                         }
-                        items.len()
                     } else {
-                        0
-                    };
-                    self.bytecode
-                        .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-                    self.bytecode.append(&mut arg_bc);
-                    self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
-                    self.bytecode
-                        .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
-                } else if let Some(offset) = self.functions.get(&n).copied() {
-                    if let Some(args) = args {
-                        args.iter()
-                            .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
-                    }
-
-                    if self.coroutine_fns.contains(&n) {
-                        bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
-                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                            offset as u32,
+                        let mut message =
+                            Message::error("Unknown method".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!("Unable to call method '{}' on '{}'", method, owner),
+                            span.into_range(),
                         ));
-                    } else {
-                        // Packed CALL: arity + target in one opcode.
-                        bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
-                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                            offset as u32,
-                        ));
+                        self.messages.push(message);
                     }
                 } else {
-                    let mut message =
-                        Message::error("Unknown function".to_string(), span.into_range());
-                    message.push(DiagLabel::new(
-                        format!("Unable to call unknown function '{}'", n),
-                        span.into_range(),
-                    ));
-                    self.messages.push(message);
-                }
+                    if let Expression::Identifier(raw) = name.1.as_ref() {
+                        if *raw == "push" {
+                            let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                            if let Some(items) = args
+                                && items.len() == 2
+                            {
+                                bytecode.append(&mut self.do_compile(&items[0]));
+                                bytecode.append(&mut self.do_compile(&items[1]));
+                                bytecode.push(Byte::new(Instruction::ArrayPush));
+                            } else {
+                                let mut message = Message::error(
+                                    "Invalid push call".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(DiagLabel::new(
+                                    format!("push expects 2 arguments, got {}", provided),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
+                            return bytecode;
+                        }
+                        if *raw == "len" {
+                            let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                            if let Some(items) = args
+                                && items.len() == 1
+                            {
+                                bytecode.append(&mut self.do_compile(&items[0]));
+                                bytecode.push(Byte::new(Instruction::ArrayLen));
+                            } else {
+                                let mut message = Message::error(
+                                    "Invalid len call".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(DiagLabel::new(
+                                    format!("len expects 1 argument, got {}", provided),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
+                            return bytecode;
+                        }
+                    }
+
+                    let identifier = self.resolve_variable_checked(name);
+                    let n = self
+                        .aliases
+                        .get(&identifier)
+                        .cloned()
+                        .unwrap_or_else(|| identifier.clone());
+
+                    if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
+                        // Stage arg bytecode in a local Vec to
+                        // release the `&mut self.bytecode` borrow
+                        // before the loop calls `self.do_compile`.
+                        let mut arg_bc = Vec::new();
+                        let arity = if let Some(items) = args {
+                            for arg in items {
+                                arg_bc.append(&mut self.do_compile(arg));
+                            }
+                            items.len()
+                        } else {
+                            0
+                        };
+                        self.bytecode
+                            .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
+                        self.bytecode
+                            .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
+                        self.bytecode.append(&mut arg_bc);
+                        self.bytecode
+                            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                        self.bytecode
+                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
+                    } else if let Some(&native_id) = self.native.get(&n) {
+                        let mut arg_bc = Vec::new();
+                        let arity = if let Some(items) = args {
+                            for arg in items {
+                                arg_bc.append(&mut self.do_compile(arg));
+                            }
+                            items.len()
+                        } else {
+                            0
+                        };
+                        self.bytecode
+                            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+                        self.bytecode.append(&mut arg_bc);
+                        self.bytecode
+                            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                        self.bytecode.push(
+                            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
+                        );
+                    } else if let Some(offset) = self.functions.get(&n).copied() {
+                        if let Some(args) = args {
+                            args.iter()
+                                .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
+                        }
+
+                        if self.coroutine_fns.contains(&n) {
+                            bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
+                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                                offset as u32,
+                            ));
+                        } else {
+                            // Packed CALL: arity + target in one opcode.
+                            bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
+                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                                offset as u32,
+                            ));
+                        }
+                    } else {
+                        let mut message =
+                            Message::error("Unknown function".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!("Unable to call unknown function '{}'", n),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
+                } // end non-method Call
             }
             Expression::Argument(_, n) => {
                 let _ = self.context.variables.intern(n.to_string());
@@ -1912,12 +2256,19 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::ADDF
+                if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
+                    Self::emit_raw_string_literal(&mut bytecode, "%s%s");
+                    bytecode.append(&mut self.do_compile(lhs));
+                    bytecode.append(&mut self.do_compile(rhs));
+                    bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
                 } else {
-                    Instruction::ADD
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::ADDF
+                    } else {
+                        Instruction::ADD
+                    }));
+                }
             }
             Expression::Sub(lhs, rhs) => {
                 let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
@@ -2068,89 +2419,83 @@ impl Compiler {
 
                 self.context.constants.insert(symbol, false);
             }
-            Expression::Assignment(lhs, value) => {
-                match lhs.1.as_ref() {
-                    Expression::Access(target_expr, field) => {
-                        bytecode.append(&mut self.do_compile(value));
-                        bytecode.append(&mut self.do_compile(target_expr));
-                        self.emit_field_name(&mut bytecode, field);
-                        bytecode.push(Byte::new(Instruction::SetField));
-                    }
-                    Expression::Index(arr, idx) => {
-                        let tmp_arr = self.alloc_temp_slot();
-                        let tmp_idx = self.alloc_temp_slot();
-                        let tmp_val = self.alloc_temp_slot();
-                        bytecode.append(&mut self.do_compile(value));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-                        bytecode.append(&mut self.do_compile(arr));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
-                        bytecode.append(&mut self.do_compile(idx));
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
-                        bytecode.push(Byte::new(Instruction::StoreIndex));
-                    }
-                    Expression::Identifier(name) => {
-                        self.context.assignments.insert(name.to_string(), true);
-                        let symbol_opt = if let Some(map) = &self.context.match_bindings {
-                            if let Some(&slot) = map.get(*name) {
-                                Some(slot as usize)
-                            } else {
-                                self.context.variables.key(&name.to_string())
-                            }
+            Expression::Assignment(lhs, value) => match lhs.1.as_ref() {
+                Expression::Access(target_expr, field) => {
+                    bytecode.append(&mut self.do_compile(value));
+                    bytecode.append(&mut self.do_compile(target_expr));
+                    self.emit_field_name(&mut bytecode, field);
+                    bytecode.push(Byte::new(Instruction::SetField));
+                }
+                Expression::Index(arr, idx) => {
+                    let tmp_arr = self.alloc_temp_slot();
+                    let tmp_idx = self.alloc_temp_slot();
+                    let tmp_val = self.alloc_temp_slot();
+                    bytecode.append(&mut self.do_compile(value));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
+                    bytecode.append(&mut self.do_compile(arr));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
+                    bytecode.append(&mut self.do_compile(idx));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
+                    bytecode.push(Byte::new(Instruction::StoreIndex));
+                }
+                Expression::Identifier(name) => {
+                    self.context.assignments.insert(name.to_string(), true);
+                    let symbol_opt = if let Some(map) = &self.context.match_bindings {
+                        if let Some(&slot) = map.get(*name) {
+                            Some(slot as usize)
                         } else {
                             self.context.variables.key(&name.to_string())
-                        };
-
-                        if let Some(symbol) = symbol_opt {
-                            if unlikely(self.context.constants.contains_key(&symbol)) {
-                                let assigned =
-                                    likely(*self.context.constants.get(&symbol).unwrap());
-                                if !assigned {
-                                    self.context.constants.entry(symbol).and_modify(|state| {
-                                        *state = true;
-                                    });
-                                } else {
-                                    let mut message = Message::error(
-                                        "Assignment error".to_string(),
-                                        span.into_range(),
-                                    );
-                                    message.push(DiagLabel::new(
-                                        format!(
-                                            "Unable to assign to an already assigned constant '{}'",
-                                            name
-                                        ),
-                                        span.into_range(),
-                                    ));
-                                    self.messages.push(message);
-                                }
-                            }
-                            bytecode.append(&mut self.do_compile(value));
-                            bytecode.push(
-                                Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32),
-                            );
-                        } else {
-                            let mut message = Message::error(
-                                "Undefined variable".to_string(),
-                                span.into_range(),
-                            );
-                            message.push(DiagLabel::new(
-                                format!(
-                                    "Unable to assign to a non-existing variable/constant '{}'",
-                                    name
-                                ),
-                                span.into_range(),
-                            ));
-                            self.messages.push(message);
                         }
-                    }
-                    _ => {
+                    } else {
+                        self.context.variables.key(&name.to_string())
+                    };
+
+                    if let Some(symbol) = symbol_opt {
+                        if unlikely(self.context.constants.contains_key(&symbol)) {
+                            let assigned = likely(*self.context.constants.get(&symbol).unwrap());
+                            if !assigned {
+                                self.context.constants.entry(symbol).and_modify(|state| {
+                                    *state = true;
+                                });
+                            } else {
+                                let mut message = Message::error(
+                                    "Assignment error".to_string(),
+                                    span.into_range(),
+                                );
+                                message.push(DiagLabel::new(
+                                    format!(
+                                        "Unable to assign to an already assigned constant '{}'",
+                                        name
+                                    ),
+                                    span.into_range(),
+                                ));
+                                self.messages.push(message);
+                            }
+                        }
                         bytecode.append(&mut self.do_compile(value));
-                        bytecode.push(Byte::new(Instruction::POP));
+                        bytecode
+                            .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
+                    } else {
+                        let mut message =
+                            Message::error("Undefined variable".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!(
+                                "Unable to assign to a non-existing variable/constant '{}'",
+                                name
+                            ),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
                     }
                 }
-            }
+                _ => {
+                    bytecode.append(&mut self.do_compile(value));
+                    bytecode.push(Byte::new(Instruction::POP));
+                }
+            },
 
             // --- Sum types, extern, construct ---
             Expression::ExternBlock {
@@ -2908,50 +3253,25 @@ impl Compiler {
                         }
                     }
 
-                    // Emit CONST + RETURN at the match's tail.
+                    // Bind `end_label` to a join pad that leaves the
+                    // arm value on the stack (Phase P0 — let x =
+                    // match). Do NOT emit RETURN here: that made
+                    // Match a function terminus so Fragment's
+                    // trailing StorePop was unreachable.
                     //
-                    // The match codegen leaves the body's value
-                    // on the stack at the end of the FIRST
-                    // (source) arm — which is the LAST arm in
-                    // bytecode order (reached by fallthrough).
-                    // The JMP-end placeholders from the non-FIRST
-                    // arms jump to a position past body_a where
-                    // the body's value is RETURNed.
+                    // Emit DUPLICATE; POP as a fusion barrier so a
+                    // trailing arm `CONST k` is not peephole-fused
+                    // with a following `RETURN` from `return match`
+                    // (that fusion left JMP-to-end targeting the
+                    // removed RETURN slot and skipped the return).
                     //
-                    // Why emit CONST + RETURN here:
-                    //   1. The function codegen's auto-additions
-                    //      check `last != RETURN` and add
-                    //      `CONST 0; RETURN` if not. Emitting
-                    //      our own RETURN avoids the duplicate
-                    //      CONST 0 (which would clobber the
-                    //      body's value with 0).
-                    //   2. The JMP-end placeholders need a real
-                    //      RETURN at their target — not just a
-                    //      position in the bytecode — otherwise
-                    //      the body's value on the stack would
-                    //      leak past the function's epilogue.
-                    //
-                    // end_pos points to the position of the
-                    // RETURN (one BEFORE the end of self.bytecode,
-                    // because bytecode_len() is a count, not an
-                    // index).
-                    // Emit a RETURN at the match's tail. The
-                    // body_a's last byte is followed by this
-                    // RETURN, so the body's value (on the stack)
-                    // is RETURNed. The non-first arms' JMP-end
-                    // placeholders target this RETURN (via
-                    // end_label bound to its position), so their
-                    // values are RETURNed directly without
-                    // clobbering.
-                    //
-                    // The function codegen's auto-additions
-                    // check `last != RETURN` and skip the
-                    // duplicate CONST + RETURN. end_pos points to
-                    // the position of the RETURN (one BEFORE the
-                    // end of self.bytecode, because bytecode_len()
-                    // is a count, not an index).
-                    self.bytecode.push(Byte::new(Instruction::RETURN));
-                    let end_pos = (self.bytecode.len() - 1) as u32;
+                    // `return match { … }` still works because
+                    // Expression::Return emits its own RETURN after
+                    // the child. Bare Match as a statement is
+                    // discarded by ExprStatement's POP.
+                    let end_pos = self.bytecode.len() as u32;
+                    self.bytecode.push(Byte::new(Instruction::DUPLICATE));
+                    self.bytecode.push(Byte::new(Instruction::POP));
                     bb.bind_label(end_label, end_pos, &mut self.bytecode, &mut self.constants);
 
                     // Validate: every label that had a
@@ -2964,24 +3284,25 @@ impl Compiler {
             Expression::Default(_) => (),
 
             // --- Field access ---
-            // receiver bytecode + LoadField(index) or GetField(name) for dicts.
+            // receiver bytecode + LoadField(index) or GetField(name) for
+            // dicts / class instances.
             Expression::Access(receiver, field) => {
                 bytecode.append(&mut self.do_compile(receiver));
 
                 let receiver_ty = self.receiver_type(receiver);
                 let is_record =
                     matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
-                if is_record {
+                let is_class = matches!(
+                    &receiver_ty,
+                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
+                );
+                if is_record || is_class {
                     // Push the field-name string on TOP of the
                     // receiver (which is already on the stack
                     // from `do_compile(receiver)` above). GetField
                     // pops the field-name (top) and the receiver,
-                    // pushes the value. Use STRING+DATA encoding.
-                    bytecode
-                        .push(Byte::new(Instruction::STRING).with_operand_u32(field.len() as u32));
-                    for ch in field.chars() {
-                        bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
-                    }
+                    // pushes the value.
+                    self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::GetField));
                 } else {
                     let enum_name = self.enum_name_for_receiver(receiver);
@@ -2995,6 +3316,10 @@ impl Compiler {
                         Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
                     );
                 }
+            }
+
+            Expression::Field(_, _, _) => {
+                // Class field decls are metadata only — consumed for ID alignment.
             }
 
             _expr => {
@@ -3023,6 +3348,8 @@ impl Compiler {
 
         self.emit_idx = 0;
         self.temp_counter = 0;
+        self.loop_stack.clear();
+        self.loop_bbs.clear();
         self.constants.clear();
         let _program_ty = self.checker.check_program(ast);
 
@@ -3090,19 +3417,15 @@ mod tests {
     #[test]
     fn async_call_emits_make_coro_not_call() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "async fn coro() { yield 1; } fn main() { let h = coro(); }",
-        );
+        let (bc, _pool) = compile_src("async fn coro() { yield 1; } fn main() { let h = coro(); }");
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::MakeCoro)),
             "expected MakeCoro for async fn call"
         );
         assert!(
-            !bc.iter().any(|b| {
-                matches!(b.bytecode(), Instruction::CALL)
-                    && b.call_parts().1 > 3
-            }),
+            !bc.iter()
+                .any(|b| { matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3 }),
             "async fn call site should not use CALL"
         );
     }
@@ -3110,9 +3433,8 @@ mod tests {
     #[test]
     fn yield_and_resume_emit_coroutine_opcodes() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "async fn coro() { yield 1; } fn main() { let h = coro(); resume h; }",
-        );
+        let (bc, _pool) =
+            compile_src("async fn coro() { yield 1; } fn main() { let h = coro(); resume h; }");
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::YieldCoro)),
@@ -3198,7 +3520,10 @@ mod tests {
         assert_eq!(yield_positions.len(), 2, "expected two YieldCoro sites");
         for pos in yield_positions {
             assert!(
-                !matches!(bc.get(pos + 1).map(|b| b.bytecode()), Some(Instruction::POP)),
+                !matches!(
+                    bc.get(pos + 1).map(|b| b.bytecode()),
+                    Some(Instruction::POP)
+                ),
                 "bare `yield expr;` must not be followed by POP (would corrupt the next resume)"
             );
         }
@@ -3214,7 +3539,10 @@ mod tests {
             .position(|b| matches!(b.bytecode(), Instruction::YieldFromCoro))
             .expect("expected YieldFromCoro");
         assert!(
-            !matches!(bc.get(pos + 1).map(|b| b.bytecode()), Some(Instruction::POP)),
+            !matches!(
+                bc.get(pos + 1).map(|b| b.bytecode()),
+                Some(Instruction::POP)
+            ),
             "bare `yield from expr;` must not be followed by POP"
         );
     }
@@ -3261,6 +3589,28 @@ mod tests {
         assert!(
             has_int_add && !has_float_add,
             "expected int ADD for integer arithmetic"
+        );
+    }
+
+    #[test]
+    fn string_addition_emits_format_not_add() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("\"a\" + \"b\";");
+
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::FORMAT)),
+            "expected string addition to lower through FORMAT"
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::ADD
+                    | Instruction::ADDF
+                    | Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+            )),
+            "string addition should not emit numeric addition opcodes"
         );
     }
 
@@ -3592,9 +3942,7 @@ mod tests {
             .position(|b| {
                 matches!(
                     b.bytecode(),
-                    Instruction::CmpJmpf
-                        | Instruction::BinSlotImm
-                        | Instruction::BinSlotImmJmpf
+                    Instruction::CmpJmpf | Instruction::BinSlotImm | Instruction::BinSlotImmJmpf
                 )
             })
             .expect("while condition should emit a fused or partial-fused compare");
@@ -3690,6 +4038,61 @@ mod tests {
         assert_eq!(
             dup_before_store, 0,
             "identifier assignment should not emit DUPLICATE before STORE_POP"
+        );
+    }
+
+    #[test]
+    fn for_with_break_and_continue_emits_patched_jumps() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let sum = 0; \
+for (let i = 0; i < 10; i = i + 1) { \
+if i == 3 { continue; } \
+if i == 7 { break; } \
+sum = sum + i; \
+} \
+}",
+        );
+
+        let jmp_targets: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JMP))
+            .map(|b| b.operand_u32())
+            .collect();
+
+        assert!(
+            jmp_targets.len() >= 3,
+            "expected continue, break, and back-edge JMPs; got {:?}",
+            jmp_targets
+        );
+        assert!(
+            jmp_targets.iter().all(|target| *target != 0),
+            "loop jump placeholders should be patched: {:?}",
+            jmp_targets
+        );
+    }
+
+    #[test]
+    fn break_and_continue_outside_loop_emit_diagnostics() {
+        let ast = Pratt::default()
+            .parse("fn main() { break; continue; }")
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        compiler.compile("", &ast);
+        let rendered = compiler
+            .get_messages()
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("break outside of loop"),
+            "expected break diagnostic, got {rendered}"
+        );
+        assert!(
+            rendered.contains("continue outside of loop"),
+            "expected continue diagnostic, got {rendered}"
         );
     }
 
@@ -4543,22 +4946,22 @@ fn main() {
             jimp_count
         );
 
-        // Exactly 1 POP for the inner Unit sub-pattern. The
-        // pre-fix codegen would have emitted 2 (one from the
-        // test chain, one from the reverse pass's redundant
-        // binding code for the inner Unit pattern).
+        // POPs expected:
+        // - 1 from the test chain for the inner Unit (`Option::None`)
+        // - 1 from Match's end-label `DUPLICATE; POP` fusion barrier
+        //   (Phase P0 — keeps peephole from fusing last-arm CONST with
+        //   a following RETURN). The reverse pass must NOT add a third
+        //   redundant POP for the Unit sub-pattern.
         //
-        // Note: `let _ = match x { ... }` is an Assignment
-        // (no ExprStatement wrapper), so it doesn't add a POP.
-        // The total is 1 POP (the test chain's POP for the
-        // inner Unit sub-pattern). Pre-fix, it would be 2.
+        // Note: `let _ = match x { ... }` is an Assignment (no
+        // ExprStatement wrapper), so it doesn't add another POP.
         let pop_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::POP))
             .count();
         assert_eq!(
-            pop_count, 1,
-            "expected exactly 1 POP (test chain's inner Unit POP; the reverse pass's redundant POP is suppressed); got {}",
+            pop_count, 2,
+            "expected 2 POPs (test-chain Unit + match end barrier); got {} (3+ means reverse-pass double-pop regression)",
             pop_count
         );
     }
@@ -4795,6 +5198,39 @@ fn main() {
             store_count, 0,
             "expected zero STORE instructions for `let` / assignment; got {}",
             store_count
+        );
+    }
+
+    // ============================================================
+    // growing array builtin codegen tests
+    // ============================================================
+
+    #[test]
+    fn array_push_and_len_builtins_emit_array_opcodes() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let a = [1, 2]; \
+push(a, 3); \
+print \"%i\", len(a); \
+}",
+        );
+
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayPush)),
+            "expected `push(a, 3)` to emit ArrayPush"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::ArrayLen)),
+            "expected `len(a)` to emit ArrayLen"
+        );
+        assert!(
+            !bc.iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3
+            }),
+            "push/len builtins should not lower to ordinary CALL instructions"
         );
     }
 

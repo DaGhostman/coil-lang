@@ -181,12 +181,33 @@ impl Pipeline {
         }
     }
 
+    /// Walk up from `start` looking for a directory that contains
+    /// `zero.toml`. Falls back to the process cwd when none is found.
+    fn find_project_root(start: &Path) -> PathBuf {
+        let mut dir = if start.is_file() {
+            start
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            start.to_path_buf()
+        };
+        loop {
+            if dir.join("zero.toml").is_file() {
+                return dir;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
     pub fn new() -> Self {
         let cwd = std::env::current_dir().expect("Unable to determine current working directory");
-        // The project root is the cwd for now. A future
-        // revision could walk up the tree looking for
-        // `zero.toml`.
-        let project_root = cwd.clone();
+        // Prefer a `zero.toml` found by walking up from cwd; otherwise
+        // use cwd with the default manifest (`src/` only).
+        let project_root = Self::find_project_root(&cwd);
         let manifest = Manifest::load(&project_root).expect("Failed to load zero.toml manifest");
 
         // The prologue is `[CALL, JMP, HALT]`. The pipeline
@@ -763,6 +784,15 @@ impl Pipeline {
     /// Multi-file entry point: discovers and compiles the module graph from disk.
     pub fn compile_src_from_file(&mut self, file: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let entry = PathBuf::from(file);
+        // Re-root the manifest from the entry file so
+        // `cargo run -- examples/modules.0s` finds the workspace
+        // `zero.toml` even when cwd differs.
+        let root = Self::find_project_root(&entry);
+        if root != self.project_root {
+            self.project_root = root.clone();
+            self.manifest =
+                Manifest::load(&root).expect("Failed to load zero.toml for entry file");
+        }
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);
 

@@ -160,9 +160,7 @@ impl<'pratt> Pratt<'pratt> {
             });
         // `(T1, T2, ...)` — tuple form. Reuses the
         // existing tuple_atom machinery.
-        let tuple_type = self.tuple_atom(
-            text::ident().padded().map_with(output!(Type)),
-        );
+        let tuple_type = self.tuple_atom(text::ident().padded().map_with(output!(Type)));
         choice((
             array_type,
             tuple_type,
@@ -186,10 +184,12 @@ impl<'pratt> Pratt<'pratt> {
                 // otherwise match `self.call(...)` as ordinary
                 // function calls to non-existent functions.
                 self.dload(expr.clone()),
+                self.done_(expr.clone()),
                 self.declare(expr.clone()),
                 self.invoke_(expr.clone()),
                 self.resume_(expr.clone()),
                 self.yield_expr_(expr.clone()),
+                self.format_expr(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
@@ -282,12 +282,7 @@ impl<'pratt> Pratt<'pratt> {
                 ),
                 infix(
                     right(Precedence::Compare as u16),
-                    choice((
-                        op!(">="),
-                        op!("<="),
-                        op!(">"),
-                        op!("<"),
-                    )),
+                    choice((op!(">="), op!("<="), op!(">"), op!("<"))),
                     |lhs, op, rhs, e| {
                         (
                             e.span(),
@@ -315,11 +310,9 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     },
                 ),
-                infix(
-                    right(Precedence::Xor as u16),
-                    op!('^'),
-                    |lhs, _, rhs, e| (e.span(), Box::new(Expression::Xor(lhs, rhs))),
-                ),
+                infix(right(Precedence::Xor as u16), op!('^'), |lhs, _, rhs, e| {
+                    (e.span(), Box::new(Expression::Xor(lhs, rhs)))
+                }),
                 infix(
                     right(Precedence::Assign as u16),
                     choice((
@@ -479,9 +472,7 @@ impl<'pratt> Pratt<'pratt> {
         let arg = self
             .type_annotation()
             .then(text::ident().padded())
-            .map_with(|(ty, name), e| {
-                (e.span(), Box::new(Expression::Argument(ty, name)))
-            });
+            .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
 
         arg.separated_by(op!(','))
             .allow_trailing()
@@ -597,6 +588,39 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
+    fn for_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let init = choice((self.variable(), self.expr())).or_not();
+        let step = self.expr().or_not();
+        keyword!("for")
+            .ignore_then(
+                init.then_ignore(op!(";"))
+                    .then(self.expr())
+                    .then_ignore(op!(";"))
+                    .then(step)
+                    .delimited_by(op!("("), op!(")")),
+            )
+            .then(self.block(stmt))
+            .map_with(|(((init, cond), step), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::For {
+                        init,
+                        cond,
+                        step,
+                        body,
+                    }),
+                )
+            })
+    }
+
     fn if_<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -666,6 +690,27 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Print(fmt, params))))
     }
 
+    fn format_expr<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("format")
+            .labelled("format expression")
+            .ignore_then(self.string())
+            .then(
+                expr.separated_by(op!(','))
+                    .allow_leading()
+                    .collect::<Vec<_>>()
+                    .or_not(),
+            )
+            .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Format(fmt, params))))
+    }
+
     // ============================================================
     //  Userland FFI builtins — `dload`, `declare`, `invoke`
     //
@@ -698,6 +743,35 @@ impl<'pratt> Pratt<'pratt> {
                 (
                     e.span(),
                     Box::new(Expression::Dload(args.into_iter().next().unwrap())),
+                )
+            })
+    }
+
+    /// `done(handle)` — true when a coroutine has completed.
+    fn done_<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::keyword("done")
+            .labelled("done builtin")
+            .ignore_then(
+                expr.clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .at_least(1)
+                    .at_most(1)
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('('), op!(')')),
+            )
+            .map_with(|args, e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Done(args.into_iter().next().unwrap())),
                 )
             })
     }
@@ -772,16 +846,39 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(output!(ExprStatement))
     }
 
+    fn break_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("break")
+            .then_ignore(op!(";"))
+            .map_with(|_, e| (e.span(), Box::new(Expression::Break)))
+    }
+
+    fn continue_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("continue")
+            .then_ignore(op!(";"))
+            .map_with(|_, e| (e.span(), Box::new(Expression::Continue)))
+    }
+
     fn statement(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         recursive(|stmt| {
             choice((
+                self.break_(),
+                self.continue_(),
+                self.for_(stmt.clone()),
                 self.while_(stmt.clone()),
                 self.if_(stmt.clone()),
                 self.block(stmt.clone()),
+                self.type_alias(),
                 self.variable().then_ignore(op!(';')),
+                self.constant().then_ignore(op!(';')),
                 self.expr_statement(),
                 self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
@@ -1107,9 +1204,10 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("impl")
             .ignore_then(text::ident())
             .then(
+                // Methods are full `fn` declarations — separate them by
+                // juxtaposition (newlines / whitespace), not commas.
                 self.method_decl(stmt)
-                    .separated_by(op!(','))
-                    .allow_trailing()
+                    .repeated()
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
@@ -1188,6 +1286,21 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
+    fn constant(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("const")
+            .ignore_then(text::ident().map_with(output!(Identifier)))
+            .then(op!(":").ignore_then(self.type_annotation()).or_not())
+            .then_ignore(op!("="))
+            .then(self.expr())
+            .map_with(|((name, ty), val), e| {
+                let result = vec![(e.span(), Box::new(Expression::Constant(name, ty))), val];
+                (e.span(), Box::new(Expression::Fragment(result)))
+            })
+    }
+
     fn params<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -1220,23 +1333,30 @@ impl<'pratt> Pratt<'pratt> {
         expr: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // A tuple is `at_least(2)` items separated by commas,
-        // OR exactly 1 item with a trailing comma. Either way,
-        // a comma must be present inside the parens.
+        // A tuple is:
+        //   - `()` (empty — used by zero-arity FFI declare/invoke),
+        //   - `at_least(2)` items separated by commas, or
+        //   - exactly 1 item with a trailing comma.
+        // Non-empty forms still require a comma so `(1)` stays a group.
         use chumsky::Parser;
+        let empty = op!('(')
+            .ignore_then(op!(')'))
+            .to(Vec::new())
+            .labelled("empty tuple");
         let two_or_more = expr
             .clone()
             .separated_by(op!(','))
             .allow_trailing()
             .at_least(2)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .delimited_by(op!('('), op!(')'));
         let one_with_trailing = expr
             .clone()
             .then_ignore(op!(','))
             .map(|e| vec![e])
-            .labelled("single-element tuple");
-        choice((two_or_more, one_with_trailing))
             .delimited_by(op!('('), op!(')'))
+            .labelled("single-element tuple");
+        choice((empty, two_or_more, one_with_trailing))
             .map_with(|items, e| (e.span(), Box::new(Expression::Tuple(items))))
             .labelled("tuple")
     }
@@ -1730,6 +1850,120 @@ mod tests {
         stmt!("print \"Hello, World!\";");
         stmt!("defer { print \"%i\", 42; }");
         stmt!("while x < 10 { x = x + 1; }");
+    }
+
+    #[test]
+    fn format_keyword_parses_as_expression() {
+        same!("format \"%i-%s\", 42, \"x\"");
+        let ast = expr_ast!("format \"%i-%s\", 42, \"x\"");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Format(_, Some(params)) => assert_eq!(params.len(), 2),
+            other => panic!("expected format expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_and_continue_parse_as_statements() {
+        let break_ast = decl_ast!("break;");
+        match break_ast {
+            Expression::Statement(inner) => {
+                assert!(matches!(inner.1.as_ref(), Expression::Break));
+            }
+            other => panic!("expected break statement, got {:?}", other),
+        }
+
+        let continue_ast = decl_ast!("continue;");
+        match continue_ast {
+            Expression::Statement(inner) => {
+                assert!(matches!(inner.1.as_ref(), Expression::Continue));
+            }
+            other => panic!("expected continue statement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn c_style_for_parses_let_init_and_step() {
+        let ast = decl_ast!("for (let i = 0; i < 10; i = i + 1) { continue; }");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    assert!(matches!(
+                        init.as_ref().map(|i| i.1.as_ref()),
+                        Some(Expression::Fragment(_))
+                    ));
+                    assert!(matches!(cond.1.as_ref(), Expression::Expr(_)));
+                    assert!(matches!(
+                        step.as_ref().map(|s| s.1.as_ref()),
+                        Some(Expression::Expr(_))
+                    ));
+                    assert!(matches!(body.1.as_ref(), Expression::Block(_)));
+                }
+                other => panic!("expected for statement, got {:?}", other),
+            },
+            other => panic!("expected statement wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn c_style_for_allows_empty_init_and_step() {
+        let ast = decl_ast!("for (; keep_going; ) { break; }");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::For {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    assert!(init.is_none());
+                    assert!(matches!(cond.1.as_ref(), Expression::Expr(_)));
+                    assert!(step.is_none());
+                    assert!(matches!(body.1.as_ref(), Expression::Block(_)));
+                }
+                other => panic!("expected for statement, got {:?}", other),
+            },
+            other => panic!("expected statement wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn const_keyword_parses_to_constant_fragment() {
+        let ast = decl_ast!("const answer = 42;");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::Fragment(children) => {
+                    assert_eq!(children.len(), 2);
+                    match children[0].1.as_ref() {
+                        Expression::Constant(name, ty) => {
+                            assert!(ty.is_none());
+                            match name.1.as_ref() {
+                                Expression::Identifier(name) => assert_eq!(*name, "answer"),
+                                other => panic!("expected const identifier, got {:?}", other),
+                            }
+                        }
+                        other => panic!("expected Constant, got {:?}", other),
+                    }
+                    match children[1].1.as_ref() {
+                        Expression::Expr(inner) => match inner.1.as_ref() {
+                            Expression::Integer(value) => assert_eq!(*value, 42),
+                            other => panic!("expected integer initializer, got {:?}", other),
+                        },
+                        other => panic!("expected expression initializer, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Fragment, got {:?}", other),
+            },
+            other => panic!("expected Statement, got {:?}", other),
+        }
     }
 
     #[test]
@@ -2416,11 +2650,7 @@ mod tests {
     fn parse_async_fn_round_trips() {
         let ast = decl_ast!("async fn coro() { yield 1; }");
         match ast {
-            Expression::Function {
-                name,
-                is_coro,
-                ..
-            } => {
+            Expression::Function { name, is_coro, .. } => {
                 assert_eq!(name, "coro");
                 assert!(is_coro);
             }
@@ -2719,5 +2949,33 @@ mod tests {
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_classes {
+    use super::*;
+
+    #[test]
+    fn parse_classes_example() {
+        let src = include_str!("../../examples/classes.0s");
+        let p = Pratt::default();
+        p.parse(src).unwrap_or_else(|e| panic!("PARSE FAIL: {e:?}"));
+    }
+
+    /// `impl` methods are space/newline-separated (no commas between methods).
+    #[test]
+    fn parse_impl_methods_without_commas() {
+        let src = r#"
+class Point { x: int, y: int, }
+impl Point {
+    fn sum() -> int { return self.x + self.y; }
+    fn set_x(int n) { self.x = n; }
+}
+fn main() { let p = new Point(1, 2); }
+"#;
+        let p = Pratt::default();
+        p.parse(src)
+            .unwrap_or_else(|e| panic!("expected space-separated impl methods: {e:?}"));
     }
 }
