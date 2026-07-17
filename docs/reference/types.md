@@ -314,7 +314,25 @@ fn main() {
 | `fn add<T: Num>(T a, T b) -> T` | `T` must satisfy the `Num` bound |
 | `fn both<T: Num + Eq>(T x) -> T` | Multiple bounds (`+`) |
 
-At each call site the compiler **monomorphizes** by choosing concrete types for `T`, discharging bounds against registered typeclass instances, and emitting dynamic operators (`DynAdd`, `DynCmp`, …) inside the generic body when operands are still type parameters.
+Call-site strategy:
+
+| Situation | Runtime |
+|-----------|---------|
+| Ground call with only **builtin** bounds (`Num`/`Ord`/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
+| Shared body / open type params with builtin bounds | `DynAdd` / friends on boxed values |
+| Ground or shared call with **user** typeclass bounds | **Dictionary passing** — see below |
+| Escaped generic fn value (`let f = id;`) | `MakePolyFn` + `CallIndirect` |
+
+### Dictionary passing
+
+Constrained calls that are not monomorphized append one dictionary per **user** typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets (typeclass declaration order). The callee reserves trailing locals `__dict0`, `__dict1`, … for those tuples. Builtin classes do **not** receive dicts — they keep using `Dyn*` on the shared path.
+
+```0s
+typeclass Describable<T> { fn describe_val(T x) -> int; }
+impl Describable<int> { fn describe_val(int x) -> int { return x; } }
+fn show<T: Describable>(T x) -> int { return 0; }
+// show(42) → CALL arity = 2 (value + Describable dict)
+```
 
 ### Builtin typeclasses
 
@@ -343,7 +361,25 @@ impl Measurable<int> {
 }
 ```
 
-Instance methods compile to ordinary functions with mangled names; generic call sites that need a bound look up the matching `impl` at typecheck time.
+Instance methods compile to ordinary functions with mangled names
+(`Class__Type__method`). Generic call sites discharge the bound at
+typecheck time and pass the matching dictionary at runtime (above).
+
+### Higher-rank `forall`
+
+Type annotations may use prenex / higher-rank quantification:
+
+```0s
+fn app(forall T. T -> T f, int x) -> int {
+    return f(x);
+}
+```
+
+`forall T: Num. …` carries constraints on the binder. When checking an
+argument against a `forall` expectation, the checker skolemizes the
+binder (rigid variables) and rejects escaping skolems. A polymorphic
+generic function identifier (e.g. `id`) is compatible with a matching
+`forall` parameter type.
 
 See `examples/generics.0s` for a runnable `Num`-bounded demo.
 
@@ -390,7 +426,7 @@ Fully generic (unbounded `T`) functions that return `T` are NOT directly printab
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
-| Generics | Generic **functions** with type params and `T: Class` bounds; builtin `Num`/`Eq`/`Ord`/`Show` instances for `int`/`float`/`string`. User `typeclass` / `impl` declarations parse and register instances; generic type constructors and higher-kinded types are not supported |
+| Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` as `Ty::App`; builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
 | Higher-kinded types | Not supported |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |

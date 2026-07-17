@@ -205,6 +205,18 @@ fn candidate_for_call(
         return None;
     }
 
+    // Skip monomorphization when ANY bound is a user-defined typeclass.
+    // Functions with user typeclass constraints use the dictionary-passing
+    // calling convention instead (dict tuples appended after value args).
+    // Builtin classes (Num, Ord, Eq, Show) are dispatched via Dyn* opcodes
+    // in the shared body and benefit from monomorphization; all others don't.
+    let has_any_user_bound = sig.type_param_bounds.iter().any(|bounds| {
+        bounds.iter().any(|b| !Checker::is_builtin_class(b))
+    });
+    if has_any_user_bound {
+        return None;
+    }
+
     let args = args.unwrap_or(&[]);
     if args.len() != sig.param_type_params.len() {
         return None;

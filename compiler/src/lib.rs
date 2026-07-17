@@ -831,6 +831,85 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
     }
 
+    /// Emit dictionary tuples for a non-monomorphized generic call site.
+    ///
+    /// Convention: after value args, one `MakeTuple` per **user** typeclass
+    /// constraint (builtin Num/Ord/Eq/Show are skipped — they use `Dyn*`).
+    /// Each tuple holds method entry offsets in typeclass declaration order
+    /// (`CONST <offset>`, or `CONST 0` if the FQN is not compiled yet).
+    ///
+    /// Instances are resolved from the callee's scheme + concrete argument
+    /// types (not `NodeId`), because the pre-walk / infer ID table can be
+    /// misaligned inside function bodies.
+    ///
+    /// Returns the number of dict tuples pushed (used to bump CALL arity).
+    fn emit_call_site_dicts(
+        bytecode: &mut Vec<Byte>,
+        fn_name: &str,
+        arg_tys: &[crate::typechecking::Ty],
+        checker: &Checker,
+        functions: &HashMap<String, usize>,
+    ) -> usize {
+        use crate::typechecking::Ty;
+        use crate::typechecking::subst::apply_ty_prune;
+
+        let Some(scheme) = checker.env().lookup(fn_name).cloned() else {
+            return 0;
+        };
+        // Map quantified vars → concrete arg types by peeling the curried
+        // function type against the call's argument types.
+        // Do NOT apply the global subst to the scheme — those vars may have
+        // been reused/unified later in the program.
+        let mut var_to_ty: HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty> =
+            HashMap::new();
+        let mut fun = &scheme.ty;
+        let mut arg_idx = 0usize;
+        while let Ty::Fun(param, ret) = fun {
+            if arg_idx >= arg_tys.len() {
+                break;
+            }
+            if let Ty::Var(v) = param.as_ref() {
+                var_to_ty
+                    .entry(*v)
+                    .or_insert_with(|| arg_tys[arg_idx].clone());
+            }
+            fun = ret.as_ref();
+            arg_idx += 1;
+        }
+
+        let mut dict_count = 0;
+        for constraint in &scheme.constraints {
+            if Checker::is_builtin_class(&constraint.class) {
+                continue;
+            }
+            let Some(concrete) = var_to_ty.get(&constraint.var) else {
+                continue;
+            };
+            let concrete = apply_ty_prune(checker.subst(), concrete);
+            let Some(instance) = checker
+                .generics()
+                .find_instance(&constraint.class, std::slice::from_ref(&concrete))
+            else {
+                continue;
+            };
+            let Some(class_def) = checker.generics().typeclass(&instance.class) else {
+                continue;
+            };
+            let n_methods = class_def.methods.len() as u32;
+            for method_def in &class_def.methods {
+                let offset = instance
+                    .method_fqns
+                    .get(&method_def.name)
+                    .and_then(|fqn| functions.get(fqn).copied())
+                    .unwrap_or(0);
+                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(offset as i32));
+            }
+            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
+            dict_count += 1;
+        }
+        dict_count
+    }
+
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
     /// emission at generic call boundaries.
     fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
@@ -1803,6 +1882,22 @@ impl Compiler {
 
                 let mut a = self.do_compile(args);
 
+                // ── Dictionary-passing prologue ────────────────────────────────
+                // Generic functions with user-defined typeclass constraints receive
+                // extra dict tuple arguments after the value params.  Reserve a
+                // stack slot `__dictN` for each expected dict so that the Interner
+                // assigns a slot number that can later be LOAD-ed by CallIndirect
+                // dispatch paths.  The VM pushes these as the trailing elements of
+                // the call frame, one per user constraint, in constraint order.
+                // Built-in classes (Num / Ord / Eq / Show) use Dyn* opcodes and do
+                // not get a dict slot.
+                let dict_arity = self.checker.dict_arity_for(name);
+                for dict_idx in 0..dict_arity {
+                    self.context
+                        .variables
+                        .intern(format!("__dict{}", dict_idx));
+                }
+
                 self.bytecode.append(&mut a);
 
                 let mut c = self.do_compile(body);
@@ -2518,20 +2613,6 @@ impl Compiler {
                         .get(&identifier)
                         .cloned()
                         .unwrap_or_else(|| identifier.clone());
-                    // B2 records selected user dictionaries here; the shared
-                    // generic body still uses the existing Dyn* path until full
-                    // dictionary passing lands.
-                    let _has_selected_user_dict = self.checker.is_generic_fn(&n)
-                        && self_id
-                            .and_then(|id| self.checker.call_dicts_at(id))
-                            .is_some_and(|dicts| {
-                                dicts.iter().any(|instance| {
-                                    instance
-                                        .method_fqns
-                                        .values()
-                                        .any(|fqn| self.functions.contains_key(fqn))
-                                })
-                            });
 
                     if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
                         // Stage arg bytecode in a local Vec to
@@ -2595,7 +2676,43 @@ impl Compiler {
                             }
                         }
 
-                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        // ── Dictionary-passing calling convention ──────────────────
+                        // For non-monomorphized generic calls with user-defined typeclass
+                        // constraints, append one dict tuple per constraint after the
+                        // value args.  Each dict is a MakeTuple of method code offsets
+                        // (CONST <offset> per method in declaration order, CONST 0 for
+                        // builtins / methods not yet compiled).  Builtin classes (Num,
+                        // Ord, Eq, Show) are dispatched via Dyn* opcodes and do NOT
+                        // need an explicit dict — only user typeclasses get a dict.
+                        let dict_count = if is_generic {
+                            let call_arg_tys: Vec<crate::typechecking::Ty> = args
+                                .as_ref()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .map(|arg| {
+                                            let ty = self.checker.infer_for_codegen(arg);
+                                            crate::typechecking::subst::apply_ty_prune(
+                                                self.checker.subst(),
+                                                &ty,
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Self::emit_call_site_dicts(
+                                &mut bytecode,
+                                &n,
+                                &call_arg_tys,
+                                &self.checker,
+                                &self.functions,
+                            )
+                        } else {
+                            0
+                        };
+
+                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32
+                            + dict_count as u32;
                         if is_instance_method_fqn(&self.checker, &n) {
                             Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
                         } else if self.coroutine_fns.contains(&n) {
@@ -6606,6 +6723,168 @@ print \"%i\", len(a); \
             has_specialized_add,
             "specialized add clone should contain int ADD/fused equivalent; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Dictionary-passing calling convention tests ─────────────────────────
+
+    /// Codegen test: A non-monomorphized call to a generic function with a
+    /// **user-defined** typeclass constraint must emit:
+    ///   1. `MakeTuple` (the method-offset dict) after the value arg.
+    ///   2. A `CALL` whose packed arity is 2 (1 value arg + 1 dict tuple),
+    ///      NOT 1.
+    ///
+    /// The CONST that feeds `MakeTuple` encodes the bytecode offset of the
+    /// instance method (i.e. it must be > 0 because the method compiles to a
+    /// real function body).
+    #[test]
+    fn user_typeclass_constrained_call_emits_dict_tuple_and_bumps_arity() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            // Declare a user typeclass with one method.
+            "typeclass Describable<T> { fn describe_val(T x) -> int; } \
+             impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
+             // Generic fn with one user typeclass constraint.  NOT called as mono.
+             fn show<T: Describable>(T x) -> int { return 0; } \
+             fn main() { show(42); }",
+        );
+
+        // ── 1. A MakeTuple must be present (the dict for Describable<int>).
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "expected MakeTuple for dict emission; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        // ── 2. The CALL to `show` must have arity 2 (1 value + 1 dict).
+        //    We look for the CALL with the highest arity among all CALL
+        //    instructions (the monomorphized clone if any won't have a dict).
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 dict); got {} from opcodes: {:?}",
+            max_call_arity,
+            bc.iter()
+                .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+                .map(|b| b.call_parts())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Codegen test: A non-monomorphized call with **two** user typeclass
+    /// constraints must emit **two** `MakeTuple` instructions (one per dict)
+    /// and a `CALL` with arity N_value_args + 2.
+    #[test]
+    fn two_user_typeclass_constraints_emit_two_dicts_and_arity_plus_two() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Printable<T> { fn printable_val(T x) -> int; } \
+             typeclass Countable<T> { fn count_val(T x) -> int; } \
+             impl Printable<int> { fn printable_val(int x) -> int { return x; } } \
+             impl Countable<int> { fn count_val(int x) -> int { return x + 1; } } \
+             fn process<T: Printable + Countable>(T x) -> int { return 0; } \
+             fn main() { process(5); }",
+        );
+
+        // Two MakeTuple instructions (one per dict).
+        let make_tuple_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .count();
+        assert!(
+            make_tuple_count >= 2,
+            "expected at least 2 MakeTuple (two dicts); got {}; opcodes: {:?}",
+            make_tuple_count,
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        // CALL arity should be 1 value + 2 dicts = 3.
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 3,
+            "expected CALL arity = 3 (1 value + 2 dicts); got {}",
+            max_call_arity
+        );
+    }
+
+    /// Codegen test: A call to a generic function with a **builtin** typeclass
+    /// constraint (Num) must NOT emit any `MakeTuple` for a dict — builtin
+    /// classes use `Dyn*` opcodes and the arity must remain equal to the
+    /// number of value args.
+    #[test]
+    fn builtin_num_constraint_does_not_emit_dict_tuple() {
+        use common::Instruction;
+        // Non-monomorphized call: use boxed arg path.
+        let (bc, _pool) = compile_src(
+            "fn add_generic<T: Num>(T a, T b) -> T { return a + b; } \
+             fn caller<U: Num>(U x, U y) -> U { return add_generic(x, y); }",
+        );
+
+        // Num is builtin → no MakeTuple for dicts.
+        // (There may still be MakeTuple for tuples in other parts of the program —
+        //  but this tiny program has none outside of dict emission.)
+        let make_tuple_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .count();
+        assert_eq!(
+            make_tuple_count, 0,
+            "builtin Num constraint should not emit MakeTuple dict; got {}; opcodes: {:?}",
+            make_tuple_count,
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        // Num uses DynAdd, not a dict.
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "expected DynAdd for Num-constrained add; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ground calls with **user** typeclass bounds are NOT monomorphized
+    /// (see `monomorphize.rs`); they use the shared body + dictionary-passing
+    /// convention instead. Expect BoxValue + MakeTuple + bumped CALL arity.
+    #[test]
+    fn ground_user_typeclass_call_uses_dict_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Describable<T> { fn describe_val(T x) -> int; } \
+             impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
+             fn id_d<T: Describable>(T x) -> T { return x; } \
+             fn main() { let y = id_d(7); }",
+        );
+
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            "shared generic path should box the concrete arg; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "user typeclass ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 dict); got {}",
+            max_call_arity
         );
     }
 }

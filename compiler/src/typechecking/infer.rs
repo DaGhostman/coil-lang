@@ -1842,6 +1842,12 @@ impl Checker {
         self.call_site_dicts.get(&id).map(Vec::as_slice)
     }
 
+    /// All call-site dicts (for debugging / testing).
+    #[cfg(test)]
+    pub fn all_call_site_dicts(&self) -> &HashMap<NodeId, Vec<InstanceDef>> {
+        &self.call_site_dicts
+    }
+
     /// Borrow the pre-walk [`IdTable`].
     pub fn id_table(&self) -> &IdTable {
         &self.ids
@@ -8045,6 +8051,35 @@ fn main() { let r = add("a", "b"); }
             "expected a Num constraint violation for string, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    /// Debug test: discharge_constraints should populate call_site_dicts for
+    /// user typeclasses at ground call sites.
+    #[test]
+    fn discharge_constraints_populates_call_site_dicts_for_user_typeclass() {
+        let src = r#"
+typeclass Describable<T> { fn describe_val(T x) -> int; }
+impl Describable<int> { fn describe_val(int x) -> int { return x; } }
+fn show<T: Describable>(T x) -> int { return 0; }
+fn main() { show(42); }
+"#;
+        let (c, _) = check(src);
+        let dicts = c.all_call_site_dicts();
+        eprintln!("call_site_dicts has {} entries", dicts.len());
+        for (id, instances) in dicts {
+            eprintln!("  NodeId {:?} -> {:?}", id, instances.iter().map(|i| &i.class).collect::<Vec<_>>());
+        }
+        let total_instances: usize = dicts.values().map(|v| v.len()).sum();
+        assert!(
+            total_instances > 0,
+            "expected at least one call_site_dict entry for user typeclass, got 0;\
+             \ndicts: {:?}", dicts
+        );
+        // Check that we recorded Describable<int>
+        let has_describable = dicts.values().any(|instances| {
+            instances.iter().any(|i| i.class == "Describable")
+        });
+        assert!(has_describable, "expected Describable in call_site_dicts, got: {:?}", dicts);
     }
 
     /// A generic function calling another generic function with the same
