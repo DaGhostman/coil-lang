@@ -154,6 +154,21 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
                 .map(|(n, t)| (n.clone(), apply_ty(subst, t)))
                 .collect(),
         },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            let mut inner = subst.clone();
+            for bound in bounds {
+                let _ = inner.remove(*bound);
+            }
+            Ty::Forall {
+                bounds: bounds.clone(),
+                constraints: constraints.clone(),
+                body: Box::new(apply_ty(&inner, body)),
+            }
+        }
     }
 }
 

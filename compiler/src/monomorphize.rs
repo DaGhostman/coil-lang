@@ -279,6 +279,7 @@ fn contains_var(ty: &Ty) -> bool {
         Ty::Tuple(items) => items.iter().any(contains_var),
         Ty::Array { element, .. } => contains_var(element),
         Ty::Record { fields } => fields.iter().any(|(_, ty)| contains_var(ty)),
+        Ty::Forall { body, .. } => contains_var(body),
         Ty::Con(_) => false,
     }
 }
@@ -486,6 +487,10 @@ where
             for arg in args {
                 f(arg);
             }
+        }
+        Expression::TypeFun(arg, ret) => {
+            f(arg);
+            f(ret);
         }
         Expression::Class { fields, .. } => {
             for field in fields {

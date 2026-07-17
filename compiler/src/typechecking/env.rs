@@ -206,7 +206,7 @@ pub fn instantiate_with_constraints(
 
 /// Walk `ty`, replacing every variable in `mapping` with its mapped
 /// value. Variables not in the mapping are left alone.
-fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
+pub(crate) fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
     match ty {
         Ty::Var(v) => match mapping.get(v) {
             Some(&new) => Ty::Var(new),
@@ -265,6 +265,27 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
                 .map(|(n, t)| (n.clone(), substitute_vars(t, mapping)))
                 .collect(),
         },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            let mut inner = mapping.clone();
+            for bound in bounds {
+                inner.remove(bound);
+            }
+            Ty::Forall {
+                bounds: bounds.clone(),
+                constraints: constraints
+                    .iter()
+                    .map(|c| super::ty::Constraint {
+                        var: inner.get(&c.var).copied().unwrap_or(c.var),
+                        class: c.class.clone(),
+                    })
+                    .collect(),
+                body: Box::new(substitute_vars(body, &inner)),
+            }
+        }
     }
 }
 

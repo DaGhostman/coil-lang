@@ -217,7 +217,13 @@ impl<'pratt> Pratt<'pratt> {
                         }),
                     )
                 });
-            choice((array_type, tuple_type, forall_type, named_type))
+            let atom = choice((array_type, tuple_type, forall_type, named_type));
+            atom.clone()
+                .then(op!("->").ignore_then(type_ann.clone()).or_not())
+                .map_with(|(lhs, rhs), e| match rhs {
+                    Some(rhs) => (e.span(), Box::new(Expression::TypeFun(lhs, rhs))),
+                    None => lhs,
+                })
         })
     }
 

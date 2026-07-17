@@ -133,6 +133,14 @@ pub struct Checker {
     /// Generic function names registered during typechecking.
     /// Used by codegen to decide between DynAdd vs regular ADD.
     pub generic_fns: HashSet<String>,
+    /// Number of *user-defined* typeclass dict slots expected by each
+    /// generic function.  Built-in classes (Num, Ord, Eq, Show) are
+    /// handled via Dyn* opcodes and do NOT count toward this arity.
+    ///
+    /// Persists across `check_program` calls (same lifetime as
+    /// `generics.generic_fns`) so codegen can query it after the
+    /// typechecking pass.
+    pub fn_dict_arity: HashMap<String, usize>,
 }
 
 /// C-layout struct registered via `extern struct Name { ... }`.
@@ -255,6 +263,7 @@ impl Checker {
             active_constraints: Vec::new(),
             generics: super::generics::Generics::new(),
             generic_fns: HashSet::new(),
+            fn_dict_arity: HashMap::new(),
         };
         checker.register_builtin_enums();
         checker
@@ -601,6 +610,11 @@ impl Checker {
             // A bare type name (only valid as an annotation, but be
             // permissive).
             Expression::Type(name) => self.parse_type_name_str(name),
+            Expression::TypeFun(arg, ret) => {
+                let arg_ty = self.infer(arg);
+                let ret_ty = self.infer(ret);
+                Ty::Fun(Box::new(arg_ty), Box::new(ret_ty))
+            }
 
             // ---- Wrappers / no-ops ----
             Expression::Noop(_)
@@ -888,6 +902,8 @@ impl Checker {
                         Some(&format!("{}::{}", owner, method)),
                         &fun_ty,
                         &arg_tys,
+                        None,
+                        id,
                         range,
                     );
                 }
@@ -915,7 +931,14 @@ impl Checker {
                     None => Vec::new(),
                 };
 
-                let result = self.apply_function(Some(&ident), &fun_ty, &arg_tys, range.clone());
+                let result = self.apply_function(
+                    Some(&ident),
+                    &fun_ty,
+                    &arg_tys,
+                    args.as_deref(),
+                    id,
+                    range.clone(),
+                );
                 // Discharge typeclass constraints from the instantiated scheme.
                 // This verifies that each concrete type argument satisfies the
                 // required bound, or propagates the constraint if the caller is
@@ -1790,16 +1813,7 @@ impl Checker {
             }
 
             Expression::Forall { params, ty } => {
-                // In a type annotation context, bind type params and resolve the inner type.
-                let mut frame = HashMap::new();
-                for tp in params {
-                    let var = self.counter.fresh();
-                    frame.insert(tp.name.to_string(), var);
-                }
-                self.type_params_in_scope.push(frame);
-                let inner_ty = self.infer(ty);
-                self.type_params_in_scope.pop();
-                inner_ty
+                self.forall_type(params, |checker| checker.infer(ty))
             }
 
             // ---- Fallback ----
@@ -2233,50 +2247,250 @@ impl Checker {
         name: Option<&str>,
         fun_ty: &Ty,
         arg_tys: &[Ty],
+        arg_exprs: Option<&[Output]>,
+        call_id: Option<NodeId>,
         range: Range<usize>,
     ) -> Ty {
         let mut current = fun_ty.clone();
         for (i, arg) in arg_tys.iter().enumerate() {
-            let pruned = apply_ty(&self.subst, &current);
-            match pruned {
-                Ty::Fun(param, ret) => {
-                    self.unify(param.as_ref(), arg, &range, "function argument");
-                    current = *ret;
-                }
-                Ty::Var(v) => {
-                    let ret_ty = Ty::Var(self.counter.fresh());
-                    let new_fun = Ty::Fun(Box::new(arg.clone()), Box::new(ret_ty.clone()));
-                    self.unify(&Ty::Var(v), &new_fun, &range, "function type");
-                    current = ret_ty;
-                }
-                _ => {
-                    // We've run out of function parameters — the call
-                    // had more arguments than the function accepts.
-                    let actual = format!("{}", apply_ty_prune(&self.subst, &pruned));
-                    return self.error_with_help(
-                        ErrorCode::GenericTypeError, match name {
-                            Some(n) => format!(
-                                "Function `{}` was called with too many arguments \
-                                 (it accepts {}, but argument #{} was given)",
-                                n,
-                                i,
-                                i + 1,
-                            ),
-                            None => format!(
-                                "Cannot call value of type `{}` as a function \
-                                 (it accepts {} argument{})",
-                                actual,
-                                i,
-                                if i == 1 { "" } else { "s" },
-                            ),
-                        },
-                        range,
-                        Some("check the function signature or the number of arguments".to_string()),
-                    );
+            let mut pending_constraints = Vec::new();
+            loop {
+                let pruned = apply_ty(&self.subst, &current);
+                match pruned {
+                    forall @ Ty::Forall { .. } => {
+                        let (body, constraints) = self.instantiate_forall_ty(&forall);
+                        pending_constraints.extend(constraints);
+                        current = body;
+                    }
+                    Ty::Fun(param, ret) => {
+                        if matches!(param.as_ref(), Ty::Forall { .. }) {
+                            self.check_rank_n_argument(
+                                param.as_ref(),
+                                arg,
+                                arg_exprs.and_then(|args| args.get(i)),
+                                &range,
+                            );
+                        } else {
+                            self.unify(param.as_ref(), arg, &range, "function argument");
+                        }
+                        if !pending_constraints.is_empty() {
+                            self.discharge_constraints(call_id, &pending_constraints, &range);
+                        }
+                        current = *ret;
+                        break;
+                    }
+                    Ty::Var(v) => {
+                        let ret_ty = Ty::Var(self.counter.fresh());
+                        let new_fun = Ty::Fun(Box::new(arg.clone()), Box::new(ret_ty.clone()));
+                        self.unify(&Ty::Var(v), &new_fun, &range, "function type");
+                        current = ret_ty;
+                        break;
+                    }
+                    _ => {
+                        // We've run out of function parameters — the call
+                        // had more arguments than the function accepts.
+                        let actual = format!("{}", apply_ty_prune(&self.subst, &pruned));
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError, match name {
+                                Some(n) => format!(
+                                    "Function `{}` was called with too many arguments \
+                                     (it accepts {}, but argument #{} was given)",
+                                    n,
+                                    i,
+                                    i + 1,
+                                ),
+                                None => format!(
+                                    "Cannot call value of type `{}` as a function \
+                                     (it accepts {} argument{})",
+                                    actual,
+                                    i,
+                                    if i == 1 { "" } else { "s" },
+                                ),
+                            },
+                            range,
+                            Some("check the function signature or the number of arguments".to_string()),
+                        );
+                    }
                 }
             }
         }
         current
+    }
+
+    fn instantiate_forall_ty(&mut self, ty: &Ty) -> (Ty, Vec<Constraint>) {
+        let Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } = ty
+        else {
+            return (ty.clone(), Vec::new());
+        };
+
+        let mapping: HashMap<TyVarId, TyVarId> = bounds
+            .iter()
+            .map(|&v| (v, self.counter.fresh()))
+            .collect();
+        let body = super::env::substitute_vars(body, &mapping);
+        let constraints = constraints
+            .iter()
+            .map(|c| Constraint {
+                var: mapping.get(&c.var).copied().unwrap_or(c.var),
+                class: c.class.clone(),
+            })
+            .collect();
+        (body, constraints)
+    }
+
+    fn skolemize_forall_ty(&mut self, ty: &Ty) -> (Ty, Vec<(String, String)>) {
+        let Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } = ty
+        else {
+            return (ty.clone(), Vec::new());
+        };
+
+        let mut subst = Subst::empty();
+        let mut skolem_names = HashMap::new();
+        for bound in bounds {
+            let fresh = self.counter.fresh();
+            let name = format!("$forall{}", fresh.raw());
+            skolem_names.insert(*bound, name.clone());
+            subst.insert(*bound, Ty::Con(name));
+        }
+        let body = apply_ty(&subst, body);
+        let constraints = constraints
+            .iter()
+            .filter_map(|c| {
+                skolem_names
+                    .get(&c.var)
+                    .map(|name| (name.clone(), c.class.clone()))
+            })
+            .collect();
+        (body, constraints)
+    }
+
+    fn check_rank_n_argument(
+        &mut self,
+        expected: &Ty,
+        inferred_arg: &Ty,
+        arg_expr: Option<&Output>,
+        range: &Range<usize>,
+    ) {
+        let (expected_body, expected_constraints) = self.skolemize_forall_ty(expected);
+        let (candidate, candidate_constraints) = match arg_expr.and_then(identifier_name) {
+            Some(name) => match self.env.lookup(name).cloned() {
+                Some(scheme) => instantiate_with_constraints(&scheme, &mut self.counter),
+                None => (inferred_arg.clone(), Vec::new()),
+            },
+            None => (inferred_arg.clone(), Vec::new()),
+        };
+        let candidate = apply_ty_prune(&self.subst, &candidate);
+
+        let local = match unify_with(&Subst::empty(), &candidate, &expected_body) {
+            Ok(s) => s,
+            Err(_) => {
+                let expected_pretty = apply_ty_prune(&self.subst, expected);
+                self.messages.push(Message::error(
+                    ErrorCode::TypeMismatch,
+                    format!(
+                        "Type mismatch: expected `{}`, found `{}`",
+                        expected_pretty, candidate
+                    ),
+                    arg_expr
+                        .map(|arg| arg.0.into_range())
+                        .unwrap_or_else(|| range.clone()),
+                ));
+                return;
+            }
+        };
+
+        for constraint in candidate_constraints {
+            let resolved = apply_ty_prune(&local, &Ty::Var(constraint.var));
+            match resolved {
+                Ty::Con(name) if name.starts_with("$forall") => {
+                    let covered = expected_constraints
+                        .iter()
+                        .any(|(skolem, class)| skolem == &name && class == &constraint.class);
+                    if !covered {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Cannot pass constrained polymorphic value where unconstrained `forall` is expected"
+                            ),
+                            arg_expr
+                                .map(|arg| arg.0.into_range())
+                                .unwrap_or_else(|| range.clone()),
+                        ));
+                    }
+                }
+                Ty::Var(v) => {
+                    let covered = self
+                        .active_constraints
+                        .iter()
+                        .any(|ac| ac.var == v && ac.class == constraint.class);
+                    if !covered {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!("Cannot satisfy constraint `{}`", constraint.class),
+                            arg_expr
+                                .map(|arg| arg.0.into_range())
+                                .unwrap_or_else(|| range.clone()),
+                        ));
+                    }
+                }
+                concrete => {
+                    if self
+                        .generics
+                        .find_instance(&constraint.class, &[concrete.clone()])
+                        .is_none()
+                    {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "No instance for `{}` of type `{}`",
+                                constraint.class, concrete
+                            ),
+                            arg_expr
+                                .map(|arg| arg.0.into_range())
+                                .unwrap_or_else(|| range.clone()),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn forall_type<F>(&mut self, params: &[parser::ast::TypeParam], body: F) -> Ty
+    where
+        F: FnOnce(&mut Self) -> Ty,
+    {
+        let mut frame = HashMap::new();
+        let mut bounds = Vec::new();
+        let mut constraints = Vec::new();
+        for tp in params {
+            let var = self.counter.fresh();
+            frame.insert(tp.name.to_string(), var);
+            bounds.push(var);
+            for bound in &tp.bounds {
+                constraints.push(Constraint {
+                    var,
+                    class: bound.to_string(),
+                });
+            }
+        }
+
+        self.type_params_in_scope.push(frame);
+        let inner_ty = body(self);
+        self.type_params_in_scope.pop();
+
+        Ty::Forall {
+            bounds,
+            constraints,
+            body: Box::new(inner_ty),
+        }
     }
 
     /// Unify two types under the current substitution, updating
@@ -2426,6 +2640,13 @@ impl Checker {
             Expression::Identifier(name) | Expression::Type(name) => self.parse_type_name_str(name),
             Expression::TypeApp { name, args } => {
                 self.parse_type_app(name, args, ann.0.into_range())
+            }
+            Expression::TypeFun(arg, ret) => Ty::Fun(
+                Box::new(self.parse_type_name(arg)),
+                Box::new(self.parse_type_name(ret)),
+            ),
+            Expression::Forall { params, ty } => {
+                self.forall_type(params, |checker| checker.parse_type_name(ty))
             }
             Expression::Array(items) => {
                 // Static-length: `[T; N]`. Look for the `; N` shape:
@@ -2998,8 +3219,20 @@ impl Checker {
         if is_generic {
             self.generic_fns.insert(name.to_string());
             self.generics.generic_fns.insert(name.to_string());
-            let scheme = Scheme::poly(param_vars, param_constraints, fun_ty.clone());
+            let scheme = Scheme::poly(param_vars, param_constraints.clone(), fun_ty.clone());
             self.env.insert_top(name.to_string(), scheme);
+
+            // Count how many user-defined typeclass dicts this function will
+            // need at the call site.  Built-in classes (Num, Ord, Eq, Show)
+            // are handled via Dyn* opcodes and do NOT require an explicit
+            // dictionary tuple.  We count unique (type-param, user-class)
+            // pairs so that multiple constraints on the same var each
+            // contribute one dict slot.
+            let user_dict_count = param_constraints
+                .iter()
+                .filter(|c| !Self::is_builtin_class(&c.class))
+                .count();
+            self.fn_dict_arity.insert(name.to_string(), user_dict_count);
         }
 
         fun_ty
@@ -3207,6 +3440,11 @@ impl Checker {
                 for a in args {
                     self.pre_register_enums_walk(a, errors);
                 }
+            }
+
+            Expression::TypeFun(arg, ret) => {
+                self.pre_register_enums_walk(arg, errors);
+                self.pre_register_enums_walk(ret, errors);
             }
 
             Expression::CompoundAssign(name, _, value) => {
@@ -4766,6 +5004,19 @@ impl Checker {
         self.generics.generic_fns.contains(name)
     }
 
+    /// Number of *user-defined* typeclass dict slots expected by a generic
+    /// function.  Returns 0 for non-generic functions or functions whose
+    /// constraints are all built-in classes (Num / Ord / Eq / Show).
+    pub fn dict_arity_for(&self, fn_name: &str) -> usize {
+        self.fn_dict_arity.get(fn_name).copied().unwrap_or(0)
+    }
+
+    /// True for compiler-built-in typeclasses whose instances are dispatched
+    /// via `Dyn*` opcodes rather than an explicit dictionary tuple.
+    pub fn is_builtin_class(class: &str) -> bool {
+        matches!(class, "Num" | "Ord" | "Eq" | "Show")
+    }
+
     /// Return the FQN for an instance method, if registered.
     /// `class` is e.g. `"Num"`, `args` are concrete types, `method` is `"add"`.
     pub fn instance_method_fqn(&self, class: &str, args: &[Ty], method: &str) -> Option<&str> {
@@ -4988,6 +5239,13 @@ fn unwrap_expr_wrappers<'a>(node: &'a Output<'a>) -> &'a Output<'a> {
         | Expression::Statement(e)
         | Expression::ExprStatement(e) => unwrap_expr_wrappers(e),
         _ => node,
+    }
+}
+
+fn identifier_name<'a>(node: &'a Output<'a>) -> Option<&'a str> {
+    match unwrap_expr_wrappers(node).1.as_ref() {
+        Expression::Identifier(name) => Some(*name),
+        _ => None,
     }
 }
 
@@ -5437,6 +5695,58 @@ mod tests {
         let ty = apply_ty(c.subst(), &scheme.ty);
         // a -> b -> ?  (return type is a fresh variable bound to int)
         assert!(matches!(ty, Ty::Fun(_, _)));
+    }
+
+    #[test]
+    fn forall_annotation_pretty_or_ty_forall() {
+        let (mut c, _) =
+            check("fn app(forall T: Num. T -> T f, int x) -> int { return x; }");
+        assert!(c.take_messages().is_empty());
+        let scheme = c.env().lookup("app").expect("app should be registered");
+        let ty = apply_ty(c.subst(), &scheme.ty);
+        let Ty::Fun(param, _) = ty else {
+            panic!("expected function type, got {ty}");
+        };
+        let Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } = param.as_ref()
+        else {
+            panic!("expected forall parameter, got {param}");
+        };
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(constraints.len(), 1);
+        assert_eq!(constraints[0].var, bounds[0]);
+        assert_eq!(constraints[0].class, "Num");
+        assert!(matches!(body.as_ref(), Ty::Fun(_, _)));
+        assert!(format!("{}", param).starts_with("forall t"));
+    }
+
+    #[test]
+    fn rank_n_param_accepts_polymorphic_id() {
+        let src = r#"
+            fn id<T>(T x) -> T { return x; }
+            fn app(forall T. T -> T f, int x) -> int { return f(x); }
+            fn main() { print "%i", app(id, 1); }
+        "#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "expected no messages, got: {msgs:?}");
+    }
+
+    #[test]
+    fn rank_n_rejects_escaping_skolem() {
+        let src = r#"
+            fn inc(int x) -> int { return x; }
+            fn app(forall T. T -> T f, int x) -> int { return f(x); }
+            fn main() { print "%i", app(inc, 1); }
+        "#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
+            "expected rank-n type mismatch, got: {msgs:?}"
+        );
     }
 
     #[test]

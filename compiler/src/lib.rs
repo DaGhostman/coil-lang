@@ -2670,7 +2670,7 @@ impl Compiler {
                 let _ = self.context.variables.intern(n.to_string());
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
-            Expression::Type(_) => {
+            Expression::Type(_) | Expression::TypeFun(_, _) | Expression::Forall { .. } => {
                 // Type names appear as metadata inside enum
                 // declarations (e.g. `Some(int)` wraps `int` as
                 // an `Expression::Type`). The typechecker has

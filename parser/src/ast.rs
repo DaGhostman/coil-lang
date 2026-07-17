@@ -62,6 +62,8 @@ pub enum Expression<'expr> {
         name: &'expr str,
         args: Vec<Output<'expr>>,
     },
+    /// Function type annotation `A -> B`.
+    TypeFun(Output<'expr>, Output<'expr>),
     Comment(&'expr str),
     Print(Output<'expr>, Option<Vec<Output<'expr>>>),
     Format(Output<'expr>, Option<Vec<Output<'expr>>>),
@@ -776,6 +778,7 @@ impl<'a> Display for Expression<'a> {
                     .join(", ");
                 write!(f, "{}<{}>", name, args_s)
             }
+            Self::TypeFun(arg, ret) => write!(f, "{} -> {}", arg.1, ret.1),
             Self::Class { name, type_params, fields } => {
                 let tp = if type_params.is_empty() {
                     String::new()

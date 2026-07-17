@@ -1,5 +1,6 @@
 //! Unification (Robinson's algorithm with occurs check).
 
+use super::env::substitute_vars;
 use super::subst::{Subst, apply_ty, compose};
 use super::ty::{Ty, TyVarId, ftv_ty, option_inner, result_ok_err};
 
@@ -89,6 +90,68 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         (Ty::Fun(a1, b1), Ty::Fun(a2, b2)) => {
             let s = unify_with(subst, a1.as_ref(), a2.as_ref())?;
             unify_with(&s, b1.as_ref(), b2.as_ref())
+        }
+
+        (
+            Ty::Forall {
+                bounds: b1,
+                constraints: c1,
+                body: body1,
+            },
+            Ty::Forall {
+                bounds: b2,
+                constraints: c2,
+                body: body2,
+            },
+        ) => {
+            if b1.len() != b2.len() {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Forall {
+                        bounds: b1,
+                        constraints: c1,
+                        body: body1,
+                    },
+                    right: Ty::Forall {
+                        bounds: b2,
+                        constraints: c2,
+                        body: body2,
+                    },
+                });
+            }
+
+            let mapping = b2.iter().copied().zip(b1.iter().copied()).collect();
+            let renamed_body2 = substitute_vars(&body2, &mapping);
+            let mut normalized_c1 = c1
+                .iter()
+                .map(|c| (c.var, c.class.clone()))
+                .collect::<Vec<_>>();
+            let mut normalized_c2 = c2
+                .iter()
+                .map(|c| {
+                    (
+                        mapping.get(&c.var).copied().unwrap_or(c.var),
+                        c.class.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            normalized_c1.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            normalized_c2.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            if normalized_c1 != normalized_c2 {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Forall {
+                        bounds: b1,
+                        constraints: c1,
+                        body: body1,
+                    },
+                    right: Ty::Forall {
+                        bounds: b2,
+                        constraints: c2,
+                        body: body2,
+                    },
+                });
+            }
+
+            unify_with(subst, &body1, &renamed_body2)
         }
 
         // List types: unify the element type.

@@ -53,6 +53,11 @@ pub enum Ty {
     Record {
         fields: Vec<(String, Ty)>,
     },
+    Forall {
+        bounds: Vec<TyVarId>,
+        constraints: Vec<Constraint>,
+        body: Box<Ty>,
+    },
 }
 
 /// Array length: compile-time constant or runtime-known.
@@ -397,6 +402,18 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
             for (_, fty) in fields {
                 go(fty, acc);
             }
+        }
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            go(body, acc);
+            for c in constraints {
+                acc.insert(c.var);
+            }
+            let bound: HashSet<_> = bounds.iter().copied().collect();
+            acc.retain(|v| !bound.contains(v));
         }
     }
 }

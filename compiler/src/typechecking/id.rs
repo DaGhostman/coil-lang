@@ -78,6 +78,11 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             }
         }
 
+        Expression::TypeFun(arg, ret) => {
+            pre_walk(arg, table);
+            pre_walk(ret, table);
+        }
+
         Expression::Expr(e)
         | Expression::Group(e)
         | Expression::Statement(e)

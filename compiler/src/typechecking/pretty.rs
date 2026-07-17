@@ -99,12 +99,36 @@ impl fmt::Display for Ty {
                 }
                 write!(f, " }}")
             }
+            Ty::Forall {
+                bounds,
+                constraints,
+                body,
+            } => {
+                let vars = bounds
+                    .iter()
+                    .map(|v| {
+                        let mut s = format!("t{}", v.raw());
+                        let classes = constraints
+                            .iter()
+                            .filter(|c| c.var == *v)
+                            .map(|c| c.class.as_str())
+                            .collect::<Vec<_>>();
+                        if !classes.is_empty() {
+                            s.push_str(": ");
+                            s.push_str(&classes.join(" + "));
+                        }
+                        s
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "forall {}. {}", vars, body)
+            }
         }
     }
 }
 
 fn needs_paren(t: &Ty) -> bool {
-    matches!(t, Ty::Fun(_, _))
+    matches!(t, Ty::Fun(_, _) | Ty::Forall { .. })
 }
 
 impl fmt::Display for Scheme {
