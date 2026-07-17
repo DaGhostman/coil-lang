@@ -2047,9 +2047,9 @@ impl Compiler {
                         .find(|(name, _)| name == field)
                         .map(|(_, ty)| ty.clone());
                 }
-                if let Ty::Con(name) = &receiver_ty {
+                if let Some(name) = Checker::class_name_of_ty(&receiver_ty) {
                     if self.checker.is_class(name) {
-                        return self.checker.class_field_ty(name, field).cloned();
+                        return self.codegen_class_field_ty(name, field, &receiver_ty);
                     }
                 }
                 extract_enum_name(&receiver_ty)
@@ -2068,9 +2068,9 @@ impl Compiler {
                         .iter()
                         .find(|(name, _)| name == field)
                         .map(|(_, ty)| ty.clone())
-                } else if let Ty::Con(name) = &inner {
+                } else if let Some(name) = Checker::class_name_of_ty(&inner) {
                     if self.checker.is_class(name) {
-                        self.checker.class_field_ty(name, field).cloned()
+                        self.codegen_class_field_ty(name, field, &inner)
                     } else {
                         extract_enum_name(&inner)
                             .and_then(|n| self.checker.field_type_for(&n, field))
@@ -2356,9 +2356,9 @@ impl Compiler {
             }
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;
-                if let Ty::Con(name) = &inner_ty {
+                if let Some(name) = Checker::class_name_of_ty(&inner_ty) {
                     if self.checker.is_class(name) {
-                        return self.checker.class_field_ty(name, field).cloned();
+                        return self.codegen_class_field_ty(name, field, &inner_ty);
                     }
                 }
                 if let Some(name) = extract_enum_name(&inner_ty) {
@@ -2374,6 +2374,31 @@ impl Compiler {
             }
             _ => None,
         }
+    }
+
+    /// Class field type for codegen, substituting type args from `App`.
+    fn codegen_class_field_ty(&self, class: &str, field: &str, receiver_ty: &Ty) -> Option<Ty> {
+        use crate::typechecking::ty::subst_ty_params;
+        let fty = self.checker.class_field_ty(class, field)?.clone();
+        let params = self
+            .checker
+            .generics()
+            .generic_type_ctors
+            .get(class)
+            .cloned()
+            .unwrap_or_default();
+        if params.is_empty() {
+            return Some(fty);
+        }
+        let args = match receiver_ty {
+            Ty::App(_, args) => args.clone(),
+            _ => return Some(fty),
+        };
+        let mut map = std::collections::HashMap::new();
+        for (p, a) in params.iter().zip(args.iter()) {
+            map.insert(p.clone(), a.clone());
+        }
+        Some(subst_ty_params(&fty, &map))
     }
 
     /// True when `expr` is (or produces) the built-in `Option` sum.
@@ -3242,12 +3267,14 @@ impl Compiler {
                 // Method call: `recv.method(args)`.
                 if let Expression::Access(recv, method) = name.1.borrow() {
                     let recv_ty = self.receiver_type(recv);
-                    let owner = match &recv_ty {
-                        Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n) => {
-                            n.clone()
-                        }
-                        _ => String::new(),
-                    };
+                    let owner = recv_ty
+                        .as_ref()
+                        .and_then(|ty| {
+                            Checker::class_name_of_ty(ty)
+                                .filter(|n| self.checker.is_class(n))
+                                .map(|n| n.to_string())
+                        })
+                        .unwrap_or_default();
                     let fqn = self
                         .context
                         .methods
@@ -4993,10 +5020,9 @@ impl Compiler {
                 let receiver_ty = self.receiver_type(receiver);
                 let is_record =
                     matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
-                let is_class = matches!(
-                    &receiver_ty,
-                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
-                );
+                let is_class = receiver_ty
+                    .as_ref()
+                    .is_some_and(|ty| self.checker.ty_is_class(ty));
                 if is_record || is_class {
                     // Push the field-name string on TOP of the
                     // receiver (which is already on the stack
@@ -5139,10 +5165,9 @@ impl Compiler {
                     }
                 });
                 let is_record = matches!(&inner_ty, Some(crate::typechecking::Ty::Record { .. }));
-                let is_class = matches!(
-                    &inner_ty,
-                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
-                );
+                let is_class = inner_ty
+                    .as_ref()
+                    .is_some_and(|ty| self.checker.ty_is_class(ty));
                 if is_record || is_class {
                     Self::emit_raw_string_literal(&mut self.bytecode, field);
                     self.bytecode.push(Byte::new(Instruction::GetField));

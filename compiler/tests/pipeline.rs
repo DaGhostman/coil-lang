@@ -137,6 +137,12 @@ fn example_classes_prints_7458() {
 }
 
 #[test]
+fn example_generic_class_prints_42() {
+    let output = run_example("examples/generic_class.0s");
+    assert_eq!(output, "42");
+}
+
+#[test]
 fn example_aliases_prints_3_4_7() {
     let output = run_example("examples/aliases.0s");
     assert_eq!(output, "347");

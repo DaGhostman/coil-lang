@@ -177,12 +177,16 @@ See [FFI tutorial](../tutorial/07-ffi.md).
 ### Classes and impl
 
 ```
-class_decl ::= 'class' IDENT '{' field_decl (',' field_decl)* ','? '}'
+class_decl ::= 'class' IDENT type_param_list? '{' field_decl (',' field_decl)* ','? '}'
 field_decl ::= 'pub'? IDENT ':' type
 
-impl_decl  ::= 'impl' IDENT '{' method_decl* '}'
+impl_decl  ::= 'impl' IDENT type_param_list? '{' method_decl* '}'
 method_decl ::= 'pub'? function_decl
 ```
+
+`type_param_list` is the same form as on functions (`<T>`, `<T: Num>`, …).
+An inherent `impl Cell<T>` shares those parameters with the class so methods
+can mention `T` and type `self` as `Cell<T>`.
 
 Example:
 
@@ -192,9 +196,17 @@ impl Foo {
     pub fn bump() -> int { return 1; }
     fn name_len() -> int { return 0; }
 }
+
+class Cell<T> { value: T }
+impl Cell<T> {
+    fn get() -> T { return self.value; }
+}
 ```
 
-Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s`.
+Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s` and `examples/generic_class.0s`.
+
+Note: typeclass `impl` (`impl Collect<Option<int>> { … }`) uses a different
+parse path — see [Typeclasses and impl](#typeclasses-and-impl) above.
 
 ### Defer
 

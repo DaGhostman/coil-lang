@@ -44,7 +44,8 @@ use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
     list, option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty,
-    schemaize_payload, string, subst_payload_params, unit as unit_ty,
+    schemaize_payload, schemaize_ty, string, subst_payload_params, subst_ty_params,
+    unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
 
@@ -1119,6 +1120,20 @@ impl Checker {
                     }
                     let owner = match &resolved {
                         Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
+                        Ty::App(head, _) => match head.as_ref() {
+                            Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
+                            _ => {
+                                return self.error_with_help(
+                                    ErrorCode::NotAFunction,
+                                    format!("Cannot call method `{}` on non-class type", method),
+                                    range,
+                                    Some(
+                                        "method calls require a class instance receiver"
+                                            .to_string(),
+                                    ),
+                                );
+                            }
+                        },
                         _ => {
                             return self.error_with_help(
                                 ErrorCode::NotAFunction,
@@ -1781,8 +1796,13 @@ impl Checker {
                 );
                 unit_ty()
             }
-            Expression::Implementation { owner, methods, .. } => {
-                self.infer_impl(owner, methods, &range);
+            Expression::Implementation {
+                owner,
+                methods,
+                type_params,
+                ..
+            } => {
+                self.infer_impl(owner, type_params, methods, &range);
                 unit_ty()
             }
             Expression::Class {
@@ -1823,22 +1843,19 @@ impl Checker {
                             ),
                         }
                     }
+                    Ty::App(head, args)
+                        if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
+                    {
+                        let name = match head.as_ref() {
+                            Ty::Con(n) => n.clone(),
+                            _ => unreachable!(),
+                        };
+                        self.access_class_field(&name, field, args, range)
+                    }
                     Ty::Con(name) => {
                         // Class instance field access.
-                        if let Some(fields) = self.classes.get(name) {
-                            if let Some((_, _, fty)) =
-                                fields.iter().find(|(_, fname, _)| fname == field)
-                            {
-                                return fty.clone();
-                            }
-                            let known: Vec<&str> =
-                                fields.iter().map(|(_, n, _)| n.as_str()).collect();
-                            return self.error_with_help(
-                                ErrorCode::UnknownField,
-                                format!("Cannot find field `{}` on class `{}`", field, name),
-                                range,
-                                Some(format!("the class has fields: {}", known.join(", "))),
-                            );
+                        if self.classes.contains_key(name) {
+                            return self.access_class_field(name, field, &[], range);
                         }
                         // Bare type name — resolve via the
                         // checker's enum registry.
@@ -1899,6 +1916,39 @@ impl Checker {
                     }
                 };
                 if let Some(fields) = self.classes.get(&class_name).cloned() {
+                    let param_names = self
+                        .generics
+                        .generic_type_ctors
+                        .get(&class_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    // Freshen field types at each `new` site so independent
+                    // instantiations don't share type variables.
+                    let (field_tys, result_ty) = if param_names.is_empty() {
+                        (
+                            fields
+                                .iter()
+                                .map(|(_, _, t)| t.clone())
+                                .collect::<Vec<_>>(),
+                            Ty::Con(class_name.clone()),
+                        )
+                    } else {
+                        let mut map = HashMap::new();
+                        let mut app_args = Vec::with_capacity(param_names.len());
+                        for p in &param_names {
+                            let v = Ty::Var(self.counter.fresh());
+                            app_args.push(v.clone());
+                            map.insert(p.clone(), v);
+                        }
+                        let field_tys = fields
+                            .iter()
+                            .map(|(_, _, t)| subst_ty_params(t, &map))
+                            .collect();
+                        (
+                            field_tys,
+                            Ty::App(Box::new(Ty::Con(class_name.clone())), app_args),
+                        )
+                    };
                     let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
                     if provided.len() != fields.len() {
                         let _ = self.error_with_help(
@@ -1916,11 +1966,12 @@ impl Checker {
                             ),
                         );
                     } else {
-                        for (arg, (_, _, fty)) in provided.iter().zip(fields.iter()) {
+                        for (arg, fty) in provided.iter().zip(field_tys.iter()) {
                             let aty = self.infer(arg);
                             self.unify(&aty, fty, &arg.0.into_range(), "constructor argument");
                         }
                     }
+                    return apply_ty_prune(&self.subst, &result_ty);
                 }
                 Ty::Con(class_name)
             }
@@ -2936,19 +2987,17 @@ impl Checker {
                             )
                         }
                     },
+                    Ty::App(head, args)
+                        if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
+                    {
+                        let name = match head.as_ref() {
+                            Ty::Con(n) => n.clone(),
+                            _ => unreachable!(),
+                        };
+                        self.access_class_field(&name, field, args, range)
+                    }
                     Ty::Con(name) if self.classes.contains_key(name) => {
-                        let fields = self.classes.get(name).unwrap();
-                        match fields.iter().find(|(_, fname, _)| fname == field) {
-                            Some((_, _, fty)) => fty.clone(),
-                            None => {
-                                let known: Vec<&str> =
-                                    fields.iter().map(|(_, n, _)| n.as_str()).collect();
-                                self.error_with_help(ErrorCode::UnknownField, format!("Cannot find field `{}` on class `{}`", field, name),
-                                    range,
-                                    Some(format!("the class has fields: {}", known.join(", "))),
-                                )
-                            }
-                        }
+                        self.access_class_field(name, field, &[], range)
                     }
                     _ => self.error_with_help(
                         ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
@@ -4538,6 +4587,10 @@ impl Checker {
     /// type) of each field. The class itself becomes a `Ty::Con(name)`
     /// constructor that's resolvable from any scope, so it can be
     /// referenced as a type elsewhere.
+    ///
+    /// Generic classes (`class Cell<T>`) store field types with
+    /// `Con(param)` schema markers (schemaized from the in-scope type
+    /// param vars) so each `new` site can freshen independently.
     fn register_class(&mut self, name: &str, fields: &[Output], range: &Range<usize>) {
         let mut field_info = Vec::new();
         for field in fields {
@@ -4563,6 +4616,16 @@ impl Checker {
                 ));
             }
         }
+        // Schemaize param vars → `Con(name)` for generic class fields.
+        if let Some(frame) = self.type_params_in_scope.last() {
+            if !frame.is_empty() {
+                let var_to_name: HashMap<TyVarId, String> =
+                    frame.iter().map(|(n, id)| (*id, n.clone())).collect();
+                for (_, _, ty) in &mut field_info {
+                    *ty = schemaize_ty(ty, &var_to_name);
+                }
+            }
+        }
         self.classes.insert(name.to_string(), field_info);
         // Register the class as a type in the environment so
         // `Foo`-as-a-type lookups succeed.
@@ -4571,20 +4634,66 @@ impl Checker {
         let _ = range;
     }
 
-    /// Process an `impl Owner { methods... }` block:
+    /// Process an `impl Owner` / `impl Owner<T>` block:
     /// 1. Auto-register the owner class if it hasn't been declared
     ///    yet (so `impl` can appear before `class`).
-    /// 2. Push a frame and bind `self : Owner`.
+    /// 2. Push a type-param scope and bind `self : Owner` or
+    ///    `self : Owner<T, …>`.
     /// 3. For each method, run [`infer_function`] with `self`
     ///    prepended to the argument list, then store the method's
-    ///    scheme under the owner's name.
-    fn infer_impl(&mut self, owner: &str, methods: &[Output], range: &Range<usize>) {
-        let owner_ty = Ty::Con(owner.to_string());
+    ///    scheme (poly when the impl is generic) under the owner's name.
+    fn infer_impl(
+        &mut self,
+        owner: &str,
+        type_params: &[parser::ast::TypeParam<'_>],
+        methods: &[Output],
+        range: &Range<usize>,
+    ) {
+        let pushed = self.push_type_params_for_type_parsing(type_params);
+
+        let owner_ty = if type_params.is_empty() {
+            Ty::Con(owner.to_string())
+        } else {
+            let frame = self
+                .type_params_in_scope
+                .last()
+                .expect("type-param frame just pushed");
+            let args: Vec<Ty> = type_params
+                .iter()
+                .map(|tp| {
+                    Ty::Var(
+                        *frame
+                            .get(tp.name)
+                            .expect("type param registered in frame"),
+                    )
+                })
+                .collect();
+            Ty::App(Box::new(Ty::Con(owner.to_string())), args)
+        };
+
+        let param_vars: Vec<TyVarId> = if pushed {
+            let frame = self
+                .type_params_in_scope
+                .last()
+                .expect("type-param frame just pushed");
+            type_params
+                .iter()
+                .map(|tp| {
+                    *frame
+                        .get(tp.name)
+                        .expect("type param registered in frame")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         if !self.classes.contains_key(owner) {
             self.classes.insert(owner.to_string(), Vec::new());
-            self.env
-                .insert_top(owner.to_string(), Scheme::mono(owner_ty.clone()));
+            self.env.insert_top(
+                owner.to_string(),
+                Scheme::mono(Ty::Con(owner.to_string())),
+            );
         }
 
         self.push_scope();
@@ -4603,9 +4712,11 @@ impl Checker {
                     ..
                 } = body.1.as_ref()
                 {
+                    // Type params stay in the outer impl frame so `self`
+                    // and method annotations share the same variables.
                     let fun_ty = self.infer_function(
                         name,
-                        &[], // impl methods don't have free type params
+                        &[],
                         args,
                         returns.as_ref(),
                         where_constraints,
@@ -4614,10 +4725,15 @@ impl Checker {
                         Some(&owner_ty),
                         *is_coro,
                     );
+                    let scheme = if param_vars.is_empty() {
+                        Scheme::mono(fun_ty)
+                    } else {
+                        Scheme::poly(param_vars.clone(), Vec::new(), fun_ty)
+                    };
                     self.methods
                         .entry(owner.to_string())
                         .or_default()
-                        .insert(name.to_string(), (*vis, Scheme::mono(fun_ty)));
+                        .insert(name.to_string(), (*vis, scheme));
                 } else {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
@@ -4629,7 +4745,56 @@ impl Checker {
         }
 
         self.pop_scope();
+        self.pop_type_params_for_type_parsing(pushed);
         let _ = range;
+    }
+
+    /// Look up a class field, substituting type-param placeholders when
+    /// the receiver is an applied generic class (`Cell<int>`).
+    fn access_class_field(
+        &mut self,
+        class: &str,
+        field: &str,
+        args: &[Ty],
+        range: Range<usize>,
+    ) -> Ty {
+        let Some(fields) = self.classes.get(class) else {
+            return self.error(
+                ErrorCode::UnknownField,
+                format!("Cannot find field `{}` on class `{}`", field, class),
+                range,
+            );
+        };
+        let Some((_, _, fty)) = fields.iter().find(|(_, fname, _)| fname == field) else {
+            let known: Vec<&str> = fields.iter().map(|(_, n, _)| n.as_str()).collect();
+            return self.error_with_help(
+                ErrorCode::UnknownField,
+                format!("Cannot find field `{}` on class `{}`", field, class),
+                range,
+                Some(format!("the class has fields: {}", known.join(", "))),
+            );
+        };
+        let fty = fty.clone();
+        let params = self
+            .generics
+            .generic_type_ctors
+            .get(class)
+            .cloned()
+            .unwrap_or_default();
+        if params.is_empty() {
+            return fty;
+        }
+        let mut map = HashMap::new();
+        if args.is_empty() {
+            for p in &params {
+                map.insert(p.clone(), Ty::Var(self.counter.fresh()));
+            }
+        } else {
+            for (p, a) in params.iter().zip(args.iter()) {
+                map.insert(p.clone(), a.clone());
+            }
+        }
+        subst_ty_params(&fty, &map)
     }
 
     // ============================================================
@@ -6877,6 +7042,23 @@ impl Checker {
         self.classes.contains_key(name)
     }
 
+    /// Class name from `Con(C)` or `App(Con(C), _)` (Phase 7).
+    pub fn class_name_of_ty(ty: &Ty) -> Option<&str> {
+        match ty {
+            Ty::Con(n) => Some(n.as_str()),
+            Ty::App(head, _) => match head.as_ref() {
+                Ty::Con(n) => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// True if `ty` is a registered class instance (`Con` or `App`).
+    pub fn ty_is_class(&self, ty: &Ty) -> bool {
+        Self::class_name_of_ty(ty).is_some_and(|n| self.is_class(n))
+    }
+
     /// Declared type of a class field (codegen / Access).
     pub fn class_field_ty(&self, class: &str, field: &str) -> Option<&Ty> {
         self.classes
@@ -7882,6 +8064,54 @@ mod tests {
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    // ---- Phase 7: generic classes ----
+
+    #[test]
+    fn generic_class_new_infers_cell_int() {
+        let src = "\
+            class Cell<T> { value: T }
+            fn main() { let c = new Cell(42); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let c_ty = c.codegen_var_type("c").expect("c should be recorded");
+        assert_eq!(
+            apply_ty_prune(c.subst(), c_ty),
+            Ty::App(Box::new(Ty::Con("Cell".into())), vec![int()])
+        );
+    }
+
+    #[test]
+    fn generic_class_method_get_returns_int() {
+        let src = "\
+            class Cell<T> { value: T }
+            impl Cell<T> {
+                fn get() -> T { return self.value; }
+            }
+            fn main() {
+                let c = new Cell(42);
+                let v = c.get();
+            }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        assert_eq!(
+            c.codegen_var_type("v").map(|t| apply_ty_prune(c.subst(), t)),
+            Some(int())
+        );
+    }
+
+    #[test]
+    fn generic_class_fields_stored_as_param_placeholders() {
+        let (mut c, _) = check("class Cell<T> { value: T }");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let fields = c.classes.get("Cell").expect("Cell registered");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].1, "value");
+        assert_eq!(fields[0].2, Ty::Con("T".into()));
     }
 
     #[test]

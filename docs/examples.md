@@ -873,6 +873,34 @@ fn main() {
 | **Run** | `cargo run -- examples/classes.0s` |
 | **Output** | `7458` |
 
+### `examples/generic_class.0s`
+
+**Demonstrates:** Generic class declaration (`class Cell<T>`), inherent
+`impl Cell<T>`, constructor type inference (`new Cell(42)` → `Cell<int>`),
+and a method that returns the type parameter.
+
+```0s
+class Cell<T> {
+    value: T
+}
+
+impl Cell<T> {
+    fn get() -> T {
+        return self.value;
+    }
+}
+
+fn main() {
+    let c = new Cell(42);
+    print "%i", c.get();
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_class.0s` |
+| **Output** | `42` |
+
 ---
 
 ## Coroutines
@@ -1002,6 +1030,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `ffi_callback_ret.0s` | FFI | `1` |
 | `sum.c` | FFI | (C source, not `.0s`) |
 | `classes.0s` | Classes | `7458` |
+| `generic_class.0s` | Classes | `42` |
 | `coro.0s` | Coroutines | (see source) |
 | `coro_gen.0s` | Coroutines | `012` |
 | `coro_send.0s` | Coroutines | `hello` |
