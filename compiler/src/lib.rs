@@ -2717,12 +2717,15 @@ impl Compiler {
                     self.bytecode.extend(fn_bc);
 
                     // Each element's bytecode pushes a Value. Function names
-                    // used as callback arguments compile to bytecode offsets.
+                    // used as callback arguments compile to relocatable
+                    // `CodePtr` offsets (not `CONST`) so peephole fusion
+                    // rewrites them in `finalize_bytecode`.
                     for elem in &tuple_elements {
                         if let Expression::Identifier(name) = elem.1.as_ref() {
                             if let Some(&offset) = self.functions.get(*name) {
                                 self.bytecode.push(
-                                    Byte::new(Instruction::CONST).with_operand_u32(offset as u32),
+                                    Byte::new(Instruction::CodePtr)
+                                        .with_operand_u32(offset as u32),
                                 );
                                 continue;
                             }
@@ -7796,6 +7799,60 @@ print \"%i\", len(a); \
             "CodePtr must carry full 32-bit targets (> u16::MAX)"
         );
         assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
+    }
+
+    /// `invoke(..., (fn, …))` callback args must use relocatable `CodePtr`,
+    /// not `CONST`. Peephole fusion adjusts `CodePtr` in `finalize_bytecode`
+    /// but never rewrites `CONST`, so a stale offset would make the FFI
+    /// trampoline jump to the wrong IP (regression: prints `0` instead of
+    /// `42` for `examples/ffi_callback.0s`).
+    #[test]
+    fn invoke_callback_fn_arg_emits_relocatable_code_ptr() {
+        use common::Instruction;
+        let src = "\
+fn doubler(int x) -> int { return x * 2; } \
+fn main() { \
+  let lib = dload(\"libsum.so\"); \
+  let id = declare(lib, \"apply_cb\", (FFIType::Callback, FFIType::Int), FFIType::Int); \
+  invoke(lib, id, (doubler, 21)); \
+}";
+        let ast = Pratt::default().parse(src).expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &ast);
+        let doubler = *compiler
+            .functions
+            .get("doubler")
+            .expect("doubler must be registered");
+
+        let ffi_idx = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::FfiInvoke))
+            .expect("expected FfiInvoke");
+        let make_tuple_idx = bc[..ffi_idx]
+            .iter()
+            .rposition(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .expect("expected MakeTuple before FfiInvoke");
+        // Callback fn arg is the first tuple element → last CodePtr before
+        // MakeTuple (args are emitted bottom-to-top; doubler then 21).
+        let code_ptr = bc[..make_tuple_idx]
+            .iter()
+            .rev()
+            .find(|b| matches!(b.bytecode(), Instruction::CodePtr))
+            .expect("expected CodePtr for callback fn arg before MakeTuple");
+        assert_eq!(
+            code_ptr.operand_u32() as usize,
+            doubler,
+            "CodePtr must match post-finalize doubler entry (got {}; table={})",
+            code_ptr.operand_u32(),
+            doubler
+        );
+        // Guard against regressing to CONST at this site.
+        assert!(
+            !bc[..make_tuple_idx].iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as usize == doubler
+            }),
+            "callback fn arg must not be baked as CONST (unrelocatable)"
+        );
     }
 
     /// `MakePolyFn` operands are absolute and survive final-link fusion.
