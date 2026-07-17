@@ -372,6 +372,8 @@ impl Checker {
         self.fn_option_mode = None;
         self.result_mode_fns.clear();
         self.option_mode_fns.clear();
+        self.generics.generic_type_ctors.clear();
+        self.generics.generic_fns.clear();
 
         // Built-in enums survive the per-program enum reset.
         self.register_builtin_enums();
@@ -476,6 +478,56 @@ impl Checker {
             .last_mut()
             .expect("type alias scope should exist")
             .insert(name.to_string(), alias_ty);
+    }
+
+    fn register_generic_type_ctor(
+        &mut self,
+        name: &str,
+        type_params: &[parser::ast::TypeParam<'_>],
+    ) -> Option<Vec<String>> {
+        let previous = self.generics.generic_type_ctors.get(name).cloned();
+        if type_params.is_empty() {
+            return previous;
+        }
+        self.generics.generic_type_ctors.insert(
+            name.to_string(),
+            type_params.iter().map(|tp| tp.name.to_string()).collect(),
+        );
+        previous
+    }
+
+    fn restore_generic_type_ctor(&mut self, name: &str, previous: Option<Vec<String>>) {
+        match previous {
+            Some(params) => {
+                self.generics
+                    .generic_type_ctors
+                    .insert(name.to_string(), params);
+            }
+            None => {
+                self.generics.generic_type_ctors.remove(name);
+            }
+        }
+    }
+
+    fn push_type_params_for_type_parsing(
+        &mut self,
+        type_params: &[parser::ast::TypeParam<'_>],
+    ) -> bool {
+        if type_params.is_empty() {
+            return false;
+        }
+        let mut frame = HashMap::new();
+        for tp in type_params {
+            frame.insert(tp.name.to_string(), self.counter.fresh());
+        }
+        self.type_params_in_scope.push(frame);
+        true
+    }
+
+    fn pop_type_params_for_type_parsing(&mut self, pushed: bool) {
+        if pushed {
+            let _ = self.type_params_in_scope.pop();
+        }
     }
 
     fn insert_const_binding(&mut self, name: impl Into<String>) {
@@ -1009,25 +1061,7 @@ impl Checker {
 
             Expression::TypeApp { name, args } => {
                 // Appears in type-annotation positions; treat like Type.
-                if common::is_builtin_option_enum(name) {
-                    let inner = args
-                        .first()
-                        .map(|a| self.parse_type_name(a))
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                    option_ty(inner)
-                } else if common::is_builtin_result_enum(name) {
-                    let ok = args
-                        .first()
-                        .map(|a| self.parse_type_name(a))
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                    let err = args
-                        .get(1)
-                        .map(|a| self.parse_type_name(a))
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                    result_ty(ok, err)
-                } else {
-                    Ty::Con(name.to_string())
-                }
+                self.parse_type_app(name, args, range)
             }
 
             // ---- I/O ----
@@ -1380,8 +1414,15 @@ impl Checker {
                 self.infer_impl(owner, methods, &range);
                 unit_ty()
             }
-            Expression::Class { name, fields, .. } => {
+            Expression::Class {
+                name,
+                type_params,
+                fields,
+            } => {
+                let _ = self.register_generic_type_ctor(name, type_params);
+                let pushed = self.push_type_params_for_type_parsing(type_params);
                 self.register_class(name, fields, &range);
+                self.pop_type_params_for_type_parsing(pushed);
                 unit_ty()
             }
             Expression::Argument(ty, _name) => self.parse_type_name(ty),
@@ -1504,12 +1545,24 @@ impl Checker {
             Expression::Field(_, _, _) => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
-            Expression::EnumDecl { name, variants, .. } => {
+            Expression::EnumDecl {
+                name,
+                type_params,
+                variants,
+            } => {
+                let _ = self.register_generic_type_ctor(name, type_params);
                 self.infer_enum_decl(name, variants, &range);
                 unit_ty()
             }
-            Expression::TypeAlias { name, ty, .. } => {
+            Expression::TypeAlias {
+                name,
+                type_params,
+                ty,
+            } => {
+                let _ = self.register_generic_type_ctor(name, type_params);
+                let pushed = self.push_type_params_for_type_parsing(type_params);
                 let alias_ty = self.parse_type_name(ty);
+                self.pop_type_params_for_type_parsing(pushed);
                 self.register_type_alias(name, alias_ty, range);
                 let _ = self.infer(ty); // ID alignment
                 unit_ty()
@@ -2217,26 +2270,7 @@ impl Checker {
         match ann.1.as_ref() {
             Expression::Identifier(name) | Expression::Type(name) => self.parse_type_name_str(name),
             Expression::TypeApp { name, args } => {
-                if common::is_builtin_option_enum(name) {
-                    let inner = args
-                        .first()
-                        .map(|a| self.parse_type_name(a))
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                    return option_ty(inner);
-                }
-                if common::is_builtin_result_enum(name) {
-                    let ok = args
-                        .first()
-                        .map(|a| self.parse_type_name(a))
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                    let err = args
-                        .get(1)
-                        .map(|a| self.parse_type_name(a))
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-                    return result_ty(ok, err);
-                }
-                // Unknown generic — fall back to Con(name).
-                Ty::Con(name.to_string())
+                self.parse_type_app(name, args, ann.0.into_range())
             }
             Expression::Array(items) => {
                 // Static-length: `[T; N]`. Look for the `; N` shape:
@@ -2273,6 +2307,56 @@ impl Checker {
             }
             _ => Ty::Var(self.counter.fresh()),
         }
+    }
+
+    fn parse_type_app(&mut self, name: &str, args: &[Output], range: Range<usize>) -> Ty {
+        if common::is_builtin_option_enum(name) {
+            let inner = args
+                .first()
+                .map(|a| self.parse_type_name(a))
+                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+            return option_ty(inner);
+        }
+        if common::is_builtin_result_enum(name) {
+            let ok = args
+                .first()
+                .map(|a| self.parse_type_name(a))
+                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+            let err = args
+                .get(1)
+                .map(|a| self.parse_type_name(a))
+                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+            return result_ty(ok, err);
+        }
+
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_type_name(a)).collect();
+        if let Some(expected_arity) = self
+            .generics
+            .generic_type_ctors
+            .get(name)
+            .map(|params| params.len())
+        {
+            if expected_arity != arg_tys.len() {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Type constructor `{}` expects {} type arguments, got {}",
+                        name,
+                        expected_arity,
+                        arg_tys.len()
+                    ),
+                    range,
+                ));
+            }
+            return Ty::App(Box::new(Ty::Con(name.to_string())), arg_tys);
+        }
+
+        self.messages.push(Message::error(
+            ErrorCode::GenericTypeError,
+            format!("Cannot find type constructor `{}`", name),
+            range,
+        ));
+        Ty::App(Box::new(Ty::Con(name.to_string())), arg_tys)
     }
 
     fn parse_type_name_str(&mut self, name: &str) -> Ty {
@@ -2820,8 +2904,14 @@ impl Checker {
             Expression::TypeAlias { ty, .. } => {
                 self.pre_register_enums_walk(ty, errors);
             }
-            Expression::EnumDecl { name, variants, .. } => {
+            Expression::EnumDecl {
+                name,
+                type_params,
+                variants,
+            } => {
                 let name_str = name.to_string();
+                let previous_generic_ctor = self.register_generic_type_ctor(name, type_params);
+                let pushed = self.push_type_params_for_type_parsing(type_params);
                 let mut variant_names = Vec::new();
                 let mut arities = Vec::new();
                 let mut payloads: Vec<EnumVariantPayloadTy> = Vec::new();
@@ -2841,11 +2931,7 @@ impl Checker {
                             EnumVariantPayload::Tuple(parts) => {
                                 let mut tys = Vec::with_capacity(parts.len());
                                 for p in parts {
-                                    if let Expression::Type(tname) = p.1.as_ref() {
-                                        tys.push(self.parse_type_name_str(tname));
-                                    } else {
-                                        tys.push(Ty::Var(self.counter.fresh()));
-                                    }
+                                    tys.push(self.parse_type_name(p));
                                 }
                                 arities.push(tys.len());
                                 EnumVariantPayloadTy::Tuple(tys)
@@ -2853,11 +2939,7 @@ impl Checker {
                             EnumVariantPayload::Record(fields) => {
                                 let mut pairs = Vec::with_capacity(fields.len());
                                 for f in fields {
-                                    let fty = if let Expression::Type(tname) = f.value.1.as_ref() {
-                                        self.parse_type_name_str(tname)
-                                    } else {
-                                        Ty::Var(self.counter.fresh())
-                                    };
+                                    let fty = self.parse_type_name(&f.value);
                                     pairs.push((f.name.to_string(), fty));
                                 }
                                 arities.push(pairs.len());
@@ -2880,6 +2962,8 @@ impl Checker {
                         name_str
                     ));
                     errors.push(msg);
+                    self.restore_generic_type_ctor(&name_str, previous_generic_ctor);
+                    self.pop_type_params_for_type_parsing(pushed);
                     return;
                 }
                 if self.enums.contains_key(&name_str) {
@@ -2892,6 +2976,8 @@ impl Checker {
                         name_str
                     ));
                     errors.push(msg);
+                    self.restore_generic_type_ctor(&name_str, previous_generic_ctor);
+                    self.pop_type_params_for_type_parsing(pushed);
                     return;
                 }
 
@@ -2911,6 +2997,8 @@ impl Checker {
                             "constructor names must be unique across all enums".to_string(),
                         );
                         errors.push(msg);
+                        self.restore_generic_type_ctor(&name_str, previous_generic_ctor);
+                        self.pop_type_params_for_type_parsing(pushed);
                         return;
                     }
                 }
@@ -2932,6 +3020,7 @@ impl Checker {
                 self.enum_tags.insert(name_str.clone(), tag_map);
                 self.enum_payloads.insert(name_str.clone(), payloads);
                 self.enum_arities.insert(name_str.clone(), arities);
+                self.pop_type_params_for_type_parsing(pushed);
             }
 
             // Recurse into the same children that `id::pre_walk` would
@@ -6641,6 +6730,55 @@ mod tests {
                    fn main() { }";
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+    }
+
+    #[test]
+    fn generic_enum_type_app_builds_ty_app() {
+        let src = "enum Box<T> { Box(T) } fn f(Box<int> x) -> int { return 0; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let scheme = c.env().lookup("f").unwrap();
+        let ty = apply_ty_prune(c.subst(), &scheme.ty);
+        let Ty::Fun(param, ret) = ty else {
+            panic!("expected function type");
+        };
+        assert_eq!(
+            *param,
+            Ty::App(Box::new(Ty::Con("Box".into())), vec![int()])
+        );
+        assert_eq!(*ret, int());
+    }
+
+    #[test]
+    fn generic_type_app_arity_mismatch_errors() {
+        let src = "enum Box<T> { Box(T) } fn f(Box<int, string> x) -> int { return 0; }";
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter().any(|m| m.message().contains(
+                "Type constructor `Box` expects 1 type arguments, got 2"
+            )),
+            "expected arity diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn generic_type_alias_registers_ctor() {
+        let src = "type Pair<T> = (T, T); fn f(Pair<int> p) -> int { return 0; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let scheme = c.env().lookup("f").unwrap();
+        let ty = apply_ty_prune(c.subst(), &scheme.ty);
+        let Ty::Fun(param, ret) = ty else {
+            panic!("expected function type");
+        };
+        assert_eq!(
+            *param,
+            Ty::App(Box::new(Ty::Con("Pair".into())), vec![int()])
+        );
+        assert_eq!(*ret, int());
     }
 
     #[test]
