@@ -844,13 +844,37 @@ impl Compiler {
     /// Return `true` when the *next* node to be emitted has an open type variable
     /// type (i.e. it is a generic type parameter, not a concrete `int`/`float`/…).
     /// Used to choose `DynAdd`/`DynSub`/… over `ADD`/`ADDF`/… for generic bodies.
-    #[allow(dead_code)] // wired by generics codegen (Dyn* path)
+    #[allow(dead_code)] // kept for potential future use alongside operand_is_open_ty
     fn is_generic_ty_at_current_idx(&self) -> bool {
         let id = self.checker.id_table().ids()[self.emit_idx];
         matches!(
             self.checker.lookup_at(id),
             Some(crate::typechecking::ty::Ty::Var(_))
         )
+    }
+
+    /// Return `true` when `operand` resolves to an open type variable — i.e.
+    /// the operand is a generic type parameter that is not yet concrete.
+    ///
+    /// Handles `Expression::Identifier` via the `codegen_var_types` side-table
+    /// (which is reliable inside function bodies even when the ID cache is
+    /// misaligned). All other expression shapes return `false` conservatively;
+    /// they are either concrete literals or sub-expressions whose containing
+    /// `Identifier` was already flagged on the inner call.
+    fn operand_is_open_ty(&self, operand: &Output) -> bool {
+        use crate::typechecking::subst::apply_ty_prune;
+        match operand.1.as_ref() {
+            Expression::Identifier(name) => {
+                match self.checker.codegen_var_type(name) {
+                    Some(ty) => {
+                        let pruned = apply_ty_prune(self.checker.subst(), ty);
+                        matches!(pruned, Ty::Var(_))
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn alloc_temp_slot(&mut self) -> u32 {
@@ -2339,6 +2363,9 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(lhs));
                     bytecode.append(&mut self.do_compile(rhs));
                     bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
+                } else if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(Instruction::DynAdd));
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -2349,36 +2376,56 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::SUBF
+                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(Instruction::DynSub));
                 } else {
-                    Instruction::SUB
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::SUBF
+                    } else {
+                        Instruction::SUB
+                    }));
+                }
             }
             Expression::Mul(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::MULF
+                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(Instruction::DynMul));
                 } else {
-                    Instruction::MUL
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::MULF
+                    } else {
+                        Instruction::MUL
+                    }));
+                }
             }
             Expression::Mod(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::MODF
+                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(Instruction::DynMod));
                 } else {
-                    Instruction::MOD
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::MODF
+                    } else {
+                        Instruction::MOD
+                    }));
+                }
             }
             Expression::Div(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::DIVF
+                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(Instruction::DynDiv));
                 } else {
-                    Instruction::DIV
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::DIVF
+                    } else {
+                        Instruction::DIV
+                    }));
+                }
             }
             Expression::And(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::AND));
@@ -5783,5 +5830,47 @@ print \"%i\", len(a); \
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant(&[]) == 99);
         assert!(has_99, "expected CONST 99 for the arm body");
+    }
+
+    /// Codegen test B1-1: a generic `fn add<T: Num>(T a, T b) -> T { return a + b; }`
+    /// must emit `DynAdd` (not `ADD` or `ADDF`) because both operands are open type
+    /// variables at compile time.
+    #[test]
+    fn generic_add_emits_dyn_add() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add<T: Num>(T a, T b) -> T { return a + b; } fn main() { }",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "expected DynAdd for generic fn add<T: Num>; bytecode opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Codegen test B1-2: a concrete `fn add(int a, int b) -> int { return a + b; }`
+    /// must NOT emit `DynAdd` — it should use the regular `ADD` (or the peephole-fused
+    /// `BinSlotSlot`) path.
+    #[test]
+    fn concrete_add_still_emits_add() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b) -> int { return a + b; } fn main() { }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "DynAdd must NOT appear for concrete fn add(int a, int b)"
+        );
+        // Either ADD (unfused) or BinSlotSlot (peephole-fused) must be present.
+        let has_int_add = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::ADD)
+                || matches!(b.bytecode(), Instruction::BinSlotSlot)
+                || matches!(b.bytecode(), Instruction::BinReturn)
+        });
+        assert!(
+            has_int_add,
+            "expected ADD or BinSlotSlot/BinReturn for concrete add; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
     }
 }
