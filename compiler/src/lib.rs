@@ -863,6 +863,17 @@ impl Compiler {
         }
     }
 
+    /// Emit an `UnboxValue` instruction for a concrete `Ty` at a generic
+    /// call return boundary (generic→concrete).  Does nothing when the
+    /// type is open (`Ty::Var`) — the caller can't know the tag at compile
+    /// time in that case (the boxed value stays boxed).
+    fn emit_unbox_if_needed(bytecode: &mut Vec<Byte>, ty: &crate::typechecking::Ty) {
+        if let Some(tag) = Self::ty_to_value_tag(ty) {
+            // UnboxValue operand: [15:0] = ValueTag as u16.
+            bytecode.push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+        }
+    }
+
     fn compile_function_output_with_name<'compiler>(
         &mut self,
         method: &Output<'compiler>,
@@ -2599,6 +2610,17 @@ impl Compiler {
                                     .with_call_packed(arity, target_offset as u32),
                             );
                         }
+                        // Generic→concrete unbox: if this was a non-monomorphized generic
+                        // call and the Call expression's inferred return type is concrete,
+                        // emit UnboxValue so the caller gets a raw value, not an ObjBoxed.
+                        if is_generic {
+                            let call_ty = self.checker.infer_for_codegen(ast);
+                            let pruned = crate::typechecking::subst::apply_ty_prune(
+                                self.checker.subst(),
+                                &call_ty,
+                            );
+                            Self::emit_unbox_if_needed(&mut bytecode, &pruned);
+                        }
                     } else if self.polyfn_vars.contains(&identifier) {
                         // `identifier` is a local variable holding an ObjPolyFn
                         // (bound via `let f = some_generic_fn;`). Emit args, then
@@ -2622,6 +2644,14 @@ impl Compiler {
                         // Push the ObjPolyFn pointer (TOS for CallIndirect).
                         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
+                        // Generic→concrete unbox for polyfn call site.
+                        if let Some(call_ty) = self_id.and_then(|id| self.checker.lookup_at(id)) {
+                            let pruned = crate::typechecking::subst::apply_ty_prune(
+                                self.checker.subst(),
+                                &call_ty,
+                            );
+                            Self::emit_unbox_if_needed(&mut bytecode, &pruned);
+                        }
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownFunction,
@@ -6503,6 +6533,47 @@ print \"%i\", len(a); \
             "BoxValue operand should be ValueTag::Int ({}), got: {:?}",
             common::ValueTag::Int as u32,
             box_ops
+        );
+    }
+
+    /// Codegen test: `fn id<T>(T x) -> T { return x; }` called with a
+    /// concrete `int` argument must emit BOTH `BoxValue` (arg boxing) AND
+    /// `UnboxValue` (return unboxing) in the bytecode.
+    ///
+    /// The unbox is required so the caller receives a raw `i64`, not an
+    /// `ObjBoxed` heap pointer, when the generic return type is instantiated
+    /// to a concrete primitive.
+    #[test]
+    fn generic_call_emits_box_and_unbox() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } fn main() { id(42); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            "expected BoxValue for concrete int arg to generic fn id<T>; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::UnboxValue)),
+            "expected UnboxValue after generic fn call returns concrete int; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // The UnboxValue operand should encode ValueTag::Int (= 0).
+        let unbox_ops: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::UnboxValue))
+            .map(|b| b.operand_u32() & 0xFFFF)
+            .collect();
+        assert!(
+            unbox_ops
+                .iter()
+                .any(|&tag| tag == common::ValueTag::Int as u32),
+            "UnboxValue operand should be ValueTag::Int ({}), got: {:?}",
+            common::ValueTag::Int as u32,
+            unbox_ops
         );
     }
 

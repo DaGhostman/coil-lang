@@ -347,6 +347,40 @@ Instance methods compile to ordinary functions with mangled names; generic call 
 
 See `examples/generics.0s` for a runnable `Num`-bounded demo.
 
+### Boxing and unboxing at generic boundaries
+
+When a concrete value crosses into a generic function body, the compiler wraps it in a heap-allocated `ObjBoxed` cell (`BoxValue`). When the generic call returns a value whose type is concrete at the call site, the compiler immediately unpacks it back to a raw value (`UnboxValue`).
+
+This means **most generic calls to primitive-returning functions are transparent** — the caller receives a plain `int`, `float`, `bool`, or `string`, not a boxed wrapper:
+
+```0s
+fn id<T>(T x) -> T { return x; }
+
+fn main() {
+    let n = id(42);   // n is a raw int — unboxed automatically
+    print "%i", n;    // prints: 42
+}
+```
+
+**Accepted limitation — `print` with a bare generic call:**
+
+If the return type of a generic call cannot be resolved to a concrete type at the call site (e.g. `T` is still open), the value stays boxed and printing it with `%i` or `%f` will show the heap address rather than the payload. This cannot occur when you bind the result to a typed variable first, or when the type is fully known at the call site:
+
+```0s
+fn id<T>(T x) -> T { return x; }
+
+fn main() {
+    // Preferred: bind to a typed variable — unbox is guaranteed.
+    let n = id(42);
+    print "%i", n;     // safe: n is int
+
+    // Direct print of id(42) also works when T is inferred as int.
+    print "%i", id(42);
+}
+```
+
+Fully generic (unbounded `T`) functions that return `T` are NOT directly printable via `%i`/`%f` unless the call-site type is concrete. When in doubt, bind and use a typed intermediate.
+
 ---
 
 ## Known limitations
