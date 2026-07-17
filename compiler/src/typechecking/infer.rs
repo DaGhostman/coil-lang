@@ -209,6 +209,14 @@ pub struct Checker {
     /// `generics.generic_fns`) so codegen can query it after the
     /// typechecking pass.
     pub fn_dict_arity: HashMap<String, usize>,
+
+    /// Typeclass currently being defined (Phase 6 — bare/`Class::` assoc resolution).
+    current_typeclass: Option<String>,
+
+    /// Open associated-type projections `(owner_var, assoc_name) → assoc_var`
+    /// (Phase 6). Used for `T::Elem` when `T: Collect` is active; pinned when
+    /// a ground instance is discharged.
+    open_assoc_projections: HashMap<(TyVarId, String), TyVarId>,
 }
 
 /// C-layout struct registered via `extern struct Name { ... }`.
@@ -344,6 +352,8 @@ impl Checker {
             generics: super::generics::Generics::new(),
             generic_fns: HashSet::new(),
             fn_dict_arity: HashMap::new(),
+            current_typeclass: None,
+            open_assoc_projections: HashMap::new(),
         };
         checker.register_builtin_enums();
         checker
@@ -482,6 +492,8 @@ impl Checker {
         self.generics.register_builtin_type_ctors();
         self.generics.generic_fns.clear();
         self.var_kinds.clear();
+        self.current_typeclass = None;
+        self.open_assoc_projections.clear();
         self.register_builtin_typeclass_method_schemes();
 
         // Built-in enums survive the per-program enum reset.
@@ -1060,7 +1072,8 @@ impl Checker {
                         if let Some((dict_index, class, method_slot, scheme)) =
                             self.select_bound_method(candidates, method, &range)
                         {
-                            let fun_ty = self.instantiate_ty(&scheme);
+                            let (fun_ty, constraints, mapping) =
+                                self.instantiate_scheme_mapped(&scheme);
                             let mut arg_tys = vec![recv_ty];
                             if let Some(a) = args {
                                 for arg in a {
@@ -1087,14 +1100,21 @@ impl Checker {
                                     has_receiver: true,
                                 },
                             );
-                            return self.apply_function(
+                            let result = self.apply_function(
                                 Some(&format!("{}::{}", class, method)),
                                 &fun_ty,
                                 &arg_tys,
                                 None,
                                 id,
-                                range,
+                                range.clone(),
                             );
+                            if !constraints.is_empty() {
+                                self.discharge_constraints(id, &constraints, &range);
+                                self.pin_assoc_after_discharge(
+                                    &class, &constraints, Some(&scheme), &mapping, &range,
+                                );
+                            }
+                            return result;
                         }
                     }
                     let owner = match &resolved {
@@ -1176,7 +1196,8 @@ impl Checker {
                     if let Some((dict_index, class, method_slot, scheme)) =
                         self.select_bound_method(candidates, &ident, &range)
                     {
-                        let fun_ty = self.instantiate_ty(&scheme);
+                        let (fun_ty, constraints, mapping) =
+                            self.instantiate_scheme_mapped(&scheme);
                         if let Some(call_id) = id {
                             self.bound_method_calls.insert(
                                 call_id,
@@ -1197,14 +1218,21 @@ impl Checker {
                                 has_receiver: false,
                             },
                         );
-                        return self.apply_function(
+                        let result = self.apply_function(
                             Some(&format!("{}::{}", class, ident)),
                             &fun_ty,
                             &arg_tys,
                             args.as_deref(),
                             id,
-                            range,
+                            range.clone(),
                         );
+                        if !constraints.is_empty() {
+                            self.discharge_constraints(id, &constraints, &range);
+                            self.pin_assoc_after_discharge(
+                                &class, &constraints, Some(&scheme), &mapping, &range,
+                            );
+                        }
+                        return result;
                     }
                 }
 
@@ -1383,6 +1411,9 @@ impl Checker {
             Expression::TypeApp { name, args } => {
                 // Appears in type-annotation positions; treat like Type.
                 self.parse_type_app(name, args, range)
+            }
+            Expression::TypeProjection { owner, name } => {
+                self.resolve_type_projection(owner, name, &range)
             }
 
             // ---- I/O ----
@@ -2004,24 +2035,37 @@ impl Checker {
                 type_params,
                 methods,
             } => {
-                // Register the typeclass definition.
+                // Collect associated type names (Phase 6) and method defs.
+                let mut assoc_types: Vec<String> = Vec::new();
                 let method_defs: Vec<TypeClassMethodDef> = methods
                     .iter()
-                    .filter_map(|m| {
-                        if let Expression::Function {
+                    .filter_map(|m| match m.1.as_ref() {
+                        Expression::AssocTypeDecl { name: aname } => {
+                            if assoc_types.iter().any(|a| a == aname) {
+                                self.messages.push(Message::error(
+                                    ErrorCode::GenericTypeError,
+                                    format!(
+                                        "Duplicate associated type `{}` in typeclass `{}`",
+                                        aname, name
+                                    ),
+                                    m.0.into_range(),
+                                ));
+                            } else {
+                                assoc_types.push(aname.to_string());
+                            }
+                            None
+                        }
+                        Expression::Function {
                             name: mname, body, ..
-                        } = m.1.as_ref()
-                        {
-                            // has_default: body is non-empty Block/Fragment
+                        } => {
                             let has_default =
                                 !matches!(body.1.as_ref(), Expression::Block(v) if v.is_empty());
                             Some(TypeClassMethodDef {
                                 name: mname.to_string(),
                                 has_default,
                             })
-                        } else {
-                            None
                         }
+                        _ => None,
                     })
                     .collect();
                 let param_names: Vec<String> =
@@ -2048,12 +2092,13 @@ impl Checker {
                     type_params: param_names,
                     param_kinds: param_kinds.clone(),
                     superclasses,
+                    assoc_types: assoc_types.clone(),
                     methods: method_defs.clone(),
                 };
                 self.generics.typeclasses.insert(name.to_string(), def);
 
-                // Build method schemes with the typeclass parameters in scope.
-                // These schemes drive bound-method calls from generic bodies.
+                // Build method schemes with the typeclass parameters + assoc
+                // types in scope. Scheme bounds = [class params…, assoc…, method params…].
                 let mut param_frame = HashMap::new();
                 let mut param_vars = Vec::new();
                 let mut class_kinds = Vec::new();
@@ -2065,7 +2110,18 @@ impl Checker {
                     param_vars.push(var);
                     class_kinds.push(kind);
                 }
+                // Associated types are quantified after class params (Phase 6).
+                let mut assoc_vars = Vec::new();
+                let mut assoc_kinds = Vec::new();
+                for aname in &assoc_types {
+                    let var = self.counter.fresh();
+                    self.set_var_kind(var, Kind::Type);
+                    param_frame.insert(aname.clone(), var);
+                    assoc_vars.push(var);
+                    assoc_kinds.push(Kind::Type);
+                }
                 self.type_params_in_scope.push(param_frame);
+                self.current_typeclass = Some(name.to_string());
                 // ONE constraint over all class params (multi-param ready).
                 let class_constraints: Vec<Constraint> = vec![Constraint {
                     class: name.to_string(),
@@ -2108,8 +2164,10 @@ impl Checker {
                             self.type_params_in_scope.pop();
                         }
                         let mut all_bounds = param_vars.clone();
+                        all_bounds.extend(assoc_vars.iter().copied());
                         all_bounds.extend(method_vars);
                         let mut all_kinds = class_kinds.clone();
+                        all_kinds.extend(assoc_kinds.iter().copied());
                         all_kinds.extend(method_kinds);
                         self.typeclass_method_schemes.insert(
                             (name.to_string(), method_name.to_string()),
@@ -2133,6 +2191,7 @@ impl Checker {
                 }
                 self.active_constraints.truncate(active_len);
                 self.type_params_in_scope.pop();
+                self.current_typeclass = None;
                 unit_ty()
             }
 
@@ -2193,82 +2252,107 @@ impl Checker {
                         range.clone(),
                     ));
                 }
-                // Build method_fqns and register instance.
+                // Build method_fqns, assoc_tys, and register instance.
                 let mut method_fqns = HashMap::new();
                 let mut method_names = Vec::new();
+                let mut assoc_tys: HashMap<String, Ty> = HashMap::new();
+                let mut assoc_names: Vec<String> = Vec::new();
                 for m in methods {
-                    let maybe_fn = match m.1.as_ref() {
-                        Expression::Function {
-                            name,
-                            type_params,
-                            args,
-                            returns,
-                            where_constraints,
-                            body,
-                            is_coro,
-                            ..
-                        } => Some((
-                            *name,
-                            type_params.as_slice(),
-                            args,
-                            returns,
-                            where_constraints.as_slice(),
-                            body,
-                            *is_coro,
-                        )),
-                        Expression::Method(_, body) => match body.1.as_ref() {
-                            Expression::Function {
-                                name,
-                                type_params,
-                                args,
-                                returns,
-                                where_constraints,
-                                body,
-                                is_coro,
-                                ..
-                            } => Some((
-                                *name,
-                                type_params.as_slice(),
-                                args,
-                                returns,
-                                where_constraints.as_slice(),
-                                body,
-                                *is_coro,
-                            )),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
-                        maybe_fn
-                    {
-                        // Build a unique FQN for this instance method.
-                        let fqn = format!(
-                            "{}__{}__{}",
-                            class,
-                            arg_tys
-                                .iter()
-                                .map(|t| format!("{}", t))
-                                .collect::<Vec<_>>()
-                                .join("_"),
-                            mname,
-                        );
-                        method_names.push(mname.to_string());
-                        method_fqns.insert(mname.to_string(), fqn.clone());
-                        // Preserve method type params (Phase 5 HKT methods).
-                        self.infer_function(
-                            mname,
-                            mparams,
-                            margs,
-                            returns.as_ref(),
-                            where_cs,
-                            body,
-                            &m.0.into_range(),
-                            None,
-                            is_coro,
-                        );
-                    } else {
-                        let _ = self.infer(m);
+                    match m.1.as_ref() {
+                        Expression::AssocTypeDef { name: aname, ty } => {
+                            // Consume the AssocTypeDef wrapper NodeId, then the RHS.
+                            let wrapper_id = self.ids.ids()[self.next_id_idx];
+                            self.next_id_idx += 1;
+                            self.cache.insert(wrapper_id, unit_ty());
+                            let resolved = self.parse_type_name(ty);
+                            self.cache_forced_ty(ty, resolved.clone());
+                            if assoc_tys.contains_key(*aname) {
+                                self.messages.push(Message::error(
+                                    ErrorCode::GenericTypeError,
+                                    format!(
+                                        "Duplicate associated type `{}` in instance of `{}`",
+                                        aname, class
+                                    ),
+                                    m.0.into_range(),
+                                ));
+                            } else {
+                                assoc_names.push(aname.to_string());
+                                assoc_tys.insert(aname.to_string(), resolved);
+                            }
+                        }
+                        _ => {
+                            let maybe_fn = match m.1.as_ref() {
+                                Expression::Function {
+                                    name,
+                                    type_params,
+                                    args,
+                                    returns,
+                                    where_constraints,
+                                    body,
+                                    is_coro,
+                                    ..
+                                } => Some((
+                                    *name,
+                                    type_params.as_slice(),
+                                    args,
+                                    returns,
+                                    where_constraints.as_slice(),
+                                    body,
+                                    *is_coro,
+                                )),
+                                Expression::Method(_, body) => match body.1.as_ref() {
+                                    Expression::Function {
+                                        name,
+                                        type_params,
+                                        args,
+                                        returns,
+                                        where_constraints,
+                                        body,
+                                        is_coro,
+                                        ..
+                                    } => Some((
+                                        *name,
+                                        type_params.as_slice(),
+                                        args,
+                                        returns,
+                                        where_constraints.as_slice(),
+                                        body,
+                                        *is_coro,
+                                    )),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
+                                maybe_fn
+                            {
+                                let fqn = format!(
+                                    "{}__{}__{}",
+                                    class,
+                                    arg_tys
+                                        .iter()
+                                        .map(|t| format!("{}", t))
+                                        .collect::<Vec<_>>()
+                                        .join("_"),
+                                    mname,
+                                );
+                                method_names.push(mname.to_string());
+                                method_fqns.insert(mname.to_string(), fqn.clone());
+                                self.infer_function(
+                                    mname,
+                                    mparams,
+                                    margs,
+                                    returns.as_ref(),
+                                    where_cs,
+                                    body,
+                                    &m.0.into_range(),
+                                    None,
+                                    is_coro,
+                                );
+                            } else {
+                                let _ = self.infer(m);
+                            }
+                        }
                     }
                 }
                 let mut invalid_instance = class_def.is_none() || overlapping;
@@ -2315,6 +2399,49 @@ impl Checker {
                             range.clone(),
                         ));
                     }
+                    let unknown_assoc = Generics::unknown_assoc_types(
+                        class_def,
+                        assoc_names.iter().map(|n| n.as_str()),
+                    );
+                    for aname in &unknown_assoc {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Unknown associated type `{}` in instance of `{}`",
+                                aname, class
+                            ),
+                            range.clone(),
+                        ));
+                    }
+                    let missing_assoc =
+                        Generics::missing_assoc_types(class_def, &assoc_tys);
+                    if !missing_assoc.is_empty() {
+                        let names = missing_assoc
+                            .iter()
+                            .map(|n| format!("`{}`", n))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let noun = if missing_assoc.len() == 1 {
+                            "associated type"
+                        } else {
+                            "associated types"
+                        };
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Instance of `{}` for `{}` is missing {} {}",
+                                class,
+                                arg_tys
+                                    .iter()
+                                    .map(|ty| ty.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                noun,
+                                names
+                            ),
+                            range.clone(),
+                        ));
+                    }
                     Generics::fill_default_method_fqns(class_def, &mut method_fqns);
                     let missing_methods =
                         Generics::missing_required_methods(class_def, &method_fqns);
@@ -2347,7 +2474,9 @@ impl Checker {
                     }
                     invalid_instance |= !unknown_methods.is_empty()
                         || !missing_methods.is_empty()
-                        || !missing_supers.is_empty();
+                        || !missing_supers.is_empty()
+                        || !unknown_assoc.is_empty()
+                        || !missing_assoc.is_empty();
                 }
                 // Register only complete, non-overlapping instances. Omitted
                 // defaulted methods have been filled with class-default FQNs.
@@ -2356,8 +2485,15 @@ impl Checker {
                         class: class.to_string(),
                         args: arg_tys,
                         method_fqns,
+                        assoc_tys,
                     });
                 }
+                unit_ty()
+            }
+
+            Expression::AssocTypeDecl { .. } => unit_ty(),
+            Expression::AssocTypeDef { ty, .. } => {
+                let _ = self.parse_type_name(ty);
                 unit_ty()
             }
 
@@ -3411,6 +3547,7 @@ impl Checker {
                             .or_default()
                             .push(instance.clone());
                     }
+                    self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                 } else {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
@@ -3420,13 +3557,22 @@ impl Checker {
                 }
             } else {
                 let lookup = self.instance_lookup_args(&c.class, &resolved_args);
-                if let Some(instance) = self.generics.find_instance(&c.class, &lookup) {
+                // Exact match first; fall back to unifying match so enum
+                // constructor values (`Option::Some(42)` → Constructor)
+                // discharge against `impl Collect<Option<int>>` (App).
+                let instance = self
+                    .generics
+                    .find_instance(&c.class, &lookup)
+                    .cloned()
+                    .or_else(|| self.find_unifying_instance(&c.class, &resolved_args));
+                if let Some(instance) = instance {
                     if let Some(call_id) = call_id {
                         self.call_site_dicts
                             .entry(call_id)
                             .or_default()
                             .push(instance.clone());
                     }
+                    self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                 } else {
                     let pretty = Constraint {
                         class: c.class.clone(),
@@ -3438,6 +3584,47 @@ impl Checker {
                         range.clone(),
                     ));
                 }
+            }
+        }
+    }
+
+    /// After discharging constraints for a typeclass method call, pin
+    /// freshened associated-type variables from the scheme mapping.
+    fn pin_assoc_after_discharge(
+        &mut self,
+        class: &str,
+        constraints: &[Constraint],
+        scheme: Option<&Scheme>,
+        mapping: &HashMap<TyVarId, TyVarId>,
+        range: &Range<usize>,
+    ) {
+        for c in constraints {
+            if c.class != class {
+                continue;
+            }
+            let resolved_args: Vec<Ty> = c
+                .args
+                .iter()
+                .map(|a| apply_ty_prune(&self.subst, a))
+                .collect();
+            let any_open = resolved_args.iter().any(|a| matches!(a, Ty::Var(_)));
+            if any_open {
+                // Open bound: leave assoc vars free (open projection).
+                continue;
+            }
+            let lookup = self.instance_lookup_args(&c.class, &resolved_args);
+            let instance = self
+                .generics
+                .find_instance(&c.class, &lookup)
+                .cloned()
+                .or_else(|| self.find_unifying_instance(&c.class, &resolved_args));
+            if let Some(instance) = instance {
+                if let Some(scheme) = scheme {
+                    self.pin_assoc_vars_from_mapping(
+                        class, &instance, scheme, mapping, range,
+                    );
+                }
+                self.pin_assoc_types_for_instance(class, &instance, scheme, range);
             }
         }
     }
@@ -3737,6 +3924,9 @@ impl Checker {
             Expression::TypeApp { name, args } => {
                 self.parse_type_app(name, args, ann.0.into_range())
             }
+            Expression::TypeProjection { owner, name } => {
+                self.resolve_type_projection(owner, name, &ann.0.into_range())
+            }
             Expression::TypeFun(arg, ret) => Ty::Fun(
                 Box::new(self.parse_type_name(arg)),
                 Box::new(self.parse_type_name(ret)),
@@ -3898,6 +4088,268 @@ impl Checker {
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             _ => Ty::Con(name.to_string()),
         }
+    }
+
+    /// Resolve `Owner::Assoc` in a type annotation (Phase 6).
+    ///
+    /// - Inside `typeclass Owner { … }`, `Owner::Elem` / bare scope lookup
+    ///   resolves to the quantified assoc var.
+    /// - `T::Elem` when `T` is a type param with an active class constraint
+    ///   that declares `Elem` → fresh (or cached) open projection var,
+    ///   pinned when a ground instance is later discharged.
+    /// - Ground-only fallback: if `Owner` names a class and exactly one
+    ///   registered instance defines the assoc type, use that concrete type.
+    fn resolve_type_projection(
+        &mut self,
+        owner: &str,
+        assoc: &str,
+        range: &Range<usize>,
+    ) -> Ty {
+        // 1. Current typeclass: `Collect::Elem` while defining Collect.
+        if self.current_typeclass.as_deref() == Some(owner) {
+            for frame in self.type_params_in_scope.iter().rev() {
+                if let Some(&var) = frame.get(assoc) {
+                    return Ty::Var(var);
+                }
+            }
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Cannot find associated type `{}` on typeclass `{}`",
+                    assoc, owner
+                ),
+                range.clone(),
+            ));
+            return Ty::Var(self.counter.fresh());
+        }
+
+        // 2. Type parameter owner: `T::Elem` with `T: Collect`.
+        for frame in self.type_params_in_scope.iter().rev() {
+            if let Some(&owner_var) = frame.get(owner) {
+                // Find an active constraint on this var whose class declares `assoc`.
+                let mut matching_class: Option<String> = None;
+                for c in &self.active_constraints {
+                    let covers = c.args.iter().any(|a| {
+                        matches!(apply_ty_prune(&self.subst, a), Ty::Var(v) if v == owner_var)
+                    });
+                    if !covers {
+                        continue;
+                    }
+                    if let Some(cdef) = self.generics.typeclass(&c.class) {
+                        if cdef.assoc_types.iter().any(|a| a == assoc) {
+                            matching_class = Some(c.class.clone());
+                            break;
+                        }
+                        // Superclass assoc types (rare; check flattened supers).
+                        for super_name in &cdef.superclasses {
+                            if let Some(sdef) = self.generics.typeclass(super_name) {
+                                if sdef.assoc_types.iter().any(|a| a == assoc) {
+                                    matching_class = Some(super_name.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        if matching_class.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if matching_class.is_some() {
+                    let key = (owner_var, assoc.to_string());
+                    if let Some(&existing) = self.open_assoc_projections.get(&key) {
+                        return Ty::Var(existing);
+                    }
+                    let fresh = self.counter.fresh();
+                    self.set_var_kind(fresh, Kind::Type);
+                    self.open_assoc_projections.insert(key, fresh);
+                    return Ty::Var(fresh);
+                }
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Cannot project associated type `{}` from `{}` \
+                         (no in-scope typeclass bound declares it)",
+                        assoc, owner
+                    ),
+                    range.clone(),
+                ));
+                return Ty::Var(self.counter.fresh());
+            }
+        }
+
+        // 3. Class-name owner outside definition: ground-only unique instance.
+        if let Some(cdef) = self.generics.typeclass(owner) {
+            if !cdef.assoc_types.iter().any(|a| a == assoc) {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Cannot find associated type `{}` on typeclass `{}`",
+                        assoc, owner
+                    ),
+                    range.clone(),
+                ));
+                return Ty::Var(self.counter.fresh());
+            }
+            let mut found: Option<Ty> = None;
+            for inst in &self.generics.instances {
+                if inst.class != owner {
+                    continue;
+                }
+                if let Some(ty) = inst.assoc_tys.get(assoc) {
+                    if found.is_some() {
+                        // Ambiguous across multiple instances — leave open.
+                        found = None;
+                        break;
+                    }
+                    found = Some(ty.clone());
+                }
+            }
+            if let Some(ty) = found {
+                return ty;
+            }
+            // No unique ground instance — fresh var (caller may pin later).
+            return Ty::Var(self.counter.fresh());
+        }
+
+        self.messages.push(Message::error(
+            ErrorCode::GenericTypeError,
+            format!(
+                "Cannot resolve type projection `{}::{}`",
+                owner, assoc
+            ),
+            range.clone(),
+        ));
+        Ty::Var(self.counter.fresh())
+    }
+
+    /// After discharging a ground (or unifying) instance, pin any open
+    /// associated-type projections whose owner matches the instance args,
+    /// and pin freshened assoc vars from typeclass method schemes.
+    fn pin_assoc_types_for_instance(
+        &mut self,
+        class: &str,
+        instance: &InstanceDef,
+        scheme: Option<&Scheme>,
+        range: &Range<usize>,
+    ) {
+        let Some(class_def) = self.generics.typeclass(class).cloned() else {
+            return;
+        };
+        if class_def.assoc_types.is_empty() {
+            return;
+        }
+
+        // Pin open `T::Elem` projections whose owner unifies with instance.args.
+        let open_keys: Vec<((TyVarId, String), TyVarId)> = self
+            .open_assoc_projections
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for ((owner_var, assoc_name), assoc_var) in open_keys {
+            if !class_def.assoc_types.iter().any(|a| a == &assoc_name) {
+                continue;
+            }
+            // Owner must unify with the primary instance arg(s).
+            let owner_ty = apply_ty_prune(&self.subst, &Ty::Var(owner_var));
+            let matches_owner = instance.args.iter().any(|arg| {
+                unify_with(&self.subst, &owner_ty, arg).is_ok()
+            });
+            if !matches_owner {
+                continue;
+            }
+            if let Some(concrete) = instance.assoc_tys.get(&assoc_name).cloned() {
+                self.unify(
+                    &Ty::Var(assoc_var),
+                    &concrete,
+                    range,
+                    &format!("associated type `{}`", assoc_name),
+                );
+            }
+        }
+
+        // Pin scheme-quantified assoc vars (trailing after class params).
+        if let Some(scheme) = scheme {
+            let n_params = class_def.type_params.len();
+            let n_assoc = class_def.assoc_types.len();
+            if scheme.bounds.len() >= n_params + n_assoc {
+                // Re-instantiate mapping is not available here; callers that
+                // have a freshened mapping should call
+                // `pin_assoc_vars_from_mapping` instead.
+                let _ = (n_params, n_assoc);
+            }
+        }
+    }
+
+    /// Pin freshened associated-type variables from a typeclass method
+    /// scheme instantiation against a concrete instance.
+    fn pin_assoc_vars_from_mapping(
+        &mut self,
+        class: &str,
+        instance: &InstanceDef,
+        scheme: &Scheme,
+        mapping: &HashMap<TyVarId, TyVarId>,
+        range: &Range<usize>,
+    ) {
+        let Some(class_def) = self.generics.typeclass(class) else {
+            return;
+        };
+        let n_params = class_def.type_params.len();
+        // Clone so unify can mutably borrow `self` in the loop.
+        let pins: Vec<(String, TyVarId, Ty)> = class_def
+            .assoc_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, assoc_name)| {
+                let bound_idx = n_params + i;
+                let &old_var = scheme.bounds.get(bound_idx)?;
+                let &fresh = mapping.get(&old_var)?;
+                let concrete = instance.assoc_tys.get(assoc_name)?.clone();
+                Some((assoc_name.clone(), fresh, concrete))
+            })
+            .collect();
+        for (assoc_name, fresh, concrete) in pins {
+            self.unify(
+                &Ty::Var(fresh),
+                &concrete,
+                range,
+                &format!("associated type `{}`", assoc_name),
+            );
+        }
+    }
+
+    /// Instantiate a scheme, returning the freshened type, constraints, and
+    /// old→new bound-variable mapping (Phase 6 assoc pinning).
+    fn instantiate_scheme_mapped(
+        &mut self,
+        scheme: &Scheme,
+    ) -> (Ty, Vec<Constraint>, HashMap<TyVarId, TyVarId>) {
+        use super::env::substitute_vars;
+        let mut fresh_kinds = HashMap::new();
+        let mapping: HashMap<TyVarId, TyVarId> = scheme
+            .bounds
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let fresh = self.counter.fresh();
+                fresh_kinds.insert(fresh, scheme.kind_at(i));
+                (v, fresh)
+            })
+            .collect();
+        self.var_kinds.extend(fresh_kinds);
+        let ty = substitute_vars(&scheme.ty, &mapping);
+        let constraints = scheme
+            .constraints
+            .iter()
+            .map(|c| Constraint {
+                class: c.class.clone(),
+                args: c
+                    .args
+                    .iter()
+                    .map(|a| substitute_vars(a, &mapping))
+                    .collect(),
+            })
+            .collect();
+        (ty, constraints, mapping)
     }
 
     /// Whether codegen should Ok-wrap bare returns for `fn_name`.
@@ -4833,11 +5285,16 @@ impl Checker {
                     self.pre_register_enums_walk(m, errors);
                 }
             }
-            Expression::TypeClassImpl { methods, .. } => {
+            Expression::TypeClassImpl { args, methods, .. } => {
+                for a in args {
+                    self.pre_register_enums_walk(a, errors);
+                }
                 for m in methods {
                     self.pre_register_enums_walk(m, errors);
                 }
             }
+            Expression::AssocTypeDecl { .. } | Expression::TypeProjection { .. } => {}
+            Expression::AssocTypeDef { ty, .. } => self.pre_register_enums_walk(ty, errors),
         }
     }
 
@@ -9810,5 +10267,80 @@ fn add<T: Num>(T a, T b) -> T { return a + b; }
             scheme.constraints[0].args[0],
             Ty::Var(v) if scheme.bounds.contains(&v)
         ));
+    }
+
+    /// Phase 6: associated type on a ground call pins `C::Elem` to `int`.
+    #[test]
+    fn assoc_type_head_returns_int_at_ground_call() {
+        let src = r#"
+typeclass Collect<C> {
+    type Elem;
+    fn head(C xs) -> Elem;
+}
+impl Collect<Option<int>> {
+    type Elem = int;
+    fn head(Option<int> xs) -> int {
+        return match xs {
+            Option::Some(v) => v,
+            Option::None => 0,
+        };
+    }
+}
+fn take_head<C: Collect>(C xs) -> C::Elem {
+    return head(xs);
+}
+fn main() {
+    let x = take_head(Option::Some(42));
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        // `x` should be int after ground Collect<Option<int>> discharge pins Elem.
+        let x_ty = c
+            .codegen_var_type("x")
+            .cloned()
+            .or_else(|| {
+                c.env()
+                    .lookup("x")
+                    .map(|s| apply_ty_prune(&c.subst, &s.ty))
+            });
+        let x_ty = x_ty.expect("x should be bound");
+        let x_ty = apply_ty_prune(&c.subst, &x_ty);
+        assert!(
+            matches!(x_ty, Ty::Con(ref n) if n == "int") || x_ty == int(),
+            "expected take_head(...) : int, got {}",
+            x_ty
+        );
+    }
+
+    /// Phase 6: open `T::Elem` under `T: Collect` uses a fresh var (not an error).
+    #[test]
+    fn assoc_type_open_projection_under_bound_is_ok() {
+        let src = r#"
+typeclass Collect<C> {
+    type Elem;
+    fn head(C xs) -> Elem;
+}
+fn peek<T: Collect>(T xs) -> T::Elem {
+    return head(xs);
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().all(|m| !m.message().contains("Cannot find")
+                && !m.message().contains("Unknown associated")
+                && !m.message().contains("Cannot resolve type projection")),
+            "open projection should resolve under Collect bound: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let scheme = c.env().lookup("peek").expect("peek scheme");
+        assert_eq!(scheme.constraints.len(), 1);
+        assert_eq!(scheme.constraints[0].class, "Collect");
     }
 }

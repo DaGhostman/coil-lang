@@ -656,6 +656,20 @@ is subclass methods then superclass methods.
 
 ---
 
+### `examples/assoc_type.0s`
+
+**Demonstrates:** Associated types — `type Elem;` in a typeclass,
+`type Elem = int;` in the impl, bare `Elem` as a method return type,
+open `C::Elem` under `C: Collect`, and a ground `take_head(Option::Some(42))`
+call that pins the projection to `int`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/assoc_type.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/polyfn.0s`
 
 **Demonstrates:** First-class generic functions, multi-instantiation,
@@ -976,6 +990,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
 | `superclass_ord.0s` | Types | `truetruefalse` |
+| `assoc_type.0s` | Types | `42` |
 | `polyfn.0s` | Types | `424.0424242` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |

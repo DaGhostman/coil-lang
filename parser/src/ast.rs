@@ -116,6 +116,11 @@ pub enum Expression<'expr> {
         name: &'expr str,
         args: Vec<Output<'expr>>,
     },
+    /// Associated-type projection in annotations: `Collect::Elem`, `C::Elem`.
+    TypeProjection {
+        owner: &'expr str,
+        name: &'expr str,
+    },
     /// Function type annotation `A -> B`.
     TypeFun(Output<'expr>, Output<'expr>),
     Comment(&'expr str),
@@ -310,20 +315,32 @@ pub enum Expression<'expr> {
         ty: Box<Output<'expr>>,
     },
 
-    /// `typeclass Name<T> { fn ...; fn ... { default } }`
+    /// `typeclass Name<T> { type Elem; fn ...; fn ... { default } }`
     TypeClass {
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
-        /// `Function` nodes; an empty `Block` body means signature-only.
+        /// Body items: `AssocTypeDecl`, and `Function` nodes (empty `Block` = sig-only).
         methods: Vec<Output<'expr>>,
     },
 
-    /// `impl Num<int> { fn add(...) { ... } }` — typeclass instance.
+    /// `impl Num<int> { type Elem = int; fn add(...) { ... } }` — typeclass instance.
     TypeClassImpl {
         class: &'expr str,
         /// Type annotations for the class type arguments, e.g. `[int]`.
         args: Vec<Output<'expr>>,
+        /// Body items: `AssocTypeDef` and method `Function`/`Method` nodes.
         methods: Vec<Output<'expr>>,
+    },
+
+    /// Associated type declaration inside a typeclass: `type Elem;`.
+    AssocTypeDecl {
+        name: &'expr str,
+    },
+
+    /// Associated type definition inside an impl: `type Elem = int;`.
+    AssocTypeDef {
+        name: &'expr str,
+        ty: Box<Output<'expr>>,
     },
 }
 
@@ -840,7 +857,10 @@ impl<'a> Display for Expression<'a> {
                     .join(", ");
                 write!(f, "{}<{}>", name, args_s)
             }
+            Self::TypeProjection { owner, name } => write!(f, "{}::{}", owner, name),
             Self::TypeFun(arg, ret) => write!(f, "{} -> {}", arg.1, ret.1),
+            Self::AssocTypeDecl { name } => write!(f, "type {};", name),
+            Self::AssocTypeDef { name, ty } => write!(f, "type {} = {};", name, ty.1),
             Self::Class { name, type_params, fields } => {
                 let tp = if type_params.is_empty() {
                     String::new()

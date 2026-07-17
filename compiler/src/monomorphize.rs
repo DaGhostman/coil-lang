@@ -512,14 +512,21 @@ where
                 f(field);
             }
         }
-        Expression::Implementation { methods, .. }
-        | Expression::TypeClass { methods, .. }
-        | Expression::TypeClassImpl { methods, .. } => {
+        Expression::Implementation { methods, .. } | Expression::TypeClass { methods, .. } => {
             for method in methods {
                 f(method);
             }
         }
-        Expression::TypeAlias { ty, .. } => f(ty),
+        Expression::TypeClassImpl { args, methods, .. } => {
+            for arg in args {
+                f(arg);
+            }
+            for method in methods {
+                f(method);
+            }
+        }
+        Expression::TypeAlias { ty, .. } | Expression::AssocTypeDef { ty, .. } => f(ty),
+        Expression::AssocTypeDecl { .. } | Expression::TypeProjection { .. } => {}
         Expression::EnumDecl { variants, .. } => {
             for variant in variants {
                 f(variant);

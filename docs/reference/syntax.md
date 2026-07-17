@@ -81,16 +81,31 @@ fn greet() { print "hi"; }
 ### Typeclasses and impl
 
 ```
-typeclass_decl ::= 'typeclass' IDENT type_param_list '{' method_sig* '}'
+typeclass_decl ::= 'typeclass' IDENT type_param_list '{' typeclass_item* '}'
+typeclass_item ::= assoc_type_decl | method_sig
+assoc_type_decl ::= 'type' IDENT ';'
 method_sig     ::= 'fn' IDENT arg_list ('->' type_annotation)? (';' | block)
-impl_decl      ::= 'impl' IDENT type_arg_list '{' method_decl* '}'
+impl_decl      ::= 'impl' IDENT type_arg_list '{' impl_item* '}'
+impl_item      ::= assoc_type_def | method_decl
+assoc_type_def ::= 'type' IDENT '=' type ';'
 type_arg_list  ::= '<' type (',' type)* '>'
+type_projection ::= IDENT '::' IDENT   // e.g. Collect::Elem, C::Elem
 ```
 
 Example:
 
 ```0s
 typeclass Num<T> { /* builtin — see types reference */ }
+
+typeclass Collect<C> {
+    type Elem;
+    fn head(C xs) -> Elem;
+}
+
+impl Collect<Option<int>> {
+    type Elem = int;
+    fn head(Option<int> xs) -> int { /* … */ }
+}
 
 impl Measurable<int> {
     fn size(int x) -> int { return x; }

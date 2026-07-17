@@ -206,6 +206,13 @@ fn example_superclass_ord_prints_truetruefalse() {
     assert_eq!(output, "truetruefalse");
 }
 
+/// Phase 6: associated types — `Collect::Elem` pinned from ground instance.
+#[test]
+fn example_assoc_type_prints_42() {
+    let output = run_example("examples/assoc_type.0s");
+    assert_eq!(output, "42");
+}
+
 /// Shuffled record pattern `{ y: _, x: a }` must bind declaration-order `x`.
 #[test]
 fn shuffled_record_pattern_binds_declaration_order_field() {

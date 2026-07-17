@@ -1151,7 +1151,7 @@ impl Compiler {
         checker: &Checker,
         functions: &HashMap<String, usize>,
     ) -> bool {
-        let Some(instance) = checker.generics().find_instance(class, lookup) else {
+        let Some(instance) = checker.generics().find_instance_relaxed(class, lookup) else {
             return false;
         };
         let Some(class_def) = checker.generics().typeclass(&instance.class) else {
@@ -1165,7 +1165,7 @@ impl Compiler {
             } else {
                 checker
                     .generics()
-                    .find_instance(owner_class, lookup)
+                    .find_instance_relaxed(owner_class, lookup)
                     .and_then(|super_inst| super_inst.method_fqns.get(&method_def.name).cloned())
             };
             let offset = fqn
@@ -1991,6 +1991,41 @@ impl Compiler {
             self.codegen_expr_ty(node),
             Some(Ty::Con(ref name)) if name == crate::typechecking::ty::STRING
         )
+    }
+
+    /// Resolve an `impl Class<…>` type argument to a [`Ty`] for FQN mangling.
+    /// Mirrors the typechecker's `parse_instance_head` so `Option<int>`
+    /// becomes `App(Option, [int])`, not `unknown`.
+    fn codegen_instance_head_ty(&self, arg: &Output) -> Ty {
+        match arg.1.as_ref() {
+            Expression::Type(name) | Expression::Identifier(name) => {
+                match name.to_ascii_lowercase().as_str() {
+                    "option" => Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                    "result" => Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                    "int" => Ty::Con("int".into()),
+                    "float" => Ty::Con("float".into()),
+                    "string" => Ty::Con("string".into()),
+                    "bool" => Ty::Con("bool".into()),
+                    "void" | "unit" => Ty::Con("unit".into()),
+                    _ => Ty::Con(name.to_string()),
+                }
+            }
+            Expression::TypeApp { name, args } => {
+                let head = match name.to_ascii_lowercase().as_str() {
+                    "option" => Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                    "result" => Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                    _ => Ty::Con(name.to_string()),
+                };
+                let arg_tys: Vec<Ty> = args
+                    .iter()
+                    .map(|a| self.codegen_instance_head_ty(a))
+                    .collect();
+                Ty::App(Box::new(head), arg_tys)
+            }
+            _ => self
+                .codegen_expr_ty(arg)
+                .unwrap_or_else(|| Ty::Con("unknown".into())),
+        }
     }
 
     fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
@@ -3550,24 +3585,31 @@ impl Compiler {
             }
             Expression::TypeClass { name, methods, .. } => {
                 for method in methods {
-                    if let Expression::Function {
-                        name: method_name,
-                        body,
-                        ..
-                    } = method.1.as_ref()
-                    {
-                        let has_default = !matches!(body.1.as_ref(), Expression::Block(items) if items.is_empty());
-                        if has_default {
-                            let fqn = crate::typechecking::generics::Generics::default_method_fqn(
-                                name,
-                                method_name,
-                            );
-                            self.compile_function_output_with_name(method, fqn, &[], 1);
-                        } else {
+                    match method.1.as_ref() {
+                        Expression::AssocTypeDecl { .. } => {
+                            // Type-level only — do_compile consumes the NodeId.
+                            let _ = self.do_compile(method);
+                        }
+                        Expression::Function {
+                            name: method_name,
+                            body,
+                            ..
+                        } => {
+                            let has_default = !matches!(body.1.as_ref(), Expression::Block(items) if items.is_empty());
+                            if has_default {
+                                let fqn =
+                                    crate::typechecking::generics::Generics::default_method_fqn(
+                                        name,
+                                        method_name,
+                                    );
+                                self.compile_function_output_with_name(method, fqn, &[], 1);
+                            } else {
+                                self.consume_function_signature_output(method);
+                            }
+                        }
+                        _ => {
                             self.consume_function_signature_output(method);
                         }
-                    } else {
-                        self.consume_function_signature_output(method);
                     }
                 }
             }
@@ -3583,23 +3625,7 @@ impl Compiler {
                 // (e.g. `unit`) and emit `Container__unit__first` instead.
                 let arg_tys: Vec<Ty> = args
                     .iter()
-                    .map(|arg| match arg.1.as_ref() {
-                        Expression::Type(name) | Expression::Identifier(name) => {
-                            match name.to_ascii_lowercase().as_str() {
-                                "option" => Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
-                                "result" => Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
-                                "int" => Ty::Con("int".into()),
-                                "float" => Ty::Con("float".into()),
-                                "string" => Ty::Con("string".into()),
-                                "bool" => Ty::Con("bool".into()),
-                                "void" | "unit" => Ty::Con("unit".into()),
-                                _ => Ty::Con(name.to_string()),
-                            }
-                        }
-                        _ => self
-                            .codegen_expr_ty(arg)
-                            .unwrap_or_else(|| Ty::Con("unknown".into())),
-                    })
+                    .map(|arg| self.codegen_instance_head_ty(arg))
                     .collect();
                 for arg in args {
                     bytecode.append(&mut self.do_compile(arg));
@@ -3610,32 +3636,45 @@ impl Compiler {
                     .collect::<Vec<_>>()
                     .join("_");
                 for method in methods {
-                    if let Expression::Function {
-                        name: method_name, ..
-                    } = method.1.as_ref()
-                    {
-                        let fqn = format!("{}__{}__{}", class, ty_part, method_name);
-                        let unbox_tys =
-                            self.instance_method_unbox_tys(class, method_name, &arg_tys);
-                        self.compile_function_output_with_name(method, fqn, &unbox_tys, 1);
-                    } else if let Expression::Method(_, body) = method.1.as_ref() {
-                        let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
-                        self.emit_idx += 1;
-                        if let Expression::Function {
+                    match method.1.as_ref() {
+                        Expression::AssocTypeDef { .. } => {
+                            // Type-level only — do_compile consumes wrapper + RHS IDs.
+                            let _ = self.do_compile(method);
+                        }
+                        Expression::Function {
                             name: method_name, ..
-                        } = body.1.as_ref()
-                        {
+                        } => {
                             let fqn = format!("{}__{}__{}", class, ty_part, method_name);
                             let unbox_tys =
                                 self.instance_method_unbox_tys(class, method_name, &arg_tys);
-                            self.compile_function_output_with_name(body, fqn, &unbox_tys, 1);
-                        } else {
-                            self.consume_function_signature_output(body);
+                            self.compile_function_output_with_name(method, fqn, &unbox_tys, 1);
                         }
-                    } else {
-                        self.consume_function_signature_output(method);
+                        Expression::Method(_, body) => {
+                            let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
+                            self.emit_idx += 1;
+                            if let Expression::Function {
+                                name: method_name, ..
+                            } = body.1.as_ref()
+                            {
+                                let fqn = format!("{}__{}__{}", class, ty_part, method_name);
+                                let unbox_tys =
+                                    self.instance_method_unbox_tys(class, method_name, &arg_tys);
+                                self.compile_function_output_with_name(body, fqn, &unbox_tys, 1);
+                            } else {
+                                self.consume_function_signature_output(body);
+                            }
+                        }
+                        _ => {
+                            self.consume_function_signature_output(method);
+                        }
                     }
                 }
+            }
+            Expression::AssocTypeDecl { .. } | Expression::TypeProjection { .. } => {
+                // Type-level only — no bytecode (NodeId already consumed by do_compile).
+            }
+            Expression::AssocTypeDef { ty, .. } => {
+                bytecode.append(&mut self.do_compile(ty));
             }
             Expression::Identifier(n) => {
                 if let Some(slot) = self.lookup_slot(n) {

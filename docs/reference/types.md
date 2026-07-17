@@ -421,6 +421,41 @@ Instance methods compile to ordinary functions with mangled names
 (`Class__Type__method`). Generic call sites discharge the bound at
 typecheck time and pass the matching dictionary at runtime (above).
 
+### Associated types
+
+A typeclass may declare associated types; each impl must define them:
+
+```0s
+typeclass Collect<C> {
+    type Elem;
+    fn head(C xs) -> Elem;
+}
+
+impl Collect<Option<int>> {
+    type Elem = int;
+    fn head(Option<int> xs) -> int {
+        return match xs {
+            Option::Some(v) => v,
+            Option::None => 0,
+        };
+    }
+}
+```
+
+- **In method signatures** inside the class, bare `Elem` (and `Collect::Elem` /
+  `C::Elem`) resolve to the associated type. Method schemes quantify class
+  parameters first, then associated types.
+- **Impls** must define every associated type (`type Elem = …;`) and may not
+  introduce unknown ones. Missing or extra assoc types are type errors.
+- **Projections** `Owner::Assoc` are allowed in type annotations. When the
+  owner is a type parameter with an active class bound that declares the
+  assoc type (`fn take_head<C: Collect>(C xs) -> C::Elem`), the projection
+  is an open type variable that is pinned when a ground instance is
+  discharged at the call site (`take_head(Option::Some(42))` → `int`).
+
+Associated types are erased at runtime (no dictionary slot); they exist only
+in the typechecker. See `examples/assoc_type.0s`.
+
 ### Superclasses and implied bounds
 
 Unary typeclass parameter bounds declare superclasses:
@@ -486,7 +521,8 @@ generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
 See `examples/generics.0s`, `examples/typeclass_dict.0s`,
-`examples/superclass_ord.0s`, and `examples/polyfn.0s` for runnable demos.
+`examples/superclass_ord.0s`, `examples/assoc_type.0s`, and
+`examples/polyfn.0s` for runnable demos.
 
 ### Boxing and unboxing at generic boundaries
 

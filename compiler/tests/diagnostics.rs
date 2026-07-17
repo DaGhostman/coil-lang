@@ -693,3 +693,51 @@ fn superclass_impl_requires_superclass_instance() {
         msgs
     );
 }
+
+/// Phase 6: impl must define every associated type declared by the class.
+#[test]
+fn assoc_type_missing_in_impl_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Collect<C> {
+            type Elem;
+            fn head(C xs) -> Elem;
+        }
+        impl Collect<int> {
+            fn head(int xs) -> int { return xs; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("missing associated type")
+            && m.contains("Elem")
+            && m.contains("Collect")),
+        "expected missing associated type diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 6: impl cannot define an unknown associated type.
+#[test]
+fn assoc_type_unknown_in_impl_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Collect<C> {
+            type Elem;
+            fn head(C xs) -> Elem;
+        }
+        impl Collect<int> {
+            type Elem = int;
+            type Extra = int;
+            fn head(int xs) -> int { return xs; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Unknown associated type")
+            && m.contains("Extra")
+            && m.contains("Collect")),
+        "expected unknown associated type diagnostic, got: {:?}",
+        msgs
+    );
+}

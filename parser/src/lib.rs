@@ -180,6 +180,19 @@ impl<'pratt> Pratt<'pratt> {
                     Some(args) => (e.span(), Box::new(Expression::TypeApp { name, args })),
                     None => (e.span(), Box::new(Expression::Type(name))),
                 });
+            // `Owner::Assoc` — associated-type projection (Phase 6).
+            // Tried before bare `named_type` so `Collect::Elem` is not
+            // left as `Type("Collect")` followed by a parse failure on `::`.
+            let projection_type = text::ident()
+                .padded()
+                .then_ignore(op!("::"))
+                .then(text::ident().padded())
+                .map_with(|(owner, name), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::TypeProjection { owner, name }),
+                    )
+                });
             // `forall T. ty` / `forall T: Num + Eq, U. ty` — universally
             // quantified type annotation. Tried BEFORE `named_type` so
             // that `forall` is not parsed as an identifier.
@@ -201,7 +214,13 @@ impl<'pratt> Pratt<'pratt> {
                         }),
                     )
                 });
-            let atom = choice((array_type, tuple_type, forall_type, named_type));
+            let atom = choice((
+                array_type,
+                tuple_type,
+                forall_type,
+                projection_type,
+                named_type,
+            ));
             atom.clone()
                 .then(op!("->").ignore_then(type_ann.clone()).or_not())
                 .map_with(|(lhs, rhs), e| match rhs {
@@ -1437,10 +1456,11 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// `typeclass Name<T, U: Bound> { fn sig(…) -> ret; fn default(…) { body } }`
+    /// `typeclass Name<T, U: Bound> { type Elem; fn sig(…) -> ret; fn default(…) { body } }`
     ///
-    /// Each method inside the body is either:
-    /// - Signature-only: `fn name(args) -> ret;`  (represented as a
+    /// Each body item is either:
+    /// - Associated type declaration: `type Elem;`
+    /// - Signature-only method: `fn name(args) -> ret;`  (represented as a
     ///   `Function` with an empty `Block` body).
     /// - Default implementation: `fn name(args) -> ret { body }`.
     fn typeclass_decl<
@@ -1477,11 +1497,22 @@ impl<'pratt> Pratt<'pratt> {
         // A method with a full block body (the default implementation).
         let default_method = self.func(stmt);
 
+        // Associated type declaration: `type Elem;`
+        let assoc_decl = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then_ignore(op!(";"))
+            .map_with(|name, e| {
+                (
+                    e.span(),
+                    Box::new(Expression::AssocTypeDecl { name }),
+                )
+            });
+
         keyword!("typeclass")
             .ignore_then(text::ident().padded())
             .then(self.type_param_list())
             .then(
-                choice((sig_only, default_method))
+                choice((assoc_decl, sig_only, default_method))
                     .padded()
                     .repeated()
                     .collect::<Vec<_>>()
@@ -1522,13 +1553,29 @@ impl<'pratt> Pratt<'pratt> {
         // names; if they appear inside `<>`, the block is a typeclass impl.
         const PRIMITIVES: &[&str] = &["int", "float", "string", "bool", "void", "unit"];
 
+        // Associated type definition: `type Elem = int;`
+        let assoc_def = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then_ignore(op!("="))
+            .then(self.type_annotation())
+            .then_ignore(op!(";"))
+            .map_with(|(name, ty), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::AssocTypeDef {
+                        name,
+                        ty: Box::new(ty),
+                    }),
+                )
+            });
+
         keyword!("impl")
             .ignore_then(text::ident())
             .then(self.type_param_list())
             .then(
-                // Methods are full `fn` declarations — separated by
-                // juxtaposition (newlines / whitespace), not commas.
-                self.method_decl(stmt)
+                // Methods (and assoc type defs for typeclass impls) are
+                // separated by juxtaposition (newlines / whitespace), not commas.
+                choice((assoc_def, self.method_decl(stmt)))
                     .repeated()
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
@@ -1594,6 +1641,22 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Associated type definition: `type Elem = int;`
+        let assoc_def = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then_ignore(op!("="))
+            .then(self.type_annotation())
+            .then_ignore(op!(";"))
+            .map_with(|(name, ty), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::AssocTypeDef {
+                        name,
+                        ty: Box::new(ty),
+                    }),
+                )
+            });
+
         keyword!("impl")
             .ignore_then(text::ident())
             .then(
@@ -1609,7 +1672,7 @@ impl<'pratt> Pratt<'pratt> {
                     .delimited_by(op!("<"), op!(">")),
             )
             .then(
-                self.method_decl(stmt)
+                choice((assoc_def, self.method_decl(stmt)))
                     .repeated()
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
@@ -4044,6 +4107,86 @@ mod tests_generics {
     fn typeclass_impl_display_round_trips() {
         let s = stmt!("impl Num<int> {}");
         assert_eq!(s, "impl Num<int> {  }");
+    }
+
+    /// Phase 6: associated type decl + projection parse / Display round-trip.
+    #[test]
+    fn assoc_type_decl_and_projection_round_trip() {
+        match decl_ast!(
+            "typeclass Collect<C> { type Elem; fn head(C xs) -> Elem; }"
+        ) {
+            Expression::TypeClass { methods, .. } => {
+                assert!(
+                    methods
+                        .iter()
+                        .any(|m| matches!(m.1.as_ref(), Expression::AssocTypeDecl { name: "Elem" })),
+                    "expected AssocTypeDecl Elem, got {:?}",
+                    methods
+                );
+                // Return type of head should be bare Type("Elem") (resolved as assoc later).
+                let head = methods.iter().find_map(|m| match m.1.as_ref() {
+                    Expression::Function {
+                        name: "head",
+                        returns: Some(r),
+                        ..
+                    } => Some(r.1.as_ref()),
+                    _ => None,
+                });
+                assert!(
+                    matches!(head, Some(Expression::Type("Elem"))),
+                    "expected bare Elem return, got {:?}",
+                    head
+                );
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+
+        let proj = Pratt::default()
+            .type_annotation()
+            .parse("Collect::Elem")
+            .into_result()
+            .expect("projection parse failed");
+        assert!(
+            matches!(
+                proj.1.as_ref(),
+                Expression::TypeProjection {
+                    owner: "Collect",
+                    name: "Elem"
+                }
+            ),
+            "expected TypeProjection, got {:?}",
+            proj.1
+        );
+        assert_eq!(format!("{}", proj.1), "Collect::Elem");
+
+        let s = stmt!(
+            "typeclass Collect<C> { type Elem; fn head(C xs) -> Elem; }"
+        );
+        assert!(s.contains("type Elem;"), "got: {s}");
+        assert!(s.contains("Collect"), "got: {s}");
+    }
+
+    /// Phase 6: assoc type def inside typeclass impl.
+    #[test]
+    fn assoc_type_def_in_impl_parses() {
+        match decl_ast!(
+            "impl Collect<Option<int>> { type Elem = int; fn head(Option<int> xs) -> int { return 0; } }"
+        ) {
+            Expression::TypeClassImpl { methods, .. } => {
+                assert!(
+                    methods.iter().any(|m| matches!(
+                        m.1.as_ref(),
+                        Expression::AssocTypeDef {
+                            name: "Elem",
+                            ..
+                        }
+                    )),
+                    "expected AssocTypeDef Elem, got {:?}",
+                    methods
+                );
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
     }
 
     /// Inherent impl Display: `impl Point { … }`

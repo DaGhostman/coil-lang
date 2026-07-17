@@ -6,7 +6,9 @@
 //! delegates type-class resolution to it.
 
 use super::kind::Kind;
+use super::subst::Subst;
 use super::ty::Ty;
+use super::unify::unify_with;
 use std::collections::{HashMap, HashSet};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -36,6 +38,10 @@ pub struct TypeClassMethodDef {
 /// `superclasses: ["Equal"]`. Dictionary layout is flattened — subclass
 /// methods first, then each superclass’s methods in declaration order
 /// (transitively).
+///
+/// Associated types (Phase 6): `typeclass Collect<C> { type Elem; … }`
+/// stores `assoc_types: ["Elem"]`. Method schemes quantify class params
+/// first, then assoc types in this order.
 #[derive(Debug, Clone)]
 pub struct TypeClassDef {
     pub name: String,
@@ -48,6 +54,8 @@ pub struct TypeClassDef {
     /// (`typeclass Ord<T: Eq>` → `["Eq"]`). Empty for multi-param classes
     /// and classes without bounds.
     pub superclasses: Vec<String>,
+    /// Associated type names in declaration order (Phase 6), e.g. `["Elem"]`.
+    pub assoc_types: Vec<String>,
     pub methods: Vec<TypeClassMethodDef>,
 }
 
@@ -122,6 +130,9 @@ impl TypeClassDef {
 /// InstanceDef { class: "Num", args: [int()],
 ///     method_fqns: { "add" → "Num__int__add" } }
 /// ```
+///
+/// Associated types (Phase 6): `impl Collect<Option<int>> { type Elem = int; … }`
+/// stores `assoc_tys: { "Elem" → int() }`.
 #[derive(Debug, Clone)]
 pub struct InstanceDef {
     /// Class name this instance implements (e.g. `"Num"`).
@@ -130,6 +141,8 @@ pub struct InstanceDef {
     pub args: Vec<Ty>,
     /// Method name → fully-qualified codegen name.
     pub method_fqns: HashMap<String, String>,
+    /// Associated type name → concrete type (Phase 6).
+    pub assoc_tys: HashMap<String, Ty>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -181,6 +194,31 @@ impl Generics {
         })
     }
 
+    /// Find an instance whose args unify with `args` (e.g. `Option::Some(42)`'s
+    /// Constructor type against `impl Collect<Option<int>>`). Does not mutate
+    /// any global substitution.
+    pub fn find_unifying_instance(&self, class: &str, args: &[Ty]) -> Option<&InstanceDef> {
+        self.instances.iter().find(|inst| {
+            if inst.class != class || inst.args.len() != args.len() {
+                return false;
+            }
+            let mut local = Subst::empty();
+            for (have, need) in inst.args.iter().zip(args.iter()) {
+                match unify_with(&local, need, have) {
+                    Ok(s) => local = s,
+                    Err(_) => return false,
+                }
+            }
+            true
+        })
+    }
+
+    /// Exact match, then unifying match (Constructor ↔ App/Sum).
+    pub fn find_instance_relaxed(&self, class: &str, args: &[Ty]) -> Option<&InstanceDef> {
+        self.find_instance(class, args)
+            .or_else(|| self.find_unifying_instance(class, args))
+    }
+
     /// True when an identical class + concrete-argument instance already exists.
     pub fn has_overlapping_instance(&self, class: &str, args: &[Ty]) -> bool {
         self.find_instance(class, args).is_some()
@@ -210,6 +248,36 @@ impl Generics {
             .map(|method| method.name.as_str())
             .collect();
         method_names
+            .into_iter()
+            .filter(|name| !known.contains(*name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Associated types required by the class but missing from the instance.
+    pub fn missing_assoc_types(
+        class_def: &TypeClassDef,
+        assoc_tys: &HashMap<String, Ty>,
+    ) -> Vec<String> {
+        class_def
+            .assoc_types
+            .iter()
+            .filter(|name| !assoc_tys.contains_key(name.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Associated types provided by an instance that the class does not declare.
+    pub fn unknown_assoc_types<'a, I>(class_def: &TypeClassDef, assoc_names: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let known: HashSet<&str> = class_def
+            .assoc_types
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assoc_names
             .into_iter()
             .filter(|name| !known.contains(*name))
             .map(str::to_string)
@@ -259,6 +327,7 @@ impl Generics {
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
+                assoc_types: vec![],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "add".into(),
@@ -291,6 +360,7 @@ impl Generics {
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
+                assoc_types: vec![],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "lt".into(),
@@ -320,6 +390,7 @@ impl Generics {
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
+                assoc_types: vec![],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "eq".into(),
@@ -341,6 +412,7 @@ impl Generics {
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
+                assoc_types: vec![],
                 methods: vec![TypeClassMethodDef {
                     name: "show".into(),
                     has_default: false,
@@ -366,21 +438,25 @@ impl Generics {
             class: "Num".into(),
             args: vec![int()],
             method_fqns: make_fqns("Num", "int", &["add", "sub", "mul", "div"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Ord".into(),
             args: vec![int()],
             method_fqns: make_fqns("Ord", "int", &["lt", "le", "gt", "ge"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Eq".into(),
             args: vec![int()],
             method_fqns: make_fqns("Eq", "int", &["eq", "ne"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
             args: vec![int()],
             method_fqns: make_fqns("Show", "int", &["show"]),
+            assoc_tys: HashMap::new(),
         });
 
         // ---- builtin instances: float ----
@@ -388,21 +464,25 @@ impl Generics {
             class: "Num".into(),
             args: vec![float()],
             method_fqns: make_fqns("Num", "float", &["add", "sub", "mul", "div"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Ord".into(),
             args: vec![float()],
             method_fqns: make_fqns("Ord", "float", &["lt", "le", "gt", "ge"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Eq".into(),
             args: vec![float()],
             method_fqns: make_fqns("Eq", "float", &["eq", "ne"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
             args: vec![float()],
             method_fqns: make_fqns("Show", "float", &["show"]),
+            assoc_tys: HashMap::new(),
         });
 
         // ---- string: Eq + Show ----
@@ -410,11 +490,13 @@ impl Generics {
             class: "Eq".into(),
             args: vec![string()],
             method_fqns: make_fqns("Eq", "string", &["eq", "ne"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
             args: vec![string()],
             method_fqns: make_fqns("Show", "string", &["show"]),
+            assoc_tys: HashMap::new(),
         });
 
         // ---- bool: Eq + Show ----
@@ -422,11 +504,13 @@ impl Generics {
             class: "Eq".into(),
             args: vec![boolean()],
             method_fqns: make_fqns("Eq", "bool", &["eq", "ne"]),
+            assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
             args: vec![boolean()],
             method_fqns: make_fqns("Show", "bool", &["show"]),
+            assoc_tys: HashMap::new(),
         });
 
         // ---- unit: Show ----
@@ -434,6 +518,7 @@ impl Generics {
             class: "Show".into(),
             args: vec![unit()],
             method_fqns: make_fqns("Show", "unit", &["show"]),
+            assoc_tys: HashMap::new(),
         });
     }
 
@@ -462,6 +547,7 @@ mod tests {
             type_params: vec!["T".to_string()],
             param_kinds: vec![Kind::Type],
             superclasses: vec![],
+            assoc_types: vec![],
             methods: vec![method("add", false), method("zero", true)],
         }
     }
@@ -476,6 +562,7 @@ mod tests {
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
+                assoc_types: vec![],
                 methods: vec![method("eq_val", false)],
             },
         );
@@ -486,6 +573,7 @@ mod tests {
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec!["Equal".into()],
+                assoc_types: vec![],
                 methods: vec![method("lt_val", false)],
             },
         );
@@ -514,6 +602,7 @@ mod tests {
             class: "Num".to_string(),
             args: vec![int()],
             method_fqns: HashMap::new(),
+            assoc_tys: HashMap::new(),
         });
 
         assert!(generics.has_overlapping_instance("Num", &[int()]));
@@ -560,6 +649,7 @@ mod tests {
                 "cast".to_string(),
                 "Convert__int_int__cast".to_string(),
             )]),
+            assoc_tys: HashMap::new(),
         });
 
         assert!(generics.find_instance("Convert", &[int(), int()]).is_some());
