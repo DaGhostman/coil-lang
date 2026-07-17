@@ -19,7 +19,7 @@
 - Single-pass stack codegen in `compiler/src/lib.rs` is the only compilation path; register-VM migration was removed.
 - Coroutines (Phase 1–2): `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` via `MakeCoro`/`ResumeCoro`/`YieldCoro`/`YieldFromCoro`; `coroutine<Y, S>` types; resume-after-done returns `Value::default()`.
 - FFI uses compile-time `extern` blocks and runtime `dload`/`declare`/`invoke` with libffi; `FFIType` is a compiler builtin with fixed tags; `resolve_library` resolves paths via entry-script `base_dir`, `zero.toml` `[ffi] search_paths`, and system search; supports Ptr (arrays/tuples), C structs, and callbacks via `FfiSignatureBuilder`.
-- `ARCHIVE_VERSION` is 16; bump on incompatible bytecode, tag, or opcode changes.
+- `ARCHIVE_VERSION` is 17; bump on incompatible bytecode, tag, or opcode changes.
 - `fib(32)` in `examples/fib.0s` is the primary performance regression benchmark (expected output `2178309`).
 - The CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
 
