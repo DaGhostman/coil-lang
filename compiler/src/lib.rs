@@ -4731,6 +4731,11 @@ impl Compiler {
         self.mono_codegen_var_types.clear();
         let _program_ty = self.checker.check_program(ast);
         self.emit_builtin_dict_thunks();
+        // Builtin dictionary thunks are emitted immediately after the
+        // prologue and before user code. Keep `program_start_offset`
+        // pointing at the first user byte so `extern` prologue JMPs
+        // don't fall into a Num/Ord/Eq/Show thunk body.
+        self.program_start_offset = self.bytecode.len() as u32;
         self.mono_plan = monomorphize::plan_monomorphization(module, ast, &self.checker);
 
         let mut program = self.do_compile(ast);
