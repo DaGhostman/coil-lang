@@ -694,6 +694,12 @@ impl Pipeline {
             return;
         }
 
+        // Module compilation emits unfused absolute-offset bytecode.
+        // Finalize (peephole fusion + CodePtr/MakePolyFn relocation) once
+        // on the linked buffer, then sync the pipeline output.
+        self.compiler.finalize_bytecode();
+        self.bytecode = self.compiler.bytecode.clone();
+
         // Patch the JMP at offset 1 to point to the
         // user-program's `main`. If the source had at
         // least one `extern` block, jump to
@@ -837,6 +843,10 @@ impl Pipeline {
         if self.failed || self.had_errors() {
             return Err(());
         }
+
+        // Final-link peephole fusion (see `Pipeline::compile`).
+        self.compiler.finalize_bytecode();
+        self.bytecode = self.compiler.bytecode.clone();
 
         // Patch the JMP at offset 1.
         if self.compiler.has_extern_block() {

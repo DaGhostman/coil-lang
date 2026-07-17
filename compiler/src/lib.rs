@@ -413,8 +413,6 @@ pub struct Compiler {
     /// Monomorphization plan for this compile unit plus emitted clone offsets.
     mono_plan: MonoPlan,
     mono_offsets: HashMap<MonoKey, usize>,
-    /// Positions of inline CONST words that carry indirect function offsets.
-    indirect_code_ptr_sites: Vec<usize>,
     /// Temporary variable-type overrides while emitting a specialized clone.
     mono_codegen_var_types: Vec<HashMap<String, Ty>>,
 }
@@ -460,7 +458,6 @@ impl Default for Compiler {
             polyfn_sources: HashMap::new(),
             mono_plan: MonoPlan::default(),
             mono_offsets: HashMap::new(),
-            indirect_code_ptr_sites: Vec::new(),
             mono_codegen_var_types: Vec::new(),
         }
     }
@@ -833,7 +830,7 @@ impl Compiler {
     }
 
     fn emit_call_indirect(bytecode: &mut Vec<Byte>, target_offset: u32, arity: u32) {
-        bytecode.push(Byte::new(Instruction::CONST).with_value_u32(target_offset));
+        bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(target_offset));
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
     }
 
@@ -842,7 +839,7 @@ impl Compiler {
     /// Convention: after value args, one `MakeTuple` per **user** typeclass
     /// constraint (builtin Num/Ord/Eq/Show are skipped — they use `Dyn*`).
     /// Each tuple holds method entry offsets in typeclass declaration order
-    /// (`CONST <offset>`, or `CONST 0` if the FQN is not compiled yet).
+    /// (`CodePtr <offset>`, or `CodePtr 0` if the FQN is not compiled yet).
     ///
     /// Instances are resolved from the callee's scheme + concrete argument
     /// types (not `NodeId`), because the pre-walk / infer ID table can be
@@ -851,7 +848,6 @@ impl Compiler {
     /// Returns the number of dict tuples pushed (used to bump CALL arity).
     fn emit_call_site_dicts(
         bytecode: &mut Vec<Byte>,
-        code_ptr_sites: &mut Vec<usize>,
         fn_name: &str,
         arg_tys: &[crate::typechecking::Ty],
         checker: &Checker,
@@ -909,8 +905,7 @@ impl Compiler {
                     .get(&method_def.name)
                     .and_then(|fqn| functions.get(fqn).copied())
                     .unwrap_or(0);
-                code_ptr_sites.push(bytecode.len());
-                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(offset as i32));
+                bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
             }
             bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
             dict_count += 1;
@@ -2837,7 +2832,6 @@ impl Compiler {
                             forwarded
                                 + Self::emit_call_site_dicts(
                                     &mut bytecode,
-                                    &mut self.indirect_code_ptr_sites,
                                     &n,
                                     &call_arg_tys,
                                     &self.checker,
@@ -2920,7 +2914,6 @@ impl Compiler {
                             }
                             dict_count += Self::emit_call_site_dicts(
                                 &mut bytecode,
-                                &mut self.indirect_code_ptr_sites,
                                 source,
                                 &arg_tys,
                                 &self.checker,
@@ -4471,11 +4464,16 @@ impl Compiler {
         bytecode
     }
 
-    pub fn compile<'compiler>(
+    /// Emit unfused absolute-offset bytecode for `ast` (no peephole pass).
+    ///
+    /// Multi-file compilation uses this so earlier module tails remain valid
+    /// until the pipeline finalizes the linked buffer once. Single-file
+    /// [`compile`] calls [`finalize_bytecode`] afterwards for unit tests.
+    fn compile_unfused<'compiler>(
         &mut self,
         module: &str,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
-    ) -> Vec<Byte> {
+    ) {
         let ns = self.namespace.clone();
         self.namespace = module.to_string();
 
@@ -4495,20 +4493,15 @@ impl Compiler {
         self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
-        // Indirect code pointers are stored as ordinary CONST values in
-        // dictionaries (and as MakePolyFn operands). They are intentionally
-        // opaque to the VM, so a peephole relocation cannot distinguish them
-        // from user integers. Preserve their absolute offsets by leaving the
-        // bytecode layout unchanged whenever such pointers are present.
-        let has_polyfn = self
-            .bytecode
-            .iter()
-            .any(|byte| matches!(byte.bytecode(), Instruction::MakePolyFn));
-        let fusion_sites = if self.indirect_code_ptr_sites.is_empty() && !has_polyfn {
-            peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants)
-        } else {
-            Vec::new()
-        };
+    }
+
+    /// Peephole-fuse `self.bytecode` and relocate absolute code offsets
+    /// (`JMP`/`CALL`/`CodePtr`/`MakePolyFn`/…).
+    ///
+    /// Called once after multi-file linking by the pipeline, or at the end
+    /// of single-file [`compile`] so unit tests observe fused output.
+    pub fn finalize_bytecode(&mut self) {
+        let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
         }
@@ -4517,18 +4510,29 @@ impl Compiler {
         }
         self.program_start_offset =
             peephole::adjust_target(self.program_start_offset as usize, &fusion_sites) as u32;
+    }
 
+    pub fn compile<'compiler>(
+        &mut self,
+        module: &str,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) -> Vec<Byte> {
+        self.compile_unfused(module, ast);
+        self.finalize_bytecode();
         self.bytecode.clone()
     }
 
     /// Return only bytes appended by this compile (multi-file pipeline).
+    ///
+    /// Emits **unfused** absolute-offset bytecode; the pipeline must call
+    /// [`finalize_bytecode`] once on the linked buffer.
     pub fn compile_module<'compiler>(
         &mut self,
         module: &str,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let pre_compile_len = self.bytecode.len();
-        let _ = self.compile(module, ast);
+        self.compile_unfused(module, ast);
         self.bytecode[pre_compile_len..].to_vec()
     }
 }
@@ -4850,8 +4854,8 @@ mod tests {
         let mut bc = Vec::new();
         Compiler::emit_call_indirect(&mut bc, 42, 2);
         assert_eq!(bc.len(), 2);
-        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
-        assert_eq!(bc[0].value_u32(), 42);
+        assert!(matches!(bc[0].bytecode(), Instruction::CodePtr));
+        assert_eq!(bc[0].operand_u32(), 42);
         assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
         assert_eq!(bc[1].operand_u32(), 2);
     }
@@ -4988,19 +4992,30 @@ mod tests {
 
     #[test]
     fn compile_module_diff_matches_compile_tail_for_fib() {
+        use common::Instruction;
         let src = include_str!("../../examples/fib.0s");
         let ast = Pratt::default().parse(src).expect("parse fib");
+
+        // `compile_module` emits unfused absolute-offset bytecode;
+        // final-link fusion is applied once via `finalize_bytecode`
+        // (same as single-file `compile`).
+        let mut module = Compiler::default();
+        let bc_unfused = module.compile_module("", &ast);
+        assert!(
+            bc_unfused
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::LOAD)),
+            "module compile should still contain unfused LOAD before finalize"
+        );
+        module.finalize_bytecode();
 
         let mut full = Compiler::default();
         let bc_full = full.compile("", &ast);
 
-        let mut module = Compiler::default();
-        let bc_diff = module.compile_module("", &ast);
-
         assert_eq!(
             &bc_full[3..],
-            bc_diff.as_slice(),
-            "compile_module diff should match compile() tail"
+            &module.bytecode[3..],
+            "finalize_bytecode on compile_module should match compile() output"
         );
         assert_eq!(full.functions, module.functions);
     }
@@ -7134,8 +7149,126 @@ print \"%i\", len(a); \
             .expect("default method dictionary");
         assert!(tuple_index > 0);
         assert!(
+            matches!(bc[tuple_index - 1].bytecode(), Instruction::CodePtr),
+            "dictionary method slots must use CodePtr; got {:?}",
+            bc[tuple_index - 1].bytecode()
+        );
+        assert!(
             bc[tuple_index - 1].operand_u32() > 0,
             "default method dictionary slot must contain a compiled code offset"
+        );
+    }
+
+    /// Dictionary emission uses self-identifying `CodePtr` (not `CONST`).
+    #[test]
+    fn dictionary_entries_emit_code_ptr() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x; } } \
+             fn size_of<T: Measurable>(T x) -> int { return size(x); } \
+             fn main() { size_of(42); }",
+        );
+        let tuple_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .expect("expected dict MakeTuple");
+        assert!(
+            matches!(bc[tuple_pos - 1].bytecode(), Instruction::CodePtr),
+            "dict entry before MakeTuple must be CodePtr"
+        );
+        let code_ptrs: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CodePtr))
+            .collect();
+        assert!(
+            !code_ptrs.is_empty(),
+            "expected at least one CodePtr in dictionary program"
+        );
+        for ptr in &code_ptrs {
+            assert!(
+                (ptr.operand_u32() as usize) < bc.len(),
+                "CodePtr target {} out of range (len={})",
+                ptr.operand_u32(),
+                bc.len()
+            );
+        }
+    }
+
+    /// Direct instance-method / CallIndirect sites push `CodePtr` targets.
+    #[test]
+    fn call_indirect_sites_use_code_ptr_targets() {
+        use common::Instruction;
+        let mut bc = Vec::new();
+        Compiler::emit_call_indirect(&mut bc, 100_000, 1);
+        assert!(matches!(bc[0].bytecode(), Instruction::CodePtr));
+        assert_eq!(
+            bc[0].operand_u32(),
+            100_000,
+            "CodePtr must carry full 32-bit targets (> u16::MAX)"
+        );
+        assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
+    }
+
+    /// `MakePolyFn` operands are absolute and survive final-link fusion.
+    #[test]
+    fn make_polyfn_operand_is_relocatable_under_fusion() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } \
+             fn main() { let f = id; print \"%i\", f(42); }",
+        );
+        let poly = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFn))
+            .expect("MakePolyFn for escaped generic");
+        let entry = poly.operand_u32() as usize;
+        assert!(entry < bc.len(), "MakePolyFn entry must point into bytecode");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "polyfn application should use CallIndirect"
+        );
+    }
+
+    /// PolyFn programs still receive peephole fusion (BinSlotImm / etc.).
+    #[test]
+    fn polyfn_plus_fib_style_body_still_fuses() {
+        use common::Instruction;
+        // Shared fib-style body uses LOAD/CONST/op patterns that fuse when
+        // CodePtr/MakePolyFn are relocatable (Phase 1 — no global skip-fusion).
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } \
+             fn fib(int n) -> int { \
+               if n <= 2 { return 1; } \
+               return fib(n - 1) + fib(n - 2); \
+             } \
+             fn main() { \
+               let f = id; \
+               print \"%i\", f(fib(5)); \
+             }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "expected MakePolyFn"
+        );
+        let has_fused = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::BinSlotImm
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlot
+                    | Instruction::CmpJmpf
+                    | Instruction::BinReturn
+                    | Instruction::ConstReturnImm
+                    | Instruction::LoadReturnSlot
+            )
+        });
+        assert!(
+            has_fused,
+            "expected fused superinstructions alongside PolyFn; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 }

@@ -181,6 +181,13 @@ pub enum Instruction {
     DynNe,
     /// DynPrint — pop one boxed/immediate; write Display-ish to output (int/float/bool/string)
     DynPrint,
+
+    /// CodePtr: [31:0] absolute bytecode entry offset.
+    ///
+    /// Self-identifying code pointer used by dictionary method slots and
+    /// direct `CallIndirect` targets. Distinct from `CONST` so peephole
+    /// fusion can relocate these offsets without mistaking them for data.
+    CodePtr,
 }
 
 impl From<u8> for Instruction {

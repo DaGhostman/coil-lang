@@ -883,7 +883,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::DynPrint as u8);
+            promise!(*bc as u8 <= Instruction::CodePtr as u8);
 
             match bc {
                 Instruction::POP => {
@@ -900,6 +900,13 @@ impl<const S: usize> Machine<S> {
                         op as i32 as i64 as u64
                     };
                     self.stack.push(Value::from(raw));
+                }
+                Instruction::CodePtr => {
+                    // Absolute bytecode entry — same stack representation as an
+                    // integer constant so `CallIndirect` / dict `Index` can
+                    // treat it as a raw code offset.
+                    let offset = opcode.operand_u32() as i64;
+                    self.stack.push(Value::from(offset));
                 }
                 Instruction::STORE => {
                     // No-op: stack and locals share memory; UNPACK/JUMP_IF_MATCH
@@ -3328,6 +3335,22 @@ mod tests {
             Byte::new(Instruction::CallIndirect).with_operand_u32(1),
             Byte::new(Instruction::HALT),
             // callee at offset 4
+            load(0),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// `CodePtr` pushes an absolute bytecode offset like an integer constant;
+    /// `CallIndirect` consumes it as the callee entry.
+    #[test]
+    fn code_ptr_feeds_call_indirect() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(42),
+            Byte::new(Instruction::CodePtr).with_operand_u32(4),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
             load(0),
             Byte::new(Instruction::RETURN),
         ]);

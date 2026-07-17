@@ -160,6 +160,53 @@ fn example_polyfn_supports_multi_instantiation_constraints_and_rank_n() {
     assert_eq!(output, "424.04242");
 }
 
+/// Phase 1: PolyFn + fib-style arithmetic still receives peephole fusion.
+#[test]
+fn polyfn_with_fib_keeps_fused_superinstructions() {
+    use common::Instruction;
+    let src = r#"
+        fn id<T>(T x) -> T { return x; }
+        fn fib(int n) -> int {
+            if n <= 2 { return 1; }
+            return fib(n - 1) + fib(n - 2);
+        }
+        fn main() {
+            let f = id;
+            print "%i", f(fib(6));
+        }
+    "#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn))
+    );
+    let has_fused = bytecode.iter().any(|b| {
+        matches!(
+            b.bytecode(),
+            Instruction::BinSlotImm
+                | Instruction::BinSlotImmJmpf
+                | Instruction::BinSlotSlot
+                | Instruction::CmpJmpf
+                | Instruction::BinReturn
+                | Instruction::ConstReturnImm
+                | Instruction::LoadReturnSlot
+        )
+    });
+    assert!(
+        has_fused,
+        "expected fused ops with PolyFn present; opcodes: {:?}",
+        bytecode
+            .iter()
+            .map(|b| b.bytecode())
+            .collect::<Vec<_>>()
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    // fib(6) = 8
+    assert_eq!(output, "8");
+}
+
 #[test]
 fn monomorphized_generic_add_prints_3() {
     let output = run_example_src(
