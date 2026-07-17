@@ -58,7 +58,9 @@ declaration ::= class_decl
 ### Functions
 
 ```
-function_decl ::= 'async'? 'fn' IDENT arg_list ('->' type_annotation)? block
+function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list ('->' type_annotation)? block
+type_param_list ::= '<' type_param (',' type_param)* '>'
+type_param      ::= IDENT (':' IDENT ('+' IDENT)*)?
 arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
 ```
 
@@ -66,8 +68,30 @@ Examples:
 
 ```0s
 fn add(int a, int b) -> int { return a + b; }
+fn add<T: Num>(T a, T b) -> T { return a + b; }
 fn greet() { print "hi"; }
 ```
+
+### Typeclasses and impl
+
+```
+typeclass_decl ::= 'typeclass' IDENT type_param_list '{' method_sig* '}'
+method_sig     ::= 'fn' IDENT arg_list ('->' type_annotation)? (';' | block)
+impl_decl      ::= 'impl' IDENT type_arg_list '{' method_decl* '}'
+type_arg_list  ::= '<' type (',' type)* '>'
+```
+
+Example:
+
+```0s
+typeclass Num<T> { /* builtin — see types reference */ }
+
+impl Measurable<int> {
+    fn size(int x) -> int { return x; }
+}
+```
+
+Generic functions use `type_param_list` on `fn` (see above). Bounds use `+` between class names (`T: Num + Eq`).
 
 ### Enums
 

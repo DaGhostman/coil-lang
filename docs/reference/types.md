@@ -293,6 +293,62 @@ a stale value.
 
 ---
 
+## Generics and typeclasses
+
+Generic functions use an optional type-parameter list and typeclass bounds on parameters:
+
+```0s
+fn add<T: Num>(T a, T b) -> T { return a + b; }
+
+fn main() {
+    print "%i", add(3, 4);   // int
+    print "%f", add(1.5, 2.5); // float
+}
+```
+
+### Syntax
+
+| Form | Meaning |
+|------|---------|
+| `fn id<T>(T x) -> T` | Unconstrained type parameter `T` |
+| `fn add<T: Num>(T a, T b) -> T` | `T` must satisfy the `Num` bound |
+| `fn both<T: Num + Eq>(T x) -> T` | Multiple bounds (`+`) |
+
+At each call site the compiler **monomorphizes** by choosing concrete types for `T`, discharging bounds against registered typeclass instances, and emitting dynamic operators (`DynAdd`, `DynCmp`, …) inside the generic body when operands are still type parameters.
+
+### Builtin typeclasses
+
+The compiler pre-registers these typeclasses and instances for `int`, `float`, and (where applicable) `string`:
+
+| Class | Purpose | Operators / methods |
+|-------|---------|---------------------|
+| `Num` | Arithmetic | `+`, `-`, `*`, `/` (and `%` for ints) |
+| `Ord` | Ordering | `<`, `<=`, `>`, `>=` |
+| `Eq` | Equality | `==`, `!=` |
+| `Show` | Display hooks | (reserved for future `show`) |
+
+Calling `add<T: Num>(…)` with `string` arguments is a type error when no `Num<string>` instance applies to that use (string `+` is only available through the `Num` instance wiring).
+
+### User-defined typeclasses (sketch)
+
+Declare a class and provide instances for concrete types:
+
+```0s
+typeclass Measurable<T> {
+    fn size(T x) -> int;
+}
+
+impl Measurable<int> {
+    fn size(int x) -> int { return x; }
+}
+```
+
+Instance methods compile to ordinary functions with mangled names; generic call sites that need a bound look up the matching `impl` at typecheck time.
+
+See `examples/generics.0s` for a runnable `Num`-bounded demo.
+
+---
+
 ## Known limitations
 
 | Area | Limitation |
@@ -300,7 +356,7 @@ a stale value.
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
-| Generics | No user-defined generic types |
+| Generics | Generic **functions** with type params and `T: Class` bounds; builtin `Num`/`Eq`/`Ord`/`Show` instances for `int`/`float`/`string`. User `typeclass` / `impl` declarations parse and register instances; generic type constructors and higher-kinded types are not supported |
 | Higher-kinded types | Not supported |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |

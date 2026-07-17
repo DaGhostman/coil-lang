@@ -137,6 +137,12 @@ fn example_aliases_prints_3_4_7() {
 }
 
 #[test]
+fn example_generics_prints_add_results_for_int_and_float() {
+    let output = run_example("examples/generics.0s");
+    assert_eq!(output, "7424.0");
+}
+
+#[test]
 fn example_const_prints_42hi() {
     let output = run_example("examples/const.0s");
     assert_eq!(output, "42hi");

@@ -50,7 +50,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 ## Declaration keywords
 
 ```
-fn | enum | type | use | mod | extern | class | impl | defer | async
+fn | enum | type | typeclass | use | mod | extern | class | impl | defer | async
 ```
 
 Registered in the top-level `declaration()` parser before generic statements so keywords like `enum` are not misparsed as `let`.

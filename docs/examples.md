@@ -509,6 +509,29 @@ fn main() {
 
 ---
 
+### `examples/generics.0s`
+
+**Demonstrates:** Generic functions with a `Num` typeclass bound — one `add<T: Num>` body used at `int` and `float` call sites.
+
+```0s
+fn add<T: Num>(T a, T b) -> T {
+    return a + b;
+}
+
+fn main() {
+    print "%i", add(3, 4);
+    print "%i", add(10, 32);
+    print "%f", add(1.5, 2.5);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generics.0s` |
+| **Output** | `7424.0` |
+
+---
+
 ## Modules & namespaces
 
 Multi-file projects using `use` and `mod`. Support files live under `examples/src/`.
@@ -806,6 +829,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
+| `generics.0s` | Types | `7424.0` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |
 | `src/foo/sadge.0s` | Modules | (support file) |
