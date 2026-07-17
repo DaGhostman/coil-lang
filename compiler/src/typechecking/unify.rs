@@ -427,38 +427,87 @@ fn unify_builtin_app_sum(subst: &Subst, app: &Ty, sum: &Ty) -> Option<Result<Sub
     let Ty::App(con, args) = app else {
         return None;
     };
-    let Ty::Con(name) = con.as_ref() else {
-        return None;
-    };
 
-    if common::is_builtin_option_enum(name) {
-        if args.len() != 1 {
-            return Some(Err(UnifyError::Mismatch {
-                left: app.clone(),
-                right: sum.clone(),
-            }));
+    // Concrete head: `Option<T>` / `Result<T, E>` annotations vs structural sums.
+    if let Ty::Con(name) = con.as_ref() {
+        if common::is_builtin_option_enum(name) {
+            if args.len() != 1 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let Some(inner) = option_inner(sum) else {
+                return None;
+            };
+            return Some(unify_with(subst, &args[0], &inner));
         }
-        let Some(inner) = option_inner(sum) else {
-            return None;
-        };
-        return Some(unify_with(subst, &args[0], &inner));
+
+        if common::is_builtin_result_enum(name) {
+            if args.len() != 2 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let Some((ok, err)) = result_ok_err(sum) else {
+                return None;
+            };
+            let s = match unify_with(subst, &args[0], &ok) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(unify_with(&s, &args[1], &err));
+        }
+
+        return None;
     }
 
-    if common::is_builtin_result_enum(name) {
-        if args.len() != 2 {
-            return Some(Err(UnifyError::Mismatch {
-                left: app.clone(),
-                right: sum.clone(),
-            }));
+    // Variable head (Phase 5 HKT): unify `F<A>` with builtin Option/Result by
+    // binding `F` to the constructor constant, then unifying payload args.
+    // Without this, `get(Option::Some(42))` cannot discharge `Container<F>`.
+    if let Ty::Var(var) = con.as_ref() {
+        if let Some(inner) = option_inner(sum) {
+            if args.len() != 1 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let s = match bind_var(
+                subst,
+                *var,
+                Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+            ) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(unify_with(&s, &args[0], &inner));
         }
-        let Some((ok, err)) = result_ok_err(sum) else {
-            return None;
-        };
-        let s = match unify_with(subst, &args[0], &ok) {
-            Ok(s) => s,
-            Err(e) => return Some(Err(e)),
-        };
-        return Some(unify_with(&s, &args[1], &err));
+
+        if let Some((ok, err)) = result_ok_err(sum) {
+            if args.len() != 2 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let s = match bind_var(
+                subst,
+                *var,
+                Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+            ) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            let s = match unify_with(&s, &args[0], &ok) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(unify_with(&s, &args[1], &err));
+        }
+
+        return None;
     }
 
     None
@@ -990,5 +1039,34 @@ mod tests {
             ],
         );
         assert!(unify(&s, &s).is_ok());
+    }
+
+    // ---- Phase 5: HKT App(Var) ↔ builtin Option/Result ----
+
+    #[test]
+    fn unify_app_var_with_option_sum_binds_constructor_head() {
+        use crate::typechecking::ty::option_ty;
+        let app = Ty::App(Box::new(v(0)), vec![v(1)]);
+        let opt = option_ty(int());
+        let s = unify(&app, &opt).unwrap();
+        assert_eq!(
+            apply_ty_prune(&s, &v(0)),
+            Ty::Con(common::BUILTIN_OPTION_ENUM.into())
+        );
+        assert_eq!(apply_ty_prune(&s, &v(1)), int());
+    }
+
+    #[test]
+    fn unify_app_var_with_option_constructor_binds_head_and_payload() {
+        use crate::typechecking::ty::option_ty;
+        let app = Ty::App(Box::new(v(0)), vec![v(1)]);
+        let owner = option_ty(int());
+        let some = ctor(owner, 1, 1);
+        let s = unify(&app, &some).unwrap();
+        assert_eq!(
+            apply_ty_prune(&s, &v(0)),
+            Ty::Con(common::BUILTIN_OPTION_ENUM.into())
+        );
+        assert_eq!(apply_ty_prune(&s, &v(1)), int());
     }
 }

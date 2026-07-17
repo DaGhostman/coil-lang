@@ -9,8 +9,9 @@ use std::ops::Range;
 use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
 use reporting::{ErrorCode, Label, Message};
 
-use super::env::{Env, TyVarCounter, instantiate, instantiate_with_constraints};
+use super::env::{Env, TyVarCounter, instantiate_with_kinds};
 use super::generics::{Generics, InstanceDef, TypeClassDef, TypeClassMethodDef};
+use super::kind::Kind;
 use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::{Constraint, Scheme};
@@ -175,6 +176,8 @@ pub struct Checker {
     /// Active typeclass constraints on in-scope type params.
     /// `(TyVarId, class_name)` — checked when applying arithmetic ops.
     active_constraints: Vec<Constraint>,
+    /// Kind of each type variable currently in play (Phase 5 — unary HKT).
+    var_kinds: HashMap<TyVarId, Kind>,
     /// Generics registry: typeclasses, instances, generic type ctors.
     generics: super::generics::Generics,
     /// Generic function names registered during typechecking.
@@ -318,6 +321,7 @@ impl Checker {
             option_mode_fns: HashSet::new(),
             type_params_in_scope: Vec::new(),
             active_constraints: Vec::new(),
+            var_kinds: HashMap::new(),
             generics: super::generics::Generics::new(),
             generic_fns: HashSet::new(),
             fn_dict_arity: HashMap::new(),
@@ -457,6 +461,7 @@ impl Checker {
         self.generics.generic_type_ctors.clear();
         self.generics.register_builtin_type_ctors();
         self.generics.generic_fns.clear();
+        self.var_kinds.clear();
         self.register_builtin_typeclass_method_schemes();
 
         // Built-in enums survive the per-program enum reset.
@@ -723,7 +728,7 @@ impl Checker {
             Expression::Identifier(name) => {
                 let scheme = self.env.lookup(name).cloned();
                 match scheme {
-                    Some(s) => instantiate(&s, &mut self.counter),
+                    Some(s) => self.instantiate_ty(&s),
                     None => self.error(
                         ErrorCode::UnknownValue,
                         format!("Cannot find value `{}` in this scope", name),
@@ -992,12 +997,12 @@ impl Checker {
                 if let Expression::Access(recv, method) = name.1.as_ref() {
                     let recv_ty = self.infer(recv);
                     let resolved = apply_ty_prune(&self.subst, &recv_ty);
-                    if let Ty::Var(receiver_var) = &resolved {
-                        let candidates = self.bound_method_candidates(method, Some(*receiver_var));
+                    if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
+                        let candidates = self.bound_method_candidates(method, Some(receiver_var));
                         if let Some((dict_index, class, method_slot, scheme)) =
                             self.select_bound_method(candidates, method, &range)
                         {
-                            let fun_ty = instantiate(&scheme, &mut self.counter);
+                            let fun_ty = self.instantiate_ty(&scheme);
                             let mut arg_tys = vec![recv_ty];
                             if let Some(a) = args {
                                 for arg in a {
@@ -1060,7 +1065,7 @@ impl Checker {
                             );
                         }
                     };
-                    let fun_ty = instantiate(&scheme, &mut self.counter);
+                    let fun_ty = self.instantiate_ty(&scheme);
                     let mut arg_tys = vec![recv_ty];
                     if let Some(a) = args {
                         for arg in a {
@@ -1104,20 +1109,16 @@ impl Checker {
                         Some(a) => a.iter().map(|arg| self.infer(arg)).collect(),
                         None => Vec::new(),
                     };
-                    let receiver_var =
-                        arg_tys
-                            .first()
-                            .and_then(|ty| match apply_ty_prune(&self.subst, ty) {
-                                Ty::Var(v) => Some(v),
-                                _ => None,
-                            });
+                    let receiver_var = arg_tys.first().and_then(|ty| {
+                        Self::constraint_var_of_ty(&apply_ty_prune(&self.subst, ty))
+                    });
                     let candidates = receiver_var
                         .map(|v| self.bound_method_candidates(&ident, Some(v)))
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| self.bound_method_candidates(&ident, None));
                     if let Some((dict_index, class, method_slot, scheme)) =
                         self.select_bound_method(candidates, &ident, &range)
                     {
-                        let fun_ty = instantiate(&scheme, &mut self.counter);
+                        let fun_ty = self.instantiate_ty(&scheme);
                         if let Some(call_id) = id {
                             self.bound_method_calls.insert(
                                 call_id,
@@ -1151,7 +1152,7 @@ impl Checker {
 
                 let scheme = self.env.lookup(&ident).cloned();
                 let (fun_ty, fresh_constraints) = match scheme {
-                    Some(s) => instantiate_with_constraints(&s, &mut self.counter),
+                    Some(s) => self.instantiate_scheme(&s),
                     None => {
                         return self.error(
                             ErrorCode::UnknownFunction,
@@ -1940,9 +1941,14 @@ impl Checker {
                     .collect();
                 let param_names: Vec<String> =
                     type_params.iter().map(|tp| tp.name.to_string()).collect();
+                let param_kinds: Vec<Kind> = type_params
+                    .iter()
+                    .map(|tp| Kind::from(tp.kind))
+                    .collect();
                 let def = TypeClassDef {
                     name: name.to_string(),
                     type_params: param_names,
+                    param_kinds: param_kinds.clone(),
                     methods: method_defs.clone(),
                 };
                 self.generics.typeclasses.insert(name.to_string(), def);
@@ -1951,10 +1957,14 @@ impl Checker {
                 // These schemes drive bound-method calls from generic bodies.
                 let mut param_frame = HashMap::new();
                 let mut param_vars = Vec::new();
-                for type_param in type_params {
+                let mut class_kinds = Vec::new();
+                for (i, type_param) in type_params.iter().enumerate() {
                     let var = self.counter.fresh();
+                    let kind = param_kinds.get(i).copied().unwrap_or(Kind::Type);
+                    self.set_var_kind(var, kind);
                     param_frame.insert(type_param.name.to_string(), var);
                     param_vars.push(var);
+                    class_kinds.push(kind);
                 }
                 self.type_params_in_scope.push(param_frame);
                 let class_constraints: Vec<Constraint> = param_vars
@@ -1967,11 +1977,28 @@ impl Checker {
                 for method in methods {
                     if let Expression::Function {
                         name: method_name,
+                        type_params: method_params,
                         args,
                         returns,
                         ..
                     } = method.1.as_ref()
                     {
+                        // Method-level type params (e.g. `fn first<A>(F<A>) -> A`).
+                        let mut method_frame = HashMap::new();
+                        let mut method_vars = Vec::new();
+                        let mut method_kinds = Vec::new();
+                        for mp in method_params {
+                            let var = self.counter.fresh();
+                            let kind = self.resolve_type_param_kind(mp);
+                            self.set_var_kind(var, kind);
+                            method_frame.insert(mp.name.to_string(), var);
+                            method_vars.push(var);
+                            method_kinds.push(kind);
+                        }
+                        let pushed_method = !method_frame.is_empty();
+                        if pushed_method {
+                            self.type_params_in_scope.push(method_frame);
+                        }
                         let arg_tys = self.parse_arg_list(args);
                         let ret_ty = returns
                             .as_ref()
@@ -1980,9 +2007,21 @@ impl Checker {
                         let fun_ty = arg_tys.iter().rev().fold(ret_ty, |ret, (_, arg)| {
                             Ty::Fun(Box::new(arg.clone()), Box::new(ret))
                         });
+                        if pushed_method {
+                            self.type_params_in_scope.pop();
+                        }
+                        let mut all_bounds = param_vars.clone();
+                        all_bounds.extend(method_vars);
+                        let mut all_kinds = class_kinds.clone();
+                        all_kinds.extend(method_kinds);
                         self.typeclass_method_schemes.insert(
                             (name.to_string(), method_name.to_string()),
-                            Scheme::poly(param_vars.clone(), class_constraints.clone(), fun_ty),
+                            Scheme::poly_with_kinds(
+                                all_bounds,
+                                all_kinds,
+                                class_constraints.clone(),
+                                fun_ty,
+                            ),
                         );
                     }
                 }
@@ -2005,11 +2044,12 @@ impl Checker {
                 args,
                 methods,
             } => {
-                // Resolve concrete type args.
-                let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_type_name(a)).collect();
-                // Walk arg type expressions for ID alignment.
-                for a in args {
-                    let _ = self.infer(a);
+                // Resolve instance heads (bare ctors stay `Con` for HKT).
+                let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_instance_head(a)).collect();
+                // Walk arg type expressions for ID alignment; cache head tys
+                // so codegen FQNs match (not `Option<t0>` placeholders).
+                for (a, ty) in args.iter().zip(arg_tys.iter()) {
+                    self.cache_forced_ty(a, ty.clone());
                 }
                 // Verify class exists.
                 let class_def = self.generics.typeclass(class).cloned();
@@ -2019,6 +2059,26 @@ impl Checker {
                         format!("Unknown typeclass `{}`", class),
                         range.clone(),
                     ));
+                }
+                // HKT classes require bare constructor heads, not applications.
+                if let Some(ref cdef) = class_def {
+                    if cdef.is_unary_hkt() {
+                        for (i, ty) in arg_tys.iter().enumerate() {
+                            if matches!(ty, Ty::App(_, _)) {
+                                self.messages.push(Message::error(
+                                    ErrorCode::GenericTypeError,
+                                    format!(
+                                        "Instance of unary HKT class `{}` expects a type constructor \
+                                         (kind `* -> *`) as argument {}, found applied type `{}`",
+                                        class,
+                                        i + 1,
+                                        ty
+                                    ),
+                                    range.clone(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 let overlapping = self.generics.has_overlapping_instance(class, &arg_tys);
                 if overlapping {
@@ -2043,26 +2103,30 @@ impl Checker {
                     let maybe_fn = match m.1.as_ref() {
                         Expression::Function {
                             name,
+                            type_params,
                             args,
                             returns,
                             body,
                             is_coro,
                             ..
-                        } => Some((*name, args, returns, body, *is_coro)),
+                        } => Some((*name, type_params.as_slice(), args, returns, body, *is_coro)),
                         Expression::Method(_, body) => match body.1.as_ref() {
                             Expression::Function {
                                 name,
+                                type_params,
                                 args,
                                 returns,
                                 body,
                                 is_coro,
                                 ..
-                            } => Some((*name, args, returns, body, *is_coro)),
+                            } => {
+                                Some((*name, type_params.as_slice(), args, returns, body, *is_coro))
+                            }
                             _ => None,
                         },
                         _ => None,
                     };
-                    if let Some((mname, margs, returns, body, is_coro)) = maybe_fn {
+                    if let Some((mname, mparams, margs, returns, body, is_coro)) = maybe_fn {
                         // Build a unique FQN for this instance method.
                         let fqn = format!(
                             "{}__{}__{}",
@@ -2076,10 +2140,10 @@ impl Checker {
                         );
                         method_names.push(mname.to_string());
                         method_fqns.insert(mname.to_string(), fqn.clone());
-                        // Typecheck the method body at concrete types.
+                        // Preserve method type params (Phase 5 HKT methods).
                         self.infer_function(
                             mname,
-                            &[],
+                            mparams,
                             margs,
                             returns.as_ref(),
                             body,
@@ -2547,7 +2611,7 @@ impl Checker {
                 let ident = n.to_string();
                 match self.env.lookup(&ident).cloned() {
                     Some(s) => {
-                        let ty = instantiate(&s, &mut self.counter);
+                        let ty = self.instantiate_ty(&s);
                         if self.is_const_binding(&ident) {
                             let mut msg = Message::error(
                                 ErrorCode::FormatSpecifierMismatch,
@@ -2933,7 +2997,7 @@ impl Checker {
         let (expected_body, expected_constraints) = self.skolemize_forall_ty(expected);
         let (candidate, candidate_constraints) = match arg_expr.and_then(identifier_name) {
             Some(name) => match self.env.lookup(name).cloned() {
-                Some(scheme) => instantiate_with_constraints(&scheme, &mut self.counter),
+                Some(scheme) => self.instantiate_scheme(&scheme),
                 None => (inferred_arg.clone(), Vec::new()),
             },
             None => (inferred_arg.clone(), Vec::new()),
@@ -2993,9 +3057,10 @@ impl Checker {
                     }
                 }
                 concrete => {
+                    let lookup = self.instance_lookup_args(&constraint.class, &concrete);
                     if self
                         .generics
-                        .find_instance(&constraint.class, &[concrete.clone()])
+                        .find_instance(&constraint.class, &lookup)
                         .is_none()
                     {
                         self.messages.push(Message::error(
@@ -3021,10 +3086,14 @@ impl Checker {
         let mut frame = HashMap::new();
         let mut bounds = Vec::new();
         let mut constraints = Vec::new();
+        let mut kinds = Vec::new();
         for tp in params {
             let var = self.counter.fresh();
+            let kind = self.resolve_type_param_kind(tp);
+            self.set_var_kind(var, kind);
             frame.insert(tp.name.to_string(), var);
             bounds.push(var);
+            kinds.push(kind);
             for bound in &tp.bounds {
                 constraints.push(Constraint {
                     var,
@@ -3175,9 +3244,8 @@ impl Checker {
                     }
                 }
                 concrete => {
-                    if let Some(instance) =
-                        self.generics.find_instance(&c.class, &[concrete.clone()])
-                    {
+                    let lookup = self.instance_lookup_args(&c.class, concrete);
+                    if let Some(instance) = self.generics.find_instance(&c.class, &lookup) {
                         if let Some(call_id) = call_id {
                             self.call_site_dicts
                                 .entry(call_id)
@@ -3243,6 +3311,133 @@ impl Checker {
         candidates.into_iter().next()
     }
 
+    /// Instantiate a scheme and record freshened variable kinds (Phase 5).
+    fn instantiate_ty(&mut self, scheme: &Scheme) -> Ty {
+        let (ty, _, kinds) = instantiate_with_kinds(scheme, &mut self.counter);
+        self.var_kinds.extend(kinds);
+        ty
+    }
+
+    /// Instantiate a scheme with constraints, recording freshened kinds.
+    fn instantiate_scheme(&mut self, scheme: &Scheme) -> (Ty, Vec<Constraint>) {
+        let (ty, constraints, kinds) = instantiate_with_kinds(scheme, &mut self.counter);
+        self.var_kinds.extend(kinds);
+        (ty, constraints)
+    }
+
+    /// Kind of a type variable, defaulting to `*`.
+    fn kind_of_var(&self, var: TyVarId) -> Kind {
+        self.var_kinds.get(&var).copied().unwrap_or(Kind::Type)
+    }
+
+    /// Record a type variable's kind (overwrites).
+    fn set_var_kind(&mut self, var: TyVarId, kind: Kind) {
+        self.var_kinds.insert(var, kind);
+    }
+
+    /// Resolve the kind of a type parameter from its AST annotation and/or
+    /// class bounds. Explicit `* -> *` wins; otherwise a bound whose class
+    /// parameter is constructor-kinded upgrades the variable to `* -> *`.
+    fn resolve_type_param_kind(&self, tp: &parser::ast::TypeParam<'_>) -> Kind {
+        if tp.kind == parser::ast::Kind::Arrow {
+            return Kind::Arrow;
+        }
+        for bound in &tp.bounds {
+            if let Some(class_def) = self.generics.typeclass(bound) {
+                if class_def.is_unary_hkt() {
+                    return Kind::Arrow;
+                }
+            }
+        }
+        Kind::from(tp.kind)
+    }
+
+    /// Canonical name for a bare type constructor used as an instance head.
+    fn canonical_ctor_name(name: &str) -> String {
+        match name.to_ascii_lowercase().as_str() {
+            "int" => "int".into(),
+            "float" => "float".into(),
+            "string" => "string".into(),
+            "bool" => "bool".into(),
+            "void" | "unit" => "unit".into(),
+            "option" => common::BUILTIN_OPTION_ENUM.into(),
+            "result" => common::BUILTIN_RESULT_ENUM.into(),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Parse a typeclass instance argument. Bare registered constructors
+    /// (`Option`, `Result`, user generics) become `Ty::Con` heads for HKT
+    /// instances rather than applied `Option<_>` placeholders.
+    fn parse_instance_head(&mut self, arg: &Output) -> Ty {
+        match arg.1.as_ref() {
+            Expression::Type(name) | Expression::Identifier(name) => {
+                let canon = Self::canonical_ctor_name(name);
+                if self.generics.generic_type_ctors.contains_key(&canon)
+                    || matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "option" | "result"
+                    )
+                {
+                    return Ty::Con(canon);
+                }
+                // First-order instance heads (`int`, `MyType`, …).
+                self.parse_type_name_str(name)
+            }
+            Expression::TypeApp { name, args } => {
+                // Applied heads are first-order (`impl Foo<Option<int>>`).
+                // For unary-HKT classes this is diagnosed later.
+                self.parse_type_app(name, args, arg.0.into_range())
+            }
+            _ => self.parse_type_name(arg),
+        }
+    }
+
+    /// Extract the type variable that a bound method should dispatch on.
+    /// First-order: bare `T`. HKT: the constructor head of `F<A>`.
+    fn constraint_var_of_ty(ty: &Ty) -> Option<TyVarId> {
+        match ty {
+            Ty::Var(v) => Some(*v),
+            Ty::App(head, _) => match head.as_ref() {
+                Ty::Var(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// For HKT class constraints, look up instances by constructor head
+    /// (`Option`), not by applied types (`Option<int>`).
+    fn instance_lookup_args(&self, class: &str, concrete: &Ty) -> Vec<Ty> {
+        let class_is_hkt = self
+            .generics
+            .typeclass(class)
+            .map(|c| c.is_unary_hkt())
+            .unwrap_or(false);
+        if class_is_hkt {
+            match concrete {
+                Ty::App(head, _) => vec![head.as_ref().clone()],
+                other => vec![other.clone()],
+            }
+        } else {
+            vec![concrete.clone()]
+        }
+    }
+
+    /// Force-cache `ty` at `expr`'s NodeId (and walk TypeApp children) so
+    /// codegen FQNs for instance methods see the same head types.
+    fn cache_forced_ty(&mut self, expr: &Output, ty: Ty) {
+        let id = self.ids.ids()[self.next_id_idx];
+        self.next_id_idx += 1;
+        self.cache.insert(id, ty);
+        if let Expression::TypeApp { args, .. } = expr.1.as_ref() {
+            for arg in args {
+                // Child annotations still need IDs consumed; infer normally.
+                let _ = self.infer(arg);
+            }
+        }
+    }
+
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
         match ann.1.as_ref() {
             Expression::Identifier(name) | Expression::Type(name) => self.parse_type_name_str(name),
@@ -3295,6 +3490,51 @@ impl Checker {
 
     fn parse_type_app(&mut self, name: &str, args: &[Output], range: Range<usize>) -> Ty {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_type_name(a)).collect();
+
+        // Phase 5: in-scope HKT type parameter as application head (`F<A>`).
+        for frame in self.type_params_in_scope.iter().rev() {
+            if let Some(&var) = frame.get(name) {
+                let kind = self.kind_of_var(var);
+                if !kind.is_arrow() {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "Type parameter `{}` has kind `{}`, but is applied as a type constructor",
+                            name, kind
+                        ),
+                        range.clone(),
+                    ));
+                } else if arg_tys.len() != 1 {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "Type constructor `{}` expects 1 type argument, got {}",
+                            name,
+                            arg_tys.len()
+                        ),
+                        range.clone(),
+                    ));
+                }
+                // Kind-check each argument (must be `*`).
+                for (i, arg_ty) in arg_tys.iter().enumerate() {
+                    if let Ty::Var(v) = arg_ty {
+                        if self.kind_of_var(*v).is_arrow() {
+                            self.messages.push(Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Type argument {} to `{}` has kind `* -> *`, expected `*`",
+                                    i + 1,
+                                    name
+                                ),
+                                range.clone(),
+                            ));
+                        }
+                    }
+                }
+                return Ty::App(Box::new(Ty::Var(var)), arg_tys);
+            }
+        }
+
         if let Some(expected_arity) = self
             .generics
             .generic_type_ctors
@@ -3649,10 +3889,14 @@ impl Checker {
         let mut param_constraints: Vec<Constraint> = Vec::new();
         let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
 
+        let mut param_kinds: Vec<Kind> = Vec::new();
         for tp in type_params {
             let var = self.counter.fresh();
+            let kind = self.resolve_type_param_kind(tp);
+            self.set_var_kind(var, kind);
             param_frame.insert(tp.name.to_string(), var);
             param_vars.push(var);
+            param_kinds.push(kind);
             for bound in &tp.bounds {
                 param_constraints.push(Constraint {
                     var,
@@ -3835,7 +4079,12 @@ impl Checker {
         if is_generic {
             self.generic_fns.insert(name.to_string());
             self.generics.generic_fns.insert(name.to_string());
-            let scheme = Scheme::poly(param_vars, param_constraints.clone(), fun_ty.clone());
+            let scheme = Scheme::poly_with_kinds(
+                param_vars,
+                param_kinds,
+                param_constraints.clone(),
+                fun_ty.clone(),
+            );
             self.env.insert_top(name.to_string(), scheme);
 
             // Every constraint is a trailing dictionary argument. Builtin

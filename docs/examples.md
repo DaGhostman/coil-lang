@@ -544,6 +544,19 @@ primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
 
 ---
 
+### `examples/hkt_container.0s`
+
+**Demonstrates:** Unary higher-kinded typeclasses (`Container<F: * -> *>`) with
+an `impl Container<Option>`, a polymorphic instance method `first<A>`, and a
+generic caller `get<F: Container, A>(F<A>) -> A`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/hkt_container.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/typeclass_dict.0s`
 
 **Demonstrates:** User typeclass dictionaries, method sugar, and dictionary
@@ -880,6 +893,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `aliases.0s` | Types | `347` |
 | `generics.0s` | Types | `7424.042` |
 | `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
+| `hkt_container.0s` | Types | `42` |
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
 | `polyfn.0s` | Types | `424.0424242` |

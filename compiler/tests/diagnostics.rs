@@ -624,3 +624,51 @@ fn optional_access_on_result_has_stable_code() {
         msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
 }
+
+/// Phase 5: HKT class instances must take a bare constructor, not an application.
+#[test]
+fn hkt_instance_rejects_applied_type_argument() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Container<F: * -> *> {
+            fn first<A>(F<A> xs) -> A;
+        }
+        impl Container<Option<int>> {
+            fn first<A>(Option<A> xs) -> A {
+                return match xs {
+                    Option::Some(v) => v,
+                    Option::None => 0,
+                };
+            }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("unary HKT")
+            && m.contains("type constructor")
+            && m.contains("* -> *")),
+        "expected HKT instance kind diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 5: a `* -> *` variable cannot be used where a proper type is required.
+#[test]
+fn hkt_var_rejected_as_type_argument() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Container<F: * -> *> {
+            fn first<A>(F<A> xs) -> A;
+        }
+        fn bad<F: Container, A>(F<F> xs) -> A {
+            return first(xs);
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("kind `* -> *`") && m.contains("expected `*`")),
+        "expected kind-mismatch diagnostic for F used as type arg, got: {:?}",
+        msgs
+    );
+}

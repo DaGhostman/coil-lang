@@ -60,7 +60,9 @@ declaration ::= class_decl
 ```
 function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list ('->' type_annotation)? block
 type_param_list ::= '<' type_param (',' type_param)* '>'
-type_param      ::= IDENT (':' IDENT ('+' IDENT)*)?
+type_param      ::= IDENT (':' (kind | class_bound ('+' class_bound)*))?
+kind            ::= '*' | '*' '->' '*'
+class_bound     ::= IDENT
 arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
 ```
 
@@ -91,7 +93,10 @@ impl Measurable<int> {
 }
 ```
 
-Generic functions use `type_param_list` on `fn` (see above). Bounds use `+` between class names (`T: Num + Eq`).
+Generic functions use `type_param_list` on `fn` (see above). Bounds use `+`
+between class names (`T: Num + Eq`). Unary higher-kinded parameters use an
+explicit kind annotation (`F: * -> *`); a bound whose class parameter is
+constructor-kinded (for example `F: Container`) also implies that kind.
 
 ### Enums
 

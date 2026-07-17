@@ -155,6 +155,7 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
     let bounds: Vec<TyVarId> = ty_ftv.difference(&env_ftv).copied().collect();
     Scheme {
         bounds,
+        kinds: Vec::new(),
         constraints: Vec::new(),
         ty: ty.clone(),
     }
@@ -170,12 +171,7 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
 /// Returns the instantiated type and freshened constraints (with new
 /// variable ids substituted).
 pub fn instantiate(scheme: &Scheme, counter: &mut TyVarCounter) -> Ty {
-    let mapping: HashMap<TyVarId, TyVarId> = scheme
-        .bounds
-        .iter()
-        .map(|&v| (v, counter.fresh()))
-        .collect();
-    substitute_vars(&scheme.ty, &mapping)
+    instantiate_with_kinds(scheme, counter).0
 }
 
 /// Like [`instantiate`], but also returns the freshened constraints.
@@ -186,11 +182,31 @@ pub fn instantiate_with_constraints(
     scheme: &Scheme,
     counter: &mut TyVarCounter,
 ) -> (Ty, Vec<super::ty::Constraint>) {
+    let (ty, constraints, _) = instantiate_with_kinds(scheme, counter);
+    (ty, constraints)
+}
+
+/// Instantiate a scheme, returning the freshened type, constraints, and a
+/// map from each fresh variable to its kind (Phase 5).
+pub fn instantiate_with_kinds(
+    scheme: &Scheme,
+    counter: &mut TyVarCounter,
+) -> (
+    Ty,
+    Vec<super::ty::Constraint>,
+    HashMap<TyVarId, super::kind::Kind>,
+) {
     use super::ty::Constraint;
+    let mut fresh_kinds = HashMap::new();
     let mapping: HashMap<TyVarId, TyVarId> = scheme
         .bounds
         .iter()
-        .map(|&v| (v, counter.fresh()))
+        .enumerate()
+        .map(|(i, &v)| {
+            let fresh = counter.fresh();
+            fresh_kinds.insert(fresh, scheme.kind_at(i));
+            (v, fresh)
+        })
         .collect();
     let ty = substitute_vars(&scheme.ty, &mapping);
     let constraints = scheme
@@ -201,7 +217,7 @@ pub fn instantiate_with_constraints(
             class: c.class.clone(),
         })
         .collect();
-    (ty, constraints)
+    (ty, constraints, fresh_kinds)
 }
 
 /// Walk `ty`, replacing every variable in `mapping` with its mapped
@@ -420,6 +436,7 @@ mod tests {
             "f",
             Scheme {
                 bounds: vec![TyVarId(0)],
+            kinds: vec![],
                 constraints: vec![],
                 ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
             },
@@ -512,6 +529,7 @@ mod tests {
         // ∀α. α -> α  ; instantiate should give β -> β for fresh β.
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
@@ -526,6 +544,7 @@ mod tests {
         // ∀α β. α -> β  ; instantiate gives γ -> δ.
         let s = Scheme {
             bounds: vec![TyVarId(0), TyVarId(1)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
@@ -543,6 +562,7 @@ mod tests {
         // let-polymorphism its power.
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
@@ -561,6 +581,7 @@ mod tests {
         // ∀α. (α -> α) -> α -> α
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),

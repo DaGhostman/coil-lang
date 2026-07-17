@@ -3,15 +3,45 @@ use std::{borrow::Borrow, fmt::Display};
 use chumsky::span::SimpleSpan;
 pub type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
 
-/// A generic type parameter with optional bounds.
+/// Kind of a type parameter (Phase 5 — unary HKT).
 ///
-/// `T` → `TypeParam { name: "T", bounds: [] }`
-/// `T: Num + Eq` → `TypeParam { name: "T", bounds: ["Num", "Eq"] }`
+/// - [`Kind::Type`] (`*`) — ordinary type parameter (`T`, `A`)
+/// - [`Kind::Arrow`] (`* -> *`) — unary type constructor (`F` in `F<A>`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Kind {
+    /// `*` — a proper type.
+    #[default]
+    Type,
+    /// `* -> *` — a unary type constructor.
+    Arrow,
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Kind::Type => write!(f, "*"),
+            Kind::Arrow => write!(f, "* -> *"),
+        }
+    }
+}
+
+/// A generic type parameter with optional bounds and/or an explicit kind.
+///
+/// `T` → `TypeParam { name: "T", bounds: [], kind: Type }`
+/// `T: Num + Eq` → `TypeParam { name: "T", bounds: ["Num", "Eq"], kind: Type }`
+/// `F: * -> *` → `TypeParam { name: "F", bounds: [], kind: Arrow }`
+///
+/// After `:`, a parameter takes either a kind annotation (`*` / `* -> *`)
+/// or class bounds (`Num + Eq`) — not both. Constructor kind may also be
+/// inferred later from a bound whose class parameter is `* -> *`
+/// (e.g. `F: Container`).
 #[derive(Clone, PartialEq, Debug)]
 pub struct TypeParam<'expr> {
     pub name: &'expr str,
     /// Bound class names, e.g. `["Num", "Eq"]` for `T: Num + Eq`.
     pub bounds: Vec<&'expr str>,
+    /// Explicit kind; defaults to [`Kind::Type`].
+    pub kind: Kind,
 }
 
 /// Compound assignment operator (`+=`, `-=`, …).
@@ -364,30 +394,23 @@ pub enum PatternPayload<'expr> {
     Record(Vec<PatternField<'expr>>),
 }
 
-/// Format a `Vec<TypeParam>` as `<T, U: Num + Eq>`.
+/// Format a `Vec<TypeParam>` as `<T, U: Num + Eq, F: * -> *>`.
 fn fmt_type_params(params: &[TypeParam<'_>]) -> String {
     if params.is_empty() {
         return String::new();
     }
-    let inner: Vec<String> = params
-        .iter()
-        .map(|p| {
-            if p.bounds.is_empty() {
-                p.name.to_string()
-            } else {
-                format!("{}: {}", p.name, p.bounds.join(" + "))
-            }
-        })
-        .collect();
+    let inner: Vec<String> = params.iter().map(|p| p.to_string()).collect();
     format!("<{}>", inner.join(", "))
 }
 
 impl<'a> Display for TypeParam<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.bounds.is_empty() {
-            write!(f, "{}", self.name)
-        } else {
+        if !self.bounds.is_empty() {
             write!(f, "{}: {}", self.name, self.bounds.join(" + "))
+        } else if self.kind != Kind::Type {
+            write!(f, "{}: {}", self.name, self.kind)
+        } else {
+            write!(f, "{}", self.name)
         }
     }
 }

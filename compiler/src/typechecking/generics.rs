@@ -5,6 +5,7 @@
 //! The [`Checker`](super::infer::Checker) owns one `Generics` value and
 //! delegates type-class resolution to it.
 
+use super::kind::Kind;
 use super::ty::Ty;
 use std::collections::{HashMap, HashSet};
 
@@ -35,7 +36,22 @@ pub struct TypeClassDef {
     pub name: String,
     /// Type-parameter names in declaration order, e.g. `["T"]`.
     pub type_params: Vec<String>,
+    /// Kinds of each type parameter (parallel to `type_params`). Phase 5.
+    /// Empty ≡ all `*`. A unary HKT class uses `[Kind::Arrow]`.
+    pub param_kinds: Vec<Kind>,
     pub methods: Vec<TypeClassMethodDef>,
+}
+
+impl TypeClassDef {
+    /// Kind of parameter `i`, defaulting to `*`.
+    pub fn kind_at(&self, i: usize) -> Kind {
+        self.param_kinds.get(i).copied().unwrap_or(Kind::Type)
+    }
+
+    /// True when this class’s first parameter is constructor-kinded (`* -> *`).
+    pub fn is_unary_hkt(&self) -> bool {
+        matches!(self.kind_at(0), Kind::Arrow)
+    }
 }
 
 /// One registered typeclass instance (concrete type → implementation mapping).
@@ -180,6 +196,7 @@ impl Generics {
             TypeClassDef {
                 name: "Num".into(),
                 type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "add".into(),
@@ -207,6 +224,7 @@ impl Generics {
             TypeClassDef {
                 name: "Ord".into(),
                 type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "lt".into(),
@@ -234,6 +252,7 @@ impl Generics {
             TypeClassDef {
                 name: "Eq".into(),
                 type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "eq".into(),
@@ -253,6 +272,7 @@ impl Generics {
             TypeClassDef {
                 name: "Show".into(),
                 type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
                 methods: vec![TypeClassMethodDef {
                     name: "show".into(),
                     has_default: false,
@@ -372,6 +392,7 @@ mod tests {
         TypeClassDef {
             name: "Num".to_string(),
             type_params: vec!["T".to_string()],
+            param_kinds: vec![Kind::Type],
             methods: vec![method("add", false), method("zero", true)],
         }
     }

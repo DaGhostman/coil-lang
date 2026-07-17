@@ -173,6 +173,15 @@ fn example_generic_print_shows_primitives_and_user_type() {
     assert_eq!(output, "42hi1.5true(3,4)99");
 }
 
+/// Phase 5: unary HKT `Container<Option>` + `get<F: Container, A>(F<A>)`.
+#[test]
+
+
+fn example_hkt_container_prints_42() {
+    let output = run_example("examples/hkt_container.0s");
+    assert_eq!(output, "42");
+}
+
 /// Phase 4: open `%v` inside a Show-bound generic body.
 #[test]
 fn generic_print_open_bound_uses_show_dictionary() {
@@ -966,3 +975,4 @@ fn example_perf_coro_ping_prints_expected() {
     let output = run_example("examples/perf/coro_ping.0s");
     assert_eq!(output, "124750");
 }
+

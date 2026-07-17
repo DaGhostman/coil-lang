@@ -148,6 +148,7 @@ fn emit_inner_test<'compiler>(
     bb: &mut BlockBuilder,
     pass_label: Option<crate::block_builder::Label>,
     fail_label: crate::block_builder::Label,
+    payload_base: u32,
 ) {
     use parser::ast::PatternPayload;
     match payload {
@@ -166,7 +167,7 @@ fn emit_inner_test<'compiler>(
                         bytecode.push(Byte::new(Instruction::POP));
                     }
                     Pattern::Binding { name } => {
-                        let slot = next_available_slot(match_bindings_per_arm);
+                        let slot = next_available_slot(match_bindings_per_arm, payload_base);
                         match_bindings_per_arm
                             .entry(arm_idx)
                             .or_default()
@@ -198,6 +199,7 @@ fn emit_inner_test<'compiler>(
                                 bb,
                                 pass_label,
                                 fail_label,
+                                payload_base,
                             );
                         } else if let Some(label) = pass_label {
                             if let Some(inner_tag) = checker.tag_for(sub_enum, sub_variant) {
@@ -249,7 +251,7 @@ fn emit_inner_test<'compiler>(
                         bytecode.push(Byte::new(Instruction::POP));
                     }
                     Pattern::Binding { name } => {
-                        let slot = next_available_slot(match_bindings_per_arm);
+                        let slot = next_available_slot(match_bindings_per_arm, payload_base);
                         match_bindings_per_arm
                             .entry(arm_idx)
                             .or_default()
@@ -282,6 +284,7 @@ fn emit_inner_test<'compiler>(
                                 bb,
                                 pass_label,
                                 fail_label,
+                                payload_base,
                             );
                         } else if let Some(label) = pass_label {
                             if let Some(inner_tag) = checker.tag_for(sub_enum, sub_variant) {
@@ -313,10 +316,17 @@ fn emit_inner_test<'compiler>(
     }
 }
 
-/// Next free binding slot (slots start at 1; 0 is the scrutinee).
+/// Next free binding slot for match payloads.
+///
+/// `base` is the first payload slot (`context.variables.len()` at match
+/// entry). Slot 0 is reserved for the first function argument; trailing
+/// dictionary locals occupy 1..base-1 when `dict_arity > 0`.
 #[allow(dead_code)]
-fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>) -> u32 {
-    let mut max_slot = 0u32;
+fn next_available_slot(
+    match_bindings: &HashMap<usize, HashMap<String, u32>>,
+    base: u32,
+) -> u32 {
+    let mut max_slot = base.saturating_sub(1);
     for arm_bindings in match_bindings.values() {
         for &slot in arm_bindings.values() {
             if slot > max_slot {
@@ -617,10 +627,14 @@ fn emit_pattern_binding<'compiler>(
             }
             PatternPayload::Record(fields) => {
                 // Declaration-order walk; nested records use UnpackAt at non-top slots.
+                // `record_base` is the first payload slot for this record
+                // (normally 1; higher when trailing dict locals precede
+                // the match).
+                let record_base = *next_slot;
                 let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
                     fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
                 for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
-                    let field_slot = (i + 1) as u32;
+                    let field_slot = record_base + i as u32;
                     if let Some(sub_pat) = pattern_site.get(decl_name.as_str()) {
                         // If the sub-pattern is a nested
                         // record, emit `UnpackAt` with the
@@ -1055,6 +1069,74 @@ impl Compiler {
         self.bytecode.push(Byte::new(Instruction::STRINGIFY));
     }
 
+    /// Structurally bind scheme pattern variables to concrete call-site types.
+    ///
+    /// Used by [`emit_call_site_dicts`] so `F<A>` against `Option<int>` records
+    /// both `F = Option` and `A = int` (Phase 5).
+    fn bind_scheme_vars(
+        pattern: &Ty,
+        concrete: &Ty,
+        map: &mut HashMap<crate::typechecking::ty::TyVarId, Ty>,
+    ) {
+        use crate::typechecking::ty::{option_inner, result_ok_err};
+
+        match (pattern, concrete) {
+            (Ty::Var(v), c) => {
+                map.entry(*v).or_insert_with(|| c.clone());
+            }
+            (Ty::App(h1, a1), Ty::App(h2, a2)) if a1.len() == a2.len() => {
+                Self::bind_scheme_vars(h1, h2, map);
+                for (p, c) in a1.iter().zip(a2.iter()) {
+                    Self::bind_scheme_vars(p, c, map);
+                }
+            }
+            // `F<A>` vs builtin Option/Result constructor or structural sum:
+            // bind `F` to the constructor constant and recurse into payloads.
+            (Ty::App(head, args), other)
+                if matches!(head.as_ref(), Ty::Var(_))
+                    && (option_inner(other).is_some() || result_ok_err(other).is_some()) =>
+            {
+                if let Some(inner) = option_inner(other) {
+                    if args.len() == 1 {
+                        Self::bind_scheme_vars(
+                            head,
+                            &Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                            map,
+                        );
+                        Self::bind_scheme_vars(&args[0], &inner, map);
+                    }
+                } else if let Some((ok, err)) = result_ok_err(other) {
+                    if args.len() == 2 {
+                        Self::bind_scheme_vars(
+                            head,
+                            &Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                            map,
+                        );
+                        Self::bind_scheme_vars(&args[0], &ok, map);
+                        Self::bind_scheme_vars(&args[1], &err, map);
+                    }
+                }
+            }
+            (Ty::App(h1, a1), Ty::Constructor { owner, .. }) => {
+                Self::bind_scheme_vars(
+                    &Ty::App(h1.clone(), a1.clone()),
+                    owner.as_ref(),
+                    map,
+                );
+            }
+            (Ty::Fun(a1, r1), Ty::Fun(a2, r2)) => {
+                Self::bind_scheme_vars(a1, a2, map);
+                Self::bind_scheme_vars(r1, r2, map);
+            }
+            (Ty::Tuple(t1), Ty::Tuple(t2)) if t1.len() == t2.len() => {
+                for (p, c) in t1.iter().zip(t2.iter()) {
+                    Self::bind_scheme_vars(p, c, map);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Emit dictionary tuples for a non-monomorphized generic call site.
     ///
     /// Convention: after value args, one `MakeTuple` per typeclass
@@ -1081,8 +1163,9 @@ impl Compiler {
         let Some(scheme) = checker.env().lookup(fn_name).cloned() else {
             return 0;
         };
-        // Map quantified vars → concrete arg types by peeling the curried
-        // function type against the call's argument types.
+        // Map quantified vars → concrete arg types by structurally matching
+        // the curried function type against the call's argument types.
+        // Phase 5: `F<A>` vs `Option<int>` binds both `F = Option` and `A = int`.
         // Do NOT apply the global subst to the scheme — those vars may have
         // been reused/unified later in the program.
         let mut var_to_ty: HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty> =
@@ -1093,11 +1176,7 @@ impl Compiler {
             if arg_idx >= arg_tys.len() {
                 break;
             }
-            if let Ty::Var(v) = param.as_ref() {
-                var_to_ty
-                    .entry(*v)
-                    .or_insert_with(|| arg_tys[arg_idx].clone());
-            }
+            Self::bind_scheme_vars(param.as_ref(), &arg_tys[arg_idx], &mut var_to_ty);
             fun = ret.as_ref();
             arg_idx += 1;
         }
@@ -1108,9 +1187,24 @@ impl Compiler {
                 continue;
             };
             let concrete = apply_ty_prune(checker.subst(), concrete);
+            // HKT classes look up by constructor head (`Option`), not
+            // applied types (`Option<int>`).
+            let lookup_ty = if checker
+                .generics()
+                .typeclass(&constraint.class)
+                .map(|c| c.is_unary_hkt())
+                .unwrap_or(false)
+            {
+                match &concrete {
+                    Ty::App(head, _) => head.as_ref().clone(),
+                    other => other.clone(),
+                }
+            } else {
+                concrete.clone()
+            };
             let Some(instance) = checker
                 .generics()
-                .find_instance(&constraint.class, std::slice::from_ref(&concrete))
+                .find_instance(&constraint.class, std::slice::from_ref(&lookup_ty))
             else {
                 continue;
             };
@@ -1400,6 +1494,33 @@ impl Compiler {
         }
         let free = crate::typechecking::subst::ftv(result);
         scheme.bounds.iter().any(|bound| free.contains(bound))
+    }
+
+    /// Whether a generic call's return value is boxed at the ABI boundary.
+    ///
+    /// Direct type-parameter arguments (`id<T>(T x) -> T`) are boxed at the
+    /// call site, so the matching return must be unboxed. Type parameters that
+    /// only appear nested under ADTs / HKT apps (`get<F, A>(F<A>) -> A`) keep
+    /// the payload's native representation (e.g. a raw `int` inside
+    /// `Option::Some`), so emitting `UnboxValue` would turn a valid immediate
+    /// into `Value::default()`.
+    fn generic_return_is_boxed(&self, name: &str) -> bool {
+        let Some(scheme) = self.checker.env().lookup(name) else {
+            return false;
+        };
+        let mut top_level_vars = std::collections::HashSet::new();
+        let mut current = &scheme.ty;
+        while let Ty::Fun(param, ret) = current {
+            if let Ty::Var(v) = param.as_ref() {
+                top_level_vars.insert(*v);
+            }
+            current = ret;
+        }
+        let free = crate::typechecking::subst::ftv(current);
+        scheme
+            .bounds
+            .iter()
+            .any(|bound| free.contains(bound) && top_level_vars.contains(bound))
     }
 
     /// Whether a CallIndirect through a local needs a post-call `UnboxValue`.
@@ -3193,10 +3314,12 @@ impl Compiler {
                                     .with_call_packed(arity, target_offset as u32),
                             );
                         }
-                        // Generic→concrete unbox: if this was a non-monomorphized generic
-                        // call and the Call expression's inferred return type is concrete,
-                        // emit UnboxValue so the caller gets a raw value, not an ObjBoxed.
-                        if is_generic && self.generic_return_depends_on_type_param(&n) {
+                        // Generic→concrete unbox: only when the return type
+                        // parameter was boxed as a top-level argument
+                        // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
+                        // not boxed at construction, so unboxing would zero
+                        // a valid immediate (Phase 5 HKT / Container::first).
+                        if is_generic && self.generic_return_is_boxed(&n) {
                             if let Some(call_ty) = self.codegen_expr_ty(ast) {
                                 Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                             }
@@ -3323,11 +3446,29 @@ impl Compiler {
                 args,
                 methods,
             } => {
-                let arg_tys: Vec<_> = args
+                // Resolve instance heads by AST shape (not span cache). Bare
+                // `Option`/`Result` must stay `Con(...)` so FQNs match the
+                // typechecker (`Container__Option__first`). Preferring
+                // `codegen_expr_ty` here can pick up a misaligned span type
+                // (e.g. `unit`) and emit `Container__unit__first` instead.
+                let arg_tys: Vec<Ty> = args
                     .iter()
-                    .map(|arg| {
-                        self.codegen_expr_ty(arg)
-                            .expect("typechecked instance argument must have a codegen type")
+                    .map(|arg| match arg.1.as_ref() {
+                        Expression::Type(name) | Expression::Identifier(name) => {
+                            match name.to_ascii_lowercase().as_str() {
+                                "option" => Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                                "result" => Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                                "int" => Ty::Con("int".into()),
+                                "float" => Ty::Con("float".into()),
+                                "string" => Ty::Con("string".into()),
+                                "bool" => Ty::Con("bool".into()),
+                                "void" | "unit" => Ty::Con("unit".into()),
+                                _ => Ty::Con(name.to_string()),
+                            }
+                        }
+                        _ => self
+                            .codegen_expr_ty(arg)
+                            .unwrap_or_else(|| Ty::Con("unknown".into())),
                     })
                     .collect();
                 for arg in args {
@@ -4115,6 +4256,14 @@ impl Compiler {
                     let mut bb = BlockBuilder::new();
                     let end_label = bb.fresh_label();
 
+                    // First payload slot after existing locals. Function
+                    // args occupy 0..n-1; trailing `__dictN` slots (for
+                    // constrained generics / HKT methods) push this above
+                    // 1. JumpIfMatch/Unpack push payloads onto the stack
+                    // above those locals, so bindings must start here —
+                    // not at the historical hardcoded slot 1.
+                    let payload_base = self.context.variables.len() as u32;
+
                     let arm_labels: Vec<Option<crate::block_builder::Label>> = arms
                         .iter()
                         .enumerate()
@@ -4195,26 +4344,17 @@ impl Compiler {
                                 }
                                 Pattern::Binding { name } => {
                                     // Binding arm — STORE the
-                                    // scrutinee at slot 1
-                                    // (matching LOAD 0's push
-                                    // position).
-                                    //
-                                    // the binding
-                                    // is recorded in
-                                    // `match_bindings` by the
-                                    // reverse pass, so the
-                                    // body's `Identifier`
-                                    // lookup resolves the
-                                    // name to slot 1.
-                                    // Hardcoding slot 1 here
-                                    // is correct because LOAD
-                                    // 0 always pushes to
-                                    // frame.sp + 1, and the
-                                    // STORE is a no-op
-                                    // .
+                                    // scrutinee at `payload_base`
+                                    // (the slot where the
+                                    // scrutinee sits after being
+                                    // pushed above existing locals).
+                                    // The reverse pass records the
+                                    // same slot in `match_bindings`.
                                     let _ = name;
-                                    self.bytecode
-                                        .push(Byte::new(Instruction::STORE).with_operand_u32(1));
+                                    self.bytecode.push(
+                                        Byte::new(Instruction::STORE)
+                                            .with_operand_u32(payload_base),
+                                    );
                                 }
                             }
                         }
@@ -4408,6 +4548,7 @@ impl Compiler {
                                 &mut bb,
                                 pass_label,
                                 fail_label,
+                                payload_base,
                             );
                         }
                     }
@@ -4497,11 +4638,12 @@ impl Compiler {
                             );
                         }
 
-                        // Per-arm binding slots (slot 1 = first payload).
-                        // Payload order follows declaration order; record
-                        // patterns may list fields in any source order.
+                        // Per-arm binding slots (`payload_base` = first
+                        // payload). Payload order follows declaration
+                        // order; record patterns may list fields in any
+                        // source order.
                         let mut arm_bindings: HashMap<String, u32> = HashMap::new();
-                        let mut next_slot: u32 = 1;
+                        let mut next_slot: u32 = payload_base;
                         // Test-chain arms: payload already on stack from
                         // the forward pass — use `consume_values = false`
                         // to record bindings without re-emitting UNPACK/POP.
@@ -4529,7 +4671,7 @@ impl Compiler {
                             // test chain handled the values).
                             match &arm.pattern {
                                 Pattern::Binding { name } => {
-                                    arm_bindings.insert(name.to_string(), 1);
+                                    arm_bindings.insert(name.to_string(), payload_base);
                                 }
                                 Pattern::Constructor {
                                     enum_name,
@@ -4573,12 +4715,12 @@ impl Compiler {
                             match &arm.pattern {
                                 Pattern::Binding { name } => {
                                     // Binding arm: the forward pass
-                                    // already emitted `STORE 1` for
-                                    // the scrutinee (at slot 1,
-                                    // matching LOAD 0's push). Record
-                                    // the binding here so the body's
+                                    // already emitted STORE at
+                                    // `payload_base` for the
+                                    // scrutinee. Record the binding
+                                    // here so the body's
                                     // `Identifier` lookup finds it.
-                                    arm_bindings.insert(name.to_string(), 1);
+                                    arm_bindings.insert(name.to_string(), payload_base);
                                 }
                                 Pattern::Constructor {
                                     enum_name,
@@ -4618,8 +4760,9 @@ impl Compiler {
 
                         // Install the per-arm bindings map so the
                         // body's `Identifier` / `Assignment` lookups
-                        // resolve pattern bindings to slots 1, 2, 3,
-                        // ... — matching the VM's payload-push
+                        // resolve pattern bindings to
+                        // `payload_base`, `payload_base+1`, …
+                        // — matching the VM's payload-push
                         // positions. Cleared after the body emits.
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);

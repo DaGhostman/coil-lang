@@ -185,23 +185,7 @@ impl<'pratt> Pratt<'pratt> {
             // that `forall` is not parsed as an identifier.
             let forall_type = keyword!("forall")
                 .ignore_then(
-                    text::ident()
-                        .padded()
-                        .then(
-                            op!(":")
-                                .ignore_then(
-                                    text::ident()
-                                        .padded()
-                                        .separated_by(op!("+"))
-                                        .at_least(1)
-                                        .collect::<Vec<_>>(),
-                                )
-                                .or_not(),
-                        )
-                        .map(|(name, bounds)| TypeParam {
-                            name,
-                            bounds: bounds.unwrap_or_default(),
-                        })
+                    self.single_type_param()
                         .separated_by(op!(","))
                         .at_least(1)
                         .collect::<Vec<_>>(),
@@ -227,7 +211,48 @@ impl<'pratt> Pratt<'pratt> {
         })
     }
 
-    /// `<T, U: Num + Eq, ...>` — optional generic type parameter list.
+    /// One type parameter: `T`, `T: Num + Eq`, or `F: * -> *` (Phase 5).
+    ///
+    /// After `:`, either a kind (`*` / `* -> *`) or class bounds — not both.
+    fn single_type_param(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, TypeParam<'pratt>, extra::Err<Rich<'pratt, char>>>
+           + Clone
+           + 'pratt {
+        use crate::ast::Kind;
+
+        // `* -> *` (unary constructor) or bare `*`.
+        let kind_ann = just('*')
+            .padded()
+            .then(
+                op!("->")
+                    .ignore_then(just('*').padded())
+                    .to(Kind::Arrow)
+                    .or_not(),
+            )
+            .map(|(_, arrow)| arrow.unwrap_or(Kind::Type));
+
+        let class_bounds = text::ident()
+            .padded()
+            .separated_by(op!("+"))
+            .at_least(1)
+            .collect::<Vec<_>>();
+
+        // After `:`, try kind first (leading `*`), else class bounds.
+        let after_colon = kind_ann
+            .map(|kind| (Vec::new(), kind))
+            .or(class_bounds.map(|bounds| (bounds, Kind::Type)));
+
+        text::ident()
+            .padded()
+            .then(op!(":").ignore_then(after_colon).or_not())
+            .map(|(name, ann)| {
+                let (bounds, kind) = ann.unwrap_or_else(|| (Vec::new(), Kind::Type));
+                TypeParam { name, bounds, kind }
+            })
+    }
+
+    /// `<T, U: Num + Eq, F: * -> *, ...>` — optional generic type parameter list.
     ///
     /// Returns an empty `Vec` when no `<` is found.
     fn type_param_list(
@@ -235,25 +260,7 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Vec<TypeParam<'pratt>>, extra::Err<Rich<'pratt, char>>>
            + Clone
            + 'pratt {
-        let single_param = text::ident()
-            .padded()
-            .then(
-                op!(":")
-                    .ignore_then(
-                        text::ident()
-                            .padded()
-                            .separated_by(op!("+"))
-                            .at_least(1)
-                            .collect::<Vec<_>>(),
-                    )
-                    .or_not(),
-            )
-            .map(|(name, bounds)| TypeParam {
-                name,
-                bounds: bounds.unwrap_or_default(),
-            });
-
-        single_param
+        self.single_type_param()
             .separated_by(op!(","))
             .allow_trailing()
             .collect::<Vec<_>>()
@@ -3897,6 +3904,30 @@ mod tests_generics {
         let s = stmt!("typeclass Show { fn show() -> string; }");
         assert!(s.starts_with("typeclass Show {"), "got: {s}");
         assert!(s.contains("show"), "got: {s}");
+    }
+
+    /// Phase 5: `F: * -> *` parses as an Arrow-kinded type parameter.
+    #[test]
+    fn unary_hkt_kind_annotation_parses() {
+        match decl_ast!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }") {
+            Expression::TypeClass { type_params, .. } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "F");
+                assert_eq!(type_params[0].kind, crate::ast::Kind::Arrow);
+                assert!(type_params[0].bounds.is_empty());
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    /// Phase 5: Display keeps the kind annotation on HKT params.
+    #[test]
+    fn unary_hkt_kind_display_round_trips() {
+        let s = stmt!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }");
+        assert!(
+            s.contains("F: * -> *"),
+            "expected kind annotation in display, got: {s}"
+        );
     }
 
     /// TypeClassImpl Display: `impl Num<int> { … }`

@@ -131,12 +131,16 @@ pub struct Constraint {
 /// A type scheme: a type possibly quantified over some type variables,
 /// with optional typeclass constraints on those variables.
 ///
-/// `Scheme { bounds: vec![], constraints: vec![], ty: Var(α) }` represents
-/// `α` (monomorphic). `bounds` lists the universally quantified variables;
-/// `constraints` lists typeclass requirements on them (e.g. `T: Num`).
+/// `Scheme { bounds: vec![], kinds: vec![], constraints: vec![], ty: Var(α) }`
+/// represents `α` (monomorphic). `bounds` lists the universally quantified
+/// variables; `constraints` lists typeclass requirements on them (e.g. `T: Num`).
+/// `kinds` (Phase 5) is parallel to `bounds` — empty means every bound has
+/// kind `*`; otherwise `kinds[i]` is the kind of `bounds[i]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
     pub bounds: Vec<TyVarId>,
+    /// Kinds of the quantified variables (parallel to `bounds`). Empty ≡ all `*`.
+    pub kinds: Vec<super::kind::Kind>,
     /// Typeclass constraints on the quantified variables.
     pub constraints: Vec<Constraint>,
     pub ty: Ty,
@@ -147,18 +151,48 @@ impl Scheme {
     pub fn mono(ty: Ty) -> Self {
         Self {
             bounds: Vec::new(),
+            kinds: Vec::new(),
             constraints: Vec::new(),
             ty,
         }
     }
 
-    /// Build a polymorphic scheme with constraints.
+    /// Build a polymorphic scheme with constraints (all bounds kind `*`).
     pub fn poly(bounds: Vec<TyVarId>, constraints: Vec<Constraint>, ty: Ty) -> Self {
+        let kinds = vec![super::kind::Kind::Type; bounds.len()];
         Self {
             bounds,
+            kinds,
             constraints,
             ty,
         }
+    }
+
+    /// Build a polymorphic scheme with explicit kinds (Phase 5).
+    pub fn poly_with_kinds(
+        bounds: Vec<TyVarId>,
+        kinds: Vec<super::kind::Kind>,
+        constraints: Vec<Constraint>,
+        ty: Ty,
+    ) -> Self {
+        debug_assert!(
+            kinds.is_empty() || kinds.len() == bounds.len(),
+            "kinds must be empty or parallel to bounds"
+        );
+        Self {
+            bounds,
+            kinds,
+            constraints,
+            ty,
+        }
+    }
+
+    /// Kind of quantified variable `i`, defaulting to `*` when unset.
+    pub fn kind_at(&self, i: usize) -> super::kind::Kind {
+        self.kinds
+            .get(i)
+            .copied()
+            .unwrap_or(super::kind::Kind::Type)
     }
 }
 
@@ -371,7 +405,9 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
             go(a, acc);
             go(b, acc);
         }
-        Ty::App(_, args) => {
+        Ty::App(head, args) => {
+            // Phase 5: HKT heads may be `Ty::Var(F)` — must collect F.
+            go(head, acc);
             for a in args {
                 go(a, acc);
             }
@@ -476,6 +512,7 @@ mod tests {
     fn ftv_of_scheme_excludes_bounds() {
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: v(0),
         };
@@ -486,6 +523,7 @@ mod tests {
     fn ftv_of_scheme_keeps_non_bound_vars() {
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };

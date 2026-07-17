@@ -459,7 +459,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` as `Ty::App`; builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
-| Higher-kinded types | Not supported |
+| Higher-kinded types | Unary constructor kinds only (`F: * -> *`); higher arities and kind variables are not supported |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |

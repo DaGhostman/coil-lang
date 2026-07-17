@@ -215,6 +215,7 @@ mod tests {
     fn display_scheme_poly() {
         let s = Scheme {
             bounds: vec![TyVarId(0), TyVarId(1)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(Box::new(Ty::Var(TyVarId(0))), Box::new(Ty::Var(TyVarId(1)))),
         };

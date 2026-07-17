@@ -189,6 +189,7 @@ pub fn apply_ty_prune(subst: &Subst, ty: &Ty) -> Ty {
 pub fn apply_scheme(subst: &Subst, s: &Scheme) -> Scheme {
     Scheme {
         bounds: s.bounds.clone(),
+        kinds: s.kinds.clone(),
         constraints: s.constraints.clone(),
         ty: apply_ty(subst, &s.ty),
     }
@@ -336,6 +337,7 @@ mod tests {
         let s = Subst::singleton(TyVarId(0), int());
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: v(0),
         };
@@ -351,6 +353,7 @@ mod tests {
         let s = Subst::singleton(TyVarId(1), int());
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
             constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
