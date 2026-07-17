@@ -116,9 +116,10 @@ impl fmt::Display for Ty {
                     .iter()
                     .map(|v| {
                         let mut s = format!("t{}", v.raw());
+                        // Unary binder-style constraints (`T: Num`) attach to the var.
                         let classes = constraints
                             .iter()
-                            .filter(|c| c.var == *v)
+                            .filter(|c| c.is_unary_on(*v))
                             .map(|c| c.class.as_str())
                             .collect::<Vec<_>>();
                         if !classes.is_empty() {
@@ -129,7 +130,17 @@ impl fmt::Display for Ty {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                write!(f, "forall {}. {}", vars, body)
+                // Multi-arg / non-binder constraints render as a trailing where.
+                let multi: Vec<String> = constraints
+                    .iter()
+                    .filter(|c| c.args.len() != 1 || c.primary_var().is_none_or(|v| !bounds.contains(&v)))
+                    .map(|c| c.to_string())
+                    .collect();
+                if multi.is_empty() {
+                    write!(f, "forall {}. {}", vars, body)
+                } else {
+                    write!(f, "forall {}. {} where {}", vars, body, multi.join(", "))
+                }
             }
         }
     }

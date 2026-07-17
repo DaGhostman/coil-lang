@@ -165,7 +165,13 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             }
             Ty::Forall {
                 bounds: bounds.clone(),
-                constraints: constraints.clone(),
+                constraints: constraints
+                    .iter()
+                    .map(|c| super::ty::Constraint {
+                        class: c.class.clone(),
+                        args: c.args.iter().map(|a| apply_ty(&inner, a)).collect(),
+                    })
+                    .collect(),
                 body: Box::new(apply_ty(&inner, body)),
             }
         }
@@ -187,10 +193,21 @@ pub fn apply_ty_prune(subst: &Subst, ty: &Ty) -> Ty {
 /// Apply a substitution to a `Scheme`. Quantified variables are preserved.
 #[allow(dead_code)]
 pub fn apply_scheme(subst: &Subst, s: &Scheme) -> Scheme {
+    let mut inner = subst.clone();
+    for bound in &s.bounds {
+        let _ = inner.remove(*bound);
+    }
     Scheme {
         bounds: s.bounds.clone(),
         kinds: s.kinds.clone(),
-        constraints: s.constraints.clone(),
+        constraints: s
+            .constraints
+            .iter()
+            .map(|c| super::ty::Constraint {
+                class: c.class.clone(),
+                args: c.args.iter().map(|a| apply_ty(&inner, a)).collect(),
+            })
+            .collect(),
         ty: apply_ty(subst, &s.ty),
     }
 }

@@ -44,6 +44,30 @@ pub struct TypeParam<'expr> {
     pub kind: Kind,
 }
 
+/// A `where` clause constraint: `Convert<A, B>` or unary `Num<T>`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct WhereConstraint<'expr> {
+    pub class: &'expr str,
+    pub args: Vec<Output<'expr>>,
+}
+
+impl<'a> Display for WhereConstraint<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.class)?;
+        if !self.args.is_empty() {
+            write!(f, "<")?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", arg.1)?;
+            }
+            write!(f, ">")?;
+        }
+        Ok(())
+    }
+}
+
 /// Compound assignment operator (`+=`, `-=`, …).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssignOp {
@@ -195,6 +219,8 @@ pub enum Expression<'expr> {
         type_params: Vec<TypeParam<'expr>>,
         args: Output<'expr>,
         returns: Option<Output<'expr>>,
+        /// Constraints from a trailing `where` clause (after returns).
+        where_constraints: Vec<WhereConstraint<'expr>>,
         body: Output<'expr>,
     },
 
@@ -598,6 +624,7 @@ impl<'a> Display for Expression<'a> {
                 type_params,
                 args,
                 returns,
+                where_constraints,
                 body,
             } => {
                 let async_kw = if *is_coro { "async " } else { "" };
@@ -610,10 +637,22 @@ impl<'a> Display for Expression<'a> {
                     .as_ref()
                     .map(|ret| format!(" -> {}", ret.1))
                     .unwrap_or_default();
+                let where_str = if where_constraints.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " where {}",
+                        where_constraints
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
                 write!(
                     f,
-                    "{}fn {}{}({}){} {{\n{}}}",
-                    async_kw, name, tp, args.1, ret_str, body.1
+                    "{}fn {}{}({}){}{} {{\n{}}}",
+                    async_kw, name, tp, args.1, ret_str, where_str, body.1
                 )
             }
             Self::Defer(b) => write!(f, "defer {}", b.1),

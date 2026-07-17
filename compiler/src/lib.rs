@@ -1154,6 +1154,7 @@ impl Compiler {
         bytecode: &mut Vec<Byte>,
         fn_name: &str,
         arg_tys: &[crate::typechecking::Ty],
+        ret_ty: Option<&crate::typechecking::Ty>,
         checker: &Checker,
         functions: &HashMap<String, usize>,
     ) -> usize {
@@ -1180,31 +1181,54 @@ impl Compiler {
             fun = ret.as_ref();
             arg_idx += 1;
         }
+        // Multi-param constraints often mention return-type vars
+        // (`Convert<A, B>` with `A -> B`). Bind those from the call's result type.
+        if let Some(ret_ty) = ret_ty {
+            Self::bind_scheme_vars(fun, ret_ty, &mut var_to_ty);
+        }
 
         let mut dict_count = 0;
         for constraint in &scheme.constraints {
-            let Some(concrete) = var_to_ty.get(&constraint.var) else {
+            // Resolve each constraint arg via scheme-var → call-site binding.
+            let mut resolved = Vec::with_capacity(constraint.args.len());
+            let mut incomplete = false;
+            for arg in &constraint.args {
+                let concrete = match arg {
+                    Ty::Var(v) => match var_to_ty.get(v) {
+                        Some(t) => apply_ty_prune(checker.subst(), t),
+                        None => {
+                            incomplete = true;
+                            break;
+                        }
+                    },
+                    other => apply_ty_prune(checker.subst(), other),
+                };
+                resolved.push(concrete);
+            }
+            if incomplete {
                 continue;
-            };
-            let concrete = apply_ty_prune(checker.subst(), concrete);
+            }
             // HKT classes look up by constructor head (`Option`), not
             // applied types (`Option<int>`).
-            let lookup_ty = if checker
+            let lookup: Vec<Ty> = if checker
                 .generics()
                 .typeclass(&constraint.class)
                 .map(|c| c.is_unary_hkt())
                 .unwrap_or(false)
             {
-                match &concrete {
-                    Ty::App(head, _) => head.as_ref().clone(),
-                    other => other.clone(),
-                }
+                resolved
+                    .iter()
+                    .map(|concrete| match concrete {
+                        Ty::App(head, _) => head.as_ref().clone(),
+                        other => other.clone(),
+                    })
+                    .collect()
             } else {
-                concrete.clone()
+                resolved
             };
             let Some(instance) = checker
                 .generics()
-                .find_instance(&constraint.class, std::slice::from_ref(&lookup_ty))
+                .find_instance(&constraint.class, &lookup)
             else {
                 continue;
             };
@@ -2406,6 +2430,7 @@ impl Compiler {
                 type_params,
                 args,
                 returns: _returns,
+                where_constraints: _,
                 body,
             } => {
                 let qualified = if self.namespace.is_empty() {
@@ -3294,11 +3319,13 @@ impl Compiler {
                                     }
                                 }
                             }
+                            let call_ret_ty = self.codegen_expr_ty(ast);
                             forwarded
                                 + Self::emit_call_site_dicts(
                                     &mut bytecode,
                                     &n,
                                     &call_arg_tys,
+                                    call_ret_ty.as_ref(),
                                     &self.checker,
                                     &self.functions,
                                 )
@@ -3372,10 +3399,12 @@ impl Compiler {
                                     }
                                 }
                             }
+                            let call_ret_ty = self.codegen_expr_ty(ast);
                             dict_count += Self::emit_call_site_dicts(
                                 &mut bytecode,
                                 source,
                                 &arg_tys,
+                                call_ret_ty.as_ref(),
                                 &self.checker,
                                 &self.functions,
                             ) as u32;

@@ -213,8 +213,8 @@ pub fn instantiate_with_kinds(
         .constraints
         .iter()
         .map(|c| Constraint {
-            var: mapping.get(&c.var).copied().unwrap_or(c.var),
             class: c.class.clone(),
+            args: c.args.iter().map(|a| substitute_vars(a, &mapping)).collect(),
         })
         .collect();
     (ty, constraints, fresh_kinds)
@@ -295,8 +295,12 @@ pub(crate) fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> T
                 constraints: constraints
                     .iter()
                     .map(|c| super::ty::Constraint {
-                        var: inner.get(&c.var).copied().unwrap_or(c.var),
                         class: c.class.clone(),
+                        args: c
+                            .args
+                            .iter()
+                            .map(|a| substitute_vars(a, &inner))
+                            .collect(),
                     })
                     .collect(),
                 body: Box::new(substitute_vars(body, &inner)),

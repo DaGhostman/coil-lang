@@ -606,6 +606,18 @@ generic caller `get<F: Container, A>(F<A>) -> A`.
 
 ---
 
+### `examples/multiparam.0s`
+
+**Demonstrates:** Multi-parameter typeclass `Convert<A, B>` with a `where`
+clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/multiparam.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/typeclass_dict.0s`
 
 **Demonstrates:** User typeclass dictionaries, method sugar, and dictionary
@@ -945,6 +957,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `generics.0s` | Types | `7424.042` |
 | `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
 | `hkt_container.0s` | Types | `42` |
+| `multiparam.0s` | Types | `42` |
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
 | `polyfn.0s` | Types | `424.0424242` |

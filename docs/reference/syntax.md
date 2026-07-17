@@ -58,11 +58,14 @@ declaration ::= class_decl
 ### Functions
 
 ```
-function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list ('->' type_annotation)? block
+function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list
+                  ('->' type_annotation)? where_clause? block
 type_param_list ::= '<' type_param (',' type_param)* '>'
 type_param      ::= IDENT (':' (kind | class_bound ('+' class_bound)*))?
 kind            ::= '*' | '*' '->' '*'
 class_bound     ::= IDENT
+where_clause    ::= 'where' where_constraint (',' where_constraint)*
+where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
 arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
 ```
 
@@ -71,6 +74,7 @@ Examples:
 ```0s
 fn add(int a, int b) -> int { return a + b; }
 fn add<T: Num>(T a, T b) -> T { return a + b; }
+fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn greet() { print "hi"; }
 ```
 
@@ -94,9 +98,11 @@ impl Measurable<int> {
 ```
 
 Generic functions use `type_param_list` on `fn` (see above). Bounds use `+`
-between class names (`T: Num + Eq`). Unary higher-kinded parameters use an
-explicit kind annotation (`F: * -> *`); a bound whose class parameter is
-constructor-kinded (for example `F: Container`) also implies that kind.
+between class names (`T: Num + Eq`). Multi-parameter classes use a trailing
+`where Class<T1, T2>` clause (unary `where Num<T>` is also accepted). Unary
+higher-kinded parameters use an explicit kind annotation (`F: * -> *`); a bound
+whose class parameter is constructor-kinded (for example `F: Container`) also
+implies that kind.
 
 ### Enums
 

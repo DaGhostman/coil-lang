@@ -44,13 +44,15 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `yield from` | Expression / stmt | Delegate to sub-coroutine | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 | `resume` | Expression | Continue coroutine handle | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 | `with` | Resume modifier | Send value on resume (`resume h with v`) | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
+| `where` | Declaration | Constraint clause on generic functions | [Types — Generics](types.md#generics-and-typeclasses) |
+| `typeclass` | Declaration | User-defined typeclass | [Types — Generics](types.md#generics-and-typeclasses) |
 
 ---
 
 ## Declaration keywords
 
 ```
-fn | enum | type | typeclass | use | mod | extern | class | impl | defer | async
+fn | enum | type | typeclass | use | mod | extern | class | impl | defer | async | where
 ```
 
 Registered in the top-level `declaration()` parser before generic statements so keywords like `enum` are not misparsed as `let`.
@@ -107,7 +109,6 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 | `import` | Not implemented — use `use` |
 | `struct` | FFI `extern struct` only; otherwise use `class` or record dicts |
 | `trait` | Not implemented |
-| `where` | Not implemented |
 | `in` | Not implemented |
 
 ---

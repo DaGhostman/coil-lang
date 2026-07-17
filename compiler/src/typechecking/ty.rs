@@ -120,12 +120,60 @@ impl Ty {
     }
 }
 
-/// A single typeclass constraint on a quantified type variable.
-/// E.g. `T: Num` → `Constraint { var: α, class: "Num" }`.
+/// A typeclass constraint over one or more type arguments.
+///
+/// Unary binder bounds desugar as a single-arg constraint:
+/// `T: Num` → `Constraint { class: "Num", args: [Var(α)] }`.
+/// Multi-param classes use N args:
+/// `Convert<A, B>` → `Constraint { class: "Convert", args: [Var(α), Var(β)] }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Constraint {
-    pub var: TyVarId,
     pub class: String,
+    pub args: Vec<Ty>,
+}
+
+impl Constraint {
+    /// Unary constraint helper: `Class<T>` for a single type variable.
+    pub fn unary(class: impl Into<String>, var: TyVarId) -> Self {
+        Self {
+            class: class.into(),
+            args: vec![Ty::Var(var)],
+        }
+    }
+
+    /// True when this is a unary constraint whose sole arg is `var`.
+    pub fn is_unary_on(&self, var: TyVarId) -> bool {
+        matches!(self.args.as_slice(), [Ty::Var(v)] if *v == var)
+    }
+
+    /// First type-variable argument, if any (unary / HKT head).
+    pub fn primary_var(&self) -> Option<TyVarId> {
+        match self.args.first() {
+            Some(Ty::Var(v)) => Some(*v),
+            Some(Ty::App(head, _)) => match head.as_ref() {
+                Ty::Var(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Constraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.class)?;
+        if !self.args.is_empty() {
+            write!(f, "<")?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", arg)?;
+            }
+            write!(f, ">")?;
+        }
+        Ok(())
+    }
 }
 
 /// A type scheme: a type possibly quantified over some type variables,
@@ -589,7 +637,9 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         } => {
             go(body, acc);
             for c in constraints {
-                acc.insert(c.var);
+                for a in &c.args {
+                    go(a, acc);
+                }
             }
             let bound: HashSet<_> = bounds.iter().copied().collect();
             acc.retain(|v| !bound.contains(v));

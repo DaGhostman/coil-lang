@@ -332,6 +332,17 @@ fn main() {
 }
 ```
 
+Multi-parameter typeclasses use a trailing `where` clause:
+
+```0s
+typeclass Convert<A, B> { fn cast(A x) -> B; }
+impl Convert<int, int> { fn cast(int x) -> int { return x; } }
+fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
+```
+
+Binder bounds (`T: Num`) remain the short form for unary classes; they desugar to
+the same constraint shape as `where Num<T>`.
+
 ### Syntax
 
 | Form | Meaning |
@@ -339,6 +350,7 @@ fn main() {
 | `fn id<T>(T x) -> T` | Unconstrained type parameter `T` |
 | `fn add<T: Num>(T a, T b) -> T` | `T` must satisfy the `Num` bound |
 | `fn both<T: Num + Eq>(T x) -> T` | Multiple bounds (`+`) |
+| `fn f<A, B>(A x) -> B where Convert<A, B>` | Multi-param (or unary) `where` constraint |
 
 Call-site strategy:
 

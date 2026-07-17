@@ -750,10 +750,7 @@ impl Checker {
                     (class.to_string(), (*method).to_string()),
                     Scheme::poly(
                         vec![var],
-                        vec![Constraint {
-                            var,
-                            class: class.to_string(),
-                        }],
+                        vec![Constraint::unary(class, var)],
                         ty,
                     ),
                 );
@@ -765,10 +762,7 @@ impl Checker {
             ("Show".to_string(), "show".to_string()),
             Scheme::poly(
                 vec![var],
-                vec![Constraint {
-                    var,
-                    class: "Show".to_string(),
-                }],
+                vec![Constraint::unary("Show", var)],
                 Ty::Fun(Box::new(Ty::Var(var)), Box::new(string())),
             ),
         );
@@ -1740,6 +1734,7 @@ impl Checker {
                 type_params,
                 args,
                 returns,
+                where_constraints,
                 body,
             } => {
                 self.infer_function(
@@ -1747,6 +1742,7 @@ impl Checker {
                     type_params,
                     args,
                     returns.as_ref(),
+                    where_constraints,
                     body,
                     &range,
                     None,
@@ -2056,13 +2052,11 @@ impl Checker {
                     class_kinds.push(kind);
                 }
                 self.type_params_in_scope.push(param_frame);
-                let class_constraints: Vec<Constraint> = param_vars
-                    .iter()
-                    .map(|var| Constraint {
-                        var: *var,
-                        class: name.to_string(),
-                    })
-                    .collect();
+                // ONE constraint over all class params (multi-param ready).
+                let class_constraints: Vec<Constraint> = vec![Constraint {
+                    class: name.to_string(),
+                    args: param_vars.iter().map(|v| Ty::Var(*v)).collect(),
+                }];
                 for method in methods {
                     if let Expression::Function {
                         name: method_name,
@@ -2195,27 +2189,45 @@ impl Checker {
                             type_params,
                             args,
                             returns,
+                            where_constraints,
                             body,
                             is_coro,
                             ..
-                        } => Some((*name, type_params.as_slice(), args, returns, body, *is_coro)),
+                        } => Some((
+                            *name,
+                            type_params.as_slice(),
+                            args,
+                            returns,
+                            where_constraints.as_slice(),
+                            body,
+                            *is_coro,
+                        )),
                         Expression::Method(_, body) => match body.1.as_ref() {
                             Expression::Function {
                                 name,
                                 type_params,
                                 args,
                                 returns,
+                                where_constraints,
                                 body,
                                 is_coro,
                                 ..
-                            } => {
-                                Some((*name, type_params.as_slice(), args, returns, body, *is_coro))
-                            }
+                            } => Some((
+                                *name,
+                                type_params.as_slice(),
+                                args,
+                                returns,
+                                where_constraints.as_slice(),
+                                body,
+                                *is_coro,
+                            )),
                             _ => None,
                         },
                         _ => None,
                     };
-                    if let Some((mname, mparams, margs, returns, body, is_coro)) = maybe_fn {
+                    if let Some((mname, mparams, margs, returns, where_cs, body, is_coro)) =
+                        maybe_fn
+                    {
                         // Build a unique FQN for this instance method.
                         let fqn = format!(
                             "{}__{}__{}",
@@ -2235,6 +2247,7 @@ impl Checker {
                             mparams,
                             margs,
                             returns.as_ref(),
+                            where_cs,
                             body,
                             &m.0.into_range(),
                             None,
@@ -2584,7 +2597,9 @@ impl Checker {
             if self
                 .active_constraints
                 .iter()
-                .any(|constraint| constraint.var == var && constraint.class == class)
+                .any(|constraint| {
+                    constraint.class == class && constraint.is_unary_on(var)
+                })
             {
                 self.record_bound_operator(id, &range, var, class, method);
             } else if self
@@ -2635,7 +2650,7 @@ impl Checker {
             let has_num = self
                 .active_constraints
                 .iter()
-                .any(|c| c.var == *v && c.class == "Num");
+                .any(|c| c.class == "Num" && c.is_unary_on(*v));
             if !has_num {
                 // Check if the var appears in any in-scope type param frame.
                 let in_scope = self
@@ -3039,14 +3054,18 @@ impl Checker {
         let constraints = constraints
             .iter()
             .map(|c| Constraint {
-                var: mapping.get(&c.var).copied().unwrap_or(c.var),
                 class: c.class.clone(),
+                args: c
+                    .args
+                    .iter()
+                    .map(|a| super::env::substitute_vars(a, &mapping))
+                    .collect(),
             })
             .collect();
         (body, constraints)
     }
 
-    fn skolemize_forall_ty(&mut self, ty: &Ty) -> (Ty, Vec<(String, String)>) {
+    fn skolemize_forall_ty(&mut self, ty: &Ty) -> (Ty, Vec<Constraint>) {
         let Ty::Forall {
             bounds,
             constraints,
@@ -3057,20 +3076,17 @@ impl Checker {
         };
 
         let mut subst = Subst::empty();
-        let mut skolem_names = HashMap::new();
         for bound in bounds {
             let fresh = self.counter.fresh();
             let name = format!("$forall{}", fresh.raw());
-            skolem_names.insert(*bound, name.clone());
             subst.insert(*bound, Ty::Con(name));
         }
         let body = apply_ty(&subst, body);
         let constraints = constraints
             .iter()
-            .filter_map(|c| {
-                skolem_names
-                    .get(&c.var)
-                    .map(|name| (name.clone(), c.class.clone()))
+            .map(|c| Constraint {
+                class: c.class.clone(),
+                args: c.args.iter().map(|a| apply_ty(&subst, a)).collect(),
             })
             .collect();
         (body, constraints)
@@ -3112,57 +3128,71 @@ impl Checker {
         };
 
         for constraint in candidate_constraints {
-            let resolved = apply_ty_prune(&local, &Ty::Var(constraint.var));
-            match resolved {
-                Ty::Con(name) if name.starts_with("$forall") => {
-                    let covered = expected_constraints
-                        .iter()
-                        .any(|(skolem, class)| skolem == &name && class == &constraint.class);
-                    if !covered {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "Cannot pass constrained polymorphic value where unconstrained `forall` is expected"
-                            ),
-                            arg_expr
-                                .map(|arg| arg.0.into_range())
-                                .unwrap_or_else(|| range.clone()),
-                        ));
-                    }
+            let resolved_args: Vec<Ty> = constraint
+                .args
+                .iter()
+                .map(|a| apply_ty_prune(&local, a))
+                .collect();
+            let all_skolems = resolved_args.iter().all(|a| {
+                matches!(a, Ty::Con(name) if name.starts_with("$forall"))
+            });
+            let all_open = resolved_args.iter().all(|a| matches!(a, Ty::Var(_)));
+            let any_open = resolved_args.iter().any(|a| matches!(a, Ty::Var(_)));
+
+            if all_skolems {
+                let covered = expected_constraints.iter().any(|ec| {
+                    ec.class == constraint.class
+                        && ec.args.len() == resolved_args.len()
+                        && ec.args.iter().zip(resolved_args.iter()).all(|(a, b)| a == b)
+                });
+                if !covered {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "Cannot pass constrained polymorphic value where unconstrained `forall` is expected"
+                        ),
+                        arg_expr
+                            .map(|arg| arg.0.into_range())
+                            .unwrap_or_else(|| range.clone()),
+                    ));
                 }
-                Ty::Var(v) => {
-                    let covered = self
-                        .active_constraints
-                        .iter()
-                        .any(|ac| ac.var == v && ac.class == constraint.class);
-                    if !covered {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("Cannot satisfy constraint `{}`", constraint.class),
-                            arg_expr
-                                .map(|arg| arg.0.into_range())
-                                .unwrap_or_else(|| range.clone()),
-                        ));
-                    }
+            } else if any_open {
+                let needed = Constraint {
+                    class: constraint.class.clone(),
+                    args: resolved_args,
+                };
+                if !self.constraint_is_covered(&needed) {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot satisfy constraint `{}`", constraint.class),
+                        arg_expr
+                            .map(|arg| arg.0.into_range())
+                            .unwrap_or_else(|| range.clone()),
+                    ));
                 }
-                concrete => {
-                    let lookup = self.instance_lookup_args(&constraint.class, &concrete);
-                    if self
-                        .generics
-                        .find_instance(&constraint.class, &lookup)
-                        .is_none()
-                    {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!(
-                                "No instance for `{}` of type `{}`",
-                                constraint.class, concrete
-                            ),
-                            arg_expr
-                                .map(|arg| arg.0.into_range())
-                                .unwrap_or_else(|| range.clone()),
-                        ));
-                    }
+                let _ = all_open;
+            } else {
+                let lookup = self.instance_lookup_args(&constraint.class, &resolved_args);
+                if self
+                    .generics
+                    .find_instance(&constraint.class, &lookup)
+                    .is_none()
+                {
+                    let pretty = resolved_args
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "No instance for `{}<{}>`",
+                            constraint.class, pretty
+                        ),
+                        arg_expr
+                            .map(|arg| arg.0.into_range())
+                            .unwrap_or_else(|| range.clone()),
+                    ));
                 }
             }
         }
@@ -3184,10 +3214,7 @@ impl Checker {
             bounds.push(var);
             kinds.push(kind);
             for bound in &tp.bounds {
-                constraints.push(Constraint {
-                    var,
-                    class: bound.to_string(),
-                });
+                constraints.push(Constraint::unary(*bound, var));
             }
         }
 
@@ -3284,17 +3311,13 @@ impl Checker {
 
     /// Discharge freshened typeclass constraints from a generic call site.
     ///
-    /// For each freshened constraint `c` (a `(var, class)` pair returned by
-    /// [`instantiate_with_constraints`]):
+    /// For each freshened constraint `c` (returned by instantiate):
     ///
-    /// 1. Resolve `c.var` under the current substitution to get the concrete
-    ///    type the caller supplied.
-    /// 2. If still a free type variable, check whether the enclosing function
-    ///    is itself generic with the same class bound on that variable — if so,
-    ///    silently propagate (the outer call site will discharge it).
-    ///    Otherwise emit a diagnostic.
-    /// 3. For a concrete type, look for a registered instance via
-    ///    `self.generics.find_instance`. If none exists, emit a diagnostic.
+    /// 1. Resolve every argument under the current substitution.
+    /// 2. If any arg is still open, check whether an active constraint covers
+    ///    the whole predicate (same class + args) — if so, forward the dict.
+    /// 3. When all args are concrete, look up `find_instance` with the N-ary
+    ///    arg list (HKT heads rewritten via [`instance_lookup_args`]).
     ///
     /// Matched instances are stored by call-site [`NodeId`] for codegen.
     fn discharge_constraints(
@@ -3304,23 +3327,20 @@ impl Checker {
         range: &Range<usize>,
     ) {
         for c in constraints {
-            let resolved = apply_ty_prune(&self.subst, &Ty::Var(c.var));
-            match &resolved {
-                Ty::Var(v) => {
-                    // Still open — acceptable only if the enclosing function
-                    // has the same constraint on that variable (propagation).
-                    let covered = self
-                        .active_constraints
-                        .iter()
-                        .any(|ac| ac.var == *v && ac.class == c.class);
-                    if !covered {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("Cannot satisfy constraint `{}`", c.class),
-                            range.clone(),
-                        ));
-                    } else if let Some(call_id) = call_id
-                        && let Some(dict_index) = self.user_dict_index(*v, &c.class)
+            let resolved_args: Vec<Ty> = c
+                .args
+                .iter()
+                .map(|a| apply_ty_prune(&self.subst, a))
+                .collect();
+            let any_open = resolved_args.iter().any(|a| matches!(a, Ty::Var(_)));
+            if any_open {
+                let needed = Constraint {
+                    class: c.class.clone(),
+                    args: resolved_args.clone(),
+                };
+                if self.constraint_is_covered(&needed) {
+                    if let Some(call_id) = call_id
+                        && let Some(dict_index) = self.dict_index_for(&needed)
                     {
                         self.call_site_forward_dicts
                             .entry(call_id)
@@ -3331,32 +3351,124 @@ impl Checker {
                             .or_default()
                             .push(dict_index);
                     }
+                    continue;
                 }
-                concrete => {
-                    let lookup = self.instance_lookup_args(&c.class, concrete);
-                    if let Some(instance) = self.generics.find_instance(&c.class, &lookup) {
-                        if let Some(call_id) = call_id {
-                            self.call_site_dicts
-                                .entry(call_id)
-                                .or_default()
-                                .push(instance.clone());
-                        }
-                    } else {
-                        self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError,
-                            format!("No instance for `{}` of type `{}`", c.class, concrete),
-                            range.clone(),
-                        ));
+                // Partially open (e.g. `Convert<int, β>`): unify against
+                // registered instances so free args get pinned by the match.
+                if let Some(instance) =
+                    self.find_unifying_instance(&c.class, &resolved_args)
+                {
+                    if let Some(call_id) = call_id {
+                        self.call_site_dicts
+                            .entry(call_id)
+                            .or_default()
+                            .push(instance.clone());
                     }
+                } else {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot satisfy constraint `{}`", needed),
+                        range.clone(),
+                    ));
+                }
+            } else {
+                let lookup = self.instance_lookup_args(&c.class, &resolved_args);
+                if let Some(instance) = self.generics.find_instance(&c.class, &lookup) {
+                    if let Some(call_id) = call_id {
+                        self.call_site_dicts
+                            .entry(call_id)
+                            .or_default()
+                            .push(instance.clone());
+                    }
+                } else {
+                    let pretty = Constraint {
+                        class: c.class.clone(),
+                        args: resolved_args,
+                    };
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!("No instance for `{}`", pretty),
+                        range.clone(),
+                    ));
                 }
             }
         }
     }
 
-    fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
-        self.active_constraints
+    /// Find an instance of `class` whose args unify with `wanted` (open vars
+    /// in `wanted` may be bound by the match). Used for multi-param discharge
+    /// when some constraint args are still free (e.g. `Convert<int, β>`).
+    fn find_unifying_instance(&mut self, class: &str, wanted: &[Ty]) -> Option<InstanceDef> {
+        let wanted_lookup = self.instance_lookup_args(class, wanted);
+        let candidates: Vec<_> = self
+            .generics
+            .instances
             .iter()
-            .position(|constraint| constraint.var == var && constraint.class == class)
+            .filter(|inst| inst.class == class && inst.args.len() == wanted_lookup.len())
+            .cloned()
+            .collect();
+        for inst in candidates {
+            let mut ok = true;
+            let mut local = self.subst.clone();
+            for (have, need) in inst.args.iter().zip(wanted_lookup.iter()) {
+                // Bind open vars in `need` to the concrete instance arg.
+                match unify_with(&local, need, have) {
+                    Ok(s) => local = s,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                self.subst = compose(&local, &self.subst);
+                return Some(inst);
+            }
+        }
+        None
+    }
+
+    /// True when some active constraint matches `needed` under the current subst.
+    fn constraint_is_covered(&self, needed: &Constraint) -> bool {
+        let needed_args: Vec<Ty> = needed
+            .args
+            .iter()
+            .map(|a| apply_ty_prune(&self.subst, a))
+            .collect();
+        self.active_constraints.iter().any(|ac| {
+            if ac.class != needed.class || ac.args.len() != needed_args.len() {
+                return false;
+            }
+            ac.args
+                .iter()
+                .zip(needed_args.iter())
+                .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
+        })
+    }
+
+    fn dict_index_for(&self, needed: &Constraint) -> Option<usize> {
+        let needed_args: Vec<Ty> = needed
+            .args
+            .iter()
+            .map(|a| apply_ty_prune(&self.subst, a))
+            .collect();
+        self.active_constraints.iter().position(|ac| {
+            ac.class == needed.class
+                && ac.args.len() == needed_args.len()
+                && ac
+                    .args
+                    .iter()
+                    .zip(needed_args.iter())
+                    .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
+        })
+    }
+
+    fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
+        self.active_constraints.iter().position(|constraint| {
+            constraint.class == class
+                && (constraint.is_unary_on(var)
+                    || constraint.primary_var() == Some(var))
+        })
     }
 
     fn bound_method_candidates(
@@ -3367,7 +3479,12 @@ impl Checker {
         self.active_constraints
             .iter()
             .enumerate()
-            .filter(|(_, constraint)| receiver_var.is_none_or(|var| constraint.var == var))
+            .filter(|(_, constraint)| {
+                receiver_var.is_none_or(|var| {
+                    constraint.primary_var() == Some(var)
+                        || constraint.args.iter().any(|a| matches!(a, Ty::Var(v) if *v == var))
+                })
+            })
             .filter_map(|(dict_index, constraint)| {
                 let class_def = self.generics.typeclass(&constraint.class)?;
                 let method_slot = class_def
@@ -3496,20 +3613,23 @@ impl Checker {
     }
 
     /// For HKT class constraints, look up instances by constructor head
-    /// (`Option`), not by applied types (`Option<int>`).
-    fn instance_lookup_args(&self, class: &str, concrete: &Ty) -> Vec<Ty> {
+    /// (`Option`), not by applied types (`Option<int>`). Multi-param classes
+    /// pass every resolved argument through unchanged (except HKT heads).
+    fn instance_lookup_args(&self, class: &str, args: &[Ty]) -> Vec<Ty> {
         let class_is_hkt = self
             .generics
             .typeclass(class)
             .map(|c| c.is_unary_hkt())
             .unwrap_or(false);
         if class_is_hkt {
-            match concrete {
-                Ty::App(head, _) => vec![head.as_ref().clone()],
-                other => vec![other.clone()],
-            }
+            args.iter()
+                .map(|concrete| match concrete {
+                    Ty::App(head, _) => head.as_ref().clone(),
+                    other => other.clone(),
+                })
+                .collect()
         } else {
-            vec![concrete.clone()]
+            args.to_vec()
         }
     }
 
@@ -3942,6 +4062,7 @@ impl Checker {
                     is_coro,
                     args,
                     returns,
+                    where_constraints,
                     body: func_body,
                     ..
                 } = body.1.as_ref()
@@ -3951,6 +4072,7 @@ impl Checker {
                         &[], // impl methods don't have free type params
                         args,
                         returns.as_ref(),
+                        where_constraints,
                         func_body,
                         &method.0.into_range(),
                         Some(&owner_ty),
@@ -3984,6 +4106,7 @@ impl Checker {
         type_params: &[parser::ast::TypeParam],
         args: &Output,
         returns: Option<&Output>,
+        where_constraints: &[parser::ast::WhereConstraint],
         body: &Output,
         range: &Range<usize>,
         self_ty: Option<&Ty>,
@@ -4003,16 +4126,22 @@ impl Checker {
             param_frame.insert(tp.name.to_string(), var);
             param_vars.push(var);
             param_kinds.push(kind);
+            // Binder bounds `T: Num` desugar to unary constraints.
             for bound in &tp.bounds {
-                param_constraints.push(Constraint {
-                    var,
-                    class: bound.to_string(),
-                });
+                param_constraints.push(Constraint::unary(*bound, var));
             }
         }
 
         // Push param frame so parse_type_name resolves T → Var(id).
         self.type_params_in_scope.push(param_frame);
+        // `where Class<T1, T2>` constraints (parsed after returns).
+        for wc in where_constraints {
+            let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
+            param_constraints.push(Constraint {
+                class: wc.class.to_string(),
+                args,
+            });
+        }
         let prev_constraints_len = self.active_constraints.len();
         self.active_constraints
             .extend(param_constraints.iter().cloned());
@@ -5818,7 +5947,7 @@ impl Checker {
                     let has_show = self
                         .active_constraints
                         .iter()
-                        .any(|c| c.var == *v && c.class == "Show");
+                        .any(|c| c.class == "Show" && c.is_unary_on(*v));
                     if has_show {
                         self.record_bound_display(arg_range, *v);
                     } else {
@@ -6975,8 +7104,8 @@ mod tests {
         };
         assert_eq!(bounds.len(), 1);
         assert_eq!(constraints.len(), 1);
-        assert_eq!(constraints[0].var, bounds[0]);
         assert_eq!(constraints[0].class, "Num");
+        assert!(constraints[0].is_unary_on(bounds[0]));
         assert!(matches!(body.as_ref(), Ty::Fun(_, _)));
         assert!(format!("{}", param).starts_with("forall t"));
     }
@@ -9391,7 +9520,7 @@ fn main() { let r = add("a", "b"); }
         assert!(
             msgs.iter().any(|m| {
                 m.code() == Some(ErrorCode::GenericTypeError)
-                    && (m.message().contains("No instance for `Num`")
+                    && (m.message().contains("No instance for `Num")
                         || m.message().contains("Cannot satisfy"))
             }),
             "expected a Num constraint violation for string, got: {:?}",
@@ -9459,5 +9588,69 @@ fn main() { let r = outer(5); }
             "unexpected constraint errors for generic propagation: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    /// Multi-param typeclass + `where` clause discharges at a ground call site.
+    #[test]
+    fn multiparam_where_clause_discharges_at_call_site() {
+        let src = r#"
+typeclass Convert<A, B> { fn cast(A x) -> B; }
+impl Convert<int, int> { fn cast(int x) -> int { return x; } }
+fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
+fn main() { let y = apply_cast(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let dicts = c.all_call_site_dicts();
+        let has_convert = dicts.values().any(|instances| {
+            instances
+                .iter()
+                .any(|i| i.class == "Convert" && i.args == vec![int(), int()])
+        });
+        assert!(
+            has_convert,
+            "expected Convert<int, int> in call_site_dicts, got: {:?}",
+            dicts
+        );
+    }
+
+    /// Missing multi-param instance produces a diagnostic.
+    #[test]
+    fn multiparam_missing_instance_errors() {
+        let src = r#"
+typeclass Convert<A, B> { fn cast(A x) -> B; }
+fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
+fn main() { let y = apply_cast(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("No instance")
+                || m.message().contains("Convert")),
+            "expected missing-instance diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Binder `T: Num` still desugars to a unary Constraint.
+    #[test]
+    fn binder_bound_desugars_to_unary_constraint() {
+        let src = r#"
+fn add<T: Num>(T a, T b) -> T { return a + b; }
+"#;
+        let (c, _) = check(src);
+        let scheme = c.env().lookup("add").expect("add scheme");
+        assert_eq!(scheme.constraints.len(), 1);
+        assert_eq!(scheme.constraints[0].class, "Num");
+        assert_eq!(scheme.constraints[0].args.len(), 1);
+        assert!(matches!(
+            scheme.constraints[0].args[0],
+            Ty::Var(v) if scheme.bounds.contains(&v)
+        ));
     }
 }

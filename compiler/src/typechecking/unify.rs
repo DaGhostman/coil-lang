@@ -123,19 +123,37 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             let renamed_body2 = substitute_vars(&body2, &mapping);
             let mut normalized_c1 = c1
                 .iter()
-                .map(|c| (c.var, c.class.clone()))
+                .map(|c| {
+                    (
+                        c.class.clone(),
+                        c.args
+                            .iter()
+                            .map(|a| format!("{}", a))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                })
                 .collect::<Vec<_>>();
             let mut normalized_c2 = c2
                 .iter()
                 .map(|c| {
+                    let renamed_args: Vec<_> = c
+                        .args
+                        .iter()
+                        .map(|a| substitute_vars(a, &mapping))
+                        .collect();
                     (
-                        mapping.get(&c.var).copied().unwrap_or(c.var),
                         c.class.clone(),
+                        renamed_args
+                            .iter()
+                            .map(|a| format!("{}", a))
+                            .collect::<Vec<_>>()
+                            .join(","),
                     )
                 })
                 .collect::<Vec<_>>();
-            normalized_c1.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            normalized_c2.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            normalized_c1.sort();
+            normalized_c2.sort();
             if normalized_c1 != normalized_c2 {
                 return Err(UnifyError::Mismatch {
                     left: Ty::Forall {

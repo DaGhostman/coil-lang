@@ -440,4 +440,21 @@ mod tests {
         assert_eq!(method_fqns.get("add").unwrap(), "Num__int__add");
         assert_eq!(method_fqns.get("zero").unwrap(), "Num__default__zero");
     }
+
+    #[test]
+    fn find_instance_matches_multi_arg_class() {
+        let mut generics = Generics::new();
+        generics.instances.push(InstanceDef {
+            class: "Convert".to_string(),
+            args: vec![int(), int()],
+            method_fqns: HashMap::from([(
+                "cast".to_string(),
+                "Convert__int_int__cast".to_string(),
+            )]),
+        });
+
+        assert!(generics.find_instance("Convert", &[int(), int()]).is_some());
+        assert!(generics.find_instance("Convert", &[int(), float()]).is_none());
+        assert!(generics.find_instance("Convert", &[int()]).is_none());
+    }
 }

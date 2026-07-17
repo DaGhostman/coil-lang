@@ -606,17 +606,70 @@ impl<'pratt> Pratt<'pratt> {
             .delimited_by(op!("("), op!(")"))
     }
 
-    /// Parses the function *signature* (`async? fn Name<T>(args) -> ret`)
+    /// Parse one `where` constraint: `Convert<A, B>` or unary `Num<T>`.
+    fn where_constraint(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, ast::WhereConstraint<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
+        text::ident()
+            .padded()
+            .then(
+                self.type_annotation()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("<"), op!(">")),
+            )
+            .map(|(class, args)| ast::WhereConstraint { class, args })
+    }
+
+    /// Optional `where Class<T1, T2>, …` clause after a function's return type.
+    fn where_clause(
+        &self,
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        Vec<ast::WhereConstraint<'pratt>>,
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+           + 'pratt {
+        keyword!("where")
+            .ignore_then(
+                self.where_constraint()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .at_least(1)
+                    .collect(),
+            )
+            .or_not()
+            .map(|opt| opt.unwrap_or_default())
+    }
+
+    /// Parses the function *signature* (`async? fn Name<T>(args) -> ret where …`)
     /// without consuming the body block.  Used by `typeclass_decl` to parse
     /// sig-only methods that end in `;`.
     ///
-    /// Returns the tuple `(((((is_coro, _), name), type_params), args), returns)`.
+    /// Returns
+    /// `((((((is_coro, _), name), type_params), args), returns), where_constraints)`.
     fn func_sig(
         &self,
     ) -> impl Parser<
         'pratt,
         &'pratt str,
-        (((((Option<&'pratt str>, &'pratt str), &'pratt str), Vec<TypeParam<'pratt>>), Output<'pratt>), Option<Output<'pratt>>),
+        (
+            (
+                (
+                    (
+                        ((Option<&'pratt str>, &'pratt str), &'pratt str),
+                        Vec<TypeParam<'pratt>>,
+                    ),
+                    Output<'pratt>,
+                ),
+                Option<Output<'pratt>>,
+            ),
+            Vec<ast::WhereConstraint<'pratt>>,
+        ),
         extra::Err<Rich<'pratt, char>>,
     > + Clone
            + 'pratt {
@@ -627,6 +680,7 @@ impl<'pratt> Pratt<'pratt> {
             .then(self.type_param_list())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
+            .then(self.where_clause())
     }
 
     fn func<
@@ -645,20 +699,25 @@ impl<'pratt> Pratt<'pratt> {
             .then(self.type_param_list())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
+            .then(self.where_clause())
             .then(self.block(stmt))
-            .map_with(|((((((is_coro, _), name), type_params), args), returns), body), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::Function {
-                        name,
-                        is_coro: is_coro.is_some(),
-                        type_params,
-                        args,
-                        returns,
-                        body,
-                    }),
-                )
-            })
+            .map_with(
+                |(((((((is_coro, _), name), type_params), args), returns), where_constraints), body),
+                 e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Function {
+                            name,
+                            is_coro: is_coro.is_some(),
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body,
+                        }),
+                    )
+                },
+            )
     }
 
     fn yield_expr_<
@@ -1397,21 +1456,23 @@ impl<'pratt> Pratt<'pratt> {
         let sig_only = self
             .func_sig()
             .then_ignore(op!(";"))
-            .map_with(|(((((is_coro, _), name), type_params), args), returns), e| {
-                let empty_block =
-                    (e.span(), Box::new(Expression::Block(vec![])));
-                (
-                    e.span(),
-                    Box::new(Expression::Function {
-                        name,
-                        is_coro: is_coro.is_some(),
-                        type_params,
-                        args,
-                        returns,
-                        body: empty_block,
-                    }),
-                )
-            });
+            .map_with(
+                |((((((is_coro, _), name), type_params), args), returns), where_constraints), e| {
+                    let empty_block = (e.span(), Box::new(Expression::Block(vec![])));
+                    (
+                        e.span(),
+                        Box::new(Expression::Function {
+                            name,
+                            is_coro: is_coro.is_some(),
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body: empty_block,
+                        }),
+                    )
+                },
+            );
 
         // A method with a full block body (the default implementation).
         let default_method = self.func(stmt);
@@ -3595,6 +3656,54 @@ mod tests_generics {
             }
             other => panic!("expected Function, got {:?}", other),
         }
+    }
+
+    // ── where clause ──────────────────────────────────────────────────────────
+
+    /// `fn f<A, B>(A x) -> B where Convert<A, B> {}` — multi-param where.
+    #[test]
+    fn fn_with_multiparam_where_clause_parses() {
+        match decl_ast!("fn f<A, B>(A x) -> B where Convert<A, B> {}") {
+            Expression::Function {
+                name,
+                type_params,
+                where_constraints,
+                ..
+            } => {
+                assert_eq!(name, "f");
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(where_constraints.len(), 1);
+                assert_eq!(where_constraints[0].class, "Convert");
+                assert_eq!(where_constraints[0].args.len(), 2);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// Unary `where Num<T>` parses alongside binder bounds remaining empty.
+    #[test]
+    fn fn_with_unary_where_clause_parses() {
+        match decl_ast!("fn g<T>(T x) -> T where Num<T> {}") {
+            Expression::Function {
+                where_constraints, ..
+            } => {
+                assert_eq!(where_constraints.len(), 1);
+                assert_eq!(where_constraints[0].class, "Num");
+                assert_eq!(where_constraints[0].args.len(), 1);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// Display round-trips a multi-param where clause.
+    #[test]
+    fn fn_with_where_clause_display_round_trips() {
+        let s = stmt!("fn f<A, B>(A x) -> B where Convert<A, B> {}");
+        assert!(
+            s.contains("where Convert<A, B>"),
+            "expected where clause in display, got: {s}"
+        );
+        assert!(s.starts_with("fn f<A, B>"), "got: {s}");
     }
 
     // ── enum with type params ──────────────────────────────────────────────────
