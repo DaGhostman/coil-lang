@@ -319,13 +319,13 @@ Call-site strategy:
 | Situation | Runtime |
 |-----------|---------|
 | Ground call with only **builtin** bounds (`Num`/`Ord`/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
-| Shared body / open type params with builtin bounds | `DynAdd` / friends on boxed values |
-| Ground or shared call with **user** typeclass bounds | **Dictionary passing** — see below |
+| Shared body / open type params with any bound | **Dictionary passing** — see below |
+| Ground or shared call with user typeclass bounds | **Dictionary passing** — see below |
 | Escaped generic fn value (`let f = id;`) | `MakePolyFn` + `CallIndirect` |
 
 ### Dictionary passing
 
-Constrained calls that are not monomorphized append one dictionary per **user** typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets in declaration order. The callee reserves trailing locals `__dict0`, `__dict1`, …, loads the matching method slot with `Index`, and invokes it with `CallIndirect`. A generic calling another generic with the same open bound forwards its existing dictionary. Builtin classes do **not** receive dictionaries — they keep using `Dyn*`.
+Constrained calls that are not monomorphized append one dictionary per typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets in declaration order. The callee reserves trailing locals `__dict0`, `__dict1`, …, loads the matching method slot with `Index`, and invokes it with `CallIndirect`. A generic calling another generic with the same open bound forwards its existing dictionary. Builtin classes use compiler-generated primitive method thunks through this same ABI; ground monomorphization remains an optimization.
 
 ```0s
 typeclass Describable<T> { fn describe_val(T x) -> int; }

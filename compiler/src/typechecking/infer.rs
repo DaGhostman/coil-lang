@@ -23,6 +23,14 @@ pub struct BoundMethodCall {
     pub arity: usize,
     pub has_receiver: bool,
 }
+
+/// Code-generation recipe for an operator dispatched through a typeclass
+/// dictionary in a shared generic body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundOperatorCall {
+    pub dict_index: usize,
+    pub method_slot: usize,
+}
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
@@ -79,9 +87,13 @@ pub struct Checker {
     call_site_forward_dicts: HashMap<NodeId, Vec<usize>>,
     call_site_forward_dicts_by_span: HashMap<(usize, usize), Vec<usize>>,
 
-    /// Calls resolved through an active user typeclass constraint.
+    /// Calls resolved through an active typeclass constraint.
     bound_method_calls: HashMap<NodeId, BoundMethodCall>,
     bound_method_calls_by_span: HashMap<(usize, usize), BoundMethodCall>,
+
+    /// Operators resolved through an active typeclass constraint.
+    bound_operator_calls: HashMap<NodeId, BoundOperatorCall>,
+    bound_operator_calls_by_span: HashMap<(usize, usize), BoundOperatorCall>,
 
     /// Typeclass method signatures, keyed by `(class, method)`.
     typeclass_method_schemes: HashMap<(String, String), Scheme>,
@@ -268,6 +280,8 @@ impl Checker {
             call_site_forward_dicts_by_span: HashMap::new(),
             bound_method_calls: HashMap::new(),
             bound_method_calls_by_span: HashMap::new(),
+            bound_operator_calls: HashMap::new(),
+            bound_operator_calls_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
             type_aliases: vec![HashMap::new()],
             const_scopes: vec![HashSet::new()],
@@ -400,6 +414,8 @@ impl Checker {
         self.call_site_forward_dicts_by_span.clear();
         self.bound_method_calls.clear();
         self.bound_method_calls_by_span.clear();
+        self.bound_operator_calls.clear();
+        self.bound_operator_calls_by_span.clear();
         self.typeclass_method_schemes.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
@@ -425,6 +441,7 @@ impl Checker {
         self.generics.generic_type_ctors.clear();
         self.generics.register_builtin_type_ctors();
         self.generics.generic_fns.clear();
+        self.register_builtin_typeclass_method_schemes();
 
         // Built-in enums survive the per-program enum reset.
         self.register_builtin_enums();
@@ -622,6 +639,54 @@ impl Checker {
             .entry((expr.0.start, expr.0.end))
             .or_insert_with(|| ty.clone());
         ty
+    }
+
+    /// Register the compiler-owned signatures for the primitive classes.
+    ///
+    /// Their instances are emitted as bytecode thunks, but they participate in
+    /// lookup exactly like source-declared classes so method/UFCS and operator
+    /// dispatch share one dictionary ABI.
+    fn register_builtin_typeclass_method_schemes(&mut self) {
+        for (class, methods, returns_bool) in [
+            ("Num", &["add", "sub", "mul", "div"][..], false),
+            ("Ord", &["lt", "le", "gt", "ge"][..], true),
+            ("Eq", &["eq", "ne"][..], true),
+        ] {
+            for method in methods {
+                let var = self.counter.fresh();
+                let ty = Ty::Fun(
+                    Box::new(Ty::Var(var)),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(var)),
+                        Box::new(if returns_bool { boolean() } else { Ty::Var(var) }),
+                    )),
+                );
+                self.typeclass_method_schemes.insert(
+                    (class.to_string(), (*method).to_string()),
+                    Scheme::poly(
+                        vec![var],
+                        vec![Constraint {
+                            var,
+                            class: class.to_string(),
+                        }],
+                        ty,
+                    ),
+                );
+            }
+        }
+
+        let var = self.counter.fresh();
+        self.typeclass_method_schemes.insert(
+            ("Show".to_string(), "show".to_string()),
+            Scheme::poly(
+                vec![var],
+                vec![Constraint {
+                    var,
+                    class: "Show".to_string(),
+                }],
+                Ty::Fun(Box::new(Ty::Var(var)), Box::new(string())),
+            ),
+        );
     }
 
     /// Inner inference — does the actual dispatch but no caching.
@@ -836,17 +901,17 @@ impl Checker {
             }
 
             // ---- Arithmetic / bitwise ----
-            Expression::Add(lhs, rhs) => self.infer_arith(lhs, rhs, range, "+"),
-            Expression::Sub(lhs, rhs) => self.infer_arith(lhs, rhs, range, "-"),
-            Expression::Mul(lhs, rhs) => self.infer_arith(lhs, rhs, range, "*"),
-            Expression::Div(lhs, rhs) => self.infer_arith(lhs, rhs, range, "/"),
-            Expression::Mod(lhs, rhs) => self.infer_arith(lhs, rhs, range, "%"),
-            Expression::Pow(lhs, rhs) => self.infer_arith(lhs, rhs, range, "**"),
-            Expression::Shl(lhs, rhs) => self.infer_arith(lhs, rhs, range, "<<"),
-            Expression::Shr(lhs, rhs) => self.infer_arith(lhs, rhs, range, ">>"),
-            Expression::Xor(lhs, rhs) => self.infer_arith(lhs, rhs, range, "^"),
-            Expression::BitAnd(lhs, rhs) => self.infer_arith(lhs, rhs, range, "&"),
-            Expression::BitOr(lhs, rhs) => self.infer_arith(lhs, rhs, range, "|"),
+            Expression::Add(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "+"),
+            Expression::Sub(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "-"),
+            Expression::Mul(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "*"),
+            Expression::Div(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "/"),
+            Expression::Mod(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "%"),
+            Expression::Pow(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "**"),
+            Expression::Shl(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "<<"),
+            Expression::Shr(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, ">>"),
+            Expression::Xor(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "^"),
+            Expression::BitAnd(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "&"),
+            Expression::BitOr(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "|"),
 
             // ---- Logical ----
             Expression::And(lhs, rhs) | Expression::Or(lhs, rhs) => {
@@ -858,17 +923,12 @@ impl Checker {
             }
 
             // ---- Comparison ----
-            Expression::Eq(lhs, rhs)
-            | Expression::Neq(lhs, rhs)
-            | Expression::Le(lhs, rhs)
-            | Expression::Gt(lhs, rhs)
-            | Expression::Leq(lhs, rhs)
-            | Expression::Geq(lhs, rhs) => {
-                let lt = self.infer(lhs);
-                let rt = self.infer(rhs);
-                self.unify(&lt, &rt, &range, "comparison operands");
-                boolean()
-            }
+            Expression::Eq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Eq", "eq"),
+            Expression::Neq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Eq", "ne"),
+            Expression::Le(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "lt"),
+            Expression::Gt(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "gt"),
+            Expression::Leq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "le"),
+            Expression::Geq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "ge"),
 
             // ---- Prefix / postfix ----
             Expression::Negate(e) | Expression::Positive(e) => self.infer(e),
@@ -2127,6 +2187,18 @@ impl Checker {
         self.bound_method_calls_by_span.get(&(start, end))
     }
 
+    pub fn bound_operator_call_at(&self, id: NodeId) -> Option<&BoundOperatorCall> {
+        self.bound_operator_calls.get(&id)
+    }
+
+    pub fn bound_operator_call_for_span(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<&BoundOperatorCall> {
+        self.bound_operator_calls_by_span.get(&(start, end))
+    }
+
     pub fn typeclass_method_scheme(&self, class: &str, method: &str) -> Option<&Scheme> {
         self.typeclass_method_schemes
             .get(&(class.to_string(), method.to_string()))
@@ -2261,7 +2333,83 @@ impl Checker {
         last_ty
     }
 
-    fn infer_arith(&mut self, lhs: &Output, rhs: &Output, range: Range<usize>, op: &str) -> Ty {
+    fn record_bound_operator(
+        &mut self,
+        id: Option<NodeId>,
+        range: &Range<usize>,
+        var: TyVarId,
+        class: &str,
+        method: &str,
+    ) {
+        let Some(dict_index) = self.user_dict_index(var, class) else {
+            return;
+        };
+        let Some(class_def) = self.generics.typeclass(class) else {
+            return;
+        };
+        let Some(method_slot) = class_def
+            .methods
+            .iter()
+            .position(|candidate| candidate.name == method)
+        else {
+            return;
+        };
+        let hint = BoundOperatorCall {
+            dict_index,
+            method_slot,
+        };
+        if let Some(id) = id {
+            self.bound_operator_calls.insert(id, hint.clone());
+        }
+        self.bound_operator_calls_by_span
+            .insert((range.start, range.end), hint);
+    }
+
+    fn infer_comparison(
+        &mut self,
+        lhs: &Output,
+        rhs: &Output,
+        id: Option<NodeId>,
+        range: Range<usize>,
+        class: &str,
+        method: &str,
+    ) -> Ty {
+        let lt = self.infer(lhs);
+        let rt = self.infer(rhs);
+        let unified = self.unify(&lt, &rt, &range, "comparison operands");
+        if let Ty::Var(var) = apply_ty_prune(&self.subst, &unified) {
+            if self
+                .active_constraints
+                .iter()
+                .any(|constraint| constraint.var == var && constraint.class == class)
+            {
+                self.record_bound_operator(id, &range, var, class, method);
+            } else if self
+                .type_params_in_scope
+                .iter()
+                .any(|frame| frame.values().any(|&candidate| candidate == var))
+            {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Cannot compare generic type without bound `{}`",
+                        class
+                    ),
+                    range,
+                ));
+            }
+        }
+        boolean()
+    }
+
+    fn infer_arith(
+        &mut self,
+        lhs: &Output,
+        rhs: &Output,
+        id: Option<NodeId>,
+        range: Range<usize>,
+        op: &str,
+    ) -> Ty {
         let lt = self.infer(lhs);
         let rt = self.infer(rhs);
         if op == "+" {
@@ -2296,6 +2444,26 @@ impl Checker {
                         ErrorCode::GenericTypeError,
                         format!(
                             "Cannot apply `{}` to value of generic type without bound `Num`",
+                            op
+                        ),
+                        range,
+                    ));
+                }
+            } else {
+                let method = match op {
+                    "+" => Some("add"),
+                    "-" => Some("sub"),
+                    "*" => Some("mul"),
+                    "/" => Some("div"),
+                    _ => None,
+                };
+                if let Some(method) = method {
+                    self.record_bound_operator(id, &range, *v, "Num", method);
+                } else {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "Operator `{}` is not available through the `Num` dictionary",
                             op
                         ),
                         range,
@@ -2943,8 +3111,7 @@ impl Checker {
                             format!("Cannot satisfy constraint `{}`", c.class),
                             range.clone(),
                         ));
-                    } else if !Self::is_builtin_class(&c.class)
-                        && let Some(call_id) = call_id
+                    } else if let Some(call_id) = call_id
                         && let Some(dict_index) = self.user_dict_index(*v, &c.class)
                     {
                         self.call_site_forward_dicts
@@ -2982,7 +3149,6 @@ impl Checker {
     fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
         self.active_constraints
             .iter()
-            .filter(|constraint| !Self::is_builtin_class(&constraint.class))
             .position(|constraint| constraint.var == var && constraint.class == class)
     }
 
@@ -2993,7 +3159,6 @@ impl Checker {
     ) -> Vec<(usize, String, usize, Scheme)> {
         self.active_constraints
             .iter()
-            .filter(|constraint| !Self::is_builtin_class(&constraint.class))
             .enumerate()
             .filter(|(_, constraint)| receiver_var.is_none_or(|var| constraint.var == var))
             .filter_map(|(dict_index, constraint)| {
@@ -3623,17 +3788,12 @@ impl Checker {
             let scheme = Scheme::poly(param_vars, param_constraints.clone(), fun_ty.clone());
             self.env.insert_top(name.to_string(), scheme);
 
-            // Count how many user-defined typeclass dicts this function will
-            // need at the call site.  Built-in classes (Num, Ord, Eq, Show)
-            // are handled via Dyn* opcodes and do NOT require an explicit
-            // dictionary tuple.  We count unique (type-param, user-class)
-            // pairs so that multiple constraints on the same var each
-            // contribute one dict slot.
-            let user_dict_count = param_constraints
-                .iter()
-                .filter(|c| !Self::is_builtin_class(&c.class))
-                .count();
-            self.fn_dict_arity.insert(name.to_string(), user_dict_count);
+            // Every constraint is a trailing dictionary argument. Builtin
+            // classes use compiler-generated implementation thunks, while
+            // user classes use source-declared methods; their calling ABI is
+            // intentionally identical.
+            self.fn_dict_arity
+                .insert(name.to_string(), param_constraints.len());
         }
 
         fun_ty

@@ -160,6 +160,14 @@ impl Generics {
         }
     }
 
+    /// Build the compiler-generated FQN for a builtin instance method.
+    ///
+    /// Convention: `{Class}__{concrete_type_str}__{method}`
+    /// e.g. `Num__int__add`, `Ord__float__lt`, `Eq__string__eq`.
+    pub fn builtin_instance_fqn(class: &str, ty_str: &str, method: &str) -> String {
+        format!("{}__{}__{}", class, ty_str, method)
+    }
+
     /// Register the built-in typeclasses and their builtin instances.
     fn register_builtins(&mut self) {
         use super::ty::{boolean, float, int, string};
@@ -252,42 +260,80 @@ impl Generics {
             },
         );
 
-        // ---- builtin instances ----
-        for ty in [int(), float()] {
-            self.instances.push(InstanceDef {
-                class: "Num".into(),
-                args: vec![ty.clone()],
-                method_fqns: HashMap::new(),
-            });
-            self.instances.push(InstanceDef {
-                class: "Ord".into(),
-                args: vec![ty.clone()],
-                method_fqns: HashMap::new(),
-            });
-            self.instances.push(InstanceDef {
-                class: "Eq".into(),
-                args: vec![ty.clone()],
-                method_fqns: HashMap::new(),
-            });
-            self.instances.push(InstanceDef {
-                class: "Show".into(),
-                args: vec![ty],
-                method_fqns: HashMap::new(),
-            });
-        }
-        // string: Eq + Show
-        for class in ["Eq", "Show"] {
-            self.instances.push(InstanceDef {
-                class: class.into(),
-                args: vec![string()],
-                method_fqns: HashMap::new(),
-            });
-        }
-        // bool: Eq
+        // Helper: build method_fqns map for an instance.
+        let make_fqns = |class: &str, ty_str: &str, methods: &[&str]| -> HashMap<String, String> {
+            methods
+                .iter()
+                .map(|m| {
+                    (
+                        m.to_string(),
+                        Self::builtin_instance_fqn(class, ty_str, m),
+                    )
+                })
+                .collect()
+        };
+
+        // ---- builtin instances: int ----
+        self.instances.push(InstanceDef {
+            class: "Num".into(),
+            args: vec![int()],
+            method_fqns: make_fqns("Num", "int", &["add", "sub", "mul", "div"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Ord".into(),
+            args: vec![int()],
+            method_fqns: make_fqns("Ord", "int", &["lt", "le", "gt", "ge"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Eq".into(),
+            args: vec![int()],
+            method_fqns: make_fqns("Eq", "int", &["eq", "ne"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Show".into(),
+            args: vec![int()],
+            method_fqns: make_fqns("Show", "int", &["show"]),
+        });
+
+        // ---- builtin instances: float ----
+        self.instances.push(InstanceDef {
+            class: "Num".into(),
+            args: vec![float()],
+            method_fqns: make_fqns("Num", "float", &["add", "sub", "mul", "div"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Ord".into(),
+            args: vec![float()],
+            method_fqns: make_fqns("Ord", "float", &["lt", "le", "gt", "ge"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Eq".into(),
+            args: vec![float()],
+            method_fqns: make_fqns("Eq", "float", &["eq", "ne"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Show".into(),
+            args: vec![float()],
+            method_fqns: make_fqns("Show", "float", &["show"]),
+        });
+
+        // ---- string: Eq + Show ----
+        self.instances.push(InstanceDef {
+            class: "Eq".into(),
+            args: vec![string()],
+            method_fqns: make_fqns("Eq", "string", &["eq", "ne"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Show".into(),
+            args: vec![string()],
+            method_fqns: make_fqns("Show", "string", &["show"]),
+        });
+
+        // ---- bool: Eq ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
             args: vec![boolean()],
-            method_fqns: HashMap::new(),
+            method_fqns: make_fqns("Eq", "bool", &["eq", "ne"]),
         });
     }
 

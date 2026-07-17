@@ -834,10 +834,36 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
     }
 
+    /// Lower an operator selected by HM inference to the uniform dictionary
+    /// calling convention: two boxed values, the hidden trailing dictionary,
+    /// then its method entry loaded from the dictionary tuple.
+    fn emit_bound_operator_call(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        lhs: &Output,
+        rhs: &Output,
+        dict_index: usize,
+        method_slot: usize,
+    ) -> bool {
+        let dict_name = format!("__dict{}", dict_index);
+        let Some(dict_slot) = self.lookup_slot(&dict_name) else {
+            return false;
+        };
+        bytecode.append(&mut self.do_compile(lhs));
+        bytecode.append(&mut self.do_compile(rhs));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
+        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
+        true
+    }
+
     /// Emit dictionary tuples for a non-monomorphized generic call site.
     ///
-    /// Convention: after value args, one `MakeTuple` per **user** typeclass
-    /// constraint (builtin Num/Ord/Eq/Show are skipped — they use `Dyn*`).
+    /// Convention: after value args, one `MakeTuple` per typeclass
+    /// constraint. Compiler-provided and source-provided instances use the
+    /// same dictionary layout.
     /// Each tuple holds method entry offsets in typeclass declaration order
     /// (`CodePtr <offset>`, or `CodePtr 0` if the FQN is not compiled yet).
     ///
@@ -882,9 +908,6 @@ impl Compiler {
 
         let mut dict_count = 0;
         for constraint in &scheme.constraints {
-            if Checker::is_builtin_class(&constraint.class) {
-                continue;
-            }
             let Some(concrete) = var_to_ty.get(&constraint.var) else {
                 continue;
             };
@@ -911,6 +934,99 @@ impl Compiler {
             dict_count += 1;
         }
         dict_count
+    }
+
+    /// Emit bytecode thunks for compiler-provided primitive instances.
+    ///
+    /// Shared generic bodies receive boxed type-parameter values, so numeric
+    /// thunks unbox their two arguments and re-box a type-parameter result.
+    /// Comparison methods return their concrete `bool` result directly. Every
+    /// thunk accepts the ordinary hidden trailing dictionary argument, even
+    /// though primitive implementations do not need to inspect it.
+    fn emit_builtin_dict_thunks(&mut self) {
+        use crate::typechecking::generics::Generics;
+
+        let emit = |compiler: &mut Self,
+                    class: &str,
+                    ty: &str,
+                    method: &str,
+                    tag: ValueTag,
+                    op: Instruction,
+                    boxes_result: bool| {
+            let fqn = Generics::builtin_instance_fqn(class, ty, method);
+            if compiler.functions.contains_key(&fqn) {
+                return;
+            }
+            compiler.functions.insert(fqn, compiler.bytecode.len());
+            for slot in 0..2 {
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+            }
+            compiler.bytecode.push(Byte::new(op));
+            if boxes_result {
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+            }
+            compiler.bytecode.push(Byte::new(Instruction::RETURN));
+        };
+
+        for (ty, tag, arithmetic, comparisons) in [
+            (
+                "int",
+                ValueTag::Int,
+                [
+                    ("add", Instruction::ADD),
+                    ("sub", Instruction::SUB),
+                    ("mul", Instruction::MUL),
+                    ("div", Instruction::DIV),
+                ],
+                [
+                    ("lt", Instruction::LE),
+                    ("le", Instruction::LEQ),
+                    ("gt", Instruction::GT),
+                    ("ge", Instruction::GEQ),
+                    ("eq", Instruction::EQ),
+                    ("ne", Instruction::NEQ),
+                ],
+            ),
+            (
+                "float",
+                ValueTag::Float,
+                [
+                    ("add", Instruction::ADDF),
+                    ("sub", Instruction::SUBF),
+                    ("mul", Instruction::MULF),
+                    ("div", Instruction::DIVF),
+                ],
+                [
+                    ("lt", Instruction::LEF),
+                    ("le", Instruction::LEQF),
+                    ("gt", Instruction::GTF),
+                    ("ge", Instruction::GEQF),
+                    ("eq", Instruction::EQ),
+                    ("ne", Instruction::NEQ),
+                ],
+            ),
+        ] {
+            for (method, op) in arithmetic {
+                emit(self, "Num", ty, method, tag, op, true);
+            }
+            for (method, op) in comparisons.iter().take(4) {
+                emit(self, "Ord", ty, method, tag, *op, false);
+            }
+            for (method, op) in comparisons.iter().skip(4) {
+                emit(self, "Eq", ty, method, tag, *op, false);
+            }
+        }
+        for (ty, tag) in [("string", ValueTag::String), ("bool", ValueTag::Bool)] {
+            emit(self, "Eq", ty, "eq", tag, Instruction::EQ, false);
+            emit(self, "Eq", ty, "ne", tag, Instruction::NEQ, false);
+        }
     }
 
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
@@ -3151,39 +3267,73 @@ impl Compiler {
                     .expect("BlockBuilder::finalize: all targeted labels bound");
             }
             Expression::Le(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::LEF
-                } else {
-                    Instruction::LE
-                }));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    )
+                {} else {
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float { Instruction::LEF } else { Instruction::LE }));
+                }
             }
             Expression::Gt(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::GTF
-                } else {
-                    Instruction::GT
-                }));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    )
+                {} else {
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float { Instruction::GTF } else { Instruction::GT }));
+                }
             }
             Expression::Leq(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::LEQF
-                } else {
-                    Instruction::LEQ
-                }));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    )
+                {} else {
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float { Instruction::LEQF } else { Instruction::LEQ }));
+                }
             }
             Expression::Geq(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::GEQF
-                } else {
-                    Instruction::GEQ
-                }));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    )
+                {} else {
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float { Instruction::GEQF } else { Instruction::GEQ }));
+                }
             }
             Expression::Eq(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    )
+                {} else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
+                }
             }
             Expression::Not(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NOT));
@@ -3200,9 +3350,14 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(lhs));
                     bytecode.append(&mut self.do_compile(rhs));
                     bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
-                } else if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
-                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(Instruction::DynAdd));
+                } else if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned()
+                {
+                    let _ = self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    );
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3213,9 +3368,14 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
-                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(Instruction::DynSub));
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned()
+                {
+                    let _ = self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    );
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3226,9 +3386,14 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
-                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
-                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(Instruction::DynMul));
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned()
+                {
+                    let _ = self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    );
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3252,9 +3417,14 @@ impl Compiler {
                 }
             }
             Expression::Div(lhs, rhs) => {
-                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
-                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(Instruction::DynDiv));
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned()
+                {
+                    let _ = self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    );
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3297,7 +3467,17 @@ impl Compiler {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::OR));
             }
             Expression::Neq(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                    )
+                {} else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
+                }
             }
             Expression::Integer(num) => bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
@@ -4485,6 +4665,7 @@ impl Compiler {
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
         let _program_ty = self.checker.check_program(ast);
+        self.emit_builtin_dict_thunks();
         self.mono_plan = monomorphize::plan_monomorphization(module, ast, &self.checker);
 
         let mut program = self.do_compile(ast);
@@ -6777,19 +6958,22 @@ print \"%i\", len(a); \
         assert!(has_99, "expected CONST 99 for the arm body");
     }
 
-    /// Codegen test B1-1: a generic `fn add<T: Num>(T a, T b) -> T { return a + b; }`
-    /// must emit `DynAdd` (not `ADD` or `ADDF`) because both operands are open type
-    /// variables at compile time.
+    /// A Num-constrained shared generic body dispatches through its trailing
+    /// dictionary rather than a legacy DynAdd opcode.
     #[test]
-    fn generic_add_emits_dyn_add() {
+    fn generic_add_emits_dictionary_indirect_call() {
         use common::Instruction;
         let (bc, _pool) =
             compile_src("fn add<T: Num>(T a, T b) -> T { return a + b; } fn main() { }");
         assert!(
             bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
-            "expected DynAdd for generic fn add<T: Num>; bytecode opcodes: {:?}",
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected CallIndirect for generic fn add<T: Num>; bytecode opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "new shared generic bodies must not emit DynAdd"
         );
     }
 
@@ -7039,12 +7223,10 @@ print \"%i\", len(a); \
         );
     }
 
-    /// Codegen test: A call to a generic function with a **builtin** typeclass
-    /// constraint (Num) must NOT emit any `MakeTuple` for a dict — builtin
-    /// classes use `Dyn*` opcodes and the arity must remain equal to the
-    /// number of value args.
+    /// Builtin constraints use the same tuple dictionary ABI as user-defined
+    /// constraints, with compiler-generated method thunks as entries.
     #[test]
-    fn builtin_num_constraint_does_not_emit_dict_tuple() {
+    fn builtin_num_constraint_emits_dict_tuple() {
         use common::Instruction;
         // Non-monomorphized call: use boxed arg path.
         let (bc, _pool) = compile_src(
@@ -7052,26 +7234,16 @@ print \"%i\", len(a); \
              fn caller<U: Num>(U x, U y) -> U { return add_generic(x, y); }",
         );
 
-        // Num is builtin → no MakeTuple for dicts.
-        // (There may still be MakeTuple for tuples in other parts of the program —
-        //  but this tiny program has none outside of dict emission.)
         let make_tuple_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
             .count();
-        assert_eq!(
-            make_tuple_count,
-            0,
-            "builtin Num constraint should not emit MakeTuple dict; got {}; opcodes: {:?}",
-            make_tuple_count,
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
-        );
+        assert_eq!(make_tuple_count, 0, "open Num evidence is forwarded, not rebuilt");
 
-        // Num uses DynAdd, not a dict.
         assert!(
             bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
-            "expected DynAdd for Num-constrained add; opcodes: {:?}",
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected dictionary CallIndirect for Num-constrained add; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
