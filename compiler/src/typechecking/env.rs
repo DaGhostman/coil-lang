@@ -155,6 +155,7 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
     let bounds: Vec<TyVarId> = ty_ftv.difference(&env_ftv).copied().collect();
     Scheme {
         bounds,
+        constraints: Vec::new(),
         ty: ty.clone(),
     }
 }
@@ -165,6 +166,9 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
 /// The fresh variables are minted in the order they appear in
 /// `scheme.bounds`, so two instantiations of the same scheme produce
 /// different but consistently-ordered substitutions.
+///
+/// Returns the instantiated type and freshened constraints (with new
+/// variable ids substituted).
 pub fn instantiate(scheme: &Scheme, counter: &mut TyVarCounter) -> Ty {
     let mapping: HashMap<TyVarId, TyVarId> = scheme
         .bounds
@@ -172,6 +176,29 @@ pub fn instantiate(scheme: &Scheme, counter: &mut TyVarCounter) -> Ty {
         .map(|&v| (v, counter.fresh()))
         .collect();
     substitute_vars(&scheme.ty, &mapping)
+}
+
+/// Like [`instantiate`], but also returns the freshened constraints.
+pub fn instantiate_with_constraints(
+    scheme: &Scheme,
+    counter: &mut TyVarCounter,
+) -> (Ty, Vec<super::ty::Constraint>) {
+    use super::ty::Constraint;
+    let mapping: HashMap<TyVarId, TyVarId> = scheme
+        .bounds
+        .iter()
+        .map(|&v| (v, counter.fresh()))
+        .collect();
+    let ty = substitute_vars(&scheme.ty, &mapping);
+    let constraints = scheme
+        .constraints
+        .iter()
+        .map(|c| Constraint {
+            var: mapping.get(&c.var).copied().unwrap_or(c.var),
+            class: c.class.clone(),
+        })
+        .collect();
+    (ty, constraints)
 }
 
 /// Walk `ty`, replacing every variable in `mapping` with its mapped
@@ -369,6 +396,7 @@ mod tests {
             "f",
             Scheme {
                 bounds: vec![TyVarId(0)],
+                constraints: vec![],
                 ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
             },
         );
@@ -460,6 +488,7 @@ mod tests {
         // ∀α. α -> α  ; instantiate should give β -> β for fresh β.
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
         let mut counter = TyVarCounter::new();
@@ -473,6 +502,7 @@ mod tests {
         // ∀α β. α -> β  ; instantiate gives γ -> δ.
         let s = Scheme {
             bounds: vec![TyVarId(0), TyVarId(1)],
+            constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         let mut counter = TyVarCounter::new();
@@ -489,6 +519,7 @@ mod tests {
         // let-polymorphism its power.
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
         let mut counter = TyVarCounter::new();
@@ -506,6 +537,7 @@ mod tests {
         // ∀α. (α -> α) -> α -> α
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            constraints: vec![],
             ty: Ty::Fun(
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),

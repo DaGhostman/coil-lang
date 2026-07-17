@@ -115,14 +115,25 @@ impl Ty {
     }
 }
 
-/// A type scheme: a type possibly quantified over some type variables.
+/// A single typeclass constraint on a quantified type variable.
+/// E.g. `T: Num` → `Constraint { var: α, class: "Num" }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Constraint {
+    pub var: TyVarId,
+    pub class: String,
+}
+
+/// A type scheme: a type possibly quantified over some type variables,
+/// with optional typeclass constraints on those variables.
 ///
-/// `Scheme { bounds: vec![], ty: Var(α) }` represents `α` (with no
-/// quantification; equivalently `∀α. α` if we later add `α` to `bounds`).
-/// `bounds` is reserved for future use (e.g. type-class constraints).
+/// `Scheme { bounds: vec![], constraints: vec![], ty: Var(α) }` represents
+/// `α` (monomorphic). `bounds` lists the universally quantified variables;
+/// `constraints` lists typeclass requirements on them (e.g. `T: Num`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
     pub bounds: Vec<TyVarId>,
+    /// Typeclass constraints on the quantified variables.
+    pub constraints: Vec<Constraint>,
     pub ty: Ty,
 }
 
@@ -131,8 +142,14 @@ impl Scheme {
     pub fn mono(ty: Ty) -> Self {
         Self {
             bounds: Vec::new(),
+            constraints: Vec::new(),
             ty,
         }
+    }
+
+    /// Build a polymorphic scheme with constraints.
+    pub fn poly(bounds: Vec<TyVarId>, constraints: Vec<Constraint>, ty: Ty) -> Self {
+        Self { bounds, constraints, ty }
     }
 }
 
@@ -401,6 +418,7 @@ mod tests {
     fn ftv_of_scheme_excludes_bounds() {
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            constraints: vec![],
             ty: v(0),
         };
         assert!(ftv_scheme(&scheme).is_empty());
@@ -410,6 +428,7 @@ mod tests {
     fn ftv_of_scheme_keeps_non_bound_vars() {
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            constraints: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         assert_eq!(ftv_scheme(&scheme), HashSet::from([TyVarId(1)]));
