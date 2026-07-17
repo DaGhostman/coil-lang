@@ -529,6 +529,35 @@ fn main() {
 
 ---
 
+### `examples/generic_enum.0s`
+
+**Demonstrates:** User generic enums — `enum Box<T> { Empty, Full(T) }` with construct/match typed as `Box<int>` (same machinery as builtin `Option` / `Result`).
+
+```0s
+enum Box<T> {
+    Empty,
+    Full(T),
+}
+
+fn unwrap(Box<int> b) -> int {
+    return match b {
+        Box::Empty => 0,
+        Box::Full(v) => v,
+    };
+}
+
+fn main() {
+    print "%i", unwrap(Box::Full(7));
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_enum.0s` |
+| **Output** | `7` |
+
+---
+
 ### `examples/generics.0s`
 
 **Demonstrates:** Generic functions with a `Num` typeclass bound — one `add<T: Num>` body used at `int` and `float` call sites.
@@ -912,6 +941,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
 | `generic_alias.0s` | Types | `7` |
+| `generic_enum.0s` | Enums / types | `7` |
 | `generics.0s` | Types | `7424.042` |
 | `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
 | `hkt_container.0s` | Types | `42` |

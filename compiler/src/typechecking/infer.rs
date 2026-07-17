@@ -43,8 +43,8 @@ pub struct BoundDisplayCall {
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty, string,
-    unit as unit_ty,
+    list, option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty,
+    schemaize_payload, string, subst_payload_params, unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
 
@@ -4353,6 +4353,26 @@ impl Checker {
                     tag_map.insert(vn.clone(), i as u32);
                 }
 
+                // Generic enums store payloads with `Con(param)` schema
+                // markers (same convention as builtin Option/Result) so
+                // construct/match can freshen independently per site.
+                let payloads = if pushed {
+                    let frame = self
+                        .type_params_in_scope
+                        .last()
+                        .expect("type-param frame just pushed");
+                    let var_to_name: HashMap<TyVarId, String> = frame
+                        .iter()
+                        .map(|(n, id)| (*id, n.clone()))
+                        .collect();
+                    payloads
+                        .iter()
+                        .map(|p| schemaize_payload(p, &var_to_name))
+                        .collect()
+                } else {
+                    payloads
+                };
+
                 self.enums.insert(name_str.clone(), variant_names);
                 self.enum_tags.insert(name_str.clone(), tag_map);
                 self.enum_payloads.insert(name_str.clone(), payloads);
@@ -4779,9 +4799,10 @@ impl Checker {
             .and_then(|a| a.get(tag as usize).copied())
             .unwrap_or(0);
 
-        // Polymorphic builtins: mint fresh payload vars so each
-        // construct site gets an independent Option<T> / Result<T,E>.
-        let (expected_payload, poly_sum_owner) = if common::is_poly_builtin_enum(&enum_str) {
+        // Polymorphic enums (builtin Option/Result or user
+        // `enum Box<T>`): mint fresh payload vars so each construct
+        // site gets an independent applied type.
+        let (expected_payload, poly_sum_owner) = if self.is_poly_enum(&enum_str) {
             let (payload, owner) = self.fresh_poly_construct_payload(&enum_str, &variant_str);
             (payload, Some(owner))
         } else {
@@ -4974,7 +4995,19 @@ impl Checker {
         }
     }
 
-    /// Fresh `Option`/`Result` payload + owning Sum for a construct site.
+    /// True when `name` is a polymorphic enum (builtin Option/Result
+    /// or a user enum registered in `generic_type_ctors`).
+    fn is_poly_enum(&self, name: &str) -> bool {
+        common::is_poly_builtin_enum(name)
+            || self.generics.generic_type_ctors.contains_key(name)
+    }
+
+    /// Fresh payload + owning type for a polymorphic construct site.
+    ///
+    /// Builtin Option/Result keep structural `Ty::Sum` owners (bridged
+    /// to `Ty::App` annotations via unify). User generic enums return
+    /// `Ty::App(Con(name), args)` so they unify directly with
+    /// annotations like `Box<int>`.
     fn fresh_poly_construct_payload(
         &mut self,
         enum_name: &str,
@@ -4988,8 +5021,9 @@ impl Checker {
             } else {
                 EnumVariantPayloadTy::Unit
             };
-            (payload, owner)
-        } else {
+            return (payload, owner);
+        }
+        if common::is_builtin_result_enum(enum_name) {
             let t = Ty::Var(self.counter.fresh());
             let e = Ty::Var(self.counter.fresh());
             let owner = result_ty(t.clone(), e.clone());
@@ -4998,12 +5032,41 @@ impl Checker {
             } else {
                 EnumVariantPayloadTy::Tuple(vec![e])
             };
-            (payload, owner)
+            return (payload, owner);
         }
+
+        // User generic enum: freshen schema payloads (`Con(param)`).
+        let params = self
+            .generics
+            .generic_type_ctors
+            .get(enum_name)
+            .cloned()
+            .unwrap_or_default();
+        let mut map = HashMap::new();
+        let mut args = Vec::with_capacity(params.len());
+        for p in &params {
+            let v = Ty::Var(self.counter.fresh());
+            args.push(v.clone());
+            map.insert(p.clone(), v);
+        }
+        let tag = self
+            .enum_tags
+            .get(enum_name)
+            .and_then(|t| t.get(variant_name).copied())
+            .unwrap_or(0);
+        let schema = self
+            .enum_payloads
+            .get(enum_name)
+            .and_then(|p| p.get(tag as usize).cloned())
+            .unwrap_or(EnumVariantPayloadTy::Unit);
+        let payload = subst_payload_params(&schema, &map);
+        let owner = Ty::App(Box::new(Ty::Con(enum_name.to_string())), args);
+        (payload, owner)
     }
 
     /// Payload type for a pattern arm: prefer the scrutinee Sum's
-    /// concrete payloads for poly builtins, else the registry.
+    /// concrete payloads for poly enums, else App-applied args, else
+    /// the registry schema.
     fn poly_or_registry_payload(
         &mut self,
         enum_name: &str,
@@ -5025,25 +5088,21 @@ impl Checker {
                 return Some(payload.clone());
             }
         }
-        if let Some(payload) = Self::poly_builtin_payload_from_app(enum_name, tag, &resolved) {
+        if let Some(payload) = self.poly_payload_from_app(enum_name, tag, &resolved) {
             return Some(payload);
         }
-        if common::is_poly_builtin_enum(enum_name) {
-            // Scrutinee not yet pinned — freshen a full Option/Result
-            // and unify so bindings share type vars with the scrutinee.
-            let owner = if common::is_builtin_option_enum(enum_name) {
-                option_app_ty(Ty::Var(self.counter.fresh()))
-            } else {
-                result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh()))
-            };
+        if self.is_poly_enum(enum_name) {
+            // Scrutinee not yet pinned — freshen an applied type and
+            // unify so bindings share type vars with the scrutinee.
+            let owner = self.fresh_poly_app_ty(enum_name);
             self.unify(
                 expected_ty,
                 &owner,
                 pattern_range,
-                "poly builtin pattern scrutinee",
+                "poly enum pattern scrutinee",
             );
             let resolved = apply_ty_prune(&self.subst, &owner);
-            if let Some(payload) = Self::poly_builtin_payload_from_app(enum_name, tag, &resolved) {
+            if let Some(payload) = self.poly_payload_from_app(enum_name, tag, &resolved) {
                 return Some(payload);
             }
         }
@@ -5052,7 +5111,34 @@ impl Checker {
             .and_then(|p| p.get(tag as usize).cloned())
     }
 
-    fn poly_builtin_payload_from_app(
+    /// Build `Enum<α, …>` with a fresh type variable per type param.
+    fn fresh_poly_app_ty(&mut self, enum_name: &str) -> Ty {
+        if common::is_builtin_option_enum(enum_name) {
+            return option_app_ty(Ty::Var(self.counter.fresh()));
+        }
+        if common::is_builtin_result_enum(enum_name) {
+            return result_app_ty(
+                Ty::Var(self.counter.fresh()),
+                Ty::Var(self.counter.fresh()),
+            );
+        }
+        let params = self
+            .generics
+            .generic_type_ctors
+            .get(enum_name)
+            .cloned()
+            .unwrap_or_default();
+        let args: Vec<Ty> = params
+            .iter()
+            .map(|_| Ty::Var(self.counter.fresh()))
+            .collect();
+        Ty::App(Box::new(Ty::Con(enum_name.to_string())), args)
+    }
+
+    /// Extract a variant payload from an applied poly enum type
+    /// (`Option<int>`, `Box<int>`, …).
+    fn poly_payload_from_app(
+        &self,
         enum_name: &str,
         tag: u32,
         ty: &Ty,
@@ -5087,9 +5173,22 @@ impl Checker {
                     _ => None,
                 }
             }
-            Ty::Constructor { owner, .. } => {
-                Self::poly_builtin_payload_from_app(enum_name, tag, owner)
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if name == enum_name)
+                    && self.generics.generic_type_ctors.contains_key(enum_name) =>
+            {
+                let param_names = self.generics.generic_type_ctors.get(enum_name)?;
+                if param_names.len() != args.len() {
+                    return None;
+                }
+                let mut map = HashMap::new();
+                for (p, a) in param_names.iter().zip(args.iter()) {
+                    map.insert(p.clone(), a.clone());
+                }
+                let schema = self.enum_payloads.get(enum_name)?.get(tag as usize)?;
+                Some(subst_payload_params(schema, &map))
             }
+            Ty::Constructor { owner, .. } => self.poly_payload_from_app(enum_name, tag, owner),
             _ => None,
         }
     }
@@ -5529,9 +5628,9 @@ impl Checker {
             Ty::Sum { variants, .. } => Some(variants.clone()),
             Ty::Constructor { owner, .. } => match owner.as_ref() {
                 Ty::Sum { variants, .. } => Some(variants.clone()),
-                other => Self::poly_builtin_variants_from_app(other),
+                other => self.poly_variants_from_app(other),
             },
-            other => Self::poly_builtin_variants_from_app(other),
+            other => self.poly_variants_from_app(other),
         };
 
         if let Some(variants) = variants {
@@ -5565,9 +5664,11 @@ impl Checker {
         }
     }
 
-    fn poly_builtin_variants_from_app(ty: &Ty) -> Option<Vec<(String, EnumVariantPayloadTy)>> {
+    /// Variant list for exhaustiveness from an applied poly enum type.
+    fn poly_variants_from_app(&self, ty: &Ty) -> Option<Vec<(String, EnumVariantPayloadTy)>> {
         match ty {
-            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
             {
                 let inner = args.first()?.clone();
                 Some(vec![
@@ -5575,7 +5676,8 @@ impl Checker {
                     ("Some".into(), EnumVariantPayloadTy::Tuple(vec![inner])),
                 ])
             }
-            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
             {
                 let ok = args.first()?.clone();
                 let err = args.get(1)?.clone();
@@ -5584,7 +5686,34 @@ impl Checker {
                     ("Err".into(), EnumVariantPayloadTy::Tuple(vec![err])),
                 ])
             }
-            Ty::Constructor { owner, .. } => Self::poly_builtin_variants_from_app(owner),
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if self.generics.generic_type_ctors.contains_key(name)) =>
+            {
+                let Ty::Con(enum_name) = con.as_ref() else {
+                    return None;
+                };
+                let param_names = self.generics.generic_type_ctors.get(enum_name)?;
+                if param_names.len() != args.len() {
+                    return None;
+                }
+                let mut map = HashMap::new();
+                for (p, a) in param_names.iter().zip(args.iter()) {
+                    map.insert(p.clone(), a.clone());
+                }
+                let names = self.enums.get(enum_name)?;
+                let payloads = self.enum_payloads.get(enum_name)?;
+                if names.len() != payloads.len() {
+                    return None;
+                }
+                Some(
+                    names
+                        .iter()
+                        .zip(payloads.iter())
+                        .map(|(n, p)| (n.clone(), subst_payload_params(p, &map)))
+                        .collect(),
+                )
+            }
+            Ty::Constructor { owner, .. } => self.poly_variants_from_app(owner),
             _ => None,
         }
     }
@@ -8434,6 +8563,39 @@ mod tests {
             Ty::App(Box::new(Ty::Con("Box".into())), vec![int()])
         );
         assert_eq!(*ret, int());
+    }
+
+    #[test]
+    fn generic_enum_construct_infers_box_int() {
+        let src = "enum Box<T> { Empty, Full(T) }
+                   fn main() { let x: Box<int> = Box::Full(7); }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let x_ty = c.codegen_var_type("x").expect("x should be recorded");
+        assert_eq!(
+            apply_ty_prune(c.subst(), x_ty),
+            Ty::App(Box::new(Ty::Con("Box".into())), vec![int()])
+        );
+    }
+
+    #[test]
+    fn generic_enum_match_binds_int_payload() {
+        let src = "enum Box<T> { Empty, Full(T) }
+                   fn main() {
+                       let x = Box::Full(7);
+                       let y = match x {
+                           Box::Empty => 0,
+                           Box::Full(v) => v,
+                       };
+                   }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        assert_eq!(
+            c.codegen_var_type("y").map(|t| apply_ty_prune(c.subst(), t)),
+            Some(int())
+        );
     }
 
     #[test]

@@ -174,9 +174,11 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             Ok(current)
         }
 
-        // Builtin Option/Result annotations are represented as `Ty::App`,
-        // while constructor owners and older inference paths may still be
-        // structural `Ty::Sum` values. Bridge only those compiler builtins.
+        // Poly enum annotations are `Ty::App` (Option/Result and user
+        // `enum Box<T>`). Constructor owners may still be structural
+        // `Ty::Sum` (builtins) — bridge those via payload extraction.
+        // User generic constructs use `Ty::App` owners and unify via the
+        // Constructor arm below (App ↔ owner).
         (app @ Ty::App(_, _), sum @ Ty::Sum { .. })
         | (sum @ Ty::Sum { .. }, app @ Ty::App(_, _)) => {
             match unify_builtin_app_sum(subst, &app, &sum) {
@@ -188,8 +190,9 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             }
         }
 
-        // Constructor values unify with their builtin App parent by
-        // unifying the App against the constructor's owner.
+        // Constructor values unify with an App parent by unifying the
+        // App against the constructor's owner (Sum for builtins, App
+        // for user generic enums).
         (app @ Ty::App(_, _), ctor @ Ty::Constructor { .. })
         | (ctor @ Ty::Constructor { .. }, app @ Ty::App(_, _)) => {
             let owner = match &ctor {

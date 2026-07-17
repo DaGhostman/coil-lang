@@ -386,6 +386,149 @@ pub fn record(fields: Vec<(String, Ty)>) -> Ty {
     Ty::Record { fields }
 }
 
+/// Substitute named type-parameter placeholders (`Ty::Con("T")`) in a type.
+///
+/// Used by polymorphic enum construct/match to freshen schema payloads
+/// stored with `Con(param)` markers into site-local type variables.
+pub fn subst_ty_params(ty: &Ty, params: &std::collections::HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::Con(name) => params.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Var(_) => ty.clone(),
+        Ty::Fun(a, b) => Ty::Fun(
+            Box::new(subst_ty_params(a, params)),
+            Box::new(subst_ty_params(b, params)),
+        ),
+        Ty::App(con, args) => Ty::App(
+            Box::new(subst_ty_params(con, params)),
+            args.iter().map(|a| subst_ty_params(a, params)).collect(),
+        ),
+        Ty::List(inner) => Ty::List(Box::new(subst_ty_params(inner, params))),
+        Ty::Sum { name, variants } => Ty::Sum {
+            name: name.clone(),
+            variants: variants
+                .iter()
+                .map(|(n, p)| (n.clone(), subst_payload_params(p, params)))
+                .collect(),
+        },
+        Ty::Constructor { owner, tag, arity } => Ty::Constructor {
+            owner: Box::new(subst_ty_params(owner, params)),
+            tag: *tag,
+            arity: *arity,
+        },
+        Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| subst_ty_params(t, params)).collect()),
+        Ty::Array { element, length } => Ty::Array {
+            element: Box::new(subst_ty_params(element, params)),
+            length: *length,
+        },
+        Ty::Record { fields } => Ty::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), subst_ty_params(t, params)))
+                .collect(),
+        },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => Ty::Forall {
+            bounds: bounds.clone(),
+            constraints: constraints.clone(),
+            body: Box::new(subst_ty_params(body, params)),
+        },
+    }
+}
+
+/// Substitute named type-parameter placeholders in a variant payload.
+pub fn subst_payload_params(
+    payload: &EnumVariantPayloadTy,
+    params: &std::collections::HashMap<String, Ty>,
+) -> EnumVariantPayloadTy {
+    match payload {
+        EnumVariantPayloadTy::Unit => EnumVariantPayloadTy::Unit,
+        EnumVariantPayloadTy::Tuple(tys) => EnumVariantPayloadTy::Tuple(
+            tys.iter().map(|t| subst_ty_params(t, params)).collect(),
+        ),
+        EnumVariantPayloadTy::Record(fields) => EnumVariantPayloadTy::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), subst_ty_params(t, params)))
+                .collect(),
+        ),
+    }
+}
+
+/// Rewrite in-scope type-parameter variables to `Ty::Con(name)` schema
+/// markers for storage in the enum payload registry.
+pub fn schemaize_ty(ty: &Ty, var_to_name: &std::collections::HashMap<TyVarId, String>) -> Ty {
+    match ty {
+        Ty::Var(id) => var_to_name
+            .get(id)
+            .map(|n| Ty::Con(n.clone()))
+            .unwrap_or_else(|| ty.clone()),
+        Ty::Con(_) => ty.clone(),
+        Ty::Fun(a, b) => Ty::Fun(
+            Box::new(schemaize_ty(a, var_to_name)),
+            Box::new(schemaize_ty(b, var_to_name)),
+        ),
+        Ty::App(con, args) => Ty::App(
+            Box::new(schemaize_ty(con, var_to_name)),
+            args.iter().map(|a| schemaize_ty(a, var_to_name)).collect(),
+        ),
+        Ty::List(inner) => Ty::List(Box::new(schemaize_ty(inner, var_to_name))),
+        Ty::Sum { name, variants } => Ty::Sum {
+            name: name.clone(),
+            variants: variants
+                .iter()
+                .map(|(n, p)| (n.clone(), schemaize_payload(p, var_to_name)))
+                .collect(),
+        },
+        Ty::Constructor { owner, tag, arity } => Ty::Constructor {
+            owner: Box::new(schemaize_ty(owner, var_to_name)),
+            tag: *tag,
+            arity: *arity,
+        },
+        Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| schemaize_ty(t, var_to_name)).collect()),
+        Ty::Array { element, length } => Ty::Array {
+            element: Box::new(schemaize_ty(element, var_to_name)),
+            length: *length,
+        },
+        Ty::Record { fields } => Ty::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), schemaize_ty(t, var_to_name)))
+                .collect(),
+        },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => Ty::Forall {
+            bounds: bounds.clone(),
+            constraints: constraints.clone(),
+            body: Box::new(schemaize_ty(body, var_to_name)),
+        },
+    }
+}
+
+/// Schemaize a variant payload (type-param vars → `Con(name)`).
+pub fn schemaize_payload(
+    payload: &EnumVariantPayloadTy,
+    var_to_name: &std::collections::HashMap<TyVarId, String>,
+) -> EnumVariantPayloadTy {
+    match payload {
+        EnumVariantPayloadTy::Unit => EnumVariantPayloadTy::Unit,
+        EnumVariantPayloadTy::Tuple(tys) => EnumVariantPayloadTy::Tuple(
+            tys.iter().map(|t| schemaize_ty(t, var_to_name)).collect(),
+        ),
+        EnumVariantPayloadTy::Record(fields) => EnumVariantPayloadTy::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), schemaize_ty(t, var_to_name)))
+                .collect(),
+        ),
+    }
+}
+
 // --- Free type variables ---
 
 /// Free type variables of a `Ty`.

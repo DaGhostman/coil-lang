@@ -77,6 +77,26 @@ Ty::Sum {
 }
 ```
 
+### Generic enums (`Ty::App`)
+
+User enums may take type parameters. Annotations and construct/match use the same `Ty::App` machinery as builtin `Option` / `Result`:
+
+```0s
+enum Box<T> {
+    Empty,
+    Full(T),
+}
+
+fn unwrap(Box<int> b) -> int {
+    return match b {
+        Box::Empty => 0,
+        Box::Full(v) => v,
+    };
+}
+```
+
+`Box::Full(7)` has type `Box<int>`. Payload types are freshened per construct/match site from the enum's schema (type-param placeholders in the registry).
+
 ### Variant payload shapes (`EnumVariantPayloadTy`)
 
 | Shape | Syntax example | Internal |
@@ -89,7 +109,7 @@ Constructors in expressions and patterns use qualified form: `Option::Some(42)` 
 
 ### Constructor types (`Ty::Constructor`)
 
-Applying a variant yields a constructor type carrying tag and arity, unified against the parent sum.
+Applying a variant yields a constructor type carrying tag and arity, unified against the parent sum (or applied `Ty::App` for polymorphic enums).
 
 ---
 
@@ -464,7 +484,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer; parametric aliases (`type Pair<T> = …`) expand on application |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
-| Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` as `Ty::App`; builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
+| Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` and user `enum Box<T>` as `Ty::App` (construct/match freshen payloads); builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
 | Higher-kinded types | Unary constructor kinds only (`F: * -> *`); higher arities and kind variables are not supported |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
