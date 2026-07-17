@@ -154,7 +154,11 @@ impl Scheme {
 
     /// Build a polymorphic scheme with constraints.
     pub fn poly(bounds: Vec<TyVarId>, constraints: Vec<Constraint>, ty: Ty) -> Self {
-        Self { bounds, constraints, ty }
+        Self {
+            bounds,
+            constraints,
+            ty,
+        }
     }
 }
 
@@ -246,9 +250,7 @@ pub fn result_ty(ok: Ty, err: Ty) -> Ty {
 /// Extract `T` from `Option<T>` (Sum or Constructor owner).
 pub fn option_inner(ty: &Ty) -> Option<Ty> {
     match ty {
-        Ty::App(con, args)
-            if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM) =>
-        {
+        Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM) => {
             args.first().cloned()
         }
         Ty::Sum { name, variants } if name == common::BUILTIN_OPTION_ENUM => {
@@ -268,9 +270,7 @@ pub fn option_inner(ty: &Ty) -> Option<Ty> {
 /// Extract `(T, E)` from `Result<T, E>`.
 pub fn result_ok_err(ty: &Ty) -> Option<(Ty, Ty)> {
     match ty {
-        Ty::App(con, args)
-            if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_RESULT_ENUM) =>
-        {
+        Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_RESULT_ENUM) => {
             match (args.first(), args.get(1)) {
                 (Some(ok), Some(err)) => Some((ok.clone(), err.clone())),
                 _ => None,

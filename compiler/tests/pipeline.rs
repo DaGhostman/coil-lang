@@ -143,6 +143,12 @@ fn example_generics_prints_add_results_for_int_and_float() {
 }
 
 #[test]
+fn example_typeclass_dict_forwards_dictionary_and_prints_42_twice() {
+    let output = run_example("examples/typeclass_dict.0s");
+    assert_eq!(output, "4242");
+}
+
+#[test]
 fn monomorphized_generic_add_prints_3() {
     let output = run_example_src(
         r#"fn add<T: Num>(T a, T b) -> T {

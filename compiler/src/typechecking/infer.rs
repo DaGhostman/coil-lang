@@ -6,18 +6,27 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use reporting::{ErrorCode, Label, Message};
 use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
+use reporting::{ErrorCode, Label, Message};
 
 use super::env::{Env, TyVarCounter, instantiate, instantiate_with_constraints};
 use super::generics::{Generics, InstanceDef, TypeClassDef, TypeClassMethodDef};
 use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::{Constraint, Scheme};
+
+/// Code-generation recipe for a typeclass method call in a generic body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundMethodCall {
+    pub dict_index: usize,
+    pub method_slot: usize,
+    pub arity: usize,
+    pub has_receiver: bool,
+}
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
-    EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty, list,
-    option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty, string,
+    EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
+    list, option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty, string,
     unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
@@ -57,11 +66,25 @@ pub struct Checker {
     /// Span-indexed inferred types for codegen ([`lookup_at`](Self::lookup_at)).
     cache: std::collections::HashMap<NodeId, Ty>,
 
+    /// Source-span fallback for codegen when pre-walk IDs are misaligned.
+    codegen_types_by_span: HashMap<(usize, usize), Ty>,
+
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
     /// Concrete typeclass dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
+
+    /// Open dictionaries forwarded from the enclosing generic function.
+    call_site_forward_dicts: HashMap<NodeId, Vec<usize>>,
+    call_site_forward_dicts_by_span: HashMap<(usize, usize), Vec<usize>>,
+
+    /// Calls resolved through an active user typeclass constraint.
+    bound_method_calls: HashMap<NodeId, BoundMethodCall>,
+    bound_method_calls_by_span: HashMap<(usize, usize), BoundMethodCall>,
+
+    /// Typeclass method signatures, keyed by `(class, method)`.
+    typeclass_method_schemes: HashMap<(String, String), Scheme>,
 
     /// `type Name = T` aliases (substituted at typecheck time).
     ///
@@ -238,8 +261,14 @@ impl Checker {
             ids: IdTable::new(),
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
+            codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
+            call_site_forward_dicts: HashMap::new(),
+            call_site_forward_dicts_by_span: HashMap::new(),
+            bound_method_calls: HashMap::new(),
+            bound_method_calls_by_span: HashMap::new(),
+            typeclass_method_schemes: HashMap::new(),
             type_aliases: vec![HashMap::new()],
             const_scopes: vec![HashSet::new()],
             enums: BTreeMap::new(),
@@ -364,8 +393,14 @@ impl Checker {
         self.ids = IdTable::new();
         self.next_id_idx = 0;
         self.cache.clear();
+        self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
         self.call_site_dicts.clear();
+        self.call_site_forward_dicts.clear();
+        self.call_site_forward_dicts_by_span.clear();
+        self.bound_method_calls.clear();
+        self.bound_method_calls_by_span.clear();
+        self.typeclass_method_schemes.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
         self.const_scopes.clear();
@@ -484,7 +519,11 @@ impl Checker {
             .unwrap_or(false);
 
         if duplicate {
-            let mut msg = Message::error(ErrorCode::GenericTypeError, format!("Duplicate type alias `{}`", name), range);
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Duplicate type alias `{}`", name),
+                range,
+            );
             msg.with_help("type aliases may shadow names only from an outer scope".to_string());
             self.messages.push(msg);
             return;
@@ -579,6 +618,9 @@ impl Checker {
 
         let ty = self.infer_inner(expr, Some(id));
         self.cache.insert(id, ty.clone());
+        self.codegen_types_by_span
+            .entry((expr.0.start, expr.0.end))
+            .or_insert_with(|| ty.clone());
         ty
     }
 
@@ -601,9 +643,11 @@ impl Checker {
                 let scheme = self.env.lookup(name).cloned();
                 match scheme {
                     Some(s) => instantiate(&s, &mut self.counter),
-                    None => {
-                        self.error(ErrorCode::UnknownValue, format!("Cannot find value `{}` in this scope", name), range)
-                    }
+                    None => self.error(
+                        ErrorCode::UnknownValue,
+                        format!("Cannot find value `{}` in this scope", name),
+                        range,
+                    ),
                 }
             }
 
@@ -725,7 +769,8 @@ impl Checker {
                     Expression::Identifier(n) => n.to_string(),
                     _ => {
                         return self.error_with_help(
-                            ErrorCode::GenericTypeError, "Invalid constant name".to_string(),
+                            ErrorCode::GenericTypeError,
+                            "Invalid constant name".to_string(),
                             range,
                             Some("a constant name must be an identifier".to_string()),
                         );
@@ -839,7 +884,8 @@ impl Checker {
                     Ty::Con(name) if name == "bool" || name == "int" => boolean(),
                     _ => {
                         let _ = self.error_with_help(
-                            ErrorCode::GenericTypeError, "Logical NOT requires a `bool` or `int` operand".to_string(),
+                            ErrorCode::GenericTypeError,
+                            "Logical NOT requires a `bool` or `int` operand".to_string(),
                             e.0.into_range(),
                             Some(format!(
                                 "found `{pruned}`; use `~` for bitwise negation on integers"
@@ -854,7 +900,8 @@ impl Checker {
                 let pruned = apply_ty_prune(&self.subst, &ty);
                 if !matches!(pruned, Ty::Con(ref n) if n == "int" || n == "float") {
                     let _ = self.error_with_help(
-                        ErrorCode::GenericTypeError, "Increment/decrement requires a numeric lvalue".to_string(),
+                        ErrorCode::GenericTypeError,
+                        "Increment/decrement requires a numeric lvalue".to_string(),
                         range,
                         Some(
                             "only `int` and `float` variables, fields, and indices support ++/--"
@@ -869,10 +916,54 @@ impl Checker {
                 if let Expression::Access(recv, method) = name.1.as_ref() {
                     let recv_ty = self.infer(recv);
                     let resolved = apply_ty_prune(&self.subst, &recv_ty);
+                    if let Ty::Var(receiver_var) = &resolved {
+                        let candidates = self.bound_method_candidates(method, Some(*receiver_var));
+                        if let Some((dict_index, class, method_slot, scheme)) =
+                            self.select_bound_method(candidates, method, &range)
+                        {
+                            let fun_ty = instantiate(&scheme, &mut self.counter);
+                            let mut arg_tys = vec![recv_ty];
+                            if let Some(a) = args {
+                                for arg in a {
+                                    arg_tys.push(self.infer(arg));
+                                }
+                            }
+                            if let Some(call_id) = id {
+                                self.bound_method_calls.insert(
+                                    call_id,
+                                    BoundMethodCall {
+                                        dict_index,
+                                        method_slot,
+                                        arity: arg_tys.len(),
+                                        has_receiver: true,
+                                    },
+                                );
+                            }
+                            self.bound_method_calls_by_span.insert(
+                                (range.start, range.end),
+                                BoundMethodCall {
+                                    dict_index,
+                                    method_slot,
+                                    arity: arg_tys.len(),
+                                    has_receiver: true,
+                                },
+                            );
+                            return self.apply_function(
+                                Some(&format!("{}::{}", class, method)),
+                                &fun_ty,
+                                &arg_tys,
+                                None,
+                                id,
+                                range,
+                            );
+                        }
+                    }
                     let owner = match &resolved {
                         Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
                         _ => {
-                            return self.error_with_help(ErrorCode::NotAFunction, format!("Cannot call method `{}` on non-class type", method),
+                            return self.error_with_help(
+                                ErrorCode::NotAFunction,
+                                format!("Cannot call method `{}` on non-class type", method),
                                 range,
                                 Some("method calls require a class instance receiver".to_string()),
                             );
@@ -886,7 +977,9 @@ impl Checker {
                     {
                         Some(s) => s,
                         None => {
-                            return self.error(ErrorCode::UnknownFunction, format!("Cannot find method `{}` on class `{}`", method, owner),
+                            return self.error(
+                                ErrorCode::UnknownFunction,
+                                format!("Cannot find method `{}` on class `{}`", method, owner),
                                 range,
                             );
                         }
@@ -910,7 +1003,13 @@ impl Checker {
 
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
-                    _ => return self.error(ErrorCode::UnknownFunction, "Invalid call target".to_string(), range),
+                    _ => {
+                        return self.error(
+                            ErrorCode::UnknownFunction,
+                            "Invalid call target".to_string(),
+                            range,
+                        );
+                    }
                 };
 
                 if ident == "push" {
@@ -920,10 +1019,70 @@ impl Checker {
                     return self.infer_array_len(args.as_deref(), range);
                 }
 
+                // Bare/UFCS typeclass method call: `method(x)`.
+                // Resolve it before ordinary environment lookup because class
+                // methods are selected by the active bound, not by a global FQN.
+                let candidates = self.bound_method_candidates(&ident, None);
+                if !candidates.is_empty() {
+                    let arg_tys: Vec<Ty> = match args {
+                        Some(a) => a.iter().map(|arg| self.infer(arg)).collect(),
+                        None => Vec::new(),
+                    };
+                    let receiver_var =
+                        arg_tys
+                            .first()
+                            .and_then(|ty| match apply_ty_prune(&self.subst, ty) {
+                                Ty::Var(v) => Some(v),
+                                _ => None,
+                            });
+                    let candidates = receiver_var
+                        .map(|v| self.bound_method_candidates(&ident, Some(v)))
+                        .unwrap_or_default();
+                    if let Some((dict_index, class, method_slot, scheme)) =
+                        self.select_bound_method(candidates, &ident, &range)
+                    {
+                        let fun_ty = instantiate(&scheme, &mut self.counter);
+                        if let Some(call_id) = id {
+                            self.bound_method_calls.insert(
+                                call_id,
+                                BoundMethodCall {
+                                    dict_index,
+                                    method_slot,
+                                    arity: arg_tys.len(),
+                                    has_receiver: false,
+                                },
+                            );
+                        }
+                        self.bound_method_calls_by_span.insert(
+                            (range.start, range.end),
+                            BoundMethodCall {
+                                dict_index,
+                                method_slot,
+                                arity: arg_tys.len(),
+                                has_receiver: false,
+                            },
+                        );
+                        return self.apply_function(
+                            Some(&format!("{}::{}", class, ident)),
+                            &fun_ty,
+                            &arg_tys,
+                            args.as_deref(),
+                            id,
+                            range,
+                        );
+                    }
+                }
+
                 let scheme = self.env.lookup(&ident).cloned();
                 let (fun_ty, fresh_constraints) = match scheme {
                     Some(s) => instantiate_with_constraints(&s, &mut self.counter),
-                    None => return self.error(ErrorCode::UnknownFunction, format!("Cannot find function `{}`", ident), range),
+                    None => {
+                        return self.error(
+                            ErrorCode::UnknownFunction,
+                            format!("Cannot find function `{}`", ident),
+                            range,
+                        );
+                    }
                 };
 
                 let arg_tys: Vec<Ty> = match args {
@@ -1009,8 +1168,8 @@ impl Checker {
                     let _ = self.ensure_result_mode(&err, &range);
                     ok
                 } else if is_option_ty(&resolved) {
-                    let inner = option_inner(&resolved)
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                    let inner =
+                        option_inner(&resolved).unwrap_or_else(|| Ty::Var(self.counter.fresh()));
                     self.ensure_option_mode(&inner, &range);
                     inner
                 } else if matches!(resolved, Ty::Var(_)) {
@@ -1025,10 +1184,7 @@ impl Checker {
                 } else {
                     self.error(
                         ErrorCode::InvalidTry,
-                        format!(
-                            "`?` requires Option or Result, found `{}`",
-                            resolved
-                        ),
+                        format!("`?` requires Option or Result, found `{}`", resolved),
                         range,
                     )
                 }
@@ -1040,8 +1196,7 @@ impl Checker {
                 let payload = if let Some((ok, _)) = result_ok_err(&resolved) {
                     ok
                 } else if is_option_ty(&resolved) {
-                    option_inner(&resolved)
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()))
+                    option_inner(&resolved).unwrap_or_else(|| Ty::Var(self.counter.fresh()))
                 } else if matches!(resolved, Ty::Var(_)) {
                     // Prefer Option for free vars under `??`.
                     let inner = Ty::Var(self.counter.fresh());
@@ -1055,10 +1210,7 @@ impl Checker {
                 } else {
                     return self.error(
                         ErrorCode::InvalidCoalesce,
-                        format!(
-                            "`??` requires Option or Result, found `{}`",
-                            resolved
-                        ),
+                        format!("`??` requires Option or Result, found `{}`", resolved),
                         range,
                     );
                 };
@@ -1071,8 +1223,7 @@ impl Checker {
                 let recv_ty = self.infer(receiver);
                 let resolved = apply_ty_prune(&self.subst, &recv_ty);
                 let inner = if is_option_ty(&resolved) {
-                    option_inner(&resolved)
-                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()))
+                    option_inner(&resolved).unwrap_or_else(|| Ty::Var(self.counter.fresh()))
                 } else if matches!(resolved, Ty::Var(_)) {
                     let inner = Ty::Var(self.counter.fresh());
                     self.unify(
@@ -1085,10 +1236,7 @@ impl Checker {
                 } else {
                     return self.error(
                         ErrorCode::InvalidOptionalAccess,
-                        format!(
-                            "`?.` requires Option, found `{}`",
-                            resolved
-                        ),
+                        format!("`?.` requires Option, found `{}`", resolved),
                         range,
                     );
                 };
@@ -1195,7 +1343,8 @@ impl Checker {
                             let i = *idx;
                             if i < 0 || (i as usize) >= *n {
                                 let _ = self.error_with_help(
-                                    ErrorCode::IndexOutOfBounds, format!(
+                                    ErrorCode::IndexOutOfBounds,
+                                    format!(
                                         "array index {} out of bounds for array of length {}",
                                         i, n
                                     ),
@@ -1218,7 +1367,8 @@ impl Checker {
                             let i = *idx;
                             if i < 0 || (i as usize) >= tys.len() {
                                 let _ = self.error_with_help(
-                                    ErrorCode::IndexOutOfBounds, format!(
+                                    ErrorCode::IndexOutOfBounds,
+                                    format!(
                                         "tuple index {} out of bounds for tuple of length {}",
                                         i,
                                         tys.len()
@@ -1239,7 +1389,8 @@ impl Checker {
                     _ => {
                         // Non-aggregate target: emit a diagnostic.
                         let _ = self.error_with_help(
-                            ErrorCode::CannotIndex, "cannot index non-aggregate type".to_string(),
+                            ErrorCode::CannotIndex,
+                            "cannot index non-aggregate type".to_string(),
                             range.clone(),
                             Some(format!("type `{}` does not support indexing", resolved)),
                         );
@@ -1256,7 +1407,8 @@ impl Checker {
                 for f in fields {
                     if seen.insert(f.name.to_string(), ()).is_some() {
                         let _ = self.error_with_help(
-                            ErrorCode::DuplicateField, format!("Duplicate field `{}` in record literal", f.name),
+                            ErrorCode::DuplicateField,
+                            format!("Duplicate field `{}` in record literal", f.name),
                             range.clone(),
                             Some("record literals must have unique field names".to_string()),
                         );
@@ -1311,7 +1463,8 @@ impl Checker {
                         self.infer(arg);
                     }
                     let mut m = Message::error(
-                        ErrorCode::DeclareArity, "declare requires 4 arguments (lib, name, args_tuple, ret_type)"
+                        ErrorCode::DeclareArity,
+                        "declare requires 4 arguments (lib, name, args_tuple, ret_type)"
                             .to_string(),
                         range.clone(),
                     );
@@ -1361,7 +1514,8 @@ impl Checker {
                         self.infer(arg);
                     }
                     let mut m = Message::error(
-                        ErrorCode::InvokeArity, "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
+                        ErrorCode::InvokeArity,
+                        "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
                         range.clone(),
                     );
                     m.push(Label::new(
@@ -1381,7 +1535,8 @@ impl Checker {
             Expression::Yield(e) => {
                 if self.async_depth == 0 {
                     return self.error_with_help(
-                        ErrorCode::YieldOutsideAsync, "yield outside async function".to_string(),
+                        ErrorCode::YieldOutsideAsync,
+                        "yield outside async function".to_string(),
                         range,
                         Some("yield may only appear inside an async fn body".to_string()),
                     );
@@ -1399,7 +1554,8 @@ impl Checker {
             Expression::YieldFrom(e) => {
                 if self.async_depth == 0 {
                     return self.error_with_help(
-                        ErrorCode::YieldOutsideAsync, "yield from outside async function".to_string(),
+                        ErrorCode::YieldOutsideAsync,
+                        "yield from outside async function".to_string(),
                         range,
                         Some("yield from may only appear inside an async fn body".to_string()),
                     );
@@ -1445,7 +1601,16 @@ impl Checker {
                 returns,
                 body,
             } => {
-                self.infer_function(name, type_params, args, returns.as_ref(), body, &range, None, *is_coro);
+                self.infer_function(
+                    name,
+                    type_params,
+                    args,
+                    returns.as_ref(),
+                    body,
+                    &range,
+                    None,
+                    *is_coro,
+                );
                 unit_ty()
             }
             Expression::Implementation { owner, methods, .. } => {
@@ -1480,7 +1645,8 @@ impl Checker {
                                 self.access_field_in_sum(name, variants, Some(*tag), field, range)
                             }
                             _ => self.error_with_help(
-                                ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
+                                ErrorCode::GenericTypeError,
+                                format!("Cannot access field `{}` on non-record type", field),
                                 range,
                                 Some(
                                     "only values of record-shaped enum types expose fields"
@@ -1499,7 +1665,9 @@ impl Checker {
                             }
                             let known: Vec<&str> =
                                 fields.iter().map(|(_, n, _)| n.as_str()).collect();
-                            return self.error_with_help(ErrorCode::UnknownField, format!("Cannot find field `{}` on class `{}`", field, name),
+                            return self.error_with_help(
+                                ErrorCode::UnknownField,
+                                format!("Cannot find field `{}` on class `{}`", field, name),
                                 range,
                                 Some(format!("the class has fields: {}", known.join(", "))),
                             );
@@ -1510,7 +1678,8 @@ impl Checker {
                         let payloads = self.enum_payloads.get(name).cloned().unwrap_or_default();
                         if variant_names.is_empty() {
                             return self.error_with_help(
-                                ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
+                                ErrorCode::GenericTypeError,
+                                format!("Cannot access field `{}` on non-record type", field),
                                 range,
                                 Some(format!("type `{}` is not a record-shaped enum", name)),
                             );
@@ -1541,7 +1710,8 @@ impl Checker {
                         }
                     },
                     _ => self.error_with_help(
-                        ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot access field `{}` on non-record type", field),
                         range,
                         Some("only values of record-shaped enum types expose fields".to_string()),
                     ),
@@ -1553,13 +1723,19 @@ impl Checker {
                 let class_name = match &resolved {
                     Ty::Con(n) => n.clone(),
                     _ => {
-                        return self.error(ErrorCode::NotAFunction, "Cannot instantiate non-class type".to_string(), range);
+                        return self.error(
+                            ErrorCode::NotAFunction,
+                            "Cannot instantiate non-class type".to_string(),
+                            range,
+                        );
                     }
                 };
                 if let Some(fields) = self.classes.get(&class_name).cloned() {
                     let provided = args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
                     if provided.len() != fields.len() {
-                        let _ = self.error_with_help(ErrorCode::ConstructorArity, format!(
+                        let _ = self.error_with_help(
+                            ErrorCode::ConstructorArity,
+                            format!(
                                 "Constructor `{}` expects {} arguments, got {}",
                                 class_name,
                                 fields.len(),
@@ -1610,7 +1786,8 @@ impl Checker {
                 let span = expr.0.into_range();
                 if self.c_structs.iter().any(|s| s.name == decl.name) {
                     self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError, format!("Duplicate extern struct `{}`", decl.name),
+                        ErrorCode::GenericTypeError,
+                        format!("Duplicate extern struct `{}`", decl.name),
                         span.clone(),
                     ));
                 } else {
@@ -1660,7 +1837,6 @@ impl Checker {
             } => self.infer_construct(enum_name, variant_name, fields, range),
 
             // ---- Generics ----
-
             Expression::TypeClass {
                 name,
                 type_params,
@@ -1670,9 +1846,13 @@ impl Checker {
                 let method_defs: Vec<TypeClassMethodDef> = methods
                     .iter()
                     .filter_map(|m| {
-                        if let Expression::Function { name: mname, body, .. } = m.1.as_ref() {
+                        if let Expression::Function {
+                            name: mname, body, ..
+                        } = m.1.as_ref()
+                        {
                             // has_default: body is non-empty Block/Fragment
-                            let has_default = !matches!(body.1.as_ref(), Expression::Block(v) if v.is_empty());
+                            let has_default =
+                                !matches!(body.1.as_ref(), Expression::Block(v) if v.is_empty());
                             Some(TypeClassMethodDef {
                                 name: mname.to_string(),
                                 has_default,
@@ -1682,17 +1862,65 @@ impl Checker {
                         }
                     })
                     .collect();
-                let param_names: Vec<String> = type_params.iter().map(|tp| tp.name.to_string()).collect();
+                let param_names: Vec<String> =
+                    type_params.iter().map(|tp| tp.name.to_string()).collect();
                 let def = TypeClassDef {
                     name: name.to_string(),
                     type_params: param_names,
                     methods: method_defs.clone(),
                 };
                 self.generics.typeclasses.insert(name.to_string(), def);
+
+                // Build method schemes with the typeclass parameters in scope.
+                // These schemes drive bound-method calls from generic bodies.
+                let mut param_frame = HashMap::new();
+                let mut param_vars = Vec::new();
+                for type_param in type_params {
+                    let var = self.counter.fresh();
+                    param_frame.insert(type_param.name.to_string(), var);
+                    param_vars.push(var);
+                }
+                self.type_params_in_scope.push(param_frame);
+                let class_constraints: Vec<Constraint> = param_vars
+                    .iter()
+                    .map(|var| Constraint {
+                        var: *var,
+                        class: name.to_string(),
+                    })
+                    .collect();
+                for method in methods {
+                    if let Expression::Function {
+                        name: method_name,
+                        args,
+                        returns,
+                        ..
+                    } = method.1.as_ref()
+                    {
+                        let arg_tys = self.parse_arg_list(args);
+                        let ret_ty = returns
+                            .as_ref()
+                            .map(|ret| self.parse_type_name(ret))
+                            .unwrap_or_else(unit_ty);
+                        let fun_ty = arg_tys.iter().rev().fold(ret_ty, |ret, (_, arg)| {
+                            Ty::Fun(Box::new(arg.clone()), Box::new(ret))
+                        });
+                        self.typeclass_method_schemes.insert(
+                            (name.to_string(), method_name.to_string()),
+                            Scheme::poly(param_vars.clone(), class_constraints.clone(), fun_ty),
+                        );
+                    }
+                }
+
                 // Walk method bodies (ID alignment + default body typecheck).
+                // The class's own constraint is active so a default can call a
+                // sibling method through the same dictionary.
+                let active_len = self.active_constraints.len();
+                self.active_constraints.extend(class_constraints);
                 for m in methods {
                     let _ = self.infer(m);
                 }
+                self.active_constraints.truncate(active_len);
+                self.type_params_in_scope.pop();
                 unit_ty()
             }
 
@@ -1723,7 +1951,11 @@ impl Checker {
                         format!(
                             "Overlapping instance of `{}` for `{}`",
                             class,
-                            arg_tys.iter().map(|ty| ty.to_string()).collect::<Vec<_>>().join(", ")
+                            arg_tys
+                                .iter()
+                                .map(|ty| ty.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                         range.clone(),
                     ));
@@ -1733,28 +1965,52 @@ impl Checker {
                 let mut method_names = Vec::new();
                 for m in methods {
                     let maybe_fn = match m.1.as_ref() {
-                        Expression::Function { name, args, returns, body, is_coro, .. } => {
-                            Some((*name, args, returns, body, *is_coro))
-                        }
+                        Expression::Function {
+                            name,
+                            args,
+                            returns,
+                            body,
+                            is_coro,
+                            ..
+                        } => Some((*name, args, returns, body, *is_coro)),
                         Expression::Method(_, body) => match body.1.as_ref() {
-                            Expression::Function { name, args, returns, body, is_coro, .. } => {
-                                Some((*name, args, returns, body, *is_coro))
-                            }
+                            Expression::Function {
+                                name,
+                                args,
+                                returns,
+                                body,
+                                is_coro,
+                                ..
+                            } => Some((*name, args, returns, body, *is_coro)),
                             _ => None,
                         },
                         _ => None,
                     };
                     if let Some((mname, margs, returns, body, is_coro)) = maybe_fn {
                         // Build a unique FQN for this instance method.
-                        let fqn = format!("{}__{}__{}",
+                        let fqn = format!(
+                            "{}__{}__{}",
                             class,
-                            arg_tys.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join("_"),
+                            arg_tys
+                                .iter()
+                                .map(|t| format!("{}", t))
+                                .collect::<Vec<_>>()
+                                .join("_"),
                             mname,
                         );
                         method_names.push(mname.to_string());
                         method_fqns.insert(mname.to_string(), fqn.clone());
                         // Typecheck the method body at concrete types.
-                        self.infer_function(mname, &[], margs, returns.as_ref(), body, &m.0.into_range(), None, is_coro);
+                        self.infer_function(
+                            mname,
+                            &[],
+                            margs,
+                            returns.as_ref(),
+                            body,
+                            &m.0.into_range(),
+                            None,
+                            is_coro,
+                        );
                     } else {
                         let _ = self.infer(m);
                     }
@@ -1791,7 +2047,11 @@ impl Checker {
                             format!(
                                 "Instance of `{}` for `{}` is missing {} {}",
                                 class,
-                                arg_tys.iter().map(|ty| ty.to_string()).collect::<Vec<_>>().join(", "),
+                                arg_tys
+                                    .iter()
+                                    .map(|ty| ty.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                                 noun,
                                 methods
                             ),
@@ -1837,9 +2097,39 @@ impl Checker {
         self.cache.get(&id).map(|t| apply_ty_prune(&self.subst, t))
     }
 
+    /// Look up the original HM result by source span without re-running inference.
+    pub fn lookup_for_codegen_span(&self, start: usize, end: usize) -> Option<Ty> {
+        self.codegen_types_by_span
+            .get(&(start, end))
+            .map(|ty| apply_ty_prune(&self.subst, ty))
+    }
+
     /// Concrete typeclass instances selected while discharging a call's bounds.
     pub fn call_dicts_at(&self, id: NodeId) -> Option<&[InstanceDef]> {
         self.call_site_dicts.get(&id).map(Vec::as_slice)
+    }
+
+    pub fn forwarded_dicts_at(&self, id: NodeId) -> Option<&[usize]> {
+        self.call_site_forward_dicts.get(&id).map(Vec::as_slice)
+    }
+
+    pub fn forwarded_dicts_for_span(&self, start: usize, end: usize) -> Option<&[usize]> {
+        self.call_site_forward_dicts_by_span
+            .get(&(start, end))
+            .map(Vec::as_slice)
+    }
+
+    pub fn bound_method_call_at(&self, id: NodeId) -> Option<&BoundMethodCall> {
+        self.bound_method_calls.get(&id)
+    }
+
+    pub fn bound_method_call_for_span(&self, start: usize, end: usize) -> Option<&BoundMethodCall> {
+        self.bound_method_calls_by_span.get(&(start, end))
+    }
+
+    pub fn typeclass_method_scheme(&self, class: &str, method: &str) -> Option<&Scheme> {
+        self.typeclass_method_schemes
+            .get(&(class.to_string(), method.to_string()))
     }
 
     /// All call-site dicts (for debugging / testing).
@@ -1978,16 +2268,23 @@ impl Checker {
         // check that it has a Num constraint; otherwise the op is invalid.
         let pruned = apply_ty_prune(&self.subst, &result);
         if let Ty::Var(v) = &pruned {
-            let has_num = self.active_constraints.iter().any(|c| c.var == *v && c.class == "Num");
+            let has_num = self
+                .active_constraints
+                .iter()
+                .any(|c| c.var == *v && c.class == "Num");
             if !has_num {
                 // Check if the var appears in any in-scope type param frame.
-                let in_scope = self.type_params_in_scope.iter().any(|frame| {
-                    frame.values().any(|&id| id == *v)
-                });
+                let in_scope = self
+                    .type_params_in_scope
+                    .iter()
+                    .any(|frame| frame.values().any(|&id| id == *v));
                 if in_scope {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
-                        format!("Cannot apply `{}` to value of generic type without bound `Num`", op),
+                        format!(
+                            "Cannot apply `{}` to value of generic type without bound `Num`",
+                            op
+                        ),
                         range,
                     ));
                 }
@@ -2021,7 +2318,9 @@ impl Checker {
                     Some(s) => {
                         let ty = instantiate(&s, &mut self.counter);
                         if self.is_const_binding(&ident) {
-                            let mut msg = Message::error(ErrorCode::FormatSpecifierMismatch, format!("Cannot assign to constant `{}`", ident),
+                            let mut msg = Message::error(
+                                ErrorCode::FormatSpecifierMismatch,
+                                format!("Cannot assign to constant `{}`", ident),
                                 range,
                             );
                             msg.with_help(
@@ -2032,7 +2331,8 @@ impl Checker {
                         ty
                     }
                     None => self.error_with_help(
-                        ErrorCode::UndeclaredAssignment, format!("Cannot assign to undeclared variable `{}`", ident),
+                        ErrorCode::UndeclaredAssignment,
+                        format!("Cannot assign to undeclared variable `{}`", ident),
                         range,
                         Some(format!("try declaring it first with `let {};`", ident)),
                     ),
@@ -2089,7 +2389,8 @@ impl Checker {
                             if let Expression::Integer(i) = idx.1.as_ref() {
                                 if *i < 0 || (*i as usize) >= *n {
                                     let _ = self.error_with_help(
-                                        ErrorCode::IndexOutOfBounds, format!(
+                                        ErrorCode::IndexOutOfBounds,
+                                        format!(
                                             "array index {} out of bounds for array of length {}",
                                             i, n
                                         ),
@@ -2102,19 +2403,22 @@ impl Checker {
                         (**element).clone()
                     }
                     Ty::Tuple(_) => self.error_with_help(
-                        ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
+                        ErrorCode::InvalidAssignment,
+                        "Invalid assignment target".to_string(),
                         range,
                         Some("tuple elements are immutable".to_string()),
                     ),
                     _ => self.error_with_help(
-                        ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
+                        ErrorCode::InvalidAssignment,
+                        "Invalid assignment target".to_string(),
                         range,
                         Some("only array elements may be indexed for assignment".to_string()),
                     ),
                 }
             }
             _ => self.error_with_help(
-                ErrorCode::InvalidAssignment, "Invalid assignment target".to_string(),
+                ErrorCode::InvalidAssignment,
+                "Invalid assignment target".to_string(),
                 range,
                 Some(
                     "the left-hand side must be a variable, dict field, or array index".to_string(),
@@ -2162,7 +2466,9 @@ impl Checker {
             for arg in args {
                 let _ = self.infer(arg);
             }
-            return self.error_with_help(ErrorCode::ConstructorArity, format!("push expects 2 arguments, got {}", args.len()),
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("push expects 2 arguments, got {}", args.len()),
                 range,
                 Some("use `push(array, value)`".to_string()),
             );
@@ -2203,7 +2509,9 @@ impl Checker {
                 }
                 dynamic
             }
-            other => self.error_with_help(ErrorCode::ConstructorArity, "push expects an array as its first argument".to_string(),
+            other => self.error_with_help(
+                ErrorCode::ConstructorArity,
+                "push expects an array as its first argument".to_string(),
                 args[0].0.into_range(),
                 Some(format!("found `{}`; use `push(array, value)`", other)),
             ),
@@ -2216,7 +2524,9 @@ impl Checker {
             for arg in args {
                 let _ = self.infer(arg);
             }
-            return self.error_with_help(ErrorCode::ConstructorArity, format!("len expects 1 argument, got {}", args.len()),
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("len expects 1 argument, got {}", args.len()),
                 range,
                 Some("use `len(array)`".to_string()),
             );
@@ -2236,7 +2546,9 @@ impl Checker {
                 );
                 int()
             }
-            other => self.error_with_help(ErrorCode::ConstructorArity, "len expects an array".to_string(),
+            other => self.error_with_help(
+                ErrorCode::ConstructorArity,
+                "len expects an array".to_string(),
                 args[0].0.into_range(),
                 Some(format!("found `{}`; use `len(array)`", other)),
             ),
@@ -2297,7 +2609,8 @@ impl Checker {
                         // had more arguments than the function accepts.
                         let actual = format!("{}", apply_ty_prune(&self.subst, &pruned));
                         return self.error_with_help(
-                            ErrorCode::GenericTypeError, match name {
+                            ErrorCode::GenericTypeError,
+                            match name {
                                 Some(n) => format!(
                                     "Function `{}` was called with too many arguments \
                                      (it accepts {}, but argument #{} was given)",
@@ -2314,7 +2627,10 @@ impl Checker {
                                 ),
                             },
                             range,
-                            Some("check the function signature or the number of arguments".to_string()),
+                            Some(
+                                "check the function signature or the number of arguments"
+                                    .to_string(),
+                            ),
                         );
                     }
                 }
@@ -2333,10 +2649,8 @@ impl Checker {
             return (ty.clone(), Vec::new());
         };
 
-        let mapping: HashMap<TyVarId, TyVarId> = bounds
-            .iter()
-            .map(|&v| (v, self.counter.fresh()))
-            .collect();
+        let mapping: HashMap<TyVarId, TyVarId> =
+            bounds.iter().map(|&v| (v, self.counter.fresh())).collect();
         let body = super::env::substitute_vars(body, &mapping);
         let constraints = constraints
             .iter()
@@ -2509,12 +2823,14 @@ impl Checker {
                 apply_ty(&self.subst, t1)
             }
             Err(UnifyError::Mismatch { left, right }) => self.error_with_help(
-                ErrorCode::TypeMismatch, format!("Type mismatch: expected `{}`, found `{}`", left, right),
+                ErrorCode::TypeMismatch,
+                format!("Type mismatch: expected `{}`, found `{}`", left, right),
                 range.clone(),
                 Some(format!("while checking `{}`", ctx)),
             ),
             Err(UnifyError::Occurs { var, ty }) => self.error_with_help(
-                ErrorCode::InfiniteType, format!("Cannot construct infinite type `{}`", ty),
+                ErrorCode::InfiniteType,
+                format!("Cannot construct infinite type `{}`", ty),
                 range.clone(),
                 Some(format!(
                     "the type variable `t{}` would occur in its own definition",
@@ -2614,6 +2930,18 @@ impl Checker {
                             format!("Cannot satisfy constraint `{}`", c.class),
                             range.clone(),
                         ));
+                    } else if !Self::is_builtin_class(&c.class)
+                        && let Some(call_id) = call_id
+                        && let Some(dict_index) = self.user_dict_index(*v, &c.class)
+                    {
+                        self.call_site_forward_dicts
+                            .entry(call_id)
+                            .or_default()
+                            .push(dict_index);
+                        self.call_site_forward_dicts_by_span
+                            .entry((range.start, range.end))
+                            .or_default()
+                            .push(dict_index);
                     }
                 }
                 concrete => {
@@ -2629,16 +2957,62 @@ impl Checker {
                     } else {
                         self.messages.push(Message::error(
                             ErrorCode::GenericTypeError,
-                            format!(
-                                "No instance for `{}` of type `{}`",
-                                c.class, concrete
-                            ),
+                            format!("No instance for `{}` of type `{}`", c.class, concrete),
                             range.clone(),
                         ));
                     }
                 }
             }
         }
+    }
+
+    fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
+        self.active_constraints
+            .iter()
+            .filter(|constraint| !Self::is_builtin_class(&constraint.class))
+            .position(|constraint| constraint.var == var && constraint.class == class)
+    }
+
+    fn bound_method_candidates(
+        &self,
+        method: &str,
+        receiver_var: Option<TyVarId>,
+    ) -> Vec<(usize, String, usize, Scheme)> {
+        self.active_constraints
+            .iter()
+            .filter(|constraint| !Self::is_builtin_class(&constraint.class))
+            .enumerate()
+            .filter(|(_, constraint)| receiver_var.is_none_or(|var| constraint.var == var))
+            .filter_map(|(dict_index, constraint)| {
+                let class_def = self.generics.typeclass(&constraint.class)?;
+                let method_slot = class_def
+                    .methods
+                    .iter()
+                    .position(|candidate| candidate.name == method)?;
+                let scheme = self
+                    .typeclass_method_schemes
+                    .get(&(constraint.class.clone(), method.to_string()))?
+                    .clone();
+                Some((dict_index, constraint.class.clone(), method_slot, scheme))
+            })
+            .collect()
+    }
+
+    fn select_bound_method(
+        &mut self,
+        candidates: Vec<(usize, String, usize, Scheme)>,
+        method: &str,
+        range: &Range<usize>,
+    ) -> Option<(usize, String, usize, Scheme)> {
+        if candidates.len() > 1 {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Ambiguous typeclass method `{}`", method),
+                range.clone(),
+            ));
+            return None;
+        }
+        candidates.into_iter().next()
     }
 
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
@@ -2834,7 +3208,11 @@ impl Checker {
         if self.is_ffi_type_expr(expr) {
             return;
         }
-        let mut m = Message::error(ErrorCode::InvalidFfiType, "Expected an FFI type tag".to_string(), expr.0.into_range());
+        let mut m = Message::error(
+            ErrorCode::InvalidFfiType,
+            "Expected an FFI type tag".to_string(),
+            expr.0.into_range(),
+        );
         m.push(Label::new(
             "use FFIType::Int, FFIType::Ptr, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
             expr.0.into_range(),
@@ -2938,7 +3316,8 @@ impl Checker {
                     Expression::Identifier(n) => n.to_string(),
                     _ => {
                         self.messages.push(Message::error(
-                            ErrorCode::GenericTypeError, "Invalid field name".to_string(),
+                            ErrorCode::GenericTypeError,
+                            "Invalid field name".to_string(),
                             field.0.into_range(),
                         ));
                         continue;
@@ -2948,7 +3327,8 @@ impl Checker {
                 field_info.push((*vis, fname_str, ty));
             } else {
                 self.messages.push(Message::error(
-                    ErrorCode::GenericTypeError, "Expected a field declaration".to_string(),
+                    ErrorCode::GenericTypeError,
+                    "Expected a field declaration".to_string(),
                     field.0.into_range(),
                 ));
             }
@@ -3008,7 +3388,8 @@ impl Checker {
                         .insert(name.to_string(), (*vis, Scheme::mono(fun_ty)));
                 } else {
                     self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError, "Method body must be a function".to_string(),
+                        ErrorCode::GenericTypeError,
+                        "Method body must be a function".to_string(),
                         method.0.into_range(),
                     ));
                 }
@@ -3055,7 +3436,8 @@ impl Checker {
         // Push param frame so parse_type_name resolves T → Var(id).
         self.type_params_in_scope.push(param_frame);
         let prev_constraints_len = self.active_constraints.len();
-        self.active_constraints.extend(param_constraints.iter().cloned());
+        self.active_constraints
+            .extend(param_constraints.iter().cloned());
 
         let arg_tys = self.parse_arg_list(args);
         let (ret_ty, yield_slot, send_slot) = if is_coro {
@@ -3343,7 +3725,8 @@ impl Checker {
                 }
                 if self.enums.contains_key(&name_str) {
                     let mut msg = Message::error(
-                        ErrorCode::DuplicateEnum, format!("Duplicate enum `{}`", name_str),
+                        ErrorCode::DuplicateEnum,
+                        format!("Duplicate enum `{}`", name_str),
                         node.0.into_range(),
                     );
                     msg.with_help(format!(
@@ -3362,7 +3745,8 @@ impl Checker {
                     let taken = self.enum_tags.values().any(|tags| tags.contains_key(vn));
                     if taken {
                         let mut msg = Message::error(
-                            ErrorCode::DuplicateConstructor, format!(
+                            ErrorCode::DuplicateConstructor,
+                            format!(
                                 "Duplicate constructor `{}` (also declared by another enum)",
                                 vn
                             ),
@@ -3789,7 +4173,8 @@ impl Checker {
             Some(t) => t.clone(),
             None => {
                 return self.error(
-                    ErrorCode::UnknownEnum, format!("Cannot find enum `{}` in this scope", enum_str),
+                    ErrorCode::UnknownEnum,
+                    format!("Cannot find enum `{}` in this scope", enum_str),
                     range,
                 );
             }
@@ -3800,7 +4185,8 @@ impl Checker {
             Some(t) => *t,
             None => {
                 return self.error(
-                    ErrorCode::UnknownVariant, format!(
+                    ErrorCode::UnknownVariant,
+                    format!(
                         "Cannot find variant `{}` on enum `{}`",
                         variant_str, enum_str
                     ),
@@ -3817,18 +4203,17 @@ impl Checker {
 
         // Polymorphic builtins: mint fresh payload vars so each
         // construct site gets an independent Option<T> / Result<T,E>.
-        let (expected_payload, poly_sum_owner) =
-            if common::is_poly_builtin_enum(&enum_str) {
-                let (payload, owner) = self.fresh_poly_construct_payload(&enum_str, &variant_str);
-                (payload, Some(owner))
-            } else {
-                let payload = self
-                    .enum_payloads
-                    .get(&enum_str)
-                    .and_then(|p| p.get(tag as usize).cloned())
-                    .unwrap_or(EnumVariantPayloadTy::Unit);
-                (payload, None)
-            };
+        let (expected_payload, poly_sum_owner) = if common::is_poly_builtin_enum(&enum_str) {
+            let (payload, owner) = self.fresh_poly_construct_payload(&enum_str, &variant_str);
+            (payload, Some(owner))
+        } else {
+            let payload = self
+                .enum_payloads
+                .get(&enum_str)
+                .and_then(|p| p.get(tag as usize).cloned())
+                .unwrap_or(EnumVariantPayloadTy::Unit);
+            (payload, None)
+        };
 
         // Shape vs arity: record shapes defer to field-by-field checks.
         let (shape_matches, same_shape_with_wrong_arity) = match (&expected_payload, fields) {
@@ -3850,7 +4235,8 @@ impl Checker {
         if !shape_matches {
             if same_shape_with_wrong_arity {
                 return self.error(
-                    ErrorCode::ConstructorArity, format!(
+                    ErrorCode::ConstructorArity,
+                    format!(
                         "Constructor `{}::{}` expects {} arguments, got {}",
                         enum_str,
                         variant_str,
@@ -3865,7 +4251,8 @@ impl Checker {
                 );
             }
             return self.error_with_help(
-                ErrorCode::PayloadShapeMismatch, format!(
+                ErrorCode::PayloadShapeMismatch,
+                format!(
                     "Constructor `{}::{}` payload shape mismatch (declared as {}, called as {})",
                     enum_str,
                     variant_str,
@@ -3915,7 +4302,8 @@ impl Checker {
                 for p in parts {
                     if call_site.insert(p.name, &p.value).is_some() {
                         return self.error_with_help(
-                            ErrorCode::DuplicateField, format!(
+                            ErrorCode::DuplicateField,
+                            format!(
                                 "Duplicate field `{}` in record constructor `{}::{}`",
                                 p.name, enum_str, variant_str,
                             ),
@@ -3933,7 +4321,8 @@ impl Checker {
                         Some(a) => *a,
                         None => {
                             return self.error_with_help(
-                                ErrorCode::MissingField, format!(
+                                ErrorCode::MissingField,
+                                format!(
                                     "Missing field `{}` in record constructor `{}::{}`",
                                     decl_name, enum_str, variant_str,
                                 ),
@@ -3958,7 +4347,8 @@ impl Checker {
                 for p in parts {
                     if !decl_fields.iter().any(|(dn, _)| dn == p.name) {
                         return self.error_with_help(
-                            ErrorCode::UnknownField, format!(
+                            ErrorCode::UnknownField,
+                            format!(
                                 "Unknown field `{}` in record constructor `{}::{}`",
                                 p.name, enum_str, variant_str,
                             ),
@@ -4066,10 +4456,7 @@ impl Checker {
             let owner = if common::is_builtin_option_enum(enum_name) {
                 option_app_ty(Ty::Var(self.counter.fresh()))
             } else {
-                result_app_ty(
-                    Ty::Var(self.counter.fresh()),
-                    Ty::Var(self.counter.fresh()),
-                )
+                result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh()))
             };
             self.unify(
                 expected_ty,
@@ -4146,7 +4533,11 @@ impl Checker {
 
         if arms.is_empty() {
             self.current_match_lhs = prev;
-            return self.error(ErrorCode::GenericTypeError, "match has no arms".to_string(), range);
+            return self.error(
+                ErrorCode::GenericTypeError,
+                "match has no arms".to_string(),
+                range,
+            );
         }
 
         for arm in arms {
@@ -4264,7 +4655,8 @@ impl Checker {
                         // expected type so the arm body is still
                         // processed.
                         self.messages.push(Message::error(
-                            ErrorCode::UnknownConstructorPattern, format!(
+                            ErrorCode::UnknownConstructorPattern,
+                            format!(
                                 "Pattern references unknown constructor `{}::{}`",
                                 enum_str, variant_str
                             ),
@@ -4300,7 +4692,8 @@ impl Checker {
                 if !shape_matches {
                     if same_shape_with_wrong_arity {
                         return self.error_with_help(
-                            ErrorCode::GenericTypeError, format!(
+                            ErrorCode::GenericTypeError,
+                            format!(
                                 "Constructor pattern `{}::{}` expects {} sub-patterns, got {}",
                                 enum_str,
                                 variant_str,
@@ -4356,7 +4749,8 @@ impl Checker {
                         for pf in fields {
                             if pattern_site.insert(pf.name, &pf.pattern).is_some() {
                                 return self.error_with_help(
-                                    ErrorCode::DuplicateField, format!(
+                                    ErrorCode::DuplicateField,
+                                    format!(
                                         "Duplicate field `{}` in record pattern `{}::{}`",
                                         pf.name, enum_str, variant_str,
                                     ),
@@ -4373,7 +4767,8 @@ impl Checker {
                                 Some(p) => *p,
                                 None => {
                                     return self.error_with_help(
-                                        ErrorCode::MissingField, format!(
+                                        ErrorCode::MissingField,
+                                        format!(
                                             "Missing field `{}` in record pattern `{}::{}`",
                                             decl_name, enum_str, variant_str,
                                         ),
@@ -4391,7 +4786,8 @@ impl Checker {
                         for pf in fields {
                             if !decl_fields.iter().any(|(dn, _)| dn == pf.name) {
                                 return self.error_with_help(
-                                    ErrorCode::UnknownField, format!(
+                                    ErrorCode::UnknownField,
+                                    format!(
                                         "Unknown field `{}` in record pattern `{}::{}`",
                                         pf.name, enum_str, variant_str,
                                     ),
@@ -4535,7 +4931,8 @@ impl Checker {
                     // Duplicate (tag, inner coverage) — this arm
                     // is unreachable.
                     self.messages.push(Message::error(
-                        ErrorCode::UnreachableArm, "Unreachable arm: this pattern is matched by an earlier arm".to_string(),
+                        ErrorCode::UnreachableArm,
+                        "Unreachable arm: this pattern is matched by an earlier arm".to_string(),
                         arm.range.clone(),
                     ));
                 }
@@ -4578,7 +4975,8 @@ impl Checker {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let mut msg = Message::error(
-                    ErrorCode::NonExhaustiveMatch, format!("Non-exhaustive match: variants not covered: {}", names),
+                    ErrorCode::NonExhaustiveMatch,
+                    format!("Non-exhaustive match: variants not covered: {}", names),
                     pending.match_range.clone(),
                 );
                 msg.with_help(
@@ -4591,8 +4989,7 @@ impl Checker {
 
     fn poly_builtin_variants_from_app(ty: &Ty) -> Option<Vec<(String, EnumVariantPayloadTy)>> {
         match ty {
-            Ty::App(con, args)
-                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
+            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
             {
                 let inner = args.first()?.clone();
                 Some(vec![
@@ -4600,8 +4997,7 @@ impl Checker {
                     ("Some".into(), EnumVariantPayloadTy::Tuple(vec![inner])),
                 ])
             }
-            Ty::App(con, args)
-                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
+            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
             {
                 let ok = args.first()?.clone();
                 let err = args.get(1)?.clone();
@@ -4657,7 +5053,8 @@ impl Checker {
                             let arg_ty_pruned = apply_ty_prune(&self.subst, &arg_ty);
                             if !type_matches_specifier(&arg_ty_pruned, spec) {
                                 let mut msg = Message::error(
-                                    ErrorCode::FormatSpecifierMismatch, format!(
+                                    ErrorCode::FormatSpecifierMismatch,
+                                    format!(
                                         "Format specifier `%{}` requires {}, found {}",
                                         spec, expected, arg_ty_pruned
                                     ),
@@ -4675,7 +5072,8 @@ impl Checker {
                             // Specifier with no arg — also an
                             // error.
                             let mut msg = Message::error(
-                                ErrorCode::GenericTypeError, format!(
+                                ErrorCode::GenericTypeError,
+                                format!(
                                     "Format string has more specifiers than arguments \
                                      (`%{}` is argument #{})",
                                     spec,
@@ -5063,7 +5461,8 @@ impl Checker {
             let variant_idx = tag as usize;
             if variant_idx >= variants.len() {
                 return self.error_with_help(
-                    ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record type", field),
+                    ErrorCode::GenericTypeError,
+                    format!("Cannot access field `{}` on non-record type", field),
                     range,
                     Some("only values of record-shaped enum types expose fields".to_string()),
                 );
@@ -5080,13 +5479,15 @@ impl Checker {
                     // the field.
                     let hint = build_record_field_hint(enum_name, variants);
                     self.error_with_help(
-                        ErrorCode::GenericTypeError, format!("Type `{}` has no field `{}`", enum_name, field),
+                        ErrorCode::GenericTypeError,
+                        format!("Type `{}` has no field `{}`", enum_name, field),
                         range,
                         hint,
                     )
                 }
                 _ => self.error_with_help(
-                    ErrorCode::GenericTypeError, format!("Cannot access field `{}` on non-record variant", field),
+                    ErrorCode::GenericTypeError,
+                    format!("Cannot access field `{}` on non-record variant", field),
                     range,
                     Some(format!(
                         "variant `{}::{}` is {}; only record-shaped variants expose named fields",
@@ -5113,7 +5514,8 @@ impl Checker {
                 0 => {
                     let hint = build_record_field_hint(enum_name, variants);
                     self.error_with_help(
-                        ErrorCode::GenericTypeError, format!("Type `{}` has no field `{}`", enum_name, field),
+                        ErrorCode::GenericTypeError,
+                        format!("Type `{}` has no field `{}`", enum_name, field),
                         range,
                         hint,
                     )
@@ -5121,7 +5523,8 @@ impl Checker {
                 1 => candidates[0].clone(),
                 _ => {
                     self.error_with_help(
-                        ErrorCode::GenericTypeError, format!(
+                        ErrorCode::GenericTypeError,
+                        format!(
                             "Field `{}` exists in multiple variants of `{}`; \
                              narrow with match first",
                             field, enum_name
@@ -5705,8 +6108,7 @@ mod tests {
 
     #[test]
     fn forall_annotation_pretty_or_ty_forall() {
-        let (mut c, _) =
-            check("fn app(forall T: Num. T -> T f, int x) -> int { return x; }");
+        let (mut c, _) = check("fn app(forall T: Num. T -> T f, int x) -> int { return x; }");
         assert!(c.take_messages().is_empty());
         let scheme = c.env().lookup("app").expect("app should be registered");
         let ty = apply_ty(c.subst(), &scheme.ty);
@@ -5750,7 +6152,8 @@ mod tests {
         "#;
         let msgs = assert_messages(src);
         assert!(
-            msgs.iter().any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
             "expected rank-n type mismatch, got: {msgs:?}"
         );
     }
@@ -7088,7 +7491,9 @@ mod tests {
     fn len_rejects_non_array() {
         let src = "fn main() { let x = 1; len(x); }";
         let (_c, msgs) = check_warn(src);
-        let found = msgs.iter().any(|m| m.message().contains("len expects an array"));
+        let found = msgs
+            .iter()
+            .any(|m| m.message().contains("len expects an array"));
         assert!(found, "expected len non-array diagnostic, got: {:?}", msgs);
     }
 
@@ -7281,11 +7686,15 @@ mod tests {
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
         assert_eq!(
-            c.generics.generic_type_ctors.get(common::BUILTIN_OPTION_ENUM),
+            c.generics
+                .generic_type_ctors
+                .get(common::BUILTIN_OPTION_ENUM),
             Some(&vec!["T".to_string()])
         );
         assert_eq!(
-            c.generics.generic_type_ctors.get(common::BUILTIN_RESULT_ENUM),
+            c.generics
+                .generic_type_ctors
+                .get(common::BUILTIN_RESULT_ENUM),
             Some(&vec!["T".to_string(), "E".to_string()])
         );
 
@@ -7327,9 +7736,9 @@ mod tests {
         let src = "enum Box<T> { Box(T) } fn f(Box<int, string> x) -> int { return 0; }";
         let (_c, msgs) = check_warn(src);
         assert!(
-            msgs.iter().any(|m| m.message().contains(
-                "Type constructor `Box` expects 1 type arguments, got 2"
-            )),
+            msgs.iter().any(|m| m
+                .message()
+                .contains("Type constructor `Box` expects 1 type arguments, got 2")),
             "expected arity diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -7423,8 +7832,9 @@ mod tests {
         "#;
         let (_c, msgs) = check_warn(src);
         assert!(
-            msgs.iter()
-                .any(|m| m.message().contains("Overlapping instance of `Tiny` for `int`")),
+            msgs.iter().any(|m| m
+                .message()
+                .contains("Overlapping instance of `Tiny` for `int`")),
             "expected overlapping-instance diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -7460,8 +7870,9 @@ mod tests {
         "#;
         let (_c, msgs) = check_warn(src);
         assert!(
-            msgs.iter()
-                .any(|m| m.message().contains("Unknown method `foo` in instance of `Tiny`")),
+            msgs.iter().any(|m| m
+                .message()
+                .contains("Unknown method `foo` in instance of `Tiny`")),
             "expected unknown-method diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -7873,9 +8284,7 @@ fn f(int n) {
 
     #[test]
     fn raise_with_explicit_non_result_return_errors() {
-        let msgs = assert_messages(
-            r#"fn f() -> int { raise "x"; return 1; }"#,
-        );
+        let msgs = assert_messages(r#"fn f() -> int { raise "x"; return 1; }"#);
         assert!(
             msgs.iter().any(|m| {
                 m.code() == Some(ErrorCode::TypeMismatch)
@@ -7891,10 +8300,11 @@ fn f(int n) {
     fn try_on_non_option_result_is_hard_error() {
         let msgs = assert_messages(r#"fn f() -> int { let x = 1; return x?; }"#);
         assert!(
-            msgs.iter()
-                .any(|m| m.code() == Some(ErrorCode::InvalidTry)),
+            msgs.iter().any(|m| m.code() == Some(ErrorCode::InvalidTry)),
             "expected InvalidTry (E0114), got: {:?}",
-            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -7936,7 +8346,9 @@ fn c() {
                     || m.message().contains("error type")
             }),
             "expected single-E conflict, got: {:?}",
-            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -7965,7 +8377,9 @@ fn main() {
             msgs.iter()
                 .any(|m| m.code() == Some(ErrorCode::InvalidCoalesce)),
             "expected InvalidCoalesce (E0115), got: {:?}",
-            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -7988,14 +8402,14 @@ fn main() {
 
     #[test]
     fn optional_access_on_result_errors() {
-        let msgs = assert_messages(
-            r#"fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }"#,
-        );
+        let msgs = assert_messages(r#"fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }"#);
         assert!(
             msgs.iter()
                 .any(|m| m.code() == Some(ErrorCode::InvalidOptionalAccess)),
             "expected InvalidOptionalAccess (E0116), got: {:?}",
-            msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -8004,8 +8418,7 @@ fn main() {
         let msgs = assert_messages(r#"enum Option { None, Some(int) }"#);
         assert!(
             msgs.iter().any(|m| {
-                m.code() == Some(ErrorCode::DuplicateEnum)
-                    || m.message().contains("Duplicate enum")
+                m.code() == Some(ErrorCode::DuplicateEnum) || m.message().contains("Duplicate enum")
             }),
             "expected Duplicate enum for Option, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
@@ -8067,19 +8480,28 @@ fn main() { show(42); }
         let dicts = c.all_call_site_dicts();
         eprintln!("call_site_dicts has {} entries", dicts.len());
         for (id, instances) in dicts {
-            eprintln!("  NodeId {:?} -> {:?}", id, instances.iter().map(|i| &i.class).collect::<Vec<_>>());
+            eprintln!(
+                "  NodeId {:?} -> {:?}",
+                id,
+                instances.iter().map(|i| &i.class).collect::<Vec<_>>()
+            );
         }
         let total_instances: usize = dicts.values().map(|v| v.len()).sum();
         assert!(
             total_instances > 0,
             "expected at least one call_site_dict entry for user typeclass, got 0;\
-             \ndicts: {:?}", dicts
+             \ndicts: {:?}",
+            dicts
         );
         // Check that we recorded Describable<int>
-        let has_describable = dicts.values().any(|instances| {
-            instances.iter().any(|i| i.class == "Describable")
-        });
-        assert!(has_describable, "expected Describable in call_site_dicts, got: {:?}", dicts);
+        let has_describable = dicts
+            .values()
+            .any(|instances| instances.iter().any(|i| i.class == "Describable"));
+        assert!(
+            has_describable,
+            "expected Describable in call_site_dicts, got: {:?}",
+            dicts
+        );
     }
 
     /// A generic function calling another generic function with the same

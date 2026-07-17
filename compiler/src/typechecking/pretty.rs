@@ -28,7 +28,15 @@ impl fmt::Display for Ty {
                         }
                         return write!(f, "coroutine<{}, {}>", y, s);
                     }
-                    write!(f, "{}<{}>", c, args.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))
+                    write!(
+                        f,
+                        "{}<{}>",
+                        c,
+                        args.iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 } else {
                     let inner = args
                         .iter()

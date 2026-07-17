@@ -210,9 +210,10 @@ fn candidate_for_call(
     // calling convention instead (dict tuples appended after value args).
     // Builtin classes (Num, Ord, Eq, Show) are dispatched via Dyn* opcodes
     // in the shared body and benefit from monomorphization; all others don't.
-    let has_any_user_bound = sig.type_param_bounds.iter().any(|bounds| {
-        bounds.iter().any(|b| !Checker::is_builtin_class(b))
-    });
+    let has_any_user_bound = sig
+        .type_param_bounds
+        .iter()
+        .any(|bounds| bounds.iter().any(|b| !Checker::is_builtin_class(b)));
     if has_any_user_bound {
         return None;
     }

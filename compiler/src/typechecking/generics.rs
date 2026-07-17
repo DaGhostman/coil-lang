@@ -5,8 +5,8 @@
 //! The [`Checker`](super::infer::Checker) owns one `Generics` value and
 //! delegates type-class resolution to it.
 
-use std::collections::{HashMap, HashSet};
 use super::ty::Ty;
+use std::collections::{HashMap, HashSet};
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  Public data types
@@ -98,7 +98,8 @@ impl Generics {
     /// Find an instance for `class` applied to `args` (exact type match).
     pub fn find_instance(&self, class: &str, args: &[Ty]) -> Option<&InstanceDef> {
         self.instances.iter().find(|inst| {
-            inst.class == class && inst.args.len() == args.len()
+            inst.class == class
+                && inst.args.len() == args.len()
                 && inst.args.iter().zip(args.iter()).all(|(a, b)| a == b)
         })
     }
@@ -161,52 +162,95 @@ impl Generics {
 
     /// Register the built-in typeclasses and their builtin instances.
     fn register_builtins(&mut self) {
-        use super::ty::{int, float, string, boolean};
+        use super::ty::{boolean, float, int, string};
 
         self.register_builtin_type_ctors();
 
         // ---- Num ----
-        self.typeclasses.insert("Num".into(), TypeClassDef {
-            name: "Num".into(),
-            type_params: vec!["T".into()],
-            methods: vec![
-                TypeClassMethodDef { name: "add".into(), has_default: false },
-                TypeClassMethodDef { name: "sub".into(), has_default: false },
-                TypeClassMethodDef { name: "mul".into(), has_default: false },
-                TypeClassMethodDef { name: "div".into(), has_default: false },
-            ],
-        });
+        self.typeclasses.insert(
+            "Num".into(),
+            TypeClassDef {
+                name: "Num".into(),
+                type_params: vec!["T".into()],
+                methods: vec![
+                    TypeClassMethodDef {
+                        name: "add".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "sub".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "mul".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "div".into(),
+                        has_default: false,
+                    },
+                ],
+            },
+        );
 
         // ---- Ord ----
-        self.typeclasses.insert("Ord".into(), TypeClassDef {
-            name: "Ord".into(),
-            type_params: vec!["T".into()],
-            methods: vec![
-                TypeClassMethodDef { name: "lt".into(), has_default: false },
-                TypeClassMethodDef { name: "le".into(), has_default: false },
-                TypeClassMethodDef { name: "gt".into(), has_default: false },
-                TypeClassMethodDef { name: "ge".into(), has_default: false },
-            ],
-        });
+        self.typeclasses.insert(
+            "Ord".into(),
+            TypeClassDef {
+                name: "Ord".into(),
+                type_params: vec!["T".into()],
+                methods: vec![
+                    TypeClassMethodDef {
+                        name: "lt".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "le".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "gt".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "ge".into(),
+                        has_default: false,
+                    },
+                ],
+            },
+        );
 
         // ---- Eq ----
-        self.typeclasses.insert("Eq".into(), TypeClassDef {
-            name: "Eq".into(),
-            type_params: vec!["T".into()],
-            methods: vec![
-                TypeClassMethodDef { name: "eq".into(), has_default: false },
-                TypeClassMethodDef { name: "ne".into(), has_default: false },
-            ],
-        });
+        self.typeclasses.insert(
+            "Eq".into(),
+            TypeClassDef {
+                name: "Eq".into(),
+                type_params: vec!["T".into()],
+                methods: vec![
+                    TypeClassMethodDef {
+                        name: "eq".into(),
+                        has_default: false,
+                    },
+                    TypeClassMethodDef {
+                        name: "ne".into(),
+                        has_default: false,
+                    },
+                ],
+            },
+        );
 
         // ---- Show ----
-        self.typeclasses.insert("Show".into(), TypeClassDef {
-            name: "Show".into(),
-            type_params: vec!["T".into()],
-            methods: vec![
-                TypeClassMethodDef { name: "show".into(), has_default: false },
-            ],
-        });
+        self.typeclasses.insert(
+            "Show".into(),
+            TypeClassDef {
+                name: "Show".into(),
+                type_params: vec!["T".into()],
+                methods: vec![TypeClassMethodDef {
+                    name: "show".into(),
+                    has_default: false,
+                }],
+            },
+        );
 
         // ---- builtin instances ----
         for ty in [int(), float()] {
@@ -249,7 +293,8 @@ impl Generics {
 
     /// Whether `class` is satisfied for `ty` (builtin or registered instance).
     pub fn has_instance(&self, class: &str, ty: &Ty) -> bool {
-        self.find_instance(class, std::slice::from_ref(ty)).is_some()
+        self.find_instance(class, std::slice::from_ref(ty))
+            .is_some()
     }
 }
 
@@ -301,8 +346,7 @@ mod tests {
 
     #[test]
     fn unknown_instance_methods_reports_methods_not_in_class() {
-        let unknown =
-            Generics::unknown_instance_methods(&class_def(), ["add", "foo"].into_iter());
+        let unknown = Generics::unknown_instance_methods(&class_def(), ["add", "foo"].into_iter());
 
         assert_eq!(unknown, vec!["foo".to_string()]);
     }

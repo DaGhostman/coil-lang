@@ -957,6 +957,7 @@ impl Compiler {
         &mut self,
         method: &Output<'compiler>,
         qualified: String,
+        argument_unbox_tys: &[Option<Ty>],
     ) {
         let _method_id = self.next_emit_id();
         let Expression::Function {
@@ -990,6 +991,16 @@ impl Compiler {
 
         let mut a = self.do_compile(args);
         self.bytecode.append(&mut a);
+        for (slot, ty) in argument_unbox_tys.iter().enumerate() {
+            if let Some(tag) = ty.as_ref().and_then(Self::ty_to_value_tag) {
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot as u32));
+            }
+        }
         let mut c = self.do_compile(body);
         self.bytecode.append(&mut c);
 
@@ -1015,6 +1026,45 @@ impl Compiler {
         self.compiling_result_mode = prev_result_mode;
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
+    }
+
+    fn instance_method_unbox_tys(
+        &self,
+        class: &str,
+        method: &str,
+        instance_args: &[Ty],
+    ) -> Vec<Option<Ty>> {
+        let Some(scheme) = self.checker.typeclass_method_scheme(class, method) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        let mut current = &scheme.ty;
+        while let Ty::Fun(param, ret) = current {
+            let concrete = match param.as_ref() {
+                Ty::Var(var) => scheme
+                    .bounds
+                    .iter()
+                    .position(|bound| bound == var)
+                    .and_then(|index| instance_args.get(index))
+                    .cloned(),
+                _ => None,
+            };
+            result.push(concrete);
+            current = ret;
+        }
+        result
+    }
+
+    fn generic_return_depends_on_type_param(&self, name: &str) -> bool {
+        let Some(scheme) = self.checker.env().lookup(name) else {
+            return false;
+        };
+        let mut result = &scheme.ty;
+        while let Ty::Fun(_, ret) = result {
+            result = ret;
+        }
+        let free = crate::typechecking::subst::ftv(result);
+        scheme.bounds.iter().any(|bound| free.contains(bound))
     }
 
     fn emit_mono_specializations_for_function<'compiler>(
@@ -1329,7 +1379,7 @@ impl Compiler {
     }
 
     fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
-        match node.1.as_ref() {
+        let resolved = match node.1.as_ref() {
             Expression::String(_) | Expression::Format(_, _) => {
                 Some(Ty::Con(crate::typechecking::ty::STRING.into()))
             }
@@ -1385,7 +1435,11 @@ impl Compiler {
             | Expression::Statement(inner)
             | Expression::ExprStatement(inner) => self.codegen_expr_ty(inner),
             _ => None,
-        }
+        };
+        resolved.or_else(|| {
+            self.checker
+                .lookup_for_codegen_span(node.0.start, node.0.end)
+        })
     }
 
     fn binop_for_assign_op(op: parser::ast::AssignOp, is_float: bool) -> Instruction {
@@ -1893,9 +1947,7 @@ impl Compiler {
                 // not get a dict slot.
                 let dict_arity = self.checker.dict_arity_for(name);
                 for dict_idx in 0..dict_arity {
-                    self.context
-                        .variables
-                        .intern(format!("__dict{}", dict_idx));
+                    self.context.variables.intern(format!("__dict{}", dict_idx));
                 }
 
                 self.bytecode.append(&mut a);
@@ -2506,6 +2558,51 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_method_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_method_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                {
+                    if hint.has_receiver
+                        && let Expression::Access(recv, _) = name.1.as_ref()
+                    {
+                        bytecode.append(&mut self.do_compile(recv));
+                    }
+                    if let Some(items) = args {
+                        for arg in items {
+                            bytecode.append(&mut self.do_compile(arg));
+                        }
+                    }
+                    let dict_name = format!("__dict{}", hint.dict_index);
+                    if let Some(dict_slot) = self.lookup_slot(&dict_name) {
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                        bytecode.push(
+                            Byte::new(Instruction::CONST)
+                                .with_const_inline(hint.method_slot as i32),
+                        );
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(
+                            Byte::new(Instruction::CallIndirect)
+                                .with_operand_u32(hint.arity as u32),
+                        );
+                    } else {
+                        let mut message = Message::error(
+                            ErrorCode::UnknownFunction,
+                            "Missing typeclass dictionary".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            format!("dictionary slot `{}` is not available", dict_name),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
+                    return bytecode;
+                }
+
                 // Method call: `recv.method(args)`.
                 if let Expression::Access(recv, method) = name.1.borrow() {
                     let recv_ty = self.receiver_type(recv);
@@ -2664,14 +2761,11 @@ impl Compiler {
                             for arg in arg_list {
                                 bytecode.append(&mut self.do_compile(arg));
                                 if is_generic {
-                                    // Infer the argument's resolved type and emit BoxValue
-                                    // when the type is a known concrete Con (int, float, etc.).
-                                    let arg_ty = self.checker.infer_for_codegen(arg);
-                                    let pruned = crate::typechecking::subst::apply_ty_prune(
-                                        self.checker.subst(),
-                                        &arg_ty,
-                                    );
-                                    Self::emit_box_if_needed(&mut bytecode, &pruned);
+                                    // Reuse the original HM result. Re-running inference here
+                                    // would occur after the function scope has been popped.
+                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    }
                                 }
                             }
                         }
@@ -2691,22 +2785,40 @@ impl Compiler {
                                     items
                                         .iter()
                                         .map(|arg| {
-                                            let ty = self.checker.infer_for_codegen(arg);
-                                            crate::typechecking::subst::apply_ty_prune(
-                                                self.checker.subst(),
-                                                &ty,
+                                            self.codegen_expr_ty(arg).expect(
+                                                "typechecked call argument must have a codegen type",
                                             )
                                         })
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            Self::emit_call_site_dicts(
-                                &mut bytecode,
-                                &n,
-                                &call_arg_tys,
-                                &self.checker,
-                                &self.functions,
-                            )
+                            let mut forwarded = 0;
+                            if let Some(indices) = self_id
+                                .and_then(|id| self.checker.forwarded_dicts_at(id))
+                                .or_else(|| {
+                                    self.checker.forwarded_dicts_for_span(span.start, span.end)
+                                })
+                                .map(<[usize]>::to_vec)
+                            {
+                                for dict_index in indices {
+                                    if let Some(slot) =
+                                        self.lookup_slot(&format!("__dict{}", dict_index))
+                                    {
+                                        bytecode.push(
+                                            Byte::new(Instruction::LOAD).with_operand_u32(slot),
+                                        );
+                                        forwarded += 1;
+                                    }
+                                }
+                            }
+                            forwarded
+                                + Self::emit_call_site_dicts(
+                                    &mut bytecode,
+                                    &n,
+                                    &call_arg_tys,
+                                    &self.checker,
+                                    &self.functions,
+                                )
                         } else {
                             0
                         };
@@ -2730,13 +2842,10 @@ impl Compiler {
                         // Generic→concrete unbox: if this was a non-monomorphized generic
                         // call and the Call expression's inferred return type is concrete,
                         // emit UnboxValue so the caller gets a raw value, not an ObjBoxed.
-                        if is_generic {
-                            let call_ty = self.checker.infer_for_codegen(ast);
-                            let pruned = crate::typechecking::subst::apply_ty_prune(
-                                self.checker.subst(),
-                                &call_ty,
-                            );
-                            Self::emit_unbox_if_needed(&mut bytecode, &pruned);
+                        if is_generic && self.generic_return_depends_on_type_param(&n) {
+                            if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                                Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                            }
                         }
                     } else if self.polyfn_vars.contains(&identifier) {
                         // `identifier` is a local variable holding an ObjPolyFn
@@ -2750,12 +2859,9 @@ impl Compiler {
                             for arg in arg_list {
                                 bytecode.append(&mut self.do_compile(arg));
                                 // Box concrete args when delegating through a polyfn.
-                                let arg_ty = self.checker.infer_for_codegen(arg);
-                                let pruned = crate::typechecking::subst::apply_ty_prune(
-                                    self.checker.subst(),
-                                    &arg_ty,
-                                );
-                                Self::emit_box_if_needed(&mut bytecode, &pruned);
+                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                }
                             }
                         }
                         // Push the ObjPolyFn pointer (TOS for CallIndirect).
@@ -2812,7 +2918,7 @@ impl Compiler {
                                 name,
                                 method_name,
                             );
-                            self.compile_function_output_with_name(method, fqn);
+                            self.compile_function_output_with_name(method, fqn, &[]);
                         } else {
                             self.consume_function_signature_output(method);
                         }
@@ -2828,7 +2934,10 @@ impl Compiler {
             } => {
                 let arg_tys: Vec<_> = args
                     .iter()
-                    .map(|arg| self.checker.infer_for_codegen(arg))
+                    .map(|arg| {
+                        self.codegen_expr_ty(arg)
+                            .expect("typechecked instance argument must have a codegen type")
+                    })
                     .collect();
                 for arg in args {
                     bytecode.append(&mut self.do_compile(arg));
@@ -2844,7 +2953,9 @@ impl Compiler {
                     } = method.1.as_ref()
                     {
                         let fqn = format!("{}__{}__{}", class, ty_part, method_name);
-                        self.compile_function_output_with_name(method, fqn);
+                        let unbox_tys =
+                            self.instance_method_unbox_tys(class, method_name, &arg_tys);
+                        self.compile_function_output_with_name(method, fqn, &unbox_tys);
                     } else if let Expression::Method(_, body) = method.1.as_ref() {
                         let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
                         self.emit_idx += 1;
@@ -2853,7 +2964,9 @@ impl Compiler {
                         } = body.1.as_ref()
                         {
                             let fqn = format!("{}__{}__{}", class, ty_part, method_name);
-                            self.compile_function_output_with_name(body, fqn);
+                            let unbox_tys =
+                                self.instance_method_unbox_tys(class, method_name, &arg_tys);
+                            self.compile_function_output_with_name(body, fqn, &unbox_tys);
                         } else {
                             self.consume_function_signature_output(body);
                         }
@@ -6663,9 +6776,7 @@ print \"%i\", len(a); \
     #[test]
     fn generic_call_emits_box_and_unbox() {
         use common::Instruction;
-        let (bc, _pool) = compile_src(
-            "fn id<T>(T x) -> T { return x; } fn main() { id(42); }",
-        );
+        let (bc, _pool) = compile_src("fn id<T>(T x) -> T { return x; } fn main() { id(42); }");
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
@@ -6751,7 +6862,8 @@ print \"%i\", len(a); \
 
         // ── 1. A MakeTuple must be present (the dict for Describable<int>).
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
             "expected MakeTuple for dict emission; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
@@ -6766,7 +6878,8 @@ print \"%i\", len(a); \
             .max()
             .unwrap_or(0);
         assert_eq!(
-            max_call_arity, 2,
+            max_call_arity,
+            2,
             "expected CALL arity = 2 (1 value + 1 dict); got {} from opcodes: {:?}",
             max_call_arity,
             bc.iter()
@@ -6838,7 +6951,8 @@ print \"%i\", len(a); \
             .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
             .count();
         assert_eq!(
-            make_tuple_count, 0,
+            make_tuple_count,
+            0,
             "builtin Num constraint should not emit MakeTuple dict; got {}; opcodes: {:?}",
             make_tuple_count,
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
@@ -6846,7 +6960,8 @@ print \"%i\", len(a); \
 
         // Num uses DynAdd, not a dict.
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
             "expected DynAdd for Num-constrained add; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
@@ -6866,12 +6981,14 @@ print \"%i\", len(a); \
         );
 
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
             "shared generic path should box the concrete arg; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
             "user typeclass ground call should emit a dict MakeTuple; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );

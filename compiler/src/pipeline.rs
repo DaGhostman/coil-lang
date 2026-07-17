@@ -10,8 +10,8 @@ use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, In
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use reporting::{
-    create_sink, Diagnostic, DiagnosticSink, ErrorCode, Label, Message, ReportConfig, SourceId,
-    SourceMap,
+    Diagnostic, DiagnosticSink, ErrorCode, Label, Message, ReportConfig, SourceId, SourceMap,
+    create_sink,
 };
 use rkyv::rancor::Error;
 
@@ -157,7 +157,9 @@ impl Pipeline {
         entry_path: Option<&std::path::Path>,
     ) {
         use machine::{CStructLayout, FfiType};
-        let base_dir = entry_path.and_then(|p| p.parent()).map(std::path::PathBuf::from);
+        let base_dir = entry_path
+            .and_then(|p| p.parent())
+            .map(std::path::PathBuf::from);
         let search: Vec<std::path::PathBuf> = self
             .manifest
             .ffi_search_paths
@@ -274,8 +276,7 @@ impl Pipeline {
 
     /// Emit a CLI / I/O style error with no source span.
     pub fn emit_spanless_error(&mut self, code: ErrorCode, message: impl Into<String>) {
-        self.sink
-            .emit(Diagnostic::error(message).with_code(code));
+        self.sink.emit(Diagnostic::error(message).with_code(code));
         self.failed = true;
     }
 
@@ -524,10 +525,7 @@ impl Pipeline {
                         format!("Failed to read file `{}`", file.display()),
                         0..0,
                     );
-                    msg.push(Label::new(
-                        format!("file path: {}", file.display()),
-                        0..0,
-                    ));
+                    msg.push(Label::new(format!("file path: {}", file.display()), 0..0));
                     self.emit_message(&file, "", &msg);
                     self.failed = true;
                     continue;
@@ -598,10 +596,7 @@ impl Pipeline {
                     format!("Failed to read file `{}`", file.display()),
                     0..0,
                 );
-                msg.push(Label::new(
-                    format!("file path: {}", file.display()),
-                    0..0,
-                ));
+                msg.push(Label::new(format!("file path: {}", file.display()), 0..0));
                 self.emit_message(&file, "", &msg);
                 self.failed = true;
                 return;
@@ -818,8 +813,7 @@ impl Pipeline {
         let root = Self::find_project_root(&entry);
         if root != self.project_root {
             self.project_root = root.clone();
-            self.manifest =
-                Manifest::load(&root).expect("Failed to load zero.toml for entry file");
+            self.manifest = Manifest::load(&root).expect("Failed to load zero.toml for entry file");
         }
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);
