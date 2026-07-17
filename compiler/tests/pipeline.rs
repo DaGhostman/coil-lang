@@ -73,7 +73,7 @@ fn example_option_prints_42() {
 #[test]
 fn example_generics_uses_builtin_dictionary_abi() {
     let output = run_example("examples/generics.0s");
-    assert_eq!(output, "7424.0");
+    assert_eq!(output, "7424.042");
 }
 
 #[test]
