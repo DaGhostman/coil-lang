@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use common::{Byte, Instruction, Interner, Value, encode_tag_operand, likely, tag, unlikely};
+use common::{Byte, Instruction, Interner, Value, ValueTag, encode_tag_operand, likely, tag, unlikely};
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
@@ -397,6 +397,12 @@ pub struct Compiler {
     /// True while compiling a function whose return type is inferred
     /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
     compiling_result_mode: bool,
+
+    /// Local variable names that hold an `ObjPolyFn` heap pointer
+    /// (i.e. `let f = some_generic_fn;`). When these are invoked via
+    /// `Expression::Call`, the codegen emits `CallIndirect` instead
+    /// of a direct `CALL` opcode.
+    polyfn_vars: HashSet<String>,
 }
 
 impl Default for Compiler {
@@ -436,6 +442,7 @@ impl Default for Compiler {
             loop_bbs: Vec::new(),
             compiling_method: false,
             compiling_result_mode: false,
+            polyfn_vars: HashSet::new(),
         }
     }
 }
@@ -779,6 +786,40 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
     }
 
+    /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
+    /// emission at generic call boundaries.
+    fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
+        use crate::typechecking::{Ty, ty::INT, ty::FLOAT, ty::STRING, ty::BOOL, ty::UNIT};
+        match ty {
+            Ty::Con(name) => match name.as_str() {
+                INT => Some(ValueTag::Int),
+                FLOAT => Some(ValueTag::Float),
+                STRING => Some(ValueTag::String),
+                BOOL => Some(ValueTag::Bool),
+                UNIT => Some(ValueTag::Unit),
+                _ => Some(ValueTag::Instance), // user-defined class / enum
+            },
+            Ty::Sum { .. } => Some(ValueTag::Enum),
+            Ty::Tuple(_) => Some(ValueTag::Tuple),
+            Ty::Array { .. } => Some(ValueTag::Array),
+            Ty::Record { .. } => Some(ValueTag::Record),
+            // Open type vars — boxing is required but we don't know the tag yet
+            Ty::Var(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Emit a `BoxValue` instruction for a concrete `Ty` at a generic
+    /// call argument boundary (concrete→generic).  Does nothing when the
+    /// type is already open (Ty::Var), or if a tag cannot be determined.
+    fn emit_box_if_needed(bytecode: &mut Vec<Byte>, ty: &crate::typechecking::Ty) {
+        if let Some(tag) = Self::ty_to_value_tag(ty) {
+            bytecode.push(
+                Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32),
+            );
+        }
+    }
+
     fn compile_function_output_with_name<'compiler>(
         &mut self,
         method: &Output<'compiler>,
@@ -804,6 +845,7 @@ impl Compiler {
         }
 
         let prev_vars = std::mem::take(&mut self.context.variables);
+        let prev_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
         self.context.variables = Interner::default();
         if self.compiling_method {
             self.context.variables.intern("self".to_string());
@@ -838,6 +880,7 @@ impl Compiler {
 
         self.compiling_result_mode = prev_result_mode;
         self.context.variables = prev_vars;
+        self.polyfn_vars = prev_polyfn_vars;
     }
 
     fn consume_function_signature_output<'compiler>(&mut self, method: &Output<'compiler>) {
@@ -1486,6 +1529,24 @@ impl Compiler {
                         if is_const {
                             self.context.constants.insert(slot as usize, true);
                         }
+                        // Check if the RHS is a bare identifier that names a generic fn.
+                        // If so, track this variable as holding an ObjPolyFn.
+                        let rhs_is_generic_fn = match children[1].1.as_ref() {
+                            Expression::Identifier(rhs_name) => {
+                                let resolved = self
+                                    .aliases
+                                    .get(*rhs_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| rhs_name.to_string());
+                                self.checker.is_generic_fn(&resolved)
+                                    || self.functions.get(&resolved).is_some()
+                                        && self.checker.is_generic_fn(rhs_name)
+                            }
+                            _ => false,
+                        };
+                        if rhs_is_generic_fn {
+                            self.polyfn_vars.insert(name.clone());
+                        }
                         // Emit the RHS.
                         let mut rhs_bc = self.do_compile(&children[1]);
                         bytecode.append(&mut rhs_bc);
@@ -1540,6 +1601,8 @@ impl Compiler {
                 // slots; `StorePop` then left holes and match bindings
                 // at slot 1 read garbage. Extern preload slots live in
                 // the entry frame (bytecode before `main`).
+                let prev_fn_vars = std::mem::take(&mut self.context.variables);
+                let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
                 self.context.variables = Interner::default();
                 if self.compiling_method {
                     self.context.variables.intern("self".to_string());
@@ -1575,6 +1638,8 @@ impl Compiler {
                 }
 
                 self.compiling_result_mode = prev_result_mode;
+                self.context.variables = prev_fn_vars;
+                self.polyfn_vars = prev_fn_polyfn_vars;
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -2294,9 +2359,23 @@ impl Compiler {
                             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
                         );
                     } else if let Some(offset) = self.functions.get(&n).copied() {
-                        if let Some(args) = args {
-                            args.iter()
-                                .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
+                        // If the callee is a generic function, box each concrete arg
+                        // at the call boundary (concrete→generic).
+                        let is_generic = self.checker.is_generic_fn(&n);
+                        if let Some(arg_list) = args {
+                            for arg in arg_list {
+                                bytecode.append(&mut self.do_compile(arg));
+                                if is_generic {
+                                    // Infer the argument's resolved type and emit BoxValue
+                                    // when the type is a known concrete Con (int, float, etc.).
+                                    let arg_ty = self.checker.infer_for_codegen(arg);
+                                    let pruned = crate::typechecking::subst::apply_ty_prune(
+                                        self.checker.subst(),
+                                        &arg_ty,
+                                    );
+                                    Self::emit_box_if_needed(&mut bytecode, &pruned);
+                                }
+                            }
                         }
 
                         let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
@@ -2314,6 +2393,31 @@ impl Compiler {
                                 offset as u32,
                             ));
                         }
+                    } else if self.polyfn_vars.contains(&identifier) {
+                        // `identifier` is a local variable holding an ObjPolyFn
+                        // (bound via `let f = some_generic_fn;`). Emit args, then
+                        // load the polyfn pointer, then CallIndirect.
+                        let slot = self
+                            .lookup_slot(&identifier)
+                            .expect("polyfn_var must have a slot");
+                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        if let Some(arg_list) = args {
+                            for arg in arg_list {
+                                bytecode.append(&mut self.do_compile(arg));
+                                // Box concrete args when delegating through a polyfn.
+                                let arg_ty = self.checker.infer_for_codegen(arg);
+                                let pruned = crate::typechecking::subst::apply_ty_prune(
+                                    self.checker.subst(),
+                                    &arg_ty,
+                                );
+                                Self::emit_box_if_needed(&mut bytecode, &pruned);
+                            }
+                        }
+                        // Push the ObjPolyFn pointer (TOS for CallIndirect).
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                        bytecode.push(
+                            Byte::new(Instruction::CallIndirect).with_operand_u32(arity),
+                        );
                     } else {
                         let mut message =
                             Message::error(ErrorCode::UnknownFunction, "Unknown function".to_string(), span.into_range());
@@ -2403,13 +2507,44 @@ impl Compiler {
                 if let Some(slot) = self.lookup_slot(n) {
                     bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                 } else {
-                    let mut message =
-                        Message::error(ErrorCode::UnknownValue, "Unknown variable".to_string(), span.into_range());
-                    message.push(DiagLabel::new(
-                        format!("Unknown variable '{}'", n),
-                        span.into_range(),
-                    ));
-                    self.messages.push(message);
+                    // Not a local variable — check if it's a generic function
+                    // escaping into a non-call position (e.g. `let f = id;`).
+                    // In that case, emit MakePolyFn instead of a direct CALL offset,
+                    // so the variable holds an ObjPolyFn that CallIndirect can use.
+                    let resolved_n = self
+                        .aliases
+                        .get(*n)
+                        .cloned()
+                        .unwrap_or_else(|| n.to_string());
+                    if self.checker.is_generic_fn(&resolved_n) {
+                        if let Some(&entry_offset) = self.functions.get(&resolved_n) {
+                            bytecode.push(
+                                Byte::new(Instruction::MakePolyFn)
+                                    .with_operand_u32(entry_offset as u32),
+                            );
+                        } else {
+                            // Function not yet compiled (forward reference) — fall
+                            // through to the unknown-variable diagnostic.
+                            let mut message = Message::error(
+                                ErrorCode::UnknownValue,
+                                "Unknown generic function".to_string(),
+                                span.into_range(),
+                            );
+                            message.push(DiagLabel::new(
+                                format!("Generic function '{}' not found in bytecode", n),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
+                        }
+                    } else {
+                        let mut message =
+                            Message::error(ErrorCode::UnknownValue, "Unknown variable".to_string(), span.into_range());
+                        message.push(DiagLabel::new(
+                            format!("Unknown variable '{}'", n),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
                 }
             }
             // --- If codegen ---
@@ -6073,6 +6208,62 @@ print \"%i\", len(a); \
             has_int_add,
             "expected ADD or BinSlotSlot/BinReturn for concrete add; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Codegen test B3-1: when a generic function is referenced in a non-call position
+    /// (e.g. `let f = id;`), the codegen must emit `MakePolyFn` so that `f` holds an
+    /// `ObjPolyFn` heap pointer that `CallIndirect` can dispatch through.
+    ///
+    /// The function `id<T>(T x) -> T` is a canonical unconstrained identity and has
+    /// no typeclass bound, so no DynAdd / DynCmp / etc. opcode is emitted — this
+    /// purely tests the MakePolyFn path.
+    #[test]
+    fn generic_fn_as_value_emits_make_polyfn() {
+        use common::Instruction;
+        // `let f = id;` in main must compile `id` (a generic fn) as a MakePolyFn rather
+        // than a direct CALL or LOAD — id is not a local variable, so the Identifier arm
+        // must detect `is_generic_fn("id")` and emit MakePolyFn with id's entry offset.
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } fn main() { let f = id; }",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "expected MakePolyFn for `let f = id` where id is generic; bytecode opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Codegen test B3-2: when a concrete value is passed to a generic function,
+    /// the codegen must emit `BoxValue` immediately after the argument to wrap it
+    /// into an `ObjBoxed` heap object at the concrete→generic boundary.
+    ///
+    /// For `id(42)` where `fn id<T>(T x) -> T`, `42` is an `int` literal.
+    /// After compiling the `CONST 42`, codegen detects `is_generic_fn("id")`,
+    /// infers the argument's type as `int`, and emits `BoxValue` with tag
+    /// `ValueTag::Int`.
+    #[test]
+    fn generic_call_with_concrete_arg_emits_box_value() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } fn main() { id(42); }",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            "expected BoxValue for concrete int arg passed to generic fn id<T>; bytecode opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // The BoxValue operand should encode ValueTag::Int (= 0).
+        let box_ops: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BoxValue))
+            .map(|b| b.operand_u32())
+            .collect();
+        assert!(
+            box_ops.iter().any(|&tag| tag == common::ValueTag::Int as u32),
+            "BoxValue operand should be ValueTag::Int ({}), got: {:?}",
+            common::ValueTag::Int as u32,
+            box_ops
         );
     }
 }

@@ -1960,11 +1960,26 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::CallIndirect => {
-                    // Stack layout: [arg0, arg1, ..., argN-1, target_offset]
+                    // Stack layout: [arg0, arg1, ..., argN-1, target_offset_or_polyfn]
                     // operand = arity
                     let arity = opcode.operand_u32() as usize;
-                    // TOS = target offset (stored as int)
-                    let target = self.stack.pop().as_int() as usize;
+                    // TOS = either a raw code offset (int) or an ObjPolyFn heap pointer
+                    let raw = self.stack.pop();
+                    let target = {
+                        let addr = raw.raw() as u64;
+                        if !raw.raw().is_null() && self.heap.contains_addr(raw.raw()) {
+                            // It's a heap pointer — check if it's an ObjPolyFn
+                            if let Some(Object::PolyFn(gc)) =
+                                self.heap.find_object_by_addr(addr)
+                            {
+                                gc.as_ref().entry as usize
+                            } else {
+                                raw.as_int() as usize
+                            }
+                        } else {
+                            raw.as_int() as usize
+                        }
+                    };
                     let return_ip = ip; // return to next instruction
                     let callee_sp = self.stack.tell() - arity;
                     self.frames.get_mut().seek(return_ip);
