@@ -17,7 +17,8 @@ use super::ty::{Constraint, Scheme};
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty, list,
-    option_inner, option_ty, result_ok_err, result_ty, string, unit as unit_ty,
+    option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty, string,
+    unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
 
@@ -285,9 +286,9 @@ impl Checker {
         self.enum_arities.insert(name, arities);
     }
 
-    /// Pre-register polymorphic `Option` / `Result`. Payload slots use
-    /// placeholder `Con` names that are freshened at each construct /
-    /// pattern / annotation site.
+    /// Pre-register polymorphic `Option` / `Result` tags and payload
+    /// shapes. Type annotations use `Ty::App`; these registry entries
+    /// remain for constructor tags, payload arities, and codegen.
     fn register_builtin_option_result(&mut self) {
         use common::{
             BUILTIN_OPTION_ENUM, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_ENUM,
@@ -303,7 +304,7 @@ impl Checker {
                 .collect();
             let payloads = vec![
                 EnumVariantPayloadTy::Unit,
-                EnumVariantPayloadTy::Tuple(vec![Ty::Con("__T".into())]),
+                EnumVariantPayloadTy::Tuple(vec![Ty::Con("T".into())]),
             ];
             let arities = vec![0, 1];
             let mut tag_map = BTreeMap::new();
@@ -324,8 +325,8 @@ impl Checker {
                 .map(|s| s.to_string())
                 .collect();
             let payloads = vec![
-                EnumVariantPayloadTy::Tuple(vec![Ty::Con("__T".into())]),
-                EnumVariantPayloadTy::Tuple(vec![Ty::Con("__E".into())]),
+                EnumVariantPayloadTy::Tuple(vec![Ty::Con("T".into())]),
+                EnumVariantPayloadTy::Tuple(vec![Ty::Con("E".into())]),
             ];
             let arities = vec![1, 1];
             let mut tag_map = BTreeMap::new();
@@ -378,6 +379,7 @@ impl Checker {
         self.result_mode_fns.clear();
         self.option_mode_fns.clear();
         self.generics.generic_type_ctors.clear();
+        self.generics.register_builtin_type_ctors();
         self.generics.generic_fns.clear();
 
         // Built-in enums survive the per-program enum reset.
@@ -2463,25 +2465,6 @@ impl Checker {
     }
 
     fn parse_type_app(&mut self, name: &str, args: &[Output], range: Range<usize>) -> Ty {
-        if common::is_builtin_option_enum(name) {
-            let inner = args
-                .first()
-                .map(|a| self.parse_type_name(a))
-                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-            return option_ty(inner);
-        }
-        if common::is_builtin_result_enum(name) {
-            let ok = args
-                .first()
-                .map(|a| self.parse_type_name(a))
-                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-            let err = args
-                .get(1)
-                .map(|a| self.parse_type_name(a))
-                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
-            return result_ty(ok, err);
-        }
-
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_type_name(a)).collect();
         if let Some(expected_arity) = self
             .generics
@@ -2532,8 +2515,8 @@ impl Checker {
             "bool" => boolean(),
             "string" => string(),
             "void" => unit_ty(),
-            "option" => option_ty(Ty::Var(self.counter.fresh())),
-            "result" => result_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
+            "option" => option_app_ty(Ty::Var(self.counter.fresh())),
+            "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             _ => Ty::Con(name.to_string()),
         }
     }
@@ -3830,13 +3813,16 @@ impl Checker {
                 return Some(payload.clone());
             }
         }
+        if let Some(payload) = Self::poly_builtin_payload_from_app(enum_name, tag, &resolved) {
+            return Some(payload);
+        }
         if common::is_poly_builtin_enum(enum_name) {
             // Scrutinee not yet pinned — freshen a full Option/Result
             // and unify so bindings share type vars with the scrutinee.
             let owner = if common::is_builtin_option_enum(enum_name) {
-                option_ty(Ty::Var(self.counter.fresh()))
+                option_app_ty(Ty::Var(self.counter.fresh()))
             } else {
-                result_ty(
+                result_app_ty(
                     Ty::Var(self.counter.fresh()),
                     Ty::Var(self.counter.fresh()),
                 )
@@ -3848,13 +3834,55 @@ impl Checker {
                 "poly builtin pattern scrutinee",
             );
             let resolved = apply_ty_prune(&self.subst, &owner);
-            if let Ty::Sum { variants, .. } = resolved {
-                return variants.get(tag as usize).map(|(_, p)| p.clone());
+            if let Some(payload) = Self::poly_builtin_payload_from_app(enum_name, tag, &resolved) {
+                return Some(payload);
             }
         }
         self.enum_payloads
             .get(enum_name)
             .and_then(|p| p.get(tag as usize).cloned())
+    }
+
+    fn poly_builtin_payload_from_app(
+        enum_name: &str,
+        tag: u32,
+        ty: &Ty,
+    ) -> Option<EnumVariantPayloadTy> {
+        match ty {
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if name == enum_name)
+                    && common::is_builtin_option_enum(enum_name) =>
+            {
+                match tag {
+                    0 => Some(EnumVariantPayloadTy::Unit),
+                    1 => args
+                        .first()
+                        .cloned()
+                        .map(|inner| EnumVariantPayloadTy::Tuple(vec![inner])),
+                    _ => None,
+                }
+            }
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if name == enum_name)
+                    && common::is_builtin_result_enum(enum_name) =>
+            {
+                match tag {
+                    0 => args
+                        .first()
+                        .cloned()
+                        .map(|ok| EnumVariantPayloadTy::Tuple(vec![ok])),
+                    1 => args
+                        .get(1)
+                        .cloned()
+                        .map(|err| EnumVariantPayloadTy::Tuple(vec![err])),
+                    _ => None,
+                }
+            }
+            Ty::Constructor { owner, .. } => {
+                Self::poly_builtin_payload_from_app(enum_name, tag, owner)
+            }
+            _ => None,
+        }
     }
 
     // ---- Match ----
@@ -4276,17 +4304,18 @@ impl Checker {
             return;
         }
 
-        // Unwrap a Constructor to its parent sum (the scrutinee
-        // is usually a Constructor because constructors are how
-        // enum values come into the match site). For Ty::Var /
+        // Unwrap a Constructor to its parent sum/app. For Ty::Var /
         // Ty::Con, no exhaustiveness check.
-        let sum_ty = match &resolved {
-            Ty::Sum { .. } => &resolved,
-            Ty::Constructor { owner, .. } => owner.as_ref(),
-            _ => return,
+        let variants = match &resolved {
+            Ty::Sum { variants, .. } => Some(variants.clone()),
+            Ty::Constructor { owner, .. } => match owner.as_ref() {
+                Ty::Sum { variants, .. } => Some(variants.clone()),
+                other => Self::poly_builtin_variants_from_app(other),
+            },
+            other => Self::poly_builtin_variants_from_app(other),
         };
 
-        if let Ty::Sum { variants, .. } = sum_ty {
+        if let Some(variants) = variants {
             // An outer tag is "covered" for the purpose of the
             // non-exhaustive check if any arm with that tag
             // exists. The inner coverage only matters for the
@@ -4313,6 +4342,32 @@ impl Checker {
                 );
                 self.messages.push(msg);
             }
+        }
+    }
+
+    fn poly_builtin_variants_from_app(ty: &Ty) -> Option<Vec<(String, EnumVariantPayloadTy)>> {
+        match ty {
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
+            {
+                let inner = args.first()?.clone();
+                Some(vec![
+                    ("None".into(), EnumVariantPayloadTy::Unit),
+                    ("Some".into(), EnumVariantPayloadTy::Tuple(vec![inner])),
+                ])
+            }
+            Ty::App(con, args)
+                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
+            {
+                let ok = args.first()?.clone();
+                let err = args.get(1)?.clone();
+                Some(vec![
+                    ("Ok".into(), EnumVariantPayloadTy::Tuple(vec![ok])),
+                    ("Err".into(), EnumVariantPayloadTy::Tuple(vec![err])),
+                ])
+            }
+            Ty::Constructor { owner, .. } => Self::poly_builtin_variants_from_app(owner),
+            _ => None,
         }
     }
 
@@ -6901,6 +6956,54 @@ mod tests {
             Ty::App(Box::new(Ty::Con("Box".into())), vec![int()])
         );
         assert_eq!(*ret, int());
+    }
+
+    #[test]
+    fn builtin_option_type_app_builds_ty_app() {
+        let src = "fn f(Option<int> x) -> int { return 0; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        assert_eq!(
+            c.generics.generic_type_ctors.get(common::BUILTIN_OPTION_ENUM),
+            Some(&vec!["T".to_string()])
+        );
+        assert_eq!(
+            c.generics.generic_type_ctors.get(common::BUILTIN_RESULT_ENUM),
+            Some(&vec!["T".to_string(), "E".to_string()])
+        );
+
+        let scheme = c.env().lookup("f").unwrap();
+        let ty = apply_ty_prune(c.subst(), &scheme.ty);
+        let Ty::Fun(param, ret) = ty else {
+            panic!("expected function type");
+        };
+        assert_eq!(
+            *param,
+            Ty::App(
+                Box::new(Ty::Con(common::BUILTIN_OPTION_ENUM.into())),
+                vec![int()]
+            )
+        );
+        assert!(is_option_ty(&param));
+        assert_eq!(option_inner(&param), Some(int()));
+        assert_eq!(*ret, int());
+    }
+
+    #[test]
+    fn builtin_option_app_annotation_unifies_with_constructor_sum() {
+        let src = "fn main() { let x: Option<int> = Option::Some(1); let y = match x { Option::None => 0, Option::Some(v) => v }; }";
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let x_ty = c.codegen_var_type("x").expect("x should be recorded");
+        assert!(matches!(
+            apply_ty_prune(c.subst(), x_ty),
+            Ty::App(con, args)
+                if con.as_ref() == &Ty::Con(common::BUILTIN_OPTION_ENUM.into())
+                    && args == vec![int()]
+        ));
+        assert_eq!(c.codegen_var_type("y"), Some(&int()));
     }
 
     #[test]

@@ -194,7 +194,26 @@ pub fn unit() -> Ty {
     Ty::Con(UNIT.into())
 }
 
+/// Build `Option<T>` as a type application.
+pub fn option_app_ty(inner: Ty) -> Ty {
+    Ty::App(
+        Box::new(Ty::Con(common::BUILTIN_OPTION_ENUM.into())),
+        vec![inner],
+    )
+}
+
+/// Build `Result<T, E>` as a type application.
+pub fn result_app_ty(ok: Ty, err: Ty) -> Ty {
+    Ty::App(
+        Box::new(Ty::Con(common::BUILTIN_RESULT_ENUM.into())),
+        vec![ok, err],
+    )
+}
+
 /// Build `Option<T>` as a sum type (`None` | `Some(T)`).
+///
+/// The builtin annotation path uses [`option_app_ty`]. This structural
+/// form is still used by constructor owners and match metadata.
 pub fn option_ty(inner: Ty) -> Ty {
     Ty::Sum {
         name: common::BUILTIN_OPTION_ENUM.into(),
@@ -206,6 +225,9 @@ pub fn option_ty(inner: Ty) -> Ty {
 }
 
 /// Build `Result<T, E>` as a sum type (`Ok(T)` | `Err(E)`).
+///
+/// The builtin annotation path uses [`result_app_ty`]. This structural
+/// form is still used by constructor owners and match metadata.
 pub fn result_ty(ok: Ty, err: Ty) -> Ty {
     Ty::Sum {
         name: common::BUILTIN_RESULT_ENUM.into(),
@@ -219,6 +241,11 @@ pub fn result_ty(ok: Ty, err: Ty) -> Ty {
 /// Extract `T` from `Option<T>` (Sum or Constructor owner).
 pub fn option_inner(ty: &Ty) -> Option<Ty> {
     match ty {
+        Ty::App(con, args)
+            if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM) =>
+        {
+            args.first().cloned()
+        }
         Ty::Sum { name, variants } if name == common::BUILTIN_OPTION_ENUM => {
             for (vn, payload) in variants {
                 if vn == "Some" {
@@ -236,6 +263,14 @@ pub fn option_inner(ty: &Ty) -> Option<Ty> {
 /// Extract `(T, E)` from `Result<T, E>`.
 pub fn result_ok_err(ty: &Ty) -> Option<(Ty, Ty)> {
     match ty {
+        Ty::App(con, args)
+            if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_RESULT_ENUM) =>
+        {
+            match (args.first(), args.get(1)) {
+                (Some(ok), Some(err)) => Some((ok.clone(), err.clone())),
+                _ => None,
+            }
+        }
         Ty::Sum { name, variants } if name == common::BUILTIN_RESULT_ENUM => {
             let mut ok = None;
             let mut err = None;
@@ -261,6 +296,9 @@ pub fn result_ok_err(ty: &Ty) -> Option<(Ty, Ty)> {
 pub fn is_option_ty(ty: &Ty) -> bool {
     match ty {
         Ty::Sum { name, .. } | Ty::Con(name) => name == common::BUILTIN_OPTION_ENUM,
+        Ty::App(con, _) => {
+            matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM)
+        }
         Ty::Constructor { owner, .. } => is_option_ty(owner),
         _ => false,
     }
@@ -270,6 +308,9 @@ pub fn is_option_ty(ty: &Ty) -> bool {
 pub fn is_result_ty(ty: &Ty) -> bool {
     match ty {
         Ty::Sum { name, .. } | Ty::Con(name) => name == common::BUILTIN_RESULT_ENUM,
+        Ty::App(con, _) => {
+            matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_RESULT_ENUM)
+        }
         Ty::Constructor { owner, .. } => is_result_ty(owner),
         _ => false,
     }

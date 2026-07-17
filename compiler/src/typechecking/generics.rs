@@ -79,6 +79,17 @@ impl Generics {
         g
     }
 
+    /// Register compiler-provided generic type constructors that are
+    /// always in scope.
+    pub fn register_builtin_type_ctors(&mut self) {
+        self.generic_type_ctors
+            .insert(common::BUILTIN_OPTION_ENUM.into(), vec!["T".into()]);
+        self.generic_type_ctors.insert(
+            common::BUILTIN_RESULT_ENUM.into(),
+            vec!["T".into(), "E".into()],
+        );
+    }
+
     /// Look up a typeclass by name.
     pub fn typeclass(&self, name: &str) -> Option<&TypeClassDef> {
         self.typeclasses.get(name)
@@ -151,6 +162,8 @@ impl Generics {
     /// Register the built-in typeclasses and their builtin instances.
     fn register_builtins(&mut self) {
         use super::ty::{int, float, string, boolean};
+
+        self.register_builtin_type_ctors();
 
         // ---- Num ----
         self.typeclasses.insert("Num".into(), TypeClassDef {

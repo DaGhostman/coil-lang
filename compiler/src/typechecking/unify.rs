@@ -1,7 +1,7 @@
 //! Unification (Robinson's algorithm with occurs check).
 
 use super::subst::{Subst, apply_ty, compose};
-use super::ty::{Ty, TyVarId, ftv_ty};
+use super::ty::{Ty, TyVarId, ftv_ty, option_inner, result_ok_err};
 
 /// Failure modes for unification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,37 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                 current = unify_with(&current, a, b)?;
             }
             Ok(current)
+        }
+
+        // Builtin Option/Result annotations are represented as `Ty::App`,
+        // while constructor owners and older inference paths may still be
+        // structural `Ty::Sum` values. Bridge only those compiler builtins.
+        (app @ Ty::App(_, _), sum @ Ty::Sum { .. })
+        | (sum @ Ty::Sum { .. }, app @ Ty::App(_, _)) => {
+            match unify_builtin_app_sum(subst, &app, &sum) {
+                Some(result) => result,
+                None => Err(UnifyError::Mismatch {
+                    left: app,
+                    right: sum,
+                }),
+            }
+        }
+
+        // Constructor values unify with their builtin App parent by
+        // unifying the App against the constructor's owner.
+        (app @ Ty::App(_, _), ctor @ Ty::Constructor { .. })
+        | (ctor @ Ty::Constructor { .. }, app @ Ty::App(_, _)) => {
+            let owner = match &ctor {
+                Ty::Constructor { owner, .. } => owner.as_ref().clone(),
+                _ => unreachable!(),
+            };
+            match unify_with(subst, &app, &owner) {
+                Ok(s) => Ok(s),
+                Err(_) => Err(UnifyError::Mismatch {
+                    left: app,
+                    right: ctor,
+                }),
+            }
         }
 
         // Sum types: same name, matching variant count/names/shapes.
@@ -327,6 +358,47 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // Anything else: the constructors are incompatible.
         (left, right) => Err(UnifyError::Mismatch { left, right }),
     }
+}
+
+fn unify_builtin_app_sum(subst: &Subst, app: &Ty, sum: &Ty) -> Option<Result<Subst, UnifyError>> {
+    let Ty::App(con, args) = app else {
+        return None;
+    };
+    let Ty::Con(name) = con.as_ref() else {
+        return None;
+    };
+
+    if common::is_builtin_option_enum(name) {
+        if args.len() != 1 {
+            return Some(Err(UnifyError::Mismatch {
+                left: app.clone(),
+                right: sum.clone(),
+            }));
+        }
+        let Some(inner) = option_inner(sum) else {
+            return None;
+        };
+        return Some(unify_with(subst, &args[0], &inner));
+    }
+
+    if common::is_builtin_result_enum(name) {
+        if args.len() != 2 {
+            return Some(Err(UnifyError::Mismatch {
+                left: app.clone(),
+                right: sum.clone(),
+            }));
+        }
+        let Some((ok, err)) = result_ok_err(sum) else {
+            return None;
+        };
+        let s = match unify_with(subst, &args[0], &ok) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(unify_with(&s, &args[1], &err));
+    }
+
+    None
 }
 
 /// Bind `var` to `ty` after the occurs check.
