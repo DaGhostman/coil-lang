@@ -509,6 +509,26 @@ fn main() {
 
 ---
 
+### `examples/generic_alias.0s`
+
+**Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
+
+```0s
+type Pair<T> = (T, T);
+
+fn main() {
+    let p: Pair<int> = (3, 4);
+    print "%i", p[0] + p[1];
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_alias.0s` |
+| **Output** | `7` |
+
+---
+
 ### `examples/generics.0s`
 
 **Demonstrates:** Generic functions with a `Num` typeclass bound — one `add<T: Num>` body used at `int` and `float` call sites.
@@ -891,6 +911,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
+| `generic_alias.0s` | Types | `7` |
 | `generics.0s` | Types | `7424.042` |
 | `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
 | `hkt_container.0s` | Types | `42` |

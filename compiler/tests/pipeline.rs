@@ -143,6 +143,12 @@ fn example_aliases_prints_3_4_7() {
 }
 
 #[test]
+fn example_generic_alias_prints_7() {
+    let output = run_example("examples/generic_alias.0s");
+    assert_eq!(output, "7");
+}
+
+#[test]
 fn example_generics_prints_add_results_for_int_and_float() {
     let output = run_example("examples/generics.0s");
     assert_eq!(output, "7424.042");

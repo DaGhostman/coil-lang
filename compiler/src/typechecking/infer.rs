@@ -48,6 +48,17 @@ use super::ty::{
 };
 use super::unify::{UnifyError, unify_with};
 
+/// A parametric type alias (`type Pair<T> = (T, T)`).
+#[derive(Clone, Debug)]
+struct GenericAliasDef {
+    /// Parameter names in declaration order.
+    params: Vec<String>,
+    /// Fresh variables used while parsing the RHS (parallel to `params`).
+    param_vars: Vec<TyVarId>,
+    /// RHS type with `param_vars` free.
+    body: Ty,
+}
+
 /// The typechecker. Owns the environment, the fresh-variable counter, the
 /// running substitution, and the accumulated diagnostic messages.
 pub struct Checker {
@@ -117,6 +128,13 @@ pub struct Checker {
     /// outward, and duplicate declarations are rejected only within
     /// the current frame.
     type_aliases: Vec<HashMap<String, Ty>>,
+
+    /// `type Name<T, …> = RHS` generic aliases.
+    ///
+    /// Stored as parameter names (declaration order), the fresh
+    /// `TyVarId`s used while parsing the RHS, and the RHS template.
+    /// `parse_type_app` substitutes concrete args for those vars.
+    generic_aliases: HashMap<String, GenericAliasDef>,
 
     /// Names declared with `const`, tracked per lexical scope so assignment
     /// diagnostics can distinguish immutable bindings from mutable `let`s.
@@ -301,6 +319,7 @@ impl Checker {
             bound_display_calls_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
             type_aliases: vec![HashMap::new()],
+            generic_aliases: HashMap::new(),
             const_scopes: vec![HashSet::new()],
             enums: BTreeMap::new(),
             enum_tags: BTreeMap::new(),
@@ -439,6 +458,7 @@ impl Checker {
         self.typeclass_method_schemes.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
+        self.generic_aliases.clear();
         self.const_scopes.clear();
         self.const_scopes.push(HashSet::new());
         self.enums.clear();
@@ -554,7 +574,8 @@ impl Checker {
             .type_aliases
             .last()
             .map(|frame| frame.contains_key(name))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.generic_aliases.contains_key(name);
 
         if duplicate {
             let mut msg = Message::error(
@@ -571,6 +592,49 @@ impl Checker {
             .last_mut()
             .expect("type alias scope should exist")
             .insert(name.to_string(), alias_ty);
+    }
+
+    fn register_generic_alias(
+        &mut self,
+        name: &str,
+        params: Vec<String>,
+        param_vars: Vec<TyVarId>,
+        body: Ty,
+        range: Range<usize>,
+    ) {
+        let duplicate = self.generic_aliases.contains_key(name)
+            || self
+                .type_aliases
+                .last()
+                .map(|frame| frame.contains_key(name))
+                .unwrap_or(false);
+        if duplicate {
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Duplicate type alias `{}`", name),
+                range,
+            );
+            msg.with_help("type aliases may shadow names only from an outer scope".to_string());
+            self.messages.push(msg);
+            return;
+        }
+        self.generic_aliases.insert(
+            name.to_string(),
+            GenericAliasDef {
+                params,
+                param_vars,
+                body,
+            },
+        );
+    }
+
+    /// Expand a generic alias by substituting concrete type arguments.
+    fn expand_generic_alias(&self, def: &GenericAliasDef, arg_tys: &[Ty]) -> Ty {
+        let mut subst = Subst::empty();
+        for (var, arg) in def.param_vars.iter().zip(arg_tys.iter()) {
+            subst.insert(*var, arg.clone());
+        }
+        apply_ty(&subst, &def.body)
     }
 
     fn register_generic_type_ctor(
@@ -1853,8 +1917,33 @@ impl Checker {
                 let _ = self.register_generic_type_ctor(name, type_params);
                 let pushed = self.push_type_params_for_type_parsing(type_params);
                 let alias_ty = self.parse_type_name(ty);
+                // Capture param → var mapping before popping the frame.
+                let param_vars: Vec<TyVarId> = if pushed {
+                    let frame = self
+                        .type_params_in_scope
+                        .last()
+                        .expect("type-param frame just pushed");
+                    type_params
+                        .iter()
+                        .map(|tp| {
+                            *frame
+                                .get(tp.name)
+                                .expect("type param registered in frame")
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 self.pop_type_params_for_type_parsing(pushed);
-                self.register_type_alias(name, alias_ty, range);
+                if type_params.is_empty() {
+                    self.register_type_alias(name, alias_ty, range);
+                } else {
+                    let params = type_params
+                        .iter()
+                        .map(|tp| tp.name.to_string())
+                        .collect();
+                    self.register_generic_alias(name, params, param_vars, alias_ty, range);
+                }
                 let _ = self.infer(ty); // ID alignment
                 unit_ty()
             }
@@ -3533,6 +3622,23 @@ impl Checker {
                 }
                 return Ty::App(Box::new(Ty::Var(var)), arg_tys);
             }
+        }
+
+        // Generic type aliases expand to their RHS (Phase 1).
+        if let Some(def) = self.generic_aliases.get(name).cloned() {
+            if def.params.len() != arg_tys.len() {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Type constructor `{}` expects {} type arguments, got {}",
+                        name,
+                        def.params.len(),
+                        arg_tys.len()
+                    ),
+                    range,
+                ));
+            }
+            return self.expand_generic_alias(&def, &arg_tys);
         }
 
         if let Some(expected_arity) = self
@@ -8396,7 +8502,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_type_alias_registers_ctor() {
+    fn generic_type_alias_expands_to_rhs() {
         let src = "type Pair<T> = (T, T); fn f(Pair<int> p) -> int { return 0; }";
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
@@ -8406,11 +8512,25 @@ mod tests {
         let Ty::Fun(param, ret) = ty else {
             panic!("expected function type");
         };
-        assert_eq!(
-            *param,
-            Ty::App(Box::new(Ty::Con("Pair".into())), vec![int()])
-        );
+        assert_eq!(*param, tuple_ty(vec![int(), int()]));
         assert_eq!(*ret, int());
+        assert!(
+            c.generic_aliases.contains_key("Pair"),
+            "generic alias should be registered"
+        );
+    }
+
+    #[test]
+    fn generic_type_alias_arity_mismatch_errors() {
+        let src = "type Pair<T> = (T, T); fn f(Pair<int, string> p) -> int { return 0; }";
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter().any(|m| m
+                .message()
+                .contains("Type constructor `Pair` expects 1 type arguments, got 2")),
+            "expected arity diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

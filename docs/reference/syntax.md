@@ -121,10 +121,10 @@ enum Tree { Leaf, Node(int, Tree, Tree) }
 ### Type aliases
 
 ```
-type_alias ::= 'type' IDENT '=' type_annotation ';'
+type_alias ::= 'type' IDENT type_param_list? '=' type_annotation ';'
 ```
 
-Example: `type PointPair = (int, int);`
+Examples: `type PointPair = (int, int);`, `type Pair<T> = (T, T);`
 
 ### Modules
 

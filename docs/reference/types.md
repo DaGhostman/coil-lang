@@ -158,13 +158,18 @@ let n = d.x;              // field access
 
 ## Type aliases (`type Name = T;`)
 
-Substituted at typecheck time; zero runtime cost.
+Substituted at typecheck time; zero runtime cost. Parametric aliases expand when applied:
 
 ```0s
 type UserId = int;
 type IntPair = (int, int);
+type Pair<T> = (T, T);
 
 fn id(UserId x) -> UserId { return x; }
+
+fn main() {
+    let p: Pair<int> = (3, 4); // same as `(int, int)`
+}
 ```
 
 | Property | Behavior |
@@ -173,6 +178,7 @@ fn id(UserId x) -> UserId { return x; }
 | Shadowing | Inner scopes may shadow outer aliases |
 | Duplicate names | Duplicate alias in the same scope is a diagnostic |
 | RHS | Any `type_annotation` form |
+| Type parameters | `type Pair<T> = (T, T);` — `Pair<int>` expands to `(int, int)` |
 
 ---
 
@@ -455,7 +461,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 
 | Area | Limitation |
 |------|------------|
-| Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer |
+| Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer; parametric aliases (`type Pair<T> = …`) expand on application |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` as `Ty::App`; builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
