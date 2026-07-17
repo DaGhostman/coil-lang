@@ -9,7 +9,7 @@ use std::ops::Range;
 use reporting::{ErrorCode, Label, Message};
 use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
 
-use super::env::{Env, TyVarCounter, instantiate};
+use super::env::{Env, TyVarCounter, instantiate, instantiate_with_constraints};
 use super::generics::{Generics, InstanceDef, TypeClassDef, TypeClassMethodDef};
 use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
@@ -898,8 +898,8 @@ impl Checker {
                 }
 
                 let scheme = self.env.lookup(&ident).cloned();
-                let fun_ty = match scheme {
-                    Some(s) => instantiate(&s, &mut self.counter),
+                let (fun_ty, fresh_constraints) = match scheme {
+                    Some(s) => instantiate_with_constraints(&s, &mut self.counter),
                     None => return self.error(ErrorCode::UnknownFunction, format!("Cannot find function `{}`", ident), range),
                 };
 
@@ -908,7 +908,15 @@ impl Checker {
                     None => Vec::new(),
                 };
 
-                self.apply_function(Some(&ident), &fun_ty, &arg_tys, range)
+                let result = self.apply_function(Some(&ident), &fun_ty, &arg_tys, range.clone());
+                // Discharge typeclass constraints from the instantiated scheme.
+                // This verifies that each concrete type argument satisfies the
+                // required bound, or propagates the constraint if the caller is
+                // itself generic with the same bound.
+                if !fresh_constraints.is_empty() {
+                    self.discharge_constraints(&fresh_constraints, &range);
+                }
+                result
             }
 
             // ---- Match / loop / if ----
@@ -2335,6 +2343,62 @@ impl Checker {
         }
         self.messages.push(msg);
         Ty::Var(self.counter.fresh())
+    }
+
+    /// Discharge freshened typeclass constraints from a generic call site.
+    ///
+    /// For each freshened constraint `c` (a `(var, class)` pair returned by
+    /// [`instantiate_with_constraints`]):
+    ///
+    /// 1. Resolve `c.var` under the current substitution to get the concrete
+    ///    type the caller supplied.
+    /// 2. If still a free type variable, check whether the enclosing function
+    ///    is itself generic with the same class bound on that variable — if so,
+    ///    silently propagate (the outer call site will discharge it).
+    ///    Otherwise emit a diagnostic.
+    /// 3. For a concrete type, look for a registered instance via
+    ///    `self.generics.find_instance`. If none exists, emit a diagnostic.
+    ///
+    /// TODO(codegen B2): store the matched `InstanceDef.method_fqns` in a
+    /// `pending_dicts` side-table so the codegen pass can emit the concrete
+    /// dispatch dictionary at the call site.
+    fn discharge_constraints(&mut self, constraints: &[Constraint], range: &Range<usize>) {
+        for c in constraints {
+            let resolved = apply_ty_prune(&self.subst, &Ty::Var(c.var));
+            match &resolved {
+                Ty::Var(v) => {
+                    // Still open — acceptable only if the enclosing function
+                    // has the same constraint on that variable (propagation).
+                    let covered = self
+                        .active_constraints
+                        .iter()
+                        .any(|ac| ac.var == *v && ac.class == c.class);
+                    if !covered {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!("Cannot satisfy constraint `{}`", c.class),
+                            range.clone(),
+                        ));
+                    }
+                }
+                concrete => {
+                    if self
+                        .generics
+                        .find_instance(&c.class, &[concrete.clone()])
+                        .is_none()
+                    {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "No instance for `{}` of type `{}`",
+                                c.class, concrete
+                            ),
+                            range.clone(),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     fn parse_type_name(&mut self, ann: &Output) -> Ty {
@@ -7485,6 +7549,71 @@ fn main() {
                     || m.message().contains("Duplicate enum")
             }),
             "expected Duplicate enum for Option, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Constraint discharge tests (Chunk A4) ─────────────────────────────────
+
+    /// Calling a generic `fn add<T: Num>(T a, T b) -> T` with `int` arguments
+    /// must succeed: `Num<int>` is a builtin instance.
+    #[test]
+    fn call_generic_num_fn_with_int_discharges() {
+        let src = r#"
+fn add<T: Num>(T a, T b) -> T { return a + b; }
+fn main() { let r = add(1, 2); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter()
+                .all(|m| !m.message().contains("Cannot satisfy")
+                    && !m.message().contains("No instance")),
+            "unexpected constraint errors for add(int, int): {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Calling `fn add<T: Num>(T a, T b) -> T` with `string` arguments must
+    /// produce a diagnostic: `string` has no `Num` instance.
+    #[test]
+    fn call_generic_num_fn_with_string_errors() {
+        let src = r#"
+fn add<T: Num>(T a, T b) -> T { return a; }
+fn main() { let r = add("a", "b"); }
+"#;
+        let msgs = assert_messages(src);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::GenericTypeError)
+                    && (m.message().contains("No instance for `Num`")
+                        || m.message().contains("Cannot satisfy"))
+            }),
+            "expected a Num constraint violation for string, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A generic function calling another generic function with the same
+    /// constraint must not emit a diagnostic — the constraint propagates.
+    ///
+    /// `fn outer<T: Num>(T x) -> T { return add(x, x); }` is valid when
+    /// `add<T: Num>` exists, because `outer`'s own `T: Num` bound covers
+    /// the inner call's constraint.
+    #[test]
+    fn call_generic_inside_generic_propagates() {
+        let src = r#"
+fn add<T: Num>(T a, T b) -> T { return a + b; }
+fn outer<T: Num>(T x) -> T { return add(x, x); }
+fn main() { let r = outer(5); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter()
+                .all(|m| !m.message().contains("Cannot satisfy")
+                    && !m.message().contains("No instance")),
+            "unexpected constraint errors for generic propagation: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
