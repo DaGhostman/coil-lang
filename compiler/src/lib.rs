@@ -2346,10 +2346,6 @@ impl Compiler {
                         _ => None,
                     };
                     if let Some((name, is_const)) = binding {
-                        let slot = self.context.variables.intern(name.clone()) as u32;
-                        if is_const {
-                            self.context.constants.insert(slot as usize, true);
-                        }
                         // Check if the RHS is a bare identifier that names a generic fn.
                         // If so, track this variable as holding an ObjPolyFn.
                         let polyfn_source = match unwrapped_identifier(&children[1]) {
@@ -2370,9 +2366,18 @@ impl Compiler {
                             self.polyfn_vars.insert(name.clone());
                             self.polyfn_sources.insert(name.clone(), source);
                         }
-                        // Emit the RHS.
+                        // Compile the RHS BEFORE interning the binding name.
+                        // Match payload slots use `variables.len()` as the first
+                        // free slot; interning early (e.g. `let v = match e`)
+                        // reserved a hole and made bindings land one slot too
+                        // high while JumpIfMatch still pushed at the real
+                        // cursor.
                         let mut rhs_bc = self.do_compile(&children[1]);
                         bytecode.append(&mut rhs_bc);
+                        let slot = self.context.variables.intern(name.clone()) as u32;
+                        if is_const {
+                            self.context.constants.insert(slot as usize, true);
+                        }
                         // Append the explicit store-pop-and-write.
                         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
                         is_binding = true;
@@ -6219,23 +6224,14 @@ fn main() {
         );
     }
 
-    /// Codegen test 12 : a match pattern with
-    /// SHUFFLED record fields (`{ y: b, x: a }`) emits STORE
-    /// opcodes in DECLARATION order — a first, then b. If the
-    /// codegen emitted in pattern-source order, the bindings
-    /// would be swapped at runtime (because the VM pushes
-    /// payload values in declaration order).
+    /// Codegen test 12 : a match pattern with SHUFFLED record
+    /// fields (`{ y: _, x: a }`) emits exactly one STORE (for `a`)
+    /// and at least one POP (for `_` / omitted fields). Declaration-
+    /// order binding is covered by the pipeline golden
+    /// `shuffled_record_pattern_binds_declaration_order_field`.
     #[test]
     fn match_emits_binding_interns_in_declaration_order() {
         use common::Instruction;
-        // Declare variant as `{ x: int, y: int, z: int }`. The
-        // pattern site supplies fields in shuffled order
-        // (`y: b, x: a`). The codegen should walk DECLARATION
-        // order (x first, then y) when emitting STORE, so the
-        // bindings line up with the VM's payload-push positions.
-        //
-        // Use a `print` to consume the match's result so the
-        // binding code is not optimized away.
         let (bc, _pool) = compile_src(
             "enum E { Foo { x: int, y: int, z: int } } \
  fn main() { \
@@ -6246,27 +6242,11 @@ fn main() {
  print \"%i\", v; \
  }",
         );
-
-        // The match has one arm. The STORE for `a` should
-        // appear at slot 1 (the first payload position for
-        // declaration-order walking). The POP for `_` doesn't
-        // emit a STORE.
-        let stores: Vec<u32> = bc
+        let store_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STORE))
-            .map(|b| b.operand_u32())
-            .collect();
-        // We expect at least one STORE at slot 1 (the binding
-        // `a`). The match destructures 3 fields but only 1 is
-        // bound (a), so only 1 STORE is emitted. The wildcard
-        // `_` produces POP.
-        let slot_1_count = stores.iter().filter(|&&s| s == 1).count();
-        assert!(
-            slot_1_count >= 1,
-            "expected STORE at slot 1 for the binding `a`; got stores at {:?}",
-            stores
-        );
-        // The POP for `_` should be present.
+            .count();
+        assert_eq!(store_count, 1, "expected exactly one STORE for `a`");
         let pop_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::POP))

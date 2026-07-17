@@ -175,11 +175,25 @@ fn example_generic_print_shows_primitives_and_user_type() {
 
 /// Phase 5: unary HKT `Container<Option>` + `get<F: Container, A>(F<A>)`.
 #[test]
-
-
 fn example_hkt_container_prints_42() {
     let output = run_example("examples/hkt_container.0s");
     assert_eq!(output, "42");
+}
+
+/// Shuffled record pattern `{ y: _, x: a }` must bind declaration-order `x`.
+#[test]
+fn shuffled_record_pattern_binds_declaration_order_field() {
+    let src = r#"
+        enum E { Foo { x: int, y: int, z: int } }
+        fn main() {
+            let e = E::Foo { x: 1, y: 2, z: 3 };
+            let v = match e {
+                E::Foo { y: _, x: a, z: _ } => a,
+            };
+            print "%i", v;
+        }
+    "#;
+    assert_eq!(run_example_src(src), "1");
 }
 
 /// Phase 4: open `%v` inside a Show-bound generic body.
