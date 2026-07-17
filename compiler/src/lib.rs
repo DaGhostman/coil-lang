@@ -3354,10 +3354,10 @@ impl Compiler {
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
                     .cloned()
-                {
-                    let _ = self.emit_bound_operator_call(
+                    && self.emit_bound_operator_call(
                         &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
-                    );
+                    )
+                {
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3372,10 +3372,10 @@ impl Compiler {
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
                     .cloned()
-                {
-                    let _ = self.emit_bound_operator_call(
+                    && self.emit_bound_operator_call(
                         &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
-                    );
+                    )
+                {
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3390,10 +3390,10 @@ impl Compiler {
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
                     .cloned()
-                {
-                    let _ = self.emit_bound_operator_call(
+                    && self.emit_bound_operator_call(
                         &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
-                    );
+                    )
+                {
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -3421,10 +3421,10 @@ impl Compiler {
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
                     .cloned()
-                {
-                    let _ = self.emit_bound_operator_call(
+                    && self.emit_bound_operator_call(
                         &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
-                    );
+                    )
+                {
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
