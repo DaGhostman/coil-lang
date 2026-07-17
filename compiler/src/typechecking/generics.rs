@@ -170,7 +170,7 @@ impl Generics {
 
     /// Register the built-in typeclasses and their builtin instances.
     fn register_builtins(&mut self) {
-        use super::ty::{boolean, float, int, string};
+        use super::ty::{boolean, float, int, string, unit};
 
         self.register_builtin_type_ctors();
 
@@ -329,11 +329,23 @@ impl Generics {
             method_fqns: make_fqns("Show", "string", &["show"]),
         });
 
-        // ---- bool: Eq ----
+        // ---- bool: Eq + Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
             args: vec![boolean()],
             method_fqns: make_fqns("Eq", "bool", &["eq", "ne"]),
+        });
+        self.instances.push(InstanceDef {
+            class: "Show".into(),
+            args: vec![boolean()],
+            method_fqns: make_fqns("Show", "bool", &["show"]),
+        });
+
+        // ---- unit: Show ----
+        self.instances.push(InstanceDef {
+            class: "Show".into(),
+            args: vec![unit()],
+            method_fqns: make_fqns("Show", "unit", &["show"]),
         });
     }
 

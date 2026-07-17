@@ -166,6 +166,40 @@ fn example_polyfn_supports_multi_instantiation_constraints_and_rank_n() {
     assert_eq!(output, "424.0424242");
 }
 
+/// Phase 4: `%v` displays through Show (builtin + user instance + format).
+#[test]
+fn example_generic_print_shows_primitives_and_user_type() {
+    let output = run_example("examples/generic_print.0s");
+    assert_eq!(output, "42hi1.5true(3,4)99");
+}
+
+/// Phase 4: open `%v` inside a Show-bound generic body.
+#[test]
+fn generic_print_open_bound_uses_show_dictionary() {
+    let src = r#"
+        fn show_it<T: Show>(T x) {
+            print "%v,", x;
+        }
+        fn main() {
+            show_it(10);
+            show_it(20);
+        }
+    "#;
+    assert_eq!(run_example_src(src), "10,20,");
+}
+
+/// Phase 4: `format "%v"` produces a string for further use.
+#[test]
+fn format_percent_v_parity_with_print() {
+    let src = r#"
+        fn main() {
+            let s = format "%v-%v", 1, "x";
+            print "%s", s;
+        }
+    "#;
+    assert_eq!(run_example_src(src), "1-x");
+}
+
 /// Phase 3: captured dictionaries remain valid after the creating frame returns.
 #[test]
 fn polyfn_captured_dict_survives_return() {

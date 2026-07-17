@@ -354,7 +354,7 @@ The compiler pre-registers these typeclasses and instances for `int`, `float`, a
 | `Num` | Arithmetic | `+`, `-`, `*`, `/` (and `%` for ints) |
 | `Ord` | Ordering | `<`, `<=`, `>`, `>=` |
 | `Eq` | Equality | `==`, `!=` |
-| `Show` | Display hooks | (reserved for future `show`) |
+| `Show` | Display | `show(T) -> string`; used by format `%v` |
 
 Calling `add<T: Num>(…)` with `string` arguments is a type error when no `Num<string>` instance applies to that use (string `+` is only available through the `Num` instance wiring).
 
@@ -430,24 +430,24 @@ fn main() {
 }
 ```
 
-**Accepted limitation — `print` with a bare generic call:**
+**Displaying open / generic values — use `%v`:**
 
-If the return type of a generic call cannot be resolved to a concrete type at the call site (e.g. `T` is still open), the value stays boxed and printing it with `%i` or `%f` will show the heap address rather than the payload. This cannot occur when you bind the result to a typed variable first, or when the type is fully known at the call site:
+Concrete format specifiers (`%i`, `%f`, `%s`, `%z`, …) require a resolved concrete type. An open type parameter is a type error; use `%v`, which requires `T: Show` and lowers through the `show` method to a string before formatting:
 
 ```0s
-fn id<T>(T x) -> T { return x; }
+fn show_it<T: Show>(T x) {
+    print "%v", x;   // ok — dictionary Show
+}
 
 fn main() {
-    // Preferred: bind to a typed variable — unbox is guaranteed.
-    let n = id(42);
-    print "%i", n;     // safe: n is int
-
-    // Direct print of id(42) also works when T is inferred as int.
-    print "%i", id(42);
+    show_it(42);
+    show_it("hi");
+    let s = format "%v", 99;  // same lowering; leaves a string
+    print "%s", s;
 }
 ```
 
-Fully generic (unbounded `T`) functions that return `T` are NOT directly printable via `%i`/`%f` unless the call-site type is concrete. When in doubt, bind and use a typed intermediate.
+Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. User types can `impl Show<MyType>`. See `examples/generic_print.0s`.
 
 ---
 

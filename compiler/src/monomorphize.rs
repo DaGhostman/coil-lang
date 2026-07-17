@@ -205,16 +205,18 @@ fn candidate_for_call(
         return None;
     }
 
-    // Skip monomorphization when ANY bound is a user-defined typeclass.
-    // Functions with user typeclass constraints use the dictionary-passing
-    // calling convention instead (dict tuples appended after value args).
-    // Builtin classes (Num, Ord, Eq, Show) are dispatched via Dyn* opcodes
-    // in the shared body and benefit from monomorphization; all others don't.
-    let has_any_user_bound = sig
-        .type_param_bounds
-        .iter()
-        .any(|bounds| bounds.iter().any(|b| !Checker::is_builtin_class(b)));
-    if has_any_user_bound {
+    // Skip monomorphization when the shared body needs dictionary dispatch:
+    // - user-defined typeclasses always use dict tuples
+    // - `Show` always uses dict / `%v` CallIndirect (Phase 2–4); it must not
+    //   be ground-specialized, or `%v` sites keep an open `Ty::Var` and skip
+    //   boxing into the Show thunk
+    // Num / Ord / Eq still monomorphize so arithmetic becomes direct opcodes.
+    let requires_dictionary_body = sig.type_param_bounds.iter().any(|bounds| {
+        bounds
+            .iter()
+            .any(|b| b == "Show" || !Checker::is_builtin_class(b))
+    });
+    if requires_dictionary_body {
         return None;
     }
 

@@ -859,6 +859,202 @@ impl Compiler {
         true
     }
 
+    /// Emit a string literal as `STRING` + `DATA` bytes into `self.bytecode`.
+    /// Applies the same escape processing as `Expression::String` codegen.
+    fn emit_string_literal(&mut self, s: &str) {
+        let escaped = s
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace("\\0", "\0");
+        let idx = self.bytecode.len();
+        let mut count = 0u32;
+        for ch in escaped.chars() {
+            count += 1;
+            self.bytecode
+                .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+        }
+        self.bytecode.insert(
+            idx,
+            Byte::new(Instruction::STRING).with_operand_u32(count),
+        );
+    }
+
+    /// Rewrite `%v` → `%s` in a format literal (leave `%%` alone).
+    fn rewrite_format_v_to_s(fmt: &str) -> String {
+        let mut out = String::with_capacity(fmt.len());
+        let mut chars = fmt.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('%') => {
+                        out.push('%');
+                        out.push('%');
+                    }
+                    Some('v') => {
+                        out.push('%');
+                        out.push('s');
+                    }
+                    Some(other) => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                    None => out.push('%'),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Consuming format specifiers in source order (`%%` skipped).
+    fn format_consuming_specs(fmt: &str) -> Vec<char> {
+        let mut specs = Vec::new();
+        let mut chars = fmt.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('%') => {}
+                    Some(spec) => specs.push(spec),
+                    None => break,
+                }
+            }
+        }
+        specs
+    }
+
+    /// Emit `print`/`format` body: format string, then args (with `%v`
+    /// lowered through `Show`), then `FORMAT`.
+    fn emit_format_expression(
+        &mut self,
+        format: &Output,
+        params: Option<&Vec<Output>>,
+    ) {
+        let fmt_lit = match format.1.as_ref() {
+            Expression::String(s) => Some(s.to_string()),
+            _ => None,
+        };
+
+        if let (Some(fmt), Some(params)) = (fmt_lit.as_deref(), params) {
+            let rewritten = Self::rewrite_format_v_to_s(fmt);
+            self.emit_string_literal(&rewritten);
+            let specs = Self::format_consuming_specs(fmt);
+            let mut emitted = 0usize;
+            for (param, spec) in params.iter().zip(specs.iter()) {
+                if *spec == 'v' {
+                    self.emit_show_for_format_arg(param);
+                } else {
+                    let bc = self.do_compile(param);
+                    self.bytecode.extend(bc);
+                }
+                emitted += 1;
+            }
+            // Extra args beyond specifiers — still push them (VM pops by count).
+            for param in params.iter().skip(emitted) {
+                let bc = self.do_compile(param);
+                self.bytecode.extend(bc);
+            }
+            self.bytecode.push(
+                Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32),
+            );
+        } else {
+            let format_bc = self.do_compile(format);
+            self.bytecode.extend(format_bc);
+            let mut params_len = 0u32;
+            if let Some(params) = params {
+                params_len = params.len() as u32;
+                for param in params {
+                    let bc = self.do_compile(param);
+                    self.bytecode.extend(bc);
+                }
+            }
+            self.bytecode
+                .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len));
+        }
+    }
+
+    /// Lower one `%v` argument to a string via the `Show` dictionary /
+    /// concrete instance method, leaving an `ObjString` on the stack.
+    fn emit_show_for_format_arg(&mut self, arg: &Output) {
+        let span = arg.0.into_range();
+        if let Some((dict_index, method_slot)) = self
+            .checker
+            .bound_display_call_for_span(span.start, span.end)
+            .map(|h| (h.dict_index, h.method_slot))
+        {
+            let dict_name = format!("__dict{}", dict_index);
+            if let Some(dict_slot) = self.lookup_slot(&dict_name) {
+                let mut arg_bc = self.do_compile(arg);
+                self.bytecode.append(&mut arg_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                self.bytecode.push(
+                    Byte::new(Instruction::CONST).with_const_inline(method_slot as i32),
+                );
+                self.bytecode.push(Byte::new(Instruction::Index));
+                self.bytecode
+                    .push(Byte::new(Instruction::CallIndirect).with_operand_u32(2));
+                return;
+            }
+        }
+
+        // Concrete Show instance at the call site.
+        // Prefer a fully resolved type: span cache from a shared generic body
+        // may still be an open `Ty::Var` even when mono/codegen side-tables
+        // know the ground type (or when the arg is a literal / construct).
+        let span_ty = self
+            .checker
+            .lookup_for_codegen_span(span.start, span.end)
+            .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t));
+        let arg_ty = match span_ty {
+            Some(Ty::Var(_)) | None => match arg.1.as_ref() {
+                Expression::Integer(_) => Some(crate::typechecking::ty::int()),
+                Expression::Float(_) => Some(crate::typechecking::ty::float()),
+                Expression::String(_) => Some(crate::typechecking::ty::string()),
+                Expression::Bool(_) => Some(crate::typechecking::ty::boolean()),
+                Expression::Identifier(name) => self.codegen_var_type_for(name),
+                _ => None,
+            },
+            Some(other) => Some(other),
+        };
+
+        if let Some(ty) = arg_ty.as_ref() {
+            // Instance heads use `Ty::Con("Point")`; construct sites often
+            // produce `Constructor` / `Sum` — peel to the enum name.
+            let lookup_ty = match ty {
+                Ty::Sum { name, .. } => Ty::Con(name.clone()),
+                Ty::Constructor { owner, .. } => match owner.as_ref() {
+                    Ty::Sum { name, .. } | Ty::Con(name) => Ty::Con(name.clone()),
+                    other => other.clone(),
+                },
+                other => other.clone(),
+            };
+            if let Some(instance) = self
+                .checker
+                .generics()
+                .find_instance("Show", std::slice::from_ref(&lookup_ty))
+                .cloned()
+                && let Some(fqn) = instance.method_fqns.get("show").cloned()
+                && let Some(&offset) = self.functions.get(&fqn)
+            {
+                let mut arg_bc = self.do_compile(arg);
+                self.bytecode.append(&mut arg_bc);
+                // Box using the lookup head so enum Constructs get Enum tag.
+                Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
+                Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                return;
+            }
+        }
+
+        // Typechecker should have rejected; keep bytecode well-formed.
+        let mut arg_bc = self.do_compile(arg);
+        self.bytecode.append(&mut arg_bc);
+        self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+    }
+
     /// Emit dictionary tuples for a non-monomorphized generic call site.
     ///
     /// Convention: after value args, one `MakeTuple` per typeclass
@@ -1026,6 +1222,20 @@ impl Compiler {
         for (ty, tag) in [("string", ValueTag::String), ("bool", ValueTag::Bool)] {
             emit(self, "Eq", ty, "eq", tag, Instruction::EQ, false);
             emit(self, "Eq", ty, "ne", tag, Instruction::NEQ, false);
+        }
+
+        // Show thunks: accept a boxed (or heap-string) argument at slot 0,
+        // ignore the trailing dictionary, and return an ObjString via STRINGIFY.
+        for ty in ["int", "float", "string", "bool", "unit"] {
+            let fqn = Generics::builtin_instance_fqn("Show", ty, "show");
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
         }
     }
 
@@ -2113,8 +2323,8 @@ impl Compiler {
                 // assigns a slot number that can later be LOAD-ed by CallIndirect
                 // dispatch paths.  The VM pushes these as the trailing elements of
                 // the call frame, one per user constraint, in constraint order.
-                // Built-in classes (Num / Ord / Eq / Show) use Dyn* opcodes and do
-                // not get a dict slot.
+                // Every typeclass constraint (including builtin Num/Ord/Eq/Show)
+                // gets a trailing `__dictN` slot for dictionary dispatch.
                 let dict_arity = self.checker.dict_arity_for(name);
                 for dict_idx in 0..dict_arity {
                     self.context.variables.intern(format!("__dict{}", dict_idx));
@@ -2178,45 +2388,15 @@ impl Compiler {
                 Self::discard_statement_value(&mut bytecode);
             }
             Expression::Print(format, params) => {
-                // The Print handler emits to `self.bytecode`
-                // DIRECTLY (not a local Vec) so that any nested
-                // expression (e.g., a `match` inside the params
-                // list) can compute ABSOLUTE jump targets in
-                // `self.bytecode`. The format string is emitted
-                // first, then the params (which may include a
-                // `match`), then FORMAT and PRINT.
-                let format_bc = self.do_compile(format);
-                self.bytecode.extend(format_bc);
-
-                let mut params_len = 0;
-                if let Some(params) = params {
-                    params_len = params.len();
-                    for param in params {
-                        let bc = self.do_compile(param);
-                        self.bytecode.extend(bc);
-                    }
-                }
-
-                self.bytecode
-                    .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
+                // Emit directly to `self.bytecode` so nested control flow
+                // (e.g. `match` in params) can compute absolute jump targets.
+                // `%v` args are lowered through `Show` to strings and the
+                // format literal is rewritten to `%s` before FORMAT.
+                self.emit_format_expression(format, params.as_ref());
                 self.bytecode.push(Byte::new(Instruction::PRINT));
             }
             Expression::Format(format, params) => {
-                // Same as Print: emit directly to `self.bytecode`
-                // for nested-match correctness.
-                let format_bc = self.do_compile(format);
-                self.bytecode.extend(format_bc);
-
-                let mut params_len = 0;
-                if let Some(params) = params {
-                    params_len = params.len();
-                    for param in params {
-                        let bc = self.do_compile(param);
-                        self.bytecode.extend(bc);
-                    }
-                }
-                self.bytecode
-                    .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
+                self.emit_format_expression(format, params.as_ref());
             }
 
             // ---- Userland FFI builtins ----
@@ -2945,13 +3125,13 @@ impl Compiler {
                         }
 
                         // ── Dictionary-passing calling convention ──────────────────
-                        // For non-monomorphized generic calls with user-defined typeclass
-                        // constraints, append one dict tuple per constraint after the
-                        // value args.  Each dict is a MakeTuple of method code offsets
-                        // (CONST <offset> per method in declaration order, CONST 0 for
-                        // builtins / methods not yet compiled).  Builtin classes (Num,
-                        // Ord, Eq, Show) are dispatched via Dyn* opcodes and do NOT
-                        // need an explicit dict — only user typeclasses get a dict.
+                        // For non-monomorphized generic calls, append one dict tuple
+                        // per constraint after the value args. Each dict is a
+                        // MakeTuple of method code offsets (CodePtr per method in
+                        // declaration order). Builtin and user instances share this
+                        // ABI; ground Num/Ord/Eq calls may still monomorphize away
+                        // from the shared body, but Show-bound calls always take
+                        // this path.
                         let dict_count = if is_generic {
                             let call_arg_tys: Vec<crate::typechecking::Ty> = args
                                 .as_ref()

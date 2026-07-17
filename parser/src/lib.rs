@@ -1057,8 +1057,8 @@ impl<'pratt> Pratt<'pratt> {
         //  - `typeclass_decl` before `type_alias` so `typeclass` keyword
         //    is not confused with a user identifier.
         //  - `impl_block` handles inherent impls and simple typeclass impls
-        //    (`impl Num<int>`) via primitive-name heuristic; it is tried
-        //    FIRST for all `impl` forms.
+        //    (`impl Num<int>`, `impl Show<Point>`) via the type-arg heuristic;
+        //    it is tried FIRST for all `impl` forms.
         //  - `typeclass_impl_block` is the fallback for complex type-annotation
         //    args (e.g. `impl Foo<Option<int>>`) that `type_param_list()` inside
         //    `impl_block` cannot parse.  Chumsky 0.12 backtracks on failure, so
@@ -1430,12 +1430,17 @@ impl<'pratt> Pratt<'pratt> {
     /// `type_param_list()`.  The result is classified at map time:
     ///
     /// - No `<…>` → `Implementation` (inherent, no type params).
-    /// - `<T>`, `<T: Num>` (all uppercase, no primitive names) → `Implementation` with type params.
-    /// - `<int>`, `<string>`, etc. (any primitive name) → `TypeClassImpl`.
+    /// - `<T>`, `<T: Num>` (type-parameter shape) → `Implementation`.
+    /// - `<int>`, `<string>`, `<Point>`, etc. (concrete type args) →
+    ///   `TypeClassImpl`.
+    ///
+    /// A bare angle-bracket name is treated as a type parameter when it has
+    /// bounds (`T: Num`) or is a single uppercase letter (`T`, `U`). Multi-
+    /// character names without bounds (`Point`, `int`) are concrete instance
+    /// heads — including user enums for `impl Show<Point>`.
     ///
     /// For complex type-annotation args (e.g. `impl Foo<Option<int>>`),
-    /// use the separate `typeclass_impl_block` parser registered first in
-    /// `declaration()`.
+    /// `typeclass_impl_block` is the fallback when `impl_block` fails to parse.
     fn impl_block<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -1462,9 +1467,22 @@ impl<'pratt> Pratt<'pratt> {
             )
             .map_with(|((name, type_params), methods), e| {
                 // Classify by inspecting parsed param names.
-                let any_primitive = type_params.iter().any(|p| PRIMITIVES.contains(&p.name));
-                if any_primitive {
-                    // e.g. `impl Num<int>` → typeclass instance.
+                let looks_like_type_param = |p: &TypeParam<'_>| -> bool {
+                    if PRIMITIVES.contains(&p.name) {
+                        return false;
+                    }
+                    // Bounded names are always type parameters (`T: Num`).
+                    if !p.bounds.is_empty() {
+                        return true;
+                    }
+                    // Single uppercase letter (`T`, `U`) — type-parameter shape.
+                    let mut chars = p.name.chars();
+                    matches!(chars.next(), Some(c) if c.is_uppercase()) && chars.next().is_none()
+                };
+                let is_typeclass_impl = !type_params.is_empty()
+                    && type_params.iter().any(|p| !looks_like_type_param(p));
+                if is_typeclass_impl {
+                    // e.g. `impl Num<int>` / `impl Show<Point>` → typeclass instance.
                     // Re-wrap each param name as a bare Type annotation.
                     let args = type_params
                         .into_iter()
@@ -3697,6 +3715,21 @@ mod tests_generics {
                 assert_eq!(class, "Show");
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0].1.as_ref(), Expression::Type("string")));
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    /// `impl Show<Point> { … }` — user enum / multi-char concrete type arg
+    /// must parse as `TypeClassImpl`, not an inherent `Implementation` for a
+    /// class named `Show` (Phase 4 `%v` / Show).
+    #[test]
+    fn typeclass_impl_with_user_type_arg_parses() {
+        match decl_ast!("impl Show<Point> { fn show(Point p) -> string {} }") {
+            Expression::TypeClassImpl { class, args, .. } => {
+                assert_eq!(class, "Show");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].1.as_ref(), Expression::Type("Point")));
             }
             other => panic!("expected TypeClassImpl, got {:?}", other),
         }

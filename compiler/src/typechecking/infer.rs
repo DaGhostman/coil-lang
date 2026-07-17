@@ -31,6 +31,14 @@ pub struct BoundOperatorCall {
     pub dict_index: usize,
     pub method_slot: usize,
 }
+
+/// Code-generation recipe for a `%v` format argument dispatched through
+/// an active `Show` dictionary in a shared generic body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundDisplayCall {
+    pub dict_index: usize,
+    pub method_slot: usize,
+}
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
@@ -94,6 +102,10 @@ pub struct Checker {
     /// Operators resolved through an active typeclass constraint.
     bound_operator_calls: HashMap<NodeId, BoundOperatorCall>,
     bound_operator_calls_by_span: HashMap<(usize, usize), BoundOperatorCall>,
+
+    /// `%v` arguments resolved through an active `Show` constraint.
+    bound_display_calls: HashMap<NodeId, BoundDisplayCall>,
+    bound_display_calls_by_span: HashMap<(usize, usize), BoundDisplayCall>,
 
     /// Typeclass method signatures, keyed by `(class, method)`.
     typeclass_method_schemes: HashMap<(String, String), Scheme>,
@@ -282,6 +294,8 @@ impl Checker {
             bound_method_calls_by_span: HashMap::new(),
             bound_operator_calls: HashMap::new(),
             bound_operator_calls_by_span: HashMap::new(),
+            bound_display_calls: HashMap::new(),
+            bound_display_calls_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
             type_aliases: vec![HashMap::new()],
             const_scopes: vec![HashSet::new()],
@@ -416,6 +430,8 @@ impl Checker {
         self.bound_method_calls_by_span.clear();
         self.bound_operator_calls.clear();
         self.bound_operator_calls_by_span.clear();
+        self.bound_display_calls.clear();
+        self.bound_display_calls_by_span.clear();
         self.typeclass_method_schemes.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
@@ -2199,6 +2215,18 @@ impl Checker {
         self.bound_operator_calls_by_span.get(&(start, end))
     }
 
+    pub fn bound_display_call_at(&self, id: NodeId) -> Option<&BoundDisplayCall> {
+        self.bound_display_calls.get(&id)
+    }
+
+    pub fn bound_display_call_for_span(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<&BoundDisplayCall> {
+        self.bound_display_calls_by_span.get(&(start, end))
+    }
+
     pub fn typeclass_method_scheme(&self, class: &str, method: &str) -> Option<&Scheme> {
         self.typeclass_method_schemes
             .get(&(class.to_string(), method.to_string()))
@@ -2362,6 +2390,28 @@ impl Checker {
             self.bound_operator_calls.insert(id, hint.clone());
         }
         self.bound_operator_calls_by_span
+            .insert((range.start, range.end), hint);
+    }
+
+    fn record_bound_display(&mut self, range: &Range<usize>, var: TyVarId) {
+        let Some(dict_index) = self.user_dict_index(var, "Show") else {
+            return;
+        };
+        let Some(class_def) = self.generics.typeclass("Show") else {
+            return;
+        };
+        let Some(method_slot) = class_def
+            .methods
+            .iter()
+            .position(|candidate| candidate.name == "show")
+        else {
+            return;
+        };
+        let hint = BoundDisplayCall {
+            dict_index,
+            method_slot,
+        };
+        self.bound_display_calls_by_span
             .insert((range.start, range.end), hint);
     }
 
@@ -5222,24 +5272,15 @@ impl Checker {
                         // We have `%X`. Validate the Nth arg.
                         if let Some(arg) = p.get(spec_index) {
                             let arg_ty = self.infer(arg);
-                            let expected = format_specifier_type(spec);
+                            let arg_range = arg.0.into_range();
                             let arg_ty_pruned = apply_ty_prune(&self.subst, &arg_ty);
-                            if !type_matches_specifier(&arg_ty_pruned, spec) {
-                                let mut msg = Message::error(
-                                    ErrorCode::FormatSpecifierMismatch,
-                                    format!(
-                                        "Format specifier `%{}` requires {}, found {}",
-                                        spec, expected, arg_ty_pruned
-                                    ),
-                                    arg.0.into_range(),
-                                );
-                                msg.with_help(format!(
-                                    "while checking `{}` format argument #{}",
-                                    ctx,
-                                    spec_index + 1
-                                ));
-                                self.messages.push(msg);
-                            }
+                            self.check_format_arg(
+                                spec,
+                                &arg_ty_pruned,
+                                &arg_range,
+                                ctx,
+                                spec_index,
+                            );
                             spec_index += 1;
                         } else {
                             // Specifier with no arg — also an
@@ -5275,6 +5316,143 @@ impl Checker {
             for arg in p {
                 let _ = self.infer(arg);
             }
+        }
+    }
+
+    /// Validate one format argument against its `%X` specifier.
+    fn check_format_arg(
+        &mut self,
+        spec: char,
+        arg_ty: &Ty,
+        arg_range: &Range<usize>,
+        ctx: &str,
+        spec_index: usize,
+    ) {
+        if spec == 'v' {
+            match arg_ty {
+                Ty::Var(v) => {
+                    let has_show = self
+                        .active_constraints
+                        .iter()
+                        .any(|c| c.var == *v && c.class == "Show");
+                    if has_show {
+                        self.record_bound_display(arg_range, *v);
+                    } else {
+                        let mut msg = Message::error(
+                            ErrorCode::FormatSpecifierMismatch,
+                            format!(
+                                "Format specifier `%v` requires a `Show` instance, found {}",
+                                arg_ty
+                            ),
+                            arg_range.clone(),
+                        );
+                        msg.with_help(format!(
+                            "add a `T: Show` bound, or use a concrete type; \
+                             while checking `{}` format argument #{}",
+                            ctx,
+                            spec_index + 1
+                        ));
+                        self.messages.push(msg);
+                    }
+                }
+                other => {
+                    let lookup = show_lookup_ty(other);
+                    if !self.generics.has_instance("Show", &lookup) {
+                        let mut msg = Message::error(
+                            ErrorCode::FormatSpecifierMismatch,
+                            format!(
+                                "Format specifier `%v` requires a `Show` instance, found {}",
+                                other
+                            ),
+                            arg_range.clone(),
+                        );
+                        msg.with_help(format!(
+                            "implement `Show` for this type, or use a concrete specifier; \
+                             while checking `{}` format argument #{}",
+                            ctx,
+                            spec_index + 1
+                        ));
+                        self.messages.push(msg);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Concrete specifiers on an open type:
+        // - quantified type parameters (`fn f<T>(T x)`) must use `%v`
+        // - free inference vars (e.g. coroutine send) unify with the
+        //   specifier's expected type (same as using the value in a
+        //   typed context)
+        if let Ty::Var(v) = arg_ty {
+            let is_type_param = self
+                .type_params_in_scope
+                .iter()
+                .any(|frame| frame.values().any(|id| id == v));
+            if is_type_param {
+                let mut msg = Message::error(
+                    ErrorCode::FormatSpecifierMismatch,
+                    format!(
+                        "Format specifier `%{}` cannot be used with an open type `{}`",
+                        spec, arg_ty
+                    ),
+                    arg_range.clone(),
+                );
+                msg.with_help(format!(
+                    "use `%v` (requires `Show`) instead of `%{}`; \
+                     while checking `{}` format argument #{}",
+                    spec,
+                    ctx,
+                    spec_index + 1
+                ));
+                self.messages.push(msg);
+                return;
+            }
+            let expected_ty = match spec {
+                'i' | 'd' | 'b' | 'x' | 'u' | 'p' => int(),
+                'f' => float(),
+                's' => string(),
+                'z' => boolean(),
+                _ => {
+                    let mut msg = Message::error(
+                        ErrorCode::FormatSpecifierMismatch,
+                        format!("Unknown format specifier `%{}`", spec),
+                        arg_range.clone(),
+                    );
+                    msg.with_help(format!(
+                        "while checking `{}` format argument #{}",
+                        ctx,
+                        spec_index + 1
+                    ));
+                    self.messages.push(msg);
+                    return;
+                }
+            };
+            self.unify(
+                arg_ty,
+                &expected_ty,
+                arg_range,
+                &format!("{} format argument #{}", ctx, spec_index + 1),
+            );
+            return;
+        }
+
+        let expected = format_specifier_type(spec);
+        if !type_matches_specifier(arg_ty, spec) {
+            let mut msg = Message::error(
+                ErrorCode::FormatSpecifierMismatch,
+                format!(
+                    "Format specifier `%{}` requires {}, found {}",
+                    spec, expected, arg_ty
+                ),
+                arg_range.clone(),
+            );
+            msg.with_help(format!(
+                "while checking `{}` format argument #{}",
+                ctx,
+                spec_index + 1
+            ));
+            self.messages.push(msg);
         }
     }
 
@@ -5588,8 +5766,11 @@ impl Checker {
         self.fn_dict_arity.get(fn_name).copied().unwrap_or(0)
     }
 
-    /// True for compiler-built-in typeclasses whose instances are dispatched
-    /// via `Dyn*` opcodes rather than an explicit dictionary tuple.
+    /// True for compiler-built-in typeclasses (Num / Ord / Eq / Show).
+    ///
+    /// These still use the dictionary ABI in shared generic bodies. Ground
+    /// Num/Ord/Eq calls may monomorphize to direct opcodes; `Show` does not
+    /// (see `monomorphize::candidate_for_call`).
     pub fn is_builtin_class(class: &str) -> bool {
         matches!(class, "Num" | "Ord" | "Eq" | "Show")
     }
@@ -5766,6 +5947,16 @@ fn build_record_field_hint(
     }
 }
 
+/// Normalize a runtime value type to the head used in `impl Show<T>`
+/// registration (`Ty::Con("Point")` rather than `Sum` / `Constructor`).
+fn show_lookup_ty(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Sum { name, .. } => Ty::Con(name.clone()),
+        Ty::Constructor { owner, .. } => show_lookup_ty(owner),
+        other => other.clone(),
+    }
+}
+
 /// Map a format specifier character to the type it expects.
 fn format_specifier_type(spec: char) -> &'static str {
     match spec {
@@ -5773,6 +5964,7 @@ fn format_specifier_type(spec: char) -> &'static str {
         'f' => "float",
         's' => "string",
         'z' => "bool",
+        'v' => "a type with a `Show` instance",
         _ => "an unknown type",
     }
 }
@@ -5782,19 +5974,15 @@ fn is_string_ty(ty: &Ty) -> bool {
 }
 
 /// True if `ty` (already resolved under the substitution) is the
-/// type expected by `spec`.
+/// type expected by a concrete `spec`. Open `Ty::Var` is rejected by
+/// [`Checker::check_format_arg`] before this is consulted.
 fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
-    // Unresolved type variables may unify later (e.g. coroutine send
-    // type `S` for `let msg = yield …` before `resume h with v` is
-    // seen). Defer the format check rather than error on `tN`.
-    if matches!(ty, Ty::Var(_)) {
-        return true;
-    }
     match spec {
         'i' | 'b' | 'x' | 'u' | 'p' => matches!(ty, Ty::Con(n) if n == "int"),
         'f' => matches!(ty, Ty::Con(n) if n == "float"),
         's' => matches!(ty, Ty::Con(n) if n == "string"),
         'z' => matches!(ty, Ty::Con(n) if n == "bool"),
+        'v' => true, // Show check happens in `check_format_arg`
         // Unknown specifier (including `%d`, which the VM does not
         // implement) — can't be matched; the caller will still
         // record a diagnostic, but we don't want to say it matches
@@ -7395,6 +7583,42 @@ mod tests {
     #[test]
     fn format_expression_returns_string() {
         assert_ok("format \"%i-%s\", 42, \"x\"", string());
+    }
+
+    #[test]
+    fn format_percent_v_accepts_int() {
+        let (mut c, _) = check(r#"print "%v", 42;"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn format_percent_i_on_open_type_errors() {
+        let msgs = assert_messages(
+            r#"fn bad<T>(T x) { print "%i", x; } fn main() { bad(1); }"#,
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.message().contains("open type")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("%v"))
+            }),
+            "expected open-type `%i` error with `%v` help, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_percent_v_without_show_errors() {
+        let msgs = assert_messages(
+            r#"fn bad<T>(T x) { print "%v", x; } fn main() { bad(1); }"#,
+        );
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Show")),
+            "expected Show requirement for `%v`, got: {:?}",
+            msgs
+        );
     }
 
     // ---- Inner-pattern reachability ----

@@ -528,7 +528,19 @@ fn main() {
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/generics.0s` |
-| **Output** | `7424.0` |
+| **Output** | `7424.042` |
+
+---
+
+### `examples/generic_print.0s`
+
+**Demonstrates:** Format `%v` via the `Show` typeclass — builtin instances for
+primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_print.0s` |
+| **Output** | `42hi1.5true(3,4)99` |
 
 ---
 
@@ -866,7 +878,8 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
-| `generics.0s` | Types | `7424.0` |
+| `generics.0s` | Types | `7424.042` |
+| `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
 | `polyfn.0s` | Types | `424.0424242` |

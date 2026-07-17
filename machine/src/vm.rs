@@ -253,6 +253,53 @@ impl<const S: usize> Machine<S> {
         }
     }
 
+    /// Convert a runtime value to a display string (Show / `%v` / STRINGIFY).
+    fn stringify_value(heap: &Heap, v: Value) -> String {
+        let addr = v.raw() as u64;
+        if !v.raw().is_null() && heap.contains_addr(v.raw()) {
+            match Self::find_object_by_addr(heap, addr) {
+                Some(Object::Boxed(gc)) => {
+                    let b = gc.as_ref();
+                    match ValueTag::from_u16(b.tag) {
+                        Some(ValueTag::Int) => match &b.payload {
+                            Member::Value(iv) => iv.as_int().to_string(),
+                            _ => "?".into(),
+                        },
+                        Some(ValueTag::Float) => match &b.payload {
+                            Member::Value(iv) => format!("{:?}", iv.as_float()),
+                            _ => "?".into(),
+                        },
+                        Some(ValueTag::Bool) => match &b.payload {
+                            Member::Value(iv) => {
+                                if iv.as_int() != 0 {
+                                    "true".into()
+                                } else {
+                                    "false".into()
+                                }
+                            }
+                            _ => "?".into(),
+                        },
+                        Some(ValueTag::String) => match &b.payload {
+                            Member::Object(o) => {
+                                Self::object_string_value(heap, &Value::from(o.addr()))
+                            }
+                            Member::Value(iv) => Self::object_string_value(heap, iv),
+                        },
+                        Some(ValueTag::Unit) => "()".into(),
+                        _ => "?".into(),
+                    }
+                }
+                Some(Object::String(gc)) => gc.as_ref().data.clone(),
+                _ => v.as_int().to_string(),
+            }
+        } else if v.raw().is_null() {
+            // `Value::default()` / unit / false-ish null pointer.
+            "0".into()
+        } else {
+            v.as_int().to_string()
+        }
+    }
+
     fn materialize_callback_args(
         &mut self,
         sig: &crate::ffi::FfiSignature,
@@ -1090,6 +1137,26 @@ impl<const S: usize> Machine<S> {
 
                         self.stack.push(Value::from(obj.addr()));
                     }
+                }
+                Instruction::STRINGIFY => {
+                    // Shared primitive conversion for Show thunks / `%v`.
+                    // Accepts a boxed value (preferred), a heap string, or a
+                    // raw immediate (treated as int).
+                    let v = self.stack.pop();
+                    let text = Self::stringify_value(&self.heap, v);
+                    let (obj, _) = self
+                        .heap
+                        .alloc(ObjString::from(text.as_str()), Object::String);
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(obj.addr()));
                 }
                 Instruction::PRINT => {
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
@@ -3590,6 +3657,61 @@ mod tests {
             Byte::new(Instruction::RETURN),
         ]);
         assert_eq!(vm.pop().as_int(), 33);
+    }
+
+    /// STRINGIFY turns a boxed int into a heap string "42".
+    #[test]
+    fn stringify_boxed_int_produces_string() {
+        let mut vm = Machine::<64>::default();
+        let int_tag: u32 = 0;
+        vm.run(&[
+            const_int(42),
+            Byte::new(Instruction::BoxValue).with_operand_u32(int_tag),
+            Byte::new(Instruction::STRINGIFY),
+            Byte::new(Instruction::HALT),
+        ]);
+        let s = vm.pop();
+        let text = Machine::<64>::object_string_value(&vm.heap, &s);
+        assert_eq!(text, "42");
+    }
+
+    /// STRINGIFY turns a boxed float into a debug-formatted string.
+    #[test]
+    fn stringify_boxed_float_produces_string() {
+        let pool = [1.5f64.to_bits()];
+        let mut vm = Machine::<64>::default();
+        let float_tag: u32 = 1;
+        vm.run_with_pool(
+            &[
+                Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG),
+                Byte::new(Instruction::BoxValue).with_operand_u32(float_tag),
+                Byte::new(Instruction::STRINGIFY),
+                Byte::new(Instruction::HALT),
+            ],
+            &pool,
+        );
+        let s = vm.pop();
+        let text = Machine::<64>::object_string_value(&vm.heap, &s);
+        assert!(
+            text.contains("1.5"),
+            "expected float display containing 1.5, got {text:?}"
+        );
+    }
+
+    /// STRINGIFY copies a heap string through.
+    #[test]
+    fn stringify_string_copies_contents() {
+        let mut vm = Machine::<64>::default();
+        vm.run(&[
+            Byte::new(Instruction::STRING).with_operand_u32(2),
+            Byte::new(Instruction::DATA).with_operand_u32('h' as u32),
+            Byte::new(Instruction::DATA).with_operand_u32('i' as u32),
+            Byte::new(Instruction::STRINGIFY),
+            Byte::new(Instruction::HALT),
+        ]);
+        let s = vm.pop();
+        let text = Machine::<64>::object_string_value(&vm.heap, &s);
+        assert_eq!(text, "hi");
     }
 
     /// Captured heap dictionaries stay alive across GC pressure.

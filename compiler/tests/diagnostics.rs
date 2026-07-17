@@ -346,6 +346,51 @@ fn format_string_percent_z_rejects_int() {
     );
 }
 
+#[test]
+fn format_percent_i_rejects_open_type_suggests_percent_v() {
+    let msgs = check_messages(
+        "fn bad<T>(T x) { print \"%i\", x; } \
+         fn main() { bad(1); }",
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("open type")
+                && m.help()
+                    .as_ref()
+                    .is_some_and(|h| h.contains("%v"))
+        }),
+        "expected open-type `%i` diagnostic suggesting `%v`, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_percent_v_requires_show_bound() {
+    let (_ty, msgs) = check(
+        "fn bad<T>(T x) { print \"%v\", x; } \
+         fn main() { bad(1); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`Show`") || m.contains("Show")),
+        "expected `%v` without Show bound to error, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_percent_v_accepts_show_bound() {
+    let (_ty, msgs) = check(
+        "fn ok<T: Show>(T x) { print \"%v\", x; } \
+         fn main() { ok(1); }",
+    );
+    assert!(
+        msgs.is_empty(),
+        "expected `%v` with Show bound to typecheck, got: {:?}",
+        msgs
+    );
+}
+
 // ---- Record-shape diagnostics ----
 
 #[test]
