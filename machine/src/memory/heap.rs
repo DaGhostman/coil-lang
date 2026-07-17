@@ -446,7 +446,13 @@ impl Object {
                     o.mark(grey_objects);
                 }
             }
-            Self::PolyFn(_) => {}
+            Self::PolyFn(p) => {
+                for captured in p.as_ref().captured_dicts.iter().flatten() {
+                    if let Member::Object(o) = captured {
+                        o.mark(grey_objects);
+                    }
+                }
+            }
         }
     }
 
@@ -662,6 +668,9 @@ pub struct ObjPolyFn {
     pub entry: u32,
     /// Number of type parameters expected (reserved for future use).
     pub type_arity: u8,
+    /// Dictionary evidence captured when this value escaped a constrained
+    /// scope. `None` leaves the position for application-time evidence.
+    pub captured_dicts: Vec<Option<Member>>,
 }
 
 impl GcSized for ObjTuple {

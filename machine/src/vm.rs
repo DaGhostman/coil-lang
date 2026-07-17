@@ -883,7 +883,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::CodePtr as u8);
+            promise!(*bc as u8 <= Instruction::MakePolyFnCapture as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1967,27 +1967,85 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::CallIndirect => {
-                    // Stack layout: [arg0, arg1, ..., argN-1, target_offset_or_polyfn]
-                    // operand = arity
-                    let arity = opcode.operand_u32() as usize;
-                    // TOS = either a raw code offset (int) or an ObjPolyFn heap pointer
+                    // Stack: [value_args..., app_dicts..., target]
+                    // operands[15:0] = value_arity; [31:16] = app_dict_arity
+                    let packed = opcode.operand_u32();
+                    let value_arity = (packed & 0xFFFF) as usize;
+                    let app_dict_arity = ((packed >> 16) & 0xFFFF) as usize;
                     let raw = self.stack.pop();
-                    let target = {
+                    let (target, captured) = {
                         let addr = raw.raw() as u64;
                         if !raw.raw().is_null() && self.heap.contains_addr(raw.raw()) {
-                            // It's a heap pointer — check if it's an ObjPolyFn
                             if let Some(Object::PolyFn(gc)) =
                                 self.heap.find_object_by_addr(addr)
                             {
-                                gc.as_ref().entry as usize
+                                let pfn = gc.as_ref();
+                                (pfn.entry as usize, pfn.captured_dicts.clone())
                             } else {
-                                raw.as_int() as usize
+                                (raw.as_int() as usize, Vec::new())
                             }
                         } else {
-                            raw.as_int() as usize
+                            (raw.as_int() as usize, Vec::new())
                         }
                     };
-                    let return_ip = ip; // return to next instruction
+
+                    // Pop application dictionaries (TOS = last in declaration order).
+                    let mut app_dicts = Vec::with_capacity(app_dict_arity);
+                    for _ in 0..app_dict_arity {
+                        app_dicts.push(self.stack.pop());
+                    }
+                    app_dicts.reverse();
+
+                    let member_value = |m: &crate::memory::Member| -> Value {
+                        match m {
+                            crate::memory::Member::Value(v) => *v,
+                            crate::memory::Member::Object(o) => Value::from(o.addr()),
+                        }
+                    };
+
+                    let merged_dicts: Vec<Value> = if captured.is_empty() {
+                        // Unconstrained / delayed-evidence PolyFn, or a plain
+                        // code-offset call: application dicts are the full set.
+                        // Plain calls pack app_dict_arity=0 and put every argument
+                        // in value_arity (legacy), so this stays a no-op.
+                        app_dicts
+                    } else {
+                        let mut app_i = 0usize;
+                        let mut merged = Vec::with_capacity(captured.len());
+                        for slot in &captured {
+                            match slot {
+                                Some(m) => {
+                                    merged.push(member_value(m));
+                                    // Skip a duplicate app-site dict for this
+                                    // already-captured constraint, if present.
+                                    if app_i < app_dicts.len() {
+                                        app_i += 1;
+                                    }
+                                }
+                                None => {
+                                    if app_i < app_dicts.len() {
+                                        merged.push(app_dicts[app_i]);
+                                        app_i += 1;
+                                    } else {
+                                        merged.push(Value::default());
+                                    }
+                                }
+                            }
+                        }
+                        merged
+                    };
+
+                    let dict_arity = merged_dicts.len();
+                    for dict in merged_dicts {
+                        self.stack.push(dict);
+                    }
+
+                    // Legacy plain calls pack the full argument count in the low
+                    // 16 bits with app_dict_arity=0 and no captures, so
+                    // `value_arity + 0` preserves the previous operand meaning.
+                    let arity = value_arity + dict_arity;
+
+                    let return_ip = ip;
                     let callee_sp = self.stack.tell() - arity;
                     self.frames.get_mut().seek(return_ip);
                     self.frames
@@ -2051,6 +2109,40 @@ impl<const S: usize> Machine<S> {
                     let pfn = ObjPolyFn {
                         entry,
                         type_arity: 0,
+                        captured_dicts: Vec::new(),
+                    };
+                    let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(object.addr()));
+                }
+                Instruction::MakePolyFnCapture => {
+                    let count = (opcode.operand_u32() & 0xFF) as usize;
+                    let entry = self.stack.pop().as_int() as u32;
+                    let mut captured_dicts = vec![None; count];
+                    for slot in (0..count).rev() {
+                        let value = self.stack.pop();
+                        let addr = value.raw() as u64;
+                        captured_dicts[slot] = if addr == 0 {
+                            // Unresolved evidence — filled at CallIndirect.
+                            None
+                        } else if self.heap.contains_addr(addr as *mut u8) {
+                            Self::find_object_by_addr(&self.heap, addr).map(Member::Object)
+                        } else {
+                            Some(Member::Value(value))
+                        };
+                    }
+                    let pfn = ObjPolyFn {
+                        entry,
+                        type_arity: 0,
+                        captured_dicts,
                     };
                     let (object, _) = self.heap.alloc(pfn, Object::PolyFn);
                     self.alloc_counter += 1;
@@ -3426,5 +3518,112 @@ mod tests {
         );
         // 1.5 + 2.5 = 4.0
         assert_eq!(vm.pop().as_float(), 4.0);
+    }
+
+    /// `MakePolyFnCapture` + `CallIndirect` injects captured dictionaries when
+    /// the application site supplies none.
+    #[test]
+    fn call_indirect_merges_captured_dicts_without_app_evidence() {
+        // Layout:
+        //  0: CONST 7            captured dict (immediate)
+        //  1: CodePtr 8          entry
+        //  2: MakePolyFnCapture  (1 slot)
+        //  3: StorePop 0         save PolyFn
+        //  4: CONST 42           value arg
+        //  5: LOAD 0             PolyFn
+        //  6: CallIndirect       value_arity=1, app_dict_arity=0
+        //  7: HALT
+        //  8: LOAD 1             callee reads captured dict
+        //  9: RETURN
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(7),
+            Byte::new(Instruction::CodePtr).with_operand_u32(8),
+            Byte::new(Instruction::MakePolyFnCapture).with_operand_u32(1),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(42),
+            load(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            load(1),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 7);
+    }
+
+    /// Captured evidence wins over a duplicate application dictionary.
+    #[test]
+    fn call_indirect_prefers_captured_dict_over_app_dict() {
+        // Captured dict = 11; app dict = 22; callee returns slot 1.
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(11),
+            Byte::new(Instruction::CodePtr).with_operand_u32(9),
+            Byte::new(Instruction::MakePolyFnCapture).with_operand_u32(1),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(42),
+            const_int(22),
+            load(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1 | (1 << 16)),
+            Byte::new(Instruction::HALT),
+            load(1),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 11);
+    }
+
+    /// Null capture slots are filled from application dictionaries.
+    #[test]
+    fn call_indirect_fills_unresolved_capture_slots_from_app() {
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(0), // unresolved sentinel
+            Byte::new(Instruction::CodePtr).with_operand_u32(9),
+            Byte::new(Instruction::MakePolyFnCapture).with_operand_u32(1),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(42),
+            const_int(33),
+            load(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1 | (1 << 16)),
+            Byte::new(Instruction::HALT),
+            load(1),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 33);
+    }
+
+    /// Captured heap dictionaries stay alive across GC pressure.
+    #[test]
+    fn polyfn_captured_dict_survives_gc() {
+        let mut vm = Machine::<64>::default();
+        // Build a 1-element tuple dict, capture it, allocate many enums to
+        // trigger GC, then CallIndirect and read the captured tuple via LOAD 1.
+        let mut code = vec![
+            Byte::new(Instruction::CodePtr).with_operand_u32(0), // placeholder method
+            Byte::new(Instruction::MakeTuple).with_operand_u32(1),
+            Byte::new(Instruction::CodePtr).with_operand_u32(0), // entry patched below
+            Byte::new(Instruction::MakePolyFnCapture).with_operand_u32(1),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+        ];
+        for _ in 0..128 {
+            code.push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+            code.push(Byte::new(Instruction::POP));
+        }
+        let entry = code.len() as u32 + 4;
+        code[2] = Byte::new(Instruction::CodePtr).with_operand_u32(entry);
+        code.extend([
+            const_int(1),
+            load(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            load(1),
+            Byte::new(Instruction::RETURN),
+        ]);
+        vm.run(&code);
+        let dict = vm.pop();
+        assert!(
+            dict.raw() as u64 != 0,
+            "captured dictionary must survive GC"
+        );
     }
 }

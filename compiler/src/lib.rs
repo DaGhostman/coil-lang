@@ -1192,6 +1192,46 @@ impl Compiler {
         scheme.bounds.iter().any(|bound| free.contains(bound))
     }
 
+    /// Whether a CallIndirect through a local needs a post-call `UnboxValue`.
+    ///
+    /// Direct `polyfn_sources` mappings consult the original generic scheme.
+    /// Returned/captured PolyFns and rank-n parameters fall back to the local's
+    /// recorded type: unbox only when that type's result is still a type
+    /// parameter (boxed at runtime) and the call site resolved it concretely.
+    fn local_polyfn_call_needs_unbox(&self, local: &str, call_ty: &Ty) -> bool {
+        use crate::typechecking::subst::apply_ty_prune;
+
+        if let Some(source) = self.polyfn_sources.get(local) {
+            return self.generic_return_depends_on_type_param(source);
+        }
+        if Self::ty_to_value_tag(call_ty).is_none() {
+            return false;
+        }
+        let Some(var_ty) = self.codegen_var_type_for(local) else {
+            return false;
+        };
+        let pruned = apply_ty_prune(self.checker.subst(), &var_ty);
+        let result_ty = match &pruned {
+            Ty::Forall { body, .. } => {
+                let mut result = body.as_ref();
+                while let Ty::Fun(_, ret) = result {
+                    result = ret.as_ref();
+                }
+                result.clone()
+            }
+            other => {
+                let mut result = other;
+                while let Ty::Fun(_, ret) = result {
+                    result = ret.as_ref();
+                }
+                result.clone()
+            }
+        };
+        // Shared generic bodies box type-parameter results; a Var return
+        // means the value on the stack is still boxed at this call site.
+        matches!(result_ty, Ty::Var(_))
+    }
+
     fn emit_mono_specializations_for_function<'compiler>(
         &mut self,
         qualified: &str,
@@ -2981,18 +3021,11 @@ impl Compiler {
                                 Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                             }
                         }
-                    } else if self.polyfn_vars.contains(&identifier)
-                        || matches!(
-                            self.codegen_var_type_for(&identifier),
-                            Some(Ty::Forall { .. })
-                        )
-                    {
-                        // `identifier` is a local variable holding an ObjPolyFn
-                        // (bound via `let f = some_generic_fn;`). Emit args, then
-                        // load the polyfn pointer, then CallIndirect.
-                        let slot = self
-                            .lookup_slot(&identifier)
-                            .expect("polyfn_var must have a slot");
+                    } else if let Some(slot) = self.lookup_slot(&identifier) {
+                        // Local holding a function value: escaped PolyFn
+                        // (`let f = show` / `return show`), rank-n parameter, or
+                        // a PolyFn returned from another call. Emit args, optional
+                        // application dictionaries, then CallIndirect.
                         let value_arity =
                             args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
                         let mut arg_tys = Vec::new();
@@ -3036,20 +3069,19 @@ impl Compiler {
                                 &self.functions,
                             ) as u32;
                         }
-                        // Push the ObjPolyFn pointer (TOS for CallIndirect).
+                        // Pack value arity + application dict arity so the VM can
+                        // merge captured evidence with apply-site dictionaries.
                         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                         bytecode.push(
-                            Byte::new(Instruction::CallIndirect)
-                                .with_operand_u32(value_arity + dict_count),
+                            Byte::new(Instruction::CallIndirect).with_operand_u32(
+                                value_arity | (dict_count << 16),
+                            ),
                         );
                         // Generic→concrete unbox for polyfn call site.
-                        if polyfn_source
-                            .as_deref()
-                            .map(|source| self.generic_return_depends_on_type_param(source))
-                            .unwrap_or(true)
-                            && let Some(call_ty) = self.codegen_expr_ty(ast)
-                        {
-                            Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                        if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                            if self.local_polyfn_call_needs_unbox(&identifier, &call_ty) {
+                                Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                            }
                         }
                     } else {
                         let mut message = Message::error(
@@ -3169,10 +3201,43 @@ impl Compiler {
                         .unwrap_or_else(|| n.to_string());
                     if self.checker.is_generic_fn(&resolved_n) {
                         if let Some(&entry_offset) = self.functions.get(&resolved_n) {
-                            bytecode.push(
-                                Byte::new(Instruction::MakePolyFn)
-                                    .with_operand_u32(entry_offset as u32),
-                            );
+                            // Hybrid evidence: capture every in-scope `__dictN` for
+                            // this scheme; leave unresolved slots as null so
+                            // CallIndirect can fill them at the application site.
+                            let dict_arity = self.checker.dict_arity_for(&resolved_n);
+                            let mut captured_any = false;
+                            let mut slot_bc = Vec::new();
+                            for dict_index in 0..dict_arity {
+                                if let Some(slot) =
+                                    self.lookup_slot(&format!("__dict{}", dict_index))
+                                {
+                                    slot_bc.push(
+                                        Byte::new(Instruction::LOAD).with_operand_u32(slot),
+                                    );
+                                    captured_any = true;
+                                } else {
+                                    // Unresolved sentinel (VM stores as None).
+                                    slot_bc.push(
+                                        Byte::new(Instruction::CONST).with_const_inline(0),
+                                    );
+                                }
+                            }
+                            if !captured_any {
+                                bytecode.push(
+                                    Byte::new(Instruction::MakePolyFn)
+                                        .with_operand_u32(entry_offset as u32),
+                                );
+                            } else {
+                                bytecode.append(&mut slot_bc);
+                                bytecode.push(
+                                    Byte::new(Instruction::CodePtr)
+                                        .with_operand_u32(entry_offset as u32),
+                                );
+                                bytecode.push(
+                                    Byte::new(Instruction::MakePolyFnCapture)
+                                        .with_operand_u32(dict_arity as u32),
+                                );
+                            }
                         } else {
                             // Function not yet compiled (forward reference) — fall
                             // through to the unknown-variable diagnostic.
@@ -7022,6 +7087,32 @@ print \"%i\", len(a); \
                 .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
             "expected MakePolyFn for `let f = id` where id is generic; bytecode opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 3: escaping a constrained generic from an active `__dictN` scope
+    /// emits `MakePolyFnCapture` instead of bare `MakePolyFn`.
+    #[test]
+    fn constrained_generic_escape_emits_make_polyfn_capture() {
+        use common::Instruction;
+        let src = r#"
+            typeclass Showable<T> { fn show_it(T x) -> int; }
+            impl Showable<int> { fn show_it(int x) -> int { return x; } }
+            fn show<T: Showable>(T x) -> int { return show_it(x); }
+            fn capture<T: Showable>(T _w) { return show; }
+            fn main() { let f = capture(0); }
+        "#;
+        let (bc, _pool) = compile_src(src);
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture)),
+            "expected MakePolyFnCapture; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "constrained escape should not emit unconstrained MakePolyFn"
         );
     }
 

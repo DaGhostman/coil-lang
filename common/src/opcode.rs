@@ -160,7 +160,17 @@ pub enum Instruction {
     ArrayLen,
 
     // Generics runtime — append-only.
-    /// CallIndirect: [31:0] arity; stack: [args..., target_offset] TOS = u32 code offset
+    /// CallIndirect: stack `[value_args..., app_dicts..., target]` (TOS = target).
+    ///
+    /// Operand packing:
+    /// - `[15:0]`  = value arity (non-dictionary arguments)
+    /// - `[31:16]` = application dictionary arity (0 for plain code-offset calls)
+    ///
+    /// When the target is an `ObjPolyFn` with captured evidence, the VM merges
+    /// `captured_dicts` with the application dictionaries (preferring captures)
+    /// before setting up the callee frame. Plain integer/`CodePtr` targets ignore
+    /// captures and treat `[15:0]` as the full argument count when `[31:16] == 0`
+    /// for backward compatibility (`arity = value_arity + app_dict_arity`).
     CallIndirect,
     /// BoxValue: [15:0] ValueTag as u16; pop raw value → push Object::Boxed pointer
     BoxValue,
@@ -188,6 +198,11 @@ pub enum Instruction {
     /// direct `CallIndirect` targets. Distinct from `CONST` so peephole
     /// fusion can relocate these offsets without mistaking them for data.
     CodePtr,
+    /// MakePolyFnCapture: stack `[captured dictionaries..., CodePtr entry]` →
+    /// `ObjPolyFn`. `operands[7:0]` is the number of dictionary slots in
+    /// declaration order. A null (`0`) slot is stored as unresolved (`None`)
+    /// and filled at `CallIndirect` from application evidence.
+    MakePolyFnCapture,
 }
 
 impl From<u8> for Instruction {

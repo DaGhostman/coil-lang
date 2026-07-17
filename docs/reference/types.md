@@ -321,7 +321,7 @@ Call-site strategy:
 | Ground call with only **builtin** bounds (`Num`/`Ord`/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
 | Shared body / open type params with any bound | **Dictionary passing** — see below |
 | Ground or shared call with user typeclass bounds | **Dictionary passing** — see below |
-| Escaped generic fn value (`let f = id;`) | `MakePolyFn` + `CallIndirect` |
+| Escaped generic fn value (`let f = id;`) | `MakePolyFn` / `MakePolyFnCapture` + `CallIndirect` |
 
 ### Dictionary passing
 
@@ -388,10 +388,13 @@ let n = f(42);
 let x = f(4.0);
 ```
 
-`MakePolyFn` stores the shared entry point and each application uses
-`CallIndirect`. For constrained PolyFns, a ground application builds the
-required dictionaries from its concrete argument types. A generic identifier
-passed to a compatible `forall T. T -> T` parameter uses the same path.
+`MakePolyFn` stores the shared entry point when no dictionaries are in scope
+yet (for example top-level `let f = show;`). Escaping from an active
+constrained scope uses `MakePolyFnCapture` instead, copying each available
+`__dictN` into the heap value. Applications use `CallIndirect`, which merges
+captured evidence with any dictionaries synthesized at the call site
+(preferring captures for already-filled slots). A generic identifier passed to
+a compatible `forall T. T -> T` parameter uses the same path.
 
 ### Higher-rank `forall`
 

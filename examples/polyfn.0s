@@ -1,4 +1,4 @@
-// Expected output: 424.04242
+// Expected output: 424.0424242
 
 typeclass Describable<T> {
     fn describe_val(T x) -> int;
@@ -22,6 +22,12 @@ fn apply_id(forall T. T -> T f, int x) -> int {
     return f(x);
 }
 
+// Capture Describable evidence into a PolyFn and return it. After this
+// frame returns, CallIndirect must still see the captured dictionary.
+fn capture_show<T: Describable>(T _witness) {
+    return show;
+}
+
 fn main() {
     let f = id;
     print "%i", f(42);
@@ -30,4 +36,7 @@ fn main() {
     let constrained = show;
     print "%i", constrained(41);
     print "%i", apply_id(id, 42);
+
+    let captured = capture_show(0);
+    print "%i", captured(41);
 }

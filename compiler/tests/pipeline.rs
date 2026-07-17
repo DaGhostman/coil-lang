@@ -163,7 +163,39 @@ fn example_typeclass_default_calls_sibling_and_prints_42() {
 #[test]
 fn example_polyfn_supports_multi_instantiation_constraints_and_rank_n() {
     let output = run_example("examples/polyfn.0s");
-    assert_eq!(output, "424.04242");
+    assert_eq!(output, "424.0424242");
+}
+
+/// Phase 3: captured dictionaries remain valid after the creating frame returns.
+#[test]
+fn polyfn_captured_dict_survives_return() {
+    let src = r#"
+        typeclass Describable<T> {
+            fn describe_val(T x) -> int;
+        }
+        impl Describable<int> {
+            fn describe_val(int x) -> int { return x + 1; }
+        }
+        fn show<T: Describable>(T x) -> int {
+            return describe_val(x);
+        }
+        fn capture_show<T: Describable>(T _w) {
+            return show;
+        }
+        fn main() {
+            let f = capture_show(0);
+            print "%i", f(41);
+        }
+    "#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _constants) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture)),
+        "expected MakePolyFnCapture when escaping show from a constrained scope"
+    );
+    assert_eq!(run_example_src(src), "42");
 }
 
 /// Phase 1: PolyFn + fib-style arithmetic still receives peephole fusion.

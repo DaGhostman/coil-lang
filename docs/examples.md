@@ -559,12 +559,13 @@ through the same dictionary.
 ### `examples/polyfn.0s`
 
 **Demonstrates:** First-class generic functions, multi-instantiation,
-constrained apply-site dictionaries, and a rank-n `forall` parameter.
+constrained apply-site dictionaries, rank-n `forall` parameters, and
+captured dictionary evidence that survives returning a PolyFn.
 
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/polyfn.0s` |
-| **Output** | `424.04242` |
+| **Output** | `424.0424242` |
 
 ---
 
@@ -868,7 +869,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `generics.0s` | Types | `7424.0` |
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
-| `polyfn.0s` | Types | `424.04242` |
+| `polyfn.0s` | Types | `424.0424242` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |
 | `src/foo/sadge.0s` | Modules | (support file) |
