@@ -10,18 +10,16 @@ use reporting::{ErrorCode, Label, Message};
 use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
 
 use super::env::{Env, TyVarCounter, instantiate};
+use super::generics::{InstanceDef, TypeClassDef, TypeClassMethodDef};
 use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
-use super::ty::Scheme;
+use super::ty::{Constraint, Scheme};
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
-    EnumVariantPayloadTy, STRING, Ty, boolean, float, int, is_option_ty, is_result_ty, list,
+    EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty, list,
     option_inner, option_ty, result_ok_err, result_ty, string, unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
-
-#[cfg(test)]
-use super::ty::TyVarId;
 
 /// The typechecker. Owns the environment, the fresh-variable counter, the
 /// running substitution, and the accumulated diagnostic messages.
@@ -118,6 +116,19 @@ pub struct Checker {
     result_mode_fns: HashSet<String>,
     /// Function names whose return type is (or was inferred as) `Option<_>`.
     option_mode_fns: HashSet<String>,
+
+    // ── Generics ──────────────────────────────────────────────────────────────
+    /// Type parameters currently in scope (name → fresh TyVarId).
+    /// Pushed when entering a generic function, popped on exit.
+    type_params_in_scope: Vec<HashMap<String, TyVarId>>,
+    /// Active typeclass constraints on in-scope type params.
+    /// `(TyVarId, class_name)` — checked when applying arithmetic ops.
+    active_constraints: Vec<Constraint>,
+    /// Generics registry: typeclasses, instances, generic type ctors.
+    generics: super::generics::Generics,
+    /// Generic function names registered during typechecking.
+    /// Used by codegen to decide between DynAdd vs regular ADD.
+    pub generic_fns: HashSet<String>,
 }
 
 /// C-layout struct registered via `extern struct Name { ... }`.
@@ -235,6 +246,10 @@ impl Checker {
             fn_option_mode: None,
             result_mode_fns: HashSet::new(),
             option_mode_fns: HashSet::new(),
+            type_params_in_scope: Vec::new(),
+            active_constraints: Vec::new(),
+            generics: super::generics::Generics::new(),
+            generic_fns: HashSet::new(),
         };
         checker.register_builtin_enums();
         checker
@@ -1353,12 +1368,12 @@ impl Checker {
             Expression::Function {
                 name,
                 is_coro,
+                type_params,
                 args,
                 returns,
                 body,
-                ..
             } => {
-                self.infer_function(name, args, returns.as_ref(), body, &range, None, *is_coro);
+                self.infer_function(name, type_params, args, returns.as_ref(), body, &range, None, *is_coro);
                 unit_ty()
             }
             Expression::Implementation { owner, methods, .. } => {
@@ -1553,6 +1568,101 @@ impl Checker {
                 fields,
             } => self.infer_construct(enum_name, variant_name, fields, range),
 
+            // ---- Generics ----
+
+            Expression::TypeClass {
+                name,
+                type_params,
+                methods,
+            } => {
+                // Register the typeclass definition.
+                let method_defs: Vec<TypeClassMethodDef> = methods
+                    .iter()
+                    .filter_map(|m| {
+                        if let Expression::Function { name: mname, body, .. } = m.1.as_ref() {
+                            // has_default: body is non-empty Block/Fragment
+                            let has_default = !matches!(body.1.as_ref(), Expression::Block(v) if v.is_empty());
+                            Some(TypeClassMethodDef {
+                                name: mname.to_string(),
+                                has_default,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let param_names: Vec<String> = type_params.iter().map(|tp| tp.name.to_string()).collect();
+                let def = TypeClassDef {
+                    name: name.to_string(),
+                    type_params: param_names,
+                    methods: method_defs.clone(),
+                };
+                self.generics.typeclasses.insert(name.to_string(), def);
+                // Walk method bodies (ID alignment + default body typecheck).
+                for m in methods {
+                    let _ = self.infer(m);
+                }
+                unit_ty()
+            }
+
+            Expression::TypeClassImpl {
+                class,
+                args,
+                methods,
+            } => {
+                // Resolve concrete type args.
+                let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_type_name(a)).collect();
+                // Walk arg type expressions for ID alignment.
+                for a in args {
+                    let _ = self.infer(a);
+                }
+                // Verify class exists.
+                if !self.generics.typeclasses.contains_key(*class) {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!("Unknown typeclass `{}`", class),
+                        range.clone(),
+                    ));
+                }
+                // Build method_fqns and register instance.
+                let mut method_fqns = HashMap::new();
+                for m in methods {
+                    if let Expression::Function { name: mname, args: margs, returns, body, is_coro, .. } = m.1.as_ref() {
+                        // Build a unique FQN for this instance method.
+                        let fqn = format!("{}__{}__{}",
+                            class,
+                            arg_tys.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join("_"),
+                            mname,
+                        );
+                        method_fqns.insert(mname.to_string(), fqn.clone());
+                        // Typecheck the method body at concrete types.
+                        self.infer_function(mname, &[], margs, returns.as_ref(), body, &m.0.into_range(), None, *is_coro);
+                    } else {
+                        let _ = self.infer(m);
+                    }
+                }
+                // Register the instance.
+                self.generics.instances.push(InstanceDef {
+                    class: class.to_string(),
+                    args: arg_tys,
+                    method_fqns,
+                });
+                unit_ty()
+            }
+
+            Expression::Forall { params, ty } => {
+                // In a type annotation context, bind type params and resolve the inner type.
+                let mut frame = HashMap::new();
+                for tp in params {
+                    let var = self.counter.fresh();
+                    frame.insert(tp.name.to_string(), var);
+                }
+                self.type_params_in_scope.push(frame);
+                let inner_ty = self.infer(ty);
+                self.type_params_in_scope.pop();
+                inner_ty
+            }
+
             // ---- Fallback ----
             //
             // `unreachable!` because the match above is exhaustive over every
@@ -1699,7 +1809,27 @@ impl Checker {
                 return self.unify(&lt, &rt, &range, "operands of `+`");
             }
         }
-        self.unify(&lt, &rt, &range, &format!("operands of `{}`", op))
+        let result = self.unify(&lt, &rt, &range, &format!("operands of `{}`", op));
+        // If the unified type is still an open type variable (generic type param),
+        // check that it has a Num constraint; otherwise the op is invalid.
+        let pruned = apply_ty_prune(&self.subst, &result);
+        if let Ty::Var(v) = &pruned {
+            let has_num = self.active_constraints.iter().any(|c| c.var == *v && c.class == "Num");
+            if !has_num {
+                // Check if the var appears in any in-scope type param frame.
+                let in_scope = self.type_params_in_scope.iter().any(|frame| {
+                    frame.values().any(|&id| id == *v)
+                });
+                if in_scope {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot apply `{}` to value of generic type without bound `Num`", op),
+                        range,
+                    ));
+                }
+            }
+        }
+        result
     }
 
     fn compound_op_name(op: parser::ast::AssignOp) -> &'static str {
@@ -2146,6 +2276,12 @@ impl Checker {
     }
 
     fn parse_type_name_str(&mut self, name: &str) -> Ty {
+        // Type parameters in scope take highest priority.
+        for frame in self.type_params_in_scope.iter().rev() {
+            if let Some(&var) = frame.get(name) {
+                return Ty::Var(var);
+            }
+        }
         for frame in self.type_aliases.iter().rev() {
             if let Some(alias_ty) = frame.get(name) {
                 return alias_ty.clone();
@@ -2411,6 +2547,7 @@ impl Checker {
                 {
                     let fun_ty = self.infer_function(
                         name,
+                        &[], // impl methods don't have free type params
                         args,
                         returns.as_ref(),
                         func_body,
@@ -2442,6 +2579,7 @@ impl Checker {
     fn infer_function(
         &mut self,
         name: &str,
+        type_params: &[parser::ast::TypeParam],
         args: &Output,
         returns: Option<&Output>,
         body: &Output,
@@ -2449,6 +2587,29 @@ impl Checker {
         self_ty: Option<&Ty>,
         is_coro: bool,
     ) -> Ty {
+        // Set up type parameter environment.
+        let is_generic = !type_params.is_empty();
+        let mut param_vars: Vec<TyVarId> = Vec::new();
+        let mut param_constraints: Vec<Constraint> = Vec::new();
+        let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
+
+        for tp in type_params {
+            let var = self.counter.fresh();
+            param_frame.insert(tp.name.to_string(), var);
+            param_vars.push(var);
+            for bound in &tp.bounds {
+                param_constraints.push(Constraint {
+                    var,
+                    class: bound.to_string(),
+                });
+            }
+        }
+
+        // Push param frame so parse_type_name resolves T → Var(id).
+        self.type_params_in_scope.push(param_frame);
+        let prev_constraints_len = self.active_constraints.len();
+        self.active_constraints.extend(param_constraints.iter().cloned());
+
         let arg_tys = self.parse_arg_list(args);
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
@@ -2608,6 +2769,19 @@ impl Checker {
         self.fn_result_mode = prev_result_mode;
         self.fn_option_mode = prev_option_mode;
         self.unify(&Ty::Var(alpha), &fun_ty, range, "function type");
+
+        // Pop type param scope.
+        self.active_constraints.truncate(prev_constraints_len);
+        self.type_params_in_scope.pop();
+
+        // If generic, build a poly scheme and re-insert into env.
+        if is_generic {
+            self.generic_fns.insert(name.to_string());
+            self.generics.generic_fns.insert(name.to_string());
+            let scheme = Scheme::poly(param_vars, param_constraints, fun_ty.clone());
+            self.env.insert_top(name.to_string(), scheme);
+        }
+
         fun_ty
     }
 
@@ -4288,6 +4462,24 @@ impl Checker {
     /// True if `name` was declared as `async fn`.
     pub fn is_async_function(&self, name: &str) -> bool {
         self.async_functions.contains(name)
+    }
+
+    /// Whether `name` is a generic function (has type params).
+    pub fn is_generic_fn(&self, name: &str) -> bool {
+        self.generics.generic_fns.contains(name)
+    }
+
+    /// Return the FQN for an instance method, if registered.
+    /// `class` is e.g. `"Num"`, `args` are concrete types, `method` is `"add"`.
+    pub fn instance_method_fqn(&self, class: &str, args: &[Ty], method: &str) -> Option<&str> {
+        self.generics
+            .find_instance(class, args)
+            .and_then(|inst| inst.method_fqns.get(method).map(|s| s.as_str()))
+    }
+
+    /// Read-only access to the generics registry (for codegen).
+    pub fn generics(&self) -> &super::generics::Generics {
+        &self.generics
     }
 
     /// Infer without updating the NodeId cache (codegen helper).

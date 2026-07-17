@@ -321,7 +321,12 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
                 pre_walk(m, table);
             }
         }
-        Expression::TypeClassImpl { methods, .. } => {
+        Expression::TypeClassImpl { args, methods, .. } => {
+            // Walk type-annotation args so NodeId counters match infer.rs's
+            // `self.infer(a)` calls for each arg.
+            for a in args {
+                pre_walk(a, table);
+            }
             for m in methods {
                 pre_walk(m, table);
             }

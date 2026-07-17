@@ -4,6 +4,7 @@
 //! for inference, native registration, and span-indexed type lookup.
 
 pub mod env;
+pub mod generics;
 pub mod id;
 pub mod infer;
 pub mod pretty;

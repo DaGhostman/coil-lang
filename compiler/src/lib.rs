@@ -841,6 +841,18 @@ impl Compiler {
         )
     }
 
+    /// Return `true` when the *next* node to be emitted has an open type variable
+    /// type (i.e. it is a generic type parameter, not a concrete `int`/`float`/…).
+    /// Used to choose `DynAdd`/`DynSub`/… over `ADD`/`ADDF`/… for generic bodies.
+    #[allow(dead_code)] // wired by generics codegen (Dyn* path)
+    fn is_generic_ty_at_current_idx(&self) -> bool {
+        let id = self.checker.id_table().ids()[self.emit_idx];
+        matches!(
+            self.checker.lookup_at(id),
+            Some(crate::typechecking::ty::Ty::Var(_))
+        )
+    }
+
     fn alloc_temp_slot(&mut self) -> u32 {
         self.temp_counter += 1;
         let name = format!("__tmp{}", self.temp_counter);

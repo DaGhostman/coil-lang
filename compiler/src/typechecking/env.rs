@@ -179,6 +179,7 @@ pub fn instantiate(scheme: &Scheme, counter: &mut TyVarCounter) -> Ty {
 }
 
 /// Like [`instantiate`], but also returns the freshened constraints.
+#[allow(dead_code)] // wired by generics call-site constraint discharge
 pub fn instantiate_with_constraints(
     scheme: &Scheme,
     counter: &mut TyVarCounter,
