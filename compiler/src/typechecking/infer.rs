@@ -59,6 +59,9 @@ pub struct Checker {
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
+    /// Concrete typeclass dictionaries selected at each generic call site.
+    call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
+
     /// `type Name = T` aliases (substituted at typecheck time).
     ///
     /// Mirrors lexical scopes: lookup walks from the innermost frame
@@ -227,6 +230,7 @@ impl Checker {
             next_id_idx: 0,
             cache: std::collections::HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
+            call_site_dicts: HashMap::new(),
             type_aliases: vec![HashMap::new()],
             const_scopes: vec![HashSet::new()],
             enums: BTreeMap::new(),
@@ -351,6 +355,7 @@ impl Checker {
         self.next_id_idx = 0;
         self.cache.clear();
         self.codegen_var_types.clear();
+        self.call_site_dicts.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
         self.const_scopes.clear();
@@ -561,7 +566,7 @@ impl Checker {
         let id = self.ids.ids()[self.next_id_idx];
         self.next_id_idx += 1;
 
-        let ty = self.infer_inner(expr);
+        let ty = self.infer_inner(expr, Some(id));
         self.cache.insert(id, ty.clone());
         ty
     }
@@ -569,7 +574,7 @@ impl Checker {
     /// Inner inference — does the actual dispatch but no caching.
     /// Every recursive call into a child still goes through
     /// [`infer`](Self::infer), so each child also gets cached.
-    fn infer_inner(&mut self, expr: &Output) -> Ty {
+    fn infer_inner(&mut self, expr: &Output, id: Option<NodeId>) -> Ty {
         let range = expr.0.into_range();
         let child = expr.1.as_ref();
 
@@ -914,7 +919,7 @@ impl Checker {
                 // required bound, or propagates the constraint if the caller is
                 // itself generic with the same bound.
                 if !fresh_constraints.is_empty() {
-                    self.discharge_constraints(&fresh_constraints, &range);
+                    self.discharge_constraints(id, &fresh_constraints, &range);
                 }
                 result
             }
@@ -1816,6 +1821,11 @@ impl Checker {
         self.cache.get(&id).map(|t| apply_ty_prune(&self.subst, t))
     }
 
+    /// Concrete typeclass instances selected while discharging a call's bounds.
+    pub fn call_dicts_at(&self, id: NodeId) -> Option<&[InstanceDef]> {
+        self.call_site_dicts.get(&id).map(Vec::as_slice)
+    }
+
     /// Borrow the pre-walk [`IdTable`].
     pub fn id_table(&self) -> &IdTable {
         &self.ids
@@ -2359,10 +2369,13 @@ impl Checker {
     /// 3. For a concrete type, look for a registered instance via
     ///    `self.generics.find_instance`. If none exists, emit a diagnostic.
     ///
-    /// TODO(codegen B2): store the matched `InstanceDef.method_fqns` in a
-    /// `pending_dicts` side-table so the codegen pass can emit the concrete
-    /// dispatch dictionary at the call site.
-    fn discharge_constraints(&mut self, constraints: &[Constraint], range: &Range<usize>) {
+    /// Matched instances are stored by call-site [`NodeId`] for codegen.
+    fn discharge_constraints(
+        &mut self,
+        call_id: Option<NodeId>,
+        constraints: &[Constraint],
+        range: &Range<usize>,
+    ) {
         for c in constraints {
             let resolved = apply_ty_prune(&self.subst, &Ty::Var(c.var));
             match &resolved {
@@ -2382,11 +2395,16 @@ impl Checker {
                     }
                 }
                 concrete => {
-                    if self
-                        .generics
-                        .find_instance(&c.class, &[concrete.clone()])
-                        .is_none()
+                    if let Some(instance) =
+                        self.generics.find_instance(&c.class, &[concrete.clone()])
                     {
+                        if let Some(call_id) = call_id {
+                            self.call_site_dicts
+                                .entry(call_id)
+                                .or_default()
+                                .push(instance.clone());
+                        }
+                    } else {
                         self.messages.push(Message::error(
                             ErrorCode::GenericTypeError,
                             format!(
@@ -4709,7 +4727,7 @@ impl Checker {
     /// Infer without updating the NodeId cache (codegen helper).
     pub fn infer_for_codegen(&mut self, expr: &Output) -> Ty {
         let saved_idx = self.next_id_idx;
-        let ty = self.infer_inner(expr);
+        let ty = self.infer_inner(expr, None);
         self.next_id_idx = saved_idx;
         // Don't insert into cache — the ID we restored might be
         // wrong for this AST node, and overwriting a correct entry
@@ -7028,6 +7046,28 @@ mod tests {
             "expected unknown-method diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn generic_call_records_concrete_instance_dict() {
+        let src = r#"
+            fn add<T: Num>(T a, T b) -> T { return a + b; }
+            fn main() { let x = add(1, 2); }
+        "#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+
+        let dicts: Vec<_> = c
+            .id_table()
+            .ids()
+            .iter()
+            .filter_map(|id| c.call_dicts_at(*id))
+            .collect();
+        assert_eq!(dicts.len(), 1, "expected one constrained call dict");
+        assert_eq!(dicts[0].len(), 1, "expected one Num dictionary");
+        assert_eq!(dicts[0][0].class, "Num");
+        assert_eq!(dicts[0][0].args, vec![int()]);
     }
 
     #[test]

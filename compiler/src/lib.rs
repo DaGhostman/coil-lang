@@ -57,6 +57,15 @@ fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
 }
 
+fn is_instance_method_fqn(checker: &Checker, name: &str) -> bool {
+    checker.generics().instances.iter().any(|instance| {
+        instance
+            .method_fqns
+            .values()
+            .any(|method_fqn| method_fqn == name)
+    })
+}
+
 fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup> {
     let mut groups: Vec<TagGroup> = Vec::new();
     let mut tag_to_idx: HashMap<u32, usize> = HashMap::new();
@@ -765,6 +774,86 @@ impl Compiler {
         }
     }
 
+    fn emit_call_indirect(bytecode: &mut Vec<Byte>, target_offset: u32, arity: u32) {
+        bytecode.push(Byte::new(Instruction::CONST).with_value_u32(target_offset));
+        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
+    }
+
+    fn compile_function_output_with_name<'compiler>(
+        &mut self,
+        method: &Output<'compiler>,
+        qualified: String,
+    ) {
+        let _method_id = self.checker.id_table().ids()[self.emit_idx];
+        self.emit_idx += 1;
+        let Expression::Function {
+            name,
+            is_coro,
+            args,
+            body,
+            ..
+        } = method.1.as_ref() else {
+            let mut bc = self.do_compile(method);
+            self.bytecode.append(&mut bc);
+            return;
+        };
+
+        self.functions.insert(qualified.clone(), self.bytecode.len());
+        if *is_coro {
+            self.coroutine_fns.insert(qualified);
+        }
+
+        let prev_vars = std::mem::take(&mut self.context.variables);
+        self.context.variables = Interner::default();
+        if self.compiling_method {
+            self.context.variables.intern("self".to_string());
+        }
+
+        let prev_result_mode = self.compiling_result_mode;
+        self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+
+        let mut a = self.do_compile(args);
+        self.bytecode.append(&mut a);
+        let mut c = self.do_compile(body);
+        self.bytecode.append(&mut c);
+
+        self.context.defers.iter().for_each(|offset| {
+            self.bytecode
+                .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+        });
+
+        if !matches!(
+            self.bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::RETURN)
+        ) {
+            self.bytecode.push(Byte::new_with_value(
+                Instruction::CONST,
+                Value::default().raw() as _,
+            ));
+            if self.compiling_result_mode {
+                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+            }
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+
+        self.compiling_result_mode = prev_result_mode;
+        self.context.variables = prev_vars;
+    }
+
+    fn consume_function_signature_output<'compiler>(&mut self, method: &Output<'compiler>) {
+        let _method_id = self.checker.id_table().ids()[self.emit_idx];
+        self.emit_idx += 1;
+        if let Expression::Function { args, body, .. } = method.1.as_ref() {
+            let mut args_bc = self.do_compile(args);
+            self.bytecode.append(&mut args_bc);
+            let mut body_bc = self.do_compile(body);
+            self.bytecode.append(&mut body_bc);
+        } else {
+            let mut bc = self.do_compile(method);
+            self.bytecode.append(&mut bc);
+        }
+    }
+
     pub fn get_messages(&self) -> &Vec<Message> {
         &self.messages
     }
@@ -1299,7 +1388,7 @@ impl Compiler {
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let mut bytecode = vec![];
-        let _self_id = self.checker.id_table().ids()[self.emit_idx];
+        let self_id = self.checker.id_table().ids()[self.emit_idx];
         self.emit_idx += 1;
         let (span, child) = ast;
 
@@ -2150,6 +2239,19 @@ impl Compiler {
                         .get(&identifier)
                         .cloned()
                         .unwrap_or_else(|| identifier.clone());
+                    // B2 records selected user dictionaries here; the shared
+                    // generic body still uses the existing Dyn* path until full
+                    // dictionary passing lands.
+                    let _has_selected_user_dict =
+                        self.checker.is_generic_fn(&n)
+                            && self.checker.call_dicts_at(self_id).is_some_and(|dicts| {
+                                dicts.iter().any(|instance| {
+                                    instance
+                                        .method_fqns
+                                        .values()
+                                        .any(|fqn| self.functions.contains_key(fqn))
+                                })
+                            });
 
                     if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
                         // Stage arg bytecode in a local Vec to
@@ -2197,15 +2299,18 @@ impl Compiler {
                                 .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
                         }
 
-                        if self.coroutine_fns.contains(&n) {
+                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        if is_instance_method_fqn(&self.checker, &n) {
+                            Self::emit_call_indirect(&mut bytecode, offset as u32, arity);
+                        } else if self.coroutine_fns.contains(&n) {
                             bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
-                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                                arity,
                                 offset as u32,
                             ));
                         } else {
                             // Packed CALL: arity + target in one opcode.
                             bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
-                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
+                                arity,
                                 offset as u32,
                             ));
                         }
@@ -2234,6 +2339,65 @@ impl Compiler {
                 // still mints a NodeId (so this arm consumes one
                 // to stay in lockstep), but the bytecode here is
                 // empty.
+            }
+            Expression::TypeClass { name, methods, .. } => {
+                for method in methods {
+                    if let Expression::Function {
+                        name: method_name,
+                        body,
+                        ..
+                    } = method.1.as_ref()
+                    {
+                        let has_default =
+                            !matches!(body.1.as_ref(), Expression::Block(items) if items.is_empty());
+                        if has_default {
+                            let fqn = crate::typechecking::generics::Generics::default_method_fqn(
+                                name,
+                                method_name,
+                            );
+                            self.compile_function_output_with_name(method, fqn);
+                        } else {
+                            self.consume_function_signature_output(method);
+                        }
+                    } else {
+                        self.consume_function_signature_output(method);
+                    }
+                }
+            }
+            Expression::TypeClassImpl {
+                class,
+                args,
+                methods,
+            } => {
+                let arg_tys: Vec<_> = args
+                    .iter()
+                    .map(|arg| self.checker.infer_for_codegen(arg))
+                    .collect();
+                for arg in args {
+                    bytecode.append(&mut self.do_compile(arg));
+                }
+                let ty_part = arg_tys
+                    .iter()
+                    .map(|ty| ty.to_string())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                for method in methods {
+                    if let Expression::Function { name: method_name, .. } = method.1.as_ref() {
+                        let fqn = format!("{}__{}__{}", class, ty_part, method_name);
+                        self.compile_function_output_with_name(method, fqn);
+                    } else if let Expression::Method(_, body) = method.1.as_ref() {
+                        let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
+                        self.emit_idx += 1;
+                        if let Expression::Function { name: method_name, .. } = body.1.as_ref() {
+                            let fqn = format!("{}__{}__{}", class, ty_part, method_name);
+                            self.compile_function_output_with_name(body, fqn);
+                        } else {
+                            self.consume_function_signature_output(body);
+                        }
+                    } else {
+                        self.consume_function_signature_output(method);
+                    }
+                }
             }
             Expression::Identifier(n) => {
                 if let Some(slot) = self.lookup_slot(n) {
@@ -3923,6 +4087,44 @@ mod tests {
         let _bc = c.compile("test", &ast);
         let msgs = std::mem::take(&mut c.messages);
         assert!(msgs.is_empty(), "expected no messages, got: {:?}", msgs);
+    }
+
+    #[test]
+    fn typeclass_impl_method_registers_fqn_function() {
+        let ast = Pratt::default()
+            .parse(
+                r#"
+                typeclass Foo<T> { fn bar(T x) -> T; }
+                impl Foo<int> { fn bar(int x) -> int { return x; } }
+                fn main() { }
+                "#,
+            )
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &ast);
+        assert!(
+            compiler.messages.is_empty(),
+            "unexpected: {:?}",
+            compiler.messages
+        );
+        let offset = compiler
+            .functions
+            .get("Foo__int__bar")
+            .copied()
+            .expect("instance method FQN should be registered");
+        assert!(offset < bc.len(), "function offset should point into bytecode");
+    }
+
+    #[test]
+    fn emit_call_indirect_pushes_target_then_opcode() {
+        use common::Instruction;
+        let mut bc = Vec::new();
+        Compiler::emit_call_indirect(&mut bc, 42, 2);
+        assert_eq!(bc.len(), 2);
+        assert!(matches!(bc[0].bytecode(), Instruction::CONST));
+        assert_eq!(bc[0].value_u32(), 42);
+        assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
+        assert_eq!(bc[1].operand_u32(), 2);
     }
 
     // ============================================================
