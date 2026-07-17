@@ -23,7 +23,8 @@ fn apply_id(forall T. T -> T f, int x) -> int {
 }
 
 // Capture Describable evidence into a PolyFn and return it. After this
-// frame returns, CallIndirect must still see the captured dictionary.
+// frame returns, CallIndirect must still see the captured dictionary
+// (app_dict_arity=0 at the use site).
 fn capture_show<T: Describable>(T _witness) {
     return show;
 }

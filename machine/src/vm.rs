@@ -3618,6 +3618,40 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 7);
     }
 
+    /// Phase 4: capture with every slot `Some` and `app_dict_arity=0` still
+    /// injects all dictionaries for the callee.
+    #[test]
+    fn call_indirect_all_some_capture_slots_work_with_zero_app_dicts() {
+        // Two captured dicts (11, 22); callee returns dict1 + dict2 (slots 1, 2).
+        //  0: CONST 11
+        //  1: CONST 22
+        //  2: CodePtr entry
+        //  3: MakePolyFnCapture (2)
+        //  4: StorePop 0
+        //  5: CONST 1            value arg (unused by callee)
+        //  6: LOAD 0
+        //  7: CallIndirect value_arity=1, app_dict_arity=0
+        //  8: HALT
+        //  9: LOAD 1 / LOAD 2 / ADD / RETURN
+        let mut vm = Machine::<16>::default();
+        vm.run(&[
+            const_int(11),
+            const_int(22),
+            Byte::new(Instruction::CodePtr).with_operand_u32(9),
+            Byte::new(Instruction::MakePolyFnCapture).with_operand_u32(2),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(1),
+            load(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            load(1),
+            load(2),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ]);
+        assert_eq!(vm.pop().as_int(), 33);
+    }
+
     /// Captured evidence wins over a duplicate application dictionary.
     #[test]
     fn call_indirect_prefers_captured_dict_over_app_dict() {

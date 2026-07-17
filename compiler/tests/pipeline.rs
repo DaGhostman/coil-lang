@@ -242,7 +242,8 @@ fn format_percent_v_parity_with_print() {
     assert_eq!(run_example_src(src), "1-x");
 }
 
-/// Phase 3: captured dictionaries remain valid after the creating frame returns.
+/// Phase 4: captured dictionaries remain valid after the creating frame returns
+/// and the application site need not supply dictionaries (`app_dict_arity=0`).
 #[test]
 fn polyfn_captured_dict_survives_return() {
     let src = r#"
@@ -265,12 +266,67 @@ fn polyfn_captured_dict_survives_return() {
     "#;
     let mut pipeline = Pipeline::new();
     let (bytecode, _constants) = pipeline.compile_src(src).expect("compile");
-    assert!(
-        bytecode
-            .iter()
-            .any(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture)),
-        "expected MakePolyFnCapture when escaping show from a constrained scope"
+    let capture = bytecode
+        .iter()
+        .find(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture))
+        .expect("expected MakePolyFnCapture when escaping show from a constrained scope");
+    assert_eq!(
+        capture.operand_u32() & 0xFF,
+        1,
+        "capture should reserve one Describable dict slot"
     );
+    // Application of the returned PolyFn must not require a second MakeTuple
+    // dict at the call site — evidence lives in the capture.
+    let capture_pos = bytecode
+        .iter()
+        .position(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture))
+        .unwrap();
+    let call_indirects_after: Vec<_> = bytecode[capture_pos..]
+        .iter()
+        .filter(|b| matches!(b.bytecode(), common::Instruction::CallIndirect))
+        .collect();
+    assert!(
+        call_indirects_after
+            .iter()
+            .any(|b| (b.operand_u32() >> 16) == 0),
+        "captured PolyFn call should use app_dict_arity=0; CallIndirect operands: {:?}",
+        call_indirects_after
+            .iter()
+            .map(|b| b.operand_u32())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(run_example_src(src), "42");
+}
+
+/// Phase 4: multiparam `Convert<A,B>` capture works after return with no app dict.
+/// Both type args are witnessed at the capture call so the dict is concrete.
+#[test]
+fn polyfn_multiparam_capture_survives_return() {
+    let src = r#"
+        typeclass Convert<A, B> {
+            fn cast(A x) -> B;
+        }
+        impl Convert<int, int> {
+            fn cast(int x) -> int { return x; }
+        }
+        fn convert_fn<A, B>(A x) -> B where Convert<A, B> {
+            return cast(x);
+        }
+        fn capture_convert<A, B>(A _wa, B _wb) where Convert<A, B> {
+            return convert_fn;
+        }
+        fn main() {
+            let f = capture_convert(0, 0);
+            print "%i", f(42);
+        }
+    "#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _constants) = pipeline.compile_src(src).expect("compile");
+    let capture = bytecode
+        .iter()
+        .find(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture))
+        .expect("expected MakePolyFnCapture for multiparam escape");
+    assert_eq!(capture.operand_u32() & 0xFF, 1);
     assert_eq!(run_example_src(src), "42");
 }
 

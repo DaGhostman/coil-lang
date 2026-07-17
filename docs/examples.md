@@ -646,7 +646,8 @@ through the same dictionary.
 
 **Demonstrates:** First-class generic functions, multi-instantiation,
 constrained apply-site dictionaries, rank-n `forall` parameters, and
-captured dictionary evidence that survives returning a PolyFn.
+captured dictionary evidence that survives returning a PolyFn
+(`app_dict_arity=0` at the use site).
 
 | | |
 |---|---|

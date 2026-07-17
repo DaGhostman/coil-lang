@@ -426,13 +426,14 @@ let n = f(42);
 let x = f(4.0);
 ```
 
-`MakePolyFn` stores the shared entry point when no dictionaries are in scope
-yet (for example top-level `let f = show;`). Escaping from an active
-constrained scope uses `MakePolyFnCapture` instead, copying each available
-`__dictN` into the heap value. Applications use `CallIndirect`, which merges
-captured evidence with any dictionaries synthesized at the call site
-(preferring captures for already-filled slots). A generic identifier passed to
-a compatible `forall T. T -> T` parameter uses the same path.
+Unconstrained escapes use `MakePolyFn`. Constrained generics always escape via
+`MakePolyFnCapture`: each constraint slot is filled from an in-scope `__dictN`
+or a concrete instance dictionary when the type arguments are ground; only
+truly unavailable evidence (for example top-level `let f = show;`) leaves a
+null slot for application-time synthesis. Applications use `CallIndirect`,
+which merges captured evidence with any dictionaries synthesized at the call
+site (preferring captures for already-filled slots). A generic identifier
+passed to a compatible `forall T. T -> T` parameter uses the same path.
 
 ### Higher-rank `forall`
 

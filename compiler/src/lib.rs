@@ -1137,6 +1137,79 @@ impl Compiler {
         }
     }
 
+    /// Emit one instance dictionary (`CodePtr`s + `MakeTuple`) for a
+    /// typeclass constraint whose type arguments have already been resolved
+    /// to concrete lookup types. Returns `true` when a dict was pushed.
+    fn emit_instance_dict(
+        bytecode: &mut Vec<Byte>,
+        class: &str,
+        lookup: &[crate::typechecking::Ty],
+        checker: &Checker,
+        functions: &HashMap<String, usize>,
+    ) -> bool {
+        let Some(instance) = checker.generics().find_instance(class, lookup) else {
+            return false;
+        };
+        let Some(class_def) = checker.generics().typeclass(&instance.class) else {
+            return false;
+        };
+        let n_methods = class_def.methods.len() as u32;
+        for method_def in &class_def.methods {
+            let offset = instance
+                .method_fqns
+                .get(&method_def.name)
+                .and_then(|fqn| functions.get(fqn).copied())
+                .unwrap_or(0);
+            bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
+        }
+        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
+        true
+    }
+
+    /// Resolve a constraint's type arguments through `var_to_ty`, returning
+    /// concrete lookup types when every argument is ground. `None` means at
+    /// least one argument is still open (cannot synthesize yet).
+    fn resolve_constraint_lookup(
+        constraint: &crate::typechecking::ty::Constraint,
+        var_to_ty: &HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty>,
+        checker: &Checker,
+    ) -> Option<Vec<crate::typechecking::Ty>> {
+        use crate::typechecking::Ty;
+        use crate::typechecking::subst::apply_ty_prune;
+        use crate::typechecking::ty::ftv_ty;
+
+        let mut resolved = Vec::with_capacity(constraint.args.len());
+        for arg in &constraint.args {
+            let concrete = match arg {
+                Ty::Var(v) => apply_ty_prune(checker.subst(), var_to_ty.get(v)?),
+                other => apply_ty_prune(checker.subst(), other),
+            };
+            if !ftv_ty(&concrete).is_empty() {
+                return None;
+            }
+            resolved.push(concrete);
+        }
+        // HKT classes look up by constructor head (`Option`), not
+        // applied types (`Option<int>`).
+        let lookup = if checker
+            .generics()
+            .typeclass(&constraint.class)
+            .map(|c| c.is_unary_hkt())
+            .unwrap_or(false)
+        {
+            resolved
+                .iter()
+                .map(|concrete| match concrete {
+                    Ty::App(head, _) => head.as_ref().clone(),
+                    other => other.clone(),
+                })
+                .collect()
+        } else {
+            resolved
+        };
+        Some(lookup)
+    }
+
     /// Emit dictionary tuples for a non-monomorphized generic call site.
     ///
     /// Convention: after value args, one `MakeTuple` per typeclass
@@ -1159,7 +1232,6 @@ impl Compiler {
         functions: &HashMap<String, usize>,
     ) -> usize {
         use crate::typechecking::Ty;
-        use crate::typechecking::subst::apply_ty_prune;
 
         let Some(scheme) = checker.env().lookup(fn_name).cloned() else {
             return 0;
@@ -1189,65 +1261,74 @@ impl Compiler {
 
         let mut dict_count = 0;
         for constraint in &scheme.constraints {
-            // Resolve each constraint arg via scheme-var → call-site binding.
-            let mut resolved = Vec::with_capacity(constraint.args.len());
-            let mut incomplete = false;
-            for arg in &constraint.args {
-                let concrete = match arg {
-                    Ty::Var(v) => match var_to_ty.get(v) {
-                        Some(t) => apply_ty_prune(checker.subst(), t),
-                        None => {
-                            incomplete = true;
-                            break;
-                        }
-                    },
-                    other => apply_ty_prune(checker.subst(), other),
-                };
-                resolved.push(concrete);
-            }
-            if incomplete {
-                continue;
-            }
-            // HKT classes look up by constructor head (`Option`), not
-            // applied types (`Option<int>`).
-            let lookup: Vec<Ty> = if checker
-                .generics()
-                .typeclass(&constraint.class)
-                .map(|c| c.is_unary_hkt())
-                .unwrap_or(false)
-            {
-                resolved
-                    .iter()
-                    .map(|concrete| match concrete {
-                        Ty::App(head, _) => head.as_ref().clone(),
-                        other => other.clone(),
-                    })
-                    .collect()
-            } else {
-                resolved
-            };
-            let Some(instance) = checker
-                .generics()
-                .find_instance(&constraint.class, &lookup)
+            let Some(lookup) =
+                Self::resolve_constraint_lookup(constraint, &var_to_ty, checker)
             else {
                 continue;
             };
-            let Some(class_def) = checker.generics().typeclass(&instance.class) else {
-                continue;
-            };
-            let n_methods = class_def.methods.len() as u32;
-            for method_def in &class_def.methods {
-                let offset = instance
-                    .method_fqns
-                    .get(&method_def.name)
-                    .and_then(|fqn| functions.get(fqn).copied())
-                    .unwrap_or(0);
-                bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
+            if Self::emit_instance_dict(bytecode, &constraint.class, &lookup, checker, functions) {
+                dict_count += 1;
             }
-            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
-            dict_count += 1;
         }
         dict_count
+    }
+
+    /// Phase 4: push dictionary evidence for every constraint slot when a
+    /// generic function escapes into a `PolyFn` value.
+    ///
+    /// Slot fill order per constraint index:
+    /// 1. in-scope `__dictN` (open bound forwarded from the enclosing frame)
+    /// 2. concrete instance synthesis when constraint args are ground
+    /// 3. null sentinel (`CONST 0` → `None` in `MakePolyFnCapture`) when
+    ///    evidence is truly unavailable (e.g. top-level `let f = show`)
+    ///
+    /// Returns the dict arity (number of stack slots pushed). Caller always
+    /// emits `MakePolyFnCapture` when this is non-zero.
+    fn emit_polyfn_escape_dicts(
+        &self,
+        bytecode: &mut Vec<Byte>,
+        fn_name: &str,
+        escape_ty: Option<&crate::typechecking::Ty>,
+    ) -> usize {
+        let dict_arity = self.checker.dict_arity_for(fn_name);
+        if dict_arity == 0 {
+            return 0;
+        }
+
+        let scheme = self.checker.env().lookup(fn_name).cloned();
+        let mut var_to_ty: HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty> =
+            HashMap::new();
+        if let (Some(scheme), Some(escape_ty)) = (scheme.as_ref(), escape_ty) {
+            // Bind scheme vars from the escape site's instantiated type so
+            // ground specializations can synthesize instance dictionaries.
+            Self::bind_scheme_vars(&scheme.ty, escape_ty, &mut var_to_ty);
+        }
+
+        for dict_index in 0..dict_arity {
+            if let Some(slot) = self.lookup_slot(&format!("__dict{}", dict_index)) {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                continue;
+            }
+
+            let synthesized = scheme.as_ref().and_then(|s| {
+                let constraint = s.constraints.get(dict_index)?;
+                let lookup =
+                    Self::resolve_constraint_lookup(constraint, &var_to_ty, &self.checker)?;
+                Self::emit_instance_dict(
+                    bytecode,
+                    &constraint.class,
+                    &lookup,
+                    &self.checker,
+                    &self.functions,
+                )
+                .then_some(())
+            });
+            if synthesized.is_none() {
+                // Unresolved sentinel — CallIndirect fills from app evidence.
+                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+            }
+        }
+        dict_arity
     }
 
     /// Emit bytecode thunks for compiler-provided primitive instances.
@@ -3559,34 +3640,23 @@ impl Compiler {
                         .unwrap_or_else(|| n.to_string());
                     if self.checker.is_generic_fn(&resolved_n) {
                         if let Some(&entry_offset) = self.functions.get(&resolved_n) {
-                            // Hybrid evidence: capture every in-scope `__dictN` for
-                            // this scheme; leave unresolved slots as null so
-                            // CallIndirect can fill them at the application site.
-                            let dict_arity = self.checker.dict_arity_for(&resolved_n);
-                            let mut captured_any = false;
-                            let mut slot_bc = Vec::new();
-                            for dict_index in 0..dict_arity {
-                                if let Some(slot) =
-                                    self.lookup_slot(&format!("__dict{}", dict_index))
-                                {
-                                    slot_bc.push(
-                                        Byte::new(Instruction::LOAD).with_operand_u32(slot),
-                                    );
-                                    captured_any = true;
-                                } else {
-                                    // Unresolved sentinel (VM stores as None).
-                                    slot_bc.push(
-                                        Byte::new(Instruction::CONST).with_const_inline(0),
-                                    );
-                                }
-                            }
-                            if !captured_any {
+                            // Phase 4: constrained generics always escape via
+                            // MakePolyFnCapture. Fill slots from in-scope
+                            // `__dictN` or concrete instance synthesis; leave
+                            // null only when evidence is unavailable (e.g.
+                            // top-level `let f = show`).
+                            let escape_ty = self.codegen_expr_ty(ast);
+                            let dict_arity = self.emit_polyfn_escape_dicts(
+                                &mut bytecode,
+                                &resolved_n,
+                                escape_ty.as_ref(),
+                            );
+                            if dict_arity == 0 {
                                 bytecode.push(
                                     Byte::new(Instruction::MakePolyFn)
                                         .with_operand_u32(entry_offset as u32),
                                 );
                             } else {
-                                bytecode.append(&mut slot_bc);
                                 bytecode.push(
                                     Byte::new(Instruction::CodePtr)
                                         .with_operand_u32(entry_offset as u32),
@@ -7432,8 +7502,8 @@ print \"%i\", len(a); \
         );
     }
 
-    /// Phase 3: escaping a constrained generic from an active `__dictN` scope
-    /// emits `MakePolyFnCapture` instead of bare `MakePolyFn`.
+    /// Phase 4: escaping a constrained generic always emits `MakePolyFnCapture`
+    /// (from an active `__dictN` scope or with unresolved null slots).
     #[test]
     fn constrained_generic_escape_emits_make_polyfn_capture() {
         use common::Instruction;
@@ -7445,16 +7515,71 @@ print \"%i\", len(a); \
             fn main() { let f = capture(0); }
         "#;
         let (bc, _pool) = compile_src(src);
-        assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture)),
-            "expected MakePolyFnCapture; opcodes: {:?}",
+        let capture = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture))
+            .expect("expected MakePolyFnCapture");
+        assert_eq!(
+            capture.operand_u32() & 0xFF,
+            1,
+            "Showable escape should capture exactly 1 dict slot; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
             !bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
             "constrained escape should not emit unconstrained MakePolyFn"
+        );
+    }
+
+    /// Phase 4: top-level constrained escape (`let f = show`) still uses
+    /// `MakePolyFnCapture` with null slots (delayed application evidence).
+    #[test]
+    fn top_level_constrained_escape_emits_make_polyfn_capture_with_null_slots() {
+        use common::Instruction;
+        let src = r#"
+            typeclass Showable<T> { fn show_it(T x) -> int; }
+            impl Showable<int> { fn show_it(int x) -> int { return x; } }
+            fn show<T: Showable>(T x) -> int { return show_it(x); }
+            fn main() { let f = show; }
+        "#;
+        let (bc, _pool) = compile_src(src);
+        let capture = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture))
+            .expect("expected MakePolyFnCapture for top-level constrained escape");
+        assert_eq!(
+            capture.operand_u32() & 0xFF,
+            1,
+            "top-level show escape should reserve 1 dict slot"
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "constrained escape must not use bare MakePolyFn"
+        );
+    }
+
+    /// Phase 4: multiparam constraint escape captures one slot per constraint.
+    #[test]
+    fn multiparam_constrained_escape_emits_capture_with_slot_count() {
+        use common::Instruction;
+        let src = r#"
+            typeclass Convert<A, B> { fn cast(A x) -> B; }
+            impl Convert<int, int> { fn cast(int x) -> int { return x; } }
+            fn convert_fn<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
+            fn capture_convert<A, B>(A _wa, B _wb) where Convert<A, B> { return convert_fn; }
+            fn main() { let f = capture_convert(0, 0); }
+        "#;
+        let (bc, _pool) = compile_src(src);
+        let capture = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture))
+            .expect("expected MakePolyFnCapture for multiparam escape");
+        assert_eq!(
+            capture.operand_u32() & 0xFF,
+            1,
+            "Convert<A,B> escape should capture exactly 1 dict slot"
         );
     }
 
