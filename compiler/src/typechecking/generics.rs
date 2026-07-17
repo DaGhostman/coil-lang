@@ -31,6 +31,11 @@ pub struct TypeClassMethodDef {
 /// TypeClassDef { name: "Num", type_params: ["T"],
 ///     methods: [TypeClassMethodDef { name: "add", has_default: false }, …] }
 /// ```
+///
+/// Superclasses (Phase 5): `typeclass Ordered<T: Equal>` stores
+/// `superclasses: ["Equal"]`. Dictionary layout is flattened — subclass
+/// methods first, then each superclass’s methods in declaration order
+/// (transitively).
 #[derive(Debug, Clone)]
 pub struct TypeClassDef {
     pub name: String,
@@ -39,6 +44,10 @@ pub struct TypeClassDef {
     /// Kinds of each type parameter (parallel to `type_params`). Phase 5.
     /// Empty ≡ all `*`. A unary HKT class uses `[Kind::Arrow]`.
     pub param_kinds: Vec<Kind>,
+    /// Direct superclass class names from unary param bounds
+    /// (`typeclass Ord<T: Eq>` → `["Eq"]`). Empty for multi-param classes
+    /// and classes without bounds.
+    pub superclasses: Vec<String>,
     pub methods: Vec<TypeClassMethodDef>,
 }
 
@@ -51,6 +60,58 @@ impl TypeClassDef {
     /// True when this class’s first parameter is constructor-kinded (`* -> *`).
     pub fn is_unary_hkt(&self) -> bool {
         matches!(self.kind_at(0), Kind::Arrow)
+    }
+
+    /// True when `name` is a transitive superclass of this class.
+    pub fn has_superclass(&self, name: &str, generics: &Generics) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack: Vec<&str> = self.superclasses.iter().map(String::as_str).collect();
+        while let Some(super_name) = stack.pop() {
+            if !seen.insert(super_name.to_string()) {
+                continue;
+            }
+            if super_name == name {
+                return true;
+            }
+            if let Some(super_def) = generics.typeclass(super_name) {
+                stack.extend(super_def.superclasses.iter().map(String::as_str));
+            }
+        }
+        false
+    }
+
+    /// Flattened dictionary method list: this class’s methods, then each
+    /// superclass’s methods in declaration order (DFS, cycle-safe).
+    ///
+    /// Returns `(owning_class_name, method_def)` pairs. Slot index in the
+    /// runtime dict is the position in this list.
+    pub fn flattened_methods<'a>(
+        &'a self,
+        generics: &'a Generics,
+    ) -> Vec<(&'a str, &'a TypeClassMethodDef)> {
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        Self::collect_flattened_methods(self, generics, &mut out, &mut visited);
+        out
+    }
+
+    fn collect_flattened_methods<'a>(
+        class: &'a TypeClassDef,
+        generics: &'a Generics,
+        out: &mut Vec<(&'a str, &'a TypeClassMethodDef)>,
+        visited: &mut HashSet<String>,
+    ) {
+        if !visited.insert(class.name.clone()) {
+            return;
+        }
+        for method in &class.methods {
+            out.push((class.name.as_str(), method));
+        }
+        for super_name in &class.superclasses {
+            if let Some(super_def) = generics.typeclass(super_name) {
+                Self::collect_flattened_methods(super_def, generics, out, visited);
+            }
+        }
     }
 }
 
@@ -197,6 +258,7 @@ impl Generics {
                 name: "Num".into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
+                superclasses: vec![],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "add".into(),
@@ -219,12 +281,16 @@ impl Generics {
         );
 
         // ---- Ord ----
+        // Builtin Ord does not declare Eq as a superclass (dict layouts for
+        // existing Num/Ord/Eq callers stay unchanged). User-defined classes
+        // use `typeclass Ordered<T: Equal>` for the superclass path.
         self.typeclasses.insert(
             "Ord".into(),
             TypeClassDef {
                 name: "Ord".into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
+                superclasses: vec![],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "lt".into(),
@@ -253,6 +319,7 @@ impl Generics {
                 name: "Eq".into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
+                superclasses: vec![],
                 methods: vec![
                     TypeClassMethodDef {
                         name: "eq".into(),
@@ -273,6 +340,7 @@ impl Generics {
                 name: "Show".into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
+                superclasses: vec![],
                 methods: vec![TypeClassMethodDef {
                     name: "show".into(),
                     has_default: false,
@@ -393,8 +461,49 @@ mod tests {
             name: "Num".to_string(),
             type_params: vec!["T".to_string()],
             param_kinds: vec![Kind::Type],
+            superclasses: vec![],
             methods: vec![method("add", false), method("zero", true)],
         }
+    }
+
+    #[test]
+    fn flattened_methods_subclass_then_superclass() {
+        let mut generics = Generics::new();
+        generics.typeclasses.insert(
+            "Equal".into(),
+            TypeClassDef {
+                name: "Equal".into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                methods: vec![method("eq_val", false)],
+            },
+        );
+        generics.typeclasses.insert(
+            "Ordered".into(),
+            TypeClassDef {
+                name: "Ordered".into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec!["Equal".into()],
+                methods: vec![method("lt_val", false)],
+            },
+        );
+        let ordered = generics.typeclass("Ordered").unwrap();
+        let flat: Vec<_> = ordered
+            .flattened_methods(&generics)
+            .into_iter()
+            .map(|(c, m)| (c.to_string(), m.name.clone()))
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("Ordered".into(), "lt_val".into()),
+                ("Equal".into(), "eq_val".into()),
+            ]
+        );
+        assert!(ordered.has_superclass("Equal", &generics));
+        assert!(!ordered.has_superclass("Num", &generics));
     }
 
     #[test]

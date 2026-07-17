@@ -199,6 +199,13 @@ fn example_multiparam_prints_42() {
     assert_eq!(output, "42");
 }
 
+/// Phase 5: superclass / implied bounds (`Ordered<T: Equal>` → `eq_val` under `T: Ordered`).
+#[test]
+fn example_superclass_ord_prints_truetruefalse() {
+    let output = run_example("examples/superclass_ord.0s");
+    assert_eq!(output, "truetruefalse");
+}
+
 /// Shuffled record pattern `{ y: _, x: a }` must bind declaration-order `x`.
 #[test]
 fn shuffled_record_pattern_binds_declaration_order_field() {

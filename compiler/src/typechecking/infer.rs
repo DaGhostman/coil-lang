@@ -2030,10 +2030,24 @@ impl Checker {
                     .iter()
                     .map(|tp| Kind::from(tp.kind))
                     .collect();
+                // Unary classes: param bounds become direct superclasses
+                // (`typeclass Ordered<T: Equal>` → superclasses: ["Equal"]).
+                // Multi-param classes ignore param bounds for superclass
+                // wiring (use `where` for those constraints later).
+                let superclasses: Vec<String> = if type_params.len() == 1 {
+                    type_params[0]
+                        .bounds
+                        .iter()
+                        .map(|b| (*b).to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let def = TypeClassDef {
                     name: name.to_string(),
                     type_params: param_names,
                     param_kinds: param_kinds.clone(),
+                    superclasses,
                     methods: method_defs.clone(),
                 };
                 self.generics.typeclasses.insert(name.to_string(), def);
@@ -2259,6 +2273,37 @@ impl Checker {
                 }
                 let mut invalid_instance = class_def.is_none() || overlapping;
                 if let Some(class_def) = class_def.as_ref() {
+                    // Superclass instances must already exist (unary args).
+                    // `impl Ordered<int>` requires `Equal<int>`, transitively.
+                    let mut missing_supers = Vec::new();
+                    let mut seen_super = HashSet::new();
+                    let mut stack: Vec<String> = class_def.superclasses.clone();
+                    while let Some(super_name) = stack.pop() {
+                        if !seen_super.insert(super_name.clone()) {
+                            continue;
+                        }
+                        if self.generics.find_instance(&super_name, &arg_tys).is_none() {
+                            missing_supers.push(super_name.clone());
+                        }
+                        if let Some(super_def) = self.generics.typeclass(&super_name) {
+                            stack.extend(super_def.superclasses.iter().cloned());
+                        }
+                    }
+                    for super_name in &missing_supers {
+                        let args_pretty = arg_tys
+                            .iter()
+                            .map(|ty| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Instance of `{}` for `{}` requires superclass instance `{}<{}>`",
+                                class, args_pretty, super_name, args_pretty
+                            ),
+                            range.clone(),
+                        ));
+                    }
                     let unknown_methods = Generics::unknown_instance_methods(
                         class_def,
                         method_names.iter().map(|name| name.as_str()),
@@ -2300,7 +2345,9 @@ impl Checker {
                             range.clone(),
                         ));
                     }
-                    invalid_instance |= !unknown_methods.is_empty() || !missing_methods.is_empty();
+                    invalid_instance |= !unknown_methods.is_empty()
+                        || !missing_methods.is_empty()
+                        || !missing_supers.is_empty();
                 }
                 // Register only complete, non-overlapping instances. Omitted
                 // defaulted methods have been filled with class-default FQNs.
@@ -3428,7 +3475,8 @@ impl Checker {
         None
     }
 
-    /// True when some active constraint matches `needed` under the current subst.
+    /// True when some active constraint matches `needed` under the current subst,
+    /// or implies it via a superclass (Phase 5: `Ordered<T>` covers `Equal<T>`).
     fn constraint_is_covered(&self, needed: &Constraint) -> bool {
         let needed_args: Vec<Ty> = needed
             .args
@@ -3436,13 +3484,24 @@ impl Checker {
             .map(|a| apply_ty_prune(&self.subst, a))
             .collect();
         self.active_constraints.iter().any(|ac| {
-            if ac.class != needed.class || ac.args.len() != needed_args.len() {
+            if ac.args.len() != needed_args.len() {
                 return false;
             }
-            ac.args
+            let args_match = ac
+                .args
                 .iter()
                 .zip(needed_args.iter())
-                .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
+                .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b);
+            if !args_match {
+                return false;
+            }
+            if ac.class == needed.class {
+                return true;
+            }
+            // Implied bound: active subclass covers a superclass constraint.
+            self.generics
+                .typeclass(&ac.class)
+                .is_some_and(|def| def.has_superclass(&needed.class, &self.generics))
         })
     }
 
@@ -3452,15 +3511,33 @@ impl Checker {
             .iter()
             .map(|a| apply_ty_prune(&self.subst, a))
             .collect();
-        self.active_constraints.iter().position(|ac| {
-            ac.class == needed.class
-                && ac.args.len() == needed_args.len()
-                && ac
-                    .args
-                    .iter()
-                    .zip(needed_args.iter())
-                    .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
-        })
+        // Prefer an exact class match; fall back to a covering subclass dict
+        // (flattened layout holds superclass methods at trailing slots).
+        self.active_constraints
+            .iter()
+            .position(|ac| {
+                ac.class == needed.class
+                    && ac.args.len() == needed_args.len()
+                    && ac
+                        .args
+                        .iter()
+                        .zip(needed_args.iter())
+                        .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
+            })
+            .or_else(|| {
+                self.active_constraints.iter().position(|ac| {
+                    ac.args.len() == needed_args.len()
+                        && ac
+                            .args
+                            .iter()
+                            .zip(needed_args.iter())
+                            .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
+                        && self
+                            .generics
+                            .typeclass(&ac.class)
+                            .is_some_and(|def| def.has_superclass(&needed.class, &self.generics))
+                })
+            })
     }
 
     fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
@@ -3487,15 +3564,22 @@ impl Checker {
             })
             .filter_map(|(dict_index, constraint)| {
                 let class_def = self.generics.typeclass(&constraint.class)?;
-                let method_slot = class_def
-                    .methods
-                    .iter()
-                    .position(|candidate| candidate.name == method)?;
+                // Flattened dict: own methods then superclass methods. A call
+                // to a superclass method under `T: Ordered` resolves here with
+                // the trailing slot index (implied Equal).
+                let flat = class_def.flattened_methods(&self.generics);
+                let (method_slot, owner) = flat.iter().enumerate().find_map(|(slot, (owner, m))| {
+                    if m.name == method {
+                        Some((slot, (*owner).to_string()))
+                    } else {
+                        None
+                    }
+                })?;
                 let scheme = self
                     .typeclass_method_schemes
-                    .get(&(constraint.class.clone(), method.to_string()))?
+                    .get(&(owner.clone(), method.to_string()))?
                     .clone();
-                Some((dict_index, constraint.class.clone(), method_slot, scheme))
+                Some((dict_index, owner, method_slot, scheme))
             })
             .collect()
     }
@@ -8938,6 +9022,80 @@ mod tests {
             "expected unknown-method diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    /// Phase 5: `typeclass Ordered<T: Equal>` stores Equal as a superclass.
+    #[test]
+    fn typeclass_param_bounds_become_superclasses() {
+        let src = r#"
+            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let ordered = c.generics().typeclass("Ordered").expect("Ordered");
+        assert_eq!(ordered.superclasses, vec!["Equal".to_string()]);
+        assert!(ordered.has_superclass("Equal", c.generics()));
+    }
+
+    /// Phase 5: `impl Ordered<int>` without `Equal<int>` is an error.
+    #[test]
+    fn typeclass_impl_missing_superclass_instance_errors() {
+        let src = r#"
+            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            impl Ordered<int> {
+                fn lt_val(int a, int b) -> bool { return a < b; }
+            }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter().any(|m| {
+                let msg = m.message();
+                msg.contains("requires superclass instance")
+                    && msg.contains("Equal")
+                    && msg.contains("Ordered")
+            }),
+            "expected missing-superclass diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 5: `T: Ordered` implies `Equal` — `eq_val` resolves without
+    /// writing `T: Ordered + Equal`.
+    #[test]
+    fn implied_superclass_bound_allows_superclass_method() {
+        let src = r#"
+            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            impl Equal<int> {
+                fn eq_val(int a, int b) -> bool { return a == b; }
+            }
+            impl Ordered<int> {
+                fn lt_val(int a, int b) -> bool { return a < b; }
+            }
+            fn cmp_eq<T: Ordered>(T a, T b) -> bool {
+                return eq_val(a, b);
+            }
+            fn main() {
+                let x = cmp_eq(1, 1);
+            }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(
+            msgs.is_empty(),
+            "implied Equal under Ordered should typecheck; got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        // eq_val under Ordered uses flattened slot 1 (after lt_val at 0).
+        let hint = c
+            .id_table()
+            .ids()
+            .iter()
+            .find_map(|id| c.bound_method_call_at(*id))
+            .expect("expected a bound method call for eq_val");
+        assert_eq!(hint.method_slot, 1, "eq_val should be superclass slot 1");
+        assert_eq!(hint.dict_index, 0);
     }
 
     #[test]

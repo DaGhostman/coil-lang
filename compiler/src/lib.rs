@@ -1140,6 +1140,10 @@ impl Compiler {
     /// Emit one instance dictionary (`CodePtr`s + `MakeTuple`) for a
     /// typeclass constraint whose type arguments have already been resolved
     /// to concrete lookup types. Returns `true` when a dict was pushed.
+    ///
+    /// Layout (Phase 5): subclass methods first, then each superclass’s
+    /// methods in declaration order (flattened). Superclass slots are filled
+    /// from the matching superclass instance for the same type arguments.
     fn emit_instance_dict(
         bytecode: &mut Vec<Byte>,
         class: &str,
@@ -1153,12 +1157,19 @@ impl Compiler {
         let Some(class_def) = checker.generics().typeclass(&instance.class) else {
             return false;
         };
-        let n_methods = class_def.methods.len() as u32;
-        for method_def in &class_def.methods {
-            let offset = instance
-                .method_fqns
-                .get(&method_def.name)
-                .and_then(|fqn| functions.get(fqn).copied())
+        let flat = class_def.flattened_methods(checker.generics());
+        let n_methods = flat.len() as u32;
+        for (owner_class, method_def) in &flat {
+            let fqn = if *owner_class == instance.class.as_str() {
+                instance.method_fqns.get(&method_def.name).cloned()
+            } else {
+                checker
+                    .generics()
+                    .find_instance(owner_class, lookup)
+                    .and_then(|super_inst| super_inst.method_fqns.get(&method_def.name).cloned())
+            };
+            let offset = fqn
+                .and_then(|name| functions.get(&name).copied())
                 .unwrap_or(0);
             bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
         }
@@ -1215,7 +1226,8 @@ impl Compiler {
     /// Convention: after value args, one `MakeTuple` per typeclass
     /// constraint. Compiler-provided and source-provided instances use the
     /// same dictionary layout.
-    /// Each tuple holds method entry offsets in typeclass declaration order
+    /// Each tuple holds method entry offsets in flattened declaration order
+    /// (subclass methods, then superclass methods — Phase 5)
     /// (`CodePtr <offset>`, or `CodePtr 0` if the FQN is not compiled yet).
     ///
     /// Instances are resolved from the callee's scheme + concrete argument

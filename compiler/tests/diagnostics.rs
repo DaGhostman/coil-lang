@@ -672,3 +672,24 @@ fn hkt_var_rejected_as_type_argument() {
         msgs
     );
 }
+
+/// Phase 5: impl of a subclass requires the superclass instance.
+#[test]
+fn superclass_impl_requires_superclass_instance() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+        typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+        impl Ordered<int> {
+            fn lt_val(int a, int b) -> bool { return a < b; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("requires superclass instance")
+            && m.contains("Equal")
+            && m.contains("Ordered")),
+        "expected missing Equal superclass diagnostic, got: {:?}",
+        msgs
+    );
+}

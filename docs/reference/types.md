@@ -365,6 +365,13 @@ Call-site strategy:
 
 Constrained calls that are not monomorphized append one dictionary per typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets in declaration order. The callee reserves trailing locals `__dict0`, `__dict1`, …, loads the matching method slot with `Index`, and invokes it with `CallIndirect`. A generic calling another generic with the same open bound forwards its existing dictionary. Builtin classes use compiler-generated primitive method thunks through this same ABI; ground monomorphization remains an optimization.
 
+**Flattened superclass layout.** When a unary class declares a param bound
+(`typeclass Ordered<T: Equal>`), those bounds are stored as *superclasses*.
+The runtime dictionary for the subclass is flattened: subclass methods first,
+then each superclass’s methods in declaration order (transitively). An
+`impl Ordered<int>` therefore requires an existing `Equal<int>` instance — its
+methods fill the trailing dict slots.
+
 ```0s
 typeclass Describable<T> { fn describe_val(T x) -> int; }
 impl Describable<int> { fn describe_val(int x) -> int { return x + 1; } }
@@ -414,6 +421,33 @@ Instance methods compile to ordinary functions with mangled names
 (`Class__Type__method`). Generic call sites discharge the bound at
 typecheck time and pass the matching dictionary at runtime (above).
 
+### Superclasses and implied bounds
+
+Unary typeclass parameter bounds declare superclasses:
+
+```0s
+typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+
+impl Equal<int> { fn eq_val(int a, int b) -> bool { return a == b; } }
+impl Ordered<int> { fn lt_val(int a, int b) -> bool { return a < b; } }
+
+// Implied Equal: no need to write `T: Ordered + Equal`
+fn cmp_eq<T: Ordered>(T a, T b) -> bool {
+    return eq_val(a, b);
+}
+```
+
+- **Impl check:** `impl Ordered<int>` errors unless `Equal<int>` already exists.
+- **Implied bounds:** an active constraint `Ordered<T>` covers `Equal<T>` for
+  discharge and method resolution, so superclass methods are available under
+  the subclass bound alone.
+- **Dict slots:** `Ordered` dict = `[lt_val, eq_val]` (subclass then superclass).
+
+Builtin `Ord` / `Eq` are independent (no superclass link) so existing builtin
+dict layouts stay unchanged. Prefer a custom `Ordered` / `Equal` pair when you
+need superclass semantics. See `examples/superclass_ord.0s`.
+
 ### First-class generic functions
 
 A generic function can escape into a local `PolyFn` value and be instantiated
@@ -451,8 +485,8 @@ binder (rigid variables) and rejects escaping skolems. A polymorphic
 generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
-See `examples/generics.0s`, `examples/typeclass_dict.0s`, and
-`examples/polyfn.0s` for runnable demos.
+See `examples/generics.0s`, `examples/typeclass_dict.0s`,
+`examples/superclass_ord.0s`, and `examples/polyfn.0s` for runnable demos.
 
 ### Boxing and unboxing at generic boundaries
 

@@ -642,6 +642,20 @@ through the same dictionary.
 
 ---
 
+### `examples/superclass_ord.0s`
+
+**Demonstrates:** Typeclass superclass / implied bounds —
+`typeclass Ordered<T: Equal>` stores `Equal` as a superclass; `fn cmp_eq<T: Ordered>`
+can call `eq_val` without writing `T: Ordered + Equal`. Flattened dict layout
+is subclass methods then superclass methods.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/superclass_ord.0s` |
+| **Output** | `truetruefalse` |
+
+---
+
 ### `examples/polyfn.0s`
 
 **Demonstrates:** First-class generic functions, multi-instantiation,
@@ -961,6 +975,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `multiparam.0s` | Types | `42` |
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
+| `superclass_ord.0s` | Types | `truetruefalse` |
 | `polyfn.0s` | Types | `424.0424242` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |
