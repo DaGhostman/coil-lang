@@ -5,7 +5,7 @@
 //! The [`Checker`](super::infer::Checker) owns one `Generics` value and
 //! delegates type-class resolution to it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use super::ty::Ty;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -90,6 +90,62 @@ impl Generics {
             inst.class == class && inst.args.len() == args.len()
                 && inst.args.iter().zip(args.iter()).all(|(a, b)| a == b)
         })
+    }
+
+    /// True when an identical class + concrete-argument instance already exists.
+    pub fn has_overlapping_instance(&self, class: &str, args: &[Ty]) -> bool {
+        self.find_instance(class, args).is_some()
+    }
+
+    /// Required class methods omitted by an instance.
+    pub fn missing_required_methods(
+        class_def: &TypeClassDef,
+        method_fqns: &HashMap<String, String>,
+    ) -> Vec<String> {
+        class_def
+            .methods
+            .iter()
+            .filter(|method| !method.has_default && !method_fqns.contains_key(&method.name))
+            .map(|method| method.name.clone())
+            .collect()
+    }
+
+    /// Methods provided by an instance that are not declared by its class.
+    pub fn unknown_instance_methods<'a, I>(class_def: &TypeClassDef, method_names: I) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let known: HashSet<&str> = class_def
+            .methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect();
+        method_names
+            .into_iter()
+            .filter(|name| !known.contains(*name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// FQN used for default typeclass methods. The class default lives outside
+    /// any concrete instance, so its slot is keyed as `{Class}__default__{method}`.
+    pub fn default_method_fqn(class: &str, method: &str) -> String {
+        format!("{}__default__{}", class, method)
+    }
+
+    /// Populate omitted defaulted methods so every satisfiable class method has
+    /// a dict slot FQN after instance checking.
+    pub fn fill_default_method_fqns(
+        class_def: &TypeClassDef,
+        method_fqns: &mut HashMap<String, String>,
+    ) {
+        for method in &class_def.methods {
+            if method.has_default {
+                method_fqns
+                    .entry(method.name.clone())
+                    .or_insert_with(|| Self::default_method_fqn(&class_def.name, &method.name));
+            }
+        }
     }
 
     /// Register the built-in typeclasses and their builtin instances.
@@ -181,5 +237,71 @@ impl Generics {
     /// Whether `class` is satisfied for `ty` (builtin or registered instance).
     pub fn has_instance(&self, class: &str, ty: &Ty) -> bool {
         self.find_instance(class, std::slice::from_ref(ty)).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typechecking::ty::{float, int};
+
+    fn method(name: &str, has_default: bool) -> TypeClassMethodDef {
+        TypeClassMethodDef {
+            name: name.to_string(),
+            has_default,
+        }
+    }
+
+    fn class_def() -> TypeClassDef {
+        TypeClassDef {
+            name: "Num".to_string(),
+            type_params: vec!["T".to_string()],
+            methods: vec![method("add", false), method("zero", true)],
+        }
+    }
+
+    #[test]
+    fn has_overlapping_instance_detects_exact_class_and_args() {
+        let mut generics = Generics::new();
+        generics.instances.clear();
+        generics.instances.push(InstanceDef {
+            class: "Num".to_string(),
+            args: vec![int()],
+            method_fqns: HashMap::new(),
+        });
+
+        assert!(generics.has_overlapping_instance("Num", &[int()]));
+        assert!(!generics.has_overlapping_instance("Num", &[float()]));
+        assert!(!generics.has_overlapping_instance("Show", &[int()]));
+    }
+
+    #[test]
+    fn missing_required_methods_ignores_default_methods() {
+        let mut method_fqns = HashMap::new();
+        method_fqns.insert("zero".to_string(), "Num__int__zero".to_string());
+
+        assert_eq!(
+            Generics::missing_required_methods(&class_def(), &method_fqns),
+            vec!["add".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_instance_methods_reports_methods_not_in_class() {
+        let unknown =
+            Generics::unknown_instance_methods(&class_def(), ["add", "foo"].into_iter());
+
+        assert_eq!(unknown, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn fill_default_method_fqns_registers_omitted_defaults() {
+        let mut method_fqns = HashMap::new();
+        method_fqns.insert("add".to_string(), "Num__int__add".to_string());
+
+        Generics::fill_default_method_fqns(&class_def(), &mut method_fqns);
+
+        assert_eq!(method_fqns.get("add").unwrap(), "Num__int__add");
+        assert_eq!(method_fqns.get("zero").unwrap(), "Num__default__zero");
     }
 }

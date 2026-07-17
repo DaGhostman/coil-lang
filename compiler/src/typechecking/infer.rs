@@ -10,7 +10,7 @@ use reporting::{ErrorCode, Label, Message};
 use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
 
 use super::env::{Env, TyVarCounter, instantiate};
-use super::generics::{InstanceDef, TypeClassDef, TypeClassMethodDef};
+use super::generics::{Generics, InstanceDef, TypeClassDef, TypeClassMethodDef};
 use super::id::{self, IdTable, NodeId};
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::{Constraint, Scheme};
@@ -1670,36 +1670,107 @@ impl Checker {
                     let _ = self.infer(a);
                 }
                 // Verify class exists.
-                if !self.generics.typeclasses.contains_key(*class) {
+                let class_def = self.generics.typeclass(class).cloned();
+                if class_def.is_none() {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
                         format!("Unknown typeclass `{}`", class),
                         range.clone(),
                     ));
                 }
+                let overlapping = self.generics.has_overlapping_instance(class, &arg_tys);
+                if overlapping {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "Overlapping instance of `{}` for `{}`",
+                            class,
+                            arg_tys.iter().map(|ty| ty.to_string()).collect::<Vec<_>>().join(", ")
+                        ),
+                        range.clone(),
+                    ));
+                }
                 // Build method_fqns and register instance.
                 let mut method_fqns = HashMap::new();
+                let mut method_names = Vec::new();
                 for m in methods {
-                    if let Expression::Function { name: mname, args: margs, returns, body, is_coro, .. } = m.1.as_ref() {
+                    let maybe_fn = match m.1.as_ref() {
+                        Expression::Function { name, args, returns, body, is_coro, .. } => {
+                            Some((*name, args, returns, body, *is_coro))
+                        }
+                        Expression::Method(_, body) => match body.1.as_ref() {
+                            Expression::Function { name, args, returns, body, is_coro, .. } => {
+                                Some((*name, args, returns, body, *is_coro))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((mname, margs, returns, body, is_coro)) = maybe_fn {
                         // Build a unique FQN for this instance method.
                         let fqn = format!("{}__{}__{}",
                             class,
                             arg_tys.iter().map(|t| format!("{}", t)).collect::<Vec<_>>().join("_"),
                             mname,
                         );
+                        method_names.push(mname.to_string());
                         method_fqns.insert(mname.to_string(), fqn.clone());
                         // Typecheck the method body at concrete types.
-                        self.infer_function(mname, &[], margs, returns.as_ref(), body, &m.0.into_range(), None, *is_coro);
+                        self.infer_function(mname, &[], margs, returns.as_ref(), body, &m.0.into_range(), None, is_coro);
                     } else {
                         let _ = self.infer(m);
                     }
                 }
-                // Register the instance.
-                self.generics.instances.push(InstanceDef {
-                    class: class.to_string(),
-                    args: arg_tys,
-                    method_fqns,
-                });
+                let mut invalid_instance = class_def.is_none() || overlapping;
+                if let Some(class_def) = class_def.as_ref() {
+                    let unknown_methods = Generics::unknown_instance_methods(
+                        class_def,
+                        method_names.iter().map(|name| name.as_str()),
+                    );
+                    for method in &unknown_methods {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!("Unknown method `{}` in instance of `{}`", method, class),
+                            range.clone(),
+                        ));
+                    }
+                    Generics::fill_default_method_fqns(class_def, &mut method_fqns);
+                    let missing_methods =
+                        Generics::missing_required_methods(class_def, &method_fqns);
+                    if !missing_methods.is_empty() {
+                        let methods = missing_methods
+                            .iter()
+                            .map(|method| format!("`{}`", method))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let noun = if missing_methods.len() == 1 {
+                            "method"
+                        } else {
+                            "methods"
+                        };
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Instance of `{}` for `{}` is missing {} {}",
+                                class,
+                                arg_tys.iter().map(|ty| ty.to_string()).collect::<Vec<_>>().join(", "),
+                                noun,
+                                methods
+                            ),
+                            range.clone(),
+                        ));
+                    }
+                    invalid_instance |= !unknown_methods.is_empty() || !missing_methods.is_empty();
+                }
+                // Register only complete, non-overlapping instances. Omitted
+                // defaulted methods have been filled with class-default FQNs.
+                if !invalid_instance {
+                    self.generics.instances.push(InstanceDef {
+                        class: class.to_string(),
+                        args: arg_tys,
+                        method_fqns,
+                    });
+                }
                 unit_ty()
             }
 
@@ -6810,6 +6881,87 @@ mod tests {
             msgs.iter()
                 .any(|m| m.message().contains("Duplicate type alias `Id`")),
             "expected duplicate alias diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typeclass_impl_missing_required_method_errors() {
+        let src = r#"
+            typeclass Tiny<T> {
+                fn add(int a, int b) -> int;
+                fn zero() -> int { return 0; }
+            }
+            impl Tiny<int> {
+                fn zero() -> int { return 0; }
+            }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter().any(|m| {
+                m.message()
+                    .contains("Instance of `Tiny` for `int` is missing method `add`")
+            }),
+            "expected missing-method diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typeclass_impl_overlapping_instance_errors() {
+        let src = r#"
+            typeclass Tiny<T> {
+                fn add(int a, int b) -> int;
+            }
+            impl Tiny<int> {
+                fn add(int a, int b) -> int { return a; }
+            }
+            impl Tiny<int> {
+                fn add(int a, int b) -> int { return b; }
+            }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Overlapping instance of `Tiny` for `int`")),
+            "expected overlapping-instance diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typeclass_impl_default_method_omission_registers_default_fqn() {
+        let src = r#"
+            typeclass Tiny<T> {
+                fn zero() -> int { return 0; }
+            }
+            impl Tiny<int> {
+            }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        assert_eq!(
+            c.instance_method_fqn("Tiny", &[int()], "zero"),
+            Some("Tiny__default__zero")
+        );
+    }
+
+    #[test]
+    fn typeclass_impl_unknown_method_errors() {
+        let src = r#"
+            typeclass Tiny<T> {
+                fn add(int a, int b) -> int;
+            }
+            impl Tiny<int> {
+                fn add(int a, int b) -> int { return a; }
+                fn foo(int a) -> int { return a; }
+            }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Unknown method `foo` in instance of `Tiny`")),
+            "expected unknown-method diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
