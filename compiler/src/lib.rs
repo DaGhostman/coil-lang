@@ -407,10 +407,14 @@ pub struct Compiler {
     /// `Expression::Call`, the codegen emits `CallIndirect` instead
     /// of a direct `CALL` opcode.
     polyfn_vars: HashSet<String>,
+    /// Local PolyFn variable → source generic function name.
+    polyfn_sources: HashMap<String, String>,
 
     /// Monomorphization plan for this compile unit plus emitted clone offsets.
     mono_plan: MonoPlan,
     mono_offsets: HashMap<MonoKey, usize>,
+    /// Positions of inline CONST words that carry indirect function offsets.
+    indirect_code_ptr_sites: Vec<usize>,
     /// Temporary variable-type overrides while emitting a specialized clone.
     mono_codegen_var_types: Vec<HashMap<String, Ty>>,
 }
@@ -453,8 +457,10 @@ impl Default for Compiler {
             compiling_method: false,
             compiling_result_mode: false,
             polyfn_vars: HashSet::new(),
+            polyfn_sources: HashMap::new(),
             mono_plan: MonoPlan::default(),
             mono_offsets: HashMap::new(),
+            indirect_code_ptr_sites: Vec::new(),
             mono_codegen_var_types: Vec::new(),
         }
     }
@@ -845,6 +851,7 @@ impl Compiler {
     /// Returns the number of dict tuples pushed (used to bump CALL arity).
     fn emit_call_site_dicts(
         bytecode: &mut Vec<Byte>,
+        code_ptr_sites: &mut Vec<usize>,
         fn_name: &str,
         arg_tys: &[crate::typechecking::Ty],
         checker: &Checker,
@@ -902,6 +909,7 @@ impl Compiler {
                     .get(&method_def.name)
                     .and_then(|fqn| functions.get(fqn).copied())
                     .unwrap_or(0);
+                code_ptr_sites.push(bytecode.len());
                 bytecode.push(Byte::new(Instruction::CONST).with_const_inline(offset as i32));
             }
             bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
@@ -958,6 +966,7 @@ impl Compiler {
         method: &Output<'compiler>,
         qualified: String,
         argument_unbox_tys: &[Option<Ty>],
+        dict_arity: usize,
     ) {
         let _method_id = self.next_emit_id();
         let Expression::Function {
@@ -981,6 +990,7 @@ impl Compiler {
 
         let prev_vars = std::mem::take(&mut self.context.variables);
         let prev_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+        let prev_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
         self.context.variables = Interner::default();
         if self.compiling_method {
             self.context.variables.intern("self".to_string());
@@ -1000,6 +1010,9 @@ impl Compiler {
                 self.bytecode
                     .push(Byte::new(Instruction::StorePop).with_operand_u32(slot as u32));
             }
+        }
+        for dict_idx in 0..dict_arity {
+            self.context.variables.intern(format!("__dict{}", dict_idx));
         }
         let mut c = self.do_compile(body);
         self.bytecode.append(&mut c);
@@ -1026,6 +1039,7 @@ impl Compiler {
         self.compiling_result_mode = prev_result_mode;
         self.context.variables = prev_vars;
         self.polyfn_vars = prev_polyfn_vars;
+        self.polyfn_sources = prev_polyfn_sources;
     }
 
     fn instance_method_unbox_tys(
@@ -1110,6 +1124,7 @@ impl Compiler {
 
             let prev_fn_vars = std::mem::take(&mut self.context.variables);
             let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+            let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
             let prev_result_mode = self.compiling_result_mode;
             self.context.variables = Interner::default();
             self.compiling_result_mode = self.checker.fn_is_result_mode(source_name);
@@ -1143,6 +1158,7 @@ impl Compiler {
             self.compiling_result_mode = prev_result_mode;
             self.context.variables = prev_fn_vars;
             self.polyfn_vars = prev_fn_polyfn_vars;
+            self.polyfn_sources = prev_fn_polyfn_sources;
         }
     }
 
@@ -1854,21 +1870,23 @@ impl Compiler {
                         }
                         // Check if the RHS is a bare identifier that names a generic fn.
                         // If so, track this variable as holding an ObjPolyFn.
-                        let rhs_is_generic_fn = match children[1].1.as_ref() {
-                            Expression::Identifier(rhs_name) => {
+                        let polyfn_source = match unwrapped_identifier(&children[1]) {
+                            Some(rhs_name) => {
                                 let resolved = self
                                     .aliases
-                                    .get(*rhs_name)
+                                    .get(rhs_name)
                                     .cloned()
                                     .unwrap_or_else(|| rhs_name.to_string());
-                                self.checker.is_generic_fn(&resolved)
+                                (self.checker.is_generic_fn(&resolved)
                                     || self.functions.get(&resolved).is_some()
-                                        && self.checker.is_generic_fn(rhs_name)
+                                        && self.checker.is_generic_fn(rhs_name))
+                                .then_some(resolved)
                             }
-                            _ => false,
+                            _ => None,
                         };
-                        if rhs_is_generic_fn {
+                        if let Some(source) = polyfn_source {
                             self.polyfn_vars.insert(name.clone());
+                            self.polyfn_sources.insert(name.clone(), source);
                         }
                         // Emit the RHS.
                         let mut rhs_bc = self.do_compile(&children[1]);
@@ -1926,6 +1944,7 @@ impl Compiler {
                 // the entry frame (bytecode before `main`).
                 let prev_fn_vars = std::mem::take(&mut self.context.variables);
                 let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+                let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
                 self.context.variables = Interner::default();
                 if self.compiling_method {
                     self.context.variables.intern("self".to_string());
@@ -1977,6 +1996,7 @@ impl Compiler {
                 self.compiling_result_mode = prev_result_mode;
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
+                self.polyfn_sources = prev_fn_polyfn_sources;
 
                 self.emit_mono_specializations_for_function(
                     &qualified,
@@ -2578,6 +2598,9 @@ impl Compiler {
                     }
                     let dict_name = format!("__dict{}", hint.dict_index);
                     if let Some(dict_slot) = self.lookup_slot(&dict_name) {
+                        // Hidden trailing dictionary argument for sibling/default
+                        // dispatch inside the selected implementation.
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
                         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
                         bytecode.push(
                             Byte::new(Instruction::CONST)
@@ -2586,7 +2609,7 @@ impl Compiler {
                         bytecode.push(Byte::new(Instruction::Index));
                         bytecode.push(
                             Byte::new(Instruction::CallIndirect)
-                                .with_operand_u32(hint.arity as u32),
+                                .with_operand_u32(hint.arity as u32 + 1),
                         );
                     } else {
                         let mut message = Message::error(
@@ -2814,6 +2837,7 @@ impl Compiler {
                             forwarded
                                 + Self::emit_call_site_dicts(
                                     &mut bytecode,
+                                    &mut self.indirect_code_ptr_sites,
                                     &n,
                                     &call_arg_tys,
                                     &self.checker,
@@ -2847,33 +2871,76 @@ impl Compiler {
                                 Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                             }
                         }
-                    } else if self.polyfn_vars.contains(&identifier) {
+                    } else if self.polyfn_vars.contains(&identifier)
+                        || matches!(
+                            self.codegen_var_type_for(&identifier),
+                            Some(Ty::Forall { .. })
+                        )
+                    {
                         // `identifier` is a local variable holding an ObjPolyFn
                         // (bound via `let f = some_generic_fn;`). Emit args, then
                         // load the polyfn pointer, then CallIndirect.
                         let slot = self
                             .lookup_slot(&identifier)
                             .expect("polyfn_var must have a slot");
-                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        let value_arity =
+                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        let mut arg_tys = Vec::new();
                         if let Some(arg_list) = args {
                             for arg in arg_list {
                                 bytecode.append(&mut self.do_compile(arg));
                                 // Box concrete args when delegating through a polyfn.
                                 if let Some(arg_ty) = self.codegen_expr_ty(arg) {
                                     Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    arg_tys.push(arg_ty);
                                 }
                             }
                         }
+                        let mut dict_count = 0u32;
+                        let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
+                        if let Some(source) = polyfn_source.as_ref() {
+                            if let Some(indices) = self_id
+                                .and_then(|id| self.checker.forwarded_dicts_at(id))
+                                .or_else(|| {
+                                    self.checker.forwarded_dicts_for_span(span.start, span.end)
+                                })
+                                .map(<[usize]>::to_vec)
+                            {
+                                for dict_index in indices {
+                                    if let Some(dict_slot) =
+                                        self.lookup_slot(&format!("__dict{}", dict_index))
+                                    {
+                                        bytecode.push(
+                                            Byte::new(Instruction::LOAD)
+                                                .with_operand_u32(dict_slot),
+                                        );
+                                        dict_count += 1;
+                                    }
+                                }
+                            }
+                            dict_count += Self::emit_call_site_dicts(
+                                &mut bytecode,
+                                &mut self.indirect_code_ptr_sites,
+                                source,
+                                &arg_tys,
+                                &self.checker,
+                                &self.functions,
+                            ) as u32;
+                        }
                         // Push the ObjPolyFn pointer (TOS for CallIndirect).
                         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
-                        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
+                        bytecode.push(
+                            Byte::new(Instruction::CallIndirect)
+                                .with_operand_u32(value_arity + dict_count),
+                        );
                         // Generic→concrete unbox for polyfn call site.
-                        if let Some(call_ty) = self_id.and_then(|id| self.checker.lookup_at(id)) {
-                            let pruned = crate::typechecking::subst::apply_ty_prune(
-                                self.checker.subst(),
-                                &call_ty,
-                            );
-                            Self::emit_unbox_if_needed(&mut bytecode, &pruned);
+                        if polyfn_source
+                            .as_deref()
+                            .map(|source| self.generic_return_depends_on_type_param(source))
+                            .unwrap_or(true)
+                            && let Some(call_ty) = self.codegen_expr_ty(ast)
+                        {
+                            Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                         }
                     } else {
                         let mut message = Message::error(
@@ -2889,8 +2956,11 @@ impl Compiler {
                     }
                 } // end non-method Call
             }
-            Expression::Argument(_, n) => {
+            Expression::Argument(ty, n) => {
                 let _ = self.context.variables.intern(n.to_string());
+                if matches!(ty.1.as_ref(), Expression::Forall { .. }) {
+                    self.polyfn_vars.insert(n.to_string());
+                }
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
             Expression::Type(_) | Expression::TypeFun(_, _) | Expression::Forall { .. } => {
@@ -2918,7 +2988,7 @@ impl Compiler {
                                 name,
                                 method_name,
                             );
-                            self.compile_function_output_with_name(method, fqn, &[]);
+                            self.compile_function_output_with_name(method, fqn, &[], 1);
                         } else {
                             self.consume_function_signature_output(method);
                         }
@@ -2955,7 +3025,7 @@ impl Compiler {
                         let fqn = format!("{}__{}__{}", class, ty_part, method_name);
                         let unbox_tys =
                             self.instance_method_unbox_tys(class, method_name, &arg_tys);
-                        self.compile_function_output_with_name(method, fqn, &unbox_tys);
+                        self.compile_function_output_with_name(method, fqn, &unbox_tys, 1);
                     } else if let Expression::Method(_, body) = method.1.as_ref() {
                         let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
                         self.emit_idx += 1;
@@ -2966,7 +3036,7 @@ impl Compiler {
                             let fqn = format!("{}__{}__{}", class, ty_part, method_name);
                             let unbox_tys =
                                 self.instance_method_unbox_tys(class, method_name, &arg_tys);
-                            self.compile_function_output_with_name(body, fqn, &unbox_tys);
+                            self.compile_function_output_with_name(body, fqn, &unbox_tys, 1);
                         } else {
                             self.consume_function_signature_output(body);
                         }
@@ -4425,7 +4495,20 @@ impl Compiler {
         self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
-        let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
+        // Indirect code pointers are stored as ordinary CONST values in
+        // dictionaries (and as MakePolyFn operands). They are intentionally
+        // opaque to the VM, so a peephole relocation cannot distinguish them
+        // from user integers. Preserve their absolute offsets by leaving the
+        // bytecode layout unchanged whenever such pointers are present.
+        let has_polyfn = self
+            .bytecode
+            .iter()
+            .any(|byte| matches!(byte.bytecode(), Instruction::MakePolyFn));
+        let fusion_sites = if self.indirect_code_ptr_sites.is_empty() && !has_polyfn {
+            peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants)
+        } else {
+            Vec::new()
+        };
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
         }
@@ -4447,6 +4530,17 @@ impl Compiler {
         let pre_compile_len = self.bytecode.len();
         let _ = self.compile(module, ast);
         self.bytecode[pre_compile_len..].to_vec()
+    }
+}
+
+fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+    match expr.1.as_ref() {
+        Expression::Identifier(name) => Some(name),
+        Expression::Expr(inner)
+        | Expression::Group(inner)
+        | Expression::Statement(inner)
+        | Expression::ExprStatement(inner) => unwrapped_identifier(inner),
+        _ => None,
     }
 }
 
@@ -7002,6 +7096,46 @@ print \"%i\", len(a); \
             max_call_arity, 2,
             "expected CALL arity = 2 (1 value + 1 dict); got {}",
             max_call_arity
+        );
+    }
+
+    #[test]
+    fn generic_bound_method_consumes_dictionary_indirectly() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x; } } \
+             fn size_of<T: Measurable>(T x) -> int { return x.size(); } \
+             fn main() { size_of(42); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::Index))
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "bound method should dispatch via CallIndirect"
+        );
+    }
+
+    #[test]
+    fn omitted_default_method_dict_slot_has_real_target() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Tiny<T> { fn zero(T x) -> int { return 7; } } \
+             impl Tiny<int> {} \
+             fn get<T: Tiny>(T x) -> int { return zero(x); } \
+             fn main() { get(0); }",
+        );
+        let tuple_index = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .expect("default method dictionary");
+        assert!(tuple_index > 0);
+        assert!(
+            bc[tuple_index - 1].operand_u32() > 0,
+            "default method dictionary slot must contain a compiled code offset"
         );
     }
 }

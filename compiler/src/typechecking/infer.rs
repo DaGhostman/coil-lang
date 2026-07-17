@@ -2191,6 +2191,19 @@ impl Checker {
                             if is_yield_expression(next) {
                                 self.yield_receives_used = true;
                             }
+                            if let Expression::Identifier(source) =
+                                unwrap_expr_wrappers(next).1.as_ref()
+                                && let Some(source_scheme) = self.env.lookup(source).cloned()
+                                && !source_scheme.bounds.is_empty()
+                            {
+                                let _ = self.infer(next);
+                                self.env.insert_top(name.to_string(), source_scheme.clone());
+                                self.codegen_var_types
+                                    .insert(name.to_string(), source_scheme.ty.clone());
+                                last_ty = source_scheme.ty;
+                                i += 2;
+                                continue;
+                            }
                             let val_ty = self.infer(next);
                             self.unify(&var_ty, &val_ty, &child.0.into_range(), "let binding");
                             // Keep the side-table in sync with the unified type

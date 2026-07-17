@@ -2,6 +2,7 @@
 //
 // Userland generic functions with a Num typeclass bound.
 // Builtin Num instances cover int, float, and string (+).
+// See typeclass_dict.0s and polyfn.0s for user dictionaries and PolyFn values.
 
 fn add<T: Num>(T a, T b) -> T {
     return a + b;

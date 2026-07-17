@@ -149,6 +149,18 @@ fn example_typeclass_dict_forwards_dictionary_and_prints_42_twice() {
 }
 
 #[test]
+fn example_typeclass_default_calls_sibling_and_prints_42() {
+    let output = run_example("examples/typeclass_default.0s");
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn example_polyfn_supports_multi_instantiation_constraints_and_rank_n() {
+    let output = run_example("examples/polyfn.0s");
+    assert_eq!(output, "424.04242");
+}
+
+#[test]
 fn monomorphized_generic_add_prints_3() {
     let output = run_example_src(
         r#"fn add<T: Num>(T a, T b) -> T {

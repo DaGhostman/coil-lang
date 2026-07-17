@@ -532,6 +532,42 @@ fn main() {
 
 ---
 
+### `examples/typeclass_dict.0s`
+
+**Demonstrates:** User typeclass dictionaries, method sugar, and dictionary
+forwarding through a nested generic call.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/typeclass_dict.0s` |
+| **Output** | `4242` |
+
+---
+
+### `examples/typeclass_default.0s`
+
+**Demonstrates:** An omitted default method calling a sibling implementation
+through the same dictionary.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/typeclass_default.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/polyfn.0s`
+
+**Demonstrates:** First-class generic functions, multi-instantiation,
+constrained apply-site dictionaries, and a rank-n `forall` parameter.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/polyfn.0s` |
+| **Output** | `424.04242` |
+
+---
+
 ## Modules & namespaces
 
 Multi-file projects using `use` and `mod`. Support files live under `examples/src/`.
@@ -830,6 +866,9 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
 | `generics.0s` | Types | `7424.0` |
+| `typeclass_dict.0s` | Types | `4242` |
+| `typeclass_default.0s` | Types | `42` |
+| `polyfn.0s` | Types | `424.04242` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |
 | `src/foo/sadge.0s` | Modules | (support file) |

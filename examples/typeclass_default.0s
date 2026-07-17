@@ -1,0 +1,23 @@
+// Expected output: 7
+
+typeclass Tiny<T> {
+    fn base(T x) -> int;
+
+    fn next(T x) -> int {
+        return base(x) + 1;
+    }
+}
+
+impl Tiny<int> {
+    fn base(int x) -> int {
+        return x;
+    }
+}
+
+fn get<T: Tiny>(T x) -> int {
+    return next(x);
+}
+
+fn main() {
+    print "%i", get(41);
+}

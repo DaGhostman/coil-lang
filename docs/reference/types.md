@@ -325,14 +325,25 @@ Call-site strategy:
 
 ### Dictionary passing
 
-Constrained calls that are not monomorphized append one dictionary per **user** typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets (typeclass declaration order). The callee reserves trailing locals `__dict0`, `__dict1`, … for those tuples. Builtin classes do **not** receive dicts — they keep using `Dyn*` on the shared path.
+Constrained calls that are not monomorphized append one dictionary per **user** typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets in declaration order. The callee reserves trailing locals `__dict0`, `__dict1`, …, loads the matching method slot with `Index`, and invokes it with `CallIndirect`. A generic calling another generic with the same open bound forwards its existing dictionary. Builtin classes do **not** receive dictionaries — they keep using `Dyn*`.
 
 ```0s
 typeclass Describable<T> { fn describe_val(T x) -> int; }
-impl Describable<int> { fn describe_val(int x) -> int { return x; } }
-fn show<T: Describable>(T x) -> int { return 0; }
+impl Describable<int> { fn describe_val(int x) -> int { return x + 1; } }
+fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 // show(42) → CALL arity = 2 (value + Describable dict)
 ```
+
+Bound methods support both equivalent forms:
+
+```0s
+x.describe_val(); // method sugar
+describe_val(x);  // bare / UFCS form
+```
+
+Default methods occupy normal dictionary slots. Every implementation method
+receives the active dictionary as a hidden trailing argument, so a default can
+call a sibling method. An omitted default slot points at the class default body.
 
 ### Builtin typeclasses
 
@@ -365,6 +376,23 @@ Instance methods compile to ordinary functions with mangled names
 (`Class__Type__method`). Generic call sites discharge the bound at
 typecheck time and pass the matching dictionary at runtime (above).
 
+### First-class generic functions
+
+A generic function can escape into a local `PolyFn` value and be instantiated
+more than once:
+
+```0s
+fn id<T>(T x) -> T { return x; }
+let f = id;
+let n = f(42);
+let x = f(4.0);
+```
+
+`MakePolyFn` stores the shared entry point and each application uses
+`CallIndirect`. For constrained PolyFns, a ground application builds the
+required dictionaries from its concrete argument types. A generic identifier
+passed to a compatible `forall T. T -> T` parameter uses the same path.
+
 ### Higher-rank `forall`
 
 Type annotations may use prenex / higher-rank quantification:
@@ -381,7 +409,8 @@ binder (rigid variables) and rejects escaping skolems. A polymorphic
 generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
-See `examples/generics.0s` for a runnable `Num`-bounded demo.
+See `examples/generics.0s`, `examples/typeclass_dict.0s`, and
+`examples/polyfn.0s` for runnable demos.
 
 ### Boxing and unboxing at generic boundaries
 
