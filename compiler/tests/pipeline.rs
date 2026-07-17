@@ -143,6 +143,20 @@ fn example_generics_prints_add_results_for_int_and_float() {
 }
 
 #[test]
+fn monomorphized_generic_add_prints_3() {
+    let output = run_example_src(
+        r#"fn add<T: Num>(T a, T b) -> T {
+            return a + b;
+        }
+
+        fn main() {
+            print "%i", add(1, 2);
+        }"#,
+    );
+    assert_eq!(output, "3");
+}
+
+#[test]
 fn example_const_prints_42hi() {
     let output = run_example("examples/const.0s");
     assert_eq!(output, "42hi");
