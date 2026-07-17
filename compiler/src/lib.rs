@@ -4989,19 +4989,20 @@ mod tests {
     fn integer_arithmetic_emits_int_opcode() {
         use common::Instruction;
         let (bc, _pool) = compile_src("fn add(int a, int b) -> int { return a + b; }");
-        let has_int_add = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::ADD
-                || (*b.bytecode() == Instruction::BinSlotSlot
-                    && b.bin_slot_slot_parts().0 == Instruction::ADD as u8)
+        // Builtin Num dictionary thunks also contain ADD/ADDF; the user function
+        // body itself should fuse to BinSlotSlot(ADD) (or bare ADD).
+        let has_int_bin_slot = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::ADD as u8
         });
-        let has_float_add = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::ADDF
-                || (*b.bytecode() == Instruction::BinSlotSlot
-                    && b.bin_slot_slot_parts().0 == Instruction::ADDF as u8)
+        let has_float_bin_slot = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::ADDF as u8
         });
         assert!(
-            has_int_add && !has_float_add,
-            "expected int ADD for integer arithmetic"
+            has_int_bin_slot && !has_float_bin_slot,
+            "expected fused int BinSlotSlot(ADD) for integer arithmetic; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -5013,17 +5014,18 @@ mod tests {
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::FORMAT)),
-            "expected string addition to lower through FORMAT"
+            "expected string addition to lower through FORMAT; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
+        // Ignore ADD/ADDF inside builtin Num thunks; the top-level expression
+        // must not fuse into a numeric BinSlot* convoy before FORMAT.
         assert!(
             !bc.iter().any(|b| matches!(
                 b.bytecode(),
-                Instruction::ADD
-                    | Instruction::ADDF
-                    | Instruction::BinSlotImm
-                    | Instruction::BinSlotSlot
+                Instruction::BinSlotImm | Instruction::BinSlotSlot
             )),
-            "string addition should not emit numeric addition opcodes"
+            "string addition should not emit fused numeric slot ops; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -7197,16 +7199,31 @@ print \"%i\", len(a); \
              fn main() { print \"%i\", add(1, 2); }",
         );
 
+        // Shared body uses the dictionary ABI (CallIndirect), not DynAdd.
         assert!(
             bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
-            "shared generic body should remain available for PolyFn/boxed calls"
-        );
-        assert!(
-            !bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
-            "ground monomorphic add call should not box args; opcodes: {:?}",
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "shared generic body should dispatch Num via CallIndirect; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Ground monomorphized call in main: CONST/CONST/CALL without a
+        // preceding BoxValue. (Builtin Num thunks also contain BoxValue.)
+        let main_call = bc
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, b)| matches!(b.bytecode(), Instruction::CALL))
+            .map(|(i, _)| i)
+            .expect("main should CALL the specialized add");
+        let boxed_before_call = main_call > 0
+            && matches!(bc[main_call - 1].bytecode(), Instruction::BoxValue);
+        assert!(
+            !boxed_before_call,
+            "ground monomorphic add call should not box args; opcodes near CALL: {:?}",
+            &bc[main_call.saturating_sub(4)..=main_call]
+                .iter()
+                .map(|b| b.bytecode())
+                .collect::<Vec<_>>()
         );
         let has_specialized_add = bc.iter().any(|b| {
             matches!(

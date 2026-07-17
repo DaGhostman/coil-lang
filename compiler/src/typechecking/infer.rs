@@ -5964,11 +5964,16 @@ mod tests {
 
     #[test]
     fn let_without_annotation_or_value_uses_fresh_var() {
-        // `let x;` — x is a fresh var (id 0).
+        // `let x;` — x is a fresh type variable (id is not stable across
+        // builtin/prelude registration, so only the shape is checked).
         let (mut c, _) = check("let x;");
         assert!(c.take_messages().is_empty());
         let scheme = c.env().lookup("x").unwrap();
-        assert_eq!(scheme.ty, Ty::Var(TyVarId(0)));
+        assert!(
+            matches!(scheme.ty, Ty::Var(_)),
+            "expected a fresh type variable, got {:?}",
+            scheme.ty
+        );
     }
 
     // ---- Assignment ----
