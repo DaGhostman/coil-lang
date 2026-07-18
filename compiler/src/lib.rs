@@ -5403,6 +5403,7 @@ impl Compiler {
         self.constants.clear();
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
+        self.checker.set_current_module(module);
         let _program_ty = self.checker.check_program(ast);
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the

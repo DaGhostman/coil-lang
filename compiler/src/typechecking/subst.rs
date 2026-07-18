@@ -208,7 +208,16 @@ pub fn apply_scheme(subst: &Subst, s: &Scheme) -> Scheme {
                 args: c.args.iter().map(|a| apply_ty(&inner, a)).collect(),
             })
             .collect(),
-        ty: apply_ty(subst, &s.ty),
+        assoc_projections: s
+            .assoc_projections
+            .iter()
+            .map(|p| super::ty::AssocProjection {
+                var: p.var,
+                name: p.name.clone(),
+                args: p.args.iter().map(|a| apply_ty(&inner, a)).collect(),
+            })
+            .collect(),
+        ty: apply_ty(&inner, &s.ty),
     }
 }
 
@@ -356,6 +365,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: v(0),
         };
         let result = apply_scheme(&s, &scheme);
@@ -372,6 +382,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         let result = apply_scheme(&s, &scheme);

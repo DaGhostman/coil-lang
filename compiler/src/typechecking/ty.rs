@@ -176,6 +176,15 @@ impl std::fmt::Display for Constraint {
     }
 }
 
+/// A fresh type variable in a scheme that represents an associated-type
+/// projection such as `T::Elem` or `T::Ref<A>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssocProjection {
+    pub var: TyVarId,
+    pub name: String,
+    pub args: Vec<Ty>,
+}
+
 /// A type scheme: a type possibly quantified over some type variables,
 /// with optional typeclass constraints on those variables.
 ///
@@ -191,6 +200,8 @@ pub struct Scheme {
     pub kinds: Vec<super::kind::Kind>,
     /// Typeclass constraints on the quantified variables.
     pub constraints: Vec<Constraint>,
+    /// Associated-type projection variables quantified by the scheme.
+    pub assoc_projections: Vec<AssocProjection>,
     pub ty: Ty,
 }
 
@@ -201,6 +212,7 @@ impl Scheme {
             bounds: Vec::new(),
             kinds: Vec::new(),
             constraints: Vec::new(),
+            assoc_projections: Vec::new(),
             ty,
         }
     }
@@ -212,6 +224,7 @@ impl Scheme {
             bounds,
             kinds,
             constraints,
+            assoc_projections: Vec::new(),
             ty,
         }
     }
@@ -231,6 +244,27 @@ impl Scheme {
             bounds,
             kinds,
             constraints,
+            assoc_projections: Vec::new(),
+            ty,
+        }
+    }
+
+    pub fn poly_with_kinds_and_assoc(
+        bounds: Vec<TyVarId>,
+        kinds: Vec<super::kind::Kind>,
+        constraints: Vec<Constraint>,
+        assoc_projections: Vec<AssocProjection>,
+        ty: Ty,
+    ) -> Self {
+        debug_assert!(
+            kinds.is_empty() || kinds.len() == bounds.len(),
+            "kinds must be empty or parallel to bounds"
+        );
+        Self {
+            bounds,
+            kinds,
+            constraints,
+            assoc_projections,
             ty,
         }
     }
@@ -650,6 +684,12 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
 /// Free type variables of a `Scheme` (excluding the quantified ones).
 pub fn ftv_scheme(s: &Scheme) -> HashSet<TyVarId> {
     let mut acc = ftv_ty(&s.ty);
+    for projection in &s.assoc_projections {
+        acc.insert(projection.var);
+        for arg in &projection.args {
+            acc.extend(ftv_ty(arg));
+        }
+    }
     let bound: HashSet<_> = s.bounds.iter().copied().collect();
     acc.retain(|v| !bound.contains(v));
     acc
@@ -707,6 +747,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: v(0),
         };
         assert!(ftv_scheme(&scheme).is_empty());
@@ -718,6 +759,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         assert_eq!(ftv_scheme(&scheme), HashSet::from([TyVarId(1)]));

@@ -228,6 +228,7 @@ mod tests {
             bounds: vec![TyVarId(0), TyVarId(1)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(Ty::Var(TyVarId(0))), Box::new(Ty::Var(TyVarId(1)))),
         };
         assert_eq!(format!("{}", s), "forall t0 t1. t0 -> t1");

@@ -430,6 +430,22 @@ Instance methods compile to ordinary functions with mangled names
 (`Class__Type__method`). Generic call sites discharge the bound at
 typecheck time and pass the matching dictionary at runtime (above).
 
+### Instance coherence
+
+Typeclass instances follow module-path ownership rules so dictionary
+resolution stays deterministic across projects:
+
+- `impl Class<T…>` is allowed when the current module defines `Class`.
+- Otherwise, every non-variable instance argument must have a nominal
+  head (enum, class, or type alias) defined in the current module.
+- Builtin types (`int`, `float`, `string`, tuples, arrays, and records)
+  are not local nominal heads. For example, a module that did not define
+  `Show` cannot add `impl Show<(int, int)>`.
+- Exact duplicates and instances whose heads unify with an existing
+  instance are rejected.
+- If constraint discharge ever sees two matching instances, it reports
+  an ambiguous-instance error rather than selecting the first one.
+
 ### Associated types
 
 A typeclass may declare associated types; each impl must define them:

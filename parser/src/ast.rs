@@ -125,6 +125,7 @@ pub enum Expression<'expr> {
     TypeProjection {
         owner: &'expr str,
         name: &'expr str,
+        args: Vec<Output<'expr>>,
     },
     /// Function type annotation `A -> B`.
     TypeFun(Output<'expr>, Output<'expr>),
@@ -337,14 +338,16 @@ pub enum Expression<'expr> {
         methods: Vec<Output<'expr>>,
     },
 
-    /// Associated type declaration inside a typeclass: `type Elem;`.
+    /// Associated type declaration inside a typeclass: `type Elem;` or `type Ref<T>;`.
     AssocTypeDecl {
         name: &'expr str,
+        type_params: Vec<TypeParam<'expr>>,
     },
 
-    /// Associated type definition inside an impl: `type Elem = int;`.
+    /// Associated type definition inside an impl: `type Elem = int;` or `type Ref<T> = T;`.
     AssocTypeDef {
         name: &'expr str,
+        type_params: Vec<TypeParam<'expr>>,
         ty: Box<Output<'expr>>,
     },
 }
@@ -880,10 +883,27 @@ impl<'a> Display for Expression<'a> {
                     .join(", ");
                 write!(f, "{}<{}>", name, args_s)
             }
-            Self::TypeProjection { owner, name } => write!(f, "{}::{}", owner, name),
+            Self::TypeProjection { owner, name, args } => {
+                if args.is_empty() {
+                    write!(f, "{}::{}", owner, name)
+                } else {
+                    let args_s = args
+                        .iter()
+                        .map(|a| a.1.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, "{}::{}<{}>", owner, name, args_s)
+                }
+            }
             Self::TypeFun(arg, ret) => write!(f, "{} -> {}", arg.1, ret.1),
-            Self::AssocTypeDecl { name } => write!(f, "type {};", name),
-            Self::AssocTypeDef { name, ty } => write!(f, "type {} = {};", name, ty.1),
+            Self::AssocTypeDecl { name, type_params } => {
+                write!(f, "type {}{};", name, fmt_type_params(type_params))
+            }
+            Self::AssocTypeDef {
+                name,
+                type_params,
+                ty,
+            } => write!(f, "type {}{} = {};", name, fmt_type_params(type_params), ty.1),
             Self::Class {
                 name,
                 type_params,

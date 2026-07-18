@@ -99,6 +99,30 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
 }
 
+fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String> {
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(project_root).expect("chdir to project root");
+
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
+    assert!(result.is_err(), "expected compile to fail");
+    pipeline
+        .messages()
+        .iter()
+        .map(|m| m.message().to_string())
+        .collect()
+}
+
 #[test]
 fn use_single_segment_resolves_in_src_root() {
     let manifest = r#"
@@ -223,6 +247,34 @@ roots = ["./src"]
     let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "ok");
+}
+
+#[test]
+fn orphan_instance_across_modules_is_rejected() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.0s",
+            "use iface::*;\n\
+             impl Foreign<int> { fn id(int x) -> int { return x; } }\n\
+             fn main() { }\n",
+        ),
+        (
+            "src/iface.0s",
+            "typeclass Foreign<T> { fn id(T x) -> int; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.0s");
+    let msgs = compile_project_errors(&root, &entry);
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Orphan instance `Foreign<int>`")),
+        "expected orphan-instance diagnostic, got: {:?}",
+        msgs
+    );
 }
 
 /// Phase 1: multi-module link finalizes peephole fusion once, relocating

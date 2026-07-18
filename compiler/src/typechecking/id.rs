@@ -340,7 +340,11 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         Expression::AssocTypeDef { ty, .. } => {
             pre_walk(ty, table);
         }
-        Expression::TypeProjection { .. } => {}
+        Expression::TypeProjection { args, .. } => {
+            for arg in args {
+                pre_walk(arg, table);
+            }
+        }
     }
 }
 

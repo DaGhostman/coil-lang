@@ -7,9 +7,12 @@
 
 use super::kind::Kind;
 use super::subst::Subst;
-use super::ty::Ty;
+use super::ty::{Ty, TyVarId};
 use super::unify::unify_with;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+pub const BUILTIN_MODULE: &str = "<builtin>";
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  Public data types
@@ -39,12 +42,15 @@ pub struct TypeClassMethodDef {
 /// methods first, then each superclass’s methods in declaration order
 /// (transitively).
 ///
-/// Associated types (Phase 6): `typeclass Collect<C> { type Elem; … }`
-/// stores `assoc_types: ["Elem"]`. Method schemes quantify class params
-/// first, then assoc types in this order.
+/// Associated types: `typeclass Collect<C> { type Elem<A>; … }`
+/// stores structured declarations so generic associated types retain
+/// their own binders and kind.
 #[derive(Debug, Clone)]
 pub struct TypeClassDef {
     pub name: String,
+    /// Module path that declared this typeclass. Builtins use
+    /// [`BUILTIN_MODULE`].
+    pub defined_module: String,
     /// Type-parameter names in declaration order, e.g. `["T"]`.
     pub type_params: Vec<String>,
     /// Kinds of each type parameter (parallel to `type_params`).
@@ -54,9 +60,49 @@ pub struct TypeClassDef {
     /// (`typeclass Ord<T: Eq>` → `["Eq"]`). Empty for multi-param classes
     /// and classes without bounds.
     pub superclasses: Vec<String>,
-    /// Associated type names in declaration order (Phase 6), e.g. `["Elem"]`.
-    pub assoc_types: Vec<String>,
+    /// Associated type declarations in source order.
+    pub assoc_types: Vec<AssocTypeDecl>,
     pub methods: Vec<TypeClassMethodDef>,
+}
+
+/// One associated type declaration in a typeclass body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssocTypeDecl {
+    pub name: String,
+    /// GAT parameter names in declaration order.
+    pub params: Vec<String>,
+    /// Kinds of each GAT parameter (parallel to `params`).
+    pub param_kinds: Vec<Kind>,
+    /// Full kind of the associated type constructor. Nullary associated
+    /// types have kind `*`; `type Ref<T>;` has kind `* -> *`.
+    pub kind: Kind,
+}
+
+impl AssocTypeDecl {
+    pub fn new(name: impl Into<String>, params: Vec<String>, param_kinds: Vec<Kind>) -> Self {
+        let kind = param_kinds
+            .iter()
+            .rev()
+            .cloned()
+            .fold(Kind::Type, |codomain, domain| {
+                Kind::arrow(domain, codomain)
+            });
+        Self {
+            name: name.into(),
+            params,
+            param_kinds,
+            kind,
+        }
+    }
+}
+
+/// One associated type definition inside an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssocTypeValue {
+    pub params: Vec<String>,
+    pub param_vars: Vec<TyVarId>,
+    pub param_kinds: Vec<Kind>,
+    pub ty: Ty,
 }
 
 impl TypeClassDef {
@@ -74,6 +120,10 @@ impl TypeClassDef {
     pub fn constructor_arity_at(&self, i: usize) -> Option<usize> {
         let kind = self.kind_at(i);
         kind.is_constructor_kind().then(|| kind.arity())
+    }
+
+    pub fn assoc_type(&self, name: &str) -> Option<&AssocTypeDecl> {
+        self.assoc_types.iter().find(|decl| decl.name == name)
     }
 
     /// True when `name` is a transitive superclass of this class.
@@ -137,18 +187,23 @@ impl TypeClassDef {
 ///     method_fqns: { "add" → "Num__int__add" } }
 /// ```
 ///
-/// Associated types (Phase 6): `impl Collect<Option<int>> { type Elem = int; … }`
-/// stores `assoc_tys: { "Elem" → int() }`.
+/// Associated types: `impl Collect<Option<int>> { type Elem<A> = A; … }`
+/// stores `assoc_tys: { "Elem" → AssocTypeValue { … } }`.
 #[derive(Debug, Clone)]
 pub struct InstanceDef {
     /// Class name this instance implements (e.g. `"Num"`).
     pub class: String,
+    /// Module path that declared this instance. Builtins use
+    /// [`BUILTIN_MODULE`].
+    pub defined_module: String,
+    /// Source span of the `impl` declaration inside `defined_module`.
+    pub range: Range<usize>,
     /// Concrete type arguments (e.g. `[int()]` for `impl Num<int>`).
     pub args: Vec<Ty>,
     /// Method name → fully-qualified codegen name.
     pub method_fqns: HashMap<String, String>,
-    /// Associated type name → concrete type (Phase 6).
-    pub assoc_tys: HashMap<String, Ty>,
+    /// Associated type name → RHS template with its own binders.
+    pub assoc_tys: HashMap<String, AssocTypeValue>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -164,6 +219,8 @@ pub struct Generics {
     pub instances: Vec<InstanceDef>,
     /// Generic type constructors: enum/class/alias name → type param names.
     pub generic_type_ctors: HashMap<String, Vec<String>>,
+    /// Nominal type ownership: enum/class/alias name → defining module path.
+    pub nominal_type_modules: HashMap<String, String>,
     /// Generic function names (have at least one type param).
     pub generic_fns: std::collections::HashSet<String>,
 }
@@ -180,10 +237,21 @@ impl Generics {
     pub fn register_builtin_type_ctors(&mut self) {
         self.generic_type_ctors
             .insert(common::BUILTIN_OPTION_ENUM.into(), vec!["T".into()]);
+        self.register_nominal_type(common::BUILTIN_OPTION_ENUM, BUILTIN_MODULE);
         self.generic_type_ctors.insert(
             common::BUILTIN_RESULT_ENUM.into(),
             vec!["T".into(), "E".into()],
         );
+        self.register_nominal_type(common::BUILTIN_RESULT_ENUM, BUILTIN_MODULE);
+    }
+
+    pub fn register_nominal_type(&mut self, name: &str, module: &str) {
+        self.nominal_type_modules
+            .insert(name.to_string(), module.to_string());
+    }
+
+    pub fn nominal_type_module(&self, name: &str) -> Option<&str> {
+        self.nominal_type_modules.get(name).map(String::as_str)
     }
 
     /// Look up a typeclass by name.
@@ -203,20 +271,15 @@ impl Generics {
     /// Find an instance whose args unify with `args` (e.g. `Option::Some(42)`'s
     /// Constructor type against `impl Collect<Option<int>>`). Does not mutate
     /// any global substitution.
+    pub fn find_unifying_instances(&self, class: &str, args: &[Ty]) -> Vec<&InstanceDef> {
+        self.instances
+            .iter()
+            .filter(|inst| Self::instances_unify(class, args, inst))
+            .collect()
+    }
+
     pub fn find_unifying_instance(&self, class: &str, args: &[Ty]) -> Option<&InstanceDef> {
-        self.instances.iter().find(|inst| {
-            if inst.class != class || inst.args.len() != args.len() {
-                return false;
-            }
-            let mut local = Subst::empty();
-            for (have, need) in inst.args.iter().zip(args.iter()) {
-                match unify_with(&local, need, have) {
-                    Ok(s) => local = s,
-                    Err(_) => return false,
-                }
-            }
-            true
-        })
+        self.find_unifying_instances(class, args).into_iter().next()
     }
 
     /// Exact match, then unifying match (Constructor ↔ App/Sum).
@@ -227,7 +290,27 @@ impl Generics {
 
     /// True when an identical class + concrete-argument instance already exists.
     pub fn has_overlapping_instance(&self, class: &str, args: &[Ty]) -> bool {
-        self.find_instance(class, args).is_some()
+        self.find_overlapping_instance(class, args).is_some()
+    }
+
+    pub fn find_overlapping_instance(&self, class: &str, args: &[Ty]) -> Option<&InstanceDef> {
+        self.instances
+            .iter()
+            .find(|inst| Self::instances_unify(class, args, inst))
+    }
+
+    pub fn instances_unify(class: &str, args: &[Ty], inst: &InstanceDef) -> bool {
+        if inst.class != class || inst.args.len() != args.len() {
+            return false;
+        }
+        let mut local = Subst::empty();
+        for (have, need) in inst.args.iter().zip(args.iter()) {
+            match unify_with(&local, need, have) {
+                Ok(s) => local = s,
+                Err(_) => return false,
+            }
+        }
+        true
     }
 
     /// Required class methods omitted by an instance.
@@ -263,13 +346,13 @@ impl Generics {
     /// Associated types required by the class but missing from the instance.
     pub fn missing_assoc_types(
         class_def: &TypeClassDef,
-        assoc_tys: &HashMap<String, Ty>,
+        assoc_tys: &HashMap<String, AssocTypeValue>,
     ) -> Vec<String> {
         class_def
             .assoc_types
             .iter()
-            .filter(|name| !assoc_tys.contains_key(name.as_str()))
-            .cloned()
+            .filter(|decl| !assoc_tys.contains_key(decl.name.as_str()))
+            .map(|decl| decl.name.clone())
             .collect()
     }
 
@@ -278,7 +361,11 @@ impl Generics {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let known: HashSet<&str> = class_def.assoc_types.iter().map(String::as_str).collect();
+        let known: HashSet<&str> = class_def
+            .assoc_types
+            .iter()
+            .map(|decl| decl.name.as_str())
+            .collect();
         assoc_names
             .into_iter()
             .filter(|name| !known.contains(*name))
@@ -326,6 +413,7 @@ impl Generics {
             "Num".into(),
             TypeClassDef {
                 name: "Num".into(),
+                defined_module: BUILTIN_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -359,6 +447,7 @@ impl Generics {
             "Ord".into(),
             TypeClassDef {
                 name: "Ord".into(),
+                defined_module: BUILTIN_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -389,6 +478,7 @@ impl Generics {
             "Eq".into(),
             TypeClassDef {
                 name: "Eq".into(),
+                defined_module: BUILTIN_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -411,6 +501,7 @@ impl Generics {
             "Show".into(),
             TypeClassDef {
                 name: "Show".into(),
+                defined_module: BUILTIN_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -433,24 +524,32 @@ impl Generics {
         // ---- builtin instances: int ----
         self.instances.push(InstanceDef {
             class: "Num".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Num", "int", &["add", "sub", "mul", "div"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Ord".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Ord", "int", &["lt", "le", "gt", "ge"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Eq".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Eq", "int", &["eq", "ne"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Show", "int", &["show"]),
             assoc_tys: HashMap::new(),
@@ -459,24 +558,32 @@ impl Generics {
         // ---- builtin instances: float ----
         self.instances.push(InstanceDef {
             class: "Num".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![float()],
             method_fqns: make_fqns("Num", "float", &["add", "sub", "mul", "div"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Ord".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![float()],
             method_fqns: make_fqns("Ord", "float", &["lt", "le", "gt", "ge"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Eq".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![float()],
             method_fqns: make_fqns("Eq", "float", &["eq", "ne"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![float()],
             method_fqns: make_fqns("Show", "float", &["show"]),
             assoc_tys: HashMap::new(),
@@ -485,12 +592,16 @@ impl Generics {
         // ---- string: Eq + Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![string()],
             method_fqns: make_fqns("Eq", "string", &["eq", "ne"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![string()],
             method_fqns: make_fqns("Show", "string", &["show"]),
             assoc_tys: HashMap::new(),
@@ -499,12 +610,16 @@ impl Generics {
         // ---- bool: Eq + Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![boolean()],
             method_fqns: make_fqns("Eq", "bool", &["eq", "ne"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![boolean()],
             method_fqns: make_fqns("Show", "bool", &["show"]),
             assoc_tys: HashMap::new(),
@@ -513,6 +628,8 @@ impl Generics {
         // ---- unit: Show ----
         self.instances.push(InstanceDef {
             class: "Show".into(),
+            defined_module: BUILTIN_MODULE.into(),
+            range: 0..0,
             args: vec![unit()],
             method_fqns: make_fqns("Show", "unit", &["show"]),
             assoc_tys: HashMap::new(),
@@ -529,7 +646,7 @@ impl Generics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::ty::{float, int};
+    use crate::typechecking::ty::{TyVarId, float, int, option_app_ty};
 
     fn method(name: &str, has_default: bool) -> TypeClassMethodDef {
         TypeClassMethodDef {
@@ -541,6 +658,7 @@ mod tests {
     fn class_def() -> TypeClassDef {
         TypeClassDef {
             name: "Num".to_string(),
+            defined_module: "test".to_string(),
             type_params: vec!["T".to_string()],
             param_kinds: vec![Kind::Type],
             superclasses: vec![],
@@ -556,6 +674,7 @@ mod tests {
             "Equal".into(),
             TypeClassDef {
                 name: "Equal".into(),
+                defined_module: "test".into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -567,6 +686,7 @@ mod tests {
             "Ordered".into(),
             TypeClassDef {
                 name: "Ordered".into(),
+                defined_module: "test".into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec!["Equal".into()],
@@ -597,6 +717,8 @@ mod tests {
         generics.instances.clear();
         generics.instances.push(InstanceDef {
             class: "Num".to_string(),
+            defined_module: "test".to_string(),
+            range: 0..0,
             args: vec![int()],
             method_fqns: HashMap::new(),
             assoc_tys: HashMap::new(),
@@ -605,6 +727,25 @@ mod tests {
         assert!(generics.has_overlapping_instance("Num", &[int()]));
         assert!(!generics.has_overlapping_instance("Num", &[float()]));
         assert!(!generics.has_overlapping_instance("Show", &[int()]));
+    }
+
+    #[test]
+    fn has_overlapping_instance_detects_unifying_args() {
+        let mut generics = Generics::new();
+        generics.instances.clear();
+        generics.instances.push(InstanceDef {
+            class: "Collect".to_string(),
+            defined_module: "test".to_string(),
+            range: 0..0,
+            args: vec![option_app_ty(int())],
+            method_fqns: HashMap::new(),
+            assoc_tys: HashMap::new(),
+        });
+
+        assert!(generics.has_overlapping_instance(
+            "Collect",
+            &[option_app_ty(Ty::Var(TyVarId(999)))]
+        ));
     }
 
     #[test]
@@ -641,6 +782,8 @@ mod tests {
         let mut generics = Generics::new();
         generics.instances.push(InstanceDef {
             class: "Convert".to_string(),
+            defined_module: "test".to_string(),
+            range: 0..0,
             args: vec![int(), int()],
             method_fqns: HashMap::from([(
                 "cast".to_string(),

@@ -180,17 +180,30 @@ impl<'pratt> Pratt<'pratt> {
                     Some(args) => (e.span(), Box::new(Expression::TypeApp { name, args })),
                     None => (e.span(), Box::new(Expression::Type(name))),
                 });
-            // `Owner::Assoc` — associated-type projection (Phase 6).
+            // `Owner::Assoc` / `Owner::Assoc<T>` — associated-type projection.
             // Tried before bare `named_type` so `Collect::Elem` is not
             // left as `Type("Collect")` followed by a parse failure on `::`.
             let projection_type = text::ident()
                 .padded()
                 .then_ignore(op!("::"))
                 .then(text::ident().padded())
-                .map_with(|(owner, name), e| {
+                .then(
+                    type_ann
+                        .clone()
+                        .separated_by(op!(','))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(op!('<'), op!('>'))
+                        .or_not(),
+                )
+                .map_with(|((owner, name), args_opt), e| {
                     (
                         e.span(),
-                        Box::new(Expression::TypeProjection { owner, name }),
+                        Box::new(Expression::TypeProjection {
+                            owner,
+                            name,
+                            args: args_opt.unwrap_or_default(),
+                        }),
                     )
                 });
             // `forall T. ty` / `forall T: Num + Eq, U. ty` — universally
@@ -1502,14 +1515,18 @@ impl<'pratt> Pratt<'pratt> {
         // A method with a full block body (the default implementation).
         let default_method = self.func(stmt);
 
-        // Associated type declaration: `type Elem;`
+        // Associated type declaration: `type Elem;` / `type Ref<T>;`
         let assoc_decl = keyword!("type")
             .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
             .then_ignore(op!(";"))
-            .map_with(|name, e| {
+            .map_with(|(name, type_params), e| {
                 (
                     e.span(),
-                    Box::new(Expression::AssocTypeDecl { name }),
+                    Box::new(Expression::AssocTypeDecl {
+                        name,
+                        type_params,
+                    }),
                 )
             });
 
@@ -1558,17 +1575,19 @@ impl<'pratt> Pratt<'pratt> {
         // names; if they appear inside `<>`, the block is a typeclass impl.
         const PRIMITIVES: &[&str] = &["int", "float", "string", "bool", "void", "unit"];
 
-        // Associated type definition: `type Elem = int;`
+        // Associated type definition: `type Elem = int;` / `type Ref<T> = T;`
         let assoc_def = keyword!("type")
             .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
             .then_ignore(op!("="))
             .then(self.type_annotation())
             .then_ignore(op!(";"))
-            .map_with(|(name, ty), e| {
+            .map_with(|((name, type_params), ty), e| {
                 (
                     e.span(),
                     Box::new(Expression::AssocTypeDef {
                         name,
+                        type_params,
                         ty: Box::new(ty),
                     }),
                 )
@@ -1646,17 +1665,19 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // Associated type definition: `type Elem = int;`
+        // Associated type definition: `type Elem = int;` / `type Ref<T> = T;`
         let assoc_def = keyword!("type")
             .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
             .then_ignore(op!("="))
             .then(self.type_annotation())
             .then_ignore(op!(";"))
-            .map_with(|(name, ty), e| {
+            .map_with(|((name, type_params), ty), e| {
                 (
                     e.span(),
                     Box::new(Expression::AssocTypeDef {
                         name,
+                        type_params,
                         ty: Box::new(ty),
                     }),
                 )
@@ -4193,7 +4214,7 @@ mod tests_generics {
                 assert!(
                     methods
                         .iter()
-                        .any(|m| matches!(m.1.as_ref(), Expression::AssocTypeDecl { name: "Elem" })),
+                        .any(|m| matches!(m.1.as_ref(), Expression::AssocTypeDecl { name: "Elem", .. })),
                     "expected AssocTypeDecl Elem, got {:?}",
                     methods
                 );
@@ -4225,8 +4246,10 @@ mod tests_generics {
                 proj.1.as_ref(),
                 Expression::TypeProjection {
                     owner: "Collect",
-                    name: "Elem"
+                    name: "Elem",
+                    args,
                 }
+                if args.is_empty()
             ),
             "expected TypeProjection, got {:?}",
             proj.1
@@ -4261,6 +4284,62 @@ mod tests_generics {
             }
             other => panic!("expected TypeClassImpl, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn generic_assoc_type_decl_parses() {
+        match decl_ast!(
+            "typeclass Pointer<P> { type Ref<T>; fn get<T>(P p) -> P::Ref<T>; }"
+        ) {
+            Expression::TypeClass { methods, .. } => {
+                let assoc = methods.iter().find_map(|m| match m.1.as_ref() {
+                    Expression::AssocTypeDecl { name: "Ref", type_params } => Some(type_params),
+                    _ => None,
+                });
+                let params = assoc.expect("expected Ref associated type declaration");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "T");
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_assoc_type_def_in_impl_parses() {
+        match decl_ast!(
+            "impl Pointer<Box> { type Ref<T> = T; fn get<T>(Box p) -> T { return 0; } }"
+        ) {
+            Expression::TypeClassImpl { methods, .. } => {
+                let assoc = methods.iter().find_map(|m| match m.1.as_ref() {
+                    Expression::AssocTypeDef { name: "Ref", type_params, .. } => {
+                        Some(type_params)
+                    }
+                    _ => None,
+                });
+                let params = assoc.expect("expected Ref associated type definition");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "T");
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_assoc_type_projection_parses_and_displays() {
+        let proj = Pratt::default()
+            .type_annotation()
+            .parse("Pointer::Ref<int>")
+            .into_result()
+            .expect("projection parse failed");
+        match proj.1.as_ref() {
+            Expression::TypeProjection { owner, name, args } => {
+                assert_eq!((*owner, *name), ("Pointer", "Ref"));
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].1.as_ref(), Expression::Type("int")));
+            }
+            other => panic!("expected TypeProjection, got {:?}", other),
+        }
+        assert_eq!(format!("{}", proj.1), "Pointer::Ref<int>");
     }
 
     /// Inherent impl Display: `impl Point { … }`

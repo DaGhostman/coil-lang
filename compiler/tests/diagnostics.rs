@@ -752,3 +752,59 @@ fn assoc_type_unknown_in_impl_errors() {
         msgs
     );
 }
+
+#[test]
+fn duplicate_typeclass_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Tiny<T> { fn id(T x) -> T; }
+        typeclass Tiny<T> { fn id(T x) -> T; }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Duplicate typeclass `Tiny`")),
+        "expected duplicate typeclass diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn orphan_instance_for_foreign_class_and_structural_type_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        impl Show<(int, int)> {
+            fn show((int, int) x) -> string { return ""; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Orphan instance `Show<(int, int)>`")),
+        "expected orphan-instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn overlapping_typeclass_instance_names_new_and_existing_instances() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Tiny<T> { fn id(T x) -> T; }
+        impl Tiny<int> {
+            fn id(int x) -> int { return x; }
+        }
+        impl Tiny<int> {
+            fn id(int x) -> int { return x; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Overlapping instance `Tiny<int>`")
+                && m.contains("existing `Tiny<int>`")
+        }),
+        "expected overlapping-instance diagnostic, got: {:?}",
+        msgs
+    );
+}

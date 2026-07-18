@@ -157,6 +157,7 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
         bounds,
         kinds: Vec::new(),
         constraints: Vec::new(),
+        assoc_projections: Vec::new(),
         ty: ty.clone(),
     }
 }
@@ -217,6 +218,15 @@ pub fn instantiate_with_kinds(
             args: c.args.iter().map(|a| substitute_vars(a, &mapping)).collect(),
         })
         .collect();
+    let _assoc_projections = scheme
+        .assoc_projections
+        .iter()
+        .map(|p| super::ty::AssocProjection {
+            var: mapping.get(&p.var).copied().unwrap_or(p.var),
+            name: p.name.clone(),
+            args: p.args.iter().map(|a| substitute_vars(a, &mapping)).collect(),
+        })
+        .collect::<Vec<_>>();
     (ty, constraints, fresh_kinds)
 }
 
@@ -440,8 +450,9 @@ mod tests {
             "f",
             Scheme {
                 bounds: vec![TyVarId(0)],
-            kinds: vec![],
+                kinds: vec![],
                 constraints: vec![],
+                assoc_projections: vec![],
                 ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
             },
         );
@@ -535,6 +546,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
         let mut counter = TyVarCounter::new();
@@ -550,6 +562,7 @@ mod tests {
             bounds: vec![TyVarId(0), TyVarId(1)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         let mut counter = TyVarCounter::new();
@@ -568,6 +581,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
         let mut counter = TyVarCounter::new();
@@ -587,6 +601,7 @@ mod tests {
             bounds: vec![TyVarId(0)],
             kinds: vec![],
             constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),

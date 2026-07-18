@@ -526,7 +526,12 @@ where
             }
         }
         Expression::TypeAlias { ty, .. } | Expression::AssocTypeDef { ty, .. } => f(ty),
-        Expression::AssocTypeDecl { .. } | Expression::TypeProjection { .. } => {}
+        Expression::AssocTypeDecl { .. } => {}
+        Expression::TypeProjection { args, .. } => {
+            for arg in args {
+                f(arg);
+            }
+        }
         Expression::EnumDecl { variants, .. } => {
             for variant in variants {
                 f(variant);
