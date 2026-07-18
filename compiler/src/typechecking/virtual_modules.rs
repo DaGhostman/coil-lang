@@ -21,6 +21,9 @@ pub const FFI_TYPES_MODULE: &str = "ffi::types";
 /// Canonical module path for test helpers (`assert`).
 pub const PRELUDE_TEST_MODULE: &str = "prelude::test";
 
+/// Canonical module path for IO streams (`open`, `read`, `Stream`, …).
+pub const IO_MODULE: &str = "io";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -69,6 +72,65 @@ impl PreludeFn {
     }
 }
 
+/// IO host natives exported from the virtual `io` module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IoBuiltin {
+    Stdin,
+    Stdout,
+    Stderr,
+    Open,
+    Close,
+    Read,
+    Write,
+    ReadExact,
+    ReadToEnd,
+    WriteAll,
+    TcpConnect,
+    TcpListen,
+    TcpAccept,
+    TcpAcceptWait,
+}
+
+impl IoBuiltin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdin => "stdin",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Open => "open",
+            Self::Close => "close",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadExact => "read_exact",
+            Self::ReadToEnd => "read_to_end",
+            Self::WriteAll => "write_all",
+            Self::TcpConnect => "tcp_connect",
+            Self::TcpListen => "tcp_listen",
+            Self::TcpAccept => "tcp_accept",
+            Self::TcpAcceptWait => "tcp_accept_wait",
+        }
+    }
+
+    pub fn all() -> &'static [IoBuiltin] {
+        &[
+            Self::Stdin,
+            Self::Stdout,
+            Self::Stderr,
+            Self::Open,
+            Self::Close,
+            Self::Read,
+            Self::Write,
+            Self::ReadExact,
+            Self::ReadToEnd,
+            Self::WriteAll,
+            Self::TcpConnect,
+            Self::TcpListen,
+            Self::TcpAccept,
+            Self::TcpAcceptWait,
+        ]
+    }
+}
+
 /// One item exported by a virtual module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinExport {
@@ -82,6 +144,10 @@ pub enum BuiltinExport {
     FfiFn { kind: FfiBuiltin },
     /// Prelude/test callable (`assert`, …).
     Fn { kind: PreludeFn },
+    /// Opaque built-in type name (`Stream`).
+    OpaqueType { name: &'static str },
+    /// IO host native (`open`, `read`, …).
+    IoFn { kind: IoBuiltin },
 }
 
 impl BuiltinExport {
@@ -92,6 +158,8 @@ impl BuiltinExport {
             Self::FfiTag { variant } => variant,
             Self::FfiFn { kind } => kind.as_str(),
             Self::Fn { kind } => kind.as_str(),
+            Self::OpaqueType { name } => name,
+            Self::IoFn { kind } => kind.as_str(),
         }
     }
 }
@@ -169,6 +237,19 @@ impl VirtualModules {
                 kind: PreludeFn::Assert,
             }],
         );
+
+        let mut io_exports = vec![
+            BuiltinExport::OpaqueType { name: "Stream" },
+            BuiltinExport::Enum {
+                name: common::BUILTIN_IO_ERROR_ENUM,
+            },
+            BuiltinExport::TypeClass { name: "Read" },
+            BuiltinExport::TypeClass { name: "Write" },
+        ];
+        for kind in IoBuiltin::all() {
+            io_exports.push(BuiltinExport::IoFn { kind: *kind });
+        }
+        modules.insert(IO_MODULE, io_exports);
 
         Self { modules }
     }

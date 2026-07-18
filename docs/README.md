@@ -37,7 +37,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 
 | Area | Status |
 |------|--------|
-| Primitives | `int`, `float`, `string`, `bool` |
+| Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
@@ -48,6 +48,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
+| IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | String concat via `+` | Supported (`string + string` → `string`) |
@@ -72,6 +73,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
 | [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from` |
 | [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
+| [10 — IO streams](tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
 
 Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
 
@@ -151,5 +153,6 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 | Generics & traits | `examples/generics.0s`, `examples/hkt_bifunctor.0s`, `examples/gat_pointer.0s`, `examples/existential_show.0s` |
 | Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
 | FFI | `examples/strlen.0s`, `examples/ffi_sum.0s` |
+| IO streams | `examples/io_bytes.0s`, `examples/io_file.0s`, `examples/io_eof.0s` |
 | Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s` |
 | Full catalog | [examples.md](examples.md) |

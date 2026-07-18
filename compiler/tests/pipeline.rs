@@ -1157,3 +1157,21 @@ fn example_perf_coro_ping_prints_expected() {
     let output = run_example("examples/perf/coro_ping.0s");
     assert_eq!(output, "124750");
 }
+
+#[test]
+fn example_io_bytes_prints_25532() {
+    let output = run_example("examples/io_bytes.0s");
+    assert_eq!(output, "25532");
+}
+
+#[test]
+fn example_io_file_prints_2() {
+    let output = run_example("examples/io_file.0s");
+    assert_eq!(output, "2");
+}
+
+#[test]
+fn example_io_eof_prints_eof() {
+    let output = run_example("examples/io_eof.0s");
+    assert_eq!(output, "eof");
+}

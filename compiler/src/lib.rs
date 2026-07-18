@@ -1746,6 +1746,37 @@ impl Compiler {
         dict_arity
     }
 
+    /// Emit `HostInvoke` for a virtual `io` free function.
+    fn emit_io_host_invoke(&mut self, kind: crate::typechecking::IoBuiltin, args: &[Output]) {
+        let name = kind.as_str();
+        let Some(native_id) = self.native_id(name) else {
+            let mut message = Message::error(
+                ErrorCode::UnknownFunction,
+                format!("IO native `{name}` is not registered with the pipeline"),
+                0..0,
+            );
+            message.push(DiagLabel::new(
+                "host natives are wired in Pipeline::register_io_natives".to_string(),
+                0..0,
+            ));
+            self.messages.push(message);
+            return;
+        };
+        let mut arg_bc = Vec::new();
+        for arg in args {
+            arg_bc.append(&mut self.do_compile(arg));
+        }
+        let arity = args.len();
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+        self.bytecode.append(&mut arg_bc);
+        self.bytecode
+            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+        self.bytecode.push(
+            Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
+        );
+    }
+
     /// Emit bytecode thunks for compiler-provided primitive instances.
     ///
     /// Shared generic bodies receive boxed type-parameter values, so numeric
@@ -1830,14 +1861,18 @@ impl Compiler {
                 emit(self, class, ty, method, tag, op, false);
             }
         }
-        for (ty, tag) in [("string", ValueTag::String), ("bool", ValueTag::Bool)] {
+        for (ty, tag) in [
+            ("string", ValueTag::String),
+            ("bool", ValueTag::Bool),
+            ("byte", ValueTag::Int),
+        ] {
             emit(self, "Eq", ty, "eq", tag, Instruction::EQ, false);
             emit(self, "Eq", ty, "ne", tag, Instruction::NEQ, false);
         }
 
         // Show thunks: accept a boxed (or heap-string) argument at slot 0,
         // ignore the trailing dictionary, and return an ObjString via STRINGIFY.
-        for ty in ["int", "float", "string", "bool", "unit"] {
+        for ty in ["int", "float", "string", "bool", "unit", "byte"] {
             let fqn = Generics::builtin_instance_fqn("Show", ty, "show");
             if self.functions.contains_key(&fqn) {
                 continue;
@@ -1848,15 +1883,49 @@ impl Compiler {
             self.bytecode.push(Byte::new(Instruction::STRINGIFY));
             self.bytecode.push(Byte::new(Instruction::RETURN));
         }
+
+        // Read/Write for Stream — lower to the same HostInvoke natives as
+        // free functions `read` / `write`. Args may arrive boxed via the
+        // dictionary ABI; unbox then call.
+        for (class, method, native_name, arity) in [
+            ("Read", "read", "read", 2u32),
+            ("Write", "write", "write", 2u32),
+        ] {
+            let fqn = Generics::builtin_instance_fqn(class, "Stream", method);
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            let Some(native_id) = self.native_id(native_name) else {
+                continue;
+            };
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode.push(
+                Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Instance as u32),
+            );
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(1));
+            self.bytecode.push(
+                Byte::new(Instruction::UnboxValue).with_operand_u32(ValueTag::Array as u32),
+            );
+            self.bytecode
+                .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+            self.bytecode
+                .push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
     }
 
     /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
     /// emission at generic call boundaries.
     fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
-        use crate::typechecking::{Ty, ty::BOOL, ty::FLOAT, ty::INT, ty::STRING, ty::UNIT};
+        use crate::typechecking::{Ty, ty::BOOL, ty::BYTE, ty::FLOAT, ty::INT, ty::STRING, ty::UNIT};
         match ty {
             Ty::Con(name) => match name.as_str() {
-                INT => Some(ValueTag::Int),
+                INT | BYTE => Some(ValueTag::Int),
                 FLOAT => Some(ValueTag::Float),
                 STRING => Some(ValueTag::String),
                 BOOL => Some(ValueTag::Bool),
@@ -2228,6 +2297,18 @@ impl Compiler {
         self.checker.register_native(name, params, returns);
 
         self
+    }
+
+    /// Bind a host-native name to a stable id for [`Instruction::HostInvoke`]
+    /// without inserting a type into the HM env (virtual `io::*` schemes
+    /// are bound via `use` instead).
+    pub fn register_native_id(&mut self, name: &str, id: usize) {
+        self.native.insert(name.to_string(), id);
+    }
+
+    /// Look up a registered host-native id by export name.
+    pub fn native_id(&self, name: &str) -> Option<usize> {
+        self.native.get(name).copied()
     }
 
     fn resolve_variable<'compiler>(
@@ -3549,6 +3630,13 @@ impl Compiler {
                             self.emit_ffi_invoke(*span, arg_slice);
                         }
                     }
+                    return bytecode;
+                }
+                // `open` / `read` / … after `use io::*` (or `use io::read as …`).
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(kind) = self.checker.io_fn_in_scope(fname)
+                {
+                    self.emit_io_host_invoke(kind, args.as_deref().unwrap_or(&[]));
                     return bytecode;
                 }
 

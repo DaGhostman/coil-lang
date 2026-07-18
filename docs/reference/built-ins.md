@@ -16,6 +16,7 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `len` | Expression | Return an array length |
 | `ffi::{dload,declare,invoke}` | Virtual module | Runtime FFI (requires `use ffi::*`) |
 | `ffi::types::{Int,…}` | Virtual module | FFI type-tag constructors (requires `use ffi::types::*`) |
+| `io::{open,read,write,…}` | Virtual module | Non-blocking streams + sync adapters (requires `use io::*`) |
 | `done` | Expression | `true` if a coroutine handle is finished |
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
 | `prelude::ops::{Add,Eq,…}` | Virtual module | Auto-imported operator traits |
@@ -23,7 +24,7 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `panic` | Keyword | Abort with a string message (exit code 1) |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
-Compiler builtins live in **virtual modules** (not `.0s` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*;`. FFI is **not** auto-imported — write `use ffi::*;` / `use ffi::types::*;` before calling `dload` / using `Int`.
+Compiler builtins live in **virtual modules** (not `.0s` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*;`. FFI and **`io`** are **not** auto-imported — write `use ffi::*;` / `use io::*;` before using those APIs.
 
 ---
 
@@ -293,6 +294,30 @@ See [FFI tutorial](../tutorial/07-ffi.md).
 
 ---
 
+## `io` virtual module
+
+Non-blocking file / stdio / TCP streams. **Not** auto-imported:
+
+```0s
+use io::*;
+```
+
+| Export | Kind | Notes |
+|--------|------|-------|
+| `Stream` | Opaque type | Heap handle; closed on GC drop |
+| `IoError` | Builtin enum | `WouldBlock`, `NotFound`, `PermissionDenied`, `AlreadyClosed`, `InvalidInput`, `Other` |
+| `Read` / `Write` | Typeclasses | `impl` for `Stream`; methods = free functions |
+| `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
+| `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
+| `read_exact` / `read_to_end` / `write_all` | Sync adapters | May block in the host via `poll` |
+| `tcp_connect` / `tcp_listen` / `tcp_accept` / `tcp_accept_wait` | TCP | Same `Stream` contract |
+
+Buffers are **`[byte]`**. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
+
+See [Tutorial 10 — IO streams](../tutorial/10-io-streams.md) and `examples/io_*.0s`.
+
+---
+
 ## What is NOT a builtin
 
 There is **no general standard library** yet. The following are **not** built-in — you must provide your own functions or FFI:
@@ -302,12 +327,12 @@ There is **no general standard library** yet. The following are **not** built-in
 | Collections API | `sort`, iterators (`push` / `len` are builtins) |
 | String ops | slice, trim (concat via `+` and `format` are supported) |
 | Math | `sin`, `sqrt`, `random` |
-| File I/O | `read_file`, `write_file` |
-| Networking | sockets, HTTP |
+| High-level file helpers | path utilities beyond `io::open` / `read_to_end` / `write_all` |
+| HTTP / TLS | Not in the VM (use userland on top of `io` TCP later) |
 | Concurrency | OS threads (stackful coroutines via `async` / `yield` / `resume` / `done` are supported) |
 | Memory | `alloc`, `free` |
 
-Use **FFI** to call C libraries for these capabilities, or **host natives** when embedding the VM in Rust.
+Use **`io`** for streams, **FFI** for C libraries, or **host natives** when embedding the VM in Rust.
 
 ---
 

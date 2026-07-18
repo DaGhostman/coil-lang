@@ -10,13 +10,18 @@ zero-script uses **Hindley–Milner (Algorithm W)** type inference with optional
 |------|---------------------|-------|
 | `int` | `Ty::Con("int")` | 64-bit signed integer at runtime |
 | `float` | `Ty::Con("float")` | IEEE double |
+| `byte` | `Ty::Con("byte")` | Integer in `0..=255`; same immediate `Value` shape as `int` |
 | `string` | `Ty::Con("string")` | Heap-allocated UTF-8 string |
 | `bool` | `Ty::Con("bool")` | `true` / `false` |
 | `void` / `unit` | `Ty::Con("unit")` | Used for statements with no value; FFI `void` return |
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
-Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print`.
+Integer literals coerce to `byte` when the expected type is `byte` (or `[byte]` array elements) and the value is in `0..=255`. `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
+
+Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print` (`%i` accepts `byte`).
+
+Opaque **`Stream`** (`Ty::Con("Stream")`) is the handle type for the virtual [`io`](built-ins.md#io-virtual-module) module — not constructible in userland.
 
 ---
 

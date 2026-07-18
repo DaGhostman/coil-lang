@@ -76,6 +76,7 @@ zero-script provides five primitive type names used in everyday programs:
 |----------|--------------------|--------------------------------------------|
 | `int`    | `0`, `-42`, `100`  | Signed integer                             |
 | `float`  | `1.0`, `3.14`      | IEEE-style floating point                  |
+| `byte`   | `0`…`255` (as `int` literal with annotation) | `0..=255`; used for IO buffers (`[byte]`) |
 | `string` | `"hello"`          | Immutable string data                      |
 | `bool`   | `true`, `false`    | Boolean                                    |
 | `void`   | (no literal)       | **FFI only** — marks functions that return nothing to C/host code |

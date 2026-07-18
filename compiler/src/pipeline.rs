@@ -17,6 +17,7 @@ use rkyv::rancor::Error;
 
 use crate::Compiler;
 use crate::manifest::Manifest;
+use crate::typechecking::IoBuiltin;
 
 /// A queued file to compile, along with the path it was
 /// discovered under. The pipeline processes queued files
@@ -132,6 +133,121 @@ impl Pipeline {
         }
     }
 
+    /// Register virtual `io` host natives (`stdin`, `open`, `read`, …).
+    ///
+    /// Names are bound for [`Instruction::HostInvoke`] only — HM types come
+    /// from `use io::*` / [`Checker::io_fn_scheme`], not from the FFI env.
+    fn register_io_natives(&mut self) {
+        use machine::io::{
+            as_result_int, as_result_option_int, as_result_unit, as_result_value, stream_close,
+            stream_open, stream_read, stream_read_exact, stream_read_to_end, stream_stderr,
+            stream_stdin, stream_stdout, stream_write, stream_write_all, tcp_accept,
+            tcp_accept_wait, tcp_connect, tcp_listen, value_as_string,
+        };
+
+        for kind in IoBuiltin::all() {
+            let name = kind.as_str().to_string();
+            let arity = match kind {
+                IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => 0,
+                IoBuiltin::Close
+                | IoBuiltin::ReadToEnd
+                | IoBuiltin::TcpAccept
+                | IoBuiltin::TcpAcceptWait => 1,
+                IoBuiltin::Open
+                | IoBuiltin::Read
+                | IoBuiltin::Write
+                | IoBuiltin::ReadExact
+                | IoBuiltin::WriteAll
+                | IoBuiltin::TcpConnect
+                | IoBuiltin::TcpListen => 2,
+            };
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.clone(), args, FfiType::Int)
+                .expect("io native arity/signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(&name, id);
+            let kind = *kind;
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    let v = match kind {
+                        // Stdio handles are `() -> Stream` (not Result).
+                        IoBuiltin::Stdin => stream_stdin(heap).unwrap_or_default(),
+                        IoBuiltin::Stdout => stream_stdout(heap).unwrap_or_default(),
+                        IoBuiltin::Stderr => stream_stderr(heap).unwrap_or_default(),
+                        IoBuiltin::Open => {
+                            let path = match value_as_string(heap, args[0]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let mode = match value_as_string(heap, args[1]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r = stream_open(heap, &path, &mode);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::Close => {
+                            let r = stream_close(heap, args[0]);
+                            as_result_unit(heap, r)
+                        }
+                        IoBuiltin::Read => {
+                            let r = stream_read(heap, args[0], args[1]);
+                            as_result_option_int(heap, r)
+                        }
+                        IoBuiltin::Write => {
+                            let r = stream_write(heap, args[0], args[1]);
+                            as_result_int(heap, r)
+                        }
+                        IoBuiltin::ReadExact => {
+                            let r = stream_read_exact(heap, args[0], args[1]);
+                            as_result_option_int(heap, r)
+                        }
+                        IoBuiltin::ReadToEnd => {
+                            let r = stream_read_to_end(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::WriteAll => {
+                            let r = stream_write_all(heap, args[0], args[1]);
+                            as_result_unit(heap, r)
+                        }
+                        IoBuiltin::TcpConnect => {
+                            let host = match value_as_string(heap, args[0]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r = tcp_connect(heap, &host, args[1].as_int());
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpListen => {
+                            let host = match value_as_string(heap, args[0]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r = tcp_listen(heap, &host, args[1].as_int());
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpAccept => {
+                            let r = tcp_accept(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::TcpAcceptWait => {
+                            let r = tcp_accept_wait(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                    };
+                    Ok(Some(v))
+                })));
+        }
+    }
+
     /// Borrow the inner `Compiler` mutably. Used by the
     /// integration tests in `compiler/src/lib.rs::tests`
     /// and `compiler/tests/namespace.rs` that need to
@@ -234,7 +350,7 @@ impl Pipeline {
             Byte::new(Instruction::HALT),
         ];
 
-        Self {
+        let mut pipeline = Self {
             failed: false,
             project_root,
             manifest,
@@ -249,7 +365,9 @@ impl Pipeline {
             compiler: Compiler::default(),
             sink: create_sink(&config, SourceMap::new(), writer),
             messages_emitted: 0,
-        }
+        };
+        pipeline.register_io_natives();
+        pipeline
     }
 
     /// Register `source` under `path` and emit a single producer [`Message`].

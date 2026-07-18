@@ -18,4 +18,4 @@ pub use infer::{CStructDef, CallbackSigDef, Checker};
 #[allow(unused_imports)] // public API for kind-aware callers / tests
 pub use kind::Kind;
 pub use ty::Ty;
-pub use virtual_modules::{BuiltinExport, FfiBuiltin, PreludeFn, VirtualModules};
+pub use virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};

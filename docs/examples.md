@@ -508,6 +508,41 @@ fn read_x_v(Outer o) -> int {
 
 ---
 
+## IO streams
+
+Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files and EOF.
+
+### `examples/io_bytes.0s`
+
+**Demonstrates:** `byte` annotation, `[byte]` literal coercion, `len` / index.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_bytes.0s` |
+| **Output** | `25532` |
+
+### `examples/io_file.0s`
+
+**Demonstrates:** `open` / `write_all` / `read_to_end` / `close` round-trip; `Result` + `?`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_file.0s` |
+| **Output** | `2` |
+
+### `examples/io_eof.0s`
+
+**Demonstrates:** Non-blocking `read` on an empty file returns `Ok(None)` (EOF).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_eof.0s` |
+| **Output** | `eof` |
+
+See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
+
+---
+
 ## Collections and type aliases
 
 Tuples, arrays, dicts, and `type` aliases.
@@ -1157,6 +1192,9 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `mixed.0s` | Enums | `025122` |
 | `nested_records.0s` | Enums | `99` |
 | `chained.0s` | Enums / fields | `427` |
+| `io_bytes.0s` | IO | `25532` |
+| `io_file.0s` | IO | `2` |
+| `io_eof.0s` | IO | `eof` |
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
