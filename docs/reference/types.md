@@ -490,6 +490,12 @@ The compiler pre-registers these traits and instances for `int`, `float`, and (w
 | `Ord` | Convenience bundle | Supertrait of `Lt` + `Le` + `Gt` + `Ge` (no own methods) |
 | `Eq` | Equality | `==`, `!=` |
 | `Show` | Display | `show(T) -> string`; used by format `%v` |
+| `Into` | Conversion | `into(Self) -> T` via `impl Into<T> for Self` (no builtin instances) |
+
+`Into` is multi-parameter: `impl Into<T> for S` stores instance args
+`[S, T]`. Prefer method form with an expected type —
+`let y: T = x.into();` — so the target pins constraint discharge. Open
+`where Into<A, B>` helpers also work. See `examples/into.0s`.
 
 On open/generic operands, operators require the matching op trait (or the
 `Num` / `Ord` convenience supertrait). Concrete `int`/`float` arithmetic and
@@ -564,7 +570,8 @@ resolution stays deterministic across projects:
   head (enum, class, or type alias) defined in the current module.
 - Builtin types (`int`, `float`, `string`, tuples, arrays, and records)
   are not local nominal heads. For example, a module that did not define
-  `Show` cannot add `impl Show<(int, int)>`.
+  `Show` cannot add `impl Show<(int, int)>`, and `impl Into<Wrapper> for int`
+  is rejected unless `Into` itself is defined in the current module.
 - Exact duplicates and instances whose heads unify with an existing
   instance are rejected.
 - If constraint discharge ever sees two matching instances, it reports

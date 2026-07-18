@@ -775,6 +775,18 @@ clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>
 
 ---
 
+### `examples/into.0s`
+
+**Demonstrates:** Prelude conversion trait `Into` —
+`impl Into<Fahrenheit> for Celsius` and `let f: Fahrenheit = c.into();`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/into.0s` |
+| **Output** | `32` |
+
+---
+
 ### `examples/trait_dict.0s`
 
 **Demonstrates:** User trait dictionaries, method sugar, and dictionary
@@ -1281,6 +1293,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `hkt_container.0s` | Types | `42` |
 | `hkt_bifunctor.0s` | Types | `42` |
 | `multiparam.0s` | Types | `42` |
+| `into.0s` | Types | `32` |
 | `trait_dict.0s` | Types | `4242` |
 | `trait_default.0s` | Types | `42` |
 | `superclass_ord.0s` | Types | `truetruefalse` |

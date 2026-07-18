@@ -155,6 +155,9 @@ pub struct Checker {
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
+    /// Span fallback when pre-walk / infer NodeIds are misaligned in
+    /// function bodies (same motivation as `bound_method_calls_by_span`).
+    call_site_dicts_by_span: HashMap<(usize, usize), Vec<InstanceDef>>,
 
     /// Open dictionaries forwarded from the enclosing generic function.
     call_site_forward_dicts: HashMap<NodeId, Vec<usize>>,
@@ -185,6 +188,11 @@ pub struct Checker {
 
     /// Typeclass method signatures, keyed by `(class, method)`.
     typeclass_method_schemes: HashMap<(String, String), Scheme>,
+
+    /// Expected type pushed by annotated `let` / `const` initializers so
+    /// ground trait calls like `x.into()` can pin the conversion target
+    /// before constraint discharge (`let y: T = x.into();`).
+    current_expected: Option<Ty>,
 
     /// `type Name = T` aliases (substituted at typecheck time).
     ///
@@ -393,6 +401,7 @@ impl Checker {
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
+            call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
             call_site_forward_dicts_by_span: HashMap::new(),
             bound_method_calls: HashMap::new(),
@@ -407,6 +416,7 @@ impl Checker {
             for_in_infos: HashMap::new(),
             for_in_infos_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
+            current_expected: None,
             type_aliases: vec![HashMap::new()],
             generic_aliases: HashMap::new(),
             const_scopes: vec![HashSet::new()],
@@ -732,6 +742,7 @@ impl Checker {
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
         self.call_site_dicts.clear();
+        self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
         self.call_site_forward_dicts_by_span.clear();
         self.bound_method_calls.clear();
@@ -746,6 +757,7 @@ impl Checker {
         self.for_in_infos.clear();
         self.for_in_infos_by_span.clear();
         self.typeclass_method_schemes.clear();
+        self.current_expected = None;
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
         self.generic_aliases.clear();
@@ -1159,6 +1171,23 @@ impl Checker {
                 Ty::Fun(Box::new(Ty::Var(var)), Box::new(string())),
             ),
         );
+
+        // Into::into : ∀Self T. Into<Self, T> => Self → T
+        {
+            let self_v = self.counter.fresh();
+            let t_v = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Into".to_string(), "into".to_string()),
+                Scheme::poly(
+                    vec![self_v, t_v],
+                    vec![Constraint {
+                        class: "Into".into(),
+                        args: vec![Ty::Var(self_v), Ty::Var(t_v)],
+                    }],
+                    Ty::Fun(Box::new(Ty::Var(self_v)), Box::new(Ty::Var(t_v))),
+                ),
+            );
+        }
 
         // Read::read / Write::write — stream IO groundwork.
         {
@@ -1642,60 +1671,94 @@ impl Checker {
                             return result;
                         }
                     }
-                    let owner = match &resolved {
-                        Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
+                    // Inherent class methods win over ground trait methods
+                    // (Rust-style): `impl Point { fn show() ... }` must not be
+                    // shadowed by prelude `Show::show` when no Show instance
+                    // exists for Point.
+                    let class_owner = match &resolved {
+                        Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
                         Ty::App(head, _) => match head.as_ref() {
-                            Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
-                            _ => {
-                                return self.error_with_help(
-                                    ErrorCode::NotAFunction,
-                                    format!("Cannot call method `{}` on non-class type", method),
-                                    range,
-                                    Some(
-                                        "method calls require a class instance receiver"
-                                            .to_string(),
-                                    ),
-                                );
-                            }
+                            Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
+                            _ => None,
                         },
-                        _ => {
-                            return self.error_with_help(
-                                ErrorCode::NotAFunction,
-                                format!("Cannot call method `{}` on non-class type", method),
-                                range,
-                                Some("method calls require a class instance receiver".to_string()),
-                            );
-                        }
+                        _ => None,
                     };
-                    let scheme = match self
-                        .methods
-                        .get(&owner)
-                        .and_then(|m| m.get(*method))
-                        .map(|(_, s)| s.clone())
+                    if let Some(owner) = class_owner.as_ref()
+                        && let Some(scheme) = self
+                            .methods
+                            .get(owner)
+                            .and_then(|m| m.get(*method))
+                            .map(|(_, s)| s.clone())
                     {
-                        Some(s) => s,
-                        None => {
-                            return self.error(
-                                ErrorCode::UnknownFunction,
-                                format!("Cannot find method `{}` on class `{}`", method, owner),
-                                range,
+                        let fun_ty = self.instantiate_ty(&scheme);
+                        let mut arg_tys = vec![recv_ty];
+                        if let Some(a) = args {
+                            for arg in a {
+                                arg_tys.push(self.infer(arg));
+                            }
+                        }
+                        return self.apply_function(
+                            Some(&format!("{}::{}", owner, method)),
+                            &fun_ty,
+                            &arg_tys,
+                            None,
+                            id,
+                            range,
+                        );
+                    }
+
+                    // Ground trait method: `recv.into()` / `recv.show()` via a
+                    // concrete instance (no open bound). Pin the return type from
+                    // `current_expected` when present so `let y: T = x.into();`
+                    // (or `return x.into();` under `-> T`) can select among
+                    // multiple `Into` targets.
+                    if let Some((class, scheme)) =
+                        self.ground_trait_method_for_receiver(method, &recv_ty)
+                    {
+                        let (fun_ty, constraints, mapping) =
+                            self.instantiate_scheme_mapped(&scheme);
+                        let mut arg_tys = vec![recv_ty];
+                        if let Some(a) = args {
+                            for arg in a {
+                                arg_tys.push(self.infer(arg));
+                            }
+                        }
+                        let result = self.apply_function(
+                            Some(&format!("{}::{}", class, method)),
+                            &fun_ty,
+                            &arg_tys,
+                            None,
+                            id,
+                            range.clone(),
+                        );
+                        if let Some(expected) = self.current_expected.clone() {
+                            self.unify(&result, &expected, &range, "expected type");
+                        }
+                        if !constraints.is_empty() {
+                            self.discharge_constraints(id, &constraints, &range);
+                            self.pin_assoc_after_discharge(
+                                &class,
+                                &constraints,
+                                Some(&scheme),
+                                &mapping,
+                                &range,
                             );
                         }
-                    };
-                    let fun_ty = self.instantiate_ty(&scheme);
-                    let mut arg_tys = vec![recv_ty];
-                    if let Some(a) = args {
-                        for arg in a {
-                            arg_tys.push(self.infer(arg));
-                        }
+                        return apply_ty_prune(&self.subst, &result);
                     }
-                    return self.apply_function(
-                        Some(&format!("{}::{}", owner, method)),
-                        &fun_ty,
-                        &arg_tys,
-                        None,
-                        id,
+
+                    if let Some(owner) = class_owner {
+                        return self.error(
+                            ErrorCode::UnknownFunction,
+                            format!("Cannot find method `{}` on class `{}`", method, owner),
+                            range,
+                        );
+                    }
+                    return self.error_with_help(
+                        ErrorCode::NotAFunction,
+                        format!("Cannot call method `{}` on non-class type", method),
                         range,
+                        Some("method calls require a class instance receiver".to_string()),
                     );
                 }
 
@@ -1938,7 +2001,15 @@ impl Checker {
 
             // ---- Return ----
             Expression::Return(e) | Expression::ImplicitReturn(e) => {
+                // Push the declared return type as expected so ground trait
+                // calls like `return c.into();` can pin `Into`'s target `T`
+                // before constraint discharge (same as annotated `let`).
+                let prev_expected = self.current_expected.take();
+                if let Some(ret) = self.current_return_ty.clone() {
+                    self.current_expected = Some(ret);
+                }
                 let ty = self.infer(e);
+                self.current_expected = prev_expected;
                 if let Some(ret) = self.current_return_ty.clone() {
                     self.coerce_or_unify(&ret, &ty, Some(e), &e.0.into_range(), "return value");
                 }
@@ -3306,6 +3377,31 @@ impl Checker {
         self.call_site_dicts.get(&id).map(Vec::as_slice)
     }
 
+    /// Span fallback for [`call_dicts_at`] when NodeIds are misaligned.
+    pub fn call_dicts_for_span(&self, start: usize, end: usize) -> Option<&[InstanceDef]> {
+        self.call_site_dicts_by_span
+            .get(&(start, end))
+            .map(Vec::as_slice)
+    }
+
+    fn record_call_site_dict(
+        &mut self,
+        call_id: Option<NodeId>,
+        range: &Range<usize>,
+        instance: InstanceDef,
+    ) {
+        if let Some(call_id) = call_id {
+            self.call_site_dicts
+                .entry(call_id)
+                .or_default()
+                .push(instance.clone());
+        }
+        self.call_site_dicts_by_span
+            .entry((range.start, range.end))
+            .or_default()
+            .push(instance);
+    }
+
     pub fn forwarded_dicts_at(&self, id: NodeId) -> Option<&[usize]> {
         self.call_site_forward_dicts.get(&id).map(Vec::as_slice)
     }
@@ -3441,7 +3537,14 @@ impl Checker {
                                 i += 2;
                                 continue;
                             }
+                            // Annotated lets push an expected type so ground
+                            // trait calls (`x.into()`) can pin conversion targets.
+                            let prev_expected = self.current_expected.take();
+                            if ty_opt.is_some() {
+                                self.current_expected = Some(var_ty.clone());
+                            }
                             let val_ty = self.infer(next);
+                            self.current_expected = prev_expected;
                             self.coerce_or_unify(
                                 &var_ty,
                                 &val_ty,
@@ -3492,7 +3595,12 @@ impl Checker {
                         if i + 1 < children.len() {
                             let next = &children[i + 1];
                             if !is_declaration_like(next) {
+                                let prev_expected = self.current_expected.take();
+                                if ty_opt.is_some() {
+                                    self.current_expected = Some(var_ty.clone());
+                                }
                                 let val_ty = self.infer(next);
+                                self.current_expected = prev_expected;
                                 self.coerce_or_unify(
                                     &var_ty,
                                     &val_ty,
@@ -4584,12 +4692,7 @@ impl Checker {
                 // registered instances so free args get pinned by the match.
                 match self.find_unique_instance(&c.class, &resolved_args, range) {
                     Ok(Some(instance)) => {
-                        if let Some(call_id) = call_id {
-                            self.call_site_dicts
-                                .entry(call_id)
-                                .or_default()
-                                .push(instance.clone());
-                        }
+                        self.record_call_site_dict(call_id, range, instance.clone());
                         self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                     }
                     Ok(None) => {
@@ -4604,12 +4707,7 @@ impl Checker {
             } else {
                 match self.find_unique_instance(&c.class, &resolved_args, range) {
                     Ok(Some(instance)) => {
-                        if let Some(call_id) = call_id {
-                            self.call_site_dicts
-                                .entry(call_id)
-                                .or_default()
-                                .push(instance.clone());
-                        }
+                        self.record_call_site_dict(call_id, range, instance.clone());
                         self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                     }
                     Ok(None) => {
@@ -5001,6 +5099,50 @@ impl Checker {
             return None;
         }
         candidates.into_iter().next()
+    }
+
+    /// Resolve a ground trait method call on a concrete receiver
+    /// (`recv.into()`, `recv.show()`, …) when no open bound is active.
+    ///
+    /// Returns `(class, scheme)` when exactly one registered method scheme
+    /// named `method` has a first parameter that unifies with `recv_ty`.
+    fn ground_trait_method_for_receiver(
+        &mut self,
+        method: &str,
+        recv_ty: &Ty,
+    ) -> Option<(String, Scheme)> {
+        let recv = apply_ty_prune(&self.subst, recv_ty);
+        let schemes: Vec<(String, Scheme)> = self
+            .typeclass_method_schemes
+            .iter()
+            .filter(|((_, mname), _)| mname.as_str() == method)
+            .map(|((class, _), scheme)| (class.clone(), scheme.clone()))
+            .collect();
+        let mut matches: Vec<(String, Scheme)> = Vec::new();
+        for (class, scheme) in schemes {
+            // Freshen to probe the first parameter; trial unify does not
+            // commit into `self.subst`.
+            let (fun_ty, _constraints, _kinds) =
+                instantiate_with_kinds(&scheme, &mut self.counter);
+            let Some(first_param) = Self::first_fun_param(&fun_ty) else {
+                continue;
+            };
+            if unify_with(&self.subst, &first_param, &recv).is_ok() {
+                matches.push((class, scheme));
+            }
+        }
+        if matches.len() == 1 {
+            matches.pop()
+        } else {
+            None
+        }
+    }
+
+    fn first_fun_param(ty: &Ty) -> Option<Ty> {
+        match ty {
+            Ty::Fun(param, _) => Some(param.as_ref().clone()),
+            _ => None,
+        }
     }
 
     /// Instantiate a scheme and record freshened variable kinds (Phase 5).
@@ -13031,6 +13173,177 @@ fn main() { let y = apply_cast(42); }
                 .any(|m| m.message().contains("No instance") || m.message().contains("Convert")),
             "expected missing-instance diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Prelude `Into` is registered as a multi-param typeclass.
+    #[test]
+    fn prelude_into_trait_is_registered() {
+        let g = Generics::new();
+        assert!(g.typeclass("From").is_none(), "From must not be registered");
+        let into = g.typeclass("Into").expect("Into");
+        assert_eq!(into.type_params, vec!["Self".to_string(), "T".to_string()]);
+        assert_eq!(into.methods.len(), 1);
+        assert_eq!(into.methods[0].name, "into");
+    }
+
+    /// `into` method scheme exists after `check_program`.
+    #[test]
+    fn prelude_into_method_scheme_registered() {
+        let (c, _) = check("fn main() {}");
+        assert!(
+            c.typeclass_method_scheme("From", "from").is_none(),
+            "From::from must not be registered"
+        );
+        let into_scheme = c
+            .typeclass_method_scheme("Into", "into")
+            .expect("Into::into scheme");
+        assert_eq!(into_scheme.constraints.len(), 1);
+        assert_eq!(into_scheme.constraints[0].class, "Into");
+        assert_eq!(into_scheme.constraints[0].args.len(), 2);
+    }
+
+    /// `impl Into<B> for A` with two local classes discharges via `x.into()`.
+    #[test]
+    fn prelude_into_method_call_with_expected_type_discharges() {
+        let src = r#"
+class Celsius { c: int }
+class Fahrenheit { f: int }
+impl Into<Fahrenheit> for Celsius {
+    fn into(Celsius x) -> Fahrenheit { return new Fahrenheit(x.c); }
+}
+fn main() {
+    let c = new Celsius(0);
+    let y: Fahrenheit = c.into();
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let dicts = c.all_call_site_dicts();
+        let has_into = dicts.values().any(|instances| {
+            instances.iter().any(|i| {
+                i.class == "Into"
+                    && i.args.len() == 2
+                    && matches!(&i.args[0], Ty::Con(n) if n == "Celsius")
+                    && matches!(&i.args[1], Ty::Con(n) if n == "Fahrenheit")
+            })
+        });
+        assert!(
+            has_into,
+            "expected Into<Celsius, Fahrenheit> in call_site_dicts, got: {:?}",
+            dicts
+        );
+    }
+
+    /// Calling an Into-bound helper without an instance errors.
+    #[test]
+    fn prelude_into_missing_instance_errors() {
+        let src = r#"
+fn wrap<A, B>(A x) -> B where Into<A, B> { return into(x); }
+fn main() { let w = wrap(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("No instance") || m.message().contains("Into")),
+            "expected missing-Into diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Builtin source type is rejected under the strict orphan rule.
+    #[test]
+    fn prelude_into_impl_for_builtin_source_is_orphan() {
+        let src = r#"
+class Wrapper { v: int }
+impl Into<Wrapper> for int {
+    fn into(int x) -> Wrapper { return new Wrapper(x); }
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Orphan instance")),
+            "expected orphan diagnostic for Into<Wrapper> for int, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Inherent class methods win over prelude trait methods of the same
+    /// name when no matching instance exists (Bugbot: ground trait must
+    /// not block `impl Point { fn show() ... }`).
+    #[test]
+    fn inherent_class_method_wins_over_missing_trait_instance() {
+        let src = r#"
+class Point { x: int }
+impl Point {
+    fn show() -> string { return "point"; }
+}
+fn main() {
+    let p = new Point(1);
+    let s = p.show();
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().all(|m| !m.message().contains("No instance")
+                && !m.message().contains("Show")),
+            "inherent show must not require Show instance, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `return c.into();` under `-> Fahrenheit` pins Into's target
+    /// (Bugbot: expected type must flow from return annotations).
+    #[test]
+    fn prelude_into_return_pins_expected_target() {
+        let src = r#"
+class Celsius { c: int }
+class Fahrenheit { f: int }
+class Kelvin { k: int }
+impl Into<Fahrenheit> for Celsius {
+    fn into(Celsius x) -> Fahrenheit { return new Fahrenheit(x.c); }
+}
+impl Into<Kelvin> for Celsius {
+    fn into(Celsius x) -> Kelvin { return new Kelvin(x.c); }
+}
+fn to_f(Celsius c) -> Fahrenheit {
+    return c.into();
+}
+fn main() {
+    let f = to_f(new Celsius(0));
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let dicts = c.all_call_site_dicts();
+        let has_f = dicts.values().any(|instances| {
+            instances.iter().any(|i| {
+                i.class == "Into"
+                    && matches!(&i.args[1], Ty::Con(n) if n == "Fahrenheit")
+            })
+        });
+        assert!(
+            has_f,
+            "expected Into<..., Fahrenheit> from return pin, got: {:?}",
+            dicts
         );
     }
 

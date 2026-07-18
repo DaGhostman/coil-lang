@@ -19,7 +19,7 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `io::{open,read,write,…}` | Virtual module | Non-blocking streams + sync adapters (requires `use io::*`) |
 | `done` | Expression | `true` if a coroutine handle is finished |
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
-| `prelude::ops::{Add,Eq,…}` | Virtual module | Auto-imported operator traits |
+| `prelude::ops::{Add,Eq,Into,…}` | Virtual module | Auto-imported operator / conversion traits |
 | `prelude::test::assert` | Virtual module | Auto-imported; `assert(cond[, msg]) → Result<(), string>` |
 | `panic` | Keyword | Abort with a string message (exit code 1) |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |

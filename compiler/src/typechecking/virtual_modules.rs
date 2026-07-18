@@ -323,6 +323,7 @@ impl VirtualModules {
                 BuiltinExport::TypeClass { name: "Gt" },
                 BuiltinExport::TypeClass { name: "Ge" },
                 BuiltinExport::TypeClass { name: "Show" },
+                BuiltinExport::TypeClass { name: "Into" },
             ],
         );
 
@@ -495,6 +496,11 @@ mod tests {
             exports
                 .iter()
                 .any(|e| matches!(e, BuiltinExport::TypeClass { name: "Eq" }))
+        );
+        assert!(
+            exports
+                .iter()
+                .any(|e| matches!(e, BuiltinExport::TypeClass { name: "Into" }))
         );
         assert!(
             exports.iter().any(|e| matches!(

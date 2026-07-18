@@ -4034,6 +4034,55 @@ impl Compiler {
 
                 // Method call: `recv.method(args)`.
                 if let Expression::Access(recv, method) = name.1.borrow() {
+                    // Ground trait method (`recv.into()`, …): typechecker
+                    // discharged a concrete instance into `call_dicts_at`.
+                    // Emit receiver + args + dictionary, then CallIndirect to
+                    // the instance method (dict ABI, `dict_arity = 1`).
+                    let ground_trait = self_id
+                        .and_then(|id| self.checker.call_dicts_at(id))
+                        .or_else(|| {
+                            self.checker
+                                .call_dicts_for_span(span.start, span.end)
+                        })
+                        .and_then(|dicts| dicts.first())
+                        .and_then(|instance| {
+                            let fqn = instance.method_fqns.get(*method)?.clone();
+                            let offset = *self.functions.get(&fqn)?;
+                            Some((instance.class.clone(), instance.args.clone(), offset))
+                        });
+                    if let Some((class, inst_args, offset)) = ground_trait {
+                        bytecode.append(&mut self.do_compile(recv));
+                        // Box the receiver when the instance method prologue
+                        // expects an unbox (same contract as Eq/Ord direct calls).
+                        // Prefer `receiver_type` for identifiers/access; fall
+                        // back to `codegen_expr_ty` so inline receivers like
+                        // `new Celsius(0).into()` still get boxed.
+                        if let Some(recv_ty) = self
+                            .receiver_type(recv)
+                            .or_else(|| self.codegen_expr_ty(recv))
+                        {
+                            Self::emit_box_if_needed(&mut bytecode, &recv_ty);
+                        }
+                        let mut nargs = 1u32; // receiver
+                        if let Some(items) = args {
+                            for arg in items {
+                                self.append_with_existential_pack(&mut bytecode, arg);
+                                nargs += 1;
+                            }
+                        }
+                        if Self::emit_instance_dict(
+                            &mut bytecode,
+                            &class,
+                            &inst_args,
+                            &self.checker,
+                            &self.functions,
+                        ) {
+                            nargs += 1; // trailing dictionary
+                        }
+                        Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
+                        return bytecode;
+                    }
+
                     let recv_ty = self.receiver_type(recv);
                     let owner = recv_ty
                         .as_ref()

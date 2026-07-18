@@ -550,6 +550,28 @@ impl Generics {
             },
         );
 
+        // ---- Into ----
+        // Multi-param conversion trait (auto-imported via prelude::ops).
+        // `impl Into<T> for Self` → instance args [Self, T]; method
+        // `into` has type `Self → T`. No builtin instances — users write
+        // the impls they need. Prefer `x.into()` with an expected type
+        // (`let y: T = x.into();`) over a reverse `From` encoding.
+        self.typeclasses.insert(
+            "Into".into(),
+            TypeClassDef {
+                name: "Into".into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
+                type_params: vec!["Self".into(), "T".into()],
+                param_kinds: vec![Kind::Type, Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "into".into(),
+                    has_default: false,
+                }],
+            },
+        );
+
         // ---- Read / Write (IO stream traits; virtual `io` module) ----
         self.typeclasses.insert(
             "Read".into(),

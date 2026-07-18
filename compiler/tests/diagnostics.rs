@@ -895,6 +895,25 @@ fn orphan_instance_for_foreign_class_and_structural_type_errors() {
     );
 }
 
+/// Builtin source type is rejected: every non-variable instance arg must
+/// be a local nominal head (strict orphan rule).
+#[test]
+fn into_impl_for_builtin_source_is_orphan() {
+    let (_ty, msgs) = check(
+        r#"
+        class Wrapper { v: int }
+        impl Into<Wrapper> for int {
+            fn into(int x) -> Wrapper { return new Wrapper(x); }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Orphan instance")),
+        "expected orphan diagnostic for Into<Wrapper> for int, got: {:?}",
+        msgs
+    );
+}
+
 #[test]
 fn overlapping_typeclass_instance_names_new_and_existing_instances() {
     let (_ty, msgs) = check(

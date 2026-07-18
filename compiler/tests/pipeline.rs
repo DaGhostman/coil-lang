@@ -258,6 +258,63 @@ fn example_multiparam_prints_42() {
     assert_eq!(output, "42");
 }
 
+/// Prelude `Into`: `let f: Fahrenheit = c.into();` with two local classes.
+#[test]
+fn example_into_prints_32() {
+    let output = run_example("examples/into.0s");
+    assert_eq!(output, "32");
+}
+
+/// Inline receiver `new Celsius(0).into()` must typecheck and run (Bugbot:
+/// codegen used to skip boxing when `receiver_type` only handled Identifier/Access).
+#[test]
+fn inline_into_receiver_prints_32() {
+    let src = r#"
+class Celsius { c: int }
+class Fahrenheit { f: int }
+impl Into<Fahrenheit> for Celsius {
+    fn into(Celsius x) -> Fahrenheit {
+        return new Fahrenheit(x.c * 2 + 32);
+    }
+}
+fn main() {
+    let f: Fahrenheit = new Celsius(0).into();
+    print "%i", f.f;
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "32");
+}
+
+/// `return c.into();` under `-> Fahrenheit` pins the Into target at runtime.
+#[test]
+fn return_into_pins_target_prints_32() {
+    let src = r#"
+class Celsius { c: int }
+class Fahrenheit { f: int }
+class Kelvin { k: int }
+impl Into<Fahrenheit> for Celsius {
+    fn into(Celsius x) -> Fahrenheit {
+        return new Fahrenheit(x.c * 2 + 32);
+    }
+}
+impl Into<Kelvin> for Celsius {
+    fn into(Celsius x) -> Kelvin {
+        return new Kelvin(x.c);
+    }
+}
+fn to_f(Celsius c) -> Fahrenheit {
+    return c.into();
+}
+fn main() {
+    let f = to_f(new Celsius(0));
+    print "%i", f.f;
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "32");
+}
+
 /// Phase 5: superclass / implied bounds (`Ordered<T: Equal>` → `eq_val` under `T: Ordered`).
 #[test]
 fn example_superclass_ord_prints_truetruefalse() {
