@@ -4054,7 +4054,13 @@ impl Compiler {
                         bytecode.append(&mut self.do_compile(recv));
                         // Box the receiver when the instance method prologue
                         // expects an unbox (same contract as Eq/Ord direct calls).
-                        if let Some(recv_ty) = self.receiver_type(recv) {
+                        // Prefer `receiver_type` for identifiers/access; fall
+                        // back to `codegen_expr_ty` so inline receivers like
+                        // `new Celsius(0).into()` still get boxed.
+                        if let Some(recv_ty) = self
+                            .receiver_type(recv)
+                            .or_else(|| self.codegen_expr_ty(recv))
+                        {
                             Self::emit_box_if_needed(&mut bytecode, &recv_ty);
                         }
                         let mut nargs = 1u32; // receiver
