@@ -73,7 +73,7 @@ fn example_option_prints_42() {
 #[test]
 fn example_generics_uses_builtin_dictionary_abi() {
     let output = run_example("examples/generics.0s");
-    assert_eq!(output, "7424.042");
+    assert_eq!(output, "7424.0427");
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn example_generic_enum_prints_7() {
 #[test]
 fn example_generics_prints_add_results_for_int_and_float() {
     let output = run_example("examples/generics.0s");
-    assert_eq!(output, "7424.042");
+    assert_eq!(output, "7424.0427");
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn example_generic_print_shows_primitives_and_user_type() {
     assert_eq!(output, "42hi1.5true(3,4)99");
 }
 
-/// Advanced generics Phase 4: a bare unary typeclass name is an existential type.
+/// Advanced generics Phase 4: a bare unary trait name is an existential type.
 #[test]
 fn example_existential_show_prints_42() {
     let output = run_example("examples/existential_show.0s");
@@ -205,7 +205,7 @@ fn example_show_tuple_prints_structural_tuple_and_record() {
     assert_eq!(output, "(1, 2){ a: 3, b: 4 }");
 }
 
-/// Constructor-kind typeclass `Container<Option>` + `get<F: Container, A>(F<A>)`.
+/// Constructor-kind trait `Container<Option>` + `get<F: Container, A>(F<A>)`.
 #[test]
 fn example_hkt_container_prints_42() {
     let output = run_example("examples/hkt_container.0s");
@@ -219,7 +219,7 @@ fn example_hkt_bifunctor_prints_42() {
     assert_eq!(output, "42");
 }
 
-/// Phase 3: multi-param typeclass `Convert<A, B>` + `where` clause.
+/// Phase 3: multi-param trait `Convert<A, B>` + `where` clause.
 #[test]
 fn example_multiparam_prints_42() {
     let output = run_example("examples/multiparam.0s");
@@ -302,7 +302,7 @@ fn format_percent_v_parity_with_print() {
 #[test]
 fn polyfn_captured_dict_survives_return() {
     let src = r#"
-        typeclass Describable<T> {
+        trait Describable<T> {
             fn describe_val(T x) -> int;
         }
         impl Describable<int> {
@@ -358,7 +358,7 @@ fn polyfn_captured_dict_survives_return() {
 #[test]
 fn polyfn_multiparam_capture_survives_return() {
     let src = r#"
-        typeclass Convert<A, B> {
+        trait Convert<A, B> {
             fn cast(A x) -> B;
         }
         impl Convert<int, int> {

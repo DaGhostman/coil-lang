@@ -1242,7 +1242,7 @@ impl Compiler {
     }
 
     /// Emit one instance dictionary (`CodePtr`s + `MakeTuple`) for a
-    /// typeclass constraint whose type arguments have already been resolved
+    /// trait constraint whose type arguments have already been resolved
     /// to concrete lookup types. Returns `true` when a dict was pushed.
     ///
     /// Layout (Phase 5): subclass methods first, then each superclass’s
@@ -1566,10 +1566,10 @@ impl Compiler {
                 "int",
                 ValueTag::Int,
                 [
-                    ("add", Instruction::ADD),
-                    ("sub", Instruction::SUB),
-                    ("mul", Instruction::MUL),
-                    ("div", Instruction::DIV),
+                    ("Add", "add", Instruction::ADD),
+                    ("Sub", "sub", Instruction::SUB),
+                    ("Mul", "mul", Instruction::MUL),
+                    ("Div", "div", Instruction::DIV),
                 ],
                 [
                     ("lt", Instruction::LE),
@@ -1584,10 +1584,10 @@ impl Compiler {
                 "float",
                 ValueTag::Float,
                 [
-                    ("add", Instruction::ADDF),
-                    ("sub", Instruction::SUBF),
-                    ("mul", Instruction::MULF),
-                    ("div", Instruction::DIVF),
+                    ("Add", "add", Instruction::ADDF),
+                    ("Sub", "sub", Instruction::SUBF),
+                    ("Mul", "mul", Instruction::MULF),
+                    ("Div", "div", Instruction::DIVF),
                 ],
                 [
                     ("lt", Instruction::LEF),
@@ -1599,8 +1599,8 @@ impl Compiler {
                 ],
             ),
         ] {
-            for (method, op) in arithmetic {
-                emit(self, "Num", ty, method, tag, op, true);
+            for (class, method, op) in arithmetic {
+                emit(self, class, ty, method, tag, op, true);
             }
             for (method, op) in comparisons.iter().take(4) {
                 emit(self, "Ord", ty, method, tag, *op, false);
@@ -2817,13 +2817,13 @@ impl Compiler {
                 let mut a = self.do_compile(args);
 
                 // ── Dictionary-passing prologue ────────────────────────────────
-                // Generic functions with user-defined typeclass constraints receive
+                // Generic functions with user-defined trait constraints receive
                 // extra dict tuple arguments after the value params.  Reserve a
                 // stack slot `__dictN` for each expected dict so that the Interner
                 // assigns a slot number that can later be LOAD-ed by CallIndirect
                 // dispatch paths.  The VM pushes these as the trailing elements of
                 // the call frame, one per user constraint, in constraint order.
-                // Every typeclass constraint (including builtin Num/Ord/Eq/Show)
+                // Every trait constraint (including builtin Num/Ord/Eq/Show)
                 // gets a trailing `__dictN` slot for dictionary dispatch.
                 let dict_arity = self.checker.dict_arity_for(name);
                 for dict_idx in 0..dict_arity {
@@ -3461,7 +3461,7 @@ impl Compiler {
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownFunction,
-                            "Missing typeclass dictionary".to_string(),
+                            "Missing trait dictionary".to_string(),
                             span.into_range(),
                         );
                         message.push(DiagLabel::new(
@@ -5884,7 +5884,7 @@ mod tests {
         let ast = Pratt::default()
             .parse(
                 r#"
-                typeclass Foo<T> { fn bar(T x) -> T; }
+                trait Foo<T> { fn bar(T x) -> T; }
                 impl Foo<int> { fn bar(int x) -> int { return x; } }
                 fn main() { }
                 "#,
@@ -7862,7 +7862,7 @@ print \"%i\", len(a); \
     /// `ObjPolyFn` heap pointer that `CallIndirect` can dispatch through.
     ///
     /// The function `id<T>(T x) -> T` is a canonical unconstrained identity and has
-    /// no typeclass bound, so no DynAdd / DynCmp / etc. opcode is emitted — this
+    /// no trait bound, so no DynAdd / DynCmp / etc. opcode is emitted — this
     /// purely tests the MakePolyFn path.
     #[test]
     fn generic_fn_as_value_emits_make_polyfn() {
@@ -7885,7 +7885,7 @@ print \"%i\", len(a); \
     fn constrained_generic_escape_emits_make_polyfn_capture() {
         use common::Instruction;
         let src = r#"
-            typeclass Showable<T> { fn show_it(T x) -> int; }
+            trait Showable<T> { fn show_it(T x) -> int; }
             impl Showable<int> { fn show_it(int x) -> int { return x; } }
             fn show<T: Showable>(T x) -> int { return show_it(x); }
             fn capture<T: Showable>(T _w) { return show; }
@@ -7915,7 +7915,7 @@ print \"%i\", len(a); \
     fn top_level_constrained_escape_emits_make_polyfn_capture_with_null_slots() {
         use common::Instruction;
         let src = r#"
-            typeclass Showable<T> { fn show_it(T x) -> int; }
+            trait Showable<T> { fn show_it(T x) -> int; }
             impl Showable<int> { fn show_it(int x) -> int { return x; } }
             fn show<T: Showable>(T x) -> int { return show_it(x); }
             fn main() { let f = show; }
@@ -7942,7 +7942,7 @@ print \"%i\", len(a); \
     fn multiparam_constrained_escape_emits_capture_with_slot_count() {
         use common::Instruction;
         let src = r#"
-            typeclass Convert<A, B> { fn cast(A x) -> B; }
+            trait Convert<A, B> { fn cast(A x) -> B; }
             impl Convert<int, int> { fn cast(int x) -> int { return x; } }
             fn convert_fn<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
             fn capture_convert<A, B>(A _wa, B _wb) where Convert<A, B> { return convert_fn; }
@@ -8083,7 +8083,7 @@ print \"%i\", len(a); \
     // ── Dictionary-passing calling convention tests ─────────────────────────
 
     /// Codegen test: A non-monomorphized call to a generic function with a
-    /// **user-defined** typeclass constraint must emit:
+    /// **user-defined** trait constraint must emit:
     ///   1. `MakeTuple` (the method-offset dict) after the value arg.
     ///   2. A `CALL` whose packed arity is 2 (1 value arg + 1 dict tuple),
     ///      NOT 1.
@@ -8095,10 +8095,10 @@ print \"%i\", len(a); \
     fn user_typeclass_constrained_call_emits_dict_tuple_and_bumps_arity() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            // Declare a user typeclass with one method.
-            "typeclass Describable<T> { fn describe_val(T x) -> int; } \
+            // Declare a user trait with one method.
+            "trait Describable<T> { fn describe_val(T x) -> int; } \
              impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
-             // Generic fn with one user typeclass constraint.  NOT called as mono.
+             // Generic fn with one user trait constraint.  NOT called as mono.
              fn show<T: Describable>(T x) -> int { return 0; } \
              fn main() { show(42); }",
         );
@@ -8139,8 +8139,8 @@ print \"%i\", len(a); \
     fn two_user_typeclass_constraints_emit_two_dicts_and_arity_plus_two() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "typeclass Printable<T> { fn printable_val(T x) -> int; } \
-             typeclass Countable<T> { fn count_val(T x) -> int; } \
+            "trait Printable<T> { fn printable_val(T x) -> int; } \
+             trait Countable<T> { fn count_val(T x) -> int; } \
              impl Printable<int> { fn printable_val(int x) -> int { return x; } } \
              impl Countable<int> { fn count_val(int x) -> int { return x + 1; } } \
              fn process<T: Printable + Countable>(T x) -> int { return 0; } \
@@ -8201,14 +8201,14 @@ print \"%i\", len(a); \
         );
     }
 
-    /// Ground calls with **user** typeclass bounds are NOT monomorphized
+    /// Ground calls with **user** trait bounds are NOT monomorphized
     /// (see `monomorphize.rs`); they use the shared body + dictionary-passing
     /// convention instead. Expect BoxValue + MakeTuple + bumped CALL arity.
     #[test]
     fn ground_user_typeclass_call_uses_dict_not_mono() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "typeclass Describable<T> { fn describe_val(T x) -> int; } \
+            "trait Describable<T> { fn describe_val(T x) -> int; } \
              impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
              fn id_d<T: Describable>(T x) -> T { return x; } \
              fn main() { let y = id_d(7); }",
@@ -8223,7 +8223,7 @@ print \"%i\", len(a); \
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
-            "user typeclass ground call should emit a dict MakeTuple; opcodes: {:?}",
+            "user trait ground call should emit a dict MakeTuple; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         let max_call_arity = bc
@@ -8243,7 +8243,7 @@ print \"%i\", len(a); \
     fn generic_bound_method_consumes_dictionary_indirectly() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "typeclass Measurable<T> { fn size(T x) -> int; } \
+            "trait Measurable<T> { fn size(T x) -> int; } \
              impl Measurable<int> { fn size(int x) -> int { return x; } } \
              fn size_of<T: Measurable>(T x) -> int { return x.size(); } \
              fn main() { size_of(42); }",
@@ -8263,7 +8263,7 @@ print \"%i\", len(a); \
     fn omitted_default_method_dict_slot_has_real_target() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "typeclass Tiny<T> { fn zero(T x) -> int { return 7; } } \
+            "trait Tiny<T> { fn zero(T x) -> int { return 7; } } \
              impl Tiny<int> {} \
              fn get<T: Tiny>(T x) -> int { return zero(x); } \
              fn main() { get(0); }",
@@ -8289,7 +8289,7 @@ print \"%i\", len(a); \
     fn dictionary_entries_emit_code_ptr() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
-            "typeclass Measurable<T> { fn size(T x) -> int; } \
+            "trait Measurable<T> { fn size(T x) -> int; } \
              impl Measurable<int> { fn size(int x) -> int { return x; } } \
              fn size_of<T: Measurable>(T x) -> int { return size(x); } \
              fn main() { size_of(42); }",

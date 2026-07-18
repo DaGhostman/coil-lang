@@ -1,6 +1,6 @@
 // Expected output: 424.0424242
 
-typeclass Describable<T> {
+trait Describable<T> {
     fn describe_val(T x) -> int;
 }
 

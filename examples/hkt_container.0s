@@ -1,7 +1,7 @@
-// Unary higher-kinded typeclass: Container<F: * -> *>.
+// Unary higher-kinded trait: Container<F: * -> *>.
 // Expected output: 42
 
-typeclass Container<F: * -> *> {
+trait Container<F: * -> *> {
     fn first<A>(F<A> xs) -> A;
 }
 

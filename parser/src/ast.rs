@@ -325,7 +325,7 @@ pub enum Expression<'expr> {
         ty: Box<Output<'expr>>,
     },
 
-    /// `typeclass Name<T> { type Elem; fn ...; fn ... { default } }`
+    /// `trait Name<T> { type Elem; fn ...; fn ... { default } }`
     TypeClass {
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
@@ -333,7 +333,9 @@ pub enum Expression<'expr> {
         methods: Vec<Output<'expr>>,
     },
 
-    /// `impl Num<int> { type Elem = int; fn add(...) { ... } }` — typeclass instance.
+    /// `impl Num<int> { … }` or `impl Show for Point { … }` — trait instance.
+    ///
+    /// For the `impl Trait<A, B> for T` form, `args` is `[T, A, B]` (Self first).
     TypeClassImpl {
         class: &'expr str,
         /// Type annotations for the class type arguments, e.g. `[int]`.
@@ -342,7 +344,7 @@ pub enum Expression<'expr> {
         methods: Vec<Output<'expr>>,
     },
 
-    /// Associated type declaration inside a typeclass: `type Elem;` or `type Ref<T>;`.
+    /// Associated type declaration inside a trait: `type Elem;` or `type Ref<T>;`.
     AssocTypeDecl {
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
@@ -969,22 +971,34 @@ impl<'a> Display for Expression<'a> {
                     fmt_type_params(type_params)
                 };
                 let ms: Vec<String> = methods.iter().map(|m| m.1.to_string()).collect();
-                write!(f, "typeclass {}{} {{ {} }}", name, tp, ms.join(" "))
+                write!(f, "trait {}{} {{ {} }}", name, tp, ms.join(" "))
             }
             Self::TypeClassImpl {
                 class,
                 args,
                 methods,
             } => {
-                let args_s: Vec<String> = args.iter().map(|a| a.1.to_string()).collect();
+                // Prefer `impl Trait for T` / `impl Trait<A, B> for T` when
+                // there is at least one type argument (Self-first convention).
                 let ms: Vec<String> = methods.iter().map(|m| m.1.to_string()).collect();
-                write!(
-                    f,
-                    "impl {}<{}> {{ {} }}",
-                    class,
-                    args_s.join(", "),
-                    ms.join(" ")
-                )
+                if let Some((for_ty, rest)) = args.split_first() {
+                    let for_s = for_ty.1.to_string();
+                    if rest.is_empty() {
+                        write!(f, "impl {} for {} {{ {} }}", class, for_s, ms.join(" "))
+                    } else {
+                        let rest_s: Vec<String> = rest.iter().map(|a| a.1.to_string()).collect();
+                        write!(
+                            f,
+                            "impl {}<{}> for {} {{ {} }}",
+                            class,
+                            rest_s.join(", "),
+                            for_s,
+                            ms.join(" ")
+                        )
+                    }
+                } else {
+                    write!(f, "impl {} {{ {} }}", class, ms.join(" "))
+                }
             }
             e => write!(f, "<unhandled: {:?}>", e),
         }

@@ -18,7 +18,7 @@ use super::kind::Kind;
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::{AssocProjection, Constraint, Scheme};
 
-/// Code-generation recipe for a typeclass method call in a generic body.
+/// Code-generation recipe for a trait method call in a generic body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundMethodCall {
     pub dict_index: usize,
@@ -43,7 +43,7 @@ pub struct BoundDisplayCall {
     pub method_slot: usize,
 }
 
-/// Code-generation recipe for a typeclass method call on an existential pack.
+/// Code-generation recipe for a trait method call on an existential pack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExistentialMethodCall {
     pub method_slot: usize,
@@ -121,18 +121,18 @@ pub struct Checker {
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
-    /// Concrete typeclass dictionaries selected at each generic call site.
+    /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
 
     /// Open dictionaries forwarded from the enclosing generic function.
     call_site_forward_dicts: HashMap<NodeId, Vec<usize>>,
     call_site_forward_dicts_by_span: HashMap<(usize, usize), Vec<usize>>,
 
-    /// Calls resolved through an active typeclass constraint.
+    /// Calls resolved through an active trait constraint.
     bound_method_calls: HashMap<NodeId, BoundMethodCall>,
     bound_method_calls_by_span: HashMap<(usize, usize), BoundMethodCall>,
 
-    /// Operators resolved through an active typeclass constraint.
+    /// Operators resolved through an active trait constraint.
     bound_operator_calls: HashMap<NodeId, BoundOperatorCall>,
     bound_operator_calls_by_span: HashMap<(usize, usize), BoundOperatorCall>,
 
@@ -219,7 +219,7 @@ pub struct Checker {
     /// Type parameters currently in scope (name → fresh TyVarId).
     /// Pushed when entering a generic function, popped on exit.
     type_params_in_scope: Vec<HashMap<String, TyVarId>>,
-    /// Active typeclass constraints on in-scope type params.
+    /// Active trait constraints on in-scope type params.
     /// `(TyVarId, class_name)` — checked when applying arithmetic ops.
     active_constraints: Vec<Constraint>,
     /// Bindings from abstract constraint parameters (`c: * -> Constraint`)
@@ -232,7 +232,7 @@ pub struct Checker {
     /// Generic function names registered during typechecking.
     /// Used by codegen to decide between DynAdd vs regular ADD.
     pub generic_fns: HashSet<String>,
-    /// Number of *user-defined* typeclass dict slots expected by each
+    /// Number of *user-defined* trait dict slots expected by each
     /// generic function.  Built-in classes (Num, Ord, Eq, Show) are
     /// handled via Dyn* opcodes and do NOT count toward this arity.
     ///
@@ -888,7 +888,10 @@ impl Checker {
     /// dispatch share one dictionary ABI.
     fn register_builtin_typeclass_method_schemes(&mut self) {
         for (class, methods, returns_bool) in [
-            ("Num", &["add", "sub", "mul", "div"][..], false),
+            ("Add", &["add"][..], false),
+            ("Sub", &["sub"][..], false),
+            ("Mul", &["mul"][..], false),
+            ("Div", &["div"][..], false),
             ("Ord", &["lt", "le", "gt", "ge"][..], true),
             ("Eq", &["eq", "ne"][..], true),
         ] {
@@ -1370,7 +1373,7 @@ impl Checker {
                     return self.infer_array_len(args.as_deref(), range);
                 }
 
-                // Bare/UFCS typeclass method call: `method(x)`.
+                // Bare/UFCS trait method call: `method(x)`.
                 // Resolve it before ordinary environment lookup because class
                 // methods are selected by the active bound, not by a global FQN.
                 let arg_tys: Vec<Ty> = match args {
@@ -1481,7 +1484,7 @@ impl Checker {
                     id,
                     range.clone(),
                 );
-                // Discharge typeclass constraints from the instantiated scheme.
+                // Discharge trait constraints from the instantiated scheme.
                 // This verifies that each concrete type argument satisfies the
                 // required bound, or propagates the constraint if the caller is
                 // itself generic with the same bound.
@@ -2303,7 +2306,7 @@ impl Checker {
                                 self.messages.push(Message::error(
                                     ErrorCode::GenericTypeError,
                                     format!(
-                                        "Duplicate associated type `{}` in typeclass `{}`",
+                                        "Duplicate associated type `{}` in trait `{}`",
                                         aname, name
                                     ),
                                     m.0.into_range(),
@@ -2341,7 +2344,7 @@ impl Checker {
                     .map(|tp| Kind::from(tp.kind.clone()))
                     .collect();
                 // Single-param classes: param bounds become direct superclasses
-                // (`typeclass Ordered<T: Equal>` → superclasses: ["Equal"]).
+                // (`trait Ordered<T: Equal>` → superclasses: ["Equal"]).
                 // Multi-param classes ignore param bounds for superclass
                 // wiring (use `where` for those constraints later).
                 let superclasses: Vec<String> = if type_params.len() == 1 {
@@ -2356,11 +2359,11 @@ impl Checker {
                 if let Some(previous) = self.generics.typeclass(name) {
                     let mut msg = Message::error(
                         ErrorCode::GenericTypeError,
-                        format!("Duplicate typeclass `{}`", name),
+                        format!("Duplicate trait `{}`", name),
                         range.clone(),
                     );
                     msg.with_help(format!(
-                        "typeclass `{}` was already declared in module `{}`",
+                        "trait `{}` was already declared in module `{}`",
                         name, previous.defined_module
                     ));
                     self.messages.push(msg);
@@ -2380,7 +2383,7 @@ impl Checker {
                 };
                 self.generics.typeclasses.insert(name.to_string(), def);
 
-                // Build method schemes with typeclass parameters in scope.
+                // Build method schemes with trait parameters in scope.
                 // Applied associated types are recorded as explicit projection
                 // variables and quantified with the method scheme.
                 let mut param_frame = HashMap::new();
@@ -2492,7 +2495,7 @@ impl Checker {
                 if class_def.is_none() {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
-                        format!("Unknown typeclass `{}`", class),
+                        format!("Unknown trait `{}`", class),
                         range.clone(),
                     ));
                 }
@@ -2513,7 +2516,7 @@ impl Checker {
                         range.clone(),
                     );
                     msg.with_help(
-                        "define the typeclass in this module, or define the nominal head of every non-variable instance argument here"
+                        "define the trait in this module, or define the nominal head of every non-variable instance argument here"
                             .to_string(),
                     );
                     self.messages.push(msg);
@@ -2913,7 +2916,7 @@ impl Checker {
             .map(|ty| apply_ty_prune(&self.subst, ty))
     }
 
-    /// Concrete typeclass instances selected while discharging a call's bounds.
+    /// Concrete trait instances selected while discharging a call's bounds.
     pub fn call_dicts_at(&self, id: NodeId) -> Option<&[InstanceDef]> {
         self.call_site_dicts.get(&id).map(Vec::as_slice)
     }
@@ -3227,16 +3230,39 @@ impl Checker {
             }
         }
         let result = self.unify(&lt, &rt, &range, &format!("operands of `{}`", op));
-        // If the unified type is still an open type variable (generic type param),
-        // check that it has a Num constraint; otherwise the op is invalid.
+        // Open type variables need the matching op trait (`Add` for `+`, …).
+        // `T: Num` also covers these via superclass implication.
         let pruned = apply_ty_prune(&self.subst, &result);
         if let Ty::Var(v) = &pruned {
-            if self.user_dict_index(*v, "Num").is_none() {
-                self.bind_matching_abstract_constraints(Some(*v), "Num");
+            let (class, method) = match op {
+                "+" => ("Add", "add"),
+                "-" => ("Sub", "sub"),
+                "*" => ("Mul", "mul"),
+                "/" => ("Div", "div"),
+                _ => {
+                    let in_scope = self
+                        .type_params_in_scope
+                        .iter()
+                        .any(|frame| frame.values().any(|&id| id == *v));
+                    if in_scope {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Operator `{}` is not available through an arithmetic trait",
+                                op
+                            ),
+                            range,
+                        ));
+                    }
+                    return result;
+                }
+            };
+            if self.user_dict_index(*v, class).is_none() {
+                self.bind_matching_abstract_constraints(Some(*v), class);
             }
-            let has_num = self.user_dict_index(*v, "Num").is_some();
-            if !has_num {
-                // Check if the var appears in any in-scope type param frame.
+            if self.user_dict_index(*v, class).is_some() {
+                self.record_bound_operator(id, &range, *v, class, method);
+            } else {
                 let in_scope = self
                     .type_params_in_scope
                     .iter()
@@ -3245,28 +3271,8 @@ impl Checker {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
                         format!(
-                            "Cannot apply `{}` to value of generic type without bound `Num`",
-                            op
-                        ),
-                        range,
-                    ));
-                }
-            } else {
-                let method = match op {
-                    "+" => Some("add"),
-                    "-" => Some("sub"),
-                    "*" => Some("mul"),
-                    "/" => Some("div"),
-                    _ => None,
-                };
-                if let Some(method) = method {
-                    self.record_bound_operator(id, &range, *v, "Num", method);
-                } else {
-                    self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Operator `{}` is not available through the `Num` dictionary",
-                            op
+                            "Cannot apply `{}` to value of generic type without bound `{}`",
+                            op, class
                         ),
                         range,
                     ));
@@ -4003,7 +4009,7 @@ impl Checker {
         Ty::Var(self.counter.fresh())
     }
 
-    /// Discharge freshened typeclass constraints from a generic call site.
+    /// Discharge freshened trait constraints from a generic call site.
     ///
     /// For each freshened constraint `c` (returned by instantiate):
     ///
@@ -4096,7 +4102,7 @@ impl Checker {
         }
     }
 
-    /// After discharging constraints for a typeclass method call, pin
+    /// After discharging constraints for a trait method call, pin
     /// freshened associated-type variables from the scheme mapping.
     fn pin_assoc_after_discharge(
         &mut self,
@@ -4462,7 +4468,7 @@ impl Checker {
         if candidates.len() > 1 {
             self.messages.push(Message::error(
                 ErrorCode::GenericTypeError,
-                format!("Ambiguous typeclass method `{}`", method),
+                format!("Ambiguous trait method `{}`", method),
                 range.clone(),
             ));
             return None;
@@ -4552,7 +4558,7 @@ impl Checker {
         if self.generics.typeclass(bound).is_none() {
             self.messages.push(Message::error(
                 ErrorCode::GenericTypeError,
-                format!("Cannot find typeclass or constraint parameter `{}`", bound),
+                format!("Cannot find trait or constraint parameter `{}`", bound),
                 range.clone(),
             ));
             return None;
@@ -4731,7 +4737,7 @@ impl Checker {
         }
     }
 
-    /// Parse a typeclass instance argument. Bare registered constructors
+    /// Parse a trait instance argument. Bare registered constructors
     /// (`Option`, `Result`, user generics) become `Ty::Con` heads for HKT
     /// instances rather than applied `Option<_>` placeholders.
     fn parse_instance_head(&mut self, arg: &Output) -> Ty {
@@ -5055,7 +5061,7 @@ impl Checker {
 
     /// Resolve `Owner::Assoc` in a type annotation (Phase 6).
     ///
-    /// - Inside `typeclass Owner { … }`, `Owner::Elem` / bare scope lookup
+    /// - Inside `trait Owner { … }`, `Owner::Elem` / bare scope lookup
     ///   resolves to the quantified assoc var.
     /// - `T::Elem` when `T` is a type param with an active class constraint
     ///   that declares `Elem` → fresh (or cached) open projection var,
@@ -5093,7 +5099,7 @@ impl Checker {
             self.messages.push(Message::error(
                 ErrorCode::GenericTypeError,
                 format!(
-                    "Cannot find associated type `{}` on typeclass `{}`",
+                    "Cannot find associated type `{}` on trait `{}`",
                     assoc, owner
                 ),
                 range.clone(),
@@ -5150,7 +5156,7 @@ impl Checker {
                     ErrorCode::GenericTypeError,
                     format!(
                         "Cannot project associated type `{}` from `{}` \
-                         (no in-scope typeclass bound declares it)",
+                         (no in-scope trait bound declares it)",
                         assoc, owner
                     ),
                     range.clone(),
@@ -5165,7 +5171,7 @@ impl Checker {
                 self.messages.push(Message::error(
                     ErrorCode::GenericTypeError,
                     format!(
-                        "Cannot find associated type `{}` on typeclass `{}`",
+                        "Cannot find associated type `{}` on trait `{}`",
                         assoc, owner
                     ),
                     range.clone(),
@@ -5205,7 +5211,7 @@ impl Checker {
 
     /// After discharging a ground (or unifying) instance, pin any open
     /// associated-type projections whose owner matches the instance args,
-    /// and pin freshened assoc vars from typeclass method schemes.
+    /// and pin freshened assoc vars from trait method schemes.
     fn pin_assoc_types_for_instance(
         &mut self,
         class: &str,
@@ -5253,7 +5259,7 @@ impl Checker {
         let _ = scheme;
     }
 
-    /// Pin freshened associated-type variables from a typeclass method
+    /// Pin freshened associated-type variables from a trait method
     /// scheme instantiation against a concrete instance.
     fn pin_assoc_vars_from_mapping(
         &mut self,
@@ -5959,7 +5965,7 @@ impl Checker {
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
                         format!(
-                            "Cannot satisfy abstract constraint `{}`; no concrete typeclass was selected",
+                            "Cannot satisfy abstract constraint `{}`; no concrete trait was selected",
                             constraint
                         ),
                         range.clone(),
@@ -8074,7 +8080,7 @@ impl Checker {
         self.generics.generic_fns.contains(name)
     }
 
-    /// Number of *user-defined* typeclass dict slots expected by a generic
+    /// Number of *user-defined* trait dict slots expected by a generic
     /// function.  Returns 0 for non-generic functions or functions whose
     /// constraints are all built-in classes (Num / Ord / Eq / Show).
     pub fn dict_arity_for(&self, fn_name: &str) -> usize {
@@ -8087,7 +8093,10 @@ impl Checker {
     /// Num/Ord/Eq calls may monomorphize to direct opcodes; `Show` does not
     /// (see `monomorphize::candidate_for_call`).
     pub fn is_builtin_class(class: &str) -> bool {
-        matches!(class, "Num" | "Ord" | "Eq" | "Show")
+        matches!(
+            class,
+            "Add" | "Sub" | "Mul" | "Div" | "Num" | "Ord" | "Eq" | "Show"
+        )
     }
 
     /// Return the FQN for an instance method, if registered.
@@ -10624,7 +10633,7 @@ mod tests {
     #[test]
     fn typeclass_impl_missing_required_method_errors() {
         let src = r#"
-            typeclass Tiny<T> {
+            trait Tiny<T> {
                 fn add(int a, int b) -> int;
                 fn zero() -> int { return 0; }
             }
@@ -10646,7 +10655,7 @@ mod tests {
     #[test]
     fn typeclass_impl_overlapping_instance_errors() {
         let src = r#"
-            typeclass Tiny<T> {
+            trait Tiny<T> {
                 fn add(int a, int b) -> int;
             }
             impl Tiny<int> {
@@ -10708,7 +10717,7 @@ mod tests {
     #[test]
     fn typeclass_impl_default_method_omission_registers_default_fqn() {
         let src = r#"
-            typeclass Tiny<T> {
+            trait Tiny<T> {
                 fn zero() -> int { return 0; }
             }
             impl Tiny<int> {
@@ -10725,7 +10734,7 @@ mod tests {
     #[test]
     fn typeclass_impl_unknown_method_errors() {
         let src = r#"
-            typeclass Tiny<T> {
+            trait Tiny<T> {
                 fn add(int a, int b) -> int;
             }
             impl Tiny<int> {
@@ -10743,12 +10752,12 @@ mod tests {
         );
     }
 
-    /// Phase 5: `typeclass Ordered<T: Equal>` stores Equal as a superclass.
+    /// Phase 5: `trait Ordered<T: Equal>` stores Equal as a superclass.
     #[test]
     fn typeclass_param_bounds_become_superclasses() {
         let src = r#"
-            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
-            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            trait Equal<T> { fn eq_val(T a, T b) -> bool; }
+            trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
         "#;
         let (c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
@@ -10761,8 +10770,8 @@ mod tests {
     #[test]
     fn typeclass_impl_missing_superclass_instance_errors() {
         let src = r#"
-            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
-            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            trait Equal<T> { fn eq_val(T a, T b) -> bool; }
+            trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
             impl Ordered<int> {
                 fn lt_val(int a, int b) -> bool { return a < b; }
             }
@@ -10785,8 +10794,8 @@ mod tests {
     #[test]
     fn implied_superclass_bound_allows_superclass_method() {
         let src = r#"
-            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
-            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            trait Equal<T> { fn eq_val(T a, T b) -> bool; }
+            trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
             impl Equal<int> {
                 fn eq_val(int a, int b) -> bool { return a == b; }
             }
@@ -10822,8 +10831,8 @@ mod tests {
     #[test]
     fn abstract_constraint_kind_uses_superclass_method_after_binding() {
         let src = r#"
-            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
-            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            trait Equal<T> { fn eq_val(T a, T b) -> bool; }
+            trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
             impl Equal<int> {
                 fn eq_val(int a, int b) -> bool { return a == b; }
             }
@@ -10898,6 +10907,61 @@ mod tests {
         assert_eq!(dicts[0].len(), 1, "expected one Num dictionary");
         assert_eq!(dicts[0][0].class, "Num");
         assert_eq!(dicts[0][0].args, vec![int()]);
+    }
+
+    /// `T: Num` still lowers `a + b` through the flattened Add slot (0).
+    #[test]
+    fn num_bound_plus_uses_add_superclass_dict_slot() {
+        let src = r#"
+            fn add<T: Num>(T a, T b) -> T { return a + b; }
+            fn main() { let x = add(1, 2); }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let hint = c
+            .id_table()
+            .ids()
+            .iter()
+            .find_map(|id| c.bound_operator_call_at(*id))
+            .expect("expected a bound operator call for `+`");
+        assert_eq!(hint.dict_index, 0);
+        assert_eq!(
+            hint.method_slot, 0,
+            "Add::add should be slot 0 in Num's flattened dict"
+        );
+    }
+
+    /// `T: Add` is enough for `+` without a full `Num` bound.
+    #[test]
+    fn add_bound_alone_allows_plus() {
+        let src = r#"
+            fn just_add<T: Add>(T a, T b) -> T { return a + b; }
+            fn main() { let x = just_add(1, 2); }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let hint = c
+            .id_table()
+            .ids()
+            .iter()
+            .find_map(|id| c.bound_operator_call_at(*id))
+            .expect("expected a bound operator call for `+`");
+        assert_eq!(hint.method_slot, 0);
+    }
+
+    /// `T: Add` does not allow `*`.
+    #[test]
+    fn add_bound_does_not_allow_mul() {
+        let src = r#"
+            fn bad<T: Add>(T a, T b) -> T { return a * b; }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("without bound `Mul`")),
+            "expected missing Mul bound diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -11471,7 +11535,7 @@ fn main() { let r = add("a", "b"); }
     #[test]
     fn discharge_constraints_populates_call_site_dicts_for_user_typeclass() {
         let src = r#"
-typeclass Describable<T> { fn describe_val(T x) -> int; }
+trait Describable<T> { fn describe_val(T x) -> int; }
 impl Describable<int> { fn describe_val(int x) -> int { return x; } }
 fn show<T: Describable>(T x) -> int { return 0; }
 fn main() { show(42); }
@@ -11528,11 +11592,11 @@ fn main() { let r = outer(5); }
         );
     }
 
-    /// Multi-param typeclass + `where` clause discharges at a ground call site.
+    /// Multi-param trait + `where` clause discharges at a ground call site.
     #[test]
     fn multiparam_where_clause_discharges_at_call_site() {
         let src = r#"
-typeclass Convert<A, B> { fn cast(A x) -> B; }
+trait Convert<A, B> { fn cast(A x) -> B; }
 impl Convert<int, int> { fn cast(int x) -> int { return x; } }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn main() { let y = apply_cast(42); }
@@ -11561,7 +11625,7 @@ fn main() { let y = apply_cast(42); }
     #[test]
     fn multiparam_missing_instance_errors() {
         let src = r#"
-typeclass Convert<A, B> { fn cast(A x) -> B; }
+trait Convert<A, B> { fn cast(A x) -> B; }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn main() { let y = apply_cast(42); }
 "#;
@@ -11578,7 +11642,7 @@ fn main() { let y = apply_cast(42); }
     #[test]
     fn binary_hkt_result_instance_discharges() {
         let src = r#"
-typeclass Bifunctor<F: * -> * -> *> {
+trait Bifunctor<F: * -> * -> *> {
     fn tag<A, B>(F<A, B> xs) -> int;
 }
 impl Bifunctor<Result> {
@@ -11603,7 +11667,7 @@ fn main() { let x = get_tag(Result::Ok(7)); }
     #[test]
     fn binary_hkt_rejects_wrong_arity_constructor_instance() {
         let src = r#"
-typeclass Bifunctor<F: * -> * -> *> {
+trait Bifunctor<F: * -> * -> *> {
     fn tag<A, B>(F<A, B> xs) -> int;
 }
 impl Bifunctor<Option> {
@@ -11642,7 +11706,7 @@ fn add<T: Num>(T a, T b) -> T { return a + b; }
     #[test]
     fn assoc_type_head_returns_int_at_ground_call() {
         let src = r#"
-typeclass Collect<C> {
+trait Collect<C> {
     type Elem;
     fn head(C xs) -> Elem;
 }
@@ -11687,7 +11751,7 @@ fn main() {
     #[test]
     fn assoc_type_open_projection_under_bound_is_ok() {
         let src = r#"
-typeclass Collect<C> {
+trait Collect<C> {
     type Elem;
     fn head(C xs) -> Elem;
 }
@@ -11712,7 +11776,7 @@ fn peek<T: Collect>(T xs) -> T::Elem {
     #[test]
     fn gat_decl_records_params_and_kind() {
         let src = r#"
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
@@ -11734,7 +11798,7 @@ typeclass Pointer<P: * -> *> {
     #[test]
     fn gat_method_scheme_quantifies_applied_projection() {
         let src = r#"
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
@@ -11758,7 +11822,7 @@ typeclass Pointer<P: * -> *> {
     #[test]
     fn gat_open_projection_under_bound_is_ok() {
         let src = r#"
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
@@ -11795,7 +11859,7 @@ fn main() { let x = get(Option::Some(42)); }
     #[test]
     fn gat_projection_wrong_arity_errors() {
         let src = r#"
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
@@ -11816,7 +11880,7 @@ fn bad<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A, int> {
     #[test]
     fn gat_projection_kind_mismatch_errors() {
         let src = r#"
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<F: * -> *>;
     fn bad<T>(P<T> ptr) -> Ref<T>;
 }

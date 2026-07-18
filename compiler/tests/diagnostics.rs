@@ -406,7 +406,7 @@ fn format_percent_v_accepts_show_bound() {
 #[test]
 fn existential_pack_without_instance_reports_missing_instance() {
     let (_ty, msgs) = check(
-        "typeclass Printable<T> { fn printable(T x) -> int; } \
+        "trait Printable<T> { fn printable(T x) -> int; } \
          fn take(Printable x) { } \
          fn main() { take(42); }",
     );
@@ -421,13 +421,13 @@ fn existential_pack_without_instance_reports_missing_instance() {
 #[test]
 fn multiparam_typeclass_cannot_be_bare_existential_type() {
     let (_ty, msgs) = check(
-        "typeclass Convert<A, B> { fn cast(A x) -> B; } \
+        "trait Convert<A, B> { fn cast(A x) -> B; } \
          fn take(Convert x) { }",
     );
     assert!(
         msgs.iter()
             .any(|m| m.contains("Typeclass `Convert` cannot be used as a bare value type")),
-        "expected bare multi-param typeclass diagnostic, got: {:?}",
+        "expected bare multi-param trait diagnostic, got: {:?}",
         msgs
     );
 }
@@ -669,7 +669,7 @@ fn optional_access_on_result_has_stable_code() {
 fn hkt_instance_rejects_applied_type_argument() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Container<F: * -> *> {
+        trait Container<F: * -> *> {
             fn first<A>(F<A> xs) -> A;
         }
         impl Container<Option<int>> {
@@ -696,7 +696,7 @@ fn hkt_instance_rejects_applied_type_argument() {
 fn hkt_var_rejected_as_type_argument() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Container<F: * -> *> {
+        trait Container<F: * -> *> {
             fn first<A>(F<A> xs) -> A;
         }
         fn bad<F: Container, A>(F<F> xs) -> A {
@@ -753,8 +753,8 @@ fn abstract_constraint_bound_requires_concrete_method_selection() {
 fn superclass_impl_requires_superclass_instance() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
-        typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+        trait Equal<T> { fn eq_val(T a, T b) -> bool; }
+        trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
         impl Ordered<int> {
             fn lt_val(int a, int b) -> bool { return a < b; }
         }
@@ -775,7 +775,7 @@ fn superclass_impl_requires_superclass_instance() {
 fn assoc_type_missing_in_impl_errors() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Collect<C> {
+        trait Collect<C> {
             type Elem;
             fn head(C xs) -> Elem;
         }
@@ -798,7 +798,7 @@ fn assoc_type_missing_in_impl_errors() {
 fn assoc_type_unknown_in_impl_errors() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Collect<C> {
+        trait Collect<C> {
             type Elem;
             fn head(C xs) -> Elem;
         }
@@ -822,7 +822,7 @@ fn assoc_type_unknown_in_impl_errors() {
 fn gat_impl_wrong_number_of_params_errors() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Pointer<P: * -> *> {
+        trait Pointer<P: * -> *> {
             type Ref<T>;
             fn deref<T>(P<T> ptr) -> Ref<T>;
         }
@@ -845,7 +845,7 @@ fn gat_impl_wrong_number_of_params_errors() {
 fn gat_projection_wrong_number_of_args_errors() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Pointer<P: * -> *> {
+        trait Pointer<P: * -> *> {
             type Ref<T>;
             fn deref<T>(P<T> ptr) -> Ref<T>;
         }
@@ -866,14 +866,14 @@ fn gat_projection_wrong_number_of_args_errors() {
 fn duplicate_typeclass_errors() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Tiny<T> { fn id(T x) -> T; }
-        typeclass Tiny<T> { fn id(T x) -> T; }
+        trait Tiny<T> { fn id(T x) -> T; }
+        trait Tiny<T> { fn id(T x) -> T; }
         "#,
     );
     assert!(
         msgs.iter()
-            .any(|m| m.contains("Duplicate typeclass `Tiny`")),
-        "expected duplicate typeclass diagnostic, got: {:?}",
+            .any(|m| m.contains("Duplicate trait `Tiny`")),
+        "expected duplicate trait diagnostic, got: {:?}",
         msgs
     );
 }
@@ -899,7 +899,7 @@ fn orphan_instance_for_foreign_class_and_structural_type_errors() {
 fn overlapping_typeclass_instance_names_new_and_existing_instances() {
     let (_ty, msgs) = check(
         r#"
-        typeclass Tiny<T> { fn id(T x) -> T; }
+        trait Tiny<T> { fn id(T x) -> T; }
         impl Tiny<int> {
             fn id(int x) -> int { return x; }
         }

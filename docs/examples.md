@@ -578,7 +578,7 @@ fn main() {
 
 ### `examples/generics.0s`
 
-**Demonstrates:** Generic functions with a `Num` typeclass bound — one `add<T: Num>` body used at `int` and `float` call sites.
+**Demonstrates:** Generic functions with a `Num` trait bound — one `add<T: Num>` body used at `int` and `float` call sites.
 
 ```0s
 fn add<T: Num>(T a, T b) -> T {
@@ -595,13 +595,13 @@ fn main() {
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/generics.0s` |
-| **Output** | `7424.042` |
+| **Output** | `7424.0427` |
 
 ---
 
 ### `examples/generic_print.0s`
 
-**Demonstrates:** Format `%v` via the `Show` typeclass — builtin instances for
+**Demonstrates:** Format `%v` via the `Show` trait — builtin instances for
 primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
 
 | | |
@@ -636,7 +636,7 @@ fn main() {
 
 ### `examples/hkt_container.0s`
 
-**Demonstrates:** Unary higher-kinded typeclasses (`Container<F: * -> *>`) with
+**Demonstrates:** Unary higher-kinded traits (`Container<F: * -> *>`) with
 an `impl Container<Option>`, a polymorphic instance method `first<A>`, and a
 generic caller `get<F: Container, A>(F<A>) -> A`.
 
@@ -649,7 +649,7 @@ generic caller `get<F: Container, A>(F<A>) -> A`.
 
 ### `examples/hkt_bifunctor.0s`
 
-**Demonstrates:** Binary higher-kinded typeclasses
+**Demonstrates:** Binary higher-kinded traits
 (`Bifunctor<F: * -> * -> *>`) with an `impl Bifunctor<Result>` and a
 generic caller whose parameter has both an explicit kind and bound:
 `F: * -> * -> *, Bifunctor`.
@@ -663,7 +663,7 @@ generic caller whose parameter has both an explicit kind and bound:
 
 ### `examples/multiparam.0s`
 
-**Demonstrates:** Multi-parameter typeclass `Convert<A, B>` with a `where`
+**Demonstrates:** Multi-parameter trait `Convert<A, B>` with a `where`
 clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>`).
 
 | | |
@@ -673,26 +673,26 @@ clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>
 
 ---
 
-### `examples/typeclass_dict.0s`
+### `examples/trait_dict.0s`
 
-**Demonstrates:** User typeclass dictionaries, method sugar, and dictionary
+**Demonstrates:** User trait dictionaries, method sugar, and dictionary
 forwarding through a nested generic call.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/typeclass_dict.0s` |
+| **Run** | `cargo run -- examples/trait_dict.0s` |
 | **Output** | `4242` |
 
 ---
 
-### `examples/typeclass_default.0s`
+### `examples/trait_default.0s`
 
 **Demonstrates:** An omitted default method calling a sibling implementation
 through the same dictionary.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/typeclass_default.0s` |
+| **Run** | `cargo run -- examples/trait_default.0s` |
 | **Output** | `42` |
 
 ---
@@ -700,7 +700,7 @@ through the same dictionary.
 ### `examples/superclass_ord.0s`
 
 **Demonstrates:** Typeclass superclass / implied bounds —
-`typeclass Ordered<T: Equal>` stores `Equal` as a superclass; `fn cmp_eq<T: Ordered>`
+`trait Ordered<T: Equal>` stores `Equal` as a superclass; `fn cmp_eq<T: Ordered>`
 can call `eq_val` without writing `T: Ordered + Equal`. Flattened dict layout
 is subclass methods then superclass methods.
 
@@ -727,7 +727,7 @@ is subclass methods then superclass methods.
 
 ### `examples/assoc_type.0s`
 
-**Demonstrates:** Associated types — `type Elem;` in a typeclass,
+**Demonstrates:** Associated types — `type Elem;` in a trait,
 `type Elem = int;` in the impl, bare `Elem` as a method return type,
 open `C::Elem` under `C: Collect`, and a ground `take_head(Option::Some(42))`
 call that pins the projection to `int`.
@@ -742,11 +742,11 @@ call that pins the projection to `int`.
 ### `examples/gat_pointer.0s`
 
 **Demonstrates:** Generic associated types — `type Ref<T>;` in a
-typeclass, `type Ref<T> = T;` in the impl, and an applied projection
+trait, `type Ref<T> = T;` in the impl, and an applied projection
 `P::Ref<A>` pinned by the selected `Pointer<Option>` instance.
 
 ```0s
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
@@ -1110,14 +1110,14 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `aliases.0s` | Types | `347` |
 | `generic_alias.0s` | Types | `7` |
 | `generic_enum.0s` | Enums / types | `7` |
-| `generics.0s` | Types | `7424.042` |
+| `generics.0s` | Types | `7424.0427` |
 | `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
 | `existential_show.0s` | Types | `42` |
 | `hkt_container.0s` | Types | `42` |
 | `hkt_bifunctor.0s` | Types | `42` |
 | `multiparam.0s` | Types | `42` |
-| `typeclass_dict.0s` | Types | `4242` |
-| `typeclass_default.0s` | Types | `42` |
+| `trait_dict.0s` | Types | `4242` |
+| `trait_default.0s` | Types | `42` |
 | `superclass_ord.0s` | Types | `truetruefalse` |
 | `constraint_kind.0s` | Types | `42` |
 | `assoc_type.0s` | Types | `42` |

@@ -264,7 +264,7 @@ roots = ["./src"]
         ),
         (
             "src/iface.0s",
-            "typeclass Foreign<T> { fn id(T x) -> int; }\n",
+            "trait Foreign<T> { fn id(T x) -> int; }\n",
         ),
     ];
     let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.0s");

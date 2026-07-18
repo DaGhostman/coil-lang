@@ -1,7 +1,7 @@
-// Binary higher-kinded typeclass: Bifunctor<F: * -> * -> *>.
+// Binary higher-kinded trait: Bifunctor<F: * -> * -> *>.
 // Expected output: 42
 
-typeclass Bifunctor<F: * -> * -> *> {
+trait Bifunctor<F: * -> * -> *> {
     fn tag<A, B>(F<A, B> xs) -> int;
 }
 

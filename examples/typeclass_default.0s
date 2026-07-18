@@ -1,6 +1,6 @@
 // Expected output: 7
 
-typeclass Tiny<T> {
+trait Tiny<T> {
     fn base(T x) -> int;
 
     fn next(T x) -> int {

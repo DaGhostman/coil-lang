@@ -1,10 +1,15 @@
-// Expected output: 7424.042
+// Expected output: 7424.0427
 //
-// Userland generic functions with a Num typeclass bound.
-// Builtin Num instances cover int, float, and string (+).
+// Userland generic functions with arithmetic trait bounds.
+// `Num` is a convenience supertrait of `Add`/`Sub`/`Mul`/`Div`.
+// Callers that only need `+` can bound `T: Add` instead.
 // See typeclass_dict.0s and polyfn.0s for user dictionaries and PolyFn values.
 
 fn add<T: Num>(T a, T b) -> T {
+    return a + b;
+}
+
+fn just_add<T: Add>(T a, T b) -> T {
     return a + b;
 }
 
@@ -15,4 +20,5 @@ fn main() {
     // Escaping through PolyFn forces the shared boxed/dictionary path.
     let add_value = add;
     print "%i", add_value(20, 22);
+    print "%i", just_add(3, 4);
 }

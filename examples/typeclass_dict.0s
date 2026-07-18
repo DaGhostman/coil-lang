@@ -1,9 +1,9 @@
 // Expected output: 4242
 //
-// User typeclass dictionaries are consumed inside generic bodies and
+// User trait dictionaries are consumed inside generic bodies and
 // forwarded through nested generic calls.
 
-typeclass Describable<T> {
+trait Describable<T> {
     fn describe_val(T x) -> int;
 }
 
