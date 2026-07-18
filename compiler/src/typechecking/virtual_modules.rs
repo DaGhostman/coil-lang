@@ -121,6 +121,10 @@ impl VirtualModules {
                 BuiltinExport::Enum {
                     name: common::BUILTIN_RESULT_ENUM,
                 },
+                BuiltinExport::TypeClass { name: "Iterator" },
+                BuiltinExport::TypeClass {
+                    name: "IntoIterator",
+                },
             ],
         );
 

@@ -207,6 +207,11 @@ pub enum Instruction {
     /// Panic: pop string message, write `panic: <msg>` to output, abort the VM.
     /// Appended after `MakePolyFnCapture` (Phase prelude::test).
     Panic,
+
+    /// DictEntries: pop dict (`ObjInstance`) → push `ObjArray` of
+    /// `ObjTuple(2)` pairs `(key_string, value)` in table iteration order.
+    /// Used by homogeneous-record `IntoIterator` / `for x in dict`.
+    DictEntries,
 }
 
 impl From<u8> for Instruction {

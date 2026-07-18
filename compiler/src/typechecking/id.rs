@@ -225,11 +225,13 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             body,
             identifier,
         } => {
+            // For-in binds `identifier` before the body; visit order must
+            // match infer (iterable → binding → body).
             pre_walk(iterable, table);
-            pre_walk(body, table);
             if let Some(i) = identifier {
                 pre_walk(i, table);
             }
+            pre_walk(body, table);
         }
 
         Expression::For {

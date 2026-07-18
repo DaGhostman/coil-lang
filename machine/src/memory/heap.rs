@@ -577,6 +577,11 @@ impl ObjInstance {
     pub fn get(&self, key: RefString) -> Option<Member> {
         self.fields.get(key)
     }
+
+    /// Iterate live `(key, value)` entries in table order (DictEntries).
+    pub fn iter_fields(&self) -> impl Iterator<Item = (RefString, Member)> + '_ {
+        self.fields.iter()
+    }
 }
 
 impl GcSized for ObjInstance {

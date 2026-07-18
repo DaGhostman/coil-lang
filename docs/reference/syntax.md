@@ -286,9 +286,10 @@ statement ::= while_stmt
 | `return` | `return expr ';'` |
 | `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
-| `for` | `for '(' init ';' cond ';' step ')' block` (C-style; desugars to `while`) |
+| `for` (C-style) | `for '(' init ';' cond ';' step ')' block` |
+| `for` (iterator) | `for IDENT in expr block` — via prelude `IntoIterator` / `Iterator` (arrays, homogeneous tuples/dicts, coroutines, or user `impl`s; see [Built-ins](built-ins.md#iterator--intoiterator)) |
 | `break` | `break ';'` (innermost loop) |
-| `continue` | `continue ';'` (jumps to `for` step / `while` condition) |
+| `continue` | `continue ';'` (jumps to `for` step / `while` condition / next for-in iteration) |
 | `if` | `if expr block ('else' (block \| if_stmt))?` |
 | Block | `'{' statement* '}'` |
 
@@ -461,7 +462,7 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| Iterator `for x in …` | Not implemented — use C-style `for` or `while` |
+| `for x in` over ranges (`0..n`) | Not implemented — use C-style `for` or an array |
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 

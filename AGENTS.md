@@ -20,7 +20,7 @@
 - Coroutines (Phase 1–2): `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` via `MakeCoro`/`ResumeCoro`/`YieldCoro`/`YieldFromCoro`; `coroutine<Y, S>` types; resume-after-done returns `Value::default()`.
 - Compiler builtins live in virtual modules: `prelude` / `prelude::ops` (auto-imported every file) and `ffi` / `ffi::types` (explicit `use` required). `dload`/`declare`/`invoke` are ordinary identifiers via `use ffi::*`; tags are `ffi::types::{Int,Ptr,…}` (no global `FFIType` name).
 - FFI uses compile-time `extern` blocks (no `use ffi` needed) and runtime `dload`/`declare`/`invoke` with libffi; `resolve_library` resolves paths via entry-script `base_dir`, `zero.toml` `[ffi] search_paths`, and system search; supports Ptr (arrays/tuples), C structs, and callbacks via `FfiSignatureBuilder`.
-- `ARCHIVE_VERSION` is 19; bump on incompatible bytecode, tag, or opcode changes.
+- `ARCHIVE_VERSION` is 20; bump on incompatible bytecode, tag, or opcode changes.
 - `prelude::test::assert` is an auto-imported virtual builtin returning `Result<(), string>`; `panic` is a keyword that aborts the VM (CLI/`zero-script test` treat it as failure).
 - `fib(32)` in `examples/fib.0s` is the primary performance regression benchmark (expected output `2178309`).
 - The CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
