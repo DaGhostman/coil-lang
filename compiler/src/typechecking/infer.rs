@@ -155,6 +155,9 @@ pub struct Checker {
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
+    /// Span fallback when pre-walk / infer NodeIds are misaligned in
+    /// function bodies (same motivation as `bound_method_calls_by_span`).
+    call_site_dicts_by_span: HashMap<(usize, usize), Vec<InstanceDef>>,
 
     /// Open dictionaries forwarded from the enclosing generic function.
     call_site_forward_dicts: HashMap<NodeId, Vec<usize>>,
@@ -398,6 +401,7 @@ impl Checker {
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
+            call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
             call_site_forward_dicts_by_span: HashMap::new(),
             bound_method_calls: HashMap::new(),
@@ -738,6 +742,7 @@ impl Checker {
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
         self.call_site_dicts.clear();
+        self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
         self.call_site_forward_dicts_by_span.clear();
         self.bound_method_calls.clear();
@@ -3368,6 +3373,31 @@ impl Checker {
         self.call_site_dicts.get(&id).map(Vec::as_slice)
     }
 
+    /// Span fallback for [`call_dicts_at`] when NodeIds are misaligned.
+    pub fn call_dicts_for_span(&self, start: usize, end: usize) -> Option<&[InstanceDef]> {
+        self.call_site_dicts_by_span
+            .get(&(start, end))
+            .map(Vec::as_slice)
+    }
+
+    fn record_call_site_dict(
+        &mut self,
+        call_id: Option<NodeId>,
+        range: &Range<usize>,
+        instance: InstanceDef,
+    ) {
+        if let Some(call_id) = call_id {
+            self.call_site_dicts
+                .entry(call_id)
+                .or_default()
+                .push(instance.clone());
+        }
+        self.call_site_dicts_by_span
+            .entry((range.start, range.end))
+            .or_default()
+            .push(instance);
+    }
+
     pub fn forwarded_dicts_at(&self, id: NodeId) -> Option<&[usize]> {
         self.call_site_forward_dicts.get(&id).map(Vec::as_slice)
     }
@@ -4658,12 +4688,7 @@ impl Checker {
                 // registered instances so free args get pinned by the match.
                 match self.find_unique_instance(&c.class, &resolved_args, range) {
                     Ok(Some(instance)) => {
-                        if let Some(call_id) = call_id {
-                            self.call_site_dicts
-                                .entry(call_id)
-                                .or_default()
-                                .push(instance.clone());
-                        }
+                        self.record_call_site_dict(call_id, range, instance.clone());
                         self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                     }
                     Ok(None) => {
@@ -4678,12 +4703,7 @@ impl Checker {
             } else {
                 match self.find_unique_instance(&c.class, &resolved_args, range) {
                     Ok(Some(instance)) => {
-                        if let Some(call_id) = call_id {
-                            self.call_site_dicts
-                                .entry(call_id)
-                                .or_default()
-                                .push(instance.clone());
-                        }
+                        self.record_call_site_dict(call_id, range, instance.clone());
                         self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                     }
                     Ok(None) => {

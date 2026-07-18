@@ -4038,39 +4038,43 @@ impl Compiler {
                     // discharged a concrete instance into `call_dicts_at`.
                     // Emit receiver + args + dictionary, then CallIndirect to
                     // the instance method (dict ABI, `dict_arity = 1`).
-                    if let Some(instances) = self_id
+                    let ground_trait = self_id
                         .and_then(|id| self.checker.call_dicts_at(id))
-                        .filter(|dicts| !dicts.is_empty())
-                    {
-                        let instance = &instances[0];
-                        if let Some(fqn) = instance.method_fqns.get(*method).cloned()
-                            && let Some(&offset) = self.functions.get(&fqn)
-                        {
-                            bytecode.append(&mut self.do_compile(recv));
-                            // Box the receiver when the instance method prologue
-                            // expects an unbox (same contract as Eq/Ord direct calls).
-                            if let Some(recv_ty) = self.receiver_type(recv) {
-                                Self::emit_box_if_needed(&mut bytecode, &recv_ty);
-                            }
-                            let mut nargs = 1u32; // receiver
-                            if let Some(items) = args {
-                                for arg in items {
-                                    self.append_with_existential_pack(&mut bytecode, arg);
-                                    nargs += 1;
-                                }
-                            }
-                            if Self::emit_instance_dict(
-                                &mut bytecode,
-                                &instance.class,
-                                &instance.args,
-                                &self.checker,
-                                &self.functions,
-                            ) {
-                                nargs += 1; // trailing dictionary
-                            }
-                            Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
-                            return bytecode;
+                        .or_else(|| {
+                            self.checker
+                                .call_dicts_for_span(span.start, span.end)
+                        })
+                        .and_then(|dicts| dicts.first())
+                        .and_then(|instance| {
+                            let fqn = instance.method_fqns.get(*method)?.clone();
+                            let offset = *self.functions.get(&fqn)?;
+                            Some((instance.class.clone(), instance.args.clone(), offset))
+                        });
+                    if let Some((class, inst_args, offset)) = ground_trait {
+                        bytecode.append(&mut self.do_compile(recv));
+                        // Box the receiver when the instance method prologue
+                        // expects an unbox (same contract as Eq/Ord direct calls).
+                        if let Some(recv_ty) = self.receiver_type(recv) {
+                            Self::emit_box_if_needed(&mut bytecode, &recv_ty);
                         }
+                        let mut nargs = 1u32; // receiver
+                        if let Some(items) = args {
+                            for arg in items {
+                                self.append_with_existential_pack(&mut bytecode, arg);
+                                nargs += 1;
+                            }
+                        }
+                        if Self::emit_instance_dict(
+                            &mut bytecode,
+                            &class,
+                            &inst_args,
+                            &self.checker,
+                            &self.functions,
+                        ) {
+                            nargs += 1; // trailing dictionary
+                        }
+                        Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
+                        return bytecode;
                     }
 
                     let recv_ty = self.receiver_type(recv);
