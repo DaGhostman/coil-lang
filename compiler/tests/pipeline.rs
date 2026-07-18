@@ -1227,6 +1227,34 @@ fn example_derive_show_eq_prints_expected() {
     );
 }
 
+/// Regression: concrete `<`/`>` codegen must look up `Lt`/`Gt` (not empty
+/// `Ord`), otherwise unit-enum compares fall back to raw heap-pointer `LE`
+/// and become ASLR-flaky (`Red < Blue` randomly false).
+#[test]
+fn derive_ord_unit_variants_compare_by_declaration_order() {
+    let src = r#"
+enum Color derive Ord {
+    Red,
+    Blue,
+}
+
+fn main() {
+    print "%z,", Color::Red < Color::Blue;
+    print "%z,", Color::Blue < Color::Red;
+    print "%z,", Color::Red < Color::Red;
+    print "%z,", Color::Red <= Color::Red;
+    print "%z", Color::Blue > Color::Red;
+}
+"#;
+    for _ in 0..8 {
+        let output = run_example_src(src);
+        assert_eq!(
+            output, "true,false,false,true,true",
+            "unit-enum Ord must be tag-order stable (not pointer order)"
+        );
+    }
+}
+
 /// Regression: `derive Ord` must emit Lt/Le/Gt/Ge + empty Ord (PR #14 layout)
 /// and lexicographic field compare must use strict `<` so equal prefixes fall
 /// through (a Leq-primary fold would short-circuit on equal leading fields).
