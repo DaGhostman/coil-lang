@@ -310,9 +310,10 @@ use io::*;
 | `stdin` / `stdout` / `stderr` | `() -> Stream` | Dup'd fds |
 | `open` / `close` / `read` / `write` | L0 | Never busy-spin; `read` → `Result<Option<int>, IoError>` (`None` = EOF) |
 | `read_exact` / `read_to_end` / `write_all` | Sync adapters | May block in the host via `poll` |
+| `from_bytes` / `to_bytes` | Text | UTF-8 `[byte] ↔ string` (`from_bytes` → `Result<string, IoError>`) |
 | `tcp_connect` / `tcp_listen` / `tcp_accept` / `tcp_accept_wait` | TCP | Same `Stream` contract |
 
-Buffers are **`[byte]`**. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
+Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
 
 See [Tutorial 10 — IO streams](../tutorial/10-io-streams.md) and `examples/io_*.0s`.
 
@@ -325,7 +326,7 @@ There is **no general standard library** yet. The following are **not** built-in
 | Category | Examples |
 |----------|----------|
 | Collections API | `sort`, iterators (`push` / `len` are builtins) |
-| String ops | slice, trim (concat via `+` and `format` are supported) |
+| String ops | slice, trim (concat via `+` / `format`; UTF-8 via `io::from_bytes` / `to_bytes`) |
 | Math | `sin`, `sqrt`, `random` |
 | High-level file helpers | path utilities beyond `io::open` / `read_to_end` / `write_all` |
 | HTTP / TLS | Not in the VM (use userland on top of `io` TCP later) |

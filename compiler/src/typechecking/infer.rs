@@ -643,7 +643,8 @@ impl Checker {
         let res_int = result_app_ty(int(), io_err.clone());
         let res_unit = result_app_ty(unit_ty(), io_err.clone());
         let res_stream = result_app_ty(stream.clone(), io_err.clone());
-        let res_bytes = result_app_ty(bytes.clone(), io_err);
+        let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
+        let res_string = result_app_ty(string(), io_err);
         let fun = |params: &[Ty], ret: Ty| {
             params.iter().rev().fold(ret, |acc, p| {
                 Ty::Fun(Box::new(p.clone()), Box::new(acc))
@@ -657,6 +658,8 @@ impl Checker {
             IoBuiltin::Write => fun(&[stream, bytes], res_int),
             IoBuiltin::ReadToEnd => fun(&[stream], res_bytes),
             IoBuiltin::WriteAll => fun(&[stream, bytes], res_unit),
+            IoBuiltin::FromBytes => fun(&[bytes], res_string),
+            IoBuiltin::ToBytes => fun(&[string()], bytes),
             IoBuiltin::TcpConnect | IoBuiltin::TcpListen => {
                 fun(&[string(), int()], res_stream)
             }

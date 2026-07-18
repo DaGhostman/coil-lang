@@ -539,6 +539,15 @@ Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files and EOF.
 | **Run** | `cargo run -- examples/io_eof.0s` |
 | **Output** | `eof` |
 
+### `examples/io_text.0s`
+
+**Demonstrates:** `from_bytes` (`[byte]` → UTF-8 `string`) and `to_bytes` (`string` → `[byte]`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_text.0s` |
+| **Output** | `hello2` |
+
 See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
 
 ---
@@ -1195,6 +1204,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `io_bytes.0s` | IO | `25532` |
 | `io_file.0s` | IO | `2` |
 | `io_eof.0s` | IO | `eof` |
+| `io_text.0s` | IO | `hello2` |
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |

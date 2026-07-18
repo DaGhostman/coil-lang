@@ -85,6 +85,10 @@ pub enum IoBuiltin {
     ReadExact,
     ReadToEnd,
     WriteAll,
+    /// Decode `[byte]` as UTF-8 → `Result<string, IoError>`.
+    FromBytes,
+    /// Encode `string` → `[byte]` (UTF-8).
+    ToBytes,
     TcpConnect,
     TcpListen,
     TcpAccept,
@@ -104,6 +108,8 @@ impl IoBuiltin {
             Self::ReadExact => "read_exact",
             Self::ReadToEnd => "read_to_end",
             Self::WriteAll => "write_all",
+            Self::FromBytes => "from_bytes",
+            Self::ToBytes => "to_bytes",
             Self::TcpConnect => "tcp_connect",
             Self::TcpListen => "tcp_listen",
             Self::TcpAccept => "tcp_accept",
@@ -123,6 +129,8 @@ impl IoBuiltin {
             Self::ReadExact,
             Self::ReadToEnd,
             Self::WriteAll,
+            Self::FromBytes,
+            Self::ToBytes,
             Self::TcpConnect,
             Self::TcpListen,
             Self::TcpAccept,

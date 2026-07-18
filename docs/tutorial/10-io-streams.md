@@ -30,6 +30,27 @@ fn main() {
 `byte` implements `Show` and `Eq`. It is **not** in `Num` / `Add` yet — use
 `int` for arithmetic and convert at the boundary if needed.
 
+### Text helpers
+
+| Function | Signature | Notes |
+|----------|-----------|--------|
+| `from_bytes` | `[byte] → Result<string, IoError>` | UTF-8 decode; invalid sequences → `InvalidInput` |
+| `to_bytes` | `string → [byte]` | UTF-8 encode (always succeeds) |
+
+```0s
+use io::*;
+
+fn main() {
+    let hello: [byte] = [104, 101, 108, 108, 111];
+    print "%s", match from_bytes(hello) {
+        Result::Ok(s) => s,
+        Result::Err(_) => "err",
+    };
+}
+```
+
+See `examples/io_text.0s`.
+
 ---
 
 ## Streams

@@ -514,6 +514,52 @@ pub fn value_as_string(heap: &Heap, v: Value) -> Result<String, IoErrorTag> {
     }
 }
 
+/// Read a heap `[byte]` array into a Rust `Vec<u8>`.
+pub fn value_as_bytes(heap: &Heap, v: Value) -> Result<Vec<u8>, IoErrorTag> {
+    match heap.find_object_by_addr(v.raw() as u64) {
+        Some(Object::Array(arr_gc)) => Ok(arr_gc
+            .as_ref()
+            .elements
+            .iter()
+            .map(|e| {
+                let n = e.as_int();
+                if (0..=255).contains(&n) {
+                    n as u8
+                } else {
+                    // Out-of-range elements are a typechecker bug; clamp
+                    // defensively rather than panicking in the host.
+                    (n as u8)
+                }
+            })
+            .collect()),
+        _ => Err(IoErrorTag::InvalidInput),
+    }
+}
+
+/// Decode `[byte]` as UTF-8 into a heap string.
+///
+/// Invalid UTF-8 → `Err(InvalidInput)`.
+pub fn from_bytes(heap: &mut Heap, buf: Value) -> Result<Value, IoErrorTag> {
+    let bytes = value_as_bytes(heap, buf)?;
+    let s = String::from_utf8(bytes).map_err(|_| IoErrorTag::InvalidInput)?;
+    let gc = heap.intern(s);
+    Ok(Value::from(gc.as_ptr() as *mut u8 as u64))
+}
+
+/// Encode a heap string as a fresh `[byte]` array (UTF-8).
+///
+/// Non-string input yields an empty array (defensive — the typechecker
+/// rejects this case).
+pub fn to_bytes(heap: &mut Heap, s: Value) -> Value {
+    let bytes = match value_as_string(heap, s) {
+        Ok(text) => text.into_bytes(),
+        Err(_) => Vec::new(),
+    };
+    let elements: Vec<Value> = bytes.iter().map(|&b| Value::from(b as i64)).collect();
+    let (obj, _) = heap.alloc(ObjArray { elements }, Object::Array);
+    Value::from(obj.addr())
+}
+
 /// Helper: wrap a fallible stream op that returns a Value into `Result<_, IoError>`.
 pub fn as_result_value(heap: &mut Heap, r: Result<Value, IoErrorTag>) -> Value {
     match r {
@@ -653,6 +699,49 @@ mod tests {
         let ok_none = as_result_option_int(&mut heap, Ok(None));
         assert_eq!(enum_tag(&heap, ok_none), Some(0));
         let err = as_result_option_int(&mut heap, Err(IoErrorTag::WouldBlock));
+        assert_eq!(enum_tag(&heap, err), Some(1));
+    }
+
+    #[test]
+    fn from_bytes_decodes_utf8() {
+        let mut heap = Heap::default();
+        let buf = make_byte_array(&mut heap, b"hello");
+        let s = from_bytes(&mut heap, buf).expect("utf-8");
+        assert_eq!(value_as_string(&heap, s).unwrap(), "hello");
+    }
+
+    #[test]
+    fn from_bytes_rejects_invalid_utf8() {
+        let mut heap = Heap::default();
+        let buf = make_byte_array(&mut heap, &[0xff, 0xfe]);
+        let err = from_bytes(&mut heap, buf).unwrap_err();
+        assert_eq!(err, IoErrorTag::InvalidInput);
+    }
+
+    #[test]
+    fn to_bytes_round_trips_with_from_bytes() {
+        let mut heap = Heap::default();
+        let s = {
+            let gc = heap.intern("Hi".into());
+            Value::from(gc.as_ptr() as *mut u8 as u64)
+        };
+        let buf = to_bytes(&mut heap, s);
+        assert_eq!(array_bytes(&heap, buf), b"Hi");
+        let back = from_bytes(&mut heap, buf).expect("round-trip");
+        assert_eq!(value_as_string(&heap, back).unwrap(), "Hi");
+    }
+
+    #[test]
+    fn from_bytes_as_result_wraps_ok_and_err() {
+        let mut heap = Heap::default();
+        let ok_buf = make_byte_array(&mut heap, b"x");
+        let ok_inner = from_bytes(&mut heap, ok_buf);
+        let ok = as_result_value(&mut heap, ok_inner);
+        assert_eq!(enum_tag(&heap, ok), Some(0));
+
+        let err_buf = make_byte_array(&mut heap, &[0x80]);
+        let err_inner = from_bytes(&mut heap, err_buf);
+        let err = as_result_value(&mut heap, err_inner);
         assert_eq!(enum_tag(&heap, err), Some(1));
     }
 

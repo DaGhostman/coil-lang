@@ -139,10 +139,10 @@ impl Pipeline {
     /// from `use io::*` / [`Checker::io_fn_scheme`], not from the FFI env.
     fn register_io_natives(&mut self) {
         use machine::io::{
-            as_result_int, as_result_option_int, as_result_unit, as_result_value, stream_close,
-            stream_open, stream_read, stream_read_exact, stream_read_to_end, stream_stderr,
-            stream_stdin, stream_stdout, stream_write, stream_write_all, tcp_accept,
-            tcp_accept_wait, tcp_connect, tcp_listen, value_as_string,
+            as_result_int, as_result_option_int, as_result_unit, as_result_value, from_bytes,
+            stream_close, stream_open, stream_read, stream_read_exact, stream_read_to_end,
+            stream_stderr, stream_stdin, stream_stdout, stream_write, stream_write_all, tcp_accept,
+            tcp_accept_wait, tcp_connect, tcp_listen, to_bytes, value_as_string,
         };
 
         for kind in IoBuiltin::all() {
@@ -151,6 +151,8 @@ impl Pipeline {
                 IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => 0,
                 IoBuiltin::Close
                 | IoBuiltin::ReadToEnd
+                | IoBuiltin::FromBytes
+                | IoBuiltin::ToBytes
                 | IoBuiltin::TcpAccept
                 | IoBuiltin::TcpAcceptWait => 1,
                 IoBuiltin::Open
@@ -214,6 +216,11 @@ impl Pipeline {
                             let r = stream_write_all(heap, args[0], args[1]);
                             as_result_unit(heap, r)
                         }
+                        IoBuiltin::FromBytes => {
+                            let r = from_bytes(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::ToBytes => to_bytes(heap, args[0]),
                         IoBuiltin::TcpConnect => {
                             let host = match value_as_string(heap, args[0]) {
                                 Ok(s) => s,

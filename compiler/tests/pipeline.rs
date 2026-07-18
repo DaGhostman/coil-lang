@@ -1175,3 +1175,9 @@ fn example_io_eof_prints_eof() {
     let output = run_example("examples/io_eof.0s");
     assert_eq!(output, "eof");
 }
+
+#[test]
+fn example_io_text_prints_hello2() {
+    let output = run_example("examples/io_text.0s");
+    assert_eq!(output, "hello2");
+}
