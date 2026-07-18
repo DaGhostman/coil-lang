@@ -101,7 +101,8 @@ The type after `for` is prepended as the first type argument (Self slot):
 Example:
 
 ```0s
-// Builtin arithmetic traits: Add / Sub / Mul / Div; Num implies all four.
+// Builtin arithmetic: Add / Sub / Mul / Div (Num implies all four).
+// Builtin ordering: Lt / Le / Gt / Ge (Ord implies all four).
 
 trait Collect<C> {
     type Elem;

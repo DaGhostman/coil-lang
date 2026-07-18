@@ -892,7 +892,10 @@ impl Checker {
             ("Sub", &["sub"][..], false),
             ("Mul", &["mul"][..], false),
             ("Div", &["div"][..], false),
-            ("Ord", &["lt", "le", "gt", "ge"][..], true),
+            ("Lt", &["lt"][..], true),
+            ("Le", &["le"][..], true),
+            ("Gt", &["gt"][..], true),
+            ("Ge", &["ge"][..], true),
             ("Eq", &["eq", "ne"][..], true),
         ] {
             for method in methods {
@@ -1162,10 +1165,10 @@ impl Checker {
             // ---- Comparison ----
             Expression::Eq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Eq", "eq"),
             Expression::Neq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Eq", "ne"),
-            Expression::Le(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "lt"),
-            Expression::Gt(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "gt"),
-            Expression::Leq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "le"),
-            Expression::Geq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ord", "ge"),
+            Expression::Le(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Lt", "lt"),
+            Expression::Gt(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Gt", "gt"),
+            Expression::Leq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Le", "le"),
+            Expression::Geq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ge", "ge"),
 
             // ---- Prefix / postfix ----
             Expression::Negate(e) | Expression::Positive(e) => self.infer(e),
@@ -8095,7 +8098,18 @@ impl Checker {
     pub fn is_builtin_class(class: &str) -> bool {
         matches!(
             class,
-            "Add" | "Sub" | "Mul" | "Div" | "Num" | "Ord" | "Eq" | "Show"
+            "Add"
+                | "Sub"
+                | "Mul"
+                | "Div"
+                | "Num"
+                | "Lt"
+                | "Le"
+                | "Gt"
+                | "Ge"
+                | "Ord"
+                | "Eq"
+                | "Show"
         )
     }
 
@@ -10960,6 +10974,61 @@ mod tests {
             msgs.iter()
                 .any(|m| m.message().contains("without bound `Mul`")),
             "expected missing Mul bound diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `T: Ord` still lowers `a < b` through the flattened Lt slot (0).
+    #[test]
+    fn ord_bound_lt_uses_lt_superclass_dict_slot() {
+        let src = r#"
+            fn less<T: Ord>(T a, T b) -> bool { return a < b; }
+            fn main() { let x = less(1, 2); }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let hint = c
+            .id_table()
+            .ids()
+            .iter()
+            .find_map(|id| c.bound_operator_call_at(*id))
+            .expect("expected a bound operator call for `<`");
+        assert_eq!(hint.dict_index, 0);
+        assert_eq!(
+            hint.method_slot, 0,
+            "Lt::lt should be slot 0 in Ord's flattened dict"
+        );
+    }
+
+    /// `T: Lt` is enough for `<` without a full `Ord` bound.
+    #[test]
+    fn lt_bound_alone_allows_less_than() {
+        let src = r#"
+            fn just_lt<T: Lt>(T a, T b) -> bool { return a < b; }
+            fn main() { let x = just_lt(1, 2); }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
+        let hint = c
+            .id_table()
+            .ids()
+            .iter()
+            .find_map(|id| c.bound_operator_call_at(*id))
+            .expect("expected a bound operator call for `<`");
+        assert_eq!(hint.method_slot, 0);
+    }
+
+    /// `T: Lt` does not allow `>`.
+    #[test]
+    fn lt_bound_does_not_allow_gt() {
+        let src = r#"
+            fn bad<T: Lt>(T a, T b) -> bool { return a > b; }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("without bound `Gt`")),
+            "expected missing Gt bound diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
