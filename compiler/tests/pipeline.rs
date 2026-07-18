@@ -205,7 +205,7 @@ fn example_show_tuple_prints_structural_tuple_and_record() {
     assert_eq!(output, "(1, 2){ a: 3, b: 4 }");
 }
 
-/// Phase 5: single-argument HKT `Container<Option>` + `get<F: Container, A>(F<A>)`.
+/// Constructor-kind typeclass `Container<Option>` + `get<F: Container, A>(F<A>)`.
 #[test]
 fn example_hkt_container_prints_42() {
     let output = run_example("examples/hkt_container.0s");

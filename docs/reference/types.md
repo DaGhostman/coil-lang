@@ -636,8 +636,11 @@ generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
 See `examples/generics.0s`, `examples/typeclass_dict.0s`,
-`examples/superclass_ord.0s`, `examples/assoc_type.0s`,
-`examples/gat_pointer.0s`, and `examples/polyfn.0s` for runnable demos.
+`examples/existential_show.0s`, `examples/hkt_container.0s`,
+`examples/hkt_bifunctor.0s`, `examples/multiparam.0s`,
+`examples/constraint_kind.0s`, `examples/superclass_ord.0s`,
+`examples/assoc_type.0s`, `examples/gat_pointer.0s`, and
+`examples/polyfn.0s` for runnable demos.
 
 ### Boxing and unboxing at generic boundaries
 
@@ -682,11 +685,14 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer; parametric aliases (`type Pair<T> = …`) expand on application |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
-| Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` and user `enum Box<T>` as `Ty::App` (construct/match freshen payloads); builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
-| Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *`; kind variables are not supported |
+| Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `typeclass`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
+| Typeclass runtime | User-defined typeclass calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Ord`/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
+| Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
+| Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
+| Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |
+| Typeclass deriving | No automatic deriving; write each `impl` explicitly |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
-| Chained field access | Typechecker validates; codegen uses side-table for simple receivers |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |
 | `async fn` `-> T` annotation | When present, `T` is unified with the coroutine yield/return type `Y` (same slot as `yield` / `return` / `resume`). A mismatch is a type error. |
 

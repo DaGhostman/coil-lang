@@ -1089,6 +1089,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `print_literal.0s` | Basics | `hello` |
 | `format_literal.0s` | Basics | `42` |
 | `string_fmt.0s` | Basics | `hello world42-x` |
+| `show_tuple.0s` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.0s` | Basics | `51020` |
 | `const.0s` | Basics | `42hi` |
 | `for_break.0s` | Basics | `18` |
@@ -1111,7 +1112,9 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `generic_enum.0s` | Enums / types | `7` |
 | `generics.0s` | Types | `7424.042` |
 | `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
+| `existential_show.0s` | Types | `42` |
 | `hkt_container.0s` | Types | `42` |
+| `hkt_bifunctor.0s` | Types | `42` |
 | `multiparam.0s` | Types | `42` |
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |

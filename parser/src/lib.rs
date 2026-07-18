@@ -4107,9 +4107,9 @@ mod tests_generics {
         assert!(s.contains("show"), "got: {s}");
     }
 
-    /// Phase 5: `F: * -> *` parses as an Arrow-kinded type parameter.
+    /// `F: * -> *` parses as an Arrow-kinded type parameter.
     #[test]
-    fn unary_hkt_kind_annotation_parses() {
+    fn constructor_kind_annotation_parses() {
         match decl_ast!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }") {
             Expression::TypeClass { type_params, .. } => {
                 assert_eq!(type_params.len(), 1);
@@ -4202,9 +4202,9 @@ mod tests_generics {
         }
     }
 
-    /// Phase 5: Display keeps the kind annotation on HKT params.
+    /// Display keeps constructor-kind annotations on type params.
     #[test]
-    fn unary_hkt_kind_display_round_trips() {
+    fn constructor_kind_display_round_trips() {
         let s = stmt!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }");
         assert!(
             s.contains("F: * -> *"),

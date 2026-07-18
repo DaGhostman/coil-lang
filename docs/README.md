@@ -44,6 +44,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |
 | Tuples, arrays (`push` / `len`), dicts (anonymous records) | Supported |
 | Type aliases (`type Name = T;`, lexically scoped) | Supported |
+| Generics and typeclasses | Supported: generic functions/enums/aliases/classes, higher-kinded type parameters, associated types/GATs, existentials, coherence checks |
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
@@ -135,6 +136,7 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 | Enums & pattern matching | `examples/option.0s`, `examples/result.0s` |
 | Record-shaped variants | `examples/record.0s`, `examples/mixed.0s` |
 | Dicts / anonymous records | `examples/dict.0s` |
+| Generics & typeclasses | `examples/generics.0s`, `examples/hkt_bifunctor.0s`, `examples/gat_pointer.0s`, `examples/existential_show.0s` |
 | Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
 | FFI | `examples/strlen.0s`, `examples/ffi_sum.0s` |
 | Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s` |
