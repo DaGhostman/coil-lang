@@ -295,7 +295,7 @@ fn contains_var(ty: &Ty) -> bool {
         Ty::Array { element, .. } => contains_var(element),
         Ty::Record { fields } => fields.iter().any(|(_, ty)| contains_var(ty)),
         Ty::Forall { body, .. } => contains_var(body),
-        Ty::Con(_) => false,
+        Ty::Con(_) | Ty::Existential { .. } => false,
     }
 }
 

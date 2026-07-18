@@ -53,6 +53,9 @@ pub enum Ty {
     Record {
         fields: Vec<(String, Ty)>,
     },
+    Existential {
+        class: String,
+    },
     Forall {
         bounds: Vec<TyVarId>,
         constraints: Vec<Constraint>,
@@ -508,6 +511,7 @@ pub fn subst_ty_params(ty: &Ty, params: &std::collections::HashMap<String, Ty>) 
                 .map(|(n, t)| (n.clone(), subst_ty_params(t, params)))
                 .collect(),
         },
+        Ty::Existential { .. } => ty.clone(),
         Ty::Forall {
             bounds,
             constraints,
@@ -547,7 +551,7 @@ pub fn schemaize_ty(ty: &Ty, var_to_name: &std::collections::HashMap<TyVarId, St
             .get(id)
             .map(|n| Ty::Con(n.clone()))
             .unwrap_or_else(|| ty.clone()),
-        Ty::Con(_) => ty.clone(),
+        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
         Ty::Fun(a, b) => Ty::Fun(
             Box::new(schemaize_ty(a, var_to_name)),
             Box::new(schemaize_ty(b, var_to_name)),
@@ -625,7 +629,7 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         Ty::Var(v) => {
             acc.insert(*v);
         }
-        Ty::Con(_) => {}
+        Ty::Con(_) | Ty::Existential { .. } => {}
         Ty::Fun(a, b) => {
             go(a, acc);
             go(b, acc);

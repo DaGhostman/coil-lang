@@ -191,6 +191,13 @@ fn example_generic_print_shows_primitives_and_user_type() {
     assert_eq!(output, "42hi1.5true(3,4)99");
 }
 
+/// Advanced generics Phase 4: a bare unary typeclass name is an existential type.
+#[test]
+fn example_existential_show_prints_42() {
+    let output = run_example("examples/existential_show.0s");
+    assert_eq!(output, "42");
+}
+
 /// Phase 8: tuples and anonymous records have structural Show for `%v`.
 #[test]
 fn example_show_tuple_prints_structural_tuple_and_record() {
@@ -540,14 +547,14 @@ fn let_binding_emits_store_pop_in_bytecode() {
     let (bytecode, _constants) = pipeline.compile_test("", &ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
-    let store_pop_count = bytecode
+    let binding_store_pop_count = bytecode
         .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+        .filter(|b| matches!(b.bytecode(), Instruction::StorePop) && b.operand_u32() == 0)
         .count();
     assert_eq!(
-        store_pop_count, 2,
-        "expected exactly 2 StorePop for one let + one re-assignment; got {}",
-        store_pop_count
+        binding_store_pop_count, 2,
+        "expected exactly 2 StorePop writes to binding slot 0 for one let + one re-assignment; got {}",
+        binding_store_pop_count
     );
 
     let store_count = bytecode

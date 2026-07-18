@@ -356,6 +356,7 @@ the same constraint shape as `where Num<T>`.
 | `fn add<T: Num>(T a, T b) -> T` | `T` must satisfy the `Num` bound |
 | `fn both<T: Num + Eq>(T x) -> T` | Multiple bounds (`+`) |
 | `fn f<A, B>(A x) -> B where Convert<A, B>` | Multi-param (or unary) `where` constraint |
+| `fn print_any(Show x)` | Bare unary typeclass name as an existential value type |
 | `typeclass Container<F: * -> *>` | Unary type-constructor parameter |
 | `typeclass Bifunctor<F: * -> * -> *>` | Binary type-constructor parameter |
 | `typeclass Higher<F: (* -> *) -> *>` | Higher-order constructor parameter |
@@ -387,6 +388,40 @@ impl Describable<int> { fn describe_val(int x) -> int { return x + 1; } }
 fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 // show(42) → CALL arity = 2 (value + Describable dict)
 ```
+
+### Bare-class existential types
+
+A unary typeclass name in a value type position denotes an existential value:
+
+```0s
+fn print_any(Show x) {
+    print "%s", show(x);
+}
+
+fn main() {
+    print_any(42); // packs the int value with the Show<int> dictionary
+}
+```
+
+This applies in function parameters, `let` annotations, and return annotations:
+`Show x`, `let x: Show = 42;`, and `-> Show`.
+
+`T: Show` is still universal: one function body works for every caller-chosen
+`T` that satisfies the bound. A bare `Show` value is existential: the concrete
+type is hidden after the pack site, and calls such as `show(x)` dispatch through
+the dictionary stored with the value.
+
+Rules:
+
+- Only unary typeclasses whose parameter has kind `Type` may be used this way.
+  Multi-parameter classes such as `Convert<A, B>` are rejected as bare value
+  types.
+- If a concrete type constructor and a typeclass have the same name, the type
+  constructor wins.
+- Packing a concrete value requires exactly one matching instance; otherwise
+  the call site reports `No instance for Class<T>`.
+- Runtime representation reuses existing tuple bytecode: `(boxed_value,
+  dictionary_tuple)`. No separate opcode is needed.
 
 Bound methods support both equivalent forms:
 

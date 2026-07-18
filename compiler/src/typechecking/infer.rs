@@ -13,8 +13,8 @@ use super::env::{Env, TyVarCounter, instantiate_with_kinds};
 use super::generics::{
     AssocTypeDecl, AssocTypeValue, Generics, InstanceDef, TypeClassDef, TypeClassMethodDef,
 };
-use super::kind::Kind;
 use super::id::{self, IdTable, NodeId};
+use super::kind::Kind;
 use super::subst::{Subst, apply_ty, apply_ty_prune, compose};
 use super::ty::{AssocProjection, Constraint, Scheme};
 
@@ -41,6 +41,21 @@ pub struct BoundOperatorCall {
 pub struct BoundDisplayCall {
     pub dict_index: usize,
     pub method_slot: usize,
+}
+
+/// Code-generation recipe for a typeclass method call on an existential pack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistentialMethodCall {
+    pub method_slot: usize,
+    pub arity: usize,
+    pub has_receiver: bool,
+}
+
+/// Code-generation recipe for packing a concrete value as a bare-class existential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistentialPack {
+    pub class: String,
+    pub value_ty: Ty,
 }
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
@@ -124,6 +139,13 @@ pub struct Checker {
     /// `%v` arguments resolved through an active `Show` constraint.
     bound_display_calls: HashMap<NodeId, BoundDisplayCall>,
     bound_display_calls_by_span: HashMap<(usize, usize), BoundDisplayCall>,
+
+    /// Expressions whose result must be packed as `(boxed_value, dict)`.
+    existential_packs_by_span: HashMap<(usize, usize), ExistentialPack>,
+
+    /// Calls dispatched through an existential argument/receiver dictionary.
+    existential_method_calls: HashMap<NodeId, ExistentialMethodCall>,
+    existential_method_calls_by_span: HashMap<(usize, usize), ExistentialMethodCall>,
 
     /// Typeclass method signatures, keyed by `(class, method)`.
     typeclass_method_schemes: HashMap<(String, String), Scheme>,
@@ -338,6 +360,9 @@ impl Checker {
             bound_operator_calls_by_span: HashMap::new(),
             bound_display_calls: HashMap::new(),
             bound_display_calls_by_span: HashMap::new(),
+            existential_packs_by_span: HashMap::new(),
+            existential_method_calls: HashMap::new(),
+            existential_method_calls_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
             type_aliases: vec![HashMap::new()],
             generic_aliases: HashMap::new(),
@@ -484,6 +509,9 @@ impl Checker {
         self.bound_operator_calls_by_span.clear();
         self.bound_display_calls.clear();
         self.bound_display_calls_by_span.clear();
+        self.existential_packs_by_span.clear();
+        self.existential_method_calls.clear();
+        self.existential_method_calls_by_span.clear();
         self.typeclass_method_schemes.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
@@ -713,6 +741,7 @@ impl Checker {
             | Ty::Tuple(_)
             | Ty::Array { .. }
             | Ty::Record { .. }
+            | Ty::Existential { .. }
             | Ty::Forall { .. } => Kind::Type,
         }
     }
@@ -864,16 +893,16 @@ impl Checker {
                     Box::new(Ty::Var(var)),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Var(var)),
-                        Box::new(if returns_bool { boolean() } else { Ty::Var(var) }),
+                        Box::new(if returns_bool {
+                            boolean()
+                        } else {
+                            Ty::Var(var)
+                        }),
                     )),
                 );
                 self.typeclass_method_schemes.insert(
                     (class.to_string(), (*method).to_string()),
-                    Scheme::poly(
-                        vec![var],
-                        vec![Constraint::unary(class, var)],
-                        ty,
-                    ),
+                    Scheme::poly(vec![var], vec![Constraint::unary(class, var)], ty),
                 );
             }
         }
@@ -1096,7 +1125,7 @@ impl Checker {
                 }
                 let val_ty = self.infer(value);
                 let target_ty = self.infer_mutable_lvalue(name, range.clone());
-                self.unify(&target_ty, &val_ty, &range, "assignment");
+                self.coerce_or_unify(&target_ty, &val_ty, Some(value), &range, "assignment");
                 apply_ty_prune(&self.subst, &val_ty)
             }
 
@@ -1176,6 +1205,36 @@ impl Checker {
                 if let Expression::Access(recv, method) = name.1.as_ref() {
                     let recv_ty = self.infer(recv);
                     let resolved = apply_ty_prune(&self.subst, &recv_ty);
+                    if let Ty::Existential { class } = &resolved
+                        && let Some((owner, method_slot, scheme)) =
+                            self.existential_method_candidate(class, method)
+                    {
+                        let mut arg_tys = vec![recv_ty];
+                        if let Some(a) = args {
+                            for arg in a {
+                                arg_tys.push(self.infer(arg));
+                            }
+                        }
+                        let hint = ExistentialMethodCall {
+                            method_slot,
+                            arity: arg_tys.len(),
+                            has_receiver: true,
+                        };
+                        if let Some(call_id) = id {
+                            self.existential_method_calls.insert(call_id, hint.clone());
+                        }
+                        self.existential_method_calls_by_span
+                            .insert((range.start, range.end), hint);
+                        return self.apply_existential_method(
+                            &owner,
+                            method,
+                            &scheme,
+                            &arg_tys,
+                            args.as_deref(),
+                            id,
+                            range,
+                        );
+                    }
                     if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
                         let candidates = self.bound_method_candidates(method, Some(receiver_var));
                         if let Some((dict_index, class, method_slot, scheme)) =
@@ -1220,7 +1279,11 @@ impl Checker {
                             if !constraints.is_empty() {
                                 self.discharge_constraints(id, &constraints, &range);
                                 self.pin_assoc_after_discharge(
-                                    &class, &constraints, Some(&scheme), &mapping, &range,
+                                    &class,
+                                    &constraints,
+                                    Some(&scheme),
+                                    &mapping,
+                                    &range,
                                 );
                             }
                             return result;
@@ -1304,12 +1367,37 @@ impl Checker {
                 // Bare/UFCS typeclass method call: `method(x)`.
                 // Resolve it before ordinary environment lookup because class
                 // methods are selected by the active bound, not by a global FQN.
+                let arg_tys: Vec<Ty> = match args {
+                    Some(a) => a.iter().map(|arg| self.infer(arg)).collect(),
+                    None => Vec::new(),
+                };
+                if let Some(Ty::Existential { class }) =
+                    arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
+                    && let Some((owner, method_slot, scheme)) =
+                        self.existential_method_candidate(&class, &ident)
+                {
+                    let hint = ExistentialMethodCall {
+                        method_slot,
+                        arity: arg_tys.len(),
+                        has_receiver: false,
+                    };
+                    if let Some(call_id) = id {
+                        self.existential_method_calls.insert(call_id, hint.clone());
+                    }
+                    self.existential_method_calls_by_span
+                        .insert((range.start, range.end), hint);
+                    return self.apply_existential_method(
+                        &owner,
+                        &ident,
+                        &scheme,
+                        &arg_tys,
+                        args.as_deref(),
+                        id,
+                        range,
+                    );
+                }
                 let candidates = self.bound_method_candidates(&ident, None);
                 if !candidates.is_empty() {
-                    let arg_tys: Vec<Ty> = match args {
-                        Some(a) => a.iter().map(|arg| self.infer(arg)).collect(),
-                        None => Vec::new(),
-                    };
                     let receiver_var = arg_tys.first().and_then(|ty| {
                         Self::constraint_var_of_ty(&apply_ty_prune(&self.subst, ty))
                     });
@@ -1352,7 +1440,11 @@ impl Checker {
                         if !constraints.is_empty() {
                             self.discharge_constraints(id, &constraints, &range);
                             self.pin_assoc_after_discharge(
-                                &class, &constraints, Some(&scheme), &mapping, &range,
+                                &class,
+                                &constraints,
+                                Some(&scheme),
+                                &mapping,
+                                &range,
                             );
                         }
                         return result;
@@ -1372,11 +1464,6 @@ impl Checker {
                             range,
                         );
                     }
-                };
-
-                let arg_tys: Vec<Ty> = match args {
-                    Some(a) => a.iter().map(|arg| self.infer(arg)).collect(),
-                    None => Vec::new(),
                 };
 
                 let result = self.apply_function(
@@ -1444,7 +1531,7 @@ impl Checker {
             Expression::Return(e) | Expression::ImplicitReturn(e) => {
                 let ty = self.infer(e);
                 if let Some(ret) = self.current_return_ty.clone() {
-                    self.unify(&ret, &ty, &e.0.into_range(), "return value");
+                    self.coerce_or_unify(&ret, &ty, Some(e), &e.0.into_range(), "return value");
                 }
                 ty
             }
@@ -1964,8 +2051,7 @@ impl Checker {
                             ),
                         }
                     }
-                    Ty::App(head, args)
-                        if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
+                    Ty::App(head, args) if matches!(head.as_ref(), Ty::Con(n) if self.classes.contains_key(n)) =>
                     {
                         let name = match head.as_ref() {
                             Ty::Con(n) => n.clone(),
@@ -2047,10 +2133,7 @@ impl Checker {
                     // instantiations don't share type variables.
                     let (field_tys, result_ty) = if param_names.is_empty() {
                         (
-                            fields
-                                .iter()
-                                .map(|(_, _, t)| t.clone())
-                                .collect::<Vec<_>>(),
+                            fields.iter().map(|(_, _, t)| t.clone()).collect::<Vec<_>>(),
                             Ty::Con(class_name.clone()),
                         )
                     } else {
@@ -2124,11 +2207,7 @@ impl Checker {
                         .expect("type-param frame just pushed");
                     type_params
                         .iter()
-                        .map(|tp| {
-                            *frame
-                                .get(tp.name)
-                                .expect("type param registered in frame")
-                        })
+                        .map(|tp| *frame.get(tp.name).expect("type param registered in frame"))
                         .collect()
                 } else {
                     Vec::new()
@@ -2137,10 +2216,7 @@ impl Checker {
                 if type_params.is_empty() {
                     self.register_type_alias(name, alias_ty, range);
                 } else {
-                    let params = type_params
-                        .iter()
-                        .map(|tp| tp.name.to_string())
-                        .collect();
+                    let params = type_params.iter().map(|tp| tp.name.to_string()).collect();
                     self.register_generic_alias(name, params, param_vars, alias_ty, range);
                 }
                 let _ = self.infer(ty); // ID alignment
@@ -2232,10 +2308,7 @@ impl Checker {
                                     .collect::<Vec<_>>();
                                 assoc_types.push(AssocTypeDecl::new(
                                     aname.to_string(),
-                                    assoc_params
-                                        .iter()
-                                        .map(|tp| tp.name.to_string())
-                                        .collect(),
+                                    assoc_params.iter().map(|tp| tp.name.to_string()).collect(),
                                     param_kinds,
                                 ));
                             }
@@ -2367,10 +2440,7 @@ impl Checker {
                         all_bounds.extend(assoc_projections.iter().map(|p| p.var));
                         let mut all_kinds = class_kinds.clone();
                         all_kinds.extend(method_kinds);
-                        all_kinds.extend(std::iter::repeat_n(
-                            Kind::Type,
-                            assoc_projections.len(),
-                        ));
+                        all_kinds.extend(std::iter::repeat_n(Kind::Type, assoc_projections.len()));
                         self.typeclass_method_schemes.insert(
                             (name.to_string(), method_name.to_string()),
                             Scheme::poly_with_kinds_and_assoc(
@@ -2459,7 +2529,10 @@ impl Checker {
                         "existing instance was declared in module `{}`",
                         existing.defined_module
                     ));
-                    msg.push(Label::new("new instance declared here".to_string(), range.clone()));
+                    msg.push(Label::new(
+                        "new instance declared here".to_string(),
+                        range.clone(),
+                    ));
                     if existing.defined_module == self.current_module {
                         msg.push(Label::new(
                             "existing overlapping instance declared here".to_string(),
@@ -2715,8 +2788,7 @@ impl Checker {
                             range.clone(),
                         ));
                     }
-                    let missing_assoc =
-                        Generics::missing_assoc_types(class_def, &assoc_tys);
+                    let missing_assoc = Generics::missing_assoc_types(class_def, &assoc_tys);
                     if !missing_assoc.is_empty() {
                         let names = missing_assoc
                             .iter()
@@ -2881,6 +2953,22 @@ impl Checker {
         self.bound_display_calls_by_span.get(&(start, end))
     }
 
+    pub fn existential_pack_for_span(&self, start: usize, end: usize) -> Option<&ExistentialPack> {
+        self.existential_packs_by_span.get(&(start, end))
+    }
+
+    pub fn existential_method_call_at(&self, id: NodeId) -> Option<&ExistentialMethodCall> {
+        self.existential_method_calls.get(&id)
+    }
+
+    pub fn existential_method_call_for_span(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<&ExistentialMethodCall> {
+        self.existential_method_calls_by_span.get(&(start, end))
+    }
+
     pub fn typeclass_method_scheme(&self, class: &str, method: &str) -> Option<&Scheme> {
         self.typeclass_method_schemes
             .get(&(class.to_string(), method.to_string()))
@@ -2959,7 +3047,13 @@ impl Checker {
                                 continue;
                             }
                             let val_ty = self.infer(next);
-                            self.unify(&var_ty, &val_ty, &child.0.into_range(), "let binding");
+                            self.coerce_or_unify(
+                                &var_ty,
+                                &val_ty,
+                                Some(next),
+                                &child.0.into_range(),
+                                "let binding",
+                            );
                             // Keep the side-table in sync with the unified type
                             // so Access codegen sees Record/enum types, not the
                             // pre-unify fresh variable.
@@ -2992,9 +3086,10 @@ impl Checker {
                             let next = &children[i + 1];
                             if !is_declaration_like(next) {
                                 let val_ty = self.infer(next);
-                                self.unify(
+                                self.coerce_or_unify(
                                     &var_ty,
                                     &val_ty,
+                                    Some(next),
                                     &child.0.into_range(),
                                     "const binding",
                                 );
@@ -3085,9 +3180,7 @@ impl Checker {
             if self
                 .active_constraints
                 .iter()
-                .any(|constraint| {
-                    constraint.class == class && constraint.is_unary_on(var)
-                })
+                .any(|constraint| constraint.class == class && constraint.is_unary_on(var))
             {
                 self.record_bound_operator(id, &range, var, class, method);
             } else if self
@@ -3097,10 +3190,7 @@ impl Checker {
             {
                 self.messages.push(Message::error(
                     ErrorCode::GenericTypeError,
-                    format!(
-                        "Cannot compare generic type without bound `{}`",
-                        class
-                    ),
+                    format!("Cannot compare generic type without bound `{}`", class),
                     range,
                 ));
             }
@@ -3474,7 +3564,13 @@ impl Checker {
                                 &range,
                             );
                         } else {
-                            self.unify(param.as_ref(), arg, &range, "function argument");
+                            self.coerce_or_unify(
+                                param.as_ref(),
+                                arg,
+                                arg_exprs.and_then(|args| args.get(i)),
+                                &range,
+                                "function argument",
+                            );
                         }
                         if !pending_constraints.is_empty() {
                             self.discharge_constraints(call_id, &pending_constraints, &range);
@@ -3522,6 +3618,104 @@ impl Checker {
             }
         }
         current
+    }
+
+    fn apply_existential_method(
+        &mut self,
+        class: &str,
+        method: &str,
+        scheme: &Scheme,
+        arg_tys: &[Ty],
+        arg_exprs: Option<&[Output]>,
+        call_id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        let (fun_ty, constraints, _mapping) = self.instantiate_scheme_mapped(scheme);
+        let result = self.apply_function(
+            Some(&format!("{}::{}", class, method)),
+            &fun_ty,
+            arg_tys,
+            arg_exprs,
+            call_id,
+            range.clone(),
+        );
+        let remaining: Vec<_> = constraints
+            .into_iter()
+            .filter(|constraint| constraint.class != class)
+            .collect();
+        if !remaining.is_empty() {
+            self.discharge_constraints(call_id, &remaining, &range);
+        }
+        result
+    }
+
+    fn coerce_or_unify(
+        &mut self,
+        expected: &Ty,
+        actual: &Ty,
+        expr: Option<&Output>,
+        range: &Range<usize>,
+        context: &str,
+    ) -> Ty {
+        let expected = apply_ty_prune(&self.subst, expected);
+        let actual = apply_ty_prune(&self.subst, actual);
+        match (&expected, &actual) {
+            (
+                Ty::Existential {
+                    class: expected_class,
+                },
+                Ty::Existential {
+                    class: actual_class,
+                },
+            ) if expected_class == actual_class => expected,
+            (Ty::Existential { class }, _) => {
+                if matches!(actual, Ty::Var(_)) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot pack open generic value as `{}`", class),
+                        range.clone(),
+                        Some("bare-class existentials require a concrete value type at the pack site".to_string()),
+                    );
+                }
+                let lookup_ty = Self::existential_lookup_ty(&actual);
+                match self.find_unique_instance(class, std::slice::from_ref(&lookup_ty), range) {
+                    Ok(Some(_)) => {
+                        if let Some(expr) = expr {
+                            self.existential_packs_by_span.insert(
+                                (expr.0.start, expr.0.end),
+                                ExistentialPack {
+                                    class: class.clone(),
+                                    value_ty: lookup_ty,
+                                },
+                            );
+                        }
+                        expected
+                    }
+                    Ok(None) => {
+                        let pretty = Constraint {
+                            class: class.clone(),
+                            args: vec![lookup_ty],
+                        };
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!("No instance for `{}`", pretty),
+                            range.clone(),
+                        ));
+                        expected
+                    }
+                    Err(()) => expected,
+                }
+            }
+            _ => self.unify(&expected, &actual, range, context),
+        }
+    }
+
+    fn existential_lookup_ty(ty: &Ty) -> Ty {
+        match ty {
+            Ty::Sum { name, .. } => Ty::Con(name.clone()),
+            Ty::Constructor { owner, .. } => Self::existential_lookup_ty(owner),
+            other => other.clone(),
+        }
     }
 
     fn instantiate_forall_ty(&mut self, ty: &Ty) -> (Ty, Vec<Constraint>) {
@@ -3619,9 +3813,9 @@ impl Checker {
                 .iter()
                 .map(|a| apply_ty_prune(&local, a))
                 .collect();
-            let all_skolems = resolved_args.iter().all(|a| {
-                matches!(a, Ty::Con(name) if name.starts_with("$forall"))
-            });
+            let all_skolems = resolved_args
+                .iter()
+                .all(|a| matches!(a, Ty::Con(name) if name.starts_with("$forall")));
             let all_open = resolved_args.iter().all(|a| matches!(a, Ty::Var(_)));
             let any_open = resolved_args.iter().any(|a| matches!(a, Ty::Var(_)));
 
@@ -3629,7 +3823,11 @@ impl Checker {
                 let covered = expected_constraints.iter().any(|ec| {
                     ec.class == constraint.class
                         && ec.args.len() == resolved_args.len()
-                        && ec.args.iter().zip(resolved_args.iter()).all(|(a, b)| a == b)
+                        && ec
+                            .args
+                            .iter()
+                            .zip(resolved_args.iter())
+                            .all(|(a, b)| a == b)
                 });
                 if !covered {
                     self.messages.push(Message::error(
@@ -3671,10 +3869,7 @@ impl Checker {
                         .join(", ");
                     self.messages.push(Message::error(
                         ErrorCode::GenericTypeError,
-                        format!(
-                            "No instance for `{}<{}>`",
-                            constraint.class, pretty
-                        ),
+                        format!("No instance for `{}<{}>`", constraint.class, pretty),
                         arg_expr
                             .map(|arg| arg.0.into_range())
                             .unwrap_or_else(|| range.clone()),
@@ -3914,9 +4109,7 @@ impl Checker {
             }
             if let Ok(Some(instance)) = self.find_unique_instance(&c.class, &resolved_args, range) {
                 if let Some(scheme) = scheme {
-                    self.pin_assoc_vars_from_mapping(
-                        &c.class, &instance, scheme, mapping, range,
-                    );
+                    self.pin_assoc_vars_from_mapping(&c.class, &instance, scheme, mapping, range);
                 }
                 self.pin_assoc_types_for_instance(&c.class, &instance, scheme, range);
             }
@@ -4078,8 +4271,7 @@ impl Checker {
     fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
         self.active_constraints.iter().position(|constraint| {
             constraint.class == class
-                && (constraint.is_unary_on(var)
-                    || constraint.primary_var() == Some(var))
+                && (constraint.is_unary_on(var) || constraint.primary_var() == Some(var))
         })
     }
 
@@ -4094,7 +4286,10 @@ impl Checker {
             .filter(|(_, constraint)| {
                 receiver_var.is_none_or(|var| {
                     constraint.primary_var() == Some(var)
-                        || constraint.args.iter().any(|a| matches!(a, Ty::Var(v) if *v == var))
+                        || constraint
+                            .args
+                            .iter()
+                            .any(|a| matches!(a, Ty::Var(v) if *v == var))
                 })
             })
             .filter_map(|(dict_index, constraint)| {
@@ -4103,13 +4298,14 @@ impl Checker {
                 // to a superclass method under `T: Ordered` resolves here with
                 // the trailing slot index (implied Equal).
                 let flat = class_def.flattened_methods(&self.generics);
-                let (method_slot, owner) = flat.iter().enumerate().find_map(|(slot, (owner, m))| {
-                    if m.name == method {
-                        Some((slot, (*owner).to_string()))
-                    } else {
-                        None
-                    }
-                })?;
+                let (method_slot, owner) =
+                    flat.iter().enumerate().find_map(|(slot, (owner, m))| {
+                        if m.name == method {
+                            Some((slot, (*owner).to_string()))
+                        } else {
+                            None
+                        }
+                    })?;
                 let scheme = self
                     .typeclass_method_schemes
                     .get(&(owner.clone(), method.to_string()))?
@@ -4117,6 +4313,23 @@ impl Checker {
                 Some((dict_index, owner, method_slot, scheme))
             })
             .collect()
+    }
+
+    fn existential_method_candidate(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<(String, usize, Scheme)> {
+        let class_def = self.generics.typeclass(class)?;
+        let flat = class_def.flattened_methods(&self.generics);
+        let (method_slot, owner) = flat.iter().enumerate().find_map(|(slot, (owner, m))| {
+            (m.name == method).then(|| (slot, (*owner).to_string()))
+        })?;
+        let scheme = self
+            .typeclass_method_schemes
+            .get(&(owner.clone(), method.to_string()))?
+            .clone();
+        Some((owner, method_slot, scheme))
     }
 
     fn select_bound_method(
@@ -4323,15 +4536,12 @@ impl Checker {
             Expression::Type(name) | Expression::Identifier(name) => {
                 let canon = Self::canonical_ctor_name(name);
                 if self.generics.generic_type_ctors.contains_key(&canon)
-                    || matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "option" | "result"
-                    )
+                    || matches!(name.to_ascii_lowercase().as_str(), "option" | "result")
                 {
                     return Ty::Con(canon);
                 }
                 // First-order instance heads (`int`, `MyType`, …).
-                self.parse_type_name_str(name)
+                self.parse_type_name_str_with_range(name, Some(arg.0.into_range()))
             }
             Expression::TypeApp { name, args } => {
                 // Applied heads are first-order (`impl Foo<Option<int>>`).
@@ -4362,10 +4572,12 @@ impl Checker {
         if let Some(class_def) = self.generics.typeclass(class) {
             args.iter()
                 .enumerate()
-                .map(|(i, concrete)| match (class_def.is_constructor_kind_at(i), concrete) {
-                    (true, Ty::App(head, _)) => head.as_ref().clone(),
-                    _ => concrete.clone(),
-                })
+                .map(
+                    |(i, concrete)| match (class_def.is_constructor_kind_at(i), concrete) {
+                        (true, Ty::App(head, _)) => head.as_ref().clone(),
+                        _ => concrete.clone(),
+                    },
+                )
                 .collect()
         } else {
             args.to_vec()
@@ -4432,6 +4644,7 @@ impl Checker {
             | Ty::Array { .. }
             | Ty::Tuple(_)
             | Ty::Record { .. }
+            | Ty::Existential { .. }
             | Ty::Fun(_, _)
             | Ty::Forall { .. } => None,
         }
@@ -4585,6 +4798,10 @@ impl Checker {
     }
 
     fn parse_type_name_str(&mut self, name: &str) -> Ty {
+        self.parse_type_name_str_with_range(name, None)
+    }
+
+    fn parse_type_name_str_with_range(&mut self, name: &str, range: Option<Range<usize>>) -> Ty {
         // Type parameters in scope take highest priority.
         for frame in self.type_params_in_scope.iter().rev() {
             if let Some(&var) = frame.get(name) {
@@ -4606,7 +4823,30 @@ impl Checker {
             "void" => unit_ty(),
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
-            _ => Ty::Con(name.to_string()),
+            _ => {
+                // Prefer concrete type constructors over bare-class existentials
+                // when a name collision exists.
+                if self.enums.contains_key(name)
+                    || self.classes.contains_key(name)
+                    || self.generics.generic_type_ctors.contains_key(name)
+                    || self.generics.nominal_type_module(name).is_some()
+                {
+                    return Ty::Con(name.to_string());
+                }
+                if let Some(class_def) = self.generics.typeclass(name) {
+                    if class_def.type_params.len() == 1 && class_def.kind_at(0) == Kind::Type {
+                        return Ty::Existential {
+                            class: name.to_string(),
+                        };
+                    }
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!("Typeclass `{}` cannot be used as a bare value type", name),
+                        range.unwrap_or(0..0),
+                    ));
+                }
+                Ty::Con(name.to_string())
+            }
         }
     }
 
@@ -4664,9 +4904,9 @@ impl Checker {
                 // Find an active constraint on this var whose class declares `assoc`.
                 let mut matching_decl: Option<(String, AssocTypeDecl)> = None;
                 for c in &self.active_constraints {
-                    let covers = c.args.iter().any(|a| {
-                        matches!(apply_ty_prune(&self.subst, a), Ty::Var(v) if v == owner_var)
-                    });
+                    let covers = c.args.iter().any(
+                        |a| matches!(apply_ty_prune(&self.subst, a), Ty::Var(v) if v == owner_var),
+                    );
                     if !covers {
                         continue;
                     }
@@ -4691,11 +4931,7 @@ impl Checker {
                 }
                 if let Some((class_name, decl)) = matching_decl {
                     self.validate_assoc_projection_args(&class_name, &decl, args, range);
-                    let key = (
-                        owner_var,
-                        assoc.to_string(),
-                        self.projection_arg_key(args),
-                    );
+                    let key = (owner_var, assoc.to_string(), self.projection_arg_key(args));
                     if let Some(&(existing, _)) = self.open_assoc_projections.get(&key) {
                         self.record_current_assoc_projection(existing, assoc, args);
                         return Ty::Var(existing);
@@ -4758,10 +4994,7 @@ impl Checker {
 
         self.messages.push(Message::error(
             ErrorCode::GenericTypeError,
-            format!(
-                "Cannot resolve type projection `{}::{}`",
-                owner, assoc
-            ),
+            format!("Cannot resolve type projection `{}::{}`", owner, assoc),
             range.clone(),
         ));
         Ty::Var(self.counter.fresh())
@@ -4796,9 +5029,10 @@ impl Checker {
             }
             // Owner must unify with the primary instance arg(s).
             let owner_ty = apply_ty_prune(&self.subst, &Ty::Var(owner_var));
-            let matches_owner = instance.args.iter().any(|arg| {
-                unify_with(&self.subst, &owner_ty, arg).is_ok()
-            });
+            let matches_owner = instance
+                .args
+                .iter()
+                .any(|arg| unify_with(&self.subst, &owner_ty, arg).is_ok());
             if !matches_owner {
                 continue;
             }
@@ -5151,13 +5385,7 @@ impl Checker {
                 .expect("type-param frame just pushed");
             let args: Vec<Ty> = type_params
                 .iter()
-                .map(|tp| {
-                    Ty::Var(
-                        *frame
-                            .get(tp.name)
-                            .expect("type param registered in frame"),
-                    )
-                })
+                .map(|tp| Ty::Var(*frame.get(tp.name).expect("type param registered in frame")))
                 .collect();
             Ty::App(Box::new(Ty::Con(owner.to_string())), args)
         };
@@ -5169,11 +5397,7 @@ impl Checker {
                 .expect("type-param frame just pushed");
             type_params
                 .iter()
-                .map(|tp| {
-                    *frame
-                        .get(tp.name)
-                        .expect("type param registered in frame")
-                })
+                .map(|tp| *frame.get(tp.name).expect("type param registered in frame"))
                 .collect()
         } else {
             Vec::new()
@@ -5181,10 +5405,8 @@ impl Checker {
 
         if !self.classes.contains_key(owner) {
             self.classes.insert(owner.to_string(), Vec::new());
-            self.env.insert_top(
-                owner.to_string(),
-                Scheme::mono(Ty::Con(owner.to_string())),
-            );
+            self.env
+                .insert_top(owner.to_string(), Scheme::mono(Ty::Con(owner.to_string())));
         }
 
         self.push_scope();
@@ -5524,10 +5746,7 @@ impl Checker {
             let mut bounds = param_vars;
             bounds.extend(fn_assoc_projections.iter().map(|p| p.var));
             let mut kinds = param_kinds;
-            kinds.extend(std::iter::repeat_n(
-                Kind::Type,
-                fn_assoc_projections.len(),
-            ));
+            kinds.extend(std::iter::repeat_n(Kind::Type, fn_assoc_projections.len()));
             let scheme = Scheme::poly_with_kinds_and_assoc(
                 bounds,
                 kinds,
@@ -5705,10 +5924,8 @@ impl Checker {
                         .type_params_in_scope
                         .last()
                         .expect("type-param frame just pushed");
-                    let var_to_name: HashMap<TyVarId, String> = frame
-                        .iter()
-                        .map(|(n, id)| (*id, n.clone()))
-                        .collect();
+                    let var_to_name: HashMap<TyVarId, String> =
+                        frame.iter().map(|(n, id)| (*id, n.clone())).collect();
                     payloads
                         .iter()
                         .map(|p| schemaize_payload(p, &var_to_name))
@@ -6354,8 +6571,7 @@ impl Checker {
     /// True when `name` is a polymorphic enum (builtin Option/Result
     /// or a user enum registered in `generic_type_ctors`).
     fn is_poly_enum(&self, name: &str) -> bool {
-        common::is_poly_builtin_enum(name)
-            || self.generics.generic_type_ctors.contains_key(name)
+        common::is_poly_builtin_enum(name) || self.generics.generic_type_ctors.contains_key(name)
     }
 
     /// Fresh payload + owning type for a polymorphic construct site.
@@ -6473,10 +6689,7 @@ impl Checker {
             return option_app_ty(Ty::Var(self.counter.fresh()));
         }
         if common::is_builtin_result_enum(enum_name) {
-            return result_app_ty(
-                Ty::Var(self.counter.fresh()),
-                Ty::Var(self.counter.fresh()),
-            );
+            return result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh()));
         }
         let params = self
             .generics
@@ -7023,8 +7236,7 @@ impl Checker {
     /// Variant list for exhaustiveness from an applied poly enum type.
     fn poly_variants_from_app(&self, ty: &Ty) -> Option<Vec<(String, EnumVariantPayloadTy)>> {
         match ty {
-            Ty::App(con, args)
-                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
+            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_option_enum(name)) =>
             {
                 let inner = args.first()?.clone();
                 Some(vec![
@@ -7032,8 +7244,7 @@ impl Checker {
                     ("Some".into(), EnumVariantPayloadTy::Tuple(vec![inner])),
                 ])
             }
-            Ty::App(con, args)
-                if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
+            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if common::is_builtin_result_enum(name)) =>
             {
                 let ok = args.first()?.clone();
                 let err = args.get(1)?.clone();
@@ -7042,8 +7253,7 @@ impl Checker {
                     ("Err".into(), EnumVariantPayloadTy::Tuple(vec![err])),
                 ])
             }
-            Ty::App(con, args)
-                if matches!(con.as_ref(), Ty::Con(name) if self.generics.generic_type_ctors.contains_key(name)) =>
+            Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if self.generics.generic_type_ctors.contains_key(name)) =>
             {
                 let Ty::Con(enum_name) = con.as_ref() else {
                     return None;
@@ -7299,9 +7509,7 @@ impl Checker {
         let resolved = apply_ty_prune(&self.subst, ty);
         match resolved {
             Ty::Var(_) => false,
-            Ty::Tuple(items) => items
-                .iter()
-                .all(|item| self.is_showable_for_format(item)),
+            Ty::Tuple(items) => items.iter().all(|item| self.is_showable_for_format(item)),
             Ty::Record { fields } => fields
                 .iter()
                 .all(|(_, field_ty)| self.is_showable_for_format(field_ty)),
@@ -8635,7 +8843,8 @@ mod tests {
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "{:?}", msgs);
         assert_eq!(
-            c.codegen_var_type("v").map(|t| apply_ty_prune(c.subst(), t)),
+            c.codegen_var_type("v")
+                .map(|t| apply_ty_prune(c.subst(), t)),
             Some(int())
         );
     }
@@ -9522,15 +9731,11 @@ mod tests {
 
     #[test]
     fn format_percent_i_on_open_type_errors() {
-        let msgs = assert_messages(
-            r#"fn bad<T>(T x) { print "%i", x; } fn main() { bad(1); }"#,
-        );
+        let msgs = assert_messages(r#"fn bad<T>(T x) { print "%i", x; } fn main() { bad(1); }"#);
         assert!(
             msgs.iter().any(|m| {
                 m.message().contains("open type")
-                    && m.help()
-                        .as_ref()
-                        .is_some_and(|h| h.contains("%v"))
+                    && m.help().as_ref().is_some_and(|h| h.contains("%v"))
             }),
             "expected open-type `%i` error with `%v` help, got: {:?}",
             msgs
@@ -9539,9 +9744,7 @@ mod tests {
 
     #[test]
     fn format_percent_v_without_show_errors() {
-        let msgs = assert_messages(
-            r#"fn bad<T>(T x) { print "%v", x; } fn main() { bad(1); }"#,
-        );
+        let msgs = assert_messages(r#"fn bad<T>(T x) { print "%v", x; } fn main() { bad(1); }"#);
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
             "expected Show requirement for `%v`, got: {:?}",
@@ -9551,9 +9754,8 @@ mod tests {
 
     #[test]
     fn format_percent_v_rejects_structural_tuple_with_open_type() {
-        let msgs = assert_messages(
-            r#"fn bad<T>(T x) { print "%v", (x, 1); } fn main() { bad(1); }"#,
-        );
+        let msgs =
+            assert_messages(r#"fn bad<T>(T x) { print "%v", (x, 1); } fn main() { bad(1); }"#);
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
             "expected Show requirement for structural `%v` with open T, got: {:?}",
@@ -10049,7 +10251,8 @@ mod tests {
         let msgs = c.take_messages();
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
         assert_eq!(
-            c.codegen_var_type("y").map(|t| apply_ty_prune(c.subst(), t)),
+            c.codegen_var_type("y")
+                .map(|t| apply_ty_prune(c.subst(), t)),
             Some(int())
         );
     }
@@ -11070,8 +11273,8 @@ fn main() { let y = apply_cast(42); }
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
         assert!(
-            msgs.iter().any(|m| m.message().contains("No instance")
-                || m.message().contains("Convert")),
+            msgs.iter()
+                .any(|m| m.message().contains("No instance") || m.message().contains("Convert")),
             "expected missing-instance diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
@@ -11175,11 +11378,7 @@ fn main() {
         let x_ty = c
             .codegen_var_type("x")
             .cloned()
-            .or_else(|| {
-                c.env()
-                    .lookup("x")
-                    .map(|s| apply_ty_prune(&c.subst, &s.ty))
-            });
+            .or_else(|| c.env().lookup("x").map(|s| apply_ty_prune(&c.subst, &s.ty)));
         let x_ty = x_ty.expect("x should be bound");
         let x_ty = apply_ty_prune(&c.subst, &x_ty);
         assert!(
@@ -11292,7 +11491,8 @@ fn main() { let x = get(Option::Some(42)); }
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
         assert_eq!(
-            c.codegen_var_type("x").map(|t| apply_ty_prune(c.subst(), t)),
+            c.codegen_var_type("x")
+                .map(|t| apply_ty_prune(c.subst(), t)),
             Some(int())
         );
     }

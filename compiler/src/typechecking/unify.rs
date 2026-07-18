@@ -54,6 +54,10 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // Same type constructor (e.g. `int` with `int`).
         (Ty::Con(a), Ty::Con(b)) if a == b => Ok(subst.clone()),
 
+        // Existentials are nominal at the type level. Concrete-to-existential
+        // conversion is a pack operation recorded by inference at value sites.
+        (Ty::Existential { class: a }, Ty::Existential { class: b }) if a == b => Ok(subst.clone()),
+
         // Isorecursive encoding: Ty::Con(name) matches Sum/Constructor of same name.
         (Ty::Con(c_name), Ty::Sum { name, variants })
         | (Ty::Sum { name, variants }, Ty::Con(c_name))

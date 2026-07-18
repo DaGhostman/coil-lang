@@ -107,6 +107,7 @@ impl fmt::Display for Ty {
                 }
                 write!(f, " }}")
             }
+            Ty::Existential { class } => write!(f, "{}", class),
             Ty::Forall {
                 bounds,
                 constraints,
@@ -133,7 +134,9 @@ impl fmt::Display for Ty {
                 // Multi-arg / non-binder constraints render as a trailing where.
                 let multi: Vec<String> = constraints
                     .iter()
-                    .filter(|c| c.args.len() != 1 || c.primary_var().is_none_or(|v| !bounds.contains(&v)))
+                    .filter(|c| {
+                        c.args.len() != 1 || c.primary_var().is_none_or(|v| !bounds.contains(&v))
+                    })
                     .map(|c| c.to_string())
                     .collect();
                 if multi.is_empty() {

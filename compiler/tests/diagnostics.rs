@@ -403,6 +403,35 @@ fn format_percent_v_accepts_show_bound() {
     );
 }
 
+#[test]
+fn existential_pack_without_instance_reports_missing_instance() {
+    let (_ty, msgs) = check(
+        "typeclass Printable<T> { fn printable(T x) -> int; } \
+         fn take(Printable x) { } \
+         fn main() { take(42); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("No instance for `Printable<int>`")),
+        "expected missing existential instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn multiparam_typeclass_cannot_be_bare_existential_type() {
+    let (_ty, msgs) = check(
+        "typeclass Convert<A, B> { fn cast(A x) -> B; } \
+         fn take(Convert x) { }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Typeclass `Convert` cannot be used as a bare value type")),
+        "expected bare multi-param typeclass diagnostic, got: {:?}",
+        msgs
+    );
+}
+
 // ---- Record-shape diagnostics ----
 
 #[test]
@@ -790,9 +819,8 @@ fn gat_projection_wrong_number_of_args_errors() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains(
-            "Associated type `Pointer::Ref` expects 1 type argument, got 2"
-        )),
+        msgs.iter()
+            .any(|m| m.contains("Associated type `Pointer::Ref` expects 1 type argument, got 2")),
         "expected GAT projection arity diagnostic, got: {:?}",
         msgs
     );
@@ -846,8 +874,7 @@ fn overlapping_typeclass_instance_names_new_and_existing_instances() {
     );
     assert!(
         msgs.iter().any(|m| {
-            m.contains("Overlapping instance `Tiny<int>`")
-                && m.contains("existing `Tiny<int>`")
+            m.contains("Overlapping instance `Tiny<int>`") && m.contains("existing `Tiny<int>`")
         }),
         "expected overlapping-instance diagnostic, got: {:?}",
         msgs

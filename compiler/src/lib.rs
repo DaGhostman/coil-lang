@@ -322,10 +322,7 @@ fn emit_inner_test<'compiler>(
 /// entry). Slot 0 is reserved for the first function argument; trailing
 /// dictionary locals occupy 1..base-1 when `dict_arity > 0`.
 #[allow(dead_code)]
-fn next_available_slot(
-    match_bindings: &HashMap<usize, HashMap<String, u32>>,
-    base: u32,
-) -> u32 {
+fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>, base: u32) -> u32 {
     let mut max_slot = base.saturating_sub(1);
     for arm_bindings in match_bindings.values() {
         for &slot in arm_bindings.values() {
@@ -888,10 +885,8 @@ impl Compiler {
             self.bytecode
                 .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
         }
-        self.bytecode.insert(
-            idx,
-            Byte::new(Instruction::STRING).with_operand_u32(count),
-        );
+        self.bytecode
+            .insert(idx, Byte::new(Instruction::STRING).with_operand_u32(count));
     }
 
     /// Rewrite `%v` → `%s` in a format literal (leave `%%` alone).
@@ -940,11 +935,7 @@ impl Compiler {
 
     /// Emit `print`/`format` body: format string, then args (with `%v`
     /// lowered through `Show`), then `FORMAT`.
-    fn emit_format_expression(
-        &mut self,
-        format: &Output,
-        params: Option<&Vec<Output>>,
-    ) {
+    fn emit_format_expression(&mut self, format: &Output, params: Option<&Vec<Output>>) {
         let fmt_lit = match format.1.as_ref() {
             Expression::String(s) => Some(s.to_string()),
             _ => None,
@@ -953,61 +944,37 @@ impl Compiler {
         if let (Some(fmt), Some(params)) = (fmt_lit.as_deref(), params) {
             let rewritten = Self::rewrite_format_v_to_s(fmt);
             let specs = Self::format_consuming_specs(fmt);
-            let has_structural_show = params
-                .iter()
-                .zip(specs.iter())
-                .any(|(param, spec)| *spec == 'v' && self.is_structural_show_arg(param));
-            if has_structural_show {
-                let mut arg_slots = Vec::with_capacity(params.len());
-                let mut emitted = 0usize;
-                for (param, spec) in params.iter().zip(specs.iter()) {
-                    if *spec == 'v' {
-                        self.emit_show_for_format_arg(param);
-                    } else {
-                        let bc = self.do_compile(param);
-                        self.bytecode.extend(bc);
-                    }
-                    let slot = self.alloc_temp_slot();
-                    self.bytecode
-                        .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
-                    arg_slots.push(slot);
-                    emitted += 1;
-                }
-                // Extra args beyond specifiers — still push them (VM pops by count).
-                for param in params.iter().skip(emitted) {
-                    let bc = self.do_compile(param);
-                    self.bytecode.extend(bc);
-                    let slot = self.alloc_temp_slot();
-                    self.bytecode
-                        .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
-                    arg_slots.push(slot);
-                }
-                self.emit_string_literal(&rewritten);
-                for slot in arg_slots {
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
-                }
-            } else {
-                self.emit_string_literal(&rewritten);
-                let mut emitted = 0usize;
-                for (param, spec) in params.iter().zip(specs.iter()) {
-                    if *spec == 'v' {
-                        self.emit_show_for_format_arg(param);
-                    } else {
-                        let bc = self.do_compile(param);
-                        self.bytecode.extend(bc);
-                    }
-                    emitted += 1;
-                }
-                // Extra args beyond specifiers — still push them (VM pops by count).
-                for param in params.iter().skip(emitted) {
+            let mut arg_slots = Vec::with_capacity(params.len());
+            let mut emitted = 0usize;
+            for (param, spec) in params.iter().zip(specs.iter()) {
+                if *spec == 'v' {
+                    self.emit_show_for_format_arg(param);
+                } else {
                     let bc = self.do_compile(param);
                     self.bytecode.extend(bc);
                 }
+                let slot = self.alloc_temp_slot();
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                arg_slots.push(slot);
+                emitted += 1;
             }
-            self.bytecode.push(
-                Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32),
-            );
+            // Extra args beyond specifiers — still push them (VM pops by count).
+            for param in params.iter().skip(emitted) {
+                let bc = self.do_compile(param);
+                self.bytecode.extend(bc);
+                let slot = self.alloc_temp_slot();
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                arg_slots.push(slot);
+            }
+            self.emit_string_literal(&rewritten);
+            for slot in arg_slots {
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+            }
+            self.bytecode
+                .push(Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32));
         } else {
             let format_bc = self.do_compile(format);
             self.bytecode.extend(format_bc);
@@ -1036,12 +1003,6 @@ impl Compiler {
         }
     }
 
-    fn is_structural_show_arg(&self, arg: &Output) -> bool {
-        self.show_format_arg_ty(arg)
-            .map(|ty| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty))
-            .is_some_and(|ty| matches!(ty, Ty::Tuple(_) | Ty::Record { .. }))
-    }
-
     /// Lower one `%v` argument to a string via the `Show` dictionary /
     /// concrete instance method, leaving an `ObjString` on the stack.
     fn emit_show_for_format_arg(&mut self, arg: &Output) {
@@ -1059,9 +1020,8 @@ impl Compiler {
                     .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
                 self.bytecode
                     .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
-                self.bytecode.push(
-                    Byte::new(Instruction::CONST).with_const_inline(method_slot as i32),
-                );
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
                 self.bytecode.push(Byte::new(Instruction::Index));
                 self.bytecode
                     .push(Byte::new(Instruction::CallIndirect).with_operand_u32(2));
@@ -1266,11 +1226,7 @@ impl Compiler {
                 }
             }
             (Ty::App(h1, a1), Ty::Constructor { owner, .. }) => {
-                Self::bind_scheme_vars(
-                    &Ty::App(h1.clone(), a1.clone()),
-                    owner.as_ref(),
-                    map,
-                );
+                Self::bind_scheme_vars(&Ty::App(h1.clone(), a1.clone()), owner.as_ref(), map);
             }
             (Ty::Fun(a1, r1), Ty::Fun(a2, r2)) => {
                 Self::bind_scheme_vars(a1, a2, map);
@@ -1322,6 +1278,80 @@ impl Compiler {
             bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
         }
         bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
+        true
+    }
+
+    fn emit_existential_pack_recipe(
+        bytecode: &mut Vec<Byte>,
+        pack: &crate::typechecking::infer::ExistentialPack,
+        checker: &Checker,
+        functions: &HashMap<String, usize>,
+    ) {
+        Self::emit_box_if_needed(bytecode, &pack.value_ty);
+        if Self::emit_instance_dict(
+            bytecode,
+            &pack.class,
+            std::slice::from_ref(&pack.value_ty),
+            checker,
+            functions,
+        ) {
+            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(2));
+        }
+    }
+
+    fn append_with_existential_pack(&mut self, bytecode: &mut Vec<Byte>, expr: &Output) {
+        let pack = self
+            .checker
+            .existential_pack_for_span(expr.0.start, expr.0.end)
+            .cloned();
+        bytecode.append(&mut self.do_compile(expr));
+        if let Some(pack) = pack {
+            Self::emit_existential_pack_recipe(bytecode, &pack, &self.checker, &self.functions);
+        }
+    }
+
+    fn load_tuple_field(bytecode: &mut Vec<Byte>, tuple_slot: u32, index: i32) {
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tuple_slot));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(index));
+        bytecode.push(Byte::new(Instruction::Index));
+    }
+
+    fn emit_existential_method_call(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        name: &Output,
+        args: Option<&Vec<Output>>,
+        hint: &crate::typechecking::infer::ExistentialMethodCall,
+    ) -> bool {
+        let (pack_expr, extra_args): (&Output, &[Output]) = if hint.has_receiver {
+            let Expression::Access(recv, _) = name.1.as_ref() else {
+                return false;
+            };
+            (recv, args.map(Vec::as_slice).unwrap_or(&[]))
+        } else {
+            let Some(items) = args else {
+                return false;
+            };
+            let Some((first, rest)) = items.split_first() else {
+                return false;
+            };
+            (first, rest)
+        };
+
+        let pack_slot = self.alloc_temp_slot();
+        bytecode.append(&mut self.do_compile(pack_expr));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(pack_slot));
+
+        // Pack layout: tuple[0] = boxed value, tuple[1] = dictionary tuple.
+        Self::load_tuple_field(bytecode, pack_slot, 0);
+        for arg in extra_args {
+            self.append_with_existential_pack(bytecode, arg);
+        }
+        Self::load_tuple_field(bytecode, pack_slot, 1);
+        Self::load_tuple_field(bytecode, pack_slot, 1);
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(hint.method_slot as i32));
+        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(hint.arity as u32 + 1));
         true
     }
 
@@ -1423,8 +1453,7 @@ impl Compiler {
 
         let mut dict_count = 0;
         for constraint in &scheme.constraints {
-            let Some(lookup) =
-                Self::resolve_constraint_lookup(constraint, &var_to_ty, checker)
+            let Some(lookup) = Self::resolve_constraint_lookup(constraint, &var_to_ty, checker)
             else {
                 continue;
             };
@@ -2717,8 +2746,7 @@ impl Compiler {
                         // reserved a hole and made bindings land one slot too
                         // high while JumpIfMatch still pushed at the real
                         // cursor.
-                        let mut rhs_bc = self.do_compile(&children[1]);
-                        bytecode.append(&mut rhs_bc);
+                        self.append_with_existential_pack(&mut bytecode, &children[1]);
                         let slot = self.context.variables.intern(name.clone()) as u32;
                         if is_const {
                             self.context.constants.insert(slot as usize, true);
@@ -3070,8 +3098,7 @@ impl Compiler {
                         if let Expression::Identifier(name) = elem.1.as_ref() {
                             if let Some(&offset) = self.functions.get(*name) {
                                 self.bytecode.push(
-                                    Byte::new(Instruction::CodePtr)
-                                        .with_operand_u32(offset as u32),
+                                    Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32),
                                 );
                                 continue;
                             }
@@ -3122,7 +3149,7 @@ impl Compiler {
                 //     let symbol = self.context.variables.intern(self.resolve_variable(expr));
                 // }
 
-                bytecode.append(&mut self.do_compile(expr));
+                self.append_with_existential_pack(&mut bytecode, expr);
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
                 if self.compiling_result_mode {
                     Self::emit_ok_or_some_wrap(&mut bytecode, false);
@@ -3385,6 +3412,20 @@ impl Compiler {
             }
             Expression::Call { name, args } => {
                 if let Some(hint) = self_id
+                    .and_then(|id| self.checker.existential_method_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .existential_method_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                {
+                    if self.emit_existential_method_call(&mut bytecode, name, args.as_ref(), &hint)
+                    {
+                        return bytecode;
+                    }
+                }
+
+                if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_method_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -3399,7 +3440,7 @@ impl Compiler {
                     }
                     if let Some(items) = args {
                         for arg in items {
-                            bytecode.append(&mut self.do_compile(arg));
+                            self.append_with_existential_pack(&mut bytecode, arg);
                         }
                     }
                     let dict_name = format!("__dict{}", hint.dict_index);
@@ -3456,7 +3497,7 @@ impl Compiler {
                             let mut nargs = 0u32;
                             if let Some(items) = args {
                                 for arg in items {
-                                    bytecode.append(&mut self.do_compile(arg));
+                                    self.append_with_existential_pack(&mut bytecode, arg);
                                     nargs += 1;
                                 }
                             }
@@ -3590,7 +3631,7 @@ impl Compiler {
                         let is_generic = self.checker.is_generic_fn(&n) && mono_offset.is_none();
                         if let Some(arg_list) = args {
                             for arg in arg_list {
-                                bytecode.append(&mut self.do_compile(arg));
+                                self.append_with_existential_pack(&mut bytecode, arg);
                                 if is_generic {
                                     // Reuse the original HM result. Re-running inference here
                                     // would occur after the function scope has been popped.
@@ -3692,7 +3733,7 @@ impl Compiler {
                         let mut arg_tys = Vec::new();
                         if let Some(arg_list) = args {
                             for arg in arg_list {
-                                bytecode.append(&mut self.do_compile(arg));
+                                self.append_with_existential_pack(&mut bytecode, arg);
                                 // Box concrete args when delegating through a polyfn.
                                 if let Some(arg_ty) = self.codegen_expr_ty(arg) {
                                     Self::emit_box_if_needed(&mut bytecode, &arg_ty);
@@ -3736,9 +3777,8 @@ impl Compiler {
                         // merge captured evidence with apply-site dictionaries.
                         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                         bytecode.push(
-                            Byte::new(Instruction::CallIndirect).with_operand_u32(
-                                value_arity | (dict_count << 16),
-                            ),
+                            Byte::new(Instruction::CallIndirect)
+                                .with_operand_u32(value_arity | (dict_count << 16)),
                         );
                         // Generic→concrete unbox for polyfn call site.
                         if let Some(call_ty) = self.codegen_expr_ty(ast) {
@@ -4008,69 +4048,125 @@ impl Compiler {
             Expression::Le(lhs, rhs) => {
                 let hint = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned();
                 if let Some(hint) = hint
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
-                {} else {
+                {
+                } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(if is_float { Instruction::LEF } else { Instruction::LE }));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::LEF
+                    } else {
+                        Instruction::LE
+                    }));
                 }
             }
             Expression::Gt(lhs, rhs) => {
                 let hint = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned();
                 if let Some(hint) = hint
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
-                {} else {
+                {
+                } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(if is_float { Instruction::GTF } else { Instruction::GT }));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::GTF
+                    } else {
+                        Instruction::GT
+                    }));
                 }
             }
             Expression::Leq(lhs, rhs) => {
                 let hint = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned();
                 if let Some(hint) = hint
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
-                {} else {
+                {
+                } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(if is_float { Instruction::LEQF } else { Instruction::LEQ }));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::LEQF
+                    } else {
+                        Instruction::LEQ
+                    }));
                 }
             }
             Expression::Geq(lhs, rhs) => {
                 let hint = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned();
                 if let Some(hint) = hint
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
-                {} else {
+                {
+                } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                    bytecode.push(Byte::new(if is_float { Instruction::GEQF } else { Instruction::GEQ }));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::GEQF
+                    } else {
+                        Instruction::GEQ
+                    }));
                 }
             }
             Expression::Eq(lhs, rhs) => {
                 let hint = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned();
                 if let Some(hint) = hint
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
-                {} else {
+                {
+                } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
                 }
             }
@@ -4091,10 +4187,17 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned()
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
                 {
                 } else {
@@ -4109,10 +4212,17 @@ impl Compiler {
             Expression::Sub(lhs, rhs) => {
                 if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned()
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
                 {
                 } else {
@@ -4127,10 +4237,17 @@ impl Compiler {
             Expression::Mul(lhs, rhs) => {
                 if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned()
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
                 {
                 } else {
@@ -4158,10 +4275,17 @@ impl Compiler {
             Expression::Div(lhs, rhs) => {
                 if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned()
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
                 {
                 } else {
@@ -4208,13 +4332,21 @@ impl Compiler {
             Expression::Neq(lhs, rhs) => {
                 let hint = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| self.checker.bound_operator_call_for_span(span.start, span.end))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
                     .cloned();
                 if let Some(hint) = hint
                     && self.emit_bound_operator_call(
-                        &mut bytecode, lhs, rhs, hint.dict_index, hint.method_slot,
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
                     )
-                {} else {
+                {
+                } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
                 }
             }
@@ -4308,7 +4440,7 @@ impl Compiler {
             }
             Expression::Assignment(lhs, value) => match lhs.1.as_ref() {
                 Expression::Access(target_expr, field) => {
-                    bytecode.append(&mut self.do_compile(value));
+                    self.append_with_existential_pack(&mut bytecode, value);
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::SetField));
@@ -4317,7 +4449,7 @@ impl Compiler {
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
                     let tmp_val = self.alloc_temp_slot();
-                    bytecode.append(&mut self.do_compile(value));
+                    self.append_with_existential_pack(&mut bytecode, value);
                     bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
                     bytecode.append(&mut self.do_compile(arr));
                     bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
@@ -4363,7 +4495,7 @@ impl Compiler {
                                 self.messages.push(message);
                             }
                         }
-                        bytecode.append(&mut self.do_compile(value));
+                        self.append_with_existential_pack(&mut bytecode, value);
                         bytecode
                             .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
                     } else {
@@ -7245,7 +7377,6 @@ fn main() {
             "fn main() { \
  let x = 5; \
  let y = 10; \
- print \"%i\", x + y; \
  }",
         );
 
@@ -7694,7 +7825,8 @@ print \"%i\", len(a); \
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         assert!(
-            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
             "new shared generic bodies must not emit DynAdd"
         );
     }
@@ -7925,8 +8057,8 @@ print \"%i\", len(a); \
             .find(|(_, b)| matches!(b.bytecode(), Instruction::CALL))
             .map(|(i, _)| i)
             .expect("main should CALL the specialized add");
-        let boxed_before_call = main_call > 0
-            && matches!(bc[main_call - 1].bytecode(), Instruction::BoxValue);
+        let boxed_before_call =
+            main_call > 0 && matches!(bc[main_call - 1].bytecode(), Instruction::BoxValue);
         assert!(
             !boxed_before_call,
             "ground monomorphic add call should not box args; opcodes near CALL: {:?}",
@@ -8056,7 +8188,10 @@ print \"%i\", len(a); \
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
             .count();
-        assert_eq!(make_tuple_count, 0, "open Num evidence is forwarded, not rebuilt");
+        assert_eq!(
+            make_tuple_count, 0,
+            "open Num evidence is forwarded, not rebuilt"
+        );
 
         assert!(
             bc.iter()
@@ -8267,7 +8402,10 @@ fn main() { \
             .find(|b| matches!(b.bytecode(), Instruction::MakePolyFn))
             .expect("MakePolyFn for escaped generic");
         let entry = poly.operand_u32() as usize;
-        assert!(entry < bc.len(), "MakePolyFn entry must point into bytecode");
+        assert!(
+            entry < bc.len(),
+            "MakePolyFn entry must point into bytecode"
+        );
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),

@@ -611,6 +611,29 @@ primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
 
 ---
 
+### `examples/existential_show.0s`
+
+**Demonstrates:** Bare-class existential `Show` in a parameter type. The call
+`print_any(42)` packs the concrete value with its `Show<int>` dictionary, and
+`show(x)` dispatches through that stored dictionary.
+
+```0s
+fn print_any(Show x) {
+    print "%s", show(x);
+}
+
+fn main() {
+    print_any(42);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/existential_show.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/hkt_container.0s`
 
 **Demonstrates:** Unary higher-kinded typeclasses (`Container<F: * -> *>`) with
