@@ -508,6 +508,59 @@ fn read_x_v(Outer o) -> int {
 
 ---
 
+## IO streams
+
+Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text helpers, UDP.
+
+### `examples/io_bytes.0s`
+
+**Demonstrates:** `byte` annotation, `[byte]` literal coercion, `len` / index.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_bytes.0s` |
+| **Output** | `25532` |
+
+### `examples/io_file.0s`
+
+**Demonstrates:** `open` / `write_all` / `read_to_end` / `close` round-trip; `Result` + `?`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_file.0s` |
+| **Output** | `2` |
+
+### `examples/io_eof.0s`
+
+**Demonstrates:** Non-blocking `read` on an empty file returns `Ok(None)` (EOF).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_eof.0s` |
+| **Output** | `eof` |
+
+### `examples/io_text.0s`
+
+**Demonstrates:** `from_bytes` (`[byte]` → UTF-8 `string`) and `to_bytes` (`string` → `[byte]`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_text.0s` |
+| **Output** | `hello2` |
+
+### `examples/io_udp.0s`
+
+**Demonstrates:** `use io::net::udp::*;` — `bind` / `local_port` / `send_to` / `recv_from_wait` localhost echo.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_udp.0s` |
+| **Output** | `2` |
+
+See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
+
+---
+
 ## Collections and type aliases
 
 Tuples, arrays, dicts, and `type` aliases.
@@ -1212,6 +1265,11 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `mixed.0s` | Enums | `025122` |
 | `nested_records.0s` | Enums | `99` |
 | `chained.0s` | Enums / fields | `427` |
+| `io_bytes.0s` | IO | `25532` |
+| `io_file.0s` | IO | `2` |
+| `io_eof.0s` | IO | `eof` |
+| `io_text.0s` | IO | `hello2` |
+| `io_udp.0s` | IO | `2` |
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |

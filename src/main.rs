@@ -225,6 +225,7 @@ fn execute_archive(
 ) -> bool {
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, entry);
+    pipeline.wire_host_natives(&mut machine);
     machine.run_raw(bytecode, constants);
     machine.panicked()
 }

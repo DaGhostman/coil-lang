@@ -53,6 +53,9 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.0s` files 
 | `prelude::test` | `assert` | Yes (every file) |
 | `ffi` | `dload`, `declare`, `invoke` | No — write `use ffi::*;` |
 | `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — write `use ffi::types::*;` |
+| `io` | `Stream`, `IoError`, `Read` / `Write`, `stdin` / `stdout` / `stderr` / `open` / `read` / `write` / `close`, `from_bytes` / `to_bytes`, sync adapters | No — write `use io::*;` |
+| `io::net::tcp` | `connect` / `listen` / `accept` / `accept_wait` | No — write `use io::net::tcp::*;` |
+| `io::net::udp` | `bind` / `connect` / `send_to` / `recv_from` / `recv_from_wait` / `local_port` | No — write `use io::net::udp::*;` |
 
 ### Prelude rebind / redefine
 

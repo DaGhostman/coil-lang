@@ -291,8 +291,12 @@ pub const FLOAT: &str = "float";
 pub const STRING: &str = "string";
 /// Name of the `bool` type constructor.
 pub const BOOL: &str = "bool";
+/// Name of the `byte` type constructor (0–255; IO buffer element).
+pub const BYTE: &str = "byte";
 /// Name of the `unit` type constructor.
 pub const UNIT: &str = "unit";
+/// Name of the opaque `Stream` IO handle type.
+pub const STREAM: &str = "Stream";
 /// Name of the `List` type constructor.
 #[allow(dead_code)] // reserved for future list-type support
 pub const LIST: &str = "List";
@@ -315,6 +319,16 @@ pub fn string() -> Ty {
 /// Build the `bool` type.
 pub fn boolean() -> Ty {
     Ty::Con(BOOL.into())
+}
+
+/// Build the `byte` type (0–255).
+pub fn byte() -> Ty {
+    Ty::Con(BYTE.into())
+}
+
+/// Build the opaque `Stream` type.
+pub fn stream_ty() -> Ty {
+    Ty::Con(STREAM.into())
 }
 
 /// Build the `unit` type (used for side-effecting expressions, `print`, etc.).

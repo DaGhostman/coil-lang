@@ -153,12 +153,14 @@ impl<'pratt> Pratt<'pratt> {
                 )
                 .delimited_by(op!('['), op!(']'))
                 .map_with(|(elem, n_opt), e| match n_opt {
+                    // Preserve the element type so `[byte; 4]` / `[int; 5]`
+                    // both round-trip through the typechecker.
                     Some(n) => (
                         e.span(),
-                        Box::new(Expression::Array(vec![(
-                            e.span(),
-                            Box::new(Expression::Integer(n)),
-                        )])),
+                        Box::new(Expression::Array(vec![
+                            elem,
+                            (e.span(), Box::new(Expression::Integer(n))),
+                        ])),
                     ),
                     None => (e.span(), Box::new(Expression::Array(vec![elem]))),
                 });

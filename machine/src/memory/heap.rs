@@ -220,6 +220,10 @@ impl Heap {
             Object::PolyFn(p) => {
                 p.release();
             }
+            Object::Stream(s) => {
+                // Closing the fd happens in ObjStream::drop via release.
+                s.release();
+            }
         }
     }
 
@@ -354,6 +358,20 @@ impl fmt::Display for Error {
 
 pub type RefBoxed = Gc<ObjBoxed>;
 pub type RefPolyFn = Gc<ObjPolyFn>;
+pub type RefStream = Gc<ObjStream>;
+
+/// Kind of host-backed IO stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKind {
+    Stdin,
+    Stdout,
+    Stderr,
+    File,
+    Tcp,
+    TcpListener,
+    /// Datagram socket (`io::net::udp::bind` / `connect`).
+    Udp,
+}
 
 #[derive(Clone, Copy)]
 pub enum Object {
@@ -366,6 +384,7 @@ pub enum Object {
     Coroutine(RefCoroutine),
     Boxed(RefBoxed),
     PolyFn(RefPolyFn),
+    Stream(RefStream),
 }
 
 impl Object {
@@ -381,6 +400,7 @@ impl Object {
             Self::Coroutine(c) => c.mark(),
             Self::Boxed(b) => b.mark(),
             Self::PolyFn(p) => p.mark(),
+            Self::Stream(s) => s.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -399,6 +419,7 @@ impl Object {
             Self::Coroutine(c) => c.unmark(),
             Self::Boxed(b) => b.unmark(),
             Self::PolyFn(p) => p.unmark(),
+            Self::Stream(s) => s.unmark(),
         }
     }
 
@@ -415,6 +436,7 @@ impl Object {
             Self::Coroutine(c) => c.is_marked(),
             Self::Boxed(b) => b.is_marked(),
             Self::PolyFn(p) => p.is_marked(),
+            Self::Stream(s) => s.is_marked(),
         }
     }
 
@@ -453,6 +475,7 @@ impl Object {
                     }
                 }
             }
+            Self::Stream(_) => {}
         }
     }
 
@@ -469,6 +492,7 @@ impl Object {
             Self::Coroutine(c) => c.get_next(),
             Self::Boxed(b) => b.get_next(),
             Self::PolyFn(p) => p.get_next(),
+            Self::Stream(s) => s.get_next(),
         }
     }
 
@@ -484,6 +508,7 @@ impl Object {
             Self::Coroutine(c) => c.set_next(next),
             Self::Boxed(b) => b.set_next(next),
             Self::PolyFn(p) => p.set_next(next),
+            Self::Stream(s) => s.set_next(next),
         }
     }
 
@@ -499,6 +524,7 @@ impl Object {
             Self::Coroutine(c) => c.as_ptr() as u64,
             Self::Boxed(b) => b.as_ptr() as u64,
             Self::PolyFn(p) => p.as_ptr() as u64,
+            Self::Stream(s) => s.as_ptr() as u64,
         }
     }
 }
@@ -515,6 +541,7 @@ impl GcSized for Object {
             Self::Coroutine(c) => c.size(),
             Self::Boxed(b) => b.size(),
             Self::PolyFn(p) => p.size(),
+            Self::Stream(s) => s.size(),
         }
     }
 }
@@ -531,6 +558,7 @@ impl fmt::Display for Object {
             Self::Coroutine(c) => write!(f, "{}", c.as_ref()),
             Self::Boxed(_) => write!(f, "<boxed 0x{:08x}>", self.addr()),
             Self::PolyFn(_) => write!(f, "<polyfn 0x{:08x}>", self.addr()),
+            Self::Stream(_) => write!(f, "<stream 0x{:08x}>", self.addr()),
         }
     }
 }
@@ -547,7 +575,8 @@ impl Object {
             | Self::Array(_)
             | Self::Coroutine(_)
             | Self::Boxed(_)
-            | Self::PolyFn(_) => std::ptr::null(),
+            | Self::PolyFn(_)
+            | Self::Stream(_) => std::ptr::null(),
         }
     }
 }
@@ -676,6 +705,33 @@ pub struct ObjPolyFn {
     /// Dictionary evidence captured when this value escaped a constrained
     /// scope. `None` leaves the position for application-time evidence.
     pub captured_dicts: Vec<Option<Member>>,
+}
+
+/// Host-backed non-blocking IO stream (file / stdio / TCP / UDP).
+pub struct ObjStream {
+    pub fd: Option<std::os::fd::OwnedFd>,
+    pub kind: StreamKind,
+    pub closed: bool,
+}
+
+impl Drop for ObjStream {
+    fn drop(&mut self) {
+        // OwnedFd closes on drop; clear explicitly for clarity.
+        self.fd.take();
+        self.closed = true;
+    }
+}
+
+impl GcSized for ObjStream {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl fmt::Display for ObjStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<stream {:?}>", self.kind)
+    }
 }
 
 impl GcSized for ObjTuple {

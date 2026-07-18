@@ -21,6 +21,15 @@ pub const FFI_TYPES_MODULE: &str = "ffi::types";
 /// Canonical module path for test helpers (`assert`).
 pub const PRELUDE_TEST_MODULE: &str = "prelude::test";
 
+/// Canonical module path for IO streams (`open`, `read`, `Stream`, …).
+pub const IO_MODULE: &str = "io";
+
+/// TCP helpers under `io::net::tcp` (`connect`, `listen`, …).
+pub const IO_NET_TCP_MODULE: &str = "io::net::tcp";
+
+/// UDP helpers under `io::net::udp` (`bind`, `send_to`, …).
+pub const IO_NET_UDP_MODULE: &str = "io::net::udp";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -69,6 +78,171 @@ impl PreludeFn {
     }
 }
 
+/// IO host natives exported from virtual `io` / `io::net::*` modules.
+///
+/// Surface names (after `use`) are short (`bind`, `connect`). Host registry
+/// keys stay uniquely prefixed (`udp_bind`, `tcp_connect`) so TCP and UDP
+/// never collide in [`Compiler::native`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IoBuiltin {
+    Stdin,
+    Stdout,
+    Stderr,
+    Open,
+    Close,
+    Read,
+    Write,
+    ReadExact,
+    ReadToEnd,
+    WriteAll,
+    /// Decode `[byte]` as UTF-8 → `Result<string, IoError>`.
+    FromBytes,
+    /// Encode `string` → `[byte]` (UTF-8).
+    ToBytes,
+    TcpConnect,
+    TcpListen,
+    TcpAccept,
+    TcpAcceptWait,
+    /// Bind a UDP datagram socket (`host`, `port`; `port` may be `0`).
+    UdpBind,
+    /// Create a connected UDP socket toward (`host`, `port`).
+    UdpConnect,
+    /// Send a datagram to an explicit peer.
+    UdpSendTo,
+    /// Non-blocking recv; returns `(nbytes, peer_host, peer_port)`.
+    UdpRecvFrom,
+    /// Block until a datagram arrives (host `poll`).
+    UdpRecvFromWait,
+    /// Local bound port of a UDP socket (useful after `bind(..., 0)`).
+    UdpLocalPort,
+}
+
+impl IoBuiltin {
+    /// Name bound by `use` / shown in diagnostics (`bind`, `connect`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdin => "stdin",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Open => "open",
+            Self::Close => "close",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadExact => "read_exact",
+            Self::ReadToEnd => "read_to_end",
+            Self::WriteAll => "write_all",
+            Self::FromBytes => "from_bytes",
+            Self::ToBytes => "to_bytes",
+            Self::TcpConnect => "connect",
+            Self::TcpListen => "listen",
+            Self::TcpAccept => "accept",
+            Self::TcpAcceptWait => "accept_wait",
+            Self::UdpBind => "bind",
+            Self::UdpConnect => "connect",
+            Self::UdpSendTo => "send_to",
+            Self::UdpRecvFrom => "recv_from",
+            Self::UdpRecvFromWait => "recv_from_wait",
+            Self::UdpLocalPort => "local_port",
+        }
+    }
+
+    /// Stable host-native registry key (unique across TCP/UDP).
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Self::Stdin
+            | Self::Stdout
+            | Self::Stderr
+            | Self::Open
+            | Self::Close
+            | Self::Read
+            | Self::Write
+            | Self::ReadExact
+            | Self::ReadToEnd
+            | Self::WriteAll
+            | Self::FromBytes
+            | Self::ToBytes => self.as_str(),
+            Self::TcpConnect => "tcp_connect",
+            Self::TcpListen => "tcp_listen",
+            Self::TcpAccept => "tcp_accept",
+            Self::TcpAcceptWait => "tcp_accept_wait",
+            Self::UdpBind => "udp_bind",
+            Self::UdpConnect => "udp_connect",
+            Self::UdpSendTo => "udp_send_to",
+            Self::UdpRecvFrom => "udp_recv_from",
+            Self::UdpRecvFromWait => "udp_recv_from_wait",
+            Self::UdpLocalPort => "udp_local_port",
+        }
+    }
+
+    /// Core stream / file / text helpers on the top-level `io` module.
+    pub fn core() -> &'static [IoBuiltin] {
+        &[
+            Self::Stdin,
+            Self::Stdout,
+            Self::Stderr,
+            Self::Open,
+            Self::Close,
+            Self::Read,
+            Self::Write,
+            Self::ReadExact,
+            Self::ReadToEnd,
+            Self::WriteAll,
+            Self::FromBytes,
+            Self::ToBytes,
+        ]
+    }
+
+    /// Exports of `io::net::tcp`.
+    pub fn tcp() -> &'static [IoBuiltin] {
+        &[
+            Self::TcpConnect,
+            Self::TcpListen,
+            Self::TcpAccept,
+            Self::TcpAcceptWait,
+        ]
+    }
+
+    /// Exports of `io::net::udp`.
+    pub fn udp() -> &'static [IoBuiltin] {
+        &[
+            Self::UdpBind,
+            Self::UdpConnect,
+            Self::UdpSendTo,
+            Self::UdpRecvFrom,
+            Self::UdpRecvFromWait,
+            Self::UdpLocalPort,
+        ]
+    }
+
+    /// Every IO host native (for pipeline registration).
+    pub fn all() -> &'static [IoBuiltin] {
+        &[
+            Self::Stdin,
+            Self::Stdout,
+            Self::Stderr,
+            Self::Open,
+            Self::Close,
+            Self::Read,
+            Self::Write,
+            Self::ReadExact,
+            Self::ReadToEnd,
+            Self::WriteAll,
+            Self::FromBytes,
+            Self::ToBytes,
+            Self::TcpConnect,
+            Self::TcpListen,
+            Self::TcpAccept,
+            Self::TcpAcceptWait,
+            Self::UdpBind,
+            Self::UdpConnect,
+            Self::UdpSendTo,
+            Self::UdpRecvFrom,
+            Self::UdpRecvFromWait,
+            Self::UdpLocalPort,
+        ]
+    }
+}
+
 /// One item exported by a virtual module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinExport {
@@ -82,6 +256,10 @@ pub enum BuiltinExport {
     FfiFn { kind: FfiBuiltin },
     /// Prelude/test callable (`assert`, …).
     Fn { kind: PreludeFn },
+    /// Opaque built-in type name (`Stream`).
+    OpaqueType { name: &'static str },
+    /// IO host native (`open`, `read`, …).
+    IoFn { kind: IoBuiltin },
 }
 
 impl BuiltinExport {
@@ -92,6 +270,8 @@ impl BuiltinExport {
             Self::FfiTag { variant } => variant,
             Self::FfiFn { kind } => kind.as_str(),
             Self::Fn { kind } => kind.as_str(),
+            Self::OpaqueType { name } => name,
+            Self::IoFn { kind } => kind.as_str(),
         }
     }
 }
@@ -173,6 +353,31 @@ impl VirtualModules {
                 kind: PreludeFn::Assert,
             }],
         );
+
+        let mut io_exports = vec![
+            BuiltinExport::OpaqueType { name: "Stream" },
+            BuiltinExport::Enum {
+                name: common::BUILTIN_IO_ERROR_ENUM,
+            },
+            BuiltinExport::TypeClass { name: "Read" },
+            BuiltinExport::TypeClass { name: "Write" },
+        ];
+        for kind in IoBuiltin::core() {
+            io_exports.push(BuiltinExport::IoFn { kind: *kind });
+        }
+        modules.insert(IO_MODULE, io_exports);
+
+        let tcp_exports: Vec<BuiltinExport> = IoBuiltin::tcp()
+            .iter()
+            .map(|kind| BuiltinExport::IoFn { kind: *kind })
+            .collect();
+        modules.insert(IO_NET_TCP_MODULE, tcp_exports);
+
+        let udp_exports: Vec<BuiltinExport> = IoBuiltin::udp()
+            .iter()
+            .map(|kind| BuiltinExport::IoFn { kind: *kind })
+            .collect();
+        modules.insert(IO_NET_UDP_MODULE, udp_exports);
 
         Self { modules }
     }
@@ -349,6 +554,45 @@ mod tests {
                 kind: FfiBuiltin::Dload
             }
         );
+    }
+
+    #[test]
+    fn io_net_udp_exports_short_names_not_prefixed() {
+        let vm = VirtualModules::new();
+        let exports = vm
+            .resolve_glob(&["io".into(), "net".into(), "udp".into()])
+            .expect("io::net::udp");
+        assert!(exports.iter().any(|e| e.short_name() == "bind"));
+        assert!(exports.iter().any(|e| e.short_name() == "send_to"));
+        assert!(exports.iter().any(|e| e.short_name() == "recv_from_wait"));
+        assert!(!exports.iter().any(|e| e.short_name() == "udp_bind"));
+
+        let bind = vm
+            .resolve_item(
+                &["io".into(), "net".into(), "udp".into()],
+                "bind",
+            )
+            .expect("io::net::udp::bind");
+        assert_eq!(
+            bind,
+            BuiltinExport::IoFn {
+                kind: IoBuiltin::UdpBind
+            }
+        );
+        assert_eq!(IoBuiltin::UdpBind.native_name(), "udp_bind");
+        assert_eq!(IoBuiltin::TcpConnect.as_str(), "connect");
+        assert_eq!(IoBuiltin::TcpConnect.native_name(), "tcp_connect");
+    }
+
+    #[test]
+    fn io_glob_excludes_net_helpers() {
+        let vm = VirtualModules::new();
+        let exports = vm.resolve_glob(&["io".into()]).expect("io");
+        assert!(exports.iter().any(|e| e.short_name() == "open"));
+        assert!(exports.iter().any(|e| e.short_name() == "from_bytes"));
+        assert!(!exports.iter().any(|e| e.short_name() == "bind"));
+        assert!(!exports.iter().any(|e| e.short_name() == "listen"));
+        assert!(vm.resolves_use(&["io".into(), "net".into(), "tcp".into()], "*"));
     }
 
     #[test]

@@ -550,6 +550,38 @@ impl Generics {
             },
         );
 
+        // ---- Read / Write (IO stream traits; virtual `io` module) ----
+        self.typeclasses.insert(
+            "Read".into(),
+            TypeClassDef {
+                name: "Read".into(),
+                defined_module: "io".into(),
+                type_params: vec!["S".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "read".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "Write".into(),
+            TypeClassDef {
+                name: "Write".into(),
+                defined_module: "io".into(),
+                type_params: vec!["S".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![],
+                methods: vec![TypeClassMethodDef {
+                    name: "write".into(),
+                    has_default: false,
+                }],
+            },
+        );
+
         // Helper: build method_fqns map for an instance.
         let make_fqns = |class: &str, ty_str: &str, methods: &[&str]| -> HashMap<String, String> {
             methods
@@ -674,6 +706,42 @@ impl Generics {
             range: 0..0,
             args: vec![unit()],
             method_fqns: make_fqns("Show", "unit", &["show"]),
+            assoc_tys: HashMap::new(),
+        });
+
+        // ---- byte: Eq + Show ----
+        self.instances.push(InstanceDef {
+            class: "Eq".into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
+            range: 0..0,
+            args: vec![super::ty::byte()],
+            method_fqns: make_fqns("Eq", "byte", &["eq", "ne"]),
+            assoc_tys: HashMap::new(),
+        });
+        self.instances.push(InstanceDef {
+            class: "Show".into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
+            range: 0..0,
+            args: vec![super::ty::byte()],
+            method_fqns: make_fqns("Show", "byte", &["show"]),
+            assoc_tys: HashMap::new(),
+        });
+
+        // ---- Stream: Read + Write (methods lower to host natives) ----
+        self.instances.push(InstanceDef {
+            class: "Read".into(),
+            defined_module: "io".into(),
+            range: 0..0,
+            args: vec![super::ty::stream_ty()],
+            method_fqns: make_fqns("Read", "Stream", &["read"]),
+            assoc_tys: HashMap::new(),
+        });
+        self.instances.push(InstanceDef {
+            class: "Write".into(),
+            defined_module: "io".into(),
+            range: 0..0,
+            args: vec![super::ty::stream_ty()],
+            method_fqns: make_fqns("Write", "Stream", &["write"]),
             assoc_tys: HashMap::new(),
         });
 

@@ -89,7 +89,7 @@ use super::ty::{
     unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
-use super::virtual_modules::{BuiltinExport, FfiBuiltin, PreludeFn, VirtualModules};
+use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};
 
 /// A parametric type alias (`type Pair<T> = (T, T)`).
 #[derive(Clone, Debug)]
@@ -446,6 +446,10 @@ impl Checker {
     fn register_builtin_enums(&mut self) {
         self.register_builtin_ffi_type();
         self.register_builtin_option_result();
+        // `IoError` is NOT registered here — it is not auto-imported.
+        // Registering its variants (esp. `Other`) globally would collide
+        // with user enums that use the same constructor names. Tags are
+        // installed on first `use io::…` that binds `IoError` or an IO fn.
     }
 
     /// Reset scope bindings and inject the auto-prelude.
@@ -460,6 +464,18 @@ impl Checker {
     /// Bind a virtual export under `local` (and drop any previous short
     /// binding for the export's canonical short name when `local` differs).
     pub fn bind_virtual_export(&mut self, local: String, export: BuiltinExport) {
+        // Lazily register `IoError` tags when the virtual `io` module is
+        // brought into scope (enum or any host fn whose scheme mentions it).
+        let needs_io_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_IO_ERROR_ENUM
+            } | BuiltinExport::IoFn { .. }
+        );
+        if needs_io_error && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM) {
+            self.register_builtin_io_error();
+        }
+
         let canonical = export.short_name().to_string();
         if local != canonical {
             // `use prelude::ops::Eq as PreludeEq` frees the short name.
@@ -499,6 +515,14 @@ impl Checker {
     pub fn prelude_fn_in_scope(&self, name: &str) -> Option<PreludeFn> {
         match self.scope_bindings.get(name)? {
             BuiltinExport::Fn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Resolve an in-scope name to an IO host native (`open`, `read`, …).
+    pub fn io_fn_in_scope(&self, name: &str) -> Option<IoBuiltin> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::IoFn { kind } => Some(*kind),
             _ => None,
         }
     }
@@ -613,6 +637,76 @@ impl Checker {
             self.enum_payloads.insert(name.clone(), payloads);
             self.enum_arities.insert(name, arities);
         }
+    }
+
+    /// Pre-register `IoError` unit variants for stream IO.
+    fn register_builtin_io_error(&mut self) {
+        use common::{BUILTIN_IO_ERROR_ENUM, BUILTIN_IO_ERROR_VARIANTS};
+        let name = BUILTIN_IO_ERROR_ENUM.to_string();
+        let variant_names: Vec<String> = BUILTIN_IO_ERROR_VARIANTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let payloads = variant_names
+            .iter()
+            .map(|_| EnumVariantPayloadTy::Unit)
+            .collect();
+        let arities = vec![0; variant_names.len()];
+        let mut tag_map = BTreeMap::new();
+        for (i, vn) in variant_names.iter().enumerate() {
+            tag_map.insert(vn.clone(), i as u32);
+        }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
+    }
+
+    /// Scheme for a virtual `io` host native (inserted on `use io::*`).
+    pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
+        use crate::typechecking::ty::{array, byte, stream_ty, tuple};
+        let stream = stream_ty();
+        let bytes = array(byte());
+        let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
+        let opt_int = option_app_ty(int());
+        let res_opt_int = result_app_ty(opt_int, io_err.clone());
+        let res_int = result_app_ty(int(), io_err.clone());
+        let res_unit = result_app_ty(unit_ty(), io_err.clone());
+        let res_stream = result_app_ty(stream.clone(), io_err.clone());
+        let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
+        let res_string = result_app_ty(string(), io_err.clone());
+        // `(nbytes, peer_host, peer_port)` from `io::net::udp::recv_from`.
+        let recv_from_ty = tuple(vec![int(), string(), int()]);
+        let res_recv_from = result_app_ty(recv_from_ty, io_err);
+        let fun = |params: &[Ty], ret: Ty| {
+            params.iter().rev().fold(ret, |acc, p| {
+                Ty::Fun(Box::new(p.clone()), Box::new(acc))
+            })
+        };
+        let ty = match kind {
+            IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => stream,
+            IoBuiltin::Open => fun(&[string(), string()], res_stream),
+            IoBuiltin::Close => fun(&[stream], res_unit),
+            IoBuiltin::Read | IoBuiltin::ReadExact => fun(&[stream, bytes], res_opt_int),
+            IoBuiltin::Write => fun(&[stream, bytes], res_int),
+            IoBuiltin::ReadToEnd => fun(&[stream], res_bytes),
+            IoBuiltin::WriteAll => fun(&[stream, bytes], res_unit),
+            IoBuiltin::FromBytes => fun(&[bytes], res_string),
+            IoBuiltin::ToBytes => fun(&[string()], bytes),
+            IoBuiltin::TcpConnect | IoBuiltin::TcpListen => {
+                fun(&[string(), int()], res_stream)
+            }
+            IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
+            IoBuiltin::UdpBind | IoBuiltin::UdpConnect => {
+                fun(&[string(), int()], res_stream)
+            }
+            IoBuiltin::UdpSendTo => fun(&[stream, bytes, string(), int()], res_int),
+            IoBuiltin::UdpRecvFrom | IoBuiltin::UdpRecvFromWait => {
+                fun(&[stream, bytes], res_recv_from)
+            }
+            IoBuiltin::UdpLocalPort => fun(&[stream], res_int),
+        };
+        Scheme::mono(ty)
     }
 
     /// Set the module path used for ownership checks while typechecking.
@@ -1066,6 +1160,39 @@ impl Checker {
             ),
         );
 
+        // Read::read / Write::write — stream IO groundwork.
+        {
+            use crate::typechecking::ty::{array, byte};
+            let var = self.counter.fresh();
+            let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
+            let res_opt_int = result_app_ty(option_app_ty(int()), io_err.clone());
+            let res_int = result_app_ty(int(), io_err);
+            let bytes = array(byte());
+            self.typeclass_method_schemes.insert(
+                ("Read".to_string(), "read".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Read", var)],
+                    Ty::Fun(
+                        Box::new(Ty::Var(var)),
+                        Box::new(Ty::Fun(Box::new(bytes.clone()), Box::new(res_opt_int))),
+                    ),
+                ),
+            );
+            let var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Write".to_string(), "write".to_string()),
+                Scheme::poly(
+                    vec![var],
+                    vec![Constraint::unary("Write", var)],
+                    Ty::Fun(
+                        Box::new(Ty::Var(var)),
+                        Box::new(Ty::Fun(Box::new(bytes), Box::new(res_int))),
+                    ),
+                ),
+            );
+        }
+
         // Iterator::next : ∀I Item. Iterator<I> => I → Option<Item>
         {
             let i_var = self.counter.fresh();
@@ -1167,16 +1294,27 @@ impl Checker {
                 if self.apply_virtual_use(path, name, alias.as_deref()) {
                     // Bind FFI callables into the value env so Call sites
                     // resolve; enums/traits/tags are scope-only.
-                    let locals: Vec<String> = self
+                    let locals: Vec<(String, BuiltinExport)> = self
                         .scope_bindings
                         .iter()
-                        .filter(|(_, e)| matches!(e, BuiltinExport::FfiFn { .. }))
-                        .map(|(k, _)| k.clone())
+                        .filter(|(_, e)| {
+                            matches!(e, BuiltinExport::FfiFn { .. } | BuiltinExport::IoFn { .. })
+                        })
+                        .map(|(k, e)| (k.clone(), e.clone()))
                         .collect();
-                    for local in locals {
-                        if self.env.lookup(&local).is_none() {
-                            self.env
-                                .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                    for (local, export) in locals {
+                        if self.env.lookup(&local).is_some() {
+                            continue;
+                        }
+                        match export {
+                            BuiltinExport::IoFn { kind } => {
+                                self.env.insert_top(local, Self::io_fn_scheme(kind));
+                            }
+                            BuiltinExport::FfiFn { .. } => {
+                                self.env
+                                    .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                            }
+                            _ => {}
                         }
                     }
                     return unit_ty();
@@ -3736,9 +3874,10 @@ impl Checker {
         let resolved = apply_ty_prune(&self.subst, &array_ty);
         match resolved {
             Ty::Array { element, .. } => {
-                self.unify(
+                self.coerce_or_unify(
                     element.as_ref(),
                     &value_ty,
+                    Some(&args[1]),
                     &args[1].0.into_range(),
                     "push element",
                 );
@@ -3976,6 +4115,66 @@ impl Checker {
     ) -> Ty {
         let expected = apply_ty_prune(&self.subst, expected);
         let actual = apply_ty_prune(&self.subst, actual);
+        // Integer literals may coerce to `byte` when in range 0..=255.
+        if Self::is_byte_ty(&expected)
+            && Self::is_int_ty(&actual)
+            && let Some(expr) = expr
+        {
+            match Self::byte_literal_coercion(expr) {
+                Ok(()) => return expected,
+                Err(Some(n)) => {
+                    return self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        format!("byte literal out of range: `{n}` is not in 0..=255"),
+                        range.clone(),
+                        Some("a `byte` must be an integer between 0 and 255".to_string()),
+                    );
+                }
+                Err(None) => {}
+            }
+        }
+        // Array literals of in-range integer literals coerce to `[byte]` / `[byte; N]`.
+        if let (
+            Ty::Array {
+                element: exp_elem,
+                length: exp_len,
+            },
+            Ty::Array {
+                element: act_elem,
+                length: act_len,
+            },
+        ) = (&expected, &actual)
+            && Self::is_byte_ty(exp_elem)
+            && Self::is_int_ty(act_elem)
+            && (exp_len == act_len
+                || matches!(exp_len, ArrayLength::Dynamic)
+                || matches!(act_len, ArrayLength::Dynamic))
+            && let Some(expr) = expr
+            && let Expression::Array(items) = unwrap_expr_wrappers(expr).1.as_ref()
+        {
+            let mut ok = true;
+            for item in items {
+                match Self::byte_literal_coercion(item) {
+                    Ok(()) => {}
+                    Err(Some(n)) => {
+                        let _ = self.error_with_help(
+                            ErrorCode::TypeMismatch,
+                            format!("byte literal out of range: `{n}` is not in 0..=255"),
+                            item.0.into_range(),
+                            Some("a `byte` must be an integer between 0 and 255".to_string()),
+                        );
+                        ok = false;
+                    }
+                    Err(None) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return expected;
+            }
+        }
         match (&expected, &actual) {
             (
                 Ty::Existential {
@@ -4024,6 +4223,29 @@ impl Checker {
                 }
             }
             _ => self.unify(&expected, &actual, range, context),
+        }
+    }
+
+    fn is_byte_ty(ty: &Ty) -> bool {
+        matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::BYTE)
+    }
+
+    fn is_int_ty(ty: &Ty) -> bool {
+        matches!(ty, Ty::Con(n) if n == crate::typechecking::ty::INT)
+    }
+
+    /// `Ok(())` if `expr` is an integer literal in `0..=255`.
+    /// `Err(Some(n))` if literal but out of range; `Err(None)` if not a literal.
+    fn byte_literal_coercion(expr: &Output) -> Result<(), Option<i64>> {
+        match unwrap_expr_wrappers(expr).1.as_ref() {
+            Expression::Integer(n) => {
+                if (0..=255).contains(n) {
+                    Ok(())
+                } else {
+                    Err(Some(*n))
+                }
+            }
+            _ => Err(None),
         }
     }
 
@@ -5207,10 +5429,16 @@ impl Checker {
                 self.forall_type(params, |checker| checker.parse_type_name(ty))
             }
             Expression::Array(items) => {
-                // Static-length: `[T; N]`. Look for the `; N` shape:
-                // a single `Integer(N)` immediately following the
-                // element-type `Identifier`. Anything else is a
-                // dynamic-length `[T]`.
+                // `[T; N]` — parser emits `[Type(T), Integer(N)]` (or the
+                // legacy single-`Integer(N)` shape, which always meant
+                // `[int; N]`).
+                if items.len() == 2
+                    && let Expression::Integer(n) = items[1].1.as_ref()
+                    && *n >= 0
+                {
+                    let elem_ty = self.parse_type_name(&items[0]);
+                    return crate::typechecking::ty::array_fixed(elem_ty, *n as usize);
+                }
                 if items.len() == 1
                     && let Expression::Integer(n) = items[0].1.as_ref()
                     && *n >= 0
@@ -5220,17 +5448,12 @@ impl Checker {
                         *n as usize,
                     );
                 }
-                // Element type — parse as a (single) type annotation.
-                // For multi-element `[int, string]` we treat the
-                // first item as the element type; the rest must be
-                // `; N` to mean static length, but anything else is
-                // a `Ty::Array` of error-typed elements that will
-                // surface elsewhere.
+                // Dynamic `[T]` — single element-type annotation.
                 if let Some(first) = items.first() {
-                    let _elem_ty = self.parse_type_name(first);
+                    let elem_ty = self.parse_type_name(first);
+                    return crate::typechecking::ty::array(elem_ty);
                 }
-                let elem_ty = self.parse_type_name_str("int");
-                crate::typechecking::ty::array(elem_ty)
+                crate::typechecking::ty::array(self.parse_type_name_str("int"))
             }
             Expression::Tuple(items) => {
                 let mut tys = Vec::with_capacity(items.len());
@@ -5333,10 +5556,13 @@ impl Checker {
             "int" => int(),
             "float" => float(),
             "bool" => boolean(),
+            "byte" => crate::typechecking::ty::byte(),
             "string" => string(),
             "void" => unit_ty(),
+            "stream" => crate::typechecking::ty::stream_ty(),
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
+            "ioerror" => Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into()),
             _ => {
                 // Prefer concrete type constructors over bare-class existentials
                 // when a name collision exists.
@@ -8208,6 +8434,10 @@ impl Checker {
                     return;
                 }
             };
+            // `byte` is printable with integer format specs (same runtime word).
+            if matches!(spec, 'i' | 'd' | 'b' | 'x' | 'u' | 'p') && Self::is_byte_ty(arg_ty) {
+                return;
+            }
             self.unify(
                 arg_ty,
                 &expected_ty,
@@ -9103,7 +9333,9 @@ fn is_string_ty(ty: &Ty) -> bool {
 /// [`Checker::check_format_arg`] before this is consulted.
 fn type_matches_specifier(ty: &Ty, spec: char) -> bool {
     match spec {
-        'i' | 'b' | 'x' | 'u' | 'p' => matches!(ty, Ty::Con(n) if n == "int"),
+        'i' | 'b' | 'x' | 'u' | 'p' => {
+            matches!(ty, Ty::Con(n) if n == "int" || n == crate::typechecking::ty::BYTE)
+        }
         'f' => matches!(ty, Ty::Con(n) if n == "float"),
         's' => matches!(ty, Ty::Con(n) if n == "string"),
         'z' => matches!(ty, Ty::Con(n) if n == "bool"),
@@ -13060,4 +13292,117 @@ trait Pointer<P: * -> *> {
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
+
+    // ---- byte / [byte] ----
+
+    #[test]
+    fn byte_annotation_accepts_in_range_literal() {
+        let (mut c, _) = check("let b: byte = 42;");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        assert_eq!(
+            c.codegen_var_type("b")
+                .map(|t| apply_ty_prune(c.subst(), t)),
+            Some(crate::typechecking::ty::byte())
+        );
+    }
+
+    #[test]
+    fn byte_annotation_rejects_out_of_range_literal() {
+        let msgs = assert_messages("let b: byte = 300;");
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("byte literal out of range")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn byte_array_literal_coerces_from_int_literals() {
+        let (mut c, _) = check("let buf: [byte] = [1, 2, 3];");
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+        let ty = c
+            .codegen_var_type("buf")
+            .map(|t| apply_ty_prune(c.subst(), t))
+            .expect("buf");
+        match ty {
+            Ty::Array { element, .. } => {
+                assert_eq!(*element, crate::typechecking::ty::byte());
+            }
+            other => panic!("expected [byte], got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_has_show_instance() {
+        assert!(
+            Checker::new()
+                .generics
+                .has_instance("Show", &crate::typechecking::ty::byte())
+        );
+    }
+
+    #[test]
+    fn write_all_accepts_named_byte_array() {
+        let (mut c, _) = check(
+            r#"
+use io::*;
+fn main() {
+    let data: [byte] = [1, 2];
+    write_all(stdin(), data);
 }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected messages: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn io_error_other_does_not_collide_until_imported() {
+        // IoError::Other must not reserve the constructor name globally —
+        // user enums may use `Other` without `use io`.
+        let (mut c, _) = check("enum Foo { Bar, Other } let x = Foo::Other;");
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected without io import: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+
+        let (mut c, _) = check("use io::*; let e = IoError::Other;");
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected with io import: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn write_all_rejects_unannotated_int_array_variable() {
+        let msgs = assert_messages(
+            r#"
+use io::*;
+fn main() {
+    let data = [1, 2];
+    write_all(stdin(), data);
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("expected `byte`")
+                    || m.message().contains("Type mismatch")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+}
+
+
