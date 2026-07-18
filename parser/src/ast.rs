@@ -6,12 +6,15 @@ pub type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
 /// Kind of a type parameter.
 ///
 /// - [`Kind::Type`] (`*`) — ordinary type parameter (`T`, `A`)
+/// - [`Kind::Constraint`] — typeclass predicates
 /// - [`Kind::Arrow`] — type constructor arrows such as `* -> * -> *`
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Kind {
     /// `*` — a proper type.
     #[default]
     Type,
+    /// `Constraint` — a typeclass predicate.
+    Constraint,
     /// `domain -> codomain` — a type constructor kind.
     Arrow(Box<Kind>, Box<Kind>),
 }
@@ -20,10 +23,11 @@ impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Kind::Type => write!(f, "*"),
+            Kind::Constraint => write!(f, "Constraint"),
             Kind::Arrow(domain, codomain) => {
                 match domain.as_ref() {
                     Kind::Arrow(_, _) => write!(f, "({})", domain)?,
-                    Kind::Type => write!(f, "{}", domain)?,
+                    Kind::Type | Kind::Constraint => write!(f, "{}", domain)?,
                 }
                 write!(f, " -> {}", codomain)
             }

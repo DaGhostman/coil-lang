@@ -222,6 +222,9 @@ pub struct Checker {
     /// Active typeclass constraints on in-scope type params.
     /// `(TyVarId, class_name)` — checked when applying arithmetic ops.
     active_constraints: Vec<Constraint>,
+    /// Bindings from abstract constraint parameters (`c: * -> Constraint`)
+    /// to the concrete class selected by method use inside the current scope.
+    abstract_constraint_bindings: Vec<HashMap<String, String>>,
     /// Kind of each type variable currently in play.
     var_kinds: HashMap<TyVarId, Kind>,
     /// Generics registry: typeclasses, instances, generic type ctors.
@@ -386,6 +389,7 @@ impl Checker {
             option_mode_fns: HashSet::new(),
             type_params_in_scope: Vec::new(),
             active_constraints: Vec::new(),
+            abstract_constraint_bindings: Vec::new(),
             var_kinds: HashMap::new(),
             generics: super::generics::Generics::new(),
             generic_fns: HashSet::new(),
@@ -518,6 +522,7 @@ impl Checker {
         self.generic_aliases.clear();
         self.const_scopes.clear();
         self.const_scopes.push(HashSet::new());
+        self.abstract_constraint_bindings.clear();
         self.enums.clear();
         self.enum_tags.clear();
         self.enum_payloads.clear();
@@ -1237,9 +1242,10 @@ impl Checker {
                     }
                     if let Some(receiver_var) = Self::constraint_var_of_ty(&resolved) {
                         let candidates = self.bound_method_candidates(method, Some(receiver_var));
-                        if let Some((dict_index, class, method_slot, scheme)) =
+                        if let Some((dict_index, dict_class, class, method_slot, scheme)) =
                             self.select_bound_method(candidates, method, &range)
                         {
+                            self.bind_matching_abstract_constraints(Some(receiver_var), &dict_class);
                             let (fun_ty, constraints, mapping) =
                                 self.instantiate_scheme_mapped(&scheme);
                             let mut arg_tys = vec![recv_ty];
@@ -1404,9 +1410,10 @@ impl Checker {
                     let candidates = receiver_var
                         .map(|v| self.bound_method_candidates(&ident, Some(v)))
                         .unwrap_or_else(|| self.bound_method_candidates(&ident, None));
-                    if let Some((dict_index, class, method_slot, scheme)) =
+                    if let Some((dict_index, dict_class, class, method_slot, scheme)) =
                         self.select_bound_method(candidates, &ident, &range)
                     {
+                        self.bind_matching_abstract_constraints(receiver_var, &dict_class);
                         let (fun_ty, constraints, mapping) =
                             self.instantiate_scheme_mapped(&scheme);
                         if let Some(call_id) = id {
@@ -3118,16 +3125,16 @@ impl Checker {
         class: &str,
         method: &str,
     ) {
-        let Some(dict_index) = self.user_dict_index(var, class) else {
+        let Some((dict_index, dict_class)) = self.user_dict_index_and_class(var, class) else {
             return;
         };
-        let Some(class_def) = self.generics.typeclass(class) else {
+        let Some(class_def) = self.generics.typeclass(&dict_class) else {
             return;
         };
         let Some(method_slot) = class_def
-            .methods
+            .flattened_methods(&self.generics)
             .iter()
-            .position(|candidate| candidate.name == method)
+            .position(|(_, candidate)| candidate.name == method)
         else {
             return;
         };
@@ -3143,16 +3150,16 @@ impl Checker {
     }
 
     fn record_bound_display(&mut self, range: &Range<usize>, var: TyVarId) {
-        let Some(dict_index) = self.user_dict_index(var, "Show") else {
+        let Some((dict_index, dict_class)) = self.user_dict_index_and_class(var, "Show") else {
             return;
         };
-        let Some(class_def) = self.generics.typeclass("Show") else {
+        let Some(class_def) = self.generics.typeclass(&dict_class) else {
             return;
         };
         let Some(method_slot) = class_def
-            .methods
+            .flattened_methods(&self.generics)
             .iter()
-            .position(|candidate| candidate.name == "show")
+            .position(|(_, candidate)| candidate.name == "show")
         else {
             return;
         };
@@ -3177,11 +3184,10 @@ impl Checker {
         let rt = self.infer(rhs);
         let unified = self.unify(&lt, &rt, &range, "comparison operands");
         if let Ty::Var(var) = apply_ty_prune(&self.subst, &unified) {
-            if self
-                .active_constraints
-                .iter()
-                .any(|constraint| constraint.class == class && constraint.is_unary_on(var))
-            {
+            if self.user_dict_index(var, class).is_none() {
+                self.bind_matching_abstract_constraints(Some(var), class);
+            }
+            if self.user_dict_index(var, class).is_some() {
                 self.record_bound_operator(id, &range, var, class, method);
             } else if self
                 .type_params_in_scope
@@ -3225,10 +3231,10 @@ impl Checker {
         // check that it has a Num constraint; otherwise the op is invalid.
         let pruned = apply_ty_prune(&self.subst, &result);
         if let Ty::Var(v) = &pruned {
-            let has_num = self
-                .active_constraints
-                .iter()
-                .any(|c| c.class == "Num" && c.is_unary_on(*v));
+            if self.user_dict_index(*v, "Num").is_none() {
+                self.bind_matching_abstract_constraints(Some(*v), "Num");
+            }
+            let has_num = self.user_dict_index(*v, "Num").is_some();
             if !has_num {
                 // Check if the var appears in any in-scope type param frame.
                 let in_scope = self
@@ -3885,7 +3891,6 @@ impl Checker {
     {
         let mut frame = HashMap::new();
         let mut bounds = Vec::new();
-        let mut constraints = Vec::new();
         let mut kinds = Vec::new();
         for tp in params {
             let var = self.counter.fresh();
@@ -3894,12 +3899,20 @@ impl Checker {
             frame.insert(tp.name.to_string(), var);
             bounds.push(var);
             kinds.push(kind);
-            for bound in &tp.bounds {
-                constraints.push(Constraint::unary(*bound, var));
-            }
         }
 
         self.type_params_in_scope.push(frame);
+        let mut constraints = Vec::new();
+        let synthetic_range = 0..0;
+        for (tp, var) in params.iter().zip(bounds.iter()) {
+            for bound in &tp.bounds {
+                if let Some(constraint) =
+                    self.constraint_from_bound(bound, Ty::Var(*var), &synthetic_range)
+                {
+                    constraints.push(constraint);
+                }
+            }
+        }
         let inner_ty = body(self);
         self.type_params_in_scope.pop();
 
@@ -4223,14 +4236,97 @@ impl Checker {
             if !args_match {
                 return false;
             }
-            if ac.class == needed.class {
+            let ac_class = self
+                .abstract_constraint_binding(&ac.class)
+                .unwrap_or(ac.class.as_str());
+            if ac_class == needed.class {
                 return true;
             }
             // Implied bound: active subclass covers a superclass constraint.
             self.generics
-                .typeclass(&ac.class)
+                .typeclass(ac_class)
                 .is_some_and(|def| def.has_superclass(&needed.class, &self.generics))
         })
+    }
+
+    fn abstract_constraint_binding(&self, name: &str) -> Option<&str> {
+        self.abstract_constraint_bindings
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(name).map(String::as_str))
+    }
+
+    fn bind_abstract_constraint(&mut self, abstract_name: &str, concrete_class: &str) {
+        if self.constraint_param_kind(abstract_name).is_none() {
+            return;
+        }
+        if let Some(frame) = self.abstract_constraint_bindings.last_mut() {
+            frame
+                .entry(abstract_name.to_string())
+                .or_insert_with(|| concrete_class.to_string());
+        }
+    }
+
+    fn bind_matching_abstract_constraints(
+        &mut self,
+        receiver_var: Option<TyVarId>,
+        concrete_class: &str,
+    ) {
+        let names: Vec<String> = self
+            .active_constraints
+            .iter()
+            .filter(|constraint| self.constraint_param_kind(&constraint.class).is_some())
+            .filter(|constraint| {
+                receiver_var.is_none_or(|var| {
+                    constraint.primary_var() == Some(var)
+                        || constraint
+                            .args
+                            .iter()
+                            .any(|a| matches!(a, Ty::Var(v) if *v == var))
+                })
+            })
+            .map(|constraint| constraint.class.clone())
+            .collect();
+        for name in names {
+            self.bind_abstract_constraint(&name, concrete_class);
+        }
+    }
+
+    fn class_own_method_slot(&self, class_name: &str, method: &str) -> Option<usize> {
+        let class_def = self.generics.typeclass(class_name)?;
+        class_def.methods.iter().position(|m| m.name == method)
+    }
+
+    fn possible_classes_for_constraint_method(
+        &self,
+        constraint: &Constraint,
+        method: &str,
+    ) -> Vec<String> {
+        if let Some(bound) = self.abstract_constraint_binding(&constraint.class) {
+            return vec![bound.to_string()];
+        }
+        if self.constraint_param_kind(&constraint.class).is_none() {
+            return vec![constraint.class.clone()];
+        }
+
+        self.generics
+            .typeclasses
+            .iter()
+            .filter_map(|(name, class_def)| {
+                if class_def.type_params.len() != constraint.args.len() {
+                    return None;
+                }
+                if self.class_own_method_slot(name, method).is_none() {
+                    return None;
+                }
+                let kinds_match = constraint
+                    .args
+                    .iter()
+                    .enumerate()
+                    .all(|(i, arg)| class_def.kind_at(i) == self.kind_of_type_argument(arg));
+                kinds_match.then(|| name.clone())
+            })
+            .collect()
     }
 
     fn dict_index_for(&self, needed: &Constraint) -> Option<usize> {
@@ -4244,8 +4340,10 @@ impl Checker {
         self.active_constraints
             .iter()
             .position(|ac| {
-                ac.class == needed.class
-                    && ac.args.len() == needed_args.len()
+                let ac_class = self
+                    .abstract_constraint_binding(&ac.class)
+                    .unwrap_or(ac.class.as_str());
+                ac_class == needed.class && ac.args.len() == needed_args.len()
                     && ac
                         .args
                         .iter()
@@ -4254,6 +4352,9 @@ impl Checker {
             })
             .or_else(|| {
                 self.active_constraints.iter().position(|ac| {
+                    let ac_class = self
+                        .abstract_constraint_binding(&ac.class)
+                        .unwrap_or(ac.class.as_str());
                     ac.args.len() == needed_args.len()
                         && ac
                             .args
@@ -4262,24 +4363,40 @@ impl Checker {
                             .all(|(a, b)| apply_ty_prune(&self.subst, a) == *b)
                         && self
                             .generics
-                            .typeclass(&ac.class)
+                            .typeclass(ac_class)
                             .is_some_and(|def| def.has_superclass(&needed.class, &self.generics))
                 })
             })
     }
 
     fn user_dict_index(&self, var: TyVarId, class: &str) -> Option<usize> {
-        self.active_constraints.iter().position(|constraint| {
-            constraint.class == class
-                && (constraint.is_unary_on(var) || constraint.primary_var() == Some(var))
-        })
+        self.user_dict_index_and_class(var, class)
+            .map(|(idx, _)| idx)
+    }
+
+    fn user_dict_index_and_class(&self, var: TyVarId, class: &str) -> Option<(usize, String)> {
+        self.active_constraints
+            .iter()
+            .enumerate()
+            .find_map(|(idx, constraint)| {
+                let concrete = self
+                    .abstract_constraint_binding(&constraint.class)
+                    .unwrap_or(constraint.class.as_str());
+                let covers = concrete == class
+                    || self
+                        .generics
+                        .typeclass(concrete)
+                        .is_some_and(|def| def.has_superclass(class, &self.generics));
+                (covers && (constraint.is_unary_on(var) || constraint.primary_var() == Some(var)))
+                    .then(|| (idx, concrete.to_string()))
+            })
     }
 
     fn bound_method_candidates(
         &self,
         method: &str,
         receiver_var: Option<TyVarId>,
-    ) -> Vec<(usize, String, usize, Scheme)> {
+    ) -> Vec<(usize, String, String, usize, Scheme)> {
         self.active_constraints
             .iter()
             .enumerate()
@@ -4292,25 +4409,29 @@ impl Checker {
                             .any(|a| matches!(a, Ty::Var(v) if *v == var))
                 })
             })
-            .filter_map(|(dict_index, constraint)| {
-                let class_def = self.generics.typeclass(&constraint.class)?;
-                // Flattened dict: own methods then superclass methods. A call
-                // to a superclass method under `T: Ordered` resolves here with
-                // the trailing slot index (implied Equal).
-                let flat = class_def.flattened_methods(&self.generics);
-                let (method_slot, owner) =
-                    flat.iter().enumerate().find_map(|(slot, (owner, m))| {
-                        if m.name == method {
-                            Some((slot, (*owner).to_string()))
-                        } else {
-                            None
-                        }
-                    })?;
-                let scheme = self
-                    .typeclass_method_schemes
-                    .get(&(owner.clone(), method.to_string()))?
-                    .clone();
-                Some((dict_index, owner, method_slot, scheme))
+            .flat_map(|(dict_index, constraint)| {
+                self.possible_classes_for_constraint_method(constraint, method)
+                    .into_iter()
+                    .filter_map(move |dict_class| {
+                        let class_def = self.generics.typeclass(&dict_class)?;
+                        // Flattened dict: own methods then superclass methods. A call
+                        // to a superclass method under `T: Ordered` resolves here with
+                        // the trailing slot index (implied Equal).
+                        let flat = class_def.flattened_methods(&self.generics);
+                        let (method_slot, owner) =
+                            flat.iter().enumerate().find_map(|(slot, (owner, m))| {
+                                if m.name == method {
+                                    Some((slot, (*owner).to_string()))
+                                } else {
+                                    None
+                                }
+                            })?;
+                        let scheme = self
+                            .typeclass_method_schemes
+                            .get(&(owner.clone(), method.to_string()))?
+                            .clone();
+                        Some((dict_index, dict_class, owner, method_slot, scheme))
+                    })
             })
             .collect()
     }
@@ -4334,10 +4455,10 @@ impl Checker {
 
     fn select_bound_method(
         &mut self,
-        candidates: Vec<(usize, String, usize, Scheme)>,
+        candidates: Vec<(usize, String, String, usize, Scheme)>,
         method: &str,
         range: &Range<usize>,
-    ) -> Option<(usize, String, usize, Scheme)> {
+    ) -> Option<(usize, String, String, usize, Scheme)> {
         if candidates.len() > 1 {
             self.messages.push(Message::error(
                 ErrorCode::GenericTypeError,
@@ -4371,6 +4492,76 @@ impl Checker {
     /// Record a type variable's kind (overwrites).
     fn set_var_kind(&mut self, var: TyVarId, kind: Kind) {
         self.var_kinds.insert(var, kind);
+    }
+
+    fn constraint_param_kind(&self, name: &str) -> Option<Kind> {
+        self.type_param_kind(name)
+            .filter(Kind::is_constraint_constructor_kind)
+    }
+
+    fn type_param_kind(&self, name: &str) -> Option<Kind> {
+        self.type_params_in_scope
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(name).copied())
+            .map(|var| self.kind_of_var(var))
+    }
+
+    fn expected_constraint_kind_for_arg(&self, arg: &Ty) -> Kind {
+        Kind::arrow(self.kind_of_type_argument(arg), Kind::Constraint)
+    }
+
+    fn constraint_from_bound(
+        &mut self,
+        bound: &str,
+        arg: Ty,
+        range: &Range<usize>,
+    ) -> Option<Constraint> {
+        if let Some(kind) = self.constraint_param_kind(bound) {
+            let expected = self.expected_constraint_kind_for_arg(&arg);
+            if kind != expected {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Constraint parameter `{}` has kind `{}`, expected `{}`",
+                        bound, kind, expected
+                    ),
+                    range.clone(),
+                ));
+                return None;
+            }
+            return Some(Constraint {
+                class: bound.to_string(),
+                args: vec![arg],
+            });
+        }
+
+        if let Some(kind) = self.type_param_kind(bound) {
+            let expected = self.expected_constraint_kind_for_arg(&arg);
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Constraint parameter `{}` has kind `{}`, expected `{}`",
+                    bound, kind, expected
+                ),
+                range.clone(),
+            ));
+            return None;
+        }
+
+        if self.generics.typeclass(bound).is_none() {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!("Cannot find typeclass or constraint parameter `{}`", bound),
+                range.clone(),
+            ));
+            return None;
+        }
+
+        Some(Constraint {
+            class: bound.to_string(),
+            args: vec![arg],
+        })
     }
 
     /// Resolve the kind of a type parameter from its AST annotation and/or
@@ -4461,6 +4652,18 @@ impl Checker {
                     range.clone(),
                 ));
             }
+        }
+
+        if head_kind.result_kind() != &Kind::Type {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Type application `{}` has kind `{}`, expected `*`",
+                    name,
+                    head_kind.result_kind()
+                ),
+                range.clone(),
+            ));
         }
     }
 
@@ -5529,7 +5732,6 @@ impl Checker {
         // Set up type parameter environment.
         let is_generic = !type_params.is_empty();
         let mut param_vars: Vec<TyVarId> = Vec::new();
-        let mut param_constraints: Vec<Constraint> = Vec::new();
         let mut param_frame: HashMap<String, TyVarId> = HashMap::new();
 
         let mut param_kinds: Vec<Kind> = Vec::new();
@@ -5540,14 +5742,22 @@ impl Checker {
             param_frame.insert(tp.name.to_string(), var);
             param_vars.push(var);
             param_kinds.push(kind);
-            // Binder bounds `T: Num` desugar to unary constraints.
-            for bound in &tp.bounds {
-                param_constraints.push(Constraint::unary(*bound, var));
-            }
         }
 
         // Push param frame so parse_type_name resolves T → Var(id).
         self.type_params_in_scope.push(param_frame);
+        let mut param_constraints: Vec<Constraint> = Vec::new();
+        for (tp, var) in type_params.iter().zip(param_vars.iter()) {
+            // Binder bounds `T: Num` desugar to unary constraints. Bounds
+            // may also name an earlier constraint parameter: `T: c`.
+            for bound in &tp.bounds {
+                if let Some(constraint) =
+                    self.constraint_from_bound(bound, Ty::Var(*var), range)
+                {
+                    param_constraints.push(constraint);
+                }
+            }
+        }
         // `where Class<T1, T2>` constraints (parsed after returns).
         for wc in where_constraints {
             let args: Vec<Ty> = wc.args.iter().map(|a| self.parse_type_name(a)).collect();
@@ -5559,6 +5769,7 @@ impl Checker {
         let prev_constraints_len = self.active_constraints.len();
         self.active_constraints
             .extend(param_constraints.iter().cloned());
+        self.abstract_constraint_bindings.push(HashMap::new());
 
         let collect_fn_assoc = is_generic && self.current_assoc_projections.is_none();
         let prev_fn_assoc = if collect_fn_assoc {
@@ -5735,6 +5946,30 @@ impl Checker {
         self.fn_option_mode = prev_option_mode;
         self.unify(&Ty::Var(alpha), &fun_ty, range, "function type");
 
+        let abstract_bindings = self.abstract_constraint_bindings.pop().unwrap_or_default();
+        let mut resolved_param_constraints = Vec::with_capacity(param_constraints.len());
+        for constraint in param_constraints {
+            if self.constraint_param_kind(&constraint.class).is_some() {
+                if let Some(concrete) = abstract_bindings.get(&constraint.class) {
+                    resolved_param_constraints.push(Constraint {
+                        class: concrete.clone(),
+                        args: constraint.args,
+                    });
+                } else {
+                    self.messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "Cannot satisfy abstract constraint `{}`; no concrete typeclass was selected",
+                            constraint
+                        ),
+                        range.clone(),
+                    ));
+                }
+            } else {
+                resolved_param_constraints.push(constraint);
+            }
+        }
+
         // Pop type param scope.
         self.active_constraints.truncate(prev_constraints_len);
         self.type_params_in_scope.pop();
@@ -5750,7 +5985,7 @@ impl Checker {
             let scheme = Scheme::poly_with_kinds_and_assoc(
                 bounds,
                 kinds,
-                param_constraints.clone(),
+                resolved_param_constraints.clone(),
                 fn_assoc_projections,
                 fun_ty.clone(),
             );
@@ -5761,7 +5996,7 @@ impl Checker {
             // user classes use source-declared methods; their calling ABI is
             // intentionally identical.
             self.fn_dict_arity
-                .insert(name.to_string(), param_constraints.len());
+                .insert(name.to_string(), resolved_param_constraints.len());
         }
 
         fun_ty
@@ -7381,11 +7616,10 @@ impl Checker {
         if spec == 'v' {
             match arg_ty {
                 Ty::Var(v) => {
-                    let has_show = self
-                        .active_constraints
-                        .iter()
-                        .any(|c| c.class == "Show" && c.is_unary_on(*v));
-                    if has_show {
+                    if self.user_dict_index(*v, "Show").is_none() {
+                        self.bind_matching_abstract_constraints(Some(*v), "Show");
+                    }
+                    if self.user_dict_index(*v, "Show").is_some() {
                         self.record_bound_display(arg_range, *v);
                     } else {
                         let mut msg = Message::error(
@@ -10581,6 +10815,67 @@ mod tests {
             .expect("expected a bound method call for eq_val");
         assert_eq!(hint.method_slot, 1, "eq_val should be superclass slot 1");
         assert_eq!(hint.dict_index, 0);
+    }
+
+    /// Phase 5: `c: * -> Constraint, T: c` can select a concrete subclass
+    /// and then use its superclass methods through the flattened dictionary.
+    #[test]
+    fn abstract_constraint_kind_uses_superclass_method_after_binding() {
+        let src = r#"
+            typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+            typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+            impl Equal<int> {
+                fn eq_val(int a, int b) -> bool { return a == b; }
+            }
+            impl Ordered<int> {
+                fn lt_val(int a, int b) -> bool { return a < b; }
+            }
+            fn choose<c: * -> Constraint, T: c>(T a, T b) -> int {
+                if lt_val(a, b) { return 0; }
+                if eq_val(a, b) { return 42; }
+                return 1;
+            }
+            fn main() {
+                let x = choose(7, 7);
+            }
+        "#;
+        let (c, msgs) = check_warn(src);
+        assert!(
+            msgs.is_empty(),
+            "abstract constraint should bind to Ordered and imply Equal; got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let scheme = c.env().lookup("choose").expect("choose scheme");
+        assert_eq!(scheme.constraints.len(), 1);
+        assert_eq!(scheme.constraints[0].class, "Ordered");
+
+        let slots: Vec<_> = c
+            .id_table()
+            .ids()
+            .iter()
+            .filter_map(|id| c.bound_method_call_at(*id).map(|hint| hint.method_slot))
+            .collect();
+        assert!(
+            slots.contains(&0) && slots.contains(&1),
+            "expected Ordered slot 0 and implied Equal slot 1, got {:?}",
+            slots
+        );
+    }
+
+    #[test]
+    fn unsatisfied_abstract_constraint_kind_reports_diagnostic() {
+        let src = r#"
+            fn id<c: * -> Constraint, T: c>(T x) -> T {
+                return x;
+            }
+        "#;
+        let (_c, msgs) = check_warn(src);
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Cannot satisfy abstract constraint")),
+            "expected unsatisfied abstract constraint diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -233,6 +233,13 @@ fn example_superclass_ord_prints_truetruefalse() {
     assert_eq!(output, "truetruefalse");
 }
 
+/// Advanced generics Phase 5: `c: * -> Constraint, T: c` with superclass method use.
+#[test]
+fn example_constraint_kind_prints_42() {
+    let output = run_example("examples/constraint_kind.0s");
+    assert_eq!(output, "42");
+}
+
 /// Phase 6: associated types — `Collect::Elem` pinned from ground instance.
 #[test]
 fn example_assoc_type_prints_42() {

@@ -712,6 +712,42 @@ fn hkt_var_rejected_as_type_argument() {
     );
 }
 
+#[test]
+fn constraint_bound_rejects_non_constraint_kind_parameter() {
+    let (_ty, msgs) = check(
+        r#"
+        fn bad<c: Constraint, T: c>(T x) -> T {
+            return x;
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Constraint parameter `c` has kind `Constraint`")
+                && m.contains("expected `* -> Constraint`")
+        }),
+        "expected ill-kinded constraint parameter diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn abstract_constraint_bound_requires_concrete_method_selection() {
+    let (_ty, msgs) = check(
+        r#"
+        fn bad<c: * -> Constraint, T: c>(T x) -> T {
+            return x;
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Cannot satisfy abstract constraint")),
+        "expected unsatisfied abstract constraint diagnostic, got: {:?}",
+        msgs
+    );
+}
+
 /// Phase 5: impl of a subclass requires the superclass instance.
 #[test]
 fn superclass_impl_requires_superclass_instance() {

@@ -711,6 +711,20 @@ is subclass methods then superclass methods.
 
 ---
 
+### `examples/constraint_kind.0s`
+
+**Demonstrates:** Constraint-kind parameters
+(`fn choose<c: * -> Constraint, T: c>(...)`). The body first selects
+`c = Ordered` through `lt_val`, then calls `eq_val` through Ordered's
+`Equal` superclass dictionary slot.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/constraint_kind.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/assoc_type.0s`
 
 **Demonstrates:** Associated types — `type Elem;` in a typeclass,
@@ -1102,6 +1116,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `typeclass_dict.0s` | Types | `4242` |
 | `typeclass_default.0s` | Types | `42` |
 | `superclass_ord.0s` | Types | `truetruefalse` |
+| `constraint_kind.0s` | Types | `42` |
 | `assoc_type.0s` | Types | `42` |
 | `gat_pointer.0s` | Types | `42` |
 | `polyfn.0s` | Types | `424.0424242` |

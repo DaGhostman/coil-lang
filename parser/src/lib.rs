@@ -244,7 +244,7 @@ impl<'pratt> Pratt<'pratt> {
     }
 
     /// One type parameter: `T`, `T: Num + Eq`, `F: * -> *`, or
-    /// `F: * -> * -> *, Bifunctor`.
+    /// `c: * -> Constraint`.
     ///
     /// After `:`, either class bounds or a kind annotation. A kind annotation
     /// may be followed by class bounds separated with a comma.
@@ -259,6 +259,7 @@ impl<'pratt> Pratt<'pratt> {
             let atom = just('*')
                 .padded()
                 .to(Kind::Type)
+                .or(keyword!("Constraint").to(Kind::Constraint))
                 .or(kind.clone().delimited_by(op!("("), op!(")")));
 
             atom.then(op!("->").ignore_then(kind).or_not())
@@ -268,8 +269,10 @@ impl<'pratt> Pratt<'pratt> {
                 })
         });
 
-        let class_bounds = text::ident()
+        let class_bound = text::ident()
             .padded()
+            .then_ignore(op!(":").not());
+        let class_bounds = class_bound
             .separated_by(op!("+"))
             .at_least(1)
             .collect::<Vec<_>>();
@@ -4125,6 +4128,27 @@ mod tests_generics {
     }
 
     #[test]
+    fn constraint_kind_annotation_parses() {
+        match decl_ast!("fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }")
+        {
+            Expression::Function { type_params, .. } => {
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(type_params[0].name, "c");
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Type),
+                        Box::new(crate::ast::Kind::Constraint)
+                    )
+                );
+                assert_eq!(type_params[1].name, "T");
+                assert_eq!(type_params[1].bounds, vec!["c"]);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn binary_hkt_kind_annotation_is_right_associative() {
         match decl_ast!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }") {
             Expression::TypeClass { type_params, .. } => {
@@ -4195,6 +4219,16 @@ mod tests_generics {
             s.contains("F: * -> * -> *"),
             "expected binary kind annotation in display, got: {s}"
         );
+    }
+
+    #[test]
+    fn constraint_kind_display_round_trips() {
+        let s = stmt!("fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }");
+        assert!(
+            s.contains("c: * -> Constraint"),
+            "expected constraint kind annotation in display, got: {s}"
+        );
+        assert!(s.contains("T: c"), "expected abstract bound in display, got: {s}");
     }
 
     /// TypeClassImpl Display: `impl Num<int> { … }`

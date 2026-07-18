@@ -62,7 +62,7 @@ function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list
                   ('->' type_annotation)? where_clause? block
 type_param_list ::= '<' type_param (',' type_param)* '>'
 type_param      ::= IDENT (':' (kind | class_bound ('+' class_bound)*))?
-kind            ::= '*' | '*' '->' '*'
+kind            ::= '*' | 'Constraint' | kind '->' kind | '(' kind ')'
 class_bound     ::= IDENT
 where_clause    ::= 'where' where_constraint (',' where_constraint)*
 where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
@@ -131,6 +131,11 @@ Higher-kinded parameters use explicit kind annotations (`F: * -> *`,
 constructor-kinded (for example `F: Container`) also implies that kind. A
 parameter can carry both an explicit kind and a bound:
 `F: * -> * -> *, Bifunctor`.
+
+Constraint-kind parameters use `Constraint` as the result kind:
+`fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }`.
+The abstract `T: c` bound must be resolved by method/operator/`%v` use in the
+function body so codegen can pass a concrete dictionary at call sites.
 
 ### Enums
 

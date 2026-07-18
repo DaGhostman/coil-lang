@@ -348,6 +348,36 @@ fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 Binder bounds (`T: Num`) remain the short form for unary classes; they desugar to
 the same constraint shape as `where Num<T>`.
 
+### Kinds
+
+Kinds classify type-level parameters:
+
+| Kind | Meaning | Example |
+|------|---------|---------|
+| `*` | A proper value type | `T: *` |
+| `* -> *` | Unary type constructor | `F: * -> *` |
+| `* -> * -> *` | Binary type constructor | `F: * -> * -> *` |
+| `(* -> *) -> *` | Higher-order type constructor | `F: (* -> *) -> *` |
+| `Constraint` | A fully applied typeclass predicate | internal result kind |
+| `* -> Constraint` | Unary constraint constructor | `c: * -> Constraint` |
+
+Constraint-kind parameters let a generic abstract over the class predicate
+itself:
+
+```0s
+fn choose<c: * -> Constraint, T: c>(T a, T b) -> int {
+    if lt_val(a, b) { return 0; } // selects c = Ordered
+    if eq_val(a, b) { return 42; } // Equal method via Ordered superclass
+    return 1;
+}
+```
+
+The function body still uses concrete dictionaries. Method use pins the abstract
+constraint parameter to a concrete class such as `Show` or `Ordered`; the stored
+function scheme then carries that concrete constraint, and call sites pass the
+ordinary instance dictionary. If no method/operator/`%v` use selects a concrete
+class, `T: c` is rejected as an unsatisfied abstract constraint.
+
 ### Syntax
 
 | Form | Meaning |
@@ -361,6 +391,7 @@ the same constraint shape as `where Num<T>`.
 | `typeclass Bifunctor<F: * -> * -> *>` | Binary type-constructor parameter |
 | `typeclass Higher<F: (* -> *) -> *>` | Higher-order constructor parameter |
 | `fn f<F: * -> * -> *, Bifunctor, A, B>(F<A, B> x)` | Explicit kind plus a class bound on one parameter |
+| `fn f<c: * -> Constraint, T: c>(T x)` | Constraint-kind parameter and abstract bound |
 
 Call-site strategy:
 
