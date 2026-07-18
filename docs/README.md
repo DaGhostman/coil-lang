@@ -108,7 +108,7 @@ zero-script/
 ├── machine/         # VM, heap/GC, FFI (libffi)
 ├── examples/        # Runnable .0s demos (see examples.md)
 ├── docs/            # This documentation
-├── src/main.rs      # CLI entry: compile → out.c0s → run
+├── src/main.rs      # CLI: default build+run, compile, run, test
 └── zero.toml.example  # Example project manifest
 ```
 
@@ -118,13 +118,25 @@ zero-script/
 # Build everything
 cargo build --workspace
 
-# Run an example (compiles to out.c0s on first invocation)
+# Default: compile to out.c0s (cached) and run
 cargo run -- examples/fib.0s
+
+# Compile only / run archive / project tests
+cargo run -- compile examples/fib.0s -o fib.c0s
+cargo run -- run fib.c0s
+cargo run -- test   # every .0s under ./tests
 
 # Release build
 cargo build --release --workspace
 cargo run --release -- examples/fib.0s
 ```
+
+| Command | Role |
+|---------|------|
+| *(no subcommand)* `<file.0s>` | Compile → `out.c0s` (cached) → run |
+| `compile <file.0s> [-o path]` | Compile entry file to a `.c0s` archive |
+| `run <file.c0s>` | Execute a compiled archive |
+| `test` | Compile+run all `./tests/**/*.0s` |
 
 For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](getting-started.md).
 
