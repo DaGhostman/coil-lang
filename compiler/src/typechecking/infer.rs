@@ -416,7 +416,10 @@ impl Checker {
     fn register_builtin_enums(&mut self) {
         self.register_builtin_ffi_type();
         self.register_builtin_option_result();
-        self.register_builtin_io_error();
+        // `IoError` is NOT registered here — it is not auto-imported.
+        // Registering its variants (esp. `Other`) globally would collide
+        // with user enums that use the same constructor names. Tags are
+        // installed on first `use io::…` that binds `IoError` or an IO fn.
     }
 
     /// Reset scope bindings and inject the auto-prelude.
@@ -431,6 +434,18 @@ impl Checker {
     /// Bind a virtual export under `local` (and drop any previous short
     /// binding for the export's canonical short name when `local` differs).
     pub fn bind_virtual_export(&mut self, local: String, export: BuiltinExport) {
+        // Lazily register `IoError` tags when the virtual `io` module is
+        // brought into scope (enum or any host fn whose scheme mentions it).
+        let needs_io_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_IO_ERROR_ENUM
+            } | BuiltinExport::IoFn { .. }
+        );
+        if needs_io_error && !self.enums.contains_key(common::BUILTIN_IO_ERROR_ENUM) {
+            self.register_builtin_io_error();
+        }
+
         let canonical = export.short_name().to_string();
         if local != canonical {
             // `use prelude::ops::Eq as PreludeEq` frees the short name.
@@ -12883,6 +12898,27 @@ fn main() {
         assert!(
             msgs.is_empty(),
             "unexpected messages: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn io_error_other_does_not_collide_until_imported() {
+        // IoError::Other must not reserve the constructor name globally —
+        // user enums may use `Other` without `use io`.
+        let (mut c, _) = check("enum Foo { Bar, Other } let x = Foo::Other;");
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected without io import: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+
+        let (mut c, _) = check("use io::*; let e = IoError::Other;");
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected with io import: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
