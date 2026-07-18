@@ -912,6 +912,30 @@ fn example_for_in_coro_prints_012_and_breaks() {
     assert_eq!(output, "01210");
 }
 
+#[test]
+fn example_for_in_array_prints_123() {
+    let output = run_example("examples/for_in_array.0s");
+    assert_eq!(output, "123");
+}
+
+#[test]
+fn example_for_in_tuple_prints_123() {
+    let output = run_example("examples/for_in_tuple.0s");
+    assert_eq!(output, "123");
+}
+
+#[test]
+fn example_for_in_dict_prints_12() {
+    let output = run_example("examples/for_in_dict.0s");
+    assert_eq!(output, "12");
+}
+
+#[test]
+fn example_for_in_custom_prints_012() {
+    let output = run_example("examples/for_in_custom.0s");
+    assert_eq!(output, "012");
+}
+
 /// Regression guard: `resume h` used INLINE as a `print` argument
 /// (no intermediate `let` binding) must not corrupt the operand
 /// stack. Pre-fix, the bare `yield expr;` statement's spurious

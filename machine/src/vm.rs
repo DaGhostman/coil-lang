@@ -938,7 +938,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::Panic as u8);
+            promise!(*bc as u8 <= Instruction::DictEntries as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1826,6 +1826,49 @@ impl<const S: usize> Machine<S> {
                     };
                     self.stack.push(Value::from(len as i64));
                 }
+                Instruction::DictEntries => {
+                    // Pop dict → push ObjArray of ObjTuple(2) (key, value).
+                    let dict_val = self.stack.pop();
+                    let dict_addr = dict_val.raw() as u64;
+                    let mut pair_addrs: Vec<Value> = Vec::new();
+                    if let Some(crate::memory::Object::Instance(gc)) =
+                        Self::find_object_by_addr(&self.heap, dict_addr)
+                    {
+                        let entries: Vec<(crate::memory::RefString, Member)> =
+                            gc.as_ref().iter_fields().collect();
+                        for (key, member) in entries {
+                            let key_val = Value::from(key.as_ptr() as u64);
+                            let val = match member {
+                                Member::Value(v) => v,
+                                Member::Object(o) => Value::from(o.addr()),
+                            };
+                            self.alloc_counter += 1;
+                            let (tuple_obj, _) = self.heap.alloc(
+                                ObjTuple {
+                                    elements: vec![key_val, val],
+                                },
+                                Object::Tuple,
+                            );
+                            pair_addrs.push(Value::from(tuple_obj.addr()));
+                        }
+                    }
+                    self.alloc_counter += 1;
+                    let (array_obj, _) = self.heap.alloc(
+                        ObjArray {
+                            elements: pair_addrs,
+                        },
+                        Object::Array,
+                    );
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(array_obj.addr()));
+                }
                 Instruction::JumpIfMatch => {
                     // Tag in operands[31:16]; jump target in value[31:0].
                     let operands = opcode.operand_u32();
@@ -2606,6 +2649,52 @@ mod tests {
             Byte::new(Instruction::HALT),
         ]);
         assert_eq!(vm.pop().as_int(), 3);
+    }
+
+    /// Emit a STRING opcode that pushes an interned heap string.
+    fn string_lit(s: &str) -> Vec<Byte> {
+        let mut out = vec![Byte::new(Instruction::STRING).with_operand_u32(s.len() as u32)];
+        for ch in s.chars() {
+            out.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        out
+    }
+
+    #[test]
+    fn dict_entries_yields_array_of_key_value_tuples() {
+        // MakeDict with {a: 1, b: 2}, then DictEntries → array of pairs.
+        let mut code = Vec::new();
+        // value, name for field a
+        code.push(const_int(1));
+        code.extend(string_lit("a"));
+        // value, name for field b
+        code.push(const_int(2));
+        code.extend(string_lit("b"));
+        code.push(Byte::new(Instruction::MakeDict).with_operand_u32(2));
+        code.push(Byte::new(Instruction::DictEntries));
+        code.push(Byte::new(Instruction::DUPLICATE));
+        code.push(Byte::new(Instruction::ArrayLen));
+        code.push(Byte::new(Instruction::HALT));
+
+        let mut vm = Machine::<16>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 2, "DictEntries should produce 2 pairs");
+
+        // Index 0 → tuple; Index 1 on tuple → value (1 or 2 depending on table order)
+        vm.run(&[
+            Byte::new(Instruction::DUPLICATE),
+            const_int(0),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::DUPLICATE),
+            const_int(1),
+            Byte::new(Instruction::Index),
+            Byte::new(Instruction::HALT),
+        ]);
+        let v0 = vm.pop().as_int();
+        assert!(
+            v0 == 1 || v0 == 2,
+            "pair value should be 1 or 2, got {v0}"
+        );
     }
 
     #[test]

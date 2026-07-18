@@ -14,8 +14,8 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `if` | Statement | Conditional | [Syntax — Statements](syntax.md#statements) |
 | `else` | Statement | Alternative branch | [Syntax — Statements](syntax.md#statements) |
 | `while` | Statement | Loop while condition true | [Syntax — Statements](syntax.md#statements) |
-| `for` | Statement | C-style `for (…)` or coroutine `for x in expr` | [Syntax — Statements](syntax.md#statements) |
-| `in` | Statement | Coroutine for-in separator (`for x in expr`) | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
+| `for` | Statement | C-style `for (…)` or iterator `for x in expr` | [Syntax — Statements](syntax.md#statements) |
+| `in` | Statement | For-in separator (`for x in expr` via `IntoIterator`) | [Built-ins — Iterator](built-ins.md#iterator--intoiterator) |
 | `break` | Statement | Exit innermost loop | [Syntax — Statements](syntax.md#statements) |
 | `continue` | Statement | Next iteration of innermost loop | [Syntax — Statements](syntax.md#statements) |
 | `return` | Statement | Exit function with value | [Syntax — Statements](syntax.md#statements) |

@@ -26,7 +26,8 @@ use parser::{
 pub use pipeline::*;
 pub use reporting::{ErrorCode, Label, Message, MessageKind};
 pub use typechecking::{
-    BuiltinExport, CStructDef, CallbackSigDef, Checker, FfiBuiltin, Ty, VirtualModules,
+    BuiltinExport, CStructDef, CallbackSigDef, Checker, FfiBuiltin, ForInInfo, ForInKind, Ty,
+    VirtualModules,
 };
 
 macro_rules! unary {
@@ -2342,6 +2343,290 @@ impl Compiler {
         self.context.variables.intern(name) as u32
     }
 
+    /// `for x in` over an array already on the operand stack (or just
+    /// compiled). Observationally identical to `ArrayIter::next`.
+    ///
+    /// Layout: StorePop arr; idx=0; [top] idx < len → else exit;
+    /// `x = arr[idx]`; body; [continue] idx++; JMP top; [exit].
+    fn emit_for_in_array_loop(
+        &mut self,
+        body: &Output<'_>,
+        binding_name: &str,
+        array_already_on_stack: bool,
+        iterable: Option<&Output<'_>>,
+    ) {
+        let arr_slot = self.alloc_temp_slot();
+        let idx_slot = self.alloc_temp_slot();
+        if !array_already_on_stack {
+            let iter_bc = self.do_compile(iterable.expect("iterable required when not on stack"));
+            self.bytecode.extend(iter_bc);
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(arr_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_const_inline(0));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx_slot));
+
+        // Consume binding Identifier NodeId (iterable → binding → body).
+        let _ = self.next_emit_id();
+        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label();
+        let continue_label = bb.fresh_label();
+        let exit_label = bb.fresh_label();
+        let top_label_target = self.bytecode.len() as u32;
+
+        // cond: idx < len(arr)  (LE is `<`)
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(arr_slot));
+        self.bytecode.push(Byte::new(Instruction::ArrayLen));
+        self.bytecode.push(Byte::new(Instruction::LE));
+        bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+        // x = arr[idx]
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(arr_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx_slot));
+        self.bytecode.push(Byte::new(Instruction::Index));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+
+        self.loop_stack.push((continue_label, exit_label));
+        self.loop_bbs.push(bb);
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        let mut bb = self
+            .loop_bbs
+            .pop()
+            .expect("loop builder stack balanced for for-in array");
+        self.loop_stack
+            .pop()
+            .expect("loop label stack balanced for for-in array");
+
+        let continue_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            continue_label,
+            continue_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        // idx = idx + 1
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(idx_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_const_inline(1));
+        self.bytecode.push(Byte::new(Instruction::ADD));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(idx_slot));
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let exit_label_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            exit_label,
+            exit_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.bind_label(
+            top_label,
+            top_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.finalize()
+            .expect("BlockBuilder::finalize: for-in array labels bound");
+    }
+
+    /// Homogeneous tuple → temp `[A; N]` via Index, then array for-in.
+    fn emit_for_in_tuple(
+        &mut self,
+        iterable: &Output<'_>,
+        body: &Output<'_>,
+        binding_name: &str,
+        arity: usize,
+    ) {
+        let tup_slot = self.alloc_temp_slot();
+        let iter_bc = self.do_compile(iterable);
+        self.bytecode.extend(iter_bc);
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(tup_slot));
+        for i in 0..arity {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(tup_slot));
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+            self.bytecode.push(Byte::new(Instruction::Index));
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::MakeArray).with_operand_u32(arity as u32));
+        self.emit_for_in_array_loop(body, binding_name, true, None);
+    }
+
+    /// Dict → `DictEntries` → array of `(string, V)` pairs → array for-in.
+    fn emit_for_in_dict(&mut self, iterable: &Output<'_>, body: &Output<'_>, binding_name: &str) {
+        let iter_bc = self.do_compile(iterable);
+        self.bytecode.extend(iter_bc);
+        self.bytecode.push(Byte::new(Instruction::DictEntries));
+        self.emit_for_in_array_loop(body, binding_name, true, None);
+    }
+
+    /// Coroutine for-in: resume → bind; skip body when `done` (completion
+    /// value excluded). Same layout as the Phase CORO for-in path.
+    fn emit_for_in_coro(&mut self, iterable: &Output<'_>, body: &Output<'_>, binding_name: &str) {
+        let handle_slot = self.alloc_temp_slot();
+        let iter_bc = self.do_compile(iterable);
+        self.bytecode.extend(iter_bc);
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(handle_slot));
+
+        let _ = self.next_emit_id();
+        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label();
+        let exit_label = bb.fresh_label();
+        let top_label_target = self.bytecode.len() as u32;
+
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::ResumeCoro).with_operand_u32(0));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
+        self.bytecode.push(Byte::new(Instruction::DoneCoro));
+        self.bytecode.push(Byte::new(Instruction::LogNot));
+        bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+        self.loop_stack.push((top_label, exit_label));
+        self.loop_bbs.push(bb);
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        let mut bb = self
+            .loop_bbs
+            .pop()
+            .expect("loop builder stack balanced for for-in coro");
+        self.loop_stack
+            .pop()
+            .expect("loop label stack balanced for for-in coro");
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let exit_label_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            exit_label,
+            exit_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.bind_label(
+            top_label,
+            top_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.finalize()
+            .expect("BlockBuilder::finalize: for-in coro labels bound");
+    }
+
+    /// User `IntoIterator` / `Iterator`: `into_iter` then `next` → Option.
+    ///
+    /// Trait instance methods unbox type-parameter args in their prologue
+    /// (`ValueTag::Instance` for classes), so call sites must `BoxValue`
+    /// the carrier before `CallIndirect`.
+    fn emit_for_in_custom(
+        &mut self,
+        iterable: &Output<'_>,
+        body: &Output<'_>,
+        binding_name: &str,
+        into_iter_fqn: &str,
+        next_fqn: &str,
+    ) {
+        let into_off = self.functions.get(into_iter_fqn).copied().unwrap_or(0) as u32;
+        let next_off = self.functions.get(next_fqn).copied().unwrap_or(0) as u32;
+        let none_tag = self
+            .checker
+            .tag_for(common::BUILTIN_OPTION_ENUM, "None")
+            .unwrap_or(0);
+        let carrier_tag = ValueTag::Instance as u32;
+
+        let it_slot = self.alloc_temp_slot();
+        let iter_bc = self.do_compile(iterable);
+        self.bytecode.extend(iter_bc);
+        self.bytecode
+            .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
+        Self::emit_call_indirect(&mut self.bytecode, into_off, 1);
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(it_slot));
+
+        let _ = self.next_emit_id();
+        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label();
+        let exit_label = bb.fresh_label();
+        let top_label_target = self.bytecode.len() as u32;
+
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(it_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::BoxValue).with_operand_u32(carrier_tag));
+        Self::emit_call_indirect(&mut self.bytecode, next_off, 1);
+
+        // `Option::None` → exit (JumpIfMatch pops unit None).
+        bb.emit_jump_to(
+            exit_label,
+            BbJumpKind::JumpIfMatch {
+                tag: none_tag,
+                arity: 0,
+            },
+            &mut self.bytecode,
+        );
+        // Fall-through: Some(v) — unpack payload into binding.
+        self.bytecode
+            .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+
+        self.loop_stack.push((top_label, exit_label));
+        self.loop_bbs.push(bb);
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        let mut bb = self
+            .loop_bbs
+            .pop()
+            .expect("loop builder stack balanced for for-in custom");
+        self.loop_stack
+            .pop()
+            .expect("loop label stack balanced for for-in custom");
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let exit_label_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            exit_label,
+            exit_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.bind_label(
+            top_label,
+            top_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.finalize()
+            .expect("BlockBuilder::finalize: for-in custom labels bound");
+    }
+
     fn emit_field_name(&self, bytecode: &mut Vec<Byte>, field: &str) {
         Self::emit_raw_string_literal(bytecode, field);
     }
@@ -3368,78 +3653,50 @@ impl Compiler {
             }
             // --- Loop codegen ---
             // `while`: [top] cond, JMPF→exit, body, JMP→top, [exit]
-            // `for x in coro`: StorePop __h; [top] resume→x; Done; LogNot; JMPF→exit; body; JMP→top; [exit]
+            // `for x in`: IntoIterator/Iterator (array/tuple/dict/coro/custom)
             Expression::Loop {
                 identifier,
                 iterable,
                 body,
             } => {
                 if let Some(binding) = identifier {
-                    // for-in over coroutine: resume then skip body when done
-                    // (completion value / Done-sentinel never enters the body).
-                    let handle_slot = self.alloc_temp_slot();
-                    let iter_bc = self.do_compile(iterable);
-                    self.bytecode.extend(iter_bc);
-                    self.bytecode
-                        .push(Byte::new(Instruction::StorePop).with_operand_u32(handle_slot));
-
                     let binding_name = match binding.1.as_ref() {
                         Expression::Identifier(n) => (*n).to_string(),
                         _ => "__for_in_x".to_string(),
                     };
-                    // Consume the binding Identifier's NodeId without emitting
-                    // LOAD (do_compile would load an unbound / wrong slot).
-                    let _ = self.next_emit_id();
-                    let binding_slot = self.context.variables.intern(binding_name) as u32;
-
-                    let mut bb = BlockBuilder::new();
-                    let top_label = bb.fresh_label();
-                    let exit_label = bb.fresh_label();
-                    let top_label_target = self.bytecode.len() as u32;
-
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
-                    self.bytecode
-                        .push(Byte::new(Instruction::ResumeCoro).with_operand_u32(0));
-                    self.bytecode
-                        .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
-
-                    // `if done(__h) { break; }` via DoneCoro; LogNot; JMPF exit
-                    self.bytecode
-                        .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
-                    self.bytecode.push(Byte::new(Instruction::DoneCoro));
-                    self.bytecode.push(Byte::new(Instruction::LogNot));
-                    bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
-
-                    self.loop_stack.push((top_label, exit_label));
-                    self.loop_bbs.push(bb);
-                    let body_bc = self.do_compile(body);
-                    self.bytecode.extend(body_bc);
-                    let mut bb = self
-                        .loop_bbs
-                        .pop()
-                        .expect("loop builder stack balanced for for-in");
-                    self.loop_stack
-                        .pop()
-                        .expect("loop label stack balanced for for-in");
-
-                    bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
-
-                    let exit_label_target = self.bytecode.len() as u32;
-                    bb.bind_label(
-                        exit_label,
-                        exit_label_target,
-                        &mut self.bytecode,
-                        &mut self.constants,
-                    );
-                    bb.bind_label(
-                        top_label,
-                        top_label_target,
-                        &mut self.bytecode,
-                        &mut self.constants,
-                    );
-                    bb.finalize()
-                        .expect("BlockBuilder::finalize: for-in labels bound");
+                    let info = self_id
+                        .and_then(|id| self.checker.for_in_info_at(id))
+                        .or_else(|| self.checker.for_in_info_for_span(span.start, span.end))
+                        .cloned();
+                    let kind = info
+                        .map(|i| i.kind)
+                        .unwrap_or(ForInKind::Coroutine);
+                    match kind {
+                        ForInKind::Array => {
+                            self.emit_for_in_array_loop(body, &binding_name, false, Some(iterable));
+                        }
+                        ForInKind::Tuple { arity } => {
+                            self.emit_for_in_tuple(iterable, body, &binding_name, arity);
+                        }
+                        ForInKind::Dict => {
+                            self.emit_for_in_dict(iterable, body, &binding_name);
+                        }
+                        ForInKind::Coroutine => {
+                            self.emit_for_in_coro(iterable, body, &binding_name);
+                        }
+                        ForInKind::Custom {
+                            into_iter_fqn,
+                            next_fqn,
+                        } => {
+                            self.emit_for_in_custom(
+                                iterable,
+                                body,
+                                &binding_name,
+                                &into_iter_fqn,
+                                &next_fqn,
+                            );
+                        }
+                    }
                 } else {
                     let mut bb = BlockBuilder::new();
                     let top_label = bb.fresh_label();
@@ -6615,6 +6872,77 @@ sum = sum + i; \
     }
 
     #[test]
+    fn for_in_array_emits_array_len_index_and_back_edge() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { for x in [1, 2, 3] { print \"%i\", x; } }",
+        );
+        let has_len = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::ArrayLen));
+        let has_index = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::Index));
+        let jmp = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JMP))
+            .count();
+        assert!(has_len, "array for-in should emit ArrayLen");
+        assert!(has_index, "array for-in should emit Index");
+        assert!(jmp >= 1, "array for-in should emit back-edge JMP; got {jmp}");
+    }
+
+    #[test]
+    fn for_in_dict_emits_dict_entries() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { let d = { a: 1, b: 2 }; for p in d { print \"%i\", p[1]; } }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::DictEntries)),
+            "dict for-in should emit DictEntries; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn for_in_custom_emits_into_iter_and_next_calls() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "class Counter { cur: int, end: int, } \
+impl IntoIterator<Counter> { \
+    type Item = int; type IntoIter = Counter; \
+    fn into_iter(Counter c) -> Counter { return c; } \
+} \
+impl Iterator<Counter> { \
+    type Item = int; \
+    fn next(Counter c) -> Option<int> { \
+        if c.cur < c.end { let v = c.cur; c.cur = c.cur + 1; return Option::Some(v); } \
+        return Option::None; \
+    } \
+} \
+fn main() { let c = new Counter(0, 3); for x in c { print \"%i\", x; } }",
+        );
+        let call_indirect = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CallIndirect))
+            .count();
+        let jump_if_match = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
+            .count();
+        assert!(
+            call_indirect >= 2,
+            "custom for-in should CallIndirect into_iter and next; got {call_indirect}"
+        );
+        assert!(
+            jump_if_match >= 1,
+            "custom for-in should JumpIfMatch on Option::None; got {jump_if_match}"
+        );
+    }
+
+    #[test]
     fn for_in_coro_emits_resume_done_and_back_edge() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
@@ -8784,3 +9112,4 @@ fn main() { \
         );
     }
 }
+// temp - will remove

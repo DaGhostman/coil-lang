@@ -49,7 +49,8 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
-| Coroutines (`async`, `yield`, `resume`, `yield from`, `done`, `for x in`) | Supported |
+| Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
+| `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, coroutines, user `impl`s) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 

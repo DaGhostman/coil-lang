@@ -287,9 +287,9 @@ statement ::= while_stmt
 | `yield` | `yield expr ';'` or `yield from expr ';'` |
 | `while` | `while expr block` |
 | `for` (C-style) | `for '(' init ';' cond ';' step ')' block` |
-| `for` (coroutine) | `for IDENT in expr block` — iterates a `coroutine<Y, S>` (see [Coroutines](../tutorial/08-coroutines.md)) |
+| `for` (iterator) | `for IDENT in expr block` — via prelude `IntoIterator` / `Iterator` (arrays, homogeneous tuples/dicts, coroutines, or user `impl`s; see [Built-ins](built-ins.md#iterator--intoiterator)) |
 | `break` | `break ';'` (innermost loop) |
-| `continue` | `continue ';'` (jumps to `for` step / `while` condition / next for-in resume) |
+| `continue` | `continue ';'` (jumps to `for` step / `while` condition / next for-in iteration) |
 | `if` | `if expr block ('else' (block \| if_stmt))?` |
 | Block | `'{' statement* '}'` |
 
@@ -462,7 +462,7 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| `for x in` over arrays / tuples / ranges | Not implemented — coroutine for-in only today |
+| `for x in` over ranges (`0..n`) | Not implemented — use C-style `for` or an array |
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 

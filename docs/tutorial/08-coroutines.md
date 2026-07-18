@@ -147,10 +147,12 @@ See `examples/coro_interleave.0s` for a longer alternating-`resume` example.
 
 ## Iterating with `for x in`
 
-A coroutine handle can be consumed with `for x in expr { … }`. The loop
-resumes until `done`, binding each **yielded** value to `x`. The resume that
-completes the coroutine (`return` / fall-off) does **not** enter the body
-(Python/JS-like). `break` / `continue` work as usual.
+`for x in expr` goes through the prelude [`IntoIterator` /
+`Iterator`](../reference/built-ins.md#iterator--intoiterator) protocol.
+Coroutines participate: the loop resumes until `done`, binding each
+**yielded** value to `x`. The resume that completes the coroutine
+(`return` / fall-off) does **not** enter the body (Python/JS-like).
+`break` / `continue` work as usual.
 
 ```0s
 async fn counter() {
@@ -167,19 +169,22 @@ fn main() {
 }
 ```
 
-See `examples/for_in_coro.0s`. Arrays and other collections are not iterable
-with `for … in` yet — only `coroutine<Y, S>`.
+See `examples/for_in_coro.0s`. The same `for x in` form also iterates
+arrays, homogeneous tuples/dicts, and user `impl IntoIterator` types
+(see `examples/for_in_array.0s`, `for_in_dict.0s`, `for_in_custom.0s`).
 
 ## Recompiling
 
-Coroutines added new VM opcodes; delete stale archives after upgrading:
+Coroutines and iterators added VM opcodes; delete stale archives after
+upgrading:
 
 ```bash
 rm -f out.c0s
 cargo run -- examples/coro_send.0s
 ```
 
-`ARCHIVE_VERSION` is **9** (Phase CORO-2).
+Bump `ARCHIVE_VERSION` whenever bytecode changes incompatibly (see
+`common/src/archive.rs`).
 
 ## Related
 

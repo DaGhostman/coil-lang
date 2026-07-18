@@ -57,6 +57,30 @@ pub struct ExistentialPack {
     pub class: String,
     pub value_ty: Ty,
 }
+
+/// Runtime lowering strategy for `for x in expr` (unified Iterator protocol).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForInKind {
+    /// Index loop over `[T]` / `[T; N]` (observationally `ArrayIter`).
+    Array,
+    /// Materialise homogeneous tuple elements into a temp array, then array path.
+    Tuple { arity: usize },
+    /// `DictEntries` then array path; items are `(string, V)` pairs.
+    Dict,
+    /// Resume/Done loop (completion value excluded from body).
+    Coroutine,
+    /// Dictionary ABI: `into_iter` then `next` → `Option<Item>`.
+    Custom {
+        into_iter_fqn: String,
+        next_fqn: String,
+    },
+}
+
+/// Side-table entry for for-in codegen, keyed by the Loop node id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForInInfo {
+    pub kind: ForInKind,
+}
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
@@ -154,6 +178,10 @@ pub struct Checker {
     /// Calls dispatched through an existential argument/receiver dictionary.
     existential_method_calls: HashMap<NodeId, ExistentialMethodCall>,
     existential_method_calls_by_span: HashMap<(usize, usize), ExistentialMethodCall>,
+
+    /// `for x in` lowering info (Iterator protocol).
+    for_in_infos: HashMap<NodeId, ForInInfo>,
+    for_in_infos_by_span: HashMap<(usize, usize), ForInInfo>,
 
     /// Typeclass method signatures, keyed by `(class, method)`.
     typeclass_method_schemes: HashMap<(String, String), Scheme>,
@@ -376,6 +404,8 @@ impl Checker {
             existential_packs_by_span: HashMap::new(),
             existential_method_calls: HashMap::new(),
             existential_method_calls_by_span: HashMap::new(),
+            for_in_infos: HashMap::new(),
+            for_in_infos_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
             type_aliases: vec![HashMap::new()],
             generic_aliases: HashMap::new(),
@@ -619,6 +649,8 @@ impl Checker {
         self.existential_packs_by_span.clear();
         self.existential_method_calls.clear();
         self.existential_method_calls_by_span.clear();
+        self.for_in_infos.clear();
+        self.for_in_infos_by_span.clear();
         self.typeclass_method_schemes.clear();
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
@@ -1033,6 +1065,56 @@ impl Checker {
                 Ty::Fun(Box::new(Ty::Var(var)), Box::new(string())),
             ),
         );
+
+        // Iterator::next : ∀I Item. Iterator<I> => I → Option<Item>
+        {
+            let i_var = self.counter.fresh();
+            let item_var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Iterator".to_string(), "next".to_string()),
+                Scheme::poly_with_kinds_and_assoc(
+                    vec![i_var, item_var],
+                    vec![Kind::Type, Kind::Type],
+                    vec![Constraint::unary("Iterator", i_var)],
+                    vec![AssocProjection {
+                        var: item_var,
+                        name: "Item".into(),
+                        args: vec![],
+                    }],
+                    Ty::Fun(
+                        Box::new(Ty::Var(i_var)),
+                        Box::new(option_app_ty(Ty::Var(item_var))),
+                    ),
+                ),
+            );
+        }
+        // IntoIterator::into_iter : ∀T Item IntoIter. IntoIterator<T> => T → IntoIter
+        {
+            let t_var = self.counter.fresh();
+            let item_var = self.counter.fresh();
+            let into_iter_var = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("IntoIterator".to_string(), "into_iter".to_string()),
+                Scheme::poly_with_kinds_and_assoc(
+                    vec![t_var, item_var, into_iter_var],
+                    vec![Kind::Type, Kind::Type, Kind::Type],
+                    vec![Constraint::unary("IntoIterator", t_var)],
+                    vec![
+                        AssocProjection {
+                            var: item_var,
+                            name: "Item".into(),
+                            args: vec![],
+                        },
+                        AssocProjection {
+                            var: into_iter_var,
+                            name: "IntoIter".into(),
+                            args: vec![],
+                        },
+                    ],
+                    Ty::Fun(Box::new(Ty::Var(t_var)), Box::new(Ty::Var(into_iter_var))),
+                ),
+            );
+        }
     }
 
     /// Inner inference — does the actual dispatch but no caching.
@@ -1670,19 +1752,14 @@ impl Checker {
                 body,
             } => {
                 if let Some(binding) = identifier {
-                    // `for x in expr { body }` — iterable must be coroutine<Y, S>;
-                    // bind `x : Y` for the body.
+                    // `for x in expr { body }` — IntoIterator / Iterator protocol
+                    // (builtin arrays, homogeneous tuples/dicts, coroutines, or
+                    // user `impl`s). Bind `x : Item`.
                     let it = self.infer(iterable);
-                    let y_var = Ty::Var(self.counter.fresh());
-                    let s_var = Ty::Var(self.counter.fresh());
-                    let coro_ty = self.coroutine_type(y_var.clone(), s_var);
-                    self.unify(
-                        &it,
-                        &coro_ty,
-                        &iterable.0.into_range(),
-                        "for-in iterable",
-                    );
-                    let elem_ty = apply_ty_prune(&self.subst, &y_var);
+                    let resolved = apply_ty_prune(&self.subst, &it);
+                    let elem_ty = self
+                        .resolve_for_in_iterable(&resolved, id, &iterable.0.into_range(), &range)
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
                     self.env.push();
                     if let Expression::Identifier(name) = binding.1.as_ref() {
                         self.env
@@ -8486,6 +8563,229 @@ impl Checker {
         self.codegen_var_types.get(name)
     }
 
+    /// For-in lowering info recorded during typecheck (by Loop node id).
+    pub fn for_in_info_at(&self, id: NodeId) -> Option<&ForInInfo> {
+        self.for_in_infos.get(&id)
+    }
+
+    /// For-in lowering info by source span (fallback when ids misalign).
+    pub fn for_in_info_for_span(&self, start: usize, end: usize) -> Option<&ForInInfo> {
+        self.for_in_infos_by_span.get(&(start, end))
+    }
+
+    /// Resolve `for x in` iterable type to `Item` and record [`ForInInfo`].
+    ///
+    /// Builtin synthesis covers arrays, homogeneous tuples/records, and
+    /// coroutines. Otherwise looks up `IntoIterator` / `Iterator` instances.
+    fn resolve_for_in_iterable(
+        &mut self,
+        te: &Ty,
+        loop_id: Option<NodeId>,
+        iterable_range: &Range<usize>,
+        loop_range: &Range<usize>,
+    ) -> Option<Ty> {
+        // ---- Builtin synthesis ----
+        if let Some((item, kind)) = self.builtin_for_in_kind(te, iterable_range) {
+            self.record_for_in_info(loop_id, loop_range, ForInInfo { kind });
+            return Some(item);
+        }
+
+        // ---- User IntoIterator / Iterator ----
+        match self.find_unique_instance("IntoIterator", &[te.clone()], iterable_range) {
+            Ok(Some(into_inst)) => {
+                let item = into_inst
+                    .assoc_tys
+                    .get("Item")
+                    .map(|v| v.ty.clone())
+                    .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                let into_iter_ty = into_inst
+                    .assoc_tys
+                    .get("IntoIter")
+                    .map(|v| v.ty.clone())
+                    .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                let into_fqn = into_inst.method_fqns.get("into_iter").cloned();
+                match self.find_unique_instance(
+                    "Iterator",
+                    &[into_iter_ty.clone()],
+                    iterable_range,
+                ) {
+                    Ok(Some(iter_inst)) => {
+                        if let Some(iter_item) = iter_inst.assoc_tys.get("Item") {
+                            self.unify(
+                                &item,
+                                &iter_item.ty,
+                                iterable_range,
+                                "IntoIterator/Iterator Item",
+                            );
+                        }
+                        let next_fqn = iter_inst.method_fqns.get("next").cloned();
+                        match (into_fqn, next_fqn) {
+                            (Some(into_iter_fqn), Some(next_fqn)) => {
+                                self.record_for_in_info(
+                                    loop_id,
+                                    loop_range,
+                                    ForInInfo {
+                                        kind: ForInKind::Custom {
+                                            into_iter_fqn,
+                                            next_fqn,
+                                        },
+                                    },
+                                );
+                                Some(apply_ty_prune(&self.subst, &item))
+                            }
+                            _ => {
+                                let _ = self.error_with_help(
+                                    ErrorCode::GenericTypeError,
+                                    "IntoIterator/Iterator instance is missing method implementations"
+                                        .to_string(),
+                                    iterable_range.clone(),
+                                    Some(
+                                        "implement `into_iter` and `next` for the iterable type"
+                                            .to_string(),
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "type `{}` is IntoIterator but its IntoIter is not Iterator",
+                                te
+                            ),
+                            iterable_range.clone(),
+                            Some(format!(
+                                "add `impl Iterator<{}>` with matching `type Item`",
+                                into_iter_ty
+                            )),
+                        );
+                        None
+                    }
+                    Err(()) => None,
+                }
+            }
+            Ok(None) => {
+                let _ = self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!("type `{}` is not iterable", te),
+                    iterable_range.clone(),
+                    Some(
+                        "implement `IntoIterator` / `Iterator`, or use an array, homogeneous tuple/dict, or coroutine"
+                            .to_string(),
+                    ),
+                );
+                None
+            }
+            Err(()) => None,
+        }
+    }
+
+    fn record_for_in_info(
+        &mut self,
+        loop_id: Option<NodeId>,
+        loop_range: &Range<usize>,
+        info: ForInInfo,
+    ) {
+        if let Some(id) = loop_id {
+            self.for_in_infos.insert(id, info.clone());
+        }
+        self.for_in_infos_by_span
+            .insert((loop_range.start, loop_range.end), info);
+    }
+
+    /// Builtin iterable shapes → `(Item, ForInKind)`. Returns `None` when
+    /// the type is not a recognised builtin iterable (caller falls through
+    /// to trait instance lookup). Emits diagnostics for hetero tuple/dict.
+    fn builtin_for_in_kind(
+        &mut self,
+        te: &Ty,
+        range: &Range<usize>,
+    ) -> Option<(Ty, ForInKind)> {
+        match te {
+            Ty::Array { element, .. } => {
+                Some((element.as_ref().clone(), ForInKind::Array))
+            }
+            Ty::Tuple(elems) => {
+                if elems.is_empty() {
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "empty tuple is not iterable".to_string(),
+                        range.clone(),
+                        Some("tuple for-in requires at least one element".to_string()),
+                    );
+                    return None;
+                }
+                match self.homogeneous_types(elems, range, "tuple") {
+                    Some(item) => Some((
+                        item,
+                        ForInKind::Tuple {
+                            arity: elems.len(),
+                        },
+                    )),
+                    None => None,
+                }
+            }
+            Ty::Record { fields } => {
+                let value_tys: Vec<Ty> = fields.iter().map(|(_, ty)| ty.clone()).collect();
+                if value_tys.is_empty() {
+                    // Vacuously homogeneous; Item = (string, α).
+                    let v = Ty::Var(self.counter.fresh());
+                    return Some((tuple_ty(vec![string(), v]), ForInKind::Dict));
+                }
+                match self.homogeneous_types(&value_tys, range, "dict") {
+                    Some(v) => Some((tuple_ty(vec![string(), v]), ForInKind::Dict)),
+                    None => None,
+                }
+            }
+            Ty::App(head, args) => {
+                if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") && args.len() == 2 {
+                    return Some((args[0].clone(), ForInKind::Coroutine));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// All types unify to one element type, or diagnose heterogeneity.
+    fn homogeneous_types(
+        &mut self,
+        tys: &[Ty],
+        range: &Range<usize>,
+        kind: &str,
+    ) -> Option<Ty> {
+        let first = apply_ty_prune(&self.subst, &tys[0]);
+        for other in tys.iter().skip(1) {
+            let other = apply_ty_prune(&self.subst, other);
+            if unify_with(&self.subst, &first, &other).is_err() {
+                let _ = self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "heterogeneous {} is not iterable (element types `{}` and `{}`)",
+                        kind, first, other
+                    ),
+                    range.clone(),
+                    Some(format!(
+                        "{} for-in requires all elements to share one type",
+                        kind
+                    )),
+                );
+                return None;
+            }
+        }
+        // Bind any open vars across the set.
+        let mut local = self.subst.clone();
+        for other in tys.iter().skip(1) {
+            if let Ok(s) = unify_with(&local, &first, other) {
+                local = s;
+            }
+        }
+        self.subst = compose(&local, &self.subst);
+        Some(apply_ty_prune(&self.subst, &first))
+    }
+
     /// True if `name` is a registered class.
     pub fn is_class(&self, name: &str) -> bool {
         self.classes.contains_key(name)
@@ -11779,18 +12079,95 @@ fn main() {
     }
 
     #[test]
-    fn for_in_non_coro_iterable_is_diagnostic() {
+    fn for_in_non_iterable_is_diagnostic() {
         let (c, _) = check("fn main() { for x in 42 { } }");
         assert!(
-            c.messages().iter().any(|m| {
-                m.message().contains("Type mismatch")
-                    && m.help()
-                        .as_ref()
-                        .is_some_and(|h| h.contains("for-in iterable"))
-            }),
-            "expected for-in type error, got {:?}",
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("not iterable")),
+            "expected for-in not-iterable error, got {:?}",
             c.messages()
         );
+    }
+
+    #[test]
+    fn for_in_array_binds_element_type() {
+        let src = r#"
+fn main() {
+    for x in [1, 2, 3] {
+        let y = x;
+    }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let y_ty = c.codegen_var_type("y").expect("y");
+        assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
+    }
+
+    #[test]
+    fn for_in_hetero_tuple_is_diagnostic() {
+        let (c, _) = check("fn main() { for x in (1, \"a\") { } }");
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("heterogeneous")),
+            "expected hetero tuple diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn for_in_hetero_dict_is_diagnostic() {
+        let (c, _) = check("fn main() { for x in { a: 1, b: \"x\" } { } }");
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("heterogeneous")),
+            "expected hetero dict diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn for_in_custom_iterator_accepted() {
+        let src = r#"
+class Counter {
+    cur: int,
+    end: int,
+}
+
+impl IntoIterator<Counter> {
+    type Item = int;
+    type IntoIter = Counter;
+    fn into_iter(Counter c) -> Counter {
+        return c;
+    }
+}
+
+impl Iterator<Counter> {
+    type Item = int;
+    fn next(Counter c) -> Option<int> {
+        if c.cur < c.end {
+            let v = c.cur;
+            c.cur = c.cur + 1;
+            return Option::Some(v);
+        }
+        return Option::None;
+    }
+}
+
+fn main() {
+    let c = new Counter(0, 3);
+    for x in c {
+        let y = x;
+    }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let y_ty = c.codegen_var_type("y").expect("y");
+        assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
     }
 
     #[test]
