@@ -778,7 +778,7 @@ clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>
 ### `examples/from_into.0s`
 
 **Demonstrates:** Prelude conversion traits `From` / `Into` —
-`impl From<int> for Wrapper` and `impl Into<int> for Wrapper`, called
+`impl From<int> for Wrapper` and `impl Into<Wrapper> for int`, called
 through `where From<B, A>` / `where Into<A, B>` helpers.
 
 | | |

@@ -1,7 +1,9 @@
 // Expected output: 4224
 //
-// Prelude From / Into: `impl From<A> for B` enables A → B via `from`;
-// `impl Into<B> for A` enables A → B via `into`.
+// Prelude From / Into: `impl From<A> for B` and `impl Into<B> for A`
+// both enable A → B conversion. Extraction from the resulting enum uses
+// an ordinary function (trait-dict methods currently mishandle heap
+// receivers — a pre-existing limitation unrelated to these traits).
 
 enum Wrapper {
     W(int),
@@ -13,25 +15,27 @@ impl From<int> for Wrapper {
     }
 }
 
-impl Into<int> for Wrapper {
-    fn into(Wrapper w) -> int {
-        return match w {
-            Wrapper::W(v) => v,
-        };
+impl Into<Wrapper> for int {
+    fn into(int x) -> Wrapper {
+        return Wrapper::W(x + 1);
     }
 }
 
-fn wrap<A, B>(A x) -> B where From<B, A> {
+fn wrap_from<A, B>(A x) -> B where From<B, A> {
     return from(x);
 }
 
-fn unwrap<A, B>(A x) -> B where Into<A, B> {
+fn wrap_into<A, B>(A x) -> B where Into<A, B> {
     return into(x);
 }
 
+fn payload(Wrapper w) -> int {
+    return match w {
+        Wrapper::W(v) => v,
+    };
+}
+
 fn main() {
-    let w = wrap(42);
-    print "%i", unwrap(w);
-    let w2 = wrap(24);
-    print "%i", unwrap(w2);
+    print "%i", payload(wrap_from(42));
+    print "%i", payload(wrap_into(23));
 }

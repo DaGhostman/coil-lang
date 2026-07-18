@@ -13150,6 +13150,39 @@ fn main() { let w = wrap(42); }
         );
     }
 
+    /// `impl Into<Wrapper> for int` typechecks and discharges at the call site.
+    #[test]
+    fn prelude_into_impl_for_local_target_typechecks() {
+        let src = r#"
+enum Wrapper { W(int) }
+impl Into<Wrapper> for int {
+    fn into(int x) -> Wrapper { return Wrapper::W(x); }
+}
+fn wrap<A, B>(A x) -> B where Into<A, B> { return into(x); }
+fn main() { let w = wrap(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let dicts = c.all_call_site_dicts();
+        let has_into = dicts.values().any(|instances| {
+            instances.iter().any(|i| {
+                i.class == "Into"
+                    && i.args.len() == 2
+                    && matches!(&i.args[0], Ty::Con(n) if n == "int")
+            })
+        });
+        assert!(
+            has_into,
+            "expected Into<int, Wrapper> in call_site_dicts, got: {:?}",
+            dicts
+        );
+    }
+
     #[test]
     fn binary_hkt_result_instance_discharges() {
         let src = r#"
