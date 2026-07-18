@@ -1160,6 +1160,37 @@ impl Checker {
             ),
         );
 
+        // From::from : ∀Self T. From<Self, T> => T → Self
+        // Into::into : ∀Self T. Into<Self, T> => Self → T
+        {
+            let self_v = self.counter.fresh();
+            let t_v = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("From".to_string(), "from".to_string()),
+                Scheme::poly(
+                    vec![self_v, t_v],
+                    vec![Constraint {
+                        class: "From".into(),
+                        args: vec![Ty::Var(self_v), Ty::Var(t_v)],
+                    }],
+                    Ty::Fun(Box::new(Ty::Var(t_v)), Box::new(Ty::Var(self_v))),
+                ),
+            );
+            let self_v = self.counter.fresh();
+            let t_v = self.counter.fresh();
+            self.typeclass_method_schemes.insert(
+                ("Into".to_string(), "into".to_string()),
+                Scheme::poly(
+                    vec![self_v, t_v],
+                    vec![Constraint {
+                        class: "Into".into(),
+                        args: vec![Ty::Var(self_v), Ty::Var(t_v)],
+                    }],
+                    Ty::Fun(Box::new(Ty::Var(self_v)), Box::new(Ty::Var(t_v))),
+                ),
+            );
+        }
+
         // Read::read / Write::write — stream IO groundwork.
         {
             use crate::typechecking::ty::{array, byte};
@@ -2844,7 +2875,7 @@ impl Checker {
                         range.clone(),
                     );
                     msg.with_help(
-                        "define the trait in this module, or define the nominal head of every non-variable instance argument here"
+                        "define the trait in this module, or define the nominal head of at least one non-variable instance argument here"
                             .to_string(),
                     );
                     self.messages.push(msg);
@@ -5345,11 +5376,14 @@ impl Checker {
             return true;
         }
 
+        // Rust-style: at least one non-variable arg must have a local
+        // nominal head. Requiring *every* arg to be local would reject
+        // useful conversions like `impl From<int> for Wrapper`.
         arg_exprs
             .iter()
             .zip(arg_tys.iter())
             .filter(|(_, ty)| !matches!(apply_ty_prune(&self.subst, ty), Ty::Var(_)))
-            .all(|(expr, ty)| {
+            .any(|(expr, ty)| {
                 let head = self
                     .nominal_head_from_instance_arg(expr)
                     .or_else(|| self.nominal_head_from_ty(ty));
@@ -13030,6 +13064,88 @@ fn main() { let y = apply_cast(42); }
             msgs.iter()
                 .any(|m| m.message().contains("No instance") || m.message().contains("Convert")),
             "expected missing-instance diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Prelude `From` / `Into` are registered as multi-param typeclasses.
+    #[test]
+    fn prelude_from_into_traits_are_registered() {
+        let g = Generics::new();
+        let from = g.typeclass("From").expect("From");
+        assert_eq!(from.type_params, vec!["Self".to_string(), "T".to_string()]);
+        assert_eq!(from.methods.len(), 1);
+        assert_eq!(from.methods[0].name, "from");
+        let into = g.typeclass("Into").expect("Into");
+        assert_eq!(into.type_params, vec!["Self".to_string(), "T".to_string()]);
+        assert_eq!(into.methods.len(), 1);
+        assert_eq!(into.methods[0].name, "into");
+    }
+
+    /// `from` / `into` method schemes exist after `check_program`.
+    #[test]
+    fn prelude_from_into_method_schemes_registered() {
+        let (c, _) = check("fn main() {}");
+        let from_scheme = c
+            .typeclass_method_scheme("From", "from")
+            .expect("From::from scheme");
+        assert_eq!(from_scheme.constraints.len(), 1);
+        assert_eq!(from_scheme.constraints[0].class, "From");
+        assert_eq!(from_scheme.constraints[0].args.len(), 2);
+        let into_scheme = c
+            .typeclass_method_scheme("Into", "into")
+            .expect("Into::into scheme");
+        assert_eq!(into_scheme.constraints.len(), 1);
+        assert_eq!(into_scheme.constraints[0].class, "Into");
+        assert_eq!(into_scheme.constraints[0].args.len(), 2);
+    }
+
+    /// `impl From<int> for Wrapper` typechecks (local Self + builtin source).
+    #[test]
+    fn prelude_from_impl_for_local_type_typechecks() {
+        let src = r#"
+enum Wrapper { W(int) }
+impl From<int> for Wrapper {
+    fn from(int x) -> Wrapper { return Wrapper::W(x); }
+}
+fn wrap<A, B>(A x) -> B where From<B, A> { return from(x); }
+fn main() { let w = wrap(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        let dicts = c.all_call_site_dicts();
+        let has_from = dicts.values().any(|instances| {
+            instances.iter().any(|i| {
+                i.class == "From"
+                    && i.args.len() == 2
+                    && matches!(&i.args[1], Ty::Con(n) if n == "int")
+            })
+        });
+        assert!(
+            has_from,
+            "expected From<Wrapper, int> in call_site_dicts, got: {:?}",
+            dicts
+        );
+    }
+
+    /// Calling a From-bound helper without an instance errors.
+    #[test]
+    fn prelude_from_missing_instance_errors() {
+        let src = r#"
+fn wrap<A, B>(A x) -> B where From<B, A> { return from(x); }
+fn main() { let w = wrap(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("No instance") || m.message().contains("From")),
+            "expected missing-From diagnostic, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }

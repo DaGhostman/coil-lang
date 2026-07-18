@@ -490,6 +490,14 @@ The compiler pre-registers these traits and instances for `int`, `float`, and (w
 | `Ord` | Convenience bundle | Supertrait of `Lt` + `Le` + `Gt` + `Ge` (no own methods) |
 | `Eq` | Equality | `==`, `!=` |
 | `Show` | Display | `show(T) -> string`; used by format `%v` |
+| `From` | Conversion | `from(T) -> Self` via `impl From<T> for Self` (no builtin instances) |
+| `Into` | Conversion | `into(Self) -> T` via `impl Into<T> for Self` (no builtin instances; no blanket from `From`) |
+
+`From` / `Into` are multi-parameter: `impl From<A> for B` stores instance
+args `[B, A]`, and a converting call uses `where From<B, A>` (or
+`where Into<A, B>` for the inverse direction). There is no compiler-provided
+blanket `Into` from `From` — write the impl you need. See
+`examples/from_into.0s`.
 
 On open/generic operands, operators require the matching op trait (or the
 `Num` / `Ord` convenience supertrait). Concrete `int`/`float` arithmetic and
@@ -560,8 +568,10 @@ Typeclass instances follow module-path ownership rules so dictionary
 resolution stays deterministic across projects:
 
 - `impl Class<T…>` is allowed when the current module defines `Class`.
-- Otherwise, every non-variable instance argument must have a nominal
-  head (enum, class, or type alias) defined in the current module.
+- Otherwise, at least one non-variable instance argument must have a
+  nominal head (enum, class, or type alias) defined in the current module
+  (Rust-style orphan rule). This allows `impl From<int> for Wrapper` when
+  `Wrapper` is local.
 - Builtin types (`int`, `float`, `string`, tuples, arrays, and records)
   are not local nominal heads. For example, a module that did not define
   `Show` cannot add `impl Show<(int, int)>`.

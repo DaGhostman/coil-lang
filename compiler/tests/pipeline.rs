@@ -258,6 +258,13 @@ fn example_multiparam_prints_42() {
     assert_eq!(output, "42");
 }
 
+/// Prelude `From` / `Into`: wrap int → Wrapper → int via from/into.
+#[test]
+fn example_from_into_prints_42_24() {
+    let output = run_example("examples/from_into.0s");
+    assert_eq!(output, "4224");
+}
+
 /// Phase 5: superclass / implied bounds (`Ordered<T: Equal>` → `eq_val` under `T: Ordered`).
 #[test]
 fn example_superclass_ord_prints_truetruefalse() {

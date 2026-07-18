@@ -1,0 +1,37 @@
+// Expected output: 4224
+//
+// Prelude From / Into: `impl From<A> for B` enables A → B via `from`;
+// `impl Into<B> for A` enables A → B via `into`.
+
+enum Wrapper {
+    W(int),
+}
+
+impl From<int> for Wrapper {
+    fn from(int x) -> Wrapper {
+        return Wrapper::W(x);
+    }
+}
+
+impl Into<int> for Wrapper {
+    fn into(Wrapper w) -> int {
+        return match w {
+            Wrapper::W(v) => v,
+        };
+    }
+}
+
+fn wrap<A, B>(A x) -> B where From<B, A> {
+    return from(x);
+}
+
+fn unwrap<A, B>(A x) -> B where Into<A, B> {
+    return into(x);
+}
+
+fn main() {
+    let w = wrap(42);
+    print "%i", unwrap(w);
+    let w2 = wrap(24);
+    print "%i", unwrap(w2);
+}

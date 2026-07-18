@@ -775,6 +775,19 @@ clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>
 
 ---
 
+### `examples/from_into.0s`
+
+**Demonstrates:** Prelude conversion traits `From` / `Into` —
+`impl From<int> for Wrapper` and `impl Into<int> for Wrapper`, called
+through `where From<B, A>` / `where Into<A, B>` helpers.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/from_into.0s` |
+| **Output** | `4224` |
+
+---
+
 ### `examples/trait_dict.0s`
 
 **Demonstrates:** User trait dictionaries, method sugar, and dictionary
@@ -1281,6 +1294,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `hkt_container.0s` | Types | `42` |
 | `hkt_bifunctor.0s` | Types | `42` |
 | `multiparam.0s` | Types | `42` |
+| `from_into.0s` | Types | `4224` |
 | `trait_dict.0s` | Types | `4242` |
 | `trait_default.0s` | Types | `42` |
 | `superclass_ord.0s` | Types | `truetruefalse` |
