@@ -22,6 +22,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `print` | Statement / I/O | Print to stdout | [Built-ins](built-ins.md#print) |
 | `format` | Expression / I/O | Build a formatted string | [Built-ins](built-ins.md#format) |
 | `enum` | Declaration | Sum type definition | [Types — Sum types](types.md#sum-types--enums-tysum) |
+| `derive` | Declaration clause | Auto-impl builtin traits on `enum` / `class` headers | [Types — Trait derive](types.md#trait-derive) |
 | `match` | Expression | Pattern match | [Syntax — Patterns](syntax.md#patterns-match) |
 | `default` | Pattern | Wildcard arm (same as `_`) | [Syntax — Patterns](syntax.md#patterns-match) |
 | `type` | Declaration | Type alias | [Types — Aliases](types.md#type-aliases-type-name--t) |
@@ -52,7 +53,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 ## Declaration keywords
 
 ```
-fn | enum | type | trait | use | mod | extern | class | impl | defer | async | where
+fn | enum | type | trait | use | mod | extern | class | impl | derive | defer | async | where
 ```
 
 Registered in the top-level `declaration()` parser before generic statements so keywords like `enum` are not misparsed as `let`.

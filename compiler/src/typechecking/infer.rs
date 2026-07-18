@@ -2030,6 +2030,7 @@ impl Checker {
                 name,
                 type_params,
                 fields,
+                ..
             } => {
                 let _ = self.register_generic_type_ctor(name, type_params);
                 let pushed = self.push_type_params_for_type_parsing(type_params);
@@ -2199,6 +2200,7 @@ impl Checker {
                 name,
                 type_params,
                 variants,
+                ..
             } => {
                 let _ = self.register_generic_type_ctor(name, type_params);
                 self.infer_enum_decl(name, variants, &range);
@@ -2560,6 +2562,48 @@ impl Checker {
                 let mut assoc_tys: HashMap<String, AssocTypeValue> = HashMap::new();
                 let mut assoc_names: Vec<String> = Vec::new();
                 let mut invalid_assoc_defs = false;
+
+                // Pre-register a stub so recursive derived/hand-written
+                // method bodies can discharge constraints against the
+                // instance under construction. Assoc types are patched
+                // onto the stub as they are collected (before methods
+                // run), so projections stay valid during body infer.
+                let args_pretty_for_fqn: String = arg_tys
+                    .iter()
+                    .map(|t| format!("{}", t))
+                    .collect::<Vec<_>>()
+                    .join("_");
+                let mut stub_fqns = HashMap::new();
+                for m in methods {
+                    let mname = match m.1.as_ref() {
+                        Expression::Function { name, .. } => Some(*name),
+                        Expression::Method(_, body) => match body.1.as_ref() {
+                            Expression::Function { name, .. } => Some(*name),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(mname) = mname {
+                        stub_fqns.insert(
+                            mname.to_string(),
+                            format!("{}__{}__{}", class, args_pretty_for_fqn, mname),
+                        );
+                    }
+                }
+                let stub_idx = if class_def.is_some() && !orphaned && overlapping.is_none() {
+                    self.generics.instances.push(InstanceDef {
+                        class: class.to_string(),
+                        defined_module: self.current_module.clone(),
+                        range: range.clone(),
+                        args: arg_tys.clone(),
+                        method_fqns: stub_fqns,
+                        assoc_tys: HashMap::new(),
+                    });
+                    Some(self.generics.instances.len() - 1)
+                } else {
+                    None
+                };
+
                 for m in methods {
                     match m.1.as_ref() {
                         Expression::AssocTypeDef {
@@ -2654,18 +2698,21 @@ impl Checker {
                                 ));
                             } else {
                                 assoc_names.push(aname.to_string());
-                                assoc_tys.insert(
-                                    aname.to_string(),
-                                    AssocTypeValue {
-                                        params: assoc_params
-                                            .iter()
-                                            .map(|tp| tp.name.to_string())
-                                            .collect(),
-                                        param_vars: assoc_param_vars,
-                                        param_kinds: assoc_param_kinds,
-                                        ty: resolved,
-                                    },
-                                );
+                                let value = AssocTypeValue {
+                                    params: assoc_params
+                                        .iter()
+                                        .map(|tp| tp.name.to_string())
+                                        .collect(),
+                                    param_vars: assoc_param_vars,
+                                    param_kinds: assoc_param_kinds,
+                                    ty: resolved,
+                                };
+                                if let Some(idx) = stub_idx {
+                                    self.generics.instances[idx]
+                                        .assoc_tys
+                                        .insert(aname.to_string(), value.clone());
+                                }
+                                assoc_tys.insert(aname.to_string(), value);
                             }
                         }
                         _ => {
@@ -2866,9 +2913,21 @@ impl Checker {
                         || !missing_assoc.is_empty()
                         || invalid_assoc_defs;
                 }
-                // Register only complete, non-overlapping instances. Omitted
-                // defaulted methods have been filled with class-default FQNs.
-                if !invalid_instance {
+                // Finalize the stub (or push a fresh instance when no stub).
+                // Omitted defaulted methods have been filled with class-default FQNs.
+                // Never `remove(idx)` — that shifts later instance indices; clear
+                // the stub in place when invalid instead.
+                if let Some(idx) = stub_idx {
+                    if invalid_instance {
+                        self.generics.instances[idx].method_fqns.clear();
+                        self.generics.instances[idx].assoc_tys.clear();
+                        self.generics.instances[idx].args.clear();
+                        self.generics.instances[idx].class.clear();
+                    } else {
+                        self.generics.instances[idx].method_fqns = method_fqns;
+                        self.generics.instances[idx].assoc_tys = assoc_tys;
+                    }
+                } else if !invalid_instance {
                     self.generics.instances.push(InstanceDef {
                         class: class.to_string(),
                         defined_module: self.current_module.clone(),
@@ -3177,6 +3236,17 @@ impl Checker {
             .insert((range.start, range.end), hint);
     }
 
+    /// Peel `Constructor` / structural `Sum` down to a nominal head so
+    /// `Color::Red == Color::Blue` unifies as `Color` rather than as two
+    /// incompatible constructor refinements.
+    fn peel_comparison_ty(ty: &Ty) -> Ty {
+        match ty {
+            Ty::Constructor { owner, .. } => Self::peel_comparison_ty(owner),
+            Ty::Sum { name, .. } => Ty::Con(name.clone()),
+            other => other.clone(),
+        }
+    }
+
     fn infer_comparison(
         &mut self,
         lhs: &Output,
@@ -3186,8 +3256,8 @@ impl Checker {
         class: &str,
         method: &str,
     ) -> Ty {
-        let lt = self.infer(lhs);
-        let rt = self.infer(rhs);
+        let lt = Self::peel_comparison_ty(&self.infer(lhs));
+        let rt = Self::peel_comparison_ty(&self.infer(rhs));
         let unified = self.unify(&lt, &rt, &range, "comparison operands");
         if let Ty::Var(var) = apply_ty_prune(&self.subst, &unified) {
             if self.user_dict_index(var, class).is_none() {
@@ -6050,6 +6120,7 @@ impl Checker {
                 name,
                 type_params,
                 variants,
+                ..
             } => {
                 let name_str = name.to_string();
                 let previous_generic_ctor = self.register_generic_type_ctor(name, type_params);
@@ -7836,6 +7907,7 @@ impl Checker {
     pub fn field_index_for(&self, enum_name: &str, field: &str) -> Option<(String, u16)> {
         let payloads = self.enum_payloads.get(enum_name)?;
         let names = self.enums.get(enum_name)?;
+        // Prefer declared record field names.
         for (i, payload) in payloads.iter().enumerate() {
             if let EnumVariantPayloadTy::Record(fields) = payload {
                 for (j, (fname, _)) in fields.iter().enumerate() {
@@ -7849,10 +7921,32 @@ impl Checker {
                 }
             }
         }
+        // Synthetic tuple indices `"0"`, `"1"`, … (used by derive expansion
+        // and any AST-level Access that targets a tuple payload slot).
+        if let Ok(idx) = field.parse::<usize>() {
+            let mut match_count = 0;
+            let mut found: Option<(String, u16)> = None;
+            for (i, payload) in payloads.iter().enumerate() {
+                if let EnumVariantPayloadTy::Tuple(parts) = payload {
+                    if idx < parts.len() {
+                        match_count += 1;
+                        let variant_name = names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("variant_{}", i));
+                        found = Some((variant_name, idx as u16));
+                    }
+                }
+            }
+            if match_count == 1 {
+                return found;
+            }
+        }
         None
     }
 
-    /// Record field type by enum and field name (chained access codegen).
+    /// Record / tuple-payload field type by enum and field name (chained
+    /// `Expression::Access` codegen, derive expansion).
     pub fn field_type_for(&self, enum_name: &str, field: &str) -> Option<Ty> {
         let payloads = self.enum_payloads.get(enum_name)?;
         for payload in payloads {
@@ -7862,6 +7956,21 @@ impl Checker {
                         return Some(fty.clone());
                     }
                 }
+            }
+        }
+        if let Ok(idx) = field.parse::<usize>() {
+            let mut match_count = 0;
+            let mut found: Option<Ty> = None;
+            for payload in payloads {
+                if let EnumVariantPayloadTy::Tuple(parts) = payload {
+                    if let Some(fty) = parts.get(idx) {
+                        match_count += 1;
+                        found = Some(fty.clone());
+                    }
+                }
+            }
+            if match_count == 1 {
+                return found;
             }
         }
         None
@@ -8177,6 +8286,25 @@ impl Checker {
                         hint,
                     )
                 }
+                EnumVariantPayloadTy::Tuple(parts) => {
+                    if let Ok(idx) = field.parse::<usize>() {
+                        if let Some(fty) = parts.get(idx) {
+                            return fty.clone();
+                        }
+                    }
+                    self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("Cannot access field `{}` on tuple variant", field),
+                        range,
+                        Some(format!(
+                            "variant `{}::{}` is a {}-tuple; use a match binding or index 0..{}",
+                            enum_name,
+                            variant_name,
+                            parts.len(),
+                            parts.len().saturating_sub(1),
+                        )),
+                    )
+                }
                 _ => self.error_with_help(
                     ErrorCode::GenericTypeError,
                     format!("Cannot access field `{}` on non-record variant", field),
@@ -8190,13 +8318,20 @@ impl Checker {
                 ),
             }
         } else {
-            // Untagged receiver: find every record-shaped variant
-            // that declares the field.
+            // Untagged receiver: find every record-/tuple-shaped variant
+            // that declares the field (named record fields, or synthetic
+            // `"0"`/`"1"`/… tuple indices).
             let mut candidates: Vec<&Ty> = Vec::new();
             for (_variant_name, payload) in variants {
                 if let EnumVariantPayloadTy::Record(fields) = payload {
                     for (fname, fty) in fields {
                         if fname == field {
+                            candidates.push(fty);
+                        }
+                    }
+                } else if let EnumVariantPayloadTy::Tuple(parts) = payload {
+                    if let Ok(idx) = field.parse::<usize>() {
+                        if let Some(fty) = parts.get(idx) {
                             candidates.push(fty);
                         }
                     }
@@ -11162,22 +11297,20 @@ mod tests {
         assert_eq!(c.field_type_for("Point", "y"), Some(int()));
     }
 
-    /// `field_type_for` returns `None` for fields declared on a
-    /// Unit or Tuple variant (not a Record variant). Setup:
-    /// `enum T { Wrap(int, int) }`. Asking for `"0"` (the
-    /// synthetic tuple-index name) — the helper doesn't know
-    /// about synthetic names, only declared record field names.
-    /// So it returns `None`. (Codegen-level reordering handles
-    /// tuple-index names via `field_pairs()` — see
-    /// `ty::EnumVariantPayloadTy::field_pairs`.)
+    /// Synthetic tuple indices (`"0"`, `"1"`, …) resolve via
+    /// `field_type_for` so derive / Access can `LoadField` tuple
+    /// payloads without match binders (which clobber instance-method
+    /// `__dictN` slots).
     #[test]
-    fn field_type_for_returns_none_for_tuple_variant() {
-        let src = "enum T { Wrap(int, int) }";
+    fn field_type_for_returns_tuple_index_types() {
+        let src = "enum T { Wrap(int, string) }";
         let (c, _) = check(src);
+        assert_eq!(c.field_type_for("T", "0"), Some(int()));
+        assert_eq!(c.field_type_for("T", "1"), Some(string()));
         assert_eq!(
-            c.field_type_for("T", "0"),
+            c.field_type_for("T", "2"),
             None,
-            "tuple variants don't have named record fields"
+            "out-of-range tuple index"
         );
     }
 

@@ -493,8 +493,8 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
 
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
-    let ast = parser.parse(&src).expect("result.0s should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &ast);
+    let mut ast = parser.parse(&src).expect("result.0s should parse");
+    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(Rc::clone(&buf));
@@ -522,8 +522,8 @@ fn fizbuz_runs_to_completion() {
 
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
-    let ast = parser.parse(&src).expect("fizbuz.0s should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &ast);
+    let mut ast = parser.parse(&src).expect("fizbuz.0s should parse");
+    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -550,8 +550,8 @@ fn let_binding_emits_store_pop_in_bytecode() {
         }
     "#;
     let parser = parser::Pratt::default();
-    let ast = parser.parse(src).expect("let-binding program should parse");
-    let (bytecode, _constants) = pipeline.compile_test("", &ast);
+    let mut ast = parser.parse(src).expect("let-binding program should parse");
+    let (bytecode, _constants) = pipeline.compile_test("", &mut ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
     let binding_store_pop_count = bytecode
@@ -651,10 +651,10 @@ fn example_let_chained_bindings_works() {
 
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
-    let ast = parser
+    let mut ast = parser
         .parse(src)
         .expect("chained-bindings program should parse");
-    let (bytecode, constants) = pipeline.compile_test("", &ast);
+    let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
     let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
     let shared = SharedBuf(std::rc::Rc::clone(&buf));
@@ -685,8 +685,8 @@ fn nested_if_in_loop_runs_correctly() {
         }
     "#;
     let parser = parser::Pratt::default();
-    let ast = parser.parse(src).expect("nested if-in-loop should parse");
-    let (bytecode, _constants) = pipeline.compile_test("", &ast);
+    let mut ast = parser.parse(src).expect("nested if-in-loop should parse");
+    let (bytecode, _constants) = pipeline.compile_test("", &mut ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
     use common::Instruction;
@@ -1085,6 +1085,15 @@ fn example_while_loop_accumulates_correctly() {
 fn example_for_break_prints_18() {
     let output = run_example("examples/for_break.0s");
     assert_eq!(output, "18");
+}
+
+#[test]
+fn example_derive_show_eq_prints_expected() {
+    let output = run_example("examples/derive_show_eq.0s");
+    assert_eq!(
+        output,
+        "Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false"
+    );
 }
 
 #[test]

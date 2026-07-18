@@ -916,3 +916,63 @@ fn overlapping_typeclass_instance_names_new_and_existing_instances() {
         msgs
     );
 }
+
+/// Compile through the full compiler so derive expansion diagnostics fire
+/// (Checker alone never sees the header `derive` clause).
+fn compile_messages(src: &str) -> Vec<String> {
+    let mut ast = Pratt::default().parse(src).expect("parse failed");
+    let mut c = compiler::Compiler::default();
+    let _ = c.compile("", &mut ast);
+    c.get_messages()
+        .iter()
+        .map(|m| m.message().to_string())
+        .collect()
+}
+
+#[test]
+fn derive_unknown_trait_reports_diagnostic() {
+    let msgs = compile_messages("enum Color derive Clone { Red } fn main() {}");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Cannot derive unknown or non-derivable trait `Clone`")),
+        "expected unknown-trait derive diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn derive_non_derivable_trait_reports_diagnostic() {
+    let msgs = compile_messages("enum Color derive Num { Red } fn main() {}");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Cannot derive unknown or non-derivable trait `Num`")),
+        "expected non-derivable trait diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn derive_generic_enum_reports_diagnostic() {
+    let msgs = compile_messages("enum Box<T> derive Show { Box(T) } fn main() {}");
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Cannot derive traits for generic enum `Box`")
+                && m.contains("write an explicit `impl`")
+        }),
+        "expected generic-enum derive diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn derive_generic_class_reports_diagnostic() {
+    let msgs = compile_messages("class Cell<T> derive Eq { value: T } fn main() {}");
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Cannot derive traits for generic class `Cell`")
+                && m.contains("write an explicit `impl`")
+        }),
+        "expected generic-class derive diagnostic, got: {:?}",
+        msgs
+    );
+}

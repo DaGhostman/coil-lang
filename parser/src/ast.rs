@@ -269,6 +269,8 @@ pub enum Expression<'expr> {
     Class {
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
+        /// Traits requested via `class Name derive Show, Eq { … }`.
+        derives: Vec<&'expr str>,
         fields: Vec<Output<'expr>>,
     },
     Implementation {
@@ -296,6 +298,8 @@ pub enum Expression<'expr> {
     EnumDecl {
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
+        /// Traits requested via `enum Name derive Show, Eq { … }`.
+        derives: Vec<&'expr str>,
         variants: Vec<Output<'expr>>,
     },
 
@@ -449,6 +453,14 @@ pub enum PatternPayload<'expr> {
     /// Shorthand `x` desugars at parse time to
     /// `PatternField { name: "x", pattern: Binding("x") }`.
     Record(Vec<PatternField<'expr>>),
+}
+
+/// Format a derive clause as ` derive Show, Eq` (leading space), or empty.
+fn fmt_derives(derives: &[&str]) -> String {
+    if derives.is_empty() {
+        return String::new();
+    }
+    format!(" derive {}", derives.join(", "))
 }
 
 /// Format a `Vec<TypeParam>` as `<T, U: Num + Eq, F: * -> *>`.
@@ -761,6 +773,7 @@ impl<'a> Display for Expression<'a> {
             Self::EnumDecl {
                 name,
                 type_params,
+                derives,
                 variants,
             } => {
                 let tp = if type_params.is_empty() {
@@ -768,6 +781,7 @@ impl<'a> Display for Expression<'a> {
                 } else {
                     fmt_type_params(type_params)
                 };
+                let der = fmt_derives(derives);
                 let vs = variants
                     .iter()
                     .map(|v| match v.1.as_ref() {
@@ -800,7 +814,7 @@ impl<'a> Display for Expression<'a> {
                     })
                     .collect::<Vec<String>>()
                     .join(", ");
-                write!(f, "enum {}{} {{ {} }}", name, tp, vs)
+                write!(f, "enum {}{}{} {{ {} }}", name, tp, der, vs)
             }
             Self::EnumVariant { name, payload } => match payload {
                 EnumVariantPayload::Unit => write!(f, "{}", name),
@@ -913,6 +927,7 @@ impl<'a> Display for Expression<'a> {
             Self::Class {
                 name,
                 type_params,
+                derives,
                 fields,
             } => {
                 let tp = if type_params.is_empty() {
@@ -920,8 +935,9 @@ impl<'a> Display for Expression<'a> {
                 } else {
                     fmt_type_params(type_params)
                 };
+                let der = fmt_derives(derives);
                 let fs: Vec<String> = fields.iter().map(|f| f.1.to_string()).collect();
-                write!(f, "class {}{} {{ {} }}", name, tp, fs.join(", "))
+                write!(f, "class {}{}{} {{ {} }}", name, tp, der, fs.join(", "))
             }
             Self::Implementation {
                 what,

@@ -160,12 +160,19 @@ record_payload  ::= '{' field_decl (',' field_decl)* '}'
 field_decl      ::= IDENT ':' type
 ```
 
+Grammar (with optional derive):
+
+```
+enum_decl ::= 'enum' IDENT type_param_list? derive_clause? '{' variant (',' variant)* ','? '}'
+derive_clause ::= 'derive' IDENT (',' IDENT)*
+```
+
 Examples:
 
 ```0s
 enum Tree { Leaf, Node(int, Tree, Tree) }
 enum Point { Origin, Point { x: int, y: int } }
-enum Tree { Leaf, Node(int, Tree, Tree) }
+enum Color derive Show, Eq, Ord { Red, Blue }
 ```
 
 ### Type aliases
@@ -206,8 +213,9 @@ See [FFI tutorial](../tutorial/07-ffi.md).
 ### Classes and impl
 
 ```
-class_decl ::= 'class' IDENT type_param_list? '{' field_decl (',' field_decl)* ','? '}'
+class_decl ::= 'class' IDENT type_param_list? derive_clause? '{' field_decl (',' field_decl)* ','? '}'
 field_decl ::= 'pub'? IDENT ':' type
+derive_clause ::= 'derive' IDENT (',' IDENT)*
 
 impl_decl  ::= 'impl' IDENT type_param_list? '{' method_decl* '}'
 method_decl ::= 'pub'? function_decl
@@ -216,6 +224,7 @@ method_decl ::= 'pub'? function_decl
 `type_param_list` is the same form as on functions (`<T>`, `<T: Num>`, …).
 An inherent `impl Cell<T>` shares those parameters with the class so methods
 can mention `T` and type `self` as `Cell<T>`.
+See [Trait derive](types.md#trait-derive) for the `derive` clause.
 
 Example:
 
@@ -225,6 +234,8 @@ impl Foo {
     pub fn bump() -> int { return 1; }
     fn name_len() -> int { return 0; }
 }
+
+class Cell derive Show, Eq { value: int }
 
 class Cell<T> { value: T }
 impl Cell<T> {

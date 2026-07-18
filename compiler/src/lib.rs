@@ -1,4 +1,5 @@
 mod block_builder;
+mod derive;
 mod manifest;
 mod monomorphize;
 mod peephole;
@@ -867,6 +868,89 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
         bytecode.push(Byte::new(Instruction::Index));
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
+        true
+    }
+
+    /// Emit a direct call to a concrete `Eq` / `Ord` instance method when
+    /// the operands are a user type with a registered instance.
+    ///
+    /// Primitive `int`/`float`/`string`/`bool` keep the hardwired opcode
+    /// path (caller falls through when this returns `false`).
+    fn emit_concrete_operator_call(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        lhs: &Output,
+        rhs: &Output,
+        class: &str,
+        method: &str,
+    ) -> bool {
+        let arg_ty = self
+            .codegen_expr_ty(lhs)
+            .or_else(|| self.codegen_expr_ty(rhs));
+        let Some(ty) = arg_ty else {
+            return false;
+        };
+        let resolved = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty);
+        let lookup_ty = Self::show_lookup_ty_for_instance(&resolved);
+        // Only dispatch for nominal *user* enums/classes. Open `Ty::Var`s
+        // unify against the first builtin `Eq`/`Ord` instance under
+        // `find_instance_relaxed`, which would incorrectly replace
+        // hardwired `EQ`/`LT` opcodes (and box immediates into garbage).
+        let nominal = match &lookup_ty {
+            Ty::Con(name) => Some(name.as_str()),
+            Ty::App(head, _) => match head.as_ref() {
+                Ty::Con(name) => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(name) = nominal else {
+            return false;
+        };
+        if matches!(
+            name,
+            "int" | "float" | "string" | "bool" | "unit" | "Option" | "Result"
+        ) {
+            return false;
+        }
+        if self.checker.enum_variants(name).is_none() && !self.checker.is_class(name) {
+            return false;
+        }
+        let Some(instance) = self
+            .checker
+            .generics()
+            .find_instance_relaxed(class, std::slice::from_ref(&lookup_ty))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(fqn) = instance.method_fqns.get(method).cloned() else {
+            return false;
+        };
+        let Some(&offset) = self.functions.get(&fqn) else {
+            return false;
+        };
+        // Instance methods use the dictionary ABI: value args are boxed at
+        // the call site and unboxed in the method prologue (see
+        // `instance_method_unbox_tys` + `compile_function_output_with_name`).
+        // Without boxing here, `UnboxValue` on a raw enum/class pointer
+        // yields `Value::default()` and comparisons always fail.
+        //
+        // Stash each boxed operand in a temp before compiling the other
+        // side: `new Class(...)` (Instantiate) uses `StorePop` into temps
+        // and would otherwise steal a pending boxed arg off the operand
+        // stack mid-call.
+        bytecode.append(&mut self.do_compile(lhs));
+        Self::emit_box_if_needed(bytecode, &lookup_ty);
+        let lhs_slot = self.alloc_temp_slot();
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(lhs_slot));
+        bytecode.append(&mut self.do_compile(rhs));
+        Self::emit_box_if_needed(bytecode, &lookup_ty);
+        let rhs_slot = self.alloc_temp_slot();
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(rhs_slot));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(lhs_slot));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(rhs_slot));
+        Self::emit_call_indirect(bytecode, offset as u32, 2);
         true
     }
 
@@ -2230,6 +2314,21 @@ impl Compiler {
             Expression::Identifier(name) => self
                 .codegen_var_type_for(name)
                 .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
+            // `Construct` / `Instantiate` must NOT collapse to a bare
+            // `Ty::Con(name)`: generic apps like `Option::Some(42)` are
+            // `Option<int>` (`Ty::App`), and call-site dictionary emission
+            // keys off that full type (`Collect<Option<int>>`). Falling
+            // through to `lookup_for_codegen_span` preserves the HM result.
+            Expression::Instantiate(class, _) => match class.1.as_ref() {
+                Expression::Identifier(name) | Expression::Type(name) => {
+                    // Non-generic `new Class(...)` is exactly `Con(Class)`.
+                    // Prefer the span cache when present (covers `Class<T>`).
+                    self.checker
+                        .lookup_for_codegen_span(node.0.start, node.0.end)
+                        .or_else(|| Some(Ty::Con((*name).to_string())))
+                }
+                _ => None,
+            },
             Expression::Add(lhs, rhs) if self.is_string_expr(lhs) && self.is_string_expr(rhs) => {
                 Some(Ty::Con(crate::typechecking::ty::STRING.into()))
             }
@@ -4059,6 +4158,13 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                } else if self.emit_concrete_operator_call(
+                    &mut bytecode,
+                    lhs,
+                    rhs,
+                    "Ord",
+                    "lt",
+                ) {
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -4085,6 +4191,13 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                } else if self.emit_concrete_operator_call(
+                    &mut bytecode,
+                    lhs,
+                    rhs,
+                    "Ord",
+                    "gt",
+                ) {
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -4111,6 +4224,13 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                } else if self.emit_concrete_operator_call(
+                    &mut bytecode,
+                    lhs,
+                    rhs,
+                    "Ord",
+                    "le",
+                ) {
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -4137,6 +4257,13 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                } else if self.emit_concrete_operator_call(
+                    &mut bytecode,
+                    lhs,
+                    rhs,
+                    "Ord",
+                    "ge",
+                ) {
                 } else {
                     let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(if is_float {
@@ -4163,6 +4290,13 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                } else if self.emit_concrete_operator_call(
+                    &mut bytecode,
+                    lhs,
+                    rhs,
+                    "Eq",
+                    "eq",
+                ) {
                 } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
                 }
@@ -4343,6 +4477,13 @@ impl Compiler {
                         hint.method_slot,
                     )
                 {
+                } else if self.emit_concrete_operator_call(
+                    &mut bytecode,
+                    lhs,
+                    rhs,
+                    "Eq",
+                    "ne",
+                ) {
                 } else {
                     binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
                 }
@@ -5520,7 +5661,7 @@ impl Compiler {
     fn compile_unfused<'compiler>(
         &mut self,
         module: &str,
-        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+        ast: &mut (SimpleSpan, Box<Expression<'compiler>>),
     ) {
         let ns = self.namespace.clone();
         self.namespace = module.to_string();
@@ -5533,6 +5674,10 @@ impl Compiler {
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
         self.checker.set_current_module(module);
+        // Expand `derive` clauses to synthetic `impl` AST before the
+        // ID pre-walk / typecheck (see `derive::expand_program`).
+        let derive_msgs = derive::expand_program(ast);
+        self.messages.extend(derive_msgs);
         let _program_ty = self.checker.check_program(ast);
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the
@@ -5570,7 +5715,7 @@ impl Compiler {
     pub fn compile<'compiler>(
         &mut self,
         module: &str,
-        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+        ast: &mut (SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         self.compile_unfused(module, ast);
         self.finalize_bytecode();
@@ -5584,7 +5729,7 @@ impl Compiler {
     pub fn compile_module<'compiler>(
         &mut self,
         module: &str,
-        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+        ast: &mut (SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let pre_compile_len = self.bytecode.len();
         self.compile_unfused(module, ast);
@@ -5620,9 +5765,9 @@ mod tests {
     use parser::Pratt;
 
     fn compile_src(src: &str) -> (Vec<Byte>, Vec<u64>) {
-        let ast = Pratt::default().parse(src).expect("parse failed");
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
         let mut compiler = Compiler::default();
-        let bc = compiler.compile("", &ast);
+        let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }
 
@@ -5851,9 +5996,9 @@ mod tests {
     /// `compile` should drain them into the compiler's message list.
     #[test]
     fn type_errors_appear_in_messages() {
-        let ast = Pratt::default().parse("x;").expect("parse failed");
+        let mut ast = Pratt::default().parse("x;").expect("parse failed");
         let mut c = Compiler::default();
-        c.compile("test", &ast);
+        c.compile("test", &mut ast);
         assert!(
             !c.messages.is_empty(),
             "expected at least one error message for unknown identifier"
@@ -5868,17 +6013,17 @@ mod tests {
         let mut c = Compiler::default();
         c.register("print", &[string()], &unit());
         // `print "hi";` should compile without errors.
-        let ast = Pratt::default()
+        let mut ast = Pratt::default()
             .parse("print \"hi\";")
             .expect("parse failed");
-        let _bc = c.compile("test", &ast);
+        let _bc = c.compile("test", &mut ast);
         let msgs = std::mem::take(&mut c.messages);
         assert!(msgs.is_empty(), "expected no messages, got: {:?}", msgs);
     }
 
     #[test]
     fn typeclass_impl_method_registers_fqn_function() {
-        let ast = Pratt::default()
+        let mut ast = Pratt::default()
             .parse(
                 r#"
                 trait Foo<T> { fn bar(T x) -> T; }
@@ -5888,7 +6033,7 @@ mod tests {
             )
             .expect("parse failed");
         let mut compiler = Compiler::default();
-        let bc = compiler.compile("", &ast);
+        let bc = compiler.compile("", &mut ast);
         assert!(
             compiler.messages.is_empty(),
             "unexpected: {:?}",
@@ -6051,13 +6196,13 @@ mod tests {
     fn compile_module_diff_matches_compile_tail_for_fib() {
         use common::Instruction;
         let src = include_str!("../../examples/fib.0s");
-        let ast = Pratt::default().parse(src).expect("parse fib");
+        let mut ast = Pratt::default().parse(src).expect("parse fib");
 
         // `compile_module` emits unfused absolute-offset bytecode;
         // final-link fusion is applied once via `finalize_bytecode`
         // (same as single-file `compile`).
         let mut module = Compiler::default();
-        let bc_unfused = module.compile_module("", &ast);
+        let bc_unfused = module.compile_module("", &mut ast);
         assert!(
             bc_unfused
                 .iter()
@@ -6067,7 +6212,7 @@ mod tests {
         module.finalize_bytecode();
 
         let mut full = Compiler::default();
-        let bc_full = full.compile("", &ast);
+        let bc_full = full.compile("", &mut ast);
 
         assert_eq!(
             &bc_full[3..],
@@ -6347,11 +6492,11 @@ sum = sum + i; \
 
     #[test]
     fn break_and_continue_outside_loop_emit_diagnostics() {
-        let ast = Pratt::default()
+        let mut ast = Pratt::default()
             .parse("fn main() { break; continue; }")
             .expect("parse failed");
         let mut compiler = Compiler::default();
-        compiler.compile("", &ast);
+        compiler.compile("", &mut ast);
         let rendered = compiler
             .get_messages()
             .iter()
@@ -7105,8 +7250,8 @@ fn main() {
  E::A(Option::None) => 0, \
  }; \
  }";
-        let ast = Pratt::default().parse(src).expect("parse failed");
-        let bc = Compiler::default().compile("test", &ast);
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
+        let bc = Compiler::default().compile("test", &mut ast);
         // The bytecode must include the outer JUMP_IF_MATCH (for A)
         // and the inner JUMP_IF_MATCH (for Some) — the test chain
         // emitted both.
@@ -7172,8 +7317,8 @@ fn main() {
  Result::Ok(Option::None) => 0, \
  }; \
  }";
-        let ast = Pratt::default().parse(src).expect("parse failed");
-        let bc = Compiler::default().compile("test", &ast);
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
+        let bc = Compiler::default().compile("test", &mut ast);
 
         // Exactly 2 JUMP_IF_MATCH (outer Ok + inner Some).
         let jimp_count = bc
@@ -8347,9 +8492,9 @@ fn main() { \
   let id = declare(lib, \"apply_cb\", (FFIType::Callback, FFIType::Int), FFIType::Int); \
   invoke(lib, id, (doubler, 21)); \
 }";
-        let ast = Pratt::default().parse(src).expect("parse failed");
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
         let mut compiler = Compiler::default();
-        let bc = compiler.compile("", &ast);
+        let bc = compiler.compile("", &mut ast);
         let doubler = *compiler
             .functions
             .get("doubler")
