@@ -218,11 +218,13 @@ The parser currently accepts only the keys documented above. Future versions may
 
 ```toml
 [module]
-preludes = ["./stdlib"]   # auto-imported in every file (not yet implemented)
+preludes = ["./stdlib"]   # customize auto-imports (not yet implemented)
 strict   = true           # reject undefined names at typecheck (not yet implemented)
 ```
 
 These are recognized in planning documents but **ignored or rejected** by the current parser. Do not rely on them.
+
+Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual modules owned by the compiler — they are **not** configured via `zero.toml` today. Every file always gets the implicit prelude; FFI still requires an explicit `use`.
 
 ---
 

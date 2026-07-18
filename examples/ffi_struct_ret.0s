@@ -2,6 +2,9 @@
 //
 // Output: 34  (Point { x: 3, y: 4 } fields)
 
+use ffi::*;
+use ffi::types::*;
+
 extern struct Point {
     x: int32,
     y: int32,
@@ -12,7 +15,7 @@ fn main() {
     let make_id = declare(
         lib,
         "make_point",
-        (FFIType::Int32, FFIType::Int32),
+        (Int32, Int32),
         Point,
     );
     let p = invoke(lib, make_id, (3, 4));

@@ -306,7 +306,6 @@ Expression grammar uses a **Pratt parser** with atoms and operator precedence (s
 
 ```
 atom ::= match_expr
-       | dload_call | declare_call | invoke_call
        | resume_expr | yield_expr
        | tuple_lit | array_lit | dict_lit
        | construct | call | instantiate
@@ -316,6 +315,8 @@ atom ::= match_expr
        | IDENT
        | group
 ```
+
+`dload` / `declare` / `invoke` are ordinary `IDENT` calls after `use ffi::*` (not keyword atoms).
 
 | Form | Syntax | Notes |
 |------|--------|-------|

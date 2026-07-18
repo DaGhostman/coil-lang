@@ -25,7 +25,9 @@ use parser::{
 
 pub use pipeline::*;
 pub use reporting::{ErrorCode, Label, Message, MessageKind};
-pub use typechecking::{CStructDef, CallbackSigDef, Checker, Ty};
+pub use typechecking::{
+    BuiltinExport, CStructDef, CallbackSigDef, Checker, FfiBuiltin, Ty, VirtualModules,
+};
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -1085,6 +1087,144 @@ impl Compiler {
             Some(Ty::Var(_)) | None => self.codegen_expr_ty(arg),
             Some(other) => Some(other),
         }
+    }
+
+    fn emit_ffi_declare(&mut self, span: SimpleSpan, args: &[Output]) {
+        if args.len() != 4 {
+            let mut m = Message::error(
+                ErrorCode::DeclareArity,
+                "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)"
+                    .to_string(),
+                span.into_range(),
+            );
+            m.push(DiagLabel::new(
+                format!(
+                    "expected 4 arguments (lib, name, args_tuple, ret_type); got {}",
+                    args.len()
+                ),
+                span.into_range(),
+            ));
+            self.messages.push(m);
+            self.bytecode
+                .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(0));
+            return;
+        }
+        let lib = &args[0];
+        let name = &args[1];
+        let args_tuple = &args[2];
+        let ret_type = &args[3];
+
+        let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
+            Expression::Tuple(items) => items.to_vec(),
+            _ => {
+                let mut m = Message::error(
+                    ErrorCode::DeclareArity,
+                    "declare(...) arguments tuple must be (T1, T2, ...) syntax".to_string(),
+                    args_tuple.0.into_range(),
+                );
+                m.push(DiagLabel::new(
+                    "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::*;`"
+                        .to_string(),
+                    args_tuple.0.into_range(),
+                ));
+                self.messages.push(m);
+                Vec::new()
+            }
+        };
+
+        let lib_bc = self.do_compile(lib);
+        self.bytecode.extend(lib_bc);
+        let name_bc = self.do_compile(name);
+        self.bytecode.extend(name_bc);
+
+        for elem in &tuple_elements {
+            if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, elem) {
+                emit_ffi_type_const(&mut self.bytecode, tag, aux);
+            } else {
+                let bc = self.do_compile(elem);
+                self.bytecode.extend(bc);
+            }
+        }
+        let arity = tuple_elements.len() as u32;
+        self.bytecode
+            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+
+        if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, ret_type) {
+            emit_ffi_type_const(&mut self.bytecode, tag, aux);
+        } else {
+            let ret_bc = self.do_compile(ret_type);
+            self.bytecode.extend(ret_bc);
+        }
+
+        let operand = arity & 0xFFFF;
+        self.bytecode
+            .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
+    }
+
+    fn emit_ffi_invoke(&mut self, span: SimpleSpan, args: &[Output]) {
+        if args.len() != 3 {
+            let mut m = Message::error(
+                ErrorCode::InvokeArity,
+                "invoke requires arguments as a tuple in position 3 (use (a, b, ...) syntax)"
+                    .to_string(),
+                span.into_range(),
+            );
+            m.push(DiagLabel::new(
+                format!(
+                    "expected 3 arguments (lib, fn_id, args_tuple); got {}",
+                    args.len()
+                ),
+                span.into_range(),
+            ));
+            self.messages.push(m);
+            self.bytecode
+                .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(0));
+            return;
+        }
+        let lib = &args[0];
+        let fn_id = &args[1];
+        let args_tuple = &args[2];
+
+        let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
+            Expression::Tuple(items) => items.to_vec(),
+            _ => {
+                let mut m = Message::error(
+                    ErrorCode::InvokeArity,
+                    "invoke(...) arguments must be a tuple in position 3".to_string(),
+                    args_tuple.0.into_range(),
+                );
+                m.push(DiagLabel::new(
+                    "wrap the arg values in parentheses — (40, 2)".to_string(),
+                    args_tuple.0.into_range(),
+                ));
+                self.messages.push(m);
+                Vec::new()
+            }
+        };
+
+        let lib_bc = self.do_compile(lib);
+        self.bytecode.extend(lib_bc);
+        let fn_bc = self.do_compile(fn_id);
+        self.bytecode.extend(fn_bc);
+
+        for elem in &tuple_elements {
+            if let Expression::Identifier(name) = elem.1.as_ref()
+                && let Some(&offset) = self.functions.get(*name)
+            {
+                self.bytecode
+                    .push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
+                continue;
+            }
+            let bc = self.do_compile(elem);
+            self.bytecode.extend(bc);
+        }
+        let arity = tuple_elements.len() as u32;
+        self.bytecode
+            .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
+
+        let operand = arity & 0xFFFF;
+        self.bytecode
+            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
     }
 
     /// Lower one `%v` argument to a string via the `Show` dictionary /
@@ -2734,20 +2874,17 @@ impl Compiler {
                 name,
                 alias,
             } => {
-                // Map local name → qualified FQN (or expand `use ns::*`).
-                if name == "*" {
+                // Virtual modules are applied during typecheck
+                // (`Checker::apply_virtual_use`); no disk FQN alias.
+                if self.checker.virtual_modules().resolves_use(p, name) {
+                    // Scope already populated by check_program.
+                } else if name == "*" {
                     let module_ns = p.join("::");
                     let prefix = if module_ns.is_empty() {
-                        // Top-level glob: `use *;` (no
-                        // module path). Items have
-                        // single-segment FQNs.
                         String::new()
                     } else {
                         format!("{}::", module_ns)
                     };
-                    // Collect the FQNs first to avoid
-                    // borrowing `self.functions` while
-                    // we mutate `self.aliases`.
                     let fqns: Vec<String> = self
                         .functions
                         .keys()
@@ -2759,35 +2896,15 @@ impl Compiler {
                         .cloned()
                         .collect();
                     for fqn in fqns {
-                        // The bare item name is the
-                        // last segment of the FQN.
                         let item_name = fqn[prefix.len()..].to_string();
                         self.aliases.insert(item_name, fqn);
                     }
                 } else {
-                    // Concrete import. The qualified
-                    // name is `<path>::<name>::<name>`
-                    // — the file's path becomes the
-                    // namespace (`foo::sadge` for
-                    // `foo/sadge.0s`), and the
-                    // function inside the file is
-                    // `<namespace>::<function_name>`.
-                    // So `sadge` in `foo/sadge.0s`
-                    // is at FQN `foo::sadge::sadge`.
                     let namespace = if p.is_empty() {
                         name.clone()
                     } else {
                         format!("{}::{}", p.join("::"), name)
                     };
-                    // We don't know the function
-                    // name yet (it's whatever the
-                    // user names the function in
-                    // the file). The convention is
-                    // that the function has the
-                    // SAME name as the file's stem
-                    // (the LAST segment of the use
-                    // path). So the FQN is
-                    // `namespace::name`.
                     let qualified = format!("{}::{}", namespace, name);
                     let local = alias.clone().unwrap_or_else(|| name.clone());
                     self.aliases.insert(local, qualified);
@@ -3062,156 +3179,9 @@ impl Compiler {
                 bytecode.append(&mut index_bc);
                 bytecode.push(Byte::new(Instruction::Index));
             }
-            // --- FFI declare/invoke ---
-            Expression::Declare(args) => {
-                if args.len() != 4 {
-                    let mut m = Message::error(
-                       ErrorCode::DeclareArity, "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)".to_string(),
-                        span.into_range(),
-                    );
-                    m.push(DiagLabel::new(
-                        format!(
-                            "expected 4 arguments (lib, name, args_tuple, ret_type); got {}",
-                            args.len()
-                        ),
-                        span.into_range(),
-                    ));
-                    self.messages.push(m);
-                    // Emit a defensive operand so the bytecode
-                    // stays well-formed (DeclareFFI on a partial
-                    // stack will just fail at runtime).
-                    self.bytecode
-                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(0));
-                } else {
-                    let lib = &args[0];
-                    let name = &args[1];
-                    let args_tuple = &args[2];
-                    let ret_type = &args[3];
-
-                    // Verify `args[2]` is a Tuple expression.
-                    // Otherwise it's a type error — emit a
-                    // diagnostic and proceed defensively.
-                    let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
-                        Expression::Tuple(items) => items.to_vec(),
-                        _ => {
-                            let mut m = Message::error(
-                                ErrorCode::DeclareArity,
-                                "declare(...) arguments tuple must be (T1, T2, ...) syntax"
-                                    .to_string(),
-                                args_tuple.0.into_range(),
-                            );
-                            m.push(DiagLabel::new(
-                                "wrap the arg types in parentheses — (FFIType::Int, FFIType::Float)".to_string(),
-                                args_tuple.0.into_range(),
-                            ));
-                            self.messages.push(m);
-                            Vec::new()
-                        }
-                    };
-
-                    let lib_bc = self.do_compile(lib);
-                    self.bytecode.extend(lib_bc);
-                    let name_bc = self.do_compile(name);
-                    self.bytecode.extend(name_bc);
-
-                    // Each element pushes its FFI type tag onto the stack.
-                    for elem in &tuple_elements {
-                        if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, elem) {
-                            emit_ffi_type_const(&mut self.bytecode, tag, aux);
-                        } else {
-                            let bc = self.do_compile(elem);
-                            self.bytecode.extend(bc);
-                        }
-                    }
-                    let arity = tuple_elements.len() as u32;
-                    self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
-
-                    // Ret-type tag on top.
-                    if let Some((tag, aux)) = ffi_type_tag_from_output(&self.checker, ret_type) {
-                        emit_ffi_type_const(&mut self.bytecode, tag, aux);
-                    } else {
-                        let ret_bc = self.do_compile(ret_type);
-                        self.bytecode.extend(ret_bc);
-                    }
-
-                    // DeclareFFI pops name + tuple + lib in
-                    // dispatch order (see VM).
-                    let operand = (arity) & 0xFFFF;
-                    self.bytecode
-                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
-                }
-            }
-            Expression::Invoke(args) => {
-                // `invoke(lib, fn_id, (args...))`
-                if args.len() != 3 {
-                    let mut m = Message::error(
-                       ErrorCode::InvokeArity, "invoke requires arguments as a tuple in position 3 (use (a, b, ...) syntax)".to_string(),
-                        span.into_range(),
-                    );
-                    m.push(DiagLabel::new(
-                        format!(
-                            "expected 3 arguments (lib, fn_id, args_tuple); got {}",
-                            args.len()
-                        ),
-                        span.into_range(),
-                    ));
-                    self.messages.push(m);
-                    self.bytecode
-                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(0));
-                } else {
-                    let lib = &args[0];
-                    let fn_id = &args[1];
-                    let args_tuple = &args[2];
-
-                    let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
-                        Expression::Tuple(items) => items.to_vec(),
-                        _ => {
-                            let mut m = Message::error(
-                                ErrorCode::InvokeArity,
-                                "invoke(...) arguments must be a tuple in position 3".to_string(),
-                                args_tuple.0.into_range(),
-                            );
-                            m.push(DiagLabel::new(
-                                "wrap the arg values in parentheses — (40, 2)".to_string(),
-                                args_tuple.0.into_range(),
-                            ));
-                            self.messages.push(m);
-                            Vec::new()
-                        }
-                    };
-
-                    let lib_bc = self.do_compile(lib);
-                    self.bytecode.extend(lib_bc);
-                    let fn_bc = self.do_compile(fn_id);
-                    self.bytecode.extend(fn_bc);
-
-                    // Each element's bytecode pushes a Value. Function names
-                    // used as callback arguments compile to relocatable
-                    // `CodePtr` offsets (not `CONST`) so peephole fusion
-                    // rewrites them in `finalize_bytecode`.
-                    for elem in &tuple_elements {
-                        if let Expression::Identifier(name) = elem.1.as_ref() {
-                            if let Some(&offset) = self.functions.get(*name) {
-                                self.bytecode.push(
-                                    Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32),
-                                );
-                                continue;
-                            }
-                        }
-                        let bc = self.do_compile(elem);
-                        self.bytecode.extend(bc);
-                    }
-                    let arity = tuple_elements.len() as u32;
-                    self.bytecode
-                        .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
-
-                    // FfiInvoke pops tuple (top) + fn_id + lib.
-                    let operand = (arity) & 0xFFFF;
-                    self.bytecode
-                        .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
-                }
-            }
+            // --- FFI declare/invoke (legacy AST; prefer Call + use ffi::*) ---
+            Expression::Declare(args) => self.emit_ffi_declare(*span, args),
+            Expression::Invoke(args) => self.emit_ffi_invoke(*span, args),
             Expression::Return(expr) | Expression::ImplicitReturn(expr) => {
                 self.context.defers.iter().for_each(|offset| {
                     self.bytecode
@@ -3507,6 +3477,29 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
+                // `dload` / `declare` / `invoke` after `use ffi::*`.
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(kind) = self.checker.ffi_fn_in_scope(fname)
+                {
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    match kind {
+                        crate::typechecking::FfiBuiltin::Dload => {
+                            if let Some(path) = arg_slice.first() {
+                                let bc = self.do_compile(path);
+                                self.bytecode.extend(bc);
+                                self.bytecode.push(Byte::new(Instruction::FfiLoad));
+                            }
+                        }
+                        crate::typechecking::FfiBuiltin::Declare => {
+                            self.emit_ffi_declare(*span, arg_slice);
+                        }
+                        crate::typechecking::FfiBuiltin::Invoke => {
+                            self.emit_ffi_invoke(*span, arg_slice);
+                        }
+                    }
+                    return bytecode;
+                }
+
                 if let Some(hint) = self_id
                     .and_then(|id| self.checker.existential_method_call_at(id))
                     .or_else(|| {
@@ -4725,7 +4718,7 @@ impl Compiler {
                                             arg.0.into_range(),
                                         );
                                         m.push(DiagLabel::new(
-                                            "use FFIType::X, a bare type name, [T], (T, U), or an extern struct".to_string(),
+                                            "use Int/Ptr after `use ffi::types::*;`, a bare type name, [T], (T, U), or an extern struct".to_string(),
                                             arg.0.into_range(),
                                         ));
                                         m
@@ -8486,10 +8479,12 @@ print \"%i\", len(a); \
     fn invoke_callback_fn_arg_emits_relocatable_code_ptr() {
         use common::Instruction;
         let src = "\
+use ffi::*; \
+use ffi::types::*; \
 fn doubler(int x) -> int { return x * 2; } \
 fn main() { \
   let lib = dload(\"libsum.so\"); \
-  let id = declare(lib, \"apply_cb\", (FFIType::Callback, FFIType::Int), FFIType::Int); \
+  let id = declare(lib, \"apply_cb\", (Callback, Int), Int); \
   invoke(lib, id, (doubler, 21)); \
 }";
         let mut ast = Pratt::default().parse(src).expect("parse failed");

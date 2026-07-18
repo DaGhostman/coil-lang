@@ -9,10 +9,12 @@ use super::kind::Kind;
 use super::subst::Subst;
 use super::ty::{Ty, TyVarId};
 use super::unify::unify_with;
+use super::virtual_modules::{PRELUDE_MODULE, PRELUDE_OPS_MODULE};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-pub const BUILTIN_MODULE: &str = "<builtin>";
+/// Legacy alias — builtin enums live under [`PRELUDE_MODULE`].
+pub const BUILTIN_MODULE: &str = PRELUDE_MODULE;
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  Public data types
@@ -422,7 +424,7 @@ impl Generics {
                 name.into(),
                 TypeClassDef {
                     name: name.into(),
-                    defined_module: BUILTIN_MODULE.into(),
+                    defined_module: PRELUDE_OPS_MODULE.into(),
                     type_params: vec!["T".into()],
                     param_kinds: vec![Kind::Type],
                     superclasses: vec![],
@@ -443,7 +445,7 @@ impl Generics {
             "Num".into(),
             TypeClassDef {
                 name: "Num".into(),
-                defined_module: BUILTIN_MODULE.into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![
@@ -471,7 +473,7 @@ impl Generics {
                 name.into(),
                 TypeClassDef {
                     name: name.into(),
-                    defined_module: BUILTIN_MODULE.into(),
+                    defined_module: PRELUDE_OPS_MODULE.into(),
                     type_params: vec!["T".into()],
                     param_kinds: vec![Kind::Type],
                     superclasses: vec![],
@@ -493,7 +495,7 @@ impl Generics {
             "Ord".into(),
             TypeClassDef {
                 name: "Ord".into(),
-                defined_module: BUILTIN_MODULE.into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![
@@ -512,7 +514,7 @@ impl Generics {
             "Eq".into(),
             TypeClassDef {
                 name: "Eq".into(),
-                defined_module: BUILTIN_MODULE.into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -535,7 +537,7 @@ impl Generics {
             "Show".into(),
             TypeClassDef {
                 name: "Show".into(),
-                defined_module: BUILTIN_MODULE.into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
                 superclasses: vec![],
@@ -573,7 +575,7 @@ impl Generics {
             ] {
                 self.instances.push(InstanceDef {
                     class: class.into(),
-                    defined_module: BUILTIN_MODULE.into(),
+                    defined_module: PRELUDE_OPS_MODULE.into(),
                     range: 0..0,
                     args: vec![ty.clone()],
                     method_fqns: make_fqns(class, ty_str, &[method]),
@@ -585,7 +587,7 @@ impl Generics {
             for class in ["Num", "Ord"] {
                 self.instances.push(InstanceDef {
                     class: class.into(),
-                    defined_module: BUILTIN_MODULE.into(),
+                    defined_module: PRELUDE_OPS_MODULE.into(),
                     range: 0..0,
                     args: vec![ty.clone()],
                     method_fqns: HashMap::new(),
@@ -597,7 +599,7 @@ impl Generics {
         // ---- builtin instances: int / float Eq / Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Eq", "int", &["eq", "ne"]),
@@ -605,7 +607,7 @@ impl Generics {
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Show", "int", &["show"]),
@@ -613,7 +615,7 @@ impl Generics {
         });
         self.instances.push(InstanceDef {
             class: "Eq".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![float()],
             method_fqns: make_fqns("Eq", "float", &["eq", "ne"]),
@@ -621,7 +623,7 @@ impl Generics {
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![float()],
             method_fqns: make_fqns("Show", "float", &["show"]),
@@ -631,7 +633,7 @@ impl Generics {
         // ---- string: Eq + Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![string()],
             method_fqns: make_fqns("Eq", "string", &["eq", "ne"]),
@@ -639,7 +641,7 @@ impl Generics {
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![string()],
             method_fqns: make_fqns("Show", "string", &["show"]),
@@ -649,7 +651,7 @@ impl Generics {
         // ---- bool: Eq + Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![boolean()],
             method_fqns: make_fqns("Eq", "bool", &["eq", "ne"]),
@@ -657,7 +659,7 @@ impl Generics {
         });
         self.instances.push(InstanceDef {
             class: "Show".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![boolean()],
             method_fqns: make_fqns("Show", "bool", &["show"]),
@@ -667,7 +669,7 @@ impl Generics {
         // ---- unit: Show ----
         self.instances.push(InstanceDef {
             class: "Show".into(),
-            defined_module: BUILTIN_MODULE.into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
             range: 0..0,
             args: vec![unit()],
             method_fqns: make_fqns("Show", "unit", &["show"]),

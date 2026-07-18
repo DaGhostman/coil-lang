@@ -12,8 +12,10 @@ pub mod pretty;
 pub mod subst;
 pub mod ty;
 pub mod unify;
+pub mod virtual_modules;
 
 pub use infer::{CStructDef, CallbackSigDef, Checker};
 #[allow(unused_imports)] // public API for kind-aware callers / tests
 pub use kind::Kind;
 pub use ty::Ty;
+pub use virtual_modules::{BuiltinExport, FfiBuiltin, VirtualModules};

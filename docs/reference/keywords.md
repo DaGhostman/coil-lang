@@ -37,9 +37,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `defer` | Declaration | Run block on function exit | [Syntax — Defer](syntax.md#defer) |
 | `true` | Literal | Boolean true | [Types — Primitives](types.md#primitive-types) |
 | `false` | Literal | Boolean false | [Types — Primitives](types.md#primitive-types) |
-| `dload` | Builtin | Load shared library | [Built-ins — FFI](built-ins.md#dload) |
-| `declare` | Builtin | Register FFI signature | [Built-ins — FFI](built-ins.md#declare) |
-| `invoke` | Builtin | Call FFI function | [Built-ins — FFI](built-ins.md#invoke) |
+| `dload` / `declare` / `invoke` | Ordinary names | FFI callables from virtual `ffi` (not keywords) | [Built-ins — FFI](built-ins.md#dload--declare--invoke-ffi) |
 | `async` | Declaration | Coroutine function (`coroutine<Y>` / `coroutine<Y, S>`) | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 | `yield` | Expression / stmt | Suspend coroutine; optional receive binding | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 | `yield from` | Expression / stmt | Delegate to sub-coroutine | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
@@ -73,7 +71,7 @@ Appear inside `{ ... }` blocks via `statement()`.
 ## Expression / literal keywords
 
 ```
-match | new | true | false | format | dload | declare | invoke | yield | resume | done | raise
+match | new | true | false | format | yield | resume | done | raise
 ```
 
 Parsed as **atoms** before the generic `ident()` rule so they are never treated as variable names.
@@ -118,7 +116,7 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 | Kind | Examples | Callable as `name(...)`? |
 |------|----------|------------------------|
 | Statement keyword | `print` | No — statement form only: `print "...";` |
-| Expression builtin | `dload`, `declare`, `invoke` | Yes — `dload("lib.so")` |
+| Virtual-module export | `dload`, `declare`, `invoke` (via `use ffi::*`) | Yes as identifiers — not reserved keywords |
 | Declaration keyword | `fn`, `enum` | No |
 
 ---

@@ -22,17 +22,20 @@
 // passes the resulting bytecode to a fresh `Machine`. Userland
 // FFI is self-contained in the script via `dload`/`declare`/`invoke`.
 
+use ffi::*;
+use ffi::types::*;
+
 fn main() {
     // `dload("<full path>")` is the most portable form — no
     // dependence on cwd or LD_LIBRARY_PATH at runtime.
     let lib = dload("libsum.so");
     // `declare` / `invoke` take argument types and values as tuples.
-    // `FFIType` is a compiler builtin — no userland enum needed.
+    // Tag constructors (`Int`, …) come from `ffi::types`.
     let sum_id = declare(
         lib,
         "sum",
-        (FFIType::Int, FFIType::Int),
-        FFIType::Int,
+        (Int, Int),
+        Int,
     );
     print "%i", invoke(lib, sum_id, (40, 2));
 }

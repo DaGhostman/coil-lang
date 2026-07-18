@@ -65,6 +65,7 @@ use super::ty::{
     unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
+use super::virtual_modules::{BuiltinExport, FfiBuiltin, VirtualModules};
 
 /// A parametric type alias (`type Pair<T> = (T, T)`).
 #[derive(Clone, Debug)]
@@ -92,6 +93,13 @@ pub struct Checker {
 
     /// Module path currently being typechecked. The entry file uses `""`.
     current_module: String,
+
+    /// Compiler virtual modules (`prelude`, `ffi`, …).
+    virtual_modules: VirtualModules,
+
+    /// Short names currently in scope from the prelude and explicit
+    /// `use` of virtual exports. Reset + re-injected each `check_program`.
+    scope_bindings: HashMap<String, BuiltinExport>,
 
     /// Type of the surrounding `match`'s LHS, if any. Used by
     /// [`Expression::Default`] arms.
@@ -346,6 +354,8 @@ impl Checker {
             messages: Vec::new(),
             current_return_ty: None,
             current_module: String::new(),
+            virtual_modules: VirtualModules::new(),
+            scope_bindings: HashMap::new(),
             current_match_lhs: None,
             classes: std::collections::HashMap::new(),
             methods: std::collections::HashMap::new(),
@@ -406,6 +416,91 @@ impl Checker {
     fn register_builtin_enums(&mut self) {
         self.register_builtin_ffi_type();
         self.register_builtin_option_result();
+    }
+
+    /// Reset scope bindings and inject the auto-prelude.
+    pub fn inject_prelude_scope(&mut self) {
+        self.scope_bindings.clear();
+        for export in self.virtual_modules.prelude_exports() {
+            let name = export.short_name().to_string();
+            self.scope_bindings.insert(name, export);
+        }
+    }
+
+    /// Bind a virtual export under `local` (and drop any previous short
+    /// binding for the export's canonical short name when `local` differs).
+    pub fn bind_virtual_export(&mut self, local: String, export: BuiltinExport) {
+        let canonical = export.short_name().to_string();
+        if local != canonical {
+            // `use prelude::ops::Eq as PreludeEq` frees the short name.
+            if self
+                .scope_bindings
+                .get(&canonical)
+                .is_some_and(|e| e == &export)
+            {
+                self.scope_bindings.remove(&canonical);
+            }
+        }
+        self.scope_bindings.insert(local, export);
+    }
+
+    /// Look up a short name in the virtual-module scope.
+    pub fn scope_binding(&self, name: &str) -> Option<&BuiltinExport> {
+        self.scope_bindings.get(name)
+    }
+
+    /// True when `name` is an in-scope FFI tag constructor (`Int`, …).
+    pub fn ffi_tag_in_scope(&self, name: &str) -> bool {
+        matches!(
+            self.scope_bindings.get(name),
+            Some(BuiltinExport::FfiTag { .. })
+        )
+    }
+
+    /// Resolve an in-scope name to a userland FFI builtin, if any.
+    pub fn ffi_fn_in_scope(&self, name: &str) -> Option<FfiBuiltin> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::FfiFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// True when a bare enum/trait name is allowed (prelude or explicit use).
+    pub fn builtin_name_in_scope(&self, name: &str) -> bool {
+        self.scope_bindings.contains_key(name)
+    }
+
+    pub fn virtual_modules(&self) -> &VirtualModules {
+        &self.virtual_modules
+    }
+
+    /// Apply a `use` against virtual modules. Returns `true` when handled
+    /// (caller should not treat it as a disk-module function import).
+    pub fn apply_virtual_use(
+        &mut self,
+        path: &[String],
+        name: &str,
+        alias: Option<&str>,
+    ) -> bool {
+        if name == "*" {
+            let Some(exports) = self.virtual_modules.resolve_glob(path) else {
+                return false;
+            };
+            let exports: Vec<_> = exports.to_vec();
+            for export in exports {
+                let local = export.short_name().to_string();
+                self.bind_virtual_export(local, export);
+            }
+            return true;
+        }
+        let Some(export) = self.virtual_modules.resolve_item(path, name) else {
+            return false;
+        };
+        let local = alias
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| name.to_string());
+        self.bind_virtual_export(local, export);
+        true
     }
 
     /// Pre-register the compiler-built-in `FFIType` enum with fixed tags.
@@ -551,6 +646,9 @@ impl Checker {
 
         // Built-in enums survive the per-program enum reset.
         self.register_builtin_enums();
+
+        // Implicit `use prelude::*; use prelude::ops::*;` — FFI stays out.
+        self.inject_prelude_scope();
 
         // Mint NodeIds for every AST node (pre-walk). The visit order
         // matches `infer`'s recursion, so the IDs line up.
@@ -970,18 +1068,33 @@ impl Checker {
             | Expression::Comment(_)
             | Expression::Break
             | Expression::Continue => unit_ty(),
-            // `use` — bind alias with a fresh type variable
+            // `use` — virtual modules first, else disk-module function alias
             Expression::Use {
-                path: _,
+                path,
                 name,
                 alias,
             } => {
+                if self.apply_virtual_use(path, name, alias.as_deref()) {
+                    // Bind FFI callables into the value env so Call sites
+                    // resolve; enums/traits/tags are scope-only.
+                    let locals: Vec<String> = self
+                        .scope_bindings
+                        .iter()
+                        .filter(|(_, e)| matches!(e, BuiltinExport::FfiFn { .. }))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for local in locals {
+                        if self.env.lookup(&local).is_none() {
+                            self.env
+                                .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
+                        }
+                    }
+                    return unit_ty();
+                }
                 let local = alias.clone().unwrap_or_else(|| name.clone());
-                // Insert a polymorphic type variable so
-                // any calls to the local name pass
-                // type-checking. The codegen resolves
-                // the actual FQN at the call site via
-                // `self.aliases`.
+                // Disk module: insert a polymorphic type variable so
+                // calls to the local name pass type-checking. Codegen
+                // resolves the FQN via `self.aliases`.
                 self.env
                     .insert_top(local, Scheme::mono(Ty::Var(self.counter.fresh())));
                 unit_ty()
@@ -1375,6 +1488,26 @@ impl Checker {
                 if ident == "len" {
                     return self.infer_array_len(args.as_deref(), range);
                 }
+                // `dload` / `declare` / `invoke` after `use ffi::*`.
+                if let Some(kind) = self.ffi_fn_in_scope(&ident) {
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    return match kind {
+                        FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
+                        FfiBuiltin::Declare => self.infer_ffi_declare(arg_slice, range),
+                        FfiBuiltin::Invoke => self.infer_ffi_invoke(arg_slice, range),
+                    };
+                }
+                if matches!(ident.as_str(), "dload" | "declare" | "invoke") {
+                    return self.error_with_help(
+                        ErrorCode::UnknownValue,
+                        format!("Cannot find value `{}` in this scope", ident),
+                        range,
+                        Some(format!(
+                            "import it with `use ffi::{};` or `use ffi::*;`",
+                            ident
+                        )),
+                    );
+                }
 
                 // Bare/UFCS trait method call: `method(x)`.
                 // Resolve it before ordinary environment lookup because class
@@ -1664,16 +1797,8 @@ impl Checker {
 
             // ---- Userland FFI builtins ----
             //
-            // `dload(path)` — `dlopen`s the path and pushes an
-            // opaque library handle (an `int` at the bytecode
-            // level — the codegen emits FfiLoad which pushes
-            // the heap `Object::Library` address as an i64).
-            // We type it as `int` so subsequent uses accept it
-            // as the first arg of `declare` / `invoke`.
-            Expression::Dload(path) => {
-                let _ = self.infer(path);
-                int()
-            }
+            // Legacy AST form (tests / older parsers). Prefer Call + `use ffi::*`.
+            Expression::Dload(path) => self.infer_ffi_dload(std::slice::from_ref(path), range),
             // `done(h)` — true when coroutine handle `h` is Done.
             Expression::Done(handle) => {
                 let handle_ty = self.infer(handle);
@@ -1834,100 +1959,8 @@ impl Checker {
             // arg/ret position is an `FFIType::X` constructor
             // application (otherwise the codegen won't know how
             // to encode the type). Returns `int`.
-            Expression::Declare(args) => {
-                if args.len() == 4 {
-                    self.infer(&args[0]);
-                    self.infer(&args[1]);
-                    match args[2].1.as_ref() {
-                        Expression::Tuple(_) => {
-                            // Consume the Tuple node + each element as
-                            // FFI type tags (not values). Bare names like
-                            // `Point` / `int32` are type tags here.
-                            self.infer_ffi_type_expr(&args[2]);
-                        }
-                        _ => {
-                            let mut m = Message::error(
-                                ErrorCode::DeclareArity, "declare(...) third argument must be an arguments tuple (T1, T2, ...)"
-                                    .to_string(),
-                                args[2].0.into_range(),
-                            );
-                            m.push(Label::new(
-                                "wrap the arg types in parentheses — (FFIType::Int, FFIType::Float)"
-                                    .to_string(),
-                                args[2].0.into_range(),
-                            ));
-                            self.messages.push(m);
-                        }
-                    }
-                    self.infer_ffi_type_expr(&args[3]);
-                } else {
-                    for arg in args {
-                        self.infer(arg);
-                    }
-                    let mut m = Message::error(
-                        ErrorCode::DeclareArity,
-                        "declare requires 4 arguments (lib, name, args_tuple, ret_type)"
-                            .to_string(),
-                        range.clone(),
-                    );
-                    m.push(Label::new(
-                        format!("got {} arguments", args.len()),
-                        range.clone(),
-                    ));
-                    self.messages.push(m);
-                }
-                int()
-            }
-            // `invoke(lib, fn_id, (v1, v2, ...))` — calls a
-            // previously-declared function. Result type is refined
-            // from `let id = declare(..., ret)` when `fn_id` is that
-            // binding; otherwise falls back to `int`.
-            Expression::Invoke(args) => {
-                let mut ret_ty = int();
-                if args.len() == 3 {
-                    self.infer(&args[0]);
-                    self.infer(&args[1]);
-                    if let Expression::Identifier(name) = args[1].1.as_ref() {
-                        if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
-                            ret_ty = ty.clone();
-                        }
-                    }
-                    match args[2].1.as_ref() {
-                        Expression::Tuple(items) => {
-                            for item in items {
-                                self.infer(item);
-                            }
-                        }
-                        _ => {
-                            let mut m = Message::error(
-                                ErrorCode::InvokeArity, "invoke(...) third argument must be an arguments tuple (v1, v2, ...)"
-                                    .to_string(),
-                                args[2].0.into_range(),
-                            );
-                            m.push(Label::new(
-                                "wrap the arg values in parentheses — (40, 2)".to_string(),
-                                args[2].0.into_range(),
-                            ));
-                            self.messages.push(m);
-                        }
-                    }
-                } else {
-                    for arg in args {
-                        self.infer(arg);
-                    }
-                    let mut m = Message::error(
-                        ErrorCode::InvokeArity,
-                        "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
-                        range.clone(),
-                    );
-                    m.push(Label::new(
-                        format!("got {} arguments", args.len()),
-                        range.clone(),
-                    ));
-                    self.messages.push(m);
-                }
-                ret_ty
-            }
+            Expression::Declare(args) => self.infer_ffi_declare(args, range),
+            Expression::Invoke(args) => self.infer_ffi_invoke(args, range),
 
             // ---- Defer / coroutines / list ----
             Expression::Defer(e) => {
@@ -2362,20 +2395,35 @@ impl Checker {
                     Vec::new()
                 };
                 if let Some(previous) = self.generics.typeclass(name) {
-                    let mut msg = Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!("Duplicate trait `{}`", name),
-                        range.clone(),
-                    );
-                    msg.with_help(format!(
-                        "trait `{}` was already declared in module `{}`",
-                        name, previous.defined_module
-                    ));
-                    self.messages.push(msg);
-                    for m in methods {
-                        let _ = self.infer(m);
+                    let is_prelude = Checker::is_builtin_class(name);
+                    if is_prelude && !self.builtin_name_in_scope(name) {
+                        // Short name was rebound (`use prelude::ops::Eq as …`);
+                        // allow the user trait to replace the builtin entry.
+                    } else {
+                        let mut msg = Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!("Duplicate trait `{}`", name),
+                            range.clone(),
+                        );
+                        if is_prelude && self.builtin_name_in_scope(name) {
+                            msg.with_help(format!(
+                                "`{}` is in the prelude; free the short name with `use {}::{} as OtherName;` before redefining, or pick a different name",
+                                name,
+                                previous.defined_module,
+                                name
+                            ));
+                        } else {
+                            msg.with_help(format!(
+                                "trait `{}` was already declared in module `{}`",
+                                name, previous.defined_module
+                            ));
+                        }
+                        self.messages.push(msg);
+                        for m in methods {
+                            let _ = self.infer(m);
+                        }
+                        return unit_ty();
                     }
-                    return unit_ty();
                 }
                 let def = TypeClassDef {
                     name: name.to_string(),
@@ -3131,14 +3179,26 @@ impl Checker {
                             // pre-unify fresh variable.
                             let pruned = apply_ty_prune(&self.subst, &var_ty);
                             self.codegen_var_types.insert(name.to_string(), pruned);
-                            // `let id = declare(...)` may wrap Declare in
+                            // `let id = declare(...)` may wrap Declare/Call in
                             // ExprStatement/Statement — unwrap before matching.
                             let init = unwrap_expr_wrappers(next);
-                            if let Expression::Declare(dargs) = init.1.as_ref() {
-                                if dargs.len() == 4 {
-                                    let ret = self.ty_from_ffi_type_expr(&dargs[3]);
-                                    self.ffi_fn_ret_tys.insert(name.to_string(), ret);
+                            let declare_args = match init.1.as_ref() {
+                                Expression::Declare(dargs) => Some(dargs.as_slice()),
+                                Expression::Call { name: callee, args }
+                                    if matches!(
+                                        callee.1.as_ref(),
+                                        Expression::Identifier("declare")
+                                    ) =>
+                                {
+                                    args.as_deref()
                                 }
+                                _ => None,
+                            };
+                            if let Some(dargs) = declare_args
+                                && dargs.len() == 4
+                            {
+                                let ret = self.ty_from_ffi_type_expr(&dargs[3]);
+                                self.ffi_fn_ret_tys.insert(name.to_string(), ret);
                             }
                             i += 1;
                         }
@@ -5447,6 +5507,134 @@ impl Checker {
         self.ffi_type_tag_from_output(expr).is_some()
     }
 
+    fn infer_ffi_dload(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        if self.ffi_fn_in_scope("dload").is_none() {
+            let _ = self.error_with_help(
+                ErrorCode::UnknownValue,
+                "Cannot find value `dload` in this scope".to_string(),
+                range.clone(),
+                Some("import it with `use ffi::dload;` or `use ffi::*;`".to_string()),
+            );
+        }
+        if let Some(path) = args.first() {
+            let _ = self.infer(path);
+        } else {
+            let _ = self.error_with_help(
+                ErrorCode::DeclareArity,
+                "dload requires 1 argument (path)".to_string(),
+                range,
+                None,
+            );
+        }
+        int()
+    }
+
+    fn infer_ffi_declare(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        if self.ffi_fn_in_scope("declare").is_none() {
+            let _ = self.error_with_help(
+                ErrorCode::UnknownValue,
+                "Cannot find value `declare` in this scope".to_string(),
+                range.clone(),
+                Some("import it with `use ffi::declare;` or `use ffi::*;`".to_string()),
+            );
+        }
+        if args.len() == 4 {
+            self.infer(&args[0]);
+            self.infer(&args[1]);
+            match args[2].1.as_ref() {
+                Expression::Tuple(_) => {
+                    self.infer_ffi_type_expr(&args[2]);
+                }
+                _ => {
+                    let mut m = Message::error(
+                        ErrorCode::DeclareArity,
+                        "declare(...) third argument must be an arguments tuple (T1, T2, ...)"
+                            .to_string(),
+                        args[2].0.into_range(),
+                    );
+                    m.push(Label::new(
+                        "wrap the arg types in parentheses — (Int, Float) after `use ffi::types::*;`"
+                            .to_string(),
+                        args[2].0.into_range(),
+                    ));
+                    self.messages.push(m);
+                }
+            }
+            self.infer_ffi_type_expr(&args[3]);
+        } else {
+            for arg in args {
+                self.infer(arg);
+            }
+            let mut m = Message::error(
+                ErrorCode::DeclareArity,
+                "declare requires 4 arguments (lib, name, args_tuple, ret_type)".to_string(),
+                range.clone(),
+            );
+            m.push(Label::new(
+                format!("got {} arguments", args.len()),
+                range.clone(),
+            ));
+            self.messages.push(m);
+        }
+        int()
+    }
+
+    fn infer_ffi_invoke(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        if self.ffi_fn_in_scope("invoke").is_none() {
+            let _ = self.error_with_help(
+                ErrorCode::UnknownValue,
+                "Cannot find value `invoke` in this scope".to_string(),
+                range.clone(),
+                Some("import it with `use ffi::invoke;` or `use ffi::*;`".to_string()),
+            );
+        }
+        let mut ret_ty = int();
+        if args.len() == 3 {
+            self.infer(&args[0]);
+            self.infer(&args[1]);
+            if let Expression::Identifier(name) = args[1].1.as_ref()
+                && let Some(ty) = self.ffi_fn_ret_tys.get(*name)
+            {
+                ret_ty = ty.clone();
+            }
+            match args[2].1.as_ref() {
+                Expression::Tuple(items) => {
+                    for item in items {
+                        self.infer(item);
+                    }
+                }
+                _ => {
+                    let mut m = Message::error(
+                        ErrorCode::InvokeArity,
+                        "invoke(...) third argument must be an arguments tuple (v1, v2, ...)"
+                            .to_string(),
+                        args[2].0.into_range(),
+                    );
+                    m.push(Label::new(
+                        "wrap the arg values in parentheses — (40, 2)".to_string(),
+                        args[2].0.into_range(),
+                    ));
+                    self.messages.push(m);
+                }
+            }
+        } else {
+            for arg in args {
+                self.infer(arg);
+            }
+            let mut m = Message::error(
+                ErrorCode::InvokeArity,
+                "invoke requires 3 arguments (lib, fn_id, args_tuple)".to_string(),
+                range.clone(),
+            );
+            m.push(Label::new(
+                format!("got {} arguments", args.len()),
+                range.clone(),
+            ));
+            self.messages.push(m);
+        }
+        ret_ty
+    }
+
     /// Resolve an FFI type expression to `(tag, aux)` for codegen.
     pub fn ffi_type_tag_from_output(&self, expr: &Output) -> Option<(u32, u32)> {
         use common::{tag, tag_from_type_name, tag_from_variant_name};
@@ -5456,15 +5644,31 @@ impl Checker {
                 variant_name,
                 ..
             } if common::is_builtin_ffi_enum(enum_name) => {
+                // Qualified `ffi::types::Int` is always allowed. Legacy
+                // `FFIType::Int` requires an explicit import binding.
+                if *enum_name == common::BUILTIN_FFI_TYPE_ENUM
+                    && !self.builtin_name_in_scope(common::BUILTIN_FFI_TYPE_ENUM)
+                    && !self.ffi_tag_in_scope(variant_name)
+                {
+                    return None;
+                }
                 let tag = tag_from_variant_name(variant_name)?;
                 Some((tag, 0))
             }
             Expression::Type(name) | Expression::Identifier(name) => {
                 if let Some(id) = self.c_struct_id(name) {
-                    Some((tag::STRUCT, id))
-                } else {
-                    tag_from_type_name(name).map(|t| (t, 0))
+                    return Some((tag::STRUCT, id));
                 }
+                // In-scope `use ffi::types::*` tags (`Int`, `Ptr`, …).
+                if self.ffi_tag_in_scope(name) {
+                    return tag_from_variant_name(name).map(|t| (t, 0));
+                }
+                // Bare lowercase primitives (`int`, `void`, …) stay
+                // available without importing `ffi::types`.
+                if name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+                    return tag_from_type_name(name).map(|t| (t, 0));
+                }
+                None
             }
             Expression::Array(items) if items.len() == 1 => Some((tag::PTR, 0)),
             Expression::Tuple(_) => Some((tag::PTR, 0)),
@@ -5498,7 +5702,7 @@ impl Checker {
             expr.0.into_range(),
         );
         m.push(Label::new(
-            "use FFIType::Int, FFIType::Ptr, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
+            "use `Int`/`Ptr` after `use ffi::types::*;`, a bare type name (int, void, …), [T], (T, U), or a declared extern struct".to_string(),
             expr.0.into_range(),
         ));
         self.messages.push(m);
@@ -6163,21 +6367,40 @@ impl Checker {
                     }
                 }
 
-                // Check 1: duplicate enum name (including built-ins).
+                // Check 1: duplicate enum name (including built-ins still in scope).
                 if common::is_builtin_enum(&name_str) {
-                    let mut msg = Message::error(
-                        ErrorCode::DuplicateEnum,
-                        format!("Cannot redeclare built-in enum `{}`", name_str),
-                        node.0.into_range(),
-                    );
-                    msg.with_help(format!(
-                        "`{}` is provided by the compiler; use it without declaring the enum",
-                        name_str
-                    ));
-                    errors.push(msg);
-                    self.restore_generic_type_ctor(&name_str, previous_generic_ctor);
-                    self.pop_type_params_for_type_parsing(pushed);
-                    return;
+                    if self.builtin_name_in_scope(&name_str)
+                        || common::is_builtin_ffi_enum(&name_str)
+                    {
+                        let mut msg = Message::error(
+                            ErrorCode::DuplicateEnum,
+                            format!("Cannot redeclare built-in enum `{}`", name_str),
+                            node.0.into_range(),
+                        );
+                        if common::is_poly_builtin_enum(&name_str) {
+                            msg.with_help(format!(
+                                "`{}` is in the prelude; free the short name with `use prelude::{} as OtherName;` before redefining, or pick a different name",
+                                name_str, name_str
+                            ));
+                        } else {
+                            msg.with_help(format!(
+                                "`{}` is a compiler FFI type; use `ffi::types::{{…}}` instead of redeclaring it",
+                                name_str
+                            ));
+                        }
+                        errors.push(msg);
+                        self.restore_generic_type_ctor(&name_str, previous_generic_ctor);
+                        self.pop_type_params_for_type_parsing(pushed);
+                        return;
+                    }
+                    // Prelude enum short name was rebound — drop the
+                    // compiler registration so the user enum can take over.
+                    self.enums.remove(&name_str);
+                    self.enum_tags.remove(&name_str);
+                    self.enum_payloads.remove(&name_str);
+                    self.enum_arities.remove(&name_str);
+                    self.generics.generic_type_ctors.remove(&name_str);
+                    self.generics.nominal_type_modules.remove(&name_str);
                 }
                 if self.enums.contains_key(&name_str) {
                     let mut msg = Message::error(
@@ -6651,7 +6874,28 @@ impl Checker {
         range: Range<usize>,
     ) -> Ty {
         use parser::ast::EnumConstructPayload;
-        let enum_str = enum_name.to_string();
+        // Surface path `ffi::types::Int` maps to the internal `FFIType` registry.
+        let registry_name = if common::is_builtin_ffi_enum(enum_name) {
+            // Legacy `FFIType::X` requires an import; `ffi::types::X` is always OK.
+            if enum_name == common::BUILTIN_FFI_TYPE_ENUM
+                && !self.builtin_name_in_scope(common::BUILTIN_FFI_TYPE_ENUM)
+                && !self.ffi_tag_in_scope(variant_name)
+            {
+                return self.error_with_help(
+                    ErrorCode::UnknownEnum,
+                    format!("Cannot find enum `{}` in this scope", enum_name),
+                    range,
+                    Some(
+                        "import tags with `use ffi::types::*;` (or write `ffi::types::Int`)"
+                            .to_string(),
+                    ),
+                );
+            }
+            common::BUILTIN_FFI_TYPE_ENUM.to_string()
+        } else {
+            enum_name.to_string()
+        };
+        let enum_str = registry_name;
         let variant_str = variant_name.to_string();
 
         // Look up the enum. Error if not registered.
@@ -6660,7 +6904,7 @@ impl Checker {
             None => {
                 return self.error(
                     ErrorCode::UnknownEnum,
-                    format!("Cannot find enum `{}` in this scope", enum_str),
+                    format!("Cannot find enum `{}` in this scope", enum_name),
                     range,
                 );
             }
@@ -7841,17 +8085,28 @@ impl Checker {
     // ============================================================
 
     /// Variant tag by enum and variant name (source-declaration order).
+    /// Map surface enum paths (`ffi::types`) to the internal registry key.
+    fn registry_enum_name<'a>(&self, enum_name: &'a str) -> &'a str {
+        if common::is_builtin_ffi_enum(enum_name) {
+            common::BUILTIN_FFI_TYPE_ENUM
+        } else {
+            enum_name
+        }
+    }
+
     pub fn tag_for(&self, enum_name: &str, variant_name: &str) -> Option<u32> {
+        let key = self.registry_enum_name(enum_name);
         self.enum_tags
-            .get(enum_name)
+            .get(key)
             .and_then(|t| t.get(variant_name).copied())
     }
 
     /// Payload arity for `(enum_name, variant_name)`.
     pub fn arity_for(&self, enum_name: &str, variant_name: &str) -> Option<usize> {
+        let key = self.registry_enum_name(enum_name);
         self.tag_for(enum_name, variant_name).and_then(|t| {
             self.enum_arities
-                .get(enum_name)
+                .get(key)
                 .and_then(|a| a.get(t as usize).copied())
         })
     }
@@ -7889,13 +8144,14 @@ impl Checker {
     /// — see `EnumVariantPayloadTy::field_pairs`. For Record
     /// variants, the field names are the declared names.
     pub fn payload_tys_for(&self, enum_name: &str, variant_name: &str) -> Vec<(String, Ty)> {
+        let key = self.registry_enum_name(enum_name);
         let tag = match self.tag_for(enum_name, variant_name) {
             Some(t) => t,
             None => return Vec::new(),
         };
         match self
             .enum_payloads
-            .get(enum_name)
+            .get(key)
             .and_then(|p| p.get(tag as usize))
         {
             Some(payload) => payload.field_pairs(),
@@ -11497,12 +11753,15 @@ extern struct Point {
     y: int32,
 };
 
+use ffi::*;
+use ffi::types::*;
+
 fn main() {
     let lib = dload("libsum.so");
     let make_id = declare(
         lib,
         "make_point",
-        (FFIType::Int32, FFIType::Int32),
+        (Int32, Int32),
         Point,
     );
     let p = invoke(lib, make_id, (3, 4));
@@ -11676,6 +11935,117 @@ fn main() {
             msgs.iter()
                 .map(|m| (m.code(), m.message()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ---- Virtual modules: prelude + ffi scope ----
+
+    #[test]
+    fn prelude_injects_option_without_import() {
+        let src = r#"
+fn main() {
+    let o = Option::Some(1);
+    print "%i", match o { Option::Some(v) => v, Option::None => 0 };
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.builtin_name_in_scope("Option"));
+        assert!(c.builtin_name_in_scope("Eq"));
+        assert!(!c.ffi_fn_in_scope("dload").is_some());
+    }
+
+    #[test]
+    fn dload_without_ffi_import_errors() {
+        let msgs = assert_messages(r#"fn main() { let lib = dload("x.so"); }"#);
+        assert!(
+            msgs.iter().any(|m| {
+                m.code() == Some(ErrorCode::UnknownValue)
+                    && m.message().contains("dload")
+            }),
+            "expected UnknownValue for bare dload, got: {:?}",
+            msgs.iter()
+                .map(|m| (m.code(), m.message()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn use_ffi_types_glob_brings_int_tag_into_scope() {
+        let src = r#"
+use ffi::*;
+use ffi::types::*;
+fn main() {
+    let lib = dload("x.so");
+    let id = declare(lib, "sum", (Int, Int), Int);
+    let _ = invoke(lib, id, (1, 2));
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.ffi_tag_in_scope("Int"));
+        assert!(c.ffi_fn_in_scope("dload").is_some());
+    }
+
+    #[test]
+    fn ffi_types_qualified_path_works_without_import() {
+        let src = r#"
+use ffi::*;
+fn main() {
+    let lib = dload("x.so");
+    let id = declare(lib, "sum", (ffi::types::Int, ffi::types::Int), ffi::types::Int);
+    let _ = invoke(lib, id, (1, 2));
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rebind_prelude_eq_allows_user_trait_eq() {
+        let src = r#"
+use prelude::ops::Eq as PreludeEq;
+trait Eq<T> {
+    fn id(T x) -> T;
+}
+fn main() {}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(!c.builtin_name_in_scope("Eq"));
+        assert!(c.builtin_name_in_scope("PreludeEq"));
+    }
+
+    #[test]
+    fn duplicate_prelude_eq_without_rebind_errors() {
+        let msgs = assert_messages(
+            r#"
+trait Eq<T> {
+    fn id(T x) -> T;
+}
+fn main() {}
+"#,
+        );
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Duplicate trait")),
+            "expected Duplicate trait for Eq, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
 

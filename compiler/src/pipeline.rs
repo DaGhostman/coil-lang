@@ -305,6 +305,15 @@ impl Pipeline {
     fn enqueue_uses(&mut self, ast: &(SimpleSpan, Box<Expression<'_>>)) {
         match ast.1.borrow() {
             Expression::Use { path, name, .. } => {
+                // Compiler virtual modules (`prelude`, `ffi`, …) are not
+                // `.0s` files — skip disk discovery for those paths.
+                {
+                    use crate::typechecking::VirtualModules;
+                    let vm = VirtualModules::new();
+                    if vm.resolves_use(path, name) {
+                        return;
+                    }
+                }
                 // `use foo::sadge;` means: import `sadge`
                 // from module `foo`. The file containing
                 // the module `foo` is `foo.0s` (the file
