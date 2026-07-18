@@ -407,6 +407,33 @@ fn sum_tree(Tree t) -> int {
 
 ---
 
+### `examples/derive_show_eq.0s`
+
+**Demonstrates:** Header `derive Show, Eq, Ord` on enums and classes — structural `%v`, `==`, and `<` without hand-written `impl`s.
+
+```0s
+enum Color derive Show, Eq, Ord {
+    Red,
+    Blue,
+}
+
+enum Point derive Show, Eq {
+    Origin,
+    Point { x: int, y: int },
+}
+
+class Cell derive Show, Eq {
+    value: int,
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/derive_show_eq.0s` |
+| **Output** | `Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false` |
+
+---
+
 ### `examples/mixed.0s`
 
 **Demonstrates:** One enum mixing **unit**, **tuple**, and **record** variant shapes; `match` arms bind payload values per shape.

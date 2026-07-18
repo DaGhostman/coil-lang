@@ -177,7 +177,9 @@ let n = d.x;              // field access
 - Duplicate field names in one literal → compile error.
 - Anonymous records have structural `Show` support for `%v` when every field is showable. Fields print in canonical name order as `{ a: 1, b: 2 }`.
 
-Structural `Show` is limited to tuples and anonymous records. Enums, classes, and other user types still need an explicit `impl Show<T>`.
+Structural `Show` covers tuples and anonymous records automatically. Non-generic
+enums and classes can also opt in with a header `derive Show` clause (see
+[Trait derive](#trait-derive)); otherwise write an explicit `impl Show for T`.
 
 ---
 
@@ -482,6 +484,38 @@ The compiler pre-registers these traits and instances for `int`, `float`, and (w
 
 On open/generic operands, operators require the matching op trait (or `Num`, which implies all four). Concrete `int`/`float` arithmetic still uses hardwired opcodes. String concatenation (`string + string`) is a separate path and is **not** covered by `Num`/`Add`.
 
+### Trait derive
+
+Non-generic `enum` and `class` headers may include an optional `derive`
+clause that synthesizes structural instances of builtin traits:
+
+```0s
+enum Point derive Show, Eq {
+    Origin,
+    Point { x: int, y: int },
+}
+
+class Cell derive Show, Eq {
+    value: int,
+}
+```
+
+| Trait | Synthesized methods | Strategy |
+|-------|---------------------|----------|
+| `Show` | `show` | Enum: `match` + `format` / string lits; class: field walk via `.field` |
+| `Eq` | `eq`, `ne` | Tag + payload `==`; `ne` is `!(a == b)` |
+| `Ord` | `lt`, `le`, `gt`, `ge` | Lexicographic on declaration order |
+
+Rules:
+
+- Placement: after optional `<…>` type params, before `{`.
+- Whitelist only: `Show`, `Eq`, `Ord`. Unknown / arithmetic traits (`Num`, …) error.
+- Generics (`enum Box<T> derive Show`) are rejected for now — write an explicit `impl`.
+- Combining `derive Show` with a hand-written `impl Show for T` hits the usual overlap diagnostic.
+- Empty `derive` with no traits is a parse error.
+
+See `examples/derive_show_eq.0s`.
+
 ### User-defined traits (sketch)
 
 Declare a trait and provide instances for concrete types. Prefer the
@@ -702,7 +736,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
 | Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
 | Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |
-| Typeclass deriving | No automatic deriving; write each `impl` explicitly |
+| Typeclass deriving | Header `derive Show, Eq, Ord` on non-generic `enum` / `class` (see [Trait derive](#trait-derive)); user traits and generics need an explicit `impl` |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
 | Inner match patterns | Same outer tag with different inner tags — supported (Phase 18A); complex nested cases may still need careful arm ordering |

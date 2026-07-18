@@ -604,7 +604,7 @@ impl Pipeline {
         };
 
         let parser = Pratt::default();
-        let ast = match parser.parse(src.as_str()) {
+        let mut ast = match parser.parse(src.as_str()) {
             Ok(ast) => ast,
             Err(errors) => {
                 self.emit_message(&file, src.as_str(), &errors);
@@ -626,7 +626,7 @@ impl Pipeline {
         // the prologue on the second call). See
         // `Compiler::compile_module` for the operand
         // adjustment details.
-        let bytecode = self.compiler.compile_module(namespace.as_str(), &ast);
+        let bytecode = self.compiler.compile_module(namespace.as_str(), &mut ast);
         #[cfg(debug_assertions)]
         eprintln!(
             "[pipeline]   compiled {} → {} bytes (total: {})",
@@ -747,7 +747,7 @@ impl Pipeline {
     pub fn compile_test(
         &mut self,
         module: &str,
-        ast: &(SimpleSpan, Box<Expression<'_>>),
+        ast: &mut (SimpleSpan, Box<Expression<'_>>),
     ) -> (Vec<Byte>, Vec<u64>) {
         let mut bytecode = self.compiler.compile(module, ast);
 
@@ -772,7 +772,7 @@ impl Pipeline {
     pub fn compile_src(&mut self, src: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let parser = Pratt::default();
         let path = Path::new("<input>");
-        let ast = match parser.parse(src) {
+        let mut ast = match parser.parse(src) {
             Ok(ast) => ast,
             Err(err) => {
                 self.emit_message(path, src, &err);
@@ -780,7 +780,7 @@ impl Pipeline {
             }
         };
 
-        let mut bytecode = self.compiler.compile("", &ast);
+        let mut bytecode = self.compiler.compile("", &mut ast);
 
         // Register source and drain typecheck / codegen diagnostics via the sink.
         let file_id = self.sink.register_source(path, src);

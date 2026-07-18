@@ -1422,7 +1422,24 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// `class Name { [pub] field: Type, ... }`
+    /// Optional `derive Trait (, Trait)*` clause on enum/class headers.
+    fn derive_clause(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Vec<&'pratt str>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("derive")
+            .ignore_then(
+                text::ident()
+                    .padded()
+                    .separated_by(op!(','))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .or_not()
+            .map(|opt| opt.unwrap_or_default())
+    }
+
+    /// `class Name [derive T, …] { [pub] field: Type, ... }`
     ///
     /// Fields are private by default; `pub` makes them public.
     fn class(
@@ -1432,6 +1449,7 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("class")
             .ignore_then(text::ident().padded())
             .then(self.type_param_list())
+            .then(self.derive_clause())
             .then(
                 self.field_decl()
                     .separated_by(op!(','))
@@ -1439,12 +1457,13 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
-            .map_with(|((name, type_params), fields), e| {
+            .map_with(|(((name, type_params), derives), fields), e| {
                 (
                     e.span(),
                     Box::new(Expression::Class {
                         name,
                         type_params,
+                        derives,
                         fields,
                     }),
                 )
@@ -2219,6 +2238,8 @@ impl<'pratt> Pratt<'pratt> {
     /// sum-type declaration. Registered in [`Self::declaration`]
     /// before `variable()` so a leading `enum` keyword isn't
     /// mis-parsed as `let`.
+    ///
+    /// Optional derive clause: `enum Name derive Show, Eq { … }`.
     fn enum_decl(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -2226,6 +2247,7 @@ impl<'pratt> Pratt<'pratt> {
         keyword!("enum")
             .ignore_then(text::ident().padded())
             .then(self.type_param_list())
+            .then(self.derive_clause())
             .then(
                 self.enum_variant()
                     .separated_by(op!(','))
@@ -2233,8 +2255,16 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!('{'), op!('}')),
             )
-            .map_with(|((name, type_params), variants), e| {
-                (e.span(), Box::new(Expression::EnumDecl { name, type_params, variants }))
+            .map_with(|(((name, type_params), derives), variants), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::EnumDecl {
+                        name,
+                        type_params,
+                        derives,
+                        variants,
+                    }),
+                )
             })
     }
 
@@ -4498,5 +4528,49 @@ mod tests_generics {
     fn inherent_impl_with_type_param_display_round_trips() {
         let s = stmt!("impl Cell<T> {}");
         assert_eq!(s, "impl Cell<T> {  }");
+    }
+
+    /// `enum Point derive Show, Eq { … }` parses derive traits onto EnumDecl.
+    #[test]
+    fn enum_derive_clause_parses_traits() {
+        match decl_ast!("enum Point derive Show, Eq { Origin, Point { x: int, y: int } }") {
+            Expression::EnumDecl {
+                name, derives, ..
+            } => {
+                assert_eq!(name, "Point");
+                assert_eq!(derives, vec!["Show", "Eq"]);
+            }
+            other => panic!("expected EnumDecl, got {:?}", other),
+        }
+    }
+
+    /// Derive clause Display round-trips on enums.
+    #[test]
+    fn enum_derive_clause_display_round_trips() {
+        let s = stmt!("enum Point derive Show, Eq { Origin }");
+        assert_eq!(s, "enum Point derive Show, Eq { Origin }");
+    }
+
+    /// `class Cell derive Show { … }` parses derive traits onto Class.
+    #[test]
+    fn class_derive_clause_parses_traits() {
+        match decl_ast!("class Cell derive Show, Eq { value: int }") {
+            Expression::Class {
+                name, derives, ..
+            } => {
+                assert_eq!(name, "Cell");
+                assert_eq!(derives, vec!["Show", "Eq"]);
+            }
+            other => panic!("expected Class, got {:?}", other),
+        }
+    }
+
+    /// Enum without derive still has an empty derives list.
+    #[test]
+    fn enum_without_derive_has_empty_list() {
+        match decl_ast!("enum Point { Origin }") {
+            Expression::EnumDecl { derives, .. } => assert!(derives.is_empty()),
+            other => panic!("expected EnumDecl, got {:?}", other),
+        }
     }
 }
