@@ -58,7 +58,14 @@ declaration ::= class_decl
 ### Functions
 
 ```
-function_decl ::= 'async'? 'fn' IDENT arg_list ('->' type_annotation)? block
+function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list
+                  ('->' type_annotation)? where_clause? block
+type_param_list ::= '<' type_param (',' type_param)* '>'
+type_param      ::= IDENT (':' (kind | class_bound ('+' class_bound)*))?
+kind            ::= '*' | 'Constraint' | kind '->' kind | '(' kind ')'
+class_bound     ::= IDENT
+where_clause    ::= 'where' where_constraint (',' where_constraint)*
+where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
 arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
 ```
 
@@ -66,8 +73,69 @@ Examples:
 
 ```0s
 fn add(int a, int b) -> int { return a + b; }
+fn add<T: Num>(T a, T b) -> T { return a + b; }
+fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn greet() { print "hi"; }
 ```
+
+### Typeclasses and impl
+
+```
+typeclass_decl ::= 'typeclass' IDENT type_param_list '{' typeclass_item* '}'
+typeclass_item ::= assoc_type_decl | method_sig
+assoc_type_decl ::= 'type' IDENT type_param_list? ';'
+method_sig     ::= 'fn' IDENT arg_list ('->' type_annotation)? (';' | block)
+impl_decl      ::= 'impl' IDENT type_arg_list '{' impl_item* '}'
+impl_item      ::= assoc_type_def | method_decl
+assoc_type_def ::= 'type' IDENT type_param_list? '=' type ';'
+type_arg_list  ::= '<' type (',' type)* '>'
+type_projection ::= IDENT '::' IDENT type_arg_list?
+                 // e.g. Collect::Elem, C::Elem, Pointer::Ref<int>, P::Ref<A>
+```
+
+Example:
+
+```0s
+typeclass Num<T> { /* builtin — see types reference */ }
+
+typeclass Collect<C> {
+    type Elem;
+    fn head(C xs) -> Elem;
+}
+
+impl Collect<Option<int>> {
+    type Elem = int;
+    fn head(Option<int> xs) -> int { /* … */ }
+}
+
+typeclass Pointer<P: * -> *> {
+    type Ref<T>;
+    fn deref<T>(P<T> ptr) -> Ref<T>;
+}
+
+impl Pointer<Option> {
+    type Ref<T> = T;
+    fn deref<T>(Option<T> ptr) -> T { /* … */ }
+}
+
+impl Measurable<int> {
+    fn size(int x) -> int { return x; }
+}
+```
+
+Generic functions use `type_param_list` on `fn` (see above). Bounds use `+`
+between class names (`T: Num + Eq`). Multi-parameter classes use a trailing
+`where Class<T1, T2>` clause (unary `where Num<T>` is also accepted).
+Higher-kinded parameters use explicit kind annotations (`F: * -> *`,
+`F: * -> * -> *`, or `F: (* -> *) -> *`); a bound whose class parameter is
+constructor-kinded (for example `F: Container`) also implies that kind. A
+parameter can carry both an explicit kind and a bound:
+`F: * -> * -> *, Bifunctor`.
+
+Constraint-kind parameters use `Constraint` as the result kind:
+`fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }`.
+The abstract `T: c` bound must be resolved by method/operator/`%v` use in the
+function body so codegen can pass a concrete dictionary at call sites.
 
 ### Enums
 
@@ -92,10 +160,10 @@ enum Tree { Leaf, Node(int, Tree, Tree) }
 ### Type aliases
 
 ```
-type_alias ::= 'type' IDENT '=' type_annotation ';'
+type_alias ::= 'type' IDENT type_param_list? '=' type_annotation ';'
 ```
 
-Example: `type PointPair = (int, int);`
+Examples: `type PointPair = (int, int);`, `type Pair<T> = (T, T);`
 
 ### Modules
 
@@ -127,12 +195,16 @@ See [FFI tutorial](../tutorial/07-ffi.md).
 ### Classes and impl
 
 ```
-class_decl ::= 'class' IDENT '{' field_decl (',' field_decl)* ','? '}'
+class_decl ::= 'class' IDENT type_param_list? '{' field_decl (',' field_decl)* ','? '}'
 field_decl ::= 'pub'? IDENT ':' type
 
-impl_decl  ::= 'impl' IDENT '{' method_decl* '}'
+impl_decl  ::= 'impl' IDENT type_param_list? '{' method_decl* '}'
 method_decl ::= 'pub'? function_decl
 ```
+
+`type_param_list` is the same form as on functions (`<T>`, `<T: Num>`, …).
+An inherent `impl Cell<T>` shares those parameters with the class so methods
+can mention `T` and type `self` as `Cell<T>`.
 
 Example:
 
@@ -142,9 +214,17 @@ impl Foo {
     pub fn bump() -> int { return 1; }
     fn name_len() -> int { return 0; }
 }
+
+class Cell<T> { value: T }
+impl Cell<T> {
+    fn get() -> T { return self.value; }
+}
 ```
 
-Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s`.
+Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s` and `examples/generic_class.0s`.
+
+Note: typeclass `impl` (`impl Collect<Option<int>> { … }`) uses a different
+parse path — see [Typeclasses and impl](#typeclasses-and-impl) above.
 
 ### Defer
 
@@ -305,9 +385,10 @@ match p {
 Used in function signatures, `let`, enum payloads, and type aliases:
 
 ```
-type_annotation ::= array_type | tuple_type | IDENT
+type_annotation ::= array_type | tuple_type | type_projection | IDENT
 array_type      ::= '[' type (';' INT)? ']'
 tuple_type      ::= '(' type (',' type)+ ')'
+type_projection ::= IDENT '::' IDENT type_arg_list?
 ```
 
 | Form | Meaning |
@@ -316,6 +397,8 @@ tuple_type      ::= '(' type (',' type)+ ')'
 | `[int]` | Dynamic-length array |
 | `[int; 5]` | Static-length array (length 5) |
 | `(int, string)` | Tuple type (comma required) |
+| `C::Elem` | Associated type projection |
+| `P::Ref<A>` | Generic associated type projection with type arguments |
 
 Primitive names are case-insensitive in the typechecker (`String` ≡ `string`).
 

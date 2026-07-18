@@ -1,5 +1,46 @@
 //! Untagged runtime values: immediates and heap pointers in one word.
 
+/// Runtime type tag used by the generics boxing opcodes (`BoxValue` / `UnboxValue`).
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ValueTag {
+    Int = 0,
+    Float = 1,
+    Bool = 2,
+    String = 3,
+    Enum = 4,
+    Instance = 5,
+    Tuple = 6,
+    Array = 7,
+    Record = 8,
+    Coroutine = 9,
+    Ptr = 10,
+    Unit = 11,
+    PolyFn = 12,
+}
+
+impl ValueTag {
+    /// Convert a raw `u16` to `ValueTag`; returns `None` for unknown tags.
+    pub fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            0 => Some(Self::Int),
+            1 => Some(Self::Float),
+            2 => Some(Self::Bool),
+            3 => Some(Self::String),
+            4 => Some(Self::Enum),
+            5 => Some(Self::Instance),
+            6 => Some(Self::Tuple),
+            7 => Some(Self::Array),
+            8 => Some(Self::Record),
+            9 => Some(Self::Coroutine),
+            10 => Some(Self::Ptr),
+            11 => Some(Self::Unit),
+            12 => Some(Self::PolyFn),
+            _ => None,
+        }
+    }
+}
+
 type Storage = u64;
 
 #[derive(Default, Copy, Clone, Eq)]

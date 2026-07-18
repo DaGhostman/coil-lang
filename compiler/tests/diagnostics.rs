@@ -35,7 +35,8 @@ fn unknown_identifier_reports_helpful_message() {
 fn unknown_identifier_has_stable_error_code() {
     let msgs = check_messages("x;");
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::UnknownValue)),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::UnknownValue)),
         "expected ErrorCode::UnknownValue (E0100), got: {:?}",
         msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
@@ -45,7 +46,8 @@ fn unknown_identifier_has_stable_error_code() {
 fn type_mismatch_has_stable_error_code() {
     let msgs = check_messages(r#"let x: int = "hello";"#);
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
         "expected ErrorCode::TypeMismatch (E0102), got: {:?}",
         msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
@@ -260,8 +262,7 @@ fn match_with_all_variants_no_messages() {
 #[test]
 fn non_exhaustive_match_emits_diagnostic() {
     // One arm missing the `Some` variant → "Non-exhaustive" error.
-    let src =
-        "let x = Option::None(); match x { Option::None() => 0 };";
+    let src = "let x = Option::None(); match x { Option::None() => 0 };";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.iter().any(|m| m.contains("Non-exhaustive match")),
@@ -342,6 +343,91 @@ fn format_string_percent_z_rejects_int() {
     assert!(
         msgs.iter().any(|m| m.contains("requires bool")),
         "expected 'requires bool' error for `%z` with int, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_percent_i_rejects_open_type_suggests_percent_v() {
+    let msgs = check_messages(
+        "fn bad<T>(T x) { print \"%i\", x; } \
+         fn main() { bad(1); }",
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("open type") && m.help().as_ref().is_some_and(|h| h.contains("%v"))
+        }),
+        "expected open-type `%i` diagnostic suggesting `%v`, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_percent_v_requires_show_bound() {
+    let (_ty, msgs) = check(
+        "fn bad<T>(T x) { print \"%v\", x; } \
+         fn main() { bad(1); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`Show`") || m.contains("Show")),
+        "expected `%v` without Show bound to error, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_percent_v_requires_show_bound_inside_structural_tuple() {
+    let (_ty, msgs) = check(
+        "fn bad<T>(T x) { print \"%v\", (x, 1); } \
+         fn main() { bad(1); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`Show`") || m.contains("Show")),
+        "expected structural `%v` with open T to require Show, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn format_percent_v_accepts_show_bound() {
+    let (_ty, msgs) = check(
+        "fn ok<T: Show>(T x) { print \"%v\", x; } \
+         fn main() { ok(1); }",
+    );
+    assert!(
+        msgs.is_empty(),
+        "expected `%v` with Show bound to typecheck, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn existential_pack_without_instance_reports_missing_instance() {
+    let (_ty, msgs) = check(
+        "typeclass Printable<T> { fn printable(T x) -> int; } \
+         fn take(Printable x) { } \
+         fn main() { take(42); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("No instance for `Printable<int>`")),
+        "expected missing existential instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn multiparam_typeclass_cannot_be_bare_existential_type() {
+    let (_ty, msgs) = check(
+        "typeclass Convert<A, B> { fn cast(A x) -> B; } \
+         fn take(Convert x) { }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Typeclass `Convert` cannot be used as a bare value type")),
+        "expected bare multi-param typeclass diagnostic, got: {:?}",
         msgs
     );
 }
@@ -569,13 +655,264 @@ fn coalesce_on_int_has_stable_invalid_coalesce_code() {
 
 #[test]
 fn optional_access_on_result_has_stable_code() {
-    let msgs = check_messages(
-        "fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }",
-    );
+    let msgs = check_messages("fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }");
     assert!(
         msgs.iter()
             .any(|m| m.code() == Some(ErrorCode::InvalidOptionalAccess)),
         "expected ErrorCode::InvalidOptionalAccess (E0116), got: {:?}",
         msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
+    );
+}
+
+/// Phase 5: HKT class instances must take a bare constructor, not an application.
+#[test]
+fn hkt_instance_rejects_applied_type_argument() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Container<F: * -> *> {
+            fn first<A>(F<A> xs) -> A;
+        }
+        impl Container<Option<int>> {
+            fn first<A>(Option<A> xs) -> A {
+                return match xs {
+                    Option::Some(v) => v,
+                    Option::None => 0,
+                };
+            }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("constructor-kinded class")
+            && m.contains("type constructor")
+            && m.contains("* -> *")),
+        "expected HKT instance kind diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 5: a `* -> *` variable cannot be used where a proper type is required.
+#[test]
+fn hkt_var_rejected_as_type_argument() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Container<F: * -> *> {
+            fn first<A>(F<A> xs) -> A;
+        }
+        fn bad<F: Container, A>(F<F> xs) -> A {
+            return first(xs);
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("kind `* -> *`") && m.contains("expected `*`")),
+        "expected kind-mismatch diagnostic for F used as type arg, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn constraint_bound_rejects_non_constraint_kind_parameter() {
+    let (_ty, msgs) = check(
+        r#"
+        fn bad<c: Constraint, T: c>(T x) -> T {
+            return x;
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Constraint parameter `c` has kind `Constraint`")
+                && m.contains("expected `* -> Constraint`")
+        }),
+        "expected ill-kinded constraint parameter diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn abstract_constraint_bound_requires_concrete_method_selection() {
+    let (_ty, msgs) = check(
+        r#"
+        fn bad<c: * -> Constraint, T: c>(T x) -> T {
+            return x;
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Cannot satisfy abstract constraint")),
+        "expected unsatisfied abstract constraint diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 5: impl of a subclass requires the superclass instance.
+#[test]
+fn superclass_impl_requires_superclass_instance() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
+        typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+        impl Ordered<int> {
+            fn lt_val(int a, int b) -> bool { return a < b; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("requires superclass instance")
+                && m.contains("Equal")
+                && m.contains("Ordered")),
+        "expected missing Equal superclass diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 6: impl must define every associated type declared by the class.
+#[test]
+fn assoc_type_missing_in_impl_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Collect<C> {
+            type Elem;
+            fn head(C xs) -> Elem;
+        }
+        impl Collect<int> {
+            fn head(int xs) -> int { return xs; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("missing associated type")
+            && m.contains("Elem")
+            && m.contains("Collect")),
+        "expected missing associated type diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 6: impl cannot define an unknown associated type.
+#[test]
+fn assoc_type_unknown_in_impl_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Collect<C> {
+            type Elem;
+            fn head(C xs) -> Elem;
+        }
+        impl Collect<int> {
+            type Elem = int;
+            type Extra = int;
+            fn head(int xs) -> int { return xs; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Unknown associated type")
+            && m.contains("Extra")
+            && m.contains("Collect")),
+        "expected unknown associated type diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn gat_impl_wrong_number_of_params_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Pointer<P: * -> *> {
+            type Ref<T>;
+            fn deref<T>(P<T> ptr) -> Ref<T>;
+        }
+        impl Pointer<Option> {
+            type Ref = int;
+            fn deref<T>(Option<T> ptr) -> T { return 0; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains(
+            "Associated type `Ref` in instance of `Pointer` expects 1 type parameter, got 0"
+        )),
+        "expected GAT impl arity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn gat_projection_wrong_number_of_args_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Pointer<P: * -> *> {
+            type Ref<T>;
+            fn deref<T>(P<T> ptr) -> Ref<T>;
+        }
+        fn bad<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A, int> {
+            return deref(ptr);
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Associated type `Pointer::Ref` expects 1 type argument, got 2")),
+        "expected GAT projection arity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn duplicate_typeclass_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Tiny<T> { fn id(T x) -> T; }
+        typeclass Tiny<T> { fn id(T x) -> T; }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Duplicate typeclass `Tiny`")),
+        "expected duplicate typeclass diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn orphan_instance_for_foreign_class_and_structural_type_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        impl Show<(int, int)> {
+            fn show((int, int) x) -> string { return ""; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Orphan instance `Show<(int, int)>`")),
+        "expected orphan-instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn overlapping_typeclass_instance_names_new_and_existing_instances() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Tiny<T> { fn id(T x) -> T; }
+        impl Tiny<int> {
+            fn id(int x) -> int { return x; }
+        }
+        impl Tiny<int> {
+            fn id(int x) -> int { return x; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Overlapping instance `Tiny<int>`") && m.contains("existing `Tiny<int>`")
+        }),
+        "expected overlapping-instance diagnostic, got: {:?}",
+        msgs
     );
 }

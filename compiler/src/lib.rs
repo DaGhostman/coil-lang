@@ -1,5 +1,6 @@
 mod block_builder;
 mod manifest;
+mod monomorphize;
 mod peephole;
 mod pipeline;
 mod typechecking;
@@ -9,10 +10,13 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use common::{Byte, Instruction, Interner, Value, encode_tag_operand, likely, tag, unlikely};
+use common::{
+    Byte, Instruction, Interner, Value, ValueTag, encode_tag_operand, likely, tag, unlikely,
+};
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
+use crate::monomorphize::{MonoKey, MonoPlan};
 use parser::{
     SimpleSpan,
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
@@ -20,7 +24,7 @@ use parser::{
 
 pub use pipeline::*;
 pub use reporting::{ErrorCode, Label, Message, MessageKind};
-pub use typechecking::{CallbackSigDef, Checker, CStructDef, Ty};
+pub use typechecking::{CStructDef, CallbackSigDef, Checker, Ty};
 
 macro_rules! unary {
     ($result: expr, $self: expr, $rhs: expr, $instruction: expr) => {
@@ -55,6 +59,15 @@ fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u3
 
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
+}
+
+fn is_instance_method_fqn(checker: &Checker, name: &str) -> bool {
+    checker.generics().instances.iter().any(|instance| {
+        instance
+            .method_fqns
+            .values()
+            .any(|method_fqn| method_fqn == name)
+    })
 }
 
 fn group_arms_by_outer_tag(arms: &[MatchArm], checker: &Checker) -> Vec<TagGroup> {
@@ -135,6 +148,7 @@ fn emit_inner_test<'compiler>(
     bb: &mut BlockBuilder,
     pass_label: Option<crate::block_builder::Label>,
     fail_label: crate::block_builder::Label,
+    payload_base: u32,
 ) {
     use parser::ast::PatternPayload;
     match payload {
@@ -153,7 +167,7 @@ fn emit_inner_test<'compiler>(
                         bytecode.push(Byte::new(Instruction::POP));
                     }
                     Pattern::Binding { name } => {
-                        let slot = next_available_slot(match_bindings_per_arm);
+                        let slot = next_available_slot(match_bindings_per_arm, payload_base);
                         match_bindings_per_arm
                             .entry(arm_idx)
                             .or_default()
@@ -185,6 +199,7 @@ fn emit_inner_test<'compiler>(
                                 bb,
                                 pass_label,
                                 fail_label,
+                                payload_base,
                             );
                         } else if let Some(label) = pass_label {
                             if let Some(inner_tag) = checker.tag_for(sub_enum, sub_variant) {
@@ -236,7 +251,7 @@ fn emit_inner_test<'compiler>(
                         bytecode.push(Byte::new(Instruction::POP));
                     }
                     Pattern::Binding { name } => {
-                        let slot = next_available_slot(match_bindings_per_arm);
+                        let slot = next_available_slot(match_bindings_per_arm, payload_base);
                         match_bindings_per_arm
                             .entry(arm_idx)
                             .or_default()
@@ -269,6 +284,7 @@ fn emit_inner_test<'compiler>(
                                 bb,
                                 pass_label,
                                 fail_label,
+                                payload_base,
                             );
                         } else if let Some(label) = pass_label {
                             if let Some(inner_tag) = checker.tag_for(sub_enum, sub_variant) {
@@ -300,10 +316,14 @@ fn emit_inner_test<'compiler>(
     }
 }
 
-/// Next free binding slot (slots start at 1; 0 is the scrutinee).
+/// Next free binding slot for match payloads.
+///
+/// `base` is the first payload slot (`context.variables.len()` at match
+/// entry). Slot 0 is reserved for the first function argument; trailing
+/// dictionary locals occupy 1..base-1 when `dict_arity > 0`.
 #[allow(dead_code)]
-fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>) -> u32 {
-    let mut max_slot = 0u32;
+fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>, base: u32) -> u32 {
+    let mut max_slot = base.saturating_sub(1);
     for arm_bindings in match_bindings.values() {
         for &slot in arm_bindings.values() {
             if slot > max_slot {
@@ -388,6 +408,20 @@ pub struct Compiler {
     /// True while compiling a function whose return type is inferred
     /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
     compiling_result_mode: bool,
+
+    /// Local variable names that hold an `ObjPolyFn` heap pointer
+    /// (i.e. `let f = some_generic_fn;`). When these are invoked via
+    /// `Expression::Call`, the codegen emits `CallIndirect` instead
+    /// of a direct `CALL` opcode.
+    polyfn_vars: HashSet<String>,
+    /// Local PolyFn variable → source generic function name.
+    polyfn_sources: HashMap<String, String>,
+
+    /// Monomorphization plan for this compile unit plus emitted clone offsets.
+    mono_plan: MonoPlan,
+    mono_offsets: HashMap<MonoKey, usize>,
+    /// Temporary variable-type overrides while emitting a specialized clone.
+    mono_codegen_var_types: Vec<HashMap<String, Ty>>,
 }
 
 impl Default for Compiler {
@@ -427,6 +461,11 @@ impl Default for Compiler {
             loop_bbs: Vec::new(),
             compiling_method: false,
             compiling_result_mode: false,
+            polyfn_vars: HashSet::new(),
+            polyfn_sources: HashMap::new(),
+            mono_plan: MonoPlan::default(),
+            mono_offsets: HashMap::new(),
+            mono_codegen_var_types: Vec::new(),
         }
     }
 }
@@ -585,10 +624,14 @@ fn emit_pattern_binding<'compiler>(
             }
             PatternPayload::Record(fields) => {
                 // Declaration-order walk; nested records use UnpackAt at non-top slots.
+                // `record_base` is the first payload slot for this record
+                // (normally 1; higher when trailing dict locals precede
+                // the match).
+                let record_base = *next_slot;
                 let pattern_site: std::collections::HashMap<&str, &Pattern<'compiler>> =
                     fields.iter().map(|pf| (pf.name, &pf.pattern)).collect();
                 for (i, (decl_name, _)) in parent_decl_order.iter().enumerate() {
-                    let field_slot = (i + 1) as u32;
+                    let field_slot = record_base + i as u32;
                     if let Some(sub_pat) = pattern_site.get(decl_name.as_str()) {
                         // If the sub-pattern is a nested
                         // record, emit `UnpackAt` with the
@@ -725,6 +768,34 @@ impl Compiler {
             .map(|s| s as u32)
     }
 
+    fn next_emit_id(&mut self) -> Option<crate::typechecking::id::NodeId> {
+        let id = self.checker.id_table().ids().get(self.emit_idx).copied();
+        if id.is_some() {
+            self.emit_idx += 1;
+        }
+        id
+    }
+
+    fn codegen_var_type_for(&self, name: &str) -> Option<Ty> {
+        for frame in self.mono_codegen_var_types.iter().rev() {
+            if let Some(ty) = frame.get(name) {
+                return Some(ty.clone());
+            }
+        }
+        self.checker.codegen_var_type(name).cloned()
+    }
+
+    fn mono_ty_from_name(name: &str) -> Ty {
+        match name {
+            crate::typechecking::ty::INT => Ty::Con(crate::typechecking::ty::INT.into()),
+            crate::typechecking::ty::FLOAT => Ty::Con(crate::typechecking::ty::FLOAT.into()),
+            crate::typechecking::ty::STRING => Ty::Con(crate::typechecking::ty::STRING.into()),
+            crate::typechecking::ty::BOOL => Ty::Con(crate::typechecking::ty::BOOL.into()),
+            crate::typechecking::ty::UNIT => Ty::Con(crate::typechecking::ty::UNIT.into()),
+            other => Ty::Con(other.to_string()),
+        }
+    }
+
     fn discard_statement_value(bytecode: &mut Vec<Byte>) {
         if matches!(
             bytecode.last().map(|b| b.bytecode()),
@@ -756,12 +827,1169 @@ impl Compiler {
         if let (Some(label), Some(bb)) = (target, self.loop_bbs.last_mut()) {
             bb.emit_jump_to(label, BbJumpKind::Unconditional, &mut self.bytecode);
         } else {
-            let mut message = Message::error(ErrorCode::GenericTypeError, format!("{} outside of loop", keyword), range.clone());
+            let mut message = Message::error(
+                ErrorCode::GenericTypeError,
+                format!("{} outside of loop", keyword),
+                range.clone(),
+            );
             message.push(DiagLabel::new(
                 format!("`{}` can only be used inside a loop", keyword),
                 range,
             ));
             self.messages.push(message);
+        }
+    }
+
+    fn emit_call_indirect(bytecode: &mut Vec<Byte>, target_offset: u32, arity: u32) {
+        bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(target_offset));
+        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(arity));
+    }
+
+    /// Lower an operator selected by HM inference to the uniform dictionary
+    /// calling convention: two boxed values, the hidden trailing dictionary,
+    /// then its method entry loaded from the dictionary tuple.
+    fn emit_bound_operator_call(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        lhs: &Output,
+        rhs: &Output,
+        dict_index: usize,
+        method_slot: usize,
+    ) -> bool {
+        let dict_name = format!("__dict{}", dict_index);
+        let Some(dict_slot) = self.lookup_slot(&dict_name) else {
+            return false;
+        };
+        bytecode.append(&mut self.do_compile(lhs));
+        bytecode.append(&mut self.do_compile(rhs));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
+        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
+        true
+    }
+
+    /// Emit a string literal as `STRING` + `DATA` bytes into `self.bytecode`.
+    /// Applies the same escape processing as `Expression::String` codegen.
+    fn emit_string_literal(&mut self, s: &str) {
+        let escaped = s
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace("\\0", "\0");
+        let idx = self.bytecode.len();
+        let mut count = 0u32;
+        for ch in escaped.chars() {
+            count += 1;
+            self.bytecode
+                .push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+        }
+        self.bytecode
+            .insert(idx, Byte::new(Instruction::STRING).with_operand_u32(count));
+    }
+
+    /// Rewrite `%v` → `%s` in a format literal (leave `%%` alone).
+    fn rewrite_format_v_to_s(fmt: &str) -> String {
+        let mut out = String::with_capacity(fmt.len());
+        let mut chars = fmt.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('%') => {
+                        out.push('%');
+                        out.push('%');
+                    }
+                    Some('v') => {
+                        out.push('%');
+                        out.push('s');
+                    }
+                    Some(other) => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                    None => out.push('%'),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Consuming format specifiers in source order (`%%` skipped).
+    fn format_consuming_specs(fmt: &str) -> Vec<char> {
+        let mut specs = Vec::new();
+        let mut chars = fmt.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('%') => {}
+                    Some(spec) => specs.push(spec),
+                    None => break,
+                }
+            }
+        }
+        specs
+    }
+
+    /// Emit `print`/`format` body: format string, then args (with `%v`
+    /// lowered through `Show`), then `FORMAT`.
+    fn emit_format_expression(&mut self, format: &Output, params: Option<&Vec<Output>>) {
+        let fmt_lit = match format.1.as_ref() {
+            Expression::String(s) => Some(s.to_string()),
+            _ => None,
+        };
+
+        if let (Some(fmt), Some(params)) = (fmt_lit.as_deref(), params) {
+            let rewritten = Self::rewrite_format_v_to_s(fmt);
+            let specs = Self::format_consuming_specs(fmt);
+            let mut arg_slots = Vec::with_capacity(params.len());
+            let mut emitted = 0usize;
+            for (param, spec) in params.iter().zip(specs.iter()) {
+                if *spec == 'v' {
+                    self.emit_show_for_format_arg(param);
+                } else {
+                    let bc = self.do_compile(param);
+                    self.bytecode.extend(bc);
+                }
+                let slot = self.alloc_temp_slot();
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                arg_slots.push(slot);
+                emitted += 1;
+            }
+            // Extra args beyond specifiers — still push them (VM pops by count).
+            for param in params.iter().skip(emitted) {
+                let bc = self.do_compile(param);
+                self.bytecode.extend(bc);
+                let slot = self.alloc_temp_slot();
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                arg_slots.push(slot);
+            }
+            self.emit_string_literal(&rewritten);
+            for slot in arg_slots {
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+            }
+            self.bytecode
+                .push(Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32));
+        } else {
+            let format_bc = self.do_compile(format);
+            self.bytecode.extend(format_bc);
+            let mut params_len = 0u32;
+            if let Some(params) = params {
+                params_len = params.len() as u32;
+                for param in params {
+                    let bc = self.do_compile(param);
+                    self.bytecode.extend(bc);
+                }
+            }
+            self.bytecode
+                .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len));
+        }
+    }
+
+    fn show_format_arg_ty(&self, arg: &Output) -> Option<Ty> {
+        let span = arg.0.into_range();
+        let span_ty = self
+            .checker
+            .lookup_for_codegen_span(span.start, span.end)
+            .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t));
+        match span_ty {
+            Some(Ty::Var(_)) | None => self.codegen_expr_ty(arg),
+            Some(other) => Some(other),
+        }
+    }
+
+    /// Lower one `%v` argument to a string via the `Show` dictionary /
+    /// concrete instance method, leaving an `ObjString` on the stack.
+    fn emit_show_for_format_arg(&mut self, arg: &Output) {
+        let span = arg.0.into_range();
+        if let Some((dict_index, method_slot)) = self
+            .checker
+            .bound_display_call_for_span(span.start, span.end)
+            .map(|h| (h.dict_index, h.method_slot))
+        {
+            let dict_name = format!("__dict{}", dict_index);
+            if let Some(dict_slot) = self.lookup_slot(&dict_name) {
+                let mut arg_bc = self.do_compile(arg);
+                self.bytecode.append(&mut arg_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_const_inline(method_slot as i32));
+                self.bytecode.push(Byte::new(Instruction::Index));
+                self.bytecode
+                    .push(Byte::new(Instruction::CallIndirect).with_operand_u32(2));
+                return;
+            }
+        }
+
+        // Concrete Show instance at the call site.
+        // Prefer a fully resolved type: span cache from a shared generic body
+        // may still be an open `Ty::Var` even when mono/codegen side-tables
+        // know the ground type (or when the arg is a literal / construct).
+        let arg_ty = self.show_format_arg_ty(arg);
+
+        if let Some(ty) = arg_ty.as_ref() {
+            let resolved = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty);
+            if matches!(resolved, Ty::Tuple(_) | Ty::Record { .. }) {
+                let mut arg_bc = self.do_compile(arg);
+                self.bytecode.append(&mut arg_bc);
+                self.emit_show_for_stack_value(&resolved);
+                return;
+            }
+
+            // Instance heads use `Ty::Con("Point")`; construct sites often
+            // produce `Constructor` / `Sum` — peel to the enum name.
+            let lookup_ty = Self::show_lookup_ty_for_instance(&resolved);
+            if let Some(instance) = self
+                .checker
+                .generics()
+                .find_instance("Show", std::slice::from_ref(&lookup_ty))
+                .cloned()
+                && let Some(fqn) = instance.method_fqns.get("show").cloned()
+                && let Some(&offset) = self.functions.get(&fqn)
+            {
+                let mut arg_bc = self.do_compile(arg);
+                self.bytecode.append(&mut arg_bc);
+                // Box using the lookup head so enum Constructs get Enum tag.
+                Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
+                Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                return;
+            }
+        }
+
+        // Typechecker should have rejected; keep bytecode well-formed.
+        let mut arg_bc = self.do_compile(arg);
+        self.bytecode.append(&mut arg_bc);
+        self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+    }
+
+    fn show_lookup_ty_for_instance(ty: &Ty) -> Ty {
+        match ty {
+            Ty::Sum { name, .. } => Ty::Con(name.clone()),
+            Ty::Constructor { owner, .. } => Self::show_lookup_ty_for_instance(owner),
+            other => other.clone(),
+        }
+    }
+
+    fn tuple_show_format(len: usize) -> String {
+        match len {
+            0 => "()".to_string(),
+            1 => "(%s,)".to_string(),
+            _ => format!("({})", vec!["%s"; len].join(", ")),
+        }
+    }
+
+    fn record_show_format(fields: &[(String, Ty)]) -> String {
+        if fields.is_empty() {
+            return "{}".to_string();
+        }
+        let parts = fields
+            .iter()
+            .map(|(name, _)| format!("{name}: %s"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ {parts} }}")
+    }
+
+    fn emit_show_for_stack_value(&mut self, ty: &Ty) {
+        let resolved = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty);
+        match resolved {
+            Ty::Tuple(items) => self.emit_tuple_show_for_stack_value(&items),
+            Ty::Record { fields } => self.emit_record_show_for_stack_value(&fields),
+            other => {
+                let lookup_ty = Self::show_lookup_ty_for_instance(&other);
+                if let Some(instance) = self
+                    .checker
+                    .generics()
+                    .find_instance("Show", std::slice::from_ref(&lookup_ty))
+                    .cloned()
+                    && let Some(fqn) = instance.method_fqns.get("show").cloned()
+                    && let Some(&offset) = self.functions.get(&fqn)
+                {
+                    Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
+                    Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                } else {
+                    self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+                }
+            }
+        }
+    }
+
+    fn emit_tuple_show_for_stack_value(&mut self, items: &[Ty]) {
+        let tuple_slot = self.alloc_temp_slot();
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(tuple_slot));
+
+        let mut element_slots = Vec::with_capacity(items.len());
+        for (idx, item_ty) in items.iter().enumerate() {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(tuple_slot));
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_inline(idx as i32));
+            self.bytecode.push(Byte::new(Instruction::Index));
+            self.emit_show_for_stack_value(item_ty);
+            let slot = self.alloc_temp_slot();
+            self.bytecode
+                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            element_slots.push(slot);
+        }
+
+        self.emit_string_literal(&Self::tuple_show_format(items.len()));
+        for slot in element_slots {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::FORMAT).with_operand_u32(items.len() as u32));
+    }
+
+    fn emit_record_show_for_stack_value(&mut self, fields: &[(String, Ty)]) {
+        let record_slot = self.alloc_temp_slot();
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(record_slot));
+
+        let mut field_slots = Vec::with_capacity(fields.len());
+        for (name, field_ty) in fields {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(record_slot));
+            Self::emit_raw_string_literal(&mut self.bytecode, name);
+            self.bytecode.push(Byte::new(Instruction::GetField));
+            self.emit_show_for_stack_value(field_ty);
+            let slot = self.alloc_temp_slot();
+            self.bytecode
+                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            field_slots.push(slot);
+        }
+
+        self.emit_string_literal(&Self::record_show_format(fields));
+        for slot in field_slots {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::FORMAT).with_operand_u32(fields.len() as u32));
+    }
+
+    /// Structurally bind scheme pattern variables to concrete call-site types.
+    ///
+    /// Used by [`emit_call_site_dicts`] so `F<A>` against `Option<int>` records
+    /// both `F = Option` and `A = int` (Phase 5).
+    fn bind_scheme_vars(
+        pattern: &Ty,
+        concrete: &Ty,
+        map: &mut HashMap<crate::typechecking::ty::TyVarId, Ty>,
+    ) {
+        use crate::typechecking::ty::{option_inner, result_ok_err};
+
+        match (pattern, concrete) {
+            (Ty::Var(v), c) => {
+                map.entry(*v).or_insert_with(|| c.clone());
+            }
+            (Ty::App(h1, a1), Ty::App(h2, a2)) if a1.len() == a2.len() => {
+                Self::bind_scheme_vars(h1, h2, map);
+                for (p, c) in a1.iter().zip(a2.iter()) {
+                    Self::bind_scheme_vars(p, c, map);
+                }
+            }
+            // `F<A>` vs builtin Option/Result constructor or structural sum:
+            // bind `F` to the constructor constant and recurse into payloads.
+            (Ty::App(head, args), other)
+                if matches!(head.as_ref(), Ty::Var(_))
+                    && (option_inner(other).is_some() || result_ok_err(other).is_some()) =>
+            {
+                if let Some(inner) = option_inner(other) {
+                    if args.len() == 1 {
+                        Self::bind_scheme_vars(
+                            head,
+                            &Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                            map,
+                        );
+                        Self::bind_scheme_vars(&args[0], &inner, map);
+                    }
+                } else if let Some((ok, err)) = result_ok_err(other) {
+                    if args.len() == 2 {
+                        Self::bind_scheme_vars(
+                            head,
+                            &Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                            map,
+                        );
+                        Self::bind_scheme_vars(&args[0], &ok, map);
+                        Self::bind_scheme_vars(&args[1], &err, map);
+                    }
+                }
+            }
+            (Ty::App(h1, a1), Ty::Constructor { owner, .. }) => {
+                Self::bind_scheme_vars(&Ty::App(h1.clone(), a1.clone()), owner.as_ref(), map);
+            }
+            (Ty::Fun(a1, r1), Ty::Fun(a2, r2)) => {
+                Self::bind_scheme_vars(a1, a2, map);
+                Self::bind_scheme_vars(r1, r2, map);
+            }
+            (Ty::Tuple(t1), Ty::Tuple(t2)) if t1.len() == t2.len() => {
+                for (p, c) in t1.iter().zip(t2.iter()) {
+                    Self::bind_scheme_vars(p, c, map);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit one instance dictionary (`CodePtr`s + `MakeTuple`) for a
+    /// typeclass constraint whose type arguments have already been resolved
+    /// to concrete lookup types. Returns `true` when a dict was pushed.
+    ///
+    /// Layout (Phase 5): subclass methods first, then each superclass’s
+    /// methods in declaration order (flattened). Superclass slots are filled
+    /// from the matching superclass instance for the same type arguments.
+    fn emit_instance_dict(
+        bytecode: &mut Vec<Byte>,
+        class: &str,
+        lookup: &[crate::typechecking::Ty],
+        checker: &Checker,
+        functions: &HashMap<String, usize>,
+    ) -> bool {
+        let Some(instance) = checker.generics().find_instance_relaxed(class, lookup) else {
+            return false;
+        };
+        let Some(class_def) = checker.generics().typeclass(&instance.class) else {
+            return false;
+        };
+        let flat = class_def.flattened_methods(checker.generics());
+        let n_methods = flat.len() as u32;
+        for (owner_class, method_def) in &flat {
+            let fqn = if *owner_class == instance.class.as_str() {
+                instance.method_fqns.get(&method_def.name).cloned()
+            } else {
+                checker
+                    .generics()
+                    .find_instance_relaxed(owner_class, lookup)
+                    .and_then(|super_inst| super_inst.method_fqns.get(&method_def.name).cloned())
+            };
+            let offset = fqn
+                .and_then(|name| functions.get(&name).copied())
+                .unwrap_or(0);
+            bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32));
+        }
+        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n_methods));
+        true
+    }
+
+    fn emit_existential_pack_recipe(
+        bytecode: &mut Vec<Byte>,
+        pack: &crate::typechecking::infer::ExistentialPack,
+        checker: &Checker,
+        functions: &HashMap<String, usize>,
+    ) {
+        Self::emit_box_if_needed(bytecode, &pack.value_ty);
+        if Self::emit_instance_dict(
+            bytecode,
+            &pack.class,
+            std::slice::from_ref(&pack.value_ty),
+            checker,
+            functions,
+        ) {
+            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(2));
+        }
+    }
+
+    fn append_with_existential_pack(&mut self, bytecode: &mut Vec<Byte>, expr: &Output) {
+        let pack = self
+            .checker
+            .existential_pack_for_span(expr.0.start, expr.0.end)
+            .cloned();
+        bytecode.append(&mut self.do_compile(expr));
+        if let Some(pack) = pack {
+            Self::emit_existential_pack_recipe(bytecode, &pack, &self.checker, &self.functions);
+        }
+    }
+
+    fn load_tuple_field(bytecode: &mut Vec<Byte>, tuple_slot: u32, index: i32) {
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tuple_slot));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(index));
+        bytecode.push(Byte::new(Instruction::Index));
+    }
+
+    fn emit_existential_method_call(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        name: &Output,
+        args: Option<&Vec<Output>>,
+        hint: &crate::typechecking::infer::ExistentialMethodCall,
+    ) -> bool {
+        let (pack_expr, extra_args): (&Output, &[Output]) = if hint.has_receiver {
+            let Expression::Access(recv, _) = name.1.as_ref() else {
+                return false;
+            };
+            (recv, args.map(Vec::as_slice).unwrap_or(&[]))
+        } else {
+            let Some(items) = args else {
+                return false;
+            };
+            let Some((first, rest)) = items.split_first() else {
+                return false;
+            };
+            (first, rest)
+        };
+
+        let pack_slot = self.alloc_temp_slot();
+        bytecode.append(&mut self.do_compile(pack_expr));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(pack_slot));
+
+        // Pack layout: tuple[0] = boxed value, tuple[1] = dictionary tuple.
+        Self::load_tuple_field(bytecode, pack_slot, 0);
+        for arg in extra_args {
+            self.append_with_existential_pack(bytecode, arg);
+        }
+        Self::load_tuple_field(bytecode, pack_slot, 1);
+        Self::load_tuple_field(bytecode, pack_slot, 1);
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(hint.method_slot as i32));
+        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(hint.arity as u32 + 1));
+        true
+    }
+
+    /// Resolve a constraint's type arguments through `var_to_ty`, returning
+    /// concrete lookup types when every argument is ground. `None` means at
+    /// least one argument is still open (cannot synthesize yet).
+    fn resolve_constraint_lookup(
+        constraint: &crate::typechecking::ty::Constraint,
+        var_to_ty: &HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty>,
+        checker: &Checker,
+    ) -> Option<Vec<crate::typechecking::Ty>> {
+        use crate::typechecking::Ty;
+        use crate::typechecking::subst::apply_ty_prune;
+        use crate::typechecking::ty::ftv_ty;
+
+        let mut resolved = Vec::with_capacity(constraint.args.len());
+        for arg in &constraint.args {
+            let concrete = match arg {
+                Ty::Var(v) => apply_ty_prune(checker.subst(), var_to_ty.get(v)?),
+                other => apply_ty_prune(checker.subst(), other),
+            };
+            if !ftv_ty(&concrete).is_empty() {
+                return None;
+            }
+            resolved.push(concrete);
+        }
+        // Constructor-kinded class params look up by constructor head
+        // (`Option`, `Result`), not applied types.
+        let lookup = if let Some(class_def) = checker.generics().typeclass(&constraint.class) {
+            resolved
+                .iter()
+                .enumerate()
+                .map(|(i, concrete)| {
+                    if class_def.is_constructor_kind_at(i) {
+                        match concrete {
+                            Ty::App(head, _) => head.as_ref().clone(),
+                            other => other.clone(),
+                        }
+                    } else {
+                        concrete.clone()
+                    }
+                })
+                .collect()
+        } else {
+            resolved
+        };
+        Some(lookup)
+    }
+
+    /// Emit dictionary tuples for a non-monomorphized generic call site.
+    ///
+    /// Convention: after value args, one `MakeTuple` per typeclass
+    /// constraint. Compiler-provided and source-provided instances use the
+    /// same dictionary layout.
+    /// Each tuple holds method entry offsets in flattened declaration order
+    /// (subclass methods, then superclass methods — Phase 5)
+    /// (`CodePtr <offset>`, or `CodePtr 0` if the FQN is not compiled yet).
+    ///
+    /// Instances are resolved from the callee's scheme + concrete argument
+    /// types (not `NodeId`), because the pre-walk / infer ID table can be
+    /// misaligned inside function bodies.
+    ///
+    /// Returns the number of dict tuples pushed (used to bump CALL arity).
+    fn emit_call_site_dicts(
+        bytecode: &mut Vec<Byte>,
+        fn_name: &str,
+        arg_tys: &[crate::typechecking::Ty],
+        ret_ty: Option<&crate::typechecking::Ty>,
+        checker: &Checker,
+        functions: &HashMap<String, usize>,
+    ) -> usize {
+        use crate::typechecking::Ty;
+
+        let Some(scheme) = checker.env().lookup(fn_name).cloned() else {
+            return 0;
+        };
+        // Map quantified vars → concrete arg types by structurally matching
+        // the curried function type against the call's argument types.
+        // Phase 5: `F<A>` vs `Option<int>` binds both `F = Option` and `A = int`.
+        // Do NOT apply the global subst to the scheme — those vars may have
+        // been reused/unified later in the program.
+        let mut var_to_ty: HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty> =
+            HashMap::new();
+        let mut fun = &scheme.ty;
+        let mut arg_idx = 0usize;
+        while let Ty::Fun(param, ret) = fun {
+            if arg_idx >= arg_tys.len() {
+                break;
+            }
+            Self::bind_scheme_vars(param.as_ref(), &arg_tys[arg_idx], &mut var_to_ty);
+            fun = ret.as_ref();
+            arg_idx += 1;
+        }
+        // Multi-param constraints often mention return-type vars
+        // (`Convert<A, B>` with `A -> B`). Bind those from the call's result type.
+        if let Some(ret_ty) = ret_ty {
+            Self::bind_scheme_vars(fun, ret_ty, &mut var_to_ty);
+        }
+
+        let mut dict_count = 0;
+        for constraint in &scheme.constraints {
+            let Some(lookup) = Self::resolve_constraint_lookup(constraint, &var_to_ty, checker)
+            else {
+                continue;
+            };
+            if Self::emit_instance_dict(bytecode, &constraint.class, &lookup, checker, functions) {
+                dict_count += 1;
+            }
+        }
+        dict_count
+    }
+
+    /// Phase 4: push dictionary evidence for every constraint slot when a
+    /// generic function escapes into a `PolyFn` value.
+    ///
+    /// Slot fill order per constraint index:
+    /// 1. in-scope `__dictN` (open bound forwarded from the enclosing frame)
+    /// 2. concrete instance synthesis when constraint args are ground
+    /// 3. null sentinel (`CONST 0` → `None` in `MakePolyFnCapture`) when
+    ///    evidence is truly unavailable (e.g. top-level `let f = show`)
+    ///
+    /// Returns the dict arity (number of stack slots pushed). Caller always
+    /// emits `MakePolyFnCapture` when this is non-zero.
+    fn emit_polyfn_escape_dicts(
+        &self,
+        bytecode: &mut Vec<Byte>,
+        fn_name: &str,
+        escape_ty: Option<&crate::typechecking::Ty>,
+    ) -> usize {
+        let dict_arity = self.checker.dict_arity_for(fn_name);
+        if dict_arity == 0 {
+            return 0;
+        }
+
+        let scheme = self.checker.env().lookup(fn_name).cloned();
+        let mut var_to_ty: HashMap<crate::typechecking::ty::TyVarId, crate::typechecking::Ty> =
+            HashMap::new();
+        if let (Some(scheme), Some(escape_ty)) = (scheme.as_ref(), escape_ty) {
+            // Bind scheme vars from the escape site's instantiated type so
+            // ground specializations can synthesize instance dictionaries.
+            Self::bind_scheme_vars(&scheme.ty, escape_ty, &mut var_to_ty);
+        }
+
+        for dict_index in 0..dict_arity {
+            if let Some(slot) = self.lookup_slot(&format!("__dict{}", dict_index)) {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                continue;
+            }
+
+            let synthesized = scheme.as_ref().and_then(|s| {
+                let constraint = s.constraints.get(dict_index)?;
+                let lookup =
+                    Self::resolve_constraint_lookup(constraint, &var_to_ty, &self.checker)?;
+                Self::emit_instance_dict(
+                    bytecode,
+                    &constraint.class,
+                    &lookup,
+                    &self.checker,
+                    &self.functions,
+                )
+                .then_some(())
+            });
+            if synthesized.is_none() {
+                // Unresolved sentinel — CallIndirect fills from app evidence.
+                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+            }
+        }
+        dict_arity
+    }
+
+    /// Emit bytecode thunks for compiler-provided primitive instances.
+    ///
+    /// Shared generic bodies receive boxed type-parameter values, so numeric
+    /// thunks unbox their two arguments and re-box a type-parameter result.
+    /// Comparison methods return their concrete `bool` result directly. Every
+    /// thunk accepts the ordinary hidden trailing dictionary argument, even
+    /// though primitive implementations do not need to inspect it.
+    fn emit_builtin_dict_thunks(&mut self) {
+        use crate::typechecking::generics::Generics;
+
+        let emit = |compiler: &mut Self,
+                    class: &str,
+                    ty: &str,
+                    method: &str,
+                    tag: ValueTag,
+                    op: Instruction,
+                    boxes_result: bool| {
+            let fqn = Generics::builtin_instance_fqn(class, ty, method);
+            if compiler.functions.contains_key(&fqn) {
+                return;
+            }
+            compiler.functions.insert(fqn, compiler.bytecode.len());
+            for slot in 0..2 {
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+            }
+            compiler.bytecode.push(Byte::new(op));
+            if boxes_result {
+                compiler
+                    .bytecode
+                    .push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+            }
+            compiler.bytecode.push(Byte::new(Instruction::RETURN));
+        };
+
+        for (ty, tag, arithmetic, comparisons) in [
+            (
+                "int",
+                ValueTag::Int,
+                [
+                    ("add", Instruction::ADD),
+                    ("sub", Instruction::SUB),
+                    ("mul", Instruction::MUL),
+                    ("div", Instruction::DIV),
+                ],
+                [
+                    ("lt", Instruction::LE),
+                    ("le", Instruction::LEQ),
+                    ("gt", Instruction::GT),
+                    ("ge", Instruction::GEQ),
+                    ("eq", Instruction::EQ),
+                    ("ne", Instruction::NEQ),
+                ],
+            ),
+            (
+                "float",
+                ValueTag::Float,
+                [
+                    ("add", Instruction::ADDF),
+                    ("sub", Instruction::SUBF),
+                    ("mul", Instruction::MULF),
+                    ("div", Instruction::DIVF),
+                ],
+                [
+                    ("lt", Instruction::LEF),
+                    ("le", Instruction::LEQF),
+                    ("gt", Instruction::GTF),
+                    ("ge", Instruction::GEQF),
+                    ("eq", Instruction::EQ),
+                    ("ne", Instruction::NEQ),
+                ],
+            ),
+        ] {
+            for (method, op) in arithmetic {
+                emit(self, "Num", ty, method, tag, op, true);
+            }
+            for (method, op) in comparisons.iter().take(4) {
+                emit(self, "Ord", ty, method, tag, *op, false);
+            }
+            for (method, op) in comparisons.iter().skip(4) {
+                emit(self, "Eq", ty, method, tag, *op, false);
+            }
+        }
+        for (ty, tag) in [("string", ValueTag::String), ("bool", ValueTag::Bool)] {
+            emit(self, "Eq", ty, "eq", tag, Instruction::EQ, false);
+            emit(self, "Eq", ty, "ne", tag, Instruction::NEQ, false);
+        }
+
+        // Show thunks: accept a boxed (or heap-string) argument at slot 0,
+        // ignore the trailing dictionary, and return an ObjString via STRINGIFY.
+        for ty in ["int", "float", "string", "bool", "unit"] {
+            let fqn = Generics::builtin_instance_fqn("Show", ty, "show");
+            if self.functions.contains_key(&fqn) {
+                continue;
+            }
+            self.functions.insert(fqn, self.bytecode.len());
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(0));
+            self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+    }
+
+    /// Map a fully-resolved `Ty` to a `ValueTag` for box/unbox
+    /// emission at generic call boundaries.
+    fn ty_to_value_tag(ty: &crate::typechecking::Ty) -> Option<ValueTag> {
+        use crate::typechecking::{Ty, ty::BOOL, ty::FLOAT, ty::INT, ty::STRING, ty::UNIT};
+        match ty {
+            Ty::Con(name) => match name.as_str() {
+                INT => Some(ValueTag::Int),
+                FLOAT => Some(ValueTag::Float),
+                STRING => Some(ValueTag::String),
+                BOOL => Some(ValueTag::Bool),
+                UNIT => Some(ValueTag::Unit),
+                _ => Some(ValueTag::Instance), // user-defined class / enum
+            },
+            Ty::Sum { .. } => Some(ValueTag::Enum),
+            Ty::Tuple(_) => Some(ValueTag::Tuple),
+            Ty::Array { .. } => Some(ValueTag::Array),
+            Ty::Record { .. } => Some(ValueTag::Record),
+            // Open type vars — boxing is required but we don't know the tag yet
+            Ty::Var(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Emit a `BoxValue` instruction for a concrete `Ty` at a generic
+    /// call argument boundary (concrete→generic).  Does nothing when the
+    /// type is already open (Ty::Var), or if a tag cannot be determined.
+    fn emit_box_if_needed(bytecode: &mut Vec<Byte>, ty: &crate::typechecking::Ty) {
+        if let Some(tag) = Self::ty_to_value_tag(ty) {
+            bytecode.push(Byte::new(Instruction::BoxValue).with_operand_u32(tag as u32));
+        }
+    }
+
+    /// Emit an `UnboxValue` instruction for a concrete `Ty` at a generic
+    /// call return boundary (generic→concrete).  Does nothing when the
+    /// type is open (`Ty::Var`) — the caller can't know the tag at compile
+    /// time in that case (the boxed value stays boxed).
+    fn emit_unbox_if_needed(bytecode: &mut Vec<Byte>, ty: &crate::typechecking::Ty) {
+        if let Some(tag) = Self::ty_to_value_tag(ty) {
+            // UnboxValue operand: [15:0] = ValueTag as u16.
+            bytecode.push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+        }
+    }
+
+    fn compile_function_output_with_name<'compiler>(
+        &mut self,
+        method: &Output<'compiler>,
+        qualified: String,
+        argument_unbox_tys: &[Option<Ty>],
+        dict_arity: usize,
+    ) {
+        let _method_id = self.next_emit_id();
+        let Expression::Function {
+            name,
+            is_coro,
+            args,
+            body,
+            ..
+        } = method.1.as_ref()
+        else {
+            let mut bc = self.do_compile(method);
+            self.bytecode.append(&mut bc);
+            return;
+        };
+
+        self.functions
+            .insert(qualified.clone(), self.bytecode.len());
+        if *is_coro {
+            self.coroutine_fns.insert(qualified);
+        }
+
+        let prev_vars = std::mem::take(&mut self.context.variables);
+        let prev_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+        let prev_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
+        self.context.variables = Interner::default();
+        if self.compiling_method {
+            self.context.variables.intern("self".to_string());
+        }
+
+        let prev_result_mode = self.compiling_result_mode;
+        self.compiling_result_mode = self.checker.fn_is_result_mode(name);
+
+        let mut a = self.do_compile(args);
+        self.bytecode.append(&mut a);
+        for (slot, ty) in argument_unbox_tys.iter().enumerate() {
+            if let Some(tag) = ty.as_ref().and_then(Self::ty_to_value_tag) {
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(slot as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::UnboxValue).with_operand_u32(tag as u32));
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(slot as u32));
+            }
+        }
+        for dict_idx in 0..dict_arity {
+            self.context.variables.intern(format!("__dict{}", dict_idx));
+        }
+        let mut c = self.do_compile(body);
+        self.bytecode.append(&mut c);
+
+        self.context.defers.iter().for_each(|offset| {
+            self.bytecode
+                .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+        });
+
+        if !matches!(
+            self.bytecode.last().map(|b| b.bytecode()),
+            Some(Instruction::RETURN)
+        ) {
+            self.bytecode.push(Byte::new_with_value(
+                Instruction::CONST,
+                Value::default().raw() as _,
+            ));
+            if self.compiling_result_mode {
+                Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+            }
+            self.bytecode.push(Byte::new(Instruction::RETURN));
+        }
+
+        self.compiling_result_mode = prev_result_mode;
+        self.context.variables = prev_vars;
+        self.polyfn_vars = prev_polyfn_vars;
+        self.polyfn_sources = prev_polyfn_sources;
+    }
+
+    fn instance_method_unbox_tys(
+        &self,
+        class: &str,
+        method: &str,
+        instance_args: &[Ty],
+    ) -> Vec<Option<Ty>> {
+        let Some(scheme) = self.checker.typeclass_method_scheme(class, method) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        let mut current = &scheme.ty;
+        while let Ty::Fun(param, ret) = current {
+            let concrete = match param.as_ref() {
+                Ty::Var(var) => scheme
+                    .bounds
+                    .iter()
+                    .position(|bound| bound == var)
+                    .and_then(|index| instance_args.get(index))
+                    .cloned(),
+                _ => None,
+            };
+            result.push(concrete);
+            current = ret;
+        }
+        result
+    }
+
+    fn generic_return_depends_on_type_param(&self, name: &str) -> bool {
+        let Some(scheme) = self.checker.env().lookup(name) else {
+            return false;
+        };
+        let mut result = &scheme.ty;
+        while let Ty::Fun(_, ret) = result {
+            result = ret;
+        }
+        let free = crate::typechecking::subst::ftv(result);
+        scheme.bounds.iter().any(|bound| free.contains(bound))
+    }
+
+    /// Whether a generic call's return value is boxed at the ABI boundary.
+    ///
+    /// Direct type-parameter arguments (`id<T>(T x) -> T`) are boxed at the
+    /// call site, so the matching return must be unboxed. Type parameters that
+    /// only appear nested under ADTs / HKT apps (`get<F, A>(F<A>) -> A`) keep
+    /// the payload's native representation (e.g. a raw `int` inside
+    /// `Option::Some`), so emitting `UnboxValue` would turn a valid immediate
+    /// into `Value::default()`.
+    fn generic_return_is_boxed(&self, name: &str) -> bool {
+        let Some(scheme) = self.checker.env().lookup(name) else {
+            return false;
+        };
+        let mut top_level_vars = std::collections::HashSet::new();
+        let mut current = &scheme.ty;
+        while let Ty::Fun(param, ret) = current {
+            if let Ty::Var(v) = param.as_ref() {
+                top_level_vars.insert(*v);
+            }
+            current = ret;
+        }
+        let free = crate::typechecking::subst::ftv(current);
+        scheme
+            .bounds
+            .iter()
+            .any(|bound| free.contains(bound) && top_level_vars.contains(bound))
+    }
+
+    /// Whether a CallIndirect through a local needs a post-call `UnboxValue`.
+    ///
+    /// Direct `polyfn_sources` mappings consult the original generic scheme.
+    /// Returned/captured PolyFns and rank-n parameters fall back to the local's
+    /// recorded type: unbox only when that type's result is still a type
+    /// parameter (boxed at runtime) and the call site resolved it concretely.
+    fn local_polyfn_call_needs_unbox(&self, local: &str, call_ty: &Ty) -> bool {
+        use crate::typechecking::subst::apply_ty_prune;
+
+        if let Some(source) = self.polyfn_sources.get(local) {
+            return self.generic_return_depends_on_type_param(source);
+        }
+        if Self::ty_to_value_tag(call_ty).is_none() {
+            return false;
+        }
+        let Some(var_ty) = self.codegen_var_type_for(local) else {
+            return false;
+        };
+        let pruned = apply_ty_prune(self.checker.subst(), &var_ty);
+        let result_ty = match &pruned {
+            Ty::Forall { body, .. } => {
+                let mut result = body.as_ref();
+                while let Ty::Fun(_, ret) = result {
+                    result = ret.as_ref();
+                }
+                result.clone()
+            }
+            other => {
+                let mut result = other;
+                while let Ty::Fun(_, ret) = result {
+                    result = ret.as_ref();
+                }
+                result.clone()
+            }
+        };
+        // Shared generic bodies box type-parameter results; a Var return
+        // means the value on the stack is still boxed at this call site.
+        matches!(result_ty, Ty::Var(_))
+    }
+
+    fn emit_mono_specializations_for_function<'compiler>(
+        &mut self,
+        qualified: &str,
+        type_params: &[parser::ast::TypeParam<'compiler>],
+        args: &Output<'compiler>,
+        body: &Output<'compiler>,
+        source_name: &str,
+    ) {
+        if type_params.is_empty() || self.mono_plan.is_empty() {
+            return;
+        }
+
+        let specializations = self
+            .mono_plan
+            .specializations_for_fn(qualified)
+            .cloned()
+            .collect::<Vec<_>>();
+        if specializations.is_empty() {
+            return;
+        }
+
+        for specialization in specializations {
+            if self.mono_offsets.contains_key(&specialization.key) {
+                continue;
+            }
+
+            let overrides = self.mono_overrides_for_args(type_params, args, &specialization.key);
+            if overrides.is_empty() {
+                continue;
+            }
+
+            let clone_offset = self.bytecode.len();
+            let mono_name = format!(
+                "{}$mono${}",
+                qualified,
+                specialization.key.subst.join("$").replace(' ', "")
+            );
+            self.functions.insert(mono_name, clone_offset);
+            self.mono_offsets
+                .insert(specialization.key.clone(), clone_offset);
+
+            let prev_fn_vars = std::mem::take(&mut self.context.variables);
+            let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+            let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
+            let prev_result_mode = self.compiling_result_mode;
+            self.context.variables = Interner::default();
+            self.compiling_result_mode = self.checker.fn_is_result_mode(source_name);
+            self.mono_codegen_var_types.push(overrides);
+
+            let mut a = self.do_compile(args);
+            self.bytecode.append(&mut a);
+            let mut c = self.do_compile(body);
+            self.bytecode.append(&mut c);
+
+            self.context.defers.iter().for_each(|offset| {
+                self.bytecode
+                    .push(Byte::new(Instruction::JMP).with_operand_u32(*offset as u32));
+            });
+
+            if !matches!(
+                self.bytecode.last().map(|b| b.bytecode()),
+                Some(Instruction::RETURN)
+            ) {
+                self.bytecode.push(Byte::new_with_value(
+                    Instruction::CONST,
+                    Value::default().raw() as _,
+                ));
+                if self.compiling_result_mode {
+                    Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+                }
+                self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+
+            self.mono_codegen_var_types.pop();
+            self.compiling_result_mode = prev_result_mode;
+            self.context.variables = prev_fn_vars;
+            self.polyfn_vars = prev_fn_polyfn_vars;
+            self.polyfn_sources = prev_fn_polyfn_sources;
+        }
+    }
+
+    fn mono_overrides_for_args<'compiler>(
+        &self,
+        type_params: &[parser::ast::TypeParam<'compiler>],
+        args: &Output<'compiler>,
+        key: &MonoKey,
+    ) -> HashMap<String, Ty> {
+        let mut type_param_tys = HashMap::new();
+        for (idx, tp) in type_params.iter().enumerate() {
+            if let Some(ty_name) = key.subst.get(idx) {
+                type_param_tys.insert(tp.name, Self::mono_ty_from_name(ty_name));
+            }
+        }
+
+        let mut overrides = HashMap::new();
+        if let Expression::Fragment(children) = args.1.as_ref() {
+            for child in children {
+                if let Expression::Argument(ty, name) = child.1.as_ref()
+                    && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
+                        ty.1.as_ref()
+                    && let Some(concrete) = type_param_tys.get(tp_name)
+                {
+                    overrides.insert(name.to_string(), concrete.clone());
+                }
+            }
+        }
+        overrides
+    }
+
+    fn mono_call_offset(&self, fn_name: &str, args: Option<&Vec<Output<'_>>>) -> Option<usize> {
+        let args = args?;
+        let arg_types = args
+            .iter()
+            .map(|arg| monomorphize::ground_type_name(&self.checker, arg))
+            .collect::<Option<Vec<_>>>()?;
+        let spec = self
+            .mono_plan
+            .specialization_for_call(fn_name, &arg_types)?;
+        self.mono_offsets.get(&spec.key).copied()
+    }
+
+    fn consume_function_signature_output<'compiler>(&mut self, method: &Output<'compiler>) {
+        let _method_id = self.next_emit_id();
+        if let Expression::Function { args, body, .. } = method.1.as_ref() {
+            let mut args_bc = self.do_compile(args);
+            self.bytecode.append(&mut args_bc);
+            let mut body_bc = self.do_compile(body);
+            self.bytecode.append(&mut body_bc);
+        } else {
+            let mut bc = self.do_compile(method);
+            self.bytecode.append(&mut bc);
         }
     }
 
@@ -801,7 +2029,9 @@ impl Compiler {
             Expression::Identifier(n) => n.to_string(),
             other => {
                 let span = variable.0;
-                let mut m = Message::error(ErrorCode::InvalidAssignment, "Cannot use this expression as a variable name".to_string(),
+                let mut m = Message::error(
+                    ErrorCode::InvalidAssignment,
+                    "Cannot use this expression as a variable name".to_string(),
                     span.into_range(),
                 );
                 m.push(DiagLabel::new(
@@ -831,14 +2061,58 @@ impl Compiler {
     ) -> bool {
         // Capture lhs's ID before recursing — `do_compile(lhs)`
         // advances `emit_idx` past lhs's entire subtree.
-        let lhs_id = self.checker.id_table().ids()[self.emit_idx];
+        let lhs_ty = self.codegen_expr_ty(lhs);
+        let lhs_id = self.checker.id_table().ids().get(self.emit_idx).copied();
         bytecode.append(&mut self.do_compile(lhs));
         bytecode.append(&mut self.do_compile(rhs));
+        if matches!(
+            lhs_ty,
+            Some(crate::typechecking::ty::Ty::Con(ref name))
+                if name == crate::typechecking::ty::FLOAT
+        ) {
+            return true;
+        }
         matches!(
-            self.checker.lookup_at(lhs_id),
+            lhs_id.and_then(|id| self.checker.lookup_at(id)),
             Some(crate::typechecking::ty::Ty::Con(ref name))
                 if name == crate::typechecking::ty::FLOAT
         )
+    }
+
+    /// Return `true` when the *next* node to be emitted has an open type variable
+    /// type (i.e. it is a generic type parameter, not a concrete `int`/`float`/…).
+    /// Used to choose `DynAdd`/`DynSub`/… over `ADD`/`ADDF`/… for generic bodies.
+    #[allow(dead_code)] // kept for potential future use alongside operand_is_open_ty
+    fn is_generic_ty_at_current_idx(&self) -> bool {
+        let Some(id) = self.checker.id_table().ids().get(self.emit_idx).copied() else {
+            return false;
+        };
+        matches!(
+            self.checker.lookup_at(id),
+            Some(crate::typechecking::ty::Ty::Var(_))
+        )
+    }
+
+    /// Return `true` when `operand` resolves to an open type variable — i.e.
+    /// the operand is a generic type parameter that is not yet concrete.
+    ///
+    /// Handles `Expression::Identifier` via the `codegen_var_types` side-table
+    /// (which is reliable inside function bodies even when the ID cache is
+    /// misaligned). All other expression shapes return `false` conservatively;
+    /// they are either concrete literals or sub-expressions whose containing
+    /// `Identifier` was already flagged on the inner call.
+    fn operand_is_open_ty(&self, operand: &Output) -> bool {
+        use crate::typechecking::subst::apply_ty_prune;
+        match operand.1.as_ref() {
+            Expression::Identifier(name) => match self.codegen_var_type_for(name) {
+                Some(ty) => {
+                    let pruned = apply_ty_prune(self.checker.subst(), &ty);
+                    matches!(pruned, Ty::Var(_))
+                }
+                None => false,
+            },
+            _ => false,
+        }
     }
 
     fn alloc_temp_slot(&mut self) -> u32 {
@@ -872,7 +2146,18 @@ impl Compiler {
     }
 
     fn is_float_ty(&self, _node: &Output) -> bool {
-        let id = self.checker.id_table().ids()[self.emit_idx];
+        if let Expression::Identifier(name) = _node.1.as_ref()
+            && matches!(
+                self.codegen_var_type_for(name),
+                Some(crate::typechecking::ty::Ty::Con(ref ty))
+                    if ty == crate::typechecking::ty::FLOAT
+            )
+        {
+            return true;
+        }
+        let Some(id) = self.checker.id_table().ids().get(self.emit_idx).copied() else {
+            return false;
+        };
         matches!(
             self.checker.lookup_at(id),
             Some(crate::typechecking::ty::Ty::Con(ref name))
@@ -887,15 +2172,66 @@ impl Compiler {
         )
     }
 
+    /// Resolve an `impl Class<…>` type argument to a [`Ty`] for FQN mangling.
+    /// Mirrors the typechecker's `parse_instance_head` so `Option<int>`
+    /// becomes `App(Option, [int])`, not `unknown`.
+    fn codegen_instance_head_ty(&self, arg: &Output) -> Ty {
+        match arg.1.as_ref() {
+            Expression::Type(name) | Expression::Identifier(name) => {
+                match name.to_ascii_lowercase().as_str() {
+                    "option" => Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                    "result" => Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                    "int" => Ty::Con("int".into()),
+                    "float" => Ty::Con("float".into()),
+                    "string" => Ty::Con("string".into()),
+                    "bool" => Ty::Con("bool".into()),
+                    "void" | "unit" => Ty::Con("unit".into()),
+                    _ => Ty::Con(name.to_string()),
+                }
+            }
+            Expression::TypeApp { name, args } => {
+                let head = match name.to_ascii_lowercase().as_str() {
+                    "option" => Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
+                    "result" => Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
+                    _ => Ty::Con(name.to_string()),
+                };
+                let arg_tys: Vec<Ty> = args
+                    .iter()
+                    .map(|a| self.codegen_instance_head_ty(a))
+                    .collect();
+                Ty::App(Box::new(head), arg_tys)
+            }
+            _ => self
+                .codegen_expr_ty(arg)
+                .unwrap_or_else(|| Ty::Con("unknown".into())),
+        }
+    }
+
     fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
-        match node.1.as_ref() {
+        let resolved = match node.1.as_ref() {
+            Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
+            Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
+            Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
             Expression::String(_) | Expression::Format(_, _) => {
                 Some(Ty::Con(crate::typechecking::ty::STRING.into()))
             }
+            Expression::Tuple(items) => {
+                let mut tys = Vec::with_capacity(items.len());
+                for item in items {
+                    tys.push(self.codegen_expr_ty(item)?);
+                }
+                Some(Ty::Tuple(tys))
+            }
+            Expression::Dict(fields) => {
+                let mut tys = Vec::with_capacity(fields.len());
+                for field in fields {
+                    tys.push((field.name.to_string(), self.codegen_expr_ty(&field.value)?));
+                }
+                tys.sort_by(|a, b| a.0.cmp(&b.0));
+                Some(Ty::Record { fields: tys })
+            }
             Expression::Identifier(name) => self
-                .checker
-                .codegen_var_type(name)
-                .cloned()
+                .codegen_var_type_for(name)
                 .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)),
             Expression::Add(lhs, rhs) if self.is_string_expr(lhs) && self.is_string_expr(rhs) => {
                 Some(Ty::Con(crate::typechecking::ty::STRING.into()))
@@ -908,9 +2244,9 @@ impl Compiler {
                         .find(|(name, _)| name == field)
                         .map(|(_, ty)| ty.clone());
                 }
-                if let Ty::Con(name) = &receiver_ty {
+                if let Some(name) = Checker::class_name_of_ty(&receiver_ty) {
                     if self.checker.is_class(name) {
-                        return self.checker.class_field_ty(name, field).cloned();
+                        return self.codegen_class_field_ty(name, field, &receiver_ty);
                     }
                 }
                 extract_enum_name(&receiver_ty)
@@ -929,16 +2265,15 @@ impl Compiler {
                         .iter()
                         .find(|(name, _)| name == field)
                         .map(|(_, ty)| ty.clone())
-                } else if let Ty::Con(name) = &inner {
+                } else if let Some(name) = Checker::class_name_of_ty(&inner) {
                     if self.checker.is_class(name) {
-                        self.checker.class_field_ty(name, field).cloned()
+                        self.codegen_class_field_ty(name, field, &inner)
                     } else {
                         extract_enum_name(&inner)
                             .and_then(|n| self.checker.field_type_for(&n, field))
                     }
                 } else {
-                    extract_enum_name(&inner)
-                        .and_then(|n| self.checker.field_type_for(&n, field))
+                    extract_enum_name(&inner).and_then(|n| self.checker.field_type_for(&n, field))
                 }?;
                 Some(option_ty(field_ty))
             }
@@ -947,7 +2282,11 @@ impl Compiler {
             | Expression::Statement(inner)
             | Expression::ExprStatement(inner) => self.codegen_expr_ty(inner),
             _ => None,
-        }
+        };
+        resolved.or_else(|| {
+            self.checker
+                .lookup_for_codegen_span(node.0.start, node.0.end)
+        })
     }
 
     fn binop_for_assign_op(op: parser::ast::AssignOp, is_float: bool) -> Instruction {
@@ -1207,16 +2546,16 @@ impl Compiler {
     fn receiver_type(&self, receiver: &Output) -> Option<Ty> {
         match receiver.1.as_ref() {
             Expression::Identifier(name) => {
-                self.checker.codegen_var_type(name).cloned().map(|t| {
+                self.codegen_var_type_for(name).map(|t| {
                     // Apply substitution so inferred record types resolve fully.
                     crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t)
                 })
             }
             Expression::Access(inner, field) => {
                 let inner_ty = self.receiver_type(inner)?;
-                if let Ty::Con(name) = &inner_ty {
+                if let Some(name) = Checker::class_name_of_ty(&inner_ty) {
                     if self.checker.is_class(name) {
-                        return self.checker.class_field_ty(name, field).cloned();
+                        return self.codegen_class_field_ty(name, field, &inner_ty);
                     }
                 }
                 if let Some(name) = extract_enum_name(&inner_ty) {
@@ -1232,6 +2571,31 @@ impl Compiler {
             }
             _ => None,
         }
+    }
+
+    /// Class field type for codegen, substituting type args from `App`.
+    fn codegen_class_field_ty(&self, class: &str, field: &str, receiver_ty: &Ty) -> Option<Ty> {
+        use crate::typechecking::ty::subst_ty_params;
+        let fty = self.checker.class_field_ty(class, field)?.clone();
+        let params = self
+            .checker
+            .generics()
+            .generic_type_ctors
+            .get(class)
+            .cloned()
+            .unwrap_or_default();
+        if params.is_empty() {
+            return Some(fty);
+        }
+        let args = match receiver_ty {
+            Ty::App(_, args) => args.clone(),
+            _ => return Some(fty),
+        };
+        let mut map = std::collections::HashMap::new();
+        for (p, a) in params.iter().zip(args.iter()) {
+            map.insert(p.clone(), a.clone());
+        }
+        Some(subst_ty_params(&fty, &map))
     }
 
     /// True when `expr` is (or produces) the built-in `Option` sum.
@@ -1263,8 +2627,7 @@ impl Compiler {
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let mut bytecode = vec![];
-        let _self_id = self.checker.id_table().ids()[self.emit_idx];
-        self.emit_idx += 1;
+        let self_id = self.next_emit_id();
         let (span, child) = ast;
 
         match child.borrow() {
@@ -1357,13 +2720,37 @@ impl Compiler {
                         _ => None,
                     };
                     if let Some((name, is_const)) = binding {
+                        // Check if the RHS is a bare identifier that names a generic fn.
+                        // If so, track this variable as holding an ObjPolyFn.
+                        let polyfn_source = match unwrapped_identifier(&children[1]) {
+                            Some(rhs_name) => {
+                                let resolved = self
+                                    .aliases
+                                    .get(rhs_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| rhs_name.to_string());
+                                (self.checker.is_generic_fn(&resolved)
+                                    || self.functions.get(&resolved).is_some()
+                                        && self.checker.is_generic_fn(rhs_name))
+                                .then_some(resolved)
+                            }
+                            _ => None,
+                        };
+                        if let Some(source) = polyfn_source {
+                            self.polyfn_vars.insert(name.clone());
+                            self.polyfn_sources.insert(name.clone(), source);
+                        }
+                        // Compile the RHS BEFORE interning the binding name.
+                        // Match payload slots use `variables.len()` as the first
+                        // free slot; interning early (e.g. `let v = match e`)
+                        // reserved a hole and made bindings land one slot too
+                        // high while JumpIfMatch still pushed at the real
+                        // cursor.
+                        self.append_with_existential_pack(&mut bytecode, &children[1]);
                         let slot = self.context.variables.intern(name.clone()) as u32;
                         if is_const {
                             self.context.constants.insert(slot as usize, true);
                         }
-                        // Emit the RHS.
-                        let mut rhs_bc = self.do_compile(&children[1]);
-                        bytecode.append(&mut rhs_bc);
                         // Append the explicit store-pop-and-write.
                         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
                         is_binding = true;
@@ -1389,8 +2776,10 @@ impl Compiler {
             Expression::Function {
                 name,
                 is_coro,
+                type_params,
                 args,
                 returns: _returns,
+                where_constraints: _,
                 body,
             } => {
                 let qualified = if self.namespace.is_empty() {
@@ -1405,7 +2794,7 @@ impl Compiler {
                 self.functions
                     .insert(qualified.clone(), self.bytecode.len());
                 if *is_coro {
-                    self.coroutine_fns.insert(qualified);
+                    self.coroutine_fns.insert(qualified.clone());
                 }
 
                 // Fresh slot map per function so locals start at 0
@@ -1414,6 +2803,9 @@ impl Compiler {
                 // slots; `StorePop` then left holes and match bindings
                 // at slot 1 read garbage. Extern preload slots live in
                 // the entry frame (bytecode before `main`).
+                let prev_fn_vars = std::mem::take(&mut self.context.variables);
+                let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+                let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
                 self.context.variables = Interner::default();
                 if self.compiling_method {
                     self.context.variables.intern("self".to_string());
@@ -1423,6 +2815,20 @@ impl Compiler {
                 self.compiling_result_mode = self.checker.fn_is_result_mode(name);
 
                 let mut a = self.do_compile(args);
+
+                // ── Dictionary-passing prologue ────────────────────────────────
+                // Generic functions with user-defined typeclass constraints receive
+                // extra dict tuple arguments after the value params.  Reserve a
+                // stack slot `__dictN` for each expected dict so that the Interner
+                // assigns a slot number that can later be LOAD-ed by CallIndirect
+                // dispatch paths.  The VM pushes these as the trailing elements of
+                // the call frame, one per user constraint, in constraint order.
+                // Every typeclass constraint (including builtin Num/Ord/Eq/Show)
+                // gets a trailing `__dictN` slot for dictionary dispatch.
+                let dict_arity = self.checker.dict_arity_for(name);
+                for dict_idx in 0..dict_arity {
+                    self.context.variables.intern(format!("__dict{}", dict_idx));
+                }
 
                 self.bytecode.append(&mut a);
 
@@ -1449,6 +2855,17 @@ impl Compiler {
                 }
 
                 self.compiling_result_mode = prev_result_mode;
+                self.context.variables = prev_fn_vars;
+                self.polyfn_vars = prev_fn_polyfn_vars;
+                self.polyfn_sources = prev_fn_polyfn_sources;
+
+                self.emit_mono_specializations_for_function(
+                    &qualified,
+                    type_params,
+                    args,
+                    body,
+                    name,
+                );
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
@@ -1471,45 +2888,15 @@ impl Compiler {
                 Self::discard_statement_value(&mut bytecode);
             }
             Expression::Print(format, params) => {
-                // The Print handler emits to `self.bytecode`
-                // DIRECTLY (not a local Vec) so that any nested
-                // expression (e.g., a `match` inside the params
-                // list) can compute ABSOLUTE jump targets in
-                // `self.bytecode`. The format string is emitted
-                // first, then the params (which may include a
-                // `match`), then FORMAT and PRINT.
-                let format_bc = self.do_compile(format);
-                self.bytecode.extend(format_bc);
-
-                let mut params_len = 0;
-                if let Some(params) = params {
-                    params_len = params.len();
-                    for param in params {
-                        let bc = self.do_compile(param);
-                        self.bytecode.extend(bc);
-                    }
-                }
-
-                self.bytecode
-                    .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
+                // Emit directly to `self.bytecode` so nested control flow
+                // (e.g. `match` in params) can compute absolute jump targets.
+                // `%v` args are lowered through `Show` to strings and the
+                // format literal is rewritten to `%s` before FORMAT.
+                self.emit_format_expression(format, params.as_ref());
                 self.bytecode.push(Byte::new(Instruction::PRINT));
             }
             Expression::Format(format, params) => {
-                // Same as Print: emit directly to `self.bytecode`
-                // for nested-match correctness.
-                let format_bc = self.do_compile(format);
-                self.bytecode.extend(format_bc);
-
-                let mut params_len = 0;
-                if let Some(params) = params {
-                    params_len = params.len();
-                    for param in params {
-                        let bc = self.do_compile(param);
-                        self.bytecode.extend(bc);
-                    }
-                }
-                self.bytecode
-                    .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len as u32));
+                self.emit_format_expression(format, params.as_ref());
             }
 
             // ---- Userland FFI builtins ----
@@ -1612,7 +2999,8 @@ impl Compiler {
                         Expression::Tuple(items) => items.to_vec(),
                         _ => {
                             let mut m = Message::error(
-                               ErrorCode::DeclareArity, "declare(...) arguments tuple must be (T1, T2, ...) syntax"
+                                ErrorCode::DeclareArity,
+                                "declare(...) arguments tuple must be (T1, T2, ...) syntax"
                                     .to_string(),
                                 args_tuple.0.into_range(),
                             );
@@ -1684,7 +3072,8 @@ impl Compiler {
                         Expression::Tuple(items) => items.to_vec(),
                         _ => {
                             let mut m = Message::error(
-                               ErrorCode::InvokeArity, "invoke(...) arguments must be a tuple in position 3".to_string(),
+                                ErrorCode::InvokeArity,
+                                "invoke(...) arguments must be a tuple in position 3".to_string(),
                                 args_tuple.0.into_range(),
                             );
                             m.push(DiagLabel::new(
@@ -1702,12 +3091,14 @@ impl Compiler {
                     self.bytecode.extend(fn_bc);
 
                     // Each element's bytecode pushes a Value. Function names
-                    // used as callback arguments compile to bytecode offsets.
+                    // used as callback arguments compile to relocatable
+                    // `CodePtr` offsets (not `CONST`) so peephole fusion
+                    // rewrites them in `finalize_bytecode`.
                     for elem in &tuple_elements {
                         if let Expression::Identifier(name) = elem.1.as_ref() {
                             if let Some(&offset) = self.functions.get(*name) {
                                 self.bytecode.push(
-                                    Byte::new(Instruction::CONST).with_operand_u32(offset as u32),
+                                    Byte::new(Instruction::CodePtr).with_operand_u32(offset as u32),
                                 );
                                 continue;
                             }
@@ -1758,7 +3149,7 @@ impl Compiler {
                 //     let symbol = self.context.variables.intern(self.resolve_variable(expr));
                 // }
 
-                bytecode.append(&mut self.do_compile(expr));
+                self.append_with_existential_pack(&mut bytecode, expr);
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
                 if self.compiling_result_mode {
                     Self::emit_ok_or_some_wrap(&mut bytecode, false);
@@ -1783,7 +3174,11 @@ impl Compiler {
                 let has_send = if arg.is_some() { 1u32 } else { 0u32 };
                 bytecode.push(Byte::new(Instruction::ResumeCoro).with_operand_u32(has_send));
             }
-            Expression::Class(name, state) => {
+            Expression::Class {
+                name,
+                fields: state,
+                ..
+            } => {
                 self.context.classes.insert(
                     name.to_string(),
                     state
@@ -1799,7 +3194,7 @@ impl Compiler {
                 );
                 self.context.symbols.intern(name.to_string());
             }
-            Expression::Implementation(_what, owner, methods) => {
+            Expression::Implementation { owner, methods, .. } => {
                 let saved_ns = self.namespace.clone();
                 self.namespace = owner.to_string();
 
@@ -2016,15 +3411,79 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.existential_method_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .existential_method_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                {
+                    if self.emit_existential_method_call(&mut bytecode, name, args.as_ref(), &hint)
+                    {
+                        return bytecode;
+                    }
+                }
+
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_method_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_method_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                {
+                    if hint.has_receiver
+                        && let Expression::Access(recv, _) = name.1.as_ref()
+                    {
+                        bytecode.append(&mut self.do_compile(recv));
+                    }
+                    if let Some(items) = args {
+                        for arg in items {
+                            self.append_with_existential_pack(&mut bytecode, arg);
+                        }
+                    }
+                    let dict_name = format!("__dict{}", hint.dict_index);
+                    if let Some(dict_slot) = self.lookup_slot(&dict_name) {
+                        // Hidden trailing dictionary argument for sibling/default
+                        // dispatch inside the selected implementation.
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(dict_slot));
+                        bytecode.push(
+                            Byte::new(Instruction::CONST)
+                                .with_const_inline(hint.method_slot as i32),
+                        );
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(
+                            Byte::new(Instruction::CallIndirect)
+                                .with_operand_u32(hint.arity as u32 + 1),
+                        );
+                    } else {
+                        let mut message = Message::error(
+                            ErrorCode::UnknownFunction,
+                            "Missing typeclass dictionary".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            format!("dictionary slot `{}` is not available", dict_name),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
+                    return bytecode;
+                }
+
                 // Method call: `recv.method(args)`.
                 if let Expression::Access(recv, method) = name.1.borrow() {
                     let recv_ty = self.receiver_type(recv);
-                    let owner = match &recv_ty {
-                        Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n) => {
-                            n.clone()
-                        }
-                        _ => String::new(),
-                    };
+                    let owner = recv_ty
+                        .as_ref()
+                        .and_then(|ty| {
+                            Checker::class_name_of_ty(ty)
+                                .filter(|n| self.checker.is_class(n))
+                                .map(|n| n.to_string())
+                        })
+                        .unwrap_or_default();
                     let fqn = self
                         .context
                         .methods
@@ -2038,7 +3497,7 @@ impl Compiler {
                             let mut nargs = 0u32;
                             if let Some(items) = args {
                                 for arg in items {
-                                    bytecode.append(&mut self.do_compile(arg));
+                                    self.append_with_existential_pack(&mut bytecode, arg);
                                     nargs += 1;
                                 }
                             }
@@ -2047,8 +3506,11 @@ impl Compiler {
                                     .with_call_packed(1 + nargs, offset as u32),
                             );
                         } else {
-                            let mut message =
-                                Message::error(ErrorCode::UnknownFunction, "Unknown method".to_string(), span.into_range());
+                            let mut message = Message::error(
+                                ErrorCode::UnknownFunction,
+                                "Unknown method".to_string(),
+                                span.into_range(),
+                            );
                             message.push(DiagLabel::new(
                                 format!("Unable to call unknown method '{}'", fqn),
                                 span.into_range(),
@@ -2056,8 +3518,11 @@ impl Compiler {
                             self.messages.push(message);
                         }
                     } else {
-                        let mut message =
-                            Message::error(ErrorCode::UnknownFunction, "Unknown method".to_string(), span.into_range());
+                        let mut message = Message::error(
+                            ErrorCode::UnknownFunction,
+                            "Unknown method".to_string(),
+                            span.into_range(),
+                        );
                         message.push(DiagLabel::new(
                             format!("Unable to call method '{}' on '{}'", method, owner),
                             span.into_range(),
@@ -2075,7 +3540,9 @@ impl Compiler {
                                 bytecode.append(&mut self.do_compile(&items[1]));
                                 bytecode.push(Byte::new(Instruction::ArrayPush));
                             } else {
-                                let mut message = Message::error(ErrorCode::TooManyArguments, "Invalid push call".to_string(),
+                                let mut message = Message::error(
+                                    ErrorCode::TooManyArguments,
+                                    "Invalid push call".to_string(),
                                     span.into_range(),
                                 );
                                 message.push(DiagLabel::new(
@@ -2094,7 +3561,9 @@ impl Compiler {
                                 bytecode.append(&mut self.do_compile(&items[0]));
                                 bytecode.push(Byte::new(Instruction::ArrayLen));
                             } else {
-                                let mut message = Message::error(ErrorCode::TooManyArguments, "Invalid len call".to_string(),
+                                let mut message = Message::error(
+                                    ErrorCode::TooManyArguments,
+                                    "Invalid len call".to_string(),
                                     span.into_range(),
                                 );
                                 message.push(DiagLabel::new(
@@ -2155,26 +3624,174 @@ impl Compiler {
                             Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32),
                         );
                     } else if let Some(offset) = self.functions.get(&n).copied() {
-                        if let Some(args) = args {
-                            args.iter()
-                                .for_each(|arg| bytecode.append(&mut self.do_compile(arg)))
+                        let mono_offset = self.mono_call_offset(&n, args.as_ref());
+                        let target_offset = mono_offset.unwrap_or(offset);
+                        // If the callee is a generic function, box each concrete arg
+                        // at the call boundary (concrete→generic).
+                        let is_generic = self.checker.is_generic_fn(&n) && mono_offset.is_none();
+                        if let Some(arg_list) = args {
+                            for arg in arg_list {
+                                self.append_with_existential_pack(&mut bytecode, arg);
+                                if is_generic {
+                                    // Reuse the original HM result. Re-running inference here
+                                    // would occur after the function scope has been popped.
+                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    }
+                                }
+                            }
                         }
 
-                        if self.coroutine_fns.contains(&n) {
-                            bytecode.push(Byte::new(Instruction::MakeCoro).with_call_packed(
-                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                                offset as u32,
-                            ));
+                        // ── Dictionary-passing calling convention ──────────────────
+                        // For non-monomorphized generic calls, append one dict tuple
+                        // per constraint after the value args. Each dict is a
+                        // MakeTuple of method code offsets (CodePtr per method in
+                        // declaration order). Builtin and user instances share this
+                        // ABI; ground Num/Ord/Eq calls may still monomorphize away
+                        // from the shared body, but Show-bound calls always take
+                        // this path.
+                        let dict_count = if is_generic {
+                            let call_arg_tys: Vec<crate::typechecking::Ty> = args
+                                .as_ref()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .map(|arg| {
+                                            self.codegen_expr_ty(arg).expect(
+                                                "typechecked call argument must have a codegen type",
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let mut forwarded = 0;
+                            if let Some(indices) = self_id
+                                .and_then(|id| self.checker.forwarded_dicts_at(id))
+                                .or_else(|| {
+                                    self.checker.forwarded_dicts_for_span(span.start, span.end)
+                                })
+                                .map(<[usize]>::to_vec)
+                            {
+                                for dict_index in indices {
+                                    if let Some(slot) =
+                                        self.lookup_slot(&format!("__dict{}", dict_index))
+                                    {
+                                        bytecode.push(
+                                            Byte::new(Instruction::LOAD).with_operand_u32(slot),
+                                        );
+                                        forwarded += 1;
+                                    }
+                                }
+                            }
+                            let call_ret_ty = self.codegen_expr_ty(ast);
+                            forwarded
+                                + Self::emit_call_site_dicts(
+                                    &mut bytecode,
+                                    &n,
+                                    &call_arg_tys,
+                                    call_ret_ty.as_ref(),
+                                    &self.checker,
+                                    &self.functions,
+                                )
+                        } else {
+                            0
+                        };
+
+                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32
+                            + dict_count as u32;
+                        if is_instance_method_fqn(&self.checker, &n) {
+                            Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
+                        } else if self.coroutine_fns.contains(&n) {
+                            bytecode.push(
+                                Byte::new(Instruction::MakeCoro)
+                                    .with_call_packed(arity, target_offset as u32),
+                            );
                         } else {
                             // Packed CALL: arity + target in one opcode.
-                            bytecode.push(Byte::new(Instruction::CALL).with_call_packed(
-                                args.as_ref().map(|items| items.len()).unwrap_or(0) as u32,
-                                offset as u32,
-                            ));
+                            bytecode.push(
+                                Byte::new(Instruction::CALL)
+                                    .with_call_packed(arity, target_offset as u32),
+                            );
+                        }
+                        // Generic→concrete unbox: only when the return type
+                        // parameter was boxed as a top-level argument
+                        // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
+                        // not boxed at construction, so unboxing would zero
+                        // a valid immediate (Phase 5 HKT / Container::first).
+                        if is_generic && self.generic_return_is_boxed(&n) {
+                            if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                                Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                            }
+                        }
+                    } else if let Some(slot) = self.lookup_slot(&identifier) {
+                        // Local holding a function value: escaped PolyFn
+                        // (`let f = show` / `return show`), rank-n parameter, or
+                        // a PolyFn returned from another call. Emit args, optional
+                        // application dictionaries, then CallIndirect.
+                        let value_arity =
+                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        let mut arg_tys = Vec::new();
+                        if let Some(arg_list) = args {
+                            for arg in arg_list {
+                                self.append_with_existential_pack(&mut bytecode, arg);
+                                // Box concrete args when delegating through a polyfn.
+                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    arg_tys.push(arg_ty);
+                                }
+                            }
+                        }
+                        let mut dict_count = 0u32;
+                        let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
+                        if let Some(source) = polyfn_source.as_ref() {
+                            if let Some(indices) = self_id
+                                .and_then(|id| self.checker.forwarded_dicts_at(id))
+                                .or_else(|| {
+                                    self.checker.forwarded_dicts_for_span(span.start, span.end)
+                                })
+                                .map(<[usize]>::to_vec)
+                            {
+                                for dict_index in indices {
+                                    if let Some(dict_slot) =
+                                        self.lookup_slot(&format!("__dict{}", dict_index))
+                                    {
+                                        bytecode.push(
+                                            Byte::new(Instruction::LOAD)
+                                                .with_operand_u32(dict_slot),
+                                        );
+                                        dict_count += 1;
+                                    }
+                                }
+                            }
+                            let call_ret_ty = self.codegen_expr_ty(ast);
+                            dict_count += Self::emit_call_site_dicts(
+                                &mut bytecode,
+                                source,
+                                &arg_tys,
+                                call_ret_ty.as_ref(),
+                                &self.checker,
+                                &self.functions,
+                            ) as u32;
+                        }
+                        // Pack value arity + application dict arity so the VM can
+                        // merge captured evidence with apply-site dictionaries.
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                        bytecode.push(
+                            Byte::new(Instruction::CallIndirect)
+                                .with_operand_u32(value_arity | (dict_count << 16)),
+                        );
+                        // Generic→concrete unbox for polyfn call site.
+                        if let Some(call_ty) = self.codegen_expr_ty(ast) {
+                            if self.local_polyfn_call_needs_unbox(&identifier, &call_ty) {
+                                Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
+                            }
                         }
                     } else {
-                        let mut message =
-                            Message::error(ErrorCode::UnknownFunction, "Unknown function".to_string(), span.into_range());
+                        let mut message = Message::error(
+                            ErrorCode::UnknownFunction,
+                            "Unknown function".to_string(),
+                            span.into_range(),
+                        );
                         message.push(DiagLabel::new(
                             format!("Unable to call unknown function '{}'", n),
                             span.into_range(),
@@ -2183,11 +3800,14 @@ impl Compiler {
                     }
                 } // end non-method Call
             }
-            Expression::Argument(_, n) => {
+            Expression::Argument(ty, n) => {
                 let _ = self.context.variables.intern(n.to_string());
+                if matches!(ty.1.as_ref(), Expression::Forall { .. }) {
+                    self.polyfn_vars.insert(n.to_string());
+                }
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
-            Expression::Type(_) => {
+            Expression::Type(_) | Expression::TypeFun(_, _) | Expression::Forall { .. } => {
                 // Type names appear as metadata inside enum
                 // declarations (e.g. `Some(int)` wraps `int` as
                 // an `Expression::Type`). The typechecker has
@@ -2198,17 +3818,166 @@ impl Compiler {
                 // to stay in lockstep), but the bytecode here is
                 // empty.
             }
+            Expression::TypeClass { name, methods, .. } => {
+                for method in methods {
+                    match method.1.as_ref() {
+                        Expression::AssocTypeDecl { .. } => {
+                            // Type-level only — do_compile consumes the NodeId.
+                            let _ = self.do_compile(method);
+                        }
+                        Expression::Function {
+                            name: method_name,
+                            body,
+                            ..
+                        } => {
+                            let has_default = !matches!(body.1.as_ref(), Expression::Block(items) if items.is_empty());
+                            if has_default {
+                                let fqn =
+                                    crate::typechecking::generics::Generics::default_method_fqn(
+                                        name,
+                                        method_name,
+                                    );
+                                self.compile_function_output_with_name(method, fqn, &[], 1);
+                            } else {
+                                self.consume_function_signature_output(method);
+                            }
+                        }
+                        _ => {
+                            self.consume_function_signature_output(method);
+                        }
+                    }
+                }
+            }
+            Expression::TypeClassImpl {
+                class,
+                args,
+                methods,
+            } => {
+                // Resolve instance heads by AST shape (not span cache). Bare
+                // `Option`/`Result` must stay `Con(...)` so FQNs match the
+                // typechecker (`Container__Option__first`). Preferring
+                // `codegen_expr_ty` here can pick up a misaligned span type
+                // (e.g. `unit`) and emit `Container__unit__first` instead.
+                let arg_tys: Vec<Ty> = args
+                    .iter()
+                    .map(|arg| self.codegen_instance_head_ty(arg))
+                    .collect();
+                for arg in args {
+                    bytecode.append(&mut self.do_compile(arg));
+                }
+                let ty_part = arg_tys
+                    .iter()
+                    .map(|ty| ty.to_string())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                for method in methods {
+                    match method.1.as_ref() {
+                        Expression::AssocTypeDef { .. } => {
+                            // Type-level only — do_compile consumes wrapper + RHS IDs.
+                            let _ = self.do_compile(method);
+                        }
+                        Expression::Function {
+                            name: method_name, ..
+                        } => {
+                            let fqn = format!("{}__{}__{}", class, ty_part, method_name);
+                            let unbox_tys =
+                                self.instance_method_unbox_tys(class, method_name, &arg_tys);
+                            self.compile_function_output_with_name(method, fqn, &unbox_tys, 1);
+                        }
+                        Expression::Method(_, body) => {
+                            let _method_wrapper_id = self.checker.id_table().ids()[self.emit_idx];
+                            self.emit_idx += 1;
+                            if let Expression::Function {
+                                name: method_name, ..
+                            } = body.1.as_ref()
+                            {
+                                let fqn = format!("{}__{}__{}", class, ty_part, method_name);
+                                let unbox_tys =
+                                    self.instance_method_unbox_tys(class, method_name, &arg_tys);
+                                self.compile_function_output_with_name(body, fqn, &unbox_tys, 1);
+                            } else {
+                                self.consume_function_signature_output(body);
+                            }
+                        }
+                        _ => {
+                            self.consume_function_signature_output(method);
+                        }
+                    }
+                }
+            }
+            Expression::AssocTypeDecl { .. } | Expression::TypeProjection { .. } => {
+                // Type-level only — no bytecode (NodeId already consumed by do_compile).
+            }
+            Expression::AssocTypeDef { ty, .. } => {
+                bytecode.append(&mut self.do_compile(ty));
+            }
             Expression::Identifier(n) => {
                 if let Some(slot) = self.lookup_slot(n) {
                     bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                 } else {
-                    let mut message =
-                        Message::error(ErrorCode::UnknownValue, "Unknown variable".to_string(), span.into_range());
-                    message.push(DiagLabel::new(
-                        format!("Unknown variable '{}'", n),
-                        span.into_range(),
-                    ));
-                    self.messages.push(message);
+                    // Not a local variable — check if it's a generic function
+                    // escaping into a non-call position (e.g. `let f = id;`).
+                    // In that case, emit MakePolyFn instead of a direct CALL offset,
+                    // so the variable holds an ObjPolyFn that CallIndirect can use.
+                    let resolved_n = self
+                        .aliases
+                        .get(*n)
+                        .cloned()
+                        .unwrap_or_else(|| n.to_string());
+                    if self.checker.is_generic_fn(&resolved_n) {
+                        if let Some(&entry_offset) = self.functions.get(&resolved_n) {
+                            // Phase 4: constrained generics always escape via
+                            // MakePolyFnCapture. Fill slots from in-scope
+                            // `__dictN` or concrete instance synthesis; leave
+                            // null only when evidence is unavailable (e.g.
+                            // top-level `let f = show`).
+                            let escape_ty = self.codegen_expr_ty(ast);
+                            let dict_arity = self.emit_polyfn_escape_dicts(
+                                &mut bytecode,
+                                &resolved_n,
+                                escape_ty.as_ref(),
+                            );
+                            if dict_arity == 0 {
+                                bytecode.push(
+                                    Byte::new(Instruction::MakePolyFn)
+                                        .with_operand_u32(entry_offset as u32),
+                                );
+                            } else {
+                                bytecode.push(
+                                    Byte::new(Instruction::CodePtr)
+                                        .with_operand_u32(entry_offset as u32),
+                                );
+                                bytecode.push(
+                                    Byte::new(Instruction::MakePolyFnCapture)
+                                        .with_operand_u32(dict_arity as u32),
+                                );
+                            }
+                        } else {
+                            // Function not yet compiled (forward reference) — fall
+                            // through to the unknown-variable diagnostic.
+                            let mut message = Message::error(
+                                ErrorCode::UnknownValue,
+                                "Unknown generic function".to_string(),
+                                span.into_range(),
+                            );
+                            message.push(DiagLabel::new(
+                                format!("Generic function '{}' not found in bytecode", n),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
+                        }
+                    } else {
+                        let mut message = Message::error(
+                            ErrorCode::UnknownValue,
+                            "Unknown variable".to_string(),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            format!("Unknown variable '{}'", n),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
                 }
             }
             // --- If codegen ---
@@ -2277,39 +4046,129 @@ impl Compiler {
                     .expect("BlockBuilder::finalize: all targeted labels bound");
             }
             Expression::Le(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::LEF
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::LE
-                }));
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::LEF
+                    } else {
+                        Instruction::LE
+                    }));
+                }
             }
             Expression::Gt(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::GTF
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::GT
-                }));
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::GTF
+                    } else {
+                        Instruction::GT
+                    }));
+                }
             }
             Expression::Leq(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::LEQF
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::LEQ
-                }));
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::LEQF
+                    } else {
+                        Instruction::LEQ
+                    }));
+                }
             }
             Expression::Geq(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::GEQF
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::GEQ
-                }));
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::GEQF
+                    } else {
+                        Instruction::GEQ
+                    }));
+                }
             }
             Expression::Eq(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::EQ));
+                }
             }
             Expression::Not(lhs) => {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NOT));
@@ -2326,6 +4185,21 @@ impl Compiler {
                     bytecode.append(&mut self.do_compile(lhs));
                     bytecode.append(&mut self.do_compile(rhs));
                     bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
+                } else if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
                     let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
                     bytecode.push(Byte::new(if is_float {
@@ -2336,36 +4210,92 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::SUBF
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::SUB
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::SUBF
+                    } else {
+                        Instruction::SUB
+                    }));
+                }
             }
             Expression::Mul(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::MULF
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::MUL
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::MULF
+                    } else {
+                        Instruction::MUL
+                    }));
+                }
             }
             Expression::Mod(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::MODF
+                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                    let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(Instruction::DynMod));
                 } else {
-                    Instruction::MOD
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::MODF
+                    } else {
+                        Instruction::MOD
+                    }));
+                }
             }
             Expression::Div(lhs, rhs) => {
-                let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::DIVF
+                if let Some(hint) = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned()
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
                 } else {
-                    Instruction::DIV
-                }));
+                    let is_float = likely(self.compile_binary_operands(&mut bytecode, lhs, rhs));
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::DIVF
+                    } else {
+                        Instruction::DIV
+                    }));
+                }
             }
             Expression::And(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::AND));
@@ -2400,7 +4330,25 @@ impl Compiler {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::OR));
             }
             Expression::Neq(lhs, rhs) => {
-                binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
+                let hint = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .cloned();
+                if let Some(hint) = hint
+                    && self.emit_bound_operator_call(
+                        &mut bytecode,
+                        lhs,
+                        rhs,
+                        hint.dict_index,
+                        hint.method_slot,
+                    )
+                {
+                } else {
+                    binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::NEQ));
+                }
             }
             Expression::Integer(num) => bytecode.push(Byte::new_with_value(
                 Instruction::CONST,
@@ -2457,8 +4405,11 @@ impl Compiler {
             }
             Expression::Variable(name, _ty) => {
                 if unlikely(self.context.variables.contains(&name.to_string())) {
-                    let mut message =
-                        Message::error(ErrorCode::VariableRedeclaration, "Variable redeclaration".to_string(), span.into_range());
+                    let mut message = Message::error(
+                        ErrorCode::VariableRedeclaration,
+                        "Variable redeclaration".to_string(),
+                        span.into_range(),
+                    );
                     message.push(DiagLabel::new(
                         format!("Variable '{}' already declared", name),
                         span.into_range(),
@@ -2471,8 +4422,11 @@ impl Compiler {
             Expression::Constant(name, _ty) => {
                 let name = self.resolve_variable(name);
                 if self.context.variables.contains(&name) {
-                    let mut message =
-                        Message::error(ErrorCode::VariableRedeclaration, "Constand redeclaration".to_string(), span.into_range());
+                    let mut message = Message::error(
+                        ErrorCode::VariableRedeclaration,
+                        "Constand redeclaration".to_string(),
+                        span.into_range(),
+                    );
                     message.push(DiagLabel::new(
                         format!("Constant '{}' already declared", name),
                         span.into_range(),
@@ -2486,7 +4440,7 @@ impl Compiler {
             }
             Expression::Assignment(lhs, value) => match lhs.1.as_ref() {
                 Expression::Access(target_expr, field) => {
-                    bytecode.append(&mut self.do_compile(value));
+                    self.append_with_existential_pack(&mut bytecode, value);
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::SetField));
@@ -2495,7 +4449,7 @@ impl Compiler {
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
                     let tmp_val = self.alloc_temp_slot();
-                    bytecode.append(&mut self.do_compile(value));
+                    self.append_with_existential_pack(&mut bytecode, value);
                     bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
                     bytecode.append(&mut self.do_compile(arr));
                     bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
@@ -2526,7 +4480,9 @@ impl Compiler {
                                     *state = true;
                                 });
                             } else {
-                                let mut message = Message::error(ErrorCode::InvalidAssignment, "Assignment error".to_string(),
+                                let mut message = Message::error(
+                                    ErrorCode::InvalidAssignment,
+                                    "Assignment error".to_string(),
                                     span.into_range(),
                                 );
                                 message.push(DiagLabel::new(
@@ -2539,12 +4495,15 @@ impl Compiler {
                                 self.messages.push(message);
                             }
                         }
-                        bytecode.append(&mut self.do_compile(value));
+                        self.append_with_existential_pack(&mut bytecode, value);
                         bytecode
                             .push(Byte::new(Instruction::StorePop).with_operand_u32(symbol as u32));
                     } else {
-                        let mut message =
-                            Message::error(ErrorCode::UnknownValue, "Undefined variable".to_string(), span.into_range());
+                        let mut message = Message::error(
+                            ErrorCode::UnknownValue,
+                            "Undefined variable".to_string(),
+                            span.into_range(),
+                        );
                         message.push(DiagLabel::new(
                             format!(
                                 "Unable to assign to a non-existing variable/constant '{}'",
@@ -2638,7 +4597,8 @@ impl Compiler {
                             } else {
                                 self.messages.push({
                                     let mut m = Message::error(
-                                       ErrorCode::GenericTypeError, "Extern fn argument must be `name: type` form".to_string(),
+                                        ErrorCode::GenericTypeError,
+                                        "Extern fn argument must be `name: type` form".to_string(),
                                         arg.0.into_range(),
                                     );
                                     m.push(DiagLabel::new(
@@ -2671,7 +4631,9 @@ impl Compiler {
                         .insert(fn_name.clone(), (lib_slot, fn_id_slot));
                 }
             }
-            Expression::EnumDecl { name: _, variants } => {
+            Expression::EnumDecl {
+                name: _, variants, ..
+            } => {
                 // Recurse into each variant. Each variant's
                 // `do_compile` consumes 1 ID (for the variant
                 // itself) and then descends into each payload's
@@ -2779,6 +4741,14 @@ impl Compiler {
                     let mut bb = BlockBuilder::new();
                     let end_label = bb.fresh_label();
 
+                    // First payload slot after existing locals. Function
+                    // args occupy 0..n-1; trailing `__dictN` slots (for
+                    // constrained generics / HKT methods) push this above
+                    // 1. JumpIfMatch/Unpack push payloads onto the stack
+                    // above those locals, so bindings must start here —
+                    // not at the historical hardcoded slot 1.
+                    let payload_base = self.context.variables.len() as u32;
+
                     let arm_labels: Vec<Option<crate::block_builder::Label>> = arms
                         .iter()
                         .enumerate()
@@ -2859,26 +4829,17 @@ impl Compiler {
                                 }
                                 Pattern::Binding { name } => {
                                     // Binding arm — STORE the
-                                    // scrutinee at slot 1
-                                    // (matching LOAD 0's push
-                                    // position).
-                                    //
-                                    // the binding
-                                    // is recorded in
-                                    // `match_bindings` by the
-                                    // reverse pass, so the
-                                    // body's `Identifier`
-                                    // lookup resolves the
-                                    // name to slot 1.
-                                    // Hardcoding slot 1 here
-                                    // is correct because LOAD
-                                    // 0 always pushes to
-                                    // frame.sp + 1, and the
-                                    // STORE is a no-op
-                                    // .
+                                    // scrutinee at `payload_base`
+                                    // (the slot where the
+                                    // scrutinee sits after being
+                                    // pushed above existing locals).
+                                    // The reverse pass records the
+                                    // same slot in `match_bindings`.
                                     let _ = name;
-                                    self.bytecode
-                                        .push(Byte::new(Instruction::STORE).with_operand_u32(1));
+                                    self.bytecode.push(
+                                        Byte::new(Instruction::STORE)
+                                            .with_operand_u32(payload_base),
+                                    );
                                 }
                             }
                         }
@@ -3072,6 +5033,7 @@ impl Compiler {
                                 &mut bb,
                                 pass_label,
                                 fail_label,
+                                payload_base,
                             );
                         }
                     }
@@ -3161,11 +5123,12 @@ impl Compiler {
                             );
                         }
 
-                        // Per-arm binding slots (slot 1 = first payload).
-                        // Payload order follows declaration order; record
-                        // patterns may list fields in any source order.
+                        // Per-arm binding slots (`payload_base` = first
+                        // payload). Payload order follows declaration
+                        // order; record patterns may list fields in any
+                        // source order.
                         let mut arm_bindings: HashMap<String, u32> = HashMap::new();
-                        let mut next_slot: u32 = 1;
+                        let mut next_slot: u32 = payload_base;
                         // Test-chain arms: payload already on stack from
                         // the forward pass — use `consume_values = false`
                         // to record bindings without re-emitting UNPACK/POP.
@@ -3193,7 +5156,7 @@ impl Compiler {
                             // test chain handled the values).
                             match &arm.pattern {
                                 Pattern::Binding { name } => {
-                                    arm_bindings.insert(name.to_string(), 1);
+                                    arm_bindings.insert(name.to_string(), payload_base);
                                 }
                                 Pattern::Constructor {
                                     enum_name,
@@ -3237,12 +5200,12 @@ impl Compiler {
                             match &arm.pattern {
                                 Pattern::Binding { name } => {
                                     // Binding arm: the forward pass
-                                    // already emitted `STORE 1` for
-                                    // the scrutinee (at slot 1,
-                                    // matching LOAD 0's push). Record
-                                    // the binding here so the body's
+                                    // already emitted STORE at
+                                    // `payload_base` for the
+                                    // scrutinee. Record the binding
+                                    // here so the body's
                                     // `Identifier` lookup finds it.
-                                    arm_bindings.insert(name.to_string(), 1);
+                                    arm_bindings.insert(name.to_string(), payload_base);
                                 }
                                 Pattern::Constructor {
                                     enum_name,
@@ -3282,8 +5245,9 @@ impl Compiler {
 
                         // Install the per-arm bindings map so the
                         // body's `Identifier` / `Assignment` lookups
-                        // resolve pattern bindings to slots 1, 2, 3,
-                        // ... — matching the VM's payload-push
+                        // resolve pattern bindings to
+                        // `payload_base`, `payload_base+1`, …
+                        // — matching the VM's payload-push
                         // positions. Cleared after the body emits.
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
@@ -3356,10 +5320,9 @@ impl Compiler {
                 let receiver_ty = self.receiver_type(receiver);
                 let is_record =
                     matches!(&receiver_ty, Some(crate::typechecking::Ty::Record { .. }));
-                let is_class = matches!(
-                    &receiver_ty,
-                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
-                );
+                let is_class = receiver_ty
+                    .as_ref()
+                    .is_some_and(|ty| self.checker.ty_is_class(ty));
                 if is_record || is_class {
                     // Push the field-name string on TOP of the
                     // receiver (which is already on the stack
@@ -3501,12 +5464,10 @@ impl Compiler {
                         None
                     }
                 });
-                let is_record =
-                    matches!(&inner_ty, Some(crate::typechecking::Ty::Record { .. }));
-                let is_class = matches!(
-                    &inner_ty,
-                    Some(crate::typechecking::Ty::Con(n)) if self.checker.is_class(n)
-                );
+                let is_record = matches!(&inner_ty, Some(crate::typechecking::Ty::Record { .. }));
+                let is_class = inner_ty
+                    .as_ref()
+                    .is_some_and(|ty| self.checker.ty_is_class(ty));
                 if is_record || is_class {
                     Self::emit_raw_string_literal(&mut self.bytecode, field);
                     self.bytecode.push(Byte::new(Instruction::GetField));
@@ -3536,8 +5497,11 @@ impl Compiler {
             }
 
             _expr => {
-                let mut message =
-                    Message::error(ErrorCode::UnknownExpression, "Unknown expression".to_string(), span.into_range());
+                let mut message = Message::error(
+                    ErrorCode::UnknownExpression,
+                    "Unknown expression".to_string(),
+                    span.into_range(),
+                );
                 message.push(DiagLabel::new(
                     "Unable to compile expression".to_string(),
                     span.into_range(),
@@ -3551,11 +5515,16 @@ impl Compiler {
         bytecode
     }
 
-    pub fn compile<'compiler>(
+    /// Emit unfused absolute-offset bytecode for `ast` (no peephole pass).
+    ///
+    /// Multi-file compilation uses this so earlier module tails remain valid
+    /// until the pipeline finalizes the linked buffer once. Single-file
+    /// [`compile`] calls [`finalize_bytecode`] afterwards for unit tests.
+    fn compile_unfused<'compiler>(
         &mut self,
         module: &str,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
-    ) -> Vec<Byte> {
+    ) {
         let ns = self.namespace.clone();
         self.namespace = module.to_string();
 
@@ -3564,7 +5533,17 @@ impl Compiler {
         self.loop_stack.clear();
         self.loop_bbs.clear();
         self.constants.clear();
+        self.mono_offsets.clear();
+        self.mono_codegen_var_types.clear();
+        self.checker.set_current_module(module);
         let _program_ty = self.checker.check_program(ast);
+        self.emit_builtin_dict_thunks();
+        // Builtin dictionary thunks are emitted immediately after the
+        // prologue and before user code. Keep `program_start_offset`
+        // pointing at the first user byte so `extern` prologue JMPs
+        // don't fall into a Num/Ord/Eq/Show thunk body.
+        self.program_start_offset = self.bytecode.len() as u32;
+        self.mono_plan = monomorphize::plan_monomorphization(module, ast, &self.checker);
 
         let mut program = self.do_compile(ast);
         self.namespace = ns.to_string();
@@ -3572,25 +5551,58 @@ impl Compiler {
         self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
+    }
+
+    /// Peephole-fuse `self.bytecode` and relocate absolute code offsets
+    /// (`JMP`/`CALL`/`CodePtr`/`MakePolyFn`/…).
+    ///
+    /// Called once after multi-file linking by the pipeline, or at the end
+    /// of single-file [`compile`] so unit tests observe fused output.
+    pub fn finalize_bytecode(&mut self) {
         let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
         }
+        for offset in self.mono_offsets.values_mut() {
+            *offset = peephole::adjust_target(*offset, &fusion_sites);
+        }
         self.program_start_offset =
             peephole::adjust_target(self.program_start_offset as usize, &fusion_sites) as u32;
+    }
 
+    pub fn compile<'compiler>(
+        &mut self,
+        module: &str,
+        ast: &(SimpleSpan, Box<Expression<'compiler>>),
+    ) -> Vec<Byte> {
+        self.compile_unfused(module, ast);
+        self.finalize_bytecode();
         self.bytecode.clone()
     }
 
     /// Return only bytes appended by this compile (multi-file pipeline).
+    ///
+    /// Emits **unfused** absolute-offset bytecode; the pipeline must call
+    /// [`finalize_bytecode`] once on the linked buffer.
     pub fn compile_module<'compiler>(
         &mut self,
         module: &str,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
     ) -> Vec<Byte> {
         let pre_compile_len = self.bytecode.len();
-        let _ = self.compile(module, ast);
+        self.compile_unfused(module, ast);
         self.bytecode[pre_compile_len..].to_vec()
+    }
+}
+
+fn unwrapped_identifier<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+    match expr.1.as_ref() {
+        Expression::Identifier(name) => Some(name),
+        Expression::Expr(inner)
+        | Expression::Group(inner)
+        | Expression::Statement(inner)
+        | Expression::ExprStatement(inner) => unwrapped_identifier(inner),
+        _ => None,
     }
 }
 
@@ -3789,19 +5801,20 @@ mod tests {
     fn integer_arithmetic_emits_int_opcode() {
         use common::Instruction;
         let (bc, _pool) = compile_src("fn add(int a, int b) -> int { return a + b; }");
-        let has_int_add = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::ADD
-                || (*b.bytecode() == Instruction::BinSlotSlot
-                    && b.bin_slot_slot_parts().0 == Instruction::ADD as u8)
+        // Builtin Num dictionary thunks also contain ADD/ADDF; the user function
+        // body itself should fuse to BinSlotSlot(ADD) (or bare ADD).
+        let has_int_bin_slot = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::ADD as u8
         });
-        let has_float_add = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::ADDF
-                || (*b.bytecode() == Instruction::BinSlotSlot
-                    && b.bin_slot_slot_parts().0 == Instruction::ADDF as u8)
+        let has_float_bin_slot = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotSlot
+                && b.bin_slot_slot_parts().0 == Instruction::ADDF as u8
         });
         assert!(
-            has_int_add && !has_float_add,
-            "expected int ADD for integer arithmetic"
+            has_int_bin_slot && !has_float_bin_slot,
+            "expected fused int BinSlotSlot(ADD) for integer arithmetic; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -3813,17 +5826,18 @@ mod tests {
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::FORMAT)),
-            "expected string addition to lower through FORMAT"
+            "expected string addition to lower through FORMAT; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
+        // Ignore ADD/ADDF inside builtin Num thunks; the top-level expression
+        // must not fuse into a numeric BinSlot* convoy before FORMAT.
         assert!(
             !bc.iter().any(|b| matches!(
                 b.bytecode(),
-                Instruction::ADD
-                    | Instruction::ADDF
-                    | Instruction::BinSlotImm
-                    | Instruction::BinSlotSlot
+                Instruction::BinSlotImm | Instruction::BinSlotSlot
             )),
-            "string addition should not emit numeric addition opcodes"
+            "string addition should not emit fused numeric slot ops; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
@@ -3863,6 +5877,47 @@ mod tests {
         let _bc = c.compile("test", &ast);
         let msgs = std::mem::take(&mut c.messages);
         assert!(msgs.is_empty(), "expected no messages, got: {:?}", msgs);
+    }
+
+    #[test]
+    fn typeclass_impl_method_registers_fqn_function() {
+        let ast = Pratt::default()
+            .parse(
+                r#"
+                typeclass Foo<T> { fn bar(T x) -> T; }
+                impl Foo<int> { fn bar(int x) -> int { return x; } }
+                fn main() { }
+                "#,
+            )
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &ast);
+        assert!(
+            compiler.messages.is_empty(),
+            "unexpected: {:?}",
+            compiler.messages
+        );
+        let offset = compiler
+            .functions
+            .get("Foo__int__bar")
+            .copied()
+            .expect("instance method FQN should be registered");
+        assert!(
+            offset < bc.len(),
+            "function offset should point into bytecode"
+        );
+    }
+
+    #[test]
+    fn emit_call_indirect_pushes_target_then_opcode() {
+        use common::Instruction;
+        let mut bc = Vec::new();
+        Compiler::emit_call_indirect(&mut bc, 42, 2);
+        assert_eq!(bc.len(), 2);
+        assert!(matches!(bc[0].bytecode(), Instruction::CodePtr));
+        assert_eq!(bc[0].operand_u32(), 42);
+        assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
+        assert_eq!(bc[1].operand_u32(), 2);
     }
 
     // ============================================================
@@ -3997,19 +6052,30 @@ mod tests {
 
     #[test]
     fn compile_module_diff_matches_compile_tail_for_fib() {
+        use common::Instruction;
         let src = include_str!("../../examples/fib.0s");
         let ast = Pratt::default().parse(src).expect("parse fib");
+
+        // `compile_module` emits unfused absolute-offset bytecode;
+        // final-link fusion is applied once via `finalize_bytecode`
+        // (same as single-file `compile`).
+        let mut module = Compiler::default();
+        let bc_unfused = module.compile_module("", &ast);
+        assert!(
+            bc_unfused
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::LOAD)),
+            "module compile should still contain unfused LOAD before finalize"
+        );
+        module.finalize_bytecode();
 
         let mut full = Compiler::default();
         let bc_full = full.compile("", &ast);
 
-        let mut module = Compiler::default();
-        let bc_diff = module.compile_module("", &ast);
-
         assert_eq!(
             &bc_full[3..],
-            bc_diff.as_slice(),
-            "compile_module diff should match compile() tail"
+            &module.bytecode[3..],
+            "finalize_bytecode on compile_module should match compile() output"
         );
         assert_eq!(full.functions, module.functions);
     }
@@ -4637,23 +6703,14 @@ fn main() {
         );
     }
 
-    /// Codegen test 12 : a match pattern with
-    /// SHUFFLED record fields (`{ y: b, x: a }`) emits STORE
-    /// opcodes in DECLARATION order — a first, then b. If the
-    /// codegen emitted in pattern-source order, the bindings
-    /// would be swapped at runtime (because the VM pushes
-    /// payload values in declaration order).
+    /// Codegen test 12 : a match pattern with SHUFFLED record
+    /// fields (`{ y: _, x: a }`) emits exactly one STORE (for `a`)
+    /// and at least one POP (for `_` / omitted fields). Declaration-
+    /// order binding is covered by the pipeline golden
+    /// `shuffled_record_pattern_binds_declaration_order_field`.
     #[test]
     fn match_emits_binding_interns_in_declaration_order() {
         use common::Instruction;
-        // Declare variant as `{ x: int, y: int, z: int }`. The
-        // pattern site supplies fields in shuffled order
-        // (`y: b, x: a`). The codegen should walk DECLARATION
-        // order (x first, then y) when emitting STORE, so the
-        // bindings line up with the VM's payload-push positions.
-        //
-        // Use a `print` to consume the match's result so the
-        // binding code is not optimized away.
         let (bc, _pool) = compile_src(
             "enum E { Foo { x: int, y: int, z: int } } \
  fn main() { \
@@ -4664,27 +6721,11 @@ fn main() {
  print \"%i\", v; \
  }",
         );
-
-        // The match has one arm. The STORE for `a` should
-        // appear at slot 1 (the first payload position for
-        // declaration-order walking). The POP for `_` doesn't
-        // emit a STORE.
-        let stores: Vec<u32> = bc
+        let store_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::STORE))
-            .map(|b| b.operand_u32())
-            .collect();
-        // We expect at least one STORE at slot 1 (the binding
-        // `a`). The match destructures 3 fields but only 1 is
-        // bound (a), so only 1 STORE is emitted. The wildcard
-        // `_` produces POP.
-        let slot_1_count = stores.iter().filter(|&&s| s == 1).count();
-        assert!(
-            slot_1_count >= 1,
-            "expected STORE at slot 1 for the binding `a`; got stores at {:?}",
-            stores
-        );
-        // The POP for `_` should be present.
+            .count();
+        assert_eq!(store_count, 1, "expected exactly one STORE for `a`");
         let pop_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::POP))
@@ -5336,7 +7377,6 @@ fn main() {
             "fn main() { \
  let x = 5; \
  let y = 10; \
- print \"%i\", x + y; \
  }",
         );
 
@@ -5429,9 +7469,8 @@ print \"%i\", len(a); \
             "expected `len(a)` to emit ArrayLen"
         );
         assert!(
-            !bc.iter().any(|b| {
-                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3
-            }),
+            !bc.iter()
+                .any(|b| { matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 > 3 }),
             "push/len builtins should not lower to ordinary CALL instructions"
         );
     }
@@ -5770,5 +7809,648 @@ print \"%i\", len(a); \
             .iter()
             .any(|b| matches!(b.bytecode(), Instruction::CONST) && b.constant(&[]) == 99);
         assert!(has_99, "expected CONST 99 for the arm body");
+    }
+
+    /// A Num-constrained shared generic body dispatches through its trailing
+    /// dictionary rather than a legacy DynAdd opcode.
+    #[test]
+    fn generic_add_emits_dictionary_indirect_call() {
+        use common::Instruction;
+        let (bc, _pool) =
+            compile_src("fn add<T: Num>(T a, T b) -> T { return a + b; } fn main() { }");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected CallIndirect for generic fn add<T: Num>; bytecode opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "new shared generic bodies must not emit DynAdd"
+        );
+    }
+
+    /// Codegen test B1-2: a concrete `fn add(int a, int b) -> int { return a + b; }`
+    /// must NOT emit `DynAdd` — it should use the regular `ADD` (or the peephole-fused
+    /// `BinSlotSlot`) path.
+    #[test]
+    fn concrete_add_still_emits_add() {
+        use common::Instruction;
+        let (bc, _pool) =
+            compile_src("fn add(int a, int b) -> int { return a + b; } fn main() { }");
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::DynAdd)),
+            "DynAdd must NOT appear for concrete fn add(int a, int b)"
+        );
+        // Either ADD (unfused) or BinSlotSlot (peephole-fused) must be present.
+        let has_int_add = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::ADD)
+                || matches!(b.bytecode(), Instruction::BinSlotSlot)
+                || matches!(b.bytecode(), Instruction::BinReturn)
+        });
+        assert!(
+            has_int_add,
+            "expected ADD or BinSlotSlot/BinReturn for concrete add; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Codegen test B3-1: when a generic function is referenced in a non-call position
+    /// (e.g. `let f = id;`), the codegen must emit `MakePolyFn` so that `f` holds an
+    /// `ObjPolyFn` heap pointer that `CallIndirect` can dispatch through.
+    ///
+    /// The function `id<T>(T x) -> T` is a canonical unconstrained identity and has
+    /// no typeclass bound, so no DynAdd / DynCmp / etc. opcode is emitted — this
+    /// purely tests the MakePolyFn path.
+    #[test]
+    fn generic_fn_as_value_emits_make_polyfn() {
+        use common::Instruction;
+        // `let f = id;` in main must compile `id` (a generic fn) as a MakePolyFn rather
+        // than a direct CALL or LOAD — id is not a local variable, so the Identifier arm
+        // must detect `is_generic_fn("id")` and emit MakePolyFn with id's entry offset.
+        let (bc, _pool) = compile_src("fn id<T>(T x) -> T { return x; } fn main() { let f = id; }");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "expected MakePolyFn for `let f = id` where id is generic; bytecode opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 4: escaping a constrained generic always emits `MakePolyFnCapture`
+    /// (from an active `__dictN` scope or with unresolved null slots).
+    #[test]
+    fn constrained_generic_escape_emits_make_polyfn_capture() {
+        use common::Instruction;
+        let src = r#"
+            typeclass Showable<T> { fn show_it(T x) -> int; }
+            impl Showable<int> { fn show_it(int x) -> int { return x; } }
+            fn show<T: Showable>(T x) -> int { return show_it(x); }
+            fn capture<T: Showable>(T _w) { return show; }
+            fn main() { let f = capture(0); }
+        "#;
+        let (bc, _pool) = compile_src(src);
+        let capture = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture))
+            .expect("expected MakePolyFnCapture");
+        assert_eq!(
+            capture.operand_u32() & 0xFF,
+            1,
+            "Showable escape should capture exactly 1 dict slot; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "constrained escape should not emit unconstrained MakePolyFn"
+        );
+    }
+
+    /// Phase 4: top-level constrained escape (`let f = show`) still uses
+    /// `MakePolyFnCapture` with null slots (delayed application evidence).
+    #[test]
+    fn top_level_constrained_escape_emits_make_polyfn_capture_with_null_slots() {
+        use common::Instruction;
+        let src = r#"
+            typeclass Showable<T> { fn show_it(T x) -> int; }
+            impl Showable<int> { fn show_it(int x) -> int { return x; } }
+            fn show<T: Showable>(T x) -> int { return show_it(x); }
+            fn main() { let f = show; }
+        "#;
+        let (bc, _pool) = compile_src(src);
+        let capture = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture))
+            .expect("expected MakePolyFnCapture for top-level constrained escape");
+        assert_eq!(
+            capture.operand_u32() & 0xFF,
+            1,
+            "top-level show escape should reserve 1 dict slot"
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "constrained escape must not use bare MakePolyFn"
+        );
+    }
+
+    /// Phase 4: multiparam constraint escape captures one slot per constraint.
+    #[test]
+    fn multiparam_constrained_escape_emits_capture_with_slot_count() {
+        use common::Instruction;
+        let src = r#"
+            typeclass Convert<A, B> { fn cast(A x) -> B; }
+            impl Convert<int, int> { fn cast(int x) -> int { return x; } }
+            fn convert_fn<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
+            fn capture_convert<A, B>(A _wa, B _wb) where Convert<A, B> { return convert_fn; }
+            fn main() { let f = capture_convert(0, 0); }
+        "#;
+        let (bc, _pool) = compile_src(src);
+        let capture = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFnCapture))
+            .expect("expected MakePolyFnCapture for multiparam escape");
+        assert_eq!(
+            capture.operand_u32() & 0xFF,
+            1,
+            "Convert<A,B> escape should capture exactly 1 dict slot"
+        );
+    }
+
+    /// Codegen test B3-2: when a concrete value is passed to a generic function,
+    /// the codegen must emit `BoxValue` immediately after the argument to wrap it
+    /// into an `ObjBoxed` heap object at the concrete→generic boundary.
+    ///
+    /// For `id(42)` where `fn id<T>(T x) -> T`, `42` is an `int` literal.
+    /// After compiling the `CONST 42`, codegen detects `is_generic_fn("id")`,
+    /// infers the argument's type as `int`, and emits `BoxValue` with tag
+    /// `ValueTag::Int`.
+    #[test]
+    fn generic_call_with_concrete_arg_emits_box_value() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn id<T>(T x) -> T { return x; } fn main() { id(42); }");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            "expected BoxValue for concrete int arg passed to generic fn id<T>; bytecode opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // The BoxValue operand should encode ValueTag::Int (= 0).
+        let box_ops: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::BoxValue))
+            .map(|b| b.operand_u32())
+            .collect();
+        assert!(
+            box_ops
+                .iter()
+                .any(|&tag| tag == common::ValueTag::Int as u32),
+            "BoxValue operand should be ValueTag::Int ({}), got: {:?}",
+            common::ValueTag::Int as u32,
+            box_ops
+        );
+    }
+
+    /// Codegen test: `fn id<T>(T x) -> T { return x; }` called with a
+    /// concrete `int` argument must emit BOTH `BoxValue` (arg boxing) AND
+    /// `UnboxValue` (return unboxing) in the bytecode.
+    ///
+    /// The unbox is required so the caller receives a raw `i64`, not an
+    /// `ObjBoxed` heap pointer, when the generic return type is instantiated
+    /// to a concrete primitive.
+    #[test]
+    fn generic_call_emits_box_and_unbox() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn id<T>(T x) -> T { return x; } fn main() { id(42); }");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            "expected BoxValue for concrete int arg to generic fn id<T>; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::UnboxValue)),
+            "expected UnboxValue after generic fn call returns concrete int; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // The UnboxValue operand should encode ValueTag::Int (= 0).
+        let unbox_ops: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::UnboxValue))
+            .map(|b| b.operand_u32() & 0xFFFF)
+            .collect();
+        assert!(
+            unbox_ops
+                .iter()
+                .any(|&tag| tag == common::ValueTag::Int as u32),
+            "UnboxValue operand should be ValueTag::Int ({}), got: {:?}",
+            common::ValueTag::Int as u32,
+            unbox_ops
+        );
+    }
+
+    #[test]
+    fn bounded_generic_add_ground_call_uses_specialized_clone() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add<T: Num>(T a, T b) -> T { return a + b; } \
+             fn main() { print \"%i\", add(1, 2); }",
+        );
+
+        // Shared body uses the dictionary ABI (CallIndirect), not DynAdd.
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "shared generic body should dispatch Num via CallIndirect; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Ground monomorphized call in main: CONST/CONST/CALL without a
+        // preceding BoxValue. (Builtin Num thunks also contain BoxValue.)
+        let main_call = bc
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, b)| matches!(b.bytecode(), Instruction::CALL))
+            .map(|(i, _)| i)
+            .expect("main should CALL the specialized add");
+        let boxed_before_call =
+            main_call > 0 && matches!(bc[main_call - 1].bytecode(), Instruction::BoxValue);
+        assert!(
+            !boxed_before_call,
+            "ground monomorphic add call should not box args; opcodes near CALL: {:?}",
+            &bc[main_call.saturating_sub(4)..=main_call]
+                .iter()
+                .map(|b| b.bytecode())
+                .collect::<Vec<_>>()
+        );
+        let has_specialized_add = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::ADD | Instruction::BinSlotSlot | Instruction::BinReturn
+            )
+        });
+        assert!(
+            has_specialized_add,
+            "specialized add clone should contain int ADD/fused equivalent; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Dictionary-passing calling convention tests ─────────────────────────
+
+    /// Codegen test: A non-monomorphized call to a generic function with a
+    /// **user-defined** typeclass constraint must emit:
+    ///   1. `MakeTuple` (the method-offset dict) after the value arg.
+    ///   2. A `CALL` whose packed arity is 2 (1 value arg + 1 dict tuple),
+    ///      NOT 1.
+    ///
+    /// The CONST that feeds `MakeTuple` encodes the bytecode offset of the
+    /// instance method (i.e. it must be > 0 because the method compiles to a
+    /// real function body).
+    #[test]
+    fn user_typeclass_constrained_call_emits_dict_tuple_and_bumps_arity() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            // Declare a user typeclass with one method.
+            "typeclass Describable<T> { fn describe_val(T x) -> int; } \
+             impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
+             // Generic fn with one user typeclass constraint.  NOT called as mono.
+             fn show<T: Describable>(T x) -> int { return 0; } \
+             fn main() { show(42); }",
+        );
+
+        // ── 1. A MakeTuple must be present (the dict for Describable<int>).
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "expected MakeTuple for dict emission; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        // ── 2. The CALL to `show` must have arity 2 (1 value + 1 dict).
+        //    We look for the CALL with the highest arity among all CALL
+        //    instructions (the monomorphized clone if any won't have a dict).
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity,
+            2,
+            "expected CALL arity = 2 (1 value + 1 dict); got {} from opcodes: {:?}",
+            max_call_arity,
+            bc.iter()
+                .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+                .map(|b| b.call_parts())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Codegen test: A non-monomorphized call with **two** user typeclass
+    /// constraints must emit **two** `MakeTuple` instructions (one per dict)
+    /// and a `CALL` with arity N_value_args + 2.
+    #[test]
+    fn two_user_typeclass_constraints_emit_two_dicts_and_arity_plus_two() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Printable<T> { fn printable_val(T x) -> int; } \
+             typeclass Countable<T> { fn count_val(T x) -> int; } \
+             impl Printable<int> { fn printable_val(int x) -> int { return x; } } \
+             impl Countable<int> { fn count_val(int x) -> int { return x + 1; } } \
+             fn process<T: Printable + Countable>(T x) -> int { return 0; } \
+             fn main() { process(5); }",
+        );
+
+        // Two MakeTuple instructions (one per dict).
+        let make_tuple_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .count();
+        assert!(
+            make_tuple_count >= 2,
+            "expected at least 2 MakeTuple (two dicts); got {}; opcodes: {:?}",
+            make_tuple_count,
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+
+        // CALL arity should be 1 value + 2 dicts = 3.
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 3,
+            "expected CALL arity = 3 (1 value + 2 dicts); got {}",
+            max_call_arity
+        );
+    }
+
+    /// Builtin constraints use the same tuple dictionary ABI as user-defined
+    /// constraints, with compiler-generated method thunks as entries.
+    #[test]
+    fn builtin_num_constraint_emits_dict_tuple() {
+        use common::Instruction;
+        // Non-monomorphized call: use boxed arg path.
+        let (bc, _pool) = compile_src(
+            "fn add_generic<T: Num>(T a, T b) -> T { return a + b; } \
+             fn caller<U: Num>(U x, U y) -> U { return add_generic(x, y); }",
+        );
+
+        let make_tuple_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .count();
+        assert_eq!(
+            make_tuple_count, 0,
+            "open Num evidence is forwarded, not rebuilt"
+        );
+
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected dictionary CallIndirect for Num-constrained add; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ground calls with **user** typeclass bounds are NOT monomorphized
+    /// (see `monomorphize.rs`); they use the shared body + dictionary-passing
+    /// convention instead. Expect BoxValue + MakeTuple + bumped CALL arity.
+    #[test]
+    fn ground_user_typeclass_call_uses_dict_not_mono() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Describable<T> { fn describe_val(T x) -> int; } \
+             impl Describable<int> { fn describe_val(int x) -> int { return x; } } \
+             fn id_d<T: Describable>(T x) -> T { return x; } \
+             fn main() { let y = id_d(7); }",
+        );
+
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::BoxValue)),
+            "shared generic path should box the concrete arg; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakeTuple)),
+            "user typeclass ground call should emit a dict MakeTuple; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let max_call_arity = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .map(|b| b.call_parts().0)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_call_arity, 2,
+            "expected CALL arity = 2 (1 value + 1 dict); got {}",
+            max_call_arity
+        );
+    }
+
+    #[test]
+    fn generic_bound_method_consumes_dictionary_indirectly() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x; } } \
+             fn size_of<T: Measurable>(T x) -> int { return x.size(); } \
+             fn main() { size_of(42); }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::Index))
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "bound method should dispatch via CallIndirect"
+        );
+    }
+
+    #[test]
+    fn omitted_default_method_dict_slot_has_real_target() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Tiny<T> { fn zero(T x) -> int { return 7; } } \
+             impl Tiny<int> {} \
+             fn get<T: Tiny>(T x) -> int { return zero(x); } \
+             fn main() { get(0); }",
+        );
+        let tuple_index = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .expect("default method dictionary");
+        assert!(tuple_index > 0);
+        assert!(
+            matches!(bc[tuple_index - 1].bytecode(), Instruction::CodePtr),
+            "dictionary method slots must use CodePtr; got {:?}",
+            bc[tuple_index - 1].bytecode()
+        );
+        assert!(
+            bc[tuple_index - 1].operand_u32() > 0,
+            "default method dictionary slot must contain a compiled code offset"
+        );
+    }
+
+    /// Dictionary emission uses self-identifying `CodePtr` (not `CONST`).
+    #[test]
+    fn dictionary_entries_emit_code_ptr() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "typeclass Measurable<T> { fn size(T x) -> int; } \
+             impl Measurable<int> { fn size(int x) -> int { return x; } } \
+             fn size_of<T: Measurable>(T x) -> int { return size(x); } \
+             fn main() { size_of(42); }",
+        );
+        let tuple_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .expect("expected dict MakeTuple");
+        assert!(
+            matches!(bc[tuple_pos - 1].bytecode(), Instruction::CodePtr),
+            "dict entry before MakeTuple must be CodePtr"
+        );
+        let code_ptrs: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CodePtr))
+            .collect();
+        assert!(
+            !code_ptrs.is_empty(),
+            "expected at least one CodePtr in dictionary program"
+        );
+        for ptr in &code_ptrs {
+            assert!(
+                (ptr.operand_u32() as usize) < bc.len(),
+                "CodePtr target {} out of range (len={})",
+                ptr.operand_u32(),
+                bc.len()
+            );
+        }
+    }
+
+    /// Direct instance-method / CallIndirect sites push `CodePtr` targets.
+    #[test]
+    fn call_indirect_sites_use_code_ptr_targets() {
+        use common::Instruction;
+        let mut bc = Vec::new();
+        Compiler::emit_call_indirect(&mut bc, 100_000, 1);
+        assert!(matches!(bc[0].bytecode(), Instruction::CodePtr));
+        assert_eq!(
+            bc[0].operand_u32(),
+            100_000,
+            "CodePtr must carry full 32-bit targets (> u16::MAX)"
+        );
+        assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
+    }
+
+    /// `invoke(..., (fn, …))` callback args must use relocatable `CodePtr`,
+    /// not `CONST`. Peephole fusion adjusts `CodePtr` in `finalize_bytecode`
+    /// but never rewrites `CONST`, so a stale offset would make the FFI
+    /// trampoline jump to the wrong IP (regression: prints `0` instead of
+    /// `42` for `examples/ffi_callback.0s`).
+    #[test]
+    fn invoke_callback_fn_arg_emits_relocatable_code_ptr() {
+        use common::Instruction;
+        let src = "\
+fn doubler(int x) -> int { return x * 2; } \
+fn main() { \
+  let lib = dload(\"libsum.so\"); \
+  let id = declare(lib, \"apply_cb\", (FFIType::Callback, FFIType::Int), FFIType::Int); \
+  invoke(lib, id, (doubler, 21)); \
+}";
+        let ast = Pratt::default().parse(src).expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &ast);
+        let doubler = *compiler
+            .functions
+            .get("doubler")
+            .expect("doubler must be registered");
+
+        let ffi_idx = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::FfiInvoke))
+            .expect("expected FfiInvoke");
+        let make_tuple_idx = bc[..ffi_idx]
+            .iter()
+            .rposition(|b| matches!(b.bytecode(), Instruction::MakeTuple))
+            .expect("expected MakeTuple before FfiInvoke");
+        // Callback fn arg is the first tuple element → last CodePtr before
+        // MakeTuple (args are emitted bottom-to-top; doubler then 21).
+        let code_ptr = bc[..make_tuple_idx]
+            .iter()
+            .rev()
+            .find(|b| matches!(b.bytecode(), Instruction::CodePtr))
+            .expect("expected CodePtr for callback fn arg before MakeTuple");
+        assert_eq!(
+            code_ptr.operand_u32() as usize,
+            doubler,
+            "CodePtr must match post-finalize doubler entry (got {}; table={})",
+            code_ptr.operand_u32(),
+            doubler
+        );
+        // Guard against regressing to CONST at this site.
+        assert!(
+            !bc[..make_tuple_idx].iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as usize == doubler
+            }),
+            "callback fn arg must not be baked as CONST (unrelocatable)"
+        );
+    }
+
+    /// `MakePolyFn` operands are absolute and survive final-link fusion.
+    #[test]
+    fn make_polyfn_operand_is_relocatable_under_fusion() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } \
+             fn main() { let f = id; print \"%i\", f(42); }",
+        );
+        let poly = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFn))
+            .expect("MakePolyFn for escaped generic");
+        let entry = poly.operand_u32() as usize;
+        assert!(
+            entry < bc.len(),
+            "MakePolyFn entry must point into bytecode"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "polyfn application should use CallIndirect"
+        );
+    }
+
+    /// PolyFn programs still receive peephole fusion (BinSlotImm / etc.).
+    #[test]
+    fn polyfn_plus_fib_style_body_still_fuses() {
+        use common::Instruction;
+        // Shared fib-style body uses LOAD/CONST/op patterns that fuse when
+        // CodePtr/MakePolyFn are relocatable (Phase 1 — no global skip-fusion).
+        let (bc, _pool) = compile_src(
+            "fn id<T>(T x) -> T { return x; } \
+             fn fib(int n) -> int { \
+               if n <= 2 { return 1; } \
+               return fib(n - 1) + fib(n - 2); \
+             } \
+             fn main() { \
+               let f = id; \
+               print \"%i\", f(fib(5)); \
+             }",
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+            "expected MakePolyFn"
+        );
+        let has_fused = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::BinSlotImm
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::BinSlotSlot
+                    | Instruction::CmpJmpf
+                    | Instruction::BinReturn
+                    | Instruction::ConstReturnImm
+                    | Instruction::LoadReturnSlot
+            )
+        });
+        assert!(
+            has_fused,
+            "expected fused superinstructions alongside PolyFn; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
     }
 }

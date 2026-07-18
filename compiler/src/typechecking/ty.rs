@@ -53,6 +53,14 @@ pub enum Ty {
     Record {
         fields: Vec<(String, Ty)>,
     },
+    Existential {
+        class: String,
+    },
+    Forall {
+        bounds: Vec<TyVarId>,
+        constraints: Vec<Constraint>,
+        body: Box<Ty>,
+    },
 }
 
 /// Array length: compile-time constant or runtime-known.
@@ -115,14 +123,88 @@ impl Ty {
     }
 }
 
-/// A type scheme: a type possibly quantified over some type variables.
+/// A typeclass constraint over one or more type arguments.
 ///
-/// `Scheme { bounds: vec![], ty: Var(α) }` represents `α` (with no
-/// quantification; equivalently `∀α. α` if we later add `α` to `bounds`).
-/// `bounds` is reserved for future use (e.g. type-class constraints).
+/// Unary binder bounds desugar as a single-arg constraint:
+/// `T: Num` → `Constraint { class: "Num", args: [Var(α)] }`.
+/// Multi-param classes use N args:
+/// `Convert<A, B>` → `Constraint { class: "Convert", args: [Var(α), Var(β)] }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Constraint {
+    pub class: String,
+    pub args: Vec<Ty>,
+}
+
+impl Constraint {
+    /// Unary constraint helper: `Class<T>` for a single type variable.
+    pub fn unary(class: impl Into<String>, var: TyVarId) -> Self {
+        Self {
+            class: class.into(),
+            args: vec![Ty::Var(var)],
+        }
+    }
+
+    /// True when this is a unary constraint whose sole arg is `var`.
+    pub fn is_unary_on(&self, var: TyVarId) -> bool {
+        matches!(self.args.as_slice(), [Ty::Var(v)] if *v == var)
+    }
+
+    /// First type-variable argument, if any (unary / HKT head).
+    pub fn primary_var(&self) -> Option<TyVarId> {
+        match self.args.first() {
+            Some(Ty::Var(v)) => Some(*v),
+            Some(Ty::App(head, _)) => match head.as_ref() {
+                Ty::Var(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Constraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.class)?;
+        if !self.args.is_empty() {
+            write!(f, "<")?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", arg)?;
+            }
+            write!(f, ">")?;
+        }
+        Ok(())
+    }
+}
+
+/// A fresh type variable in a scheme that represents an associated-type
+/// projection such as `T::Elem` or `T::Ref<A>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssocProjection {
+    pub var: TyVarId,
+    pub name: String,
+    pub args: Vec<Ty>,
+}
+
+/// A type scheme: a type possibly quantified over some type variables,
+/// with optional typeclass constraints on those variables.
+///
+/// `Scheme { bounds: vec![], kinds: vec![], constraints: vec![], ty: Var(α) }`
+/// represents `α` (monomorphic). `bounds` lists the universally quantified
+/// variables; `constraints` lists typeclass requirements on them (e.g. `T: Num`).
+/// `kinds` (Phase 5) is parallel to `bounds` — empty means every bound has
+/// kind `*`; otherwise `kinds[i]` is the kind of `bounds[i]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheme {
     pub bounds: Vec<TyVarId>,
+    /// Kinds of the quantified variables (parallel to `bounds`). Empty ≡ all `*`.
+    pub kinds: Vec<super::kind::Kind>,
+    /// Typeclass constraints on the quantified variables.
+    pub constraints: Vec<Constraint>,
+    /// Associated-type projection variables quantified by the scheme.
+    pub assoc_projections: Vec<AssocProjection>,
     pub ty: Ty,
 }
 
@@ -131,8 +213,71 @@ impl Scheme {
     pub fn mono(ty: Ty) -> Self {
         Self {
             bounds: Vec::new(),
+            kinds: Vec::new(),
+            constraints: Vec::new(),
+            assoc_projections: Vec::new(),
             ty,
         }
+    }
+
+    /// Build a polymorphic scheme with constraints (all bounds kind `*`).
+    pub fn poly(bounds: Vec<TyVarId>, constraints: Vec<Constraint>, ty: Ty) -> Self {
+        let kinds = vec![super::kind::Kind::Type; bounds.len()];
+        Self {
+            bounds,
+            kinds,
+            constraints,
+            assoc_projections: Vec::new(),
+            ty,
+        }
+    }
+
+    /// Build a polymorphic scheme with explicit kinds (Phase 5).
+    pub fn poly_with_kinds(
+        bounds: Vec<TyVarId>,
+        kinds: Vec<super::kind::Kind>,
+        constraints: Vec<Constraint>,
+        ty: Ty,
+    ) -> Self {
+        debug_assert!(
+            kinds.is_empty() || kinds.len() == bounds.len(),
+            "kinds must be empty or parallel to bounds"
+        );
+        Self {
+            bounds,
+            kinds,
+            constraints,
+            assoc_projections: Vec::new(),
+            ty,
+        }
+    }
+
+    pub fn poly_with_kinds_and_assoc(
+        bounds: Vec<TyVarId>,
+        kinds: Vec<super::kind::Kind>,
+        constraints: Vec<Constraint>,
+        assoc_projections: Vec<AssocProjection>,
+        ty: Ty,
+    ) -> Self {
+        debug_assert!(
+            kinds.is_empty() || kinds.len() == bounds.len(),
+            "kinds must be empty or parallel to bounds"
+        );
+        Self {
+            bounds,
+            kinds,
+            constraints,
+            assoc_projections,
+            ty,
+        }
+    }
+
+    /// Kind of quantified variable `i`, defaulting to `*` when unset.
+    pub fn kind_at(&self, i: usize) -> super::kind::Kind {
+        self.kinds
+            .get(i)
+            .cloned()
+            .unwrap_or(super::kind::Kind::Type)
     }
 }
 
@@ -177,7 +322,26 @@ pub fn unit() -> Ty {
     Ty::Con(UNIT.into())
 }
 
+/// Build `Option<T>` as a type application.
+pub fn option_app_ty(inner: Ty) -> Ty {
+    Ty::App(
+        Box::new(Ty::Con(common::BUILTIN_OPTION_ENUM.into())),
+        vec![inner],
+    )
+}
+
+/// Build `Result<T, E>` as a type application.
+pub fn result_app_ty(ok: Ty, err: Ty) -> Ty {
+    Ty::App(
+        Box::new(Ty::Con(common::BUILTIN_RESULT_ENUM.into())),
+        vec![ok, err],
+    )
+}
+
 /// Build `Option<T>` as a sum type (`None` | `Some(T)`).
+///
+/// The builtin annotation path uses [`option_app_ty`]. This structural
+/// form is still used by constructor owners and match metadata.
 pub fn option_ty(inner: Ty) -> Ty {
     Ty::Sum {
         name: common::BUILTIN_OPTION_ENUM.into(),
@@ -189,6 +353,9 @@ pub fn option_ty(inner: Ty) -> Ty {
 }
 
 /// Build `Result<T, E>` as a sum type (`Ok(T)` | `Err(E)`).
+///
+/// The builtin annotation path uses [`result_app_ty`]. This structural
+/// form is still used by constructor owners and match metadata.
 pub fn result_ty(ok: Ty, err: Ty) -> Ty {
     Ty::Sum {
         name: common::BUILTIN_RESULT_ENUM.into(),
@@ -202,6 +369,9 @@ pub fn result_ty(ok: Ty, err: Ty) -> Ty {
 /// Extract `T` from `Option<T>` (Sum or Constructor owner).
 pub fn option_inner(ty: &Ty) -> Option<Ty> {
     match ty {
+        Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM) => {
+            args.first().cloned()
+        }
         Ty::Sum { name, variants } if name == common::BUILTIN_OPTION_ENUM => {
             for (vn, payload) in variants {
                 if vn == "Some" {
@@ -219,6 +389,12 @@ pub fn option_inner(ty: &Ty) -> Option<Ty> {
 /// Extract `(T, E)` from `Result<T, E>`.
 pub fn result_ok_err(ty: &Ty) -> Option<(Ty, Ty)> {
     match ty {
+        Ty::App(con, args) if matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_RESULT_ENUM) => {
+            match (args.first(), args.get(1)) {
+                (Some(ok), Some(err)) => Some((ok.clone(), err.clone())),
+                _ => None,
+            }
+        }
         Ty::Sum { name, variants } if name == common::BUILTIN_RESULT_ENUM => {
             let mut ok = None;
             let mut err = None;
@@ -244,6 +420,9 @@ pub fn result_ok_err(ty: &Ty) -> Option<(Ty, Ty)> {
 pub fn is_option_ty(ty: &Ty) -> bool {
     match ty {
         Ty::Sum { name, .. } | Ty::Con(name) => name == common::BUILTIN_OPTION_ENUM,
+        Ty::App(con, _) => {
+            matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_OPTION_ENUM)
+        }
         Ty::Constructor { owner, .. } => is_option_ty(owner),
         _ => false,
     }
@@ -253,6 +432,9 @@ pub fn is_option_ty(ty: &Ty) -> bool {
 pub fn is_result_ty(ty: &Ty) -> bool {
     match ty {
         Ty::Sum { name, .. } | Ty::Con(name) => name == common::BUILTIN_RESULT_ENUM,
+        Ty::App(con, _) => {
+            matches!(con.as_ref(), Ty::Con(name) if name == common::BUILTIN_RESULT_ENUM)
+        }
         Ty::Constructor { owner, .. } => is_result_ty(owner),
         _ => false,
     }
@@ -289,6 +471,150 @@ pub fn record(fields: Vec<(String, Ty)>) -> Ty {
     Ty::Record { fields }
 }
 
+/// Substitute named type-parameter placeholders (`Ty::Con("T")`) in a type.
+///
+/// Used by polymorphic enum construct/match to freshen schema payloads
+/// stored with `Con(param)` markers into site-local type variables.
+pub fn subst_ty_params(ty: &Ty, params: &std::collections::HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::Con(name) => params.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Var(_) => ty.clone(),
+        Ty::Fun(a, b) => Ty::Fun(
+            Box::new(subst_ty_params(a, params)),
+            Box::new(subst_ty_params(b, params)),
+        ),
+        Ty::App(con, args) => Ty::App(
+            Box::new(subst_ty_params(con, params)),
+            args.iter().map(|a| subst_ty_params(a, params)).collect(),
+        ),
+        Ty::List(inner) => Ty::List(Box::new(subst_ty_params(inner, params))),
+        Ty::Sum { name, variants } => Ty::Sum {
+            name: name.clone(),
+            variants: variants
+                .iter()
+                .map(|(n, p)| (n.clone(), subst_payload_params(p, params)))
+                .collect(),
+        },
+        Ty::Constructor { owner, tag, arity } => Ty::Constructor {
+            owner: Box::new(subst_ty_params(owner, params)),
+            tag: *tag,
+            arity: *arity,
+        },
+        Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| subst_ty_params(t, params)).collect()),
+        Ty::Array { element, length } => Ty::Array {
+            element: Box::new(subst_ty_params(element, params)),
+            length: *length,
+        },
+        Ty::Record { fields } => Ty::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), subst_ty_params(t, params)))
+                .collect(),
+        },
+        Ty::Existential { .. } => ty.clone(),
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => Ty::Forall {
+            bounds: bounds.clone(),
+            constraints: constraints.clone(),
+            body: Box::new(subst_ty_params(body, params)),
+        },
+    }
+}
+
+/// Substitute named type-parameter placeholders in a variant payload.
+pub fn subst_payload_params(
+    payload: &EnumVariantPayloadTy,
+    params: &std::collections::HashMap<String, Ty>,
+) -> EnumVariantPayloadTy {
+    match payload {
+        EnumVariantPayloadTy::Unit => EnumVariantPayloadTy::Unit,
+        EnumVariantPayloadTy::Tuple(tys) => {
+            EnumVariantPayloadTy::Tuple(tys.iter().map(|t| subst_ty_params(t, params)).collect())
+        }
+        EnumVariantPayloadTy::Record(fields) => EnumVariantPayloadTy::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), subst_ty_params(t, params)))
+                .collect(),
+        ),
+    }
+}
+
+/// Rewrite in-scope type-parameter variables to `Ty::Con(name)` schema
+/// markers for storage in the enum payload registry.
+pub fn schemaize_ty(ty: &Ty, var_to_name: &std::collections::HashMap<TyVarId, String>) -> Ty {
+    match ty {
+        Ty::Var(id) => var_to_name
+            .get(id)
+            .map(|n| Ty::Con(n.clone()))
+            .unwrap_or_else(|| ty.clone()),
+        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
+        Ty::Fun(a, b) => Ty::Fun(
+            Box::new(schemaize_ty(a, var_to_name)),
+            Box::new(schemaize_ty(b, var_to_name)),
+        ),
+        Ty::App(con, args) => Ty::App(
+            Box::new(schemaize_ty(con, var_to_name)),
+            args.iter().map(|a| schemaize_ty(a, var_to_name)).collect(),
+        ),
+        Ty::List(inner) => Ty::List(Box::new(schemaize_ty(inner, var_to_name))),
+        Ty::Sum { name, variants } => Ty::Sum {
+            name: name.clone(),
+            variants: variants
+                .iter()
+                .map(|(n, p)| (n.clone(), schemaize_payload(p, var_to_name)))
+                .collect(),
+        },
+        Ty::Constructor { owner, tag, arity } => Ty::Constructor {
+            owner: Box::new(schemaize_ty(owner, var_to_name)),
+            tag: *tag,
+            arity: *arity,
+        },
+        Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| schemaize_ty(t, var_to_name)).collect()),
+        Ty::Array { element, length } => Ty::Array {
+            element: Box::new(schemaize_ty(element, var_to_name)),
+            length: *length,
+        },
+        Ty::Record { fields } => Ty::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), schemaize_ty(t, var_to_name)))
+                .collect(),
+        },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => Ty::Forall {
+            bounds: bounds.clone(),
+            constraints: constraints.clone(),
+            body: Box::new(schemaize_ty(body, var_to_name)),
+        },
+    }
+}
+
+/// Schemaize a variant payload (type-param vars → `Con(name)`).
+pub fn schemaize_payload(
+    payload: &EnumVariantPayloadTy,
+    var_to_name: &std::collections::HashMap<TyVarId, String>,
+) -> EnumVariantPayloadTy {
+    match payload {
+        EnumVariantPayloadTy::Unit => EnumVariantPayloadTy::Unit,
+        EnumVariantPayloadTy::Tuple(tys) => {
+            EnumVariantPayloadTy::Tuple(tys.iter().map(|t| schemaize_ty(t, var_to_name)).collect())
+        }
+        EnumVariantPayloadTy::Record(fields) => EnumVariantPayloadTy::Record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), schemaize_ty(t, var_to_name)))
+                .collect(),
+        ),
+    }
+}
+
 // --- Free type variables ---
 
 /// Free type variables of a `Ty`.
@@ -303,12 +629,14 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
         Ty::Var(v) => {
             acc.insert(*v);
         }
-        Ty::Con(_) => {}
+        Ty::Con(_) | Ty::Existential { .. } => {}
         Ty::Fun(a, b) => {
             go(a, acc);
             go(b, acc);
         }
-        Ty::App(_, args) => {
+        Ty::App(head, args) => {
+            // Phase 5: HKT heads may be `Ty::Var(F)` — must collect F.
+            go(head, acc);
             for a in args {
                 go(a, acc);
             }
@@ -340,12 +668,32 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
                 go(fty, acc);
             }
         }
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            go(body, acc);
+            for c in constraints {
+                for a in &c.args {
+                    go(a, acc);
+                }
+            }
+            let bound: HashSet<_> = bounds.iter().copied().collect();
+            acc.retain(|v| !bound.contains(v));
+        }
     }
 }
 
 /// Free type variables of a `Scheme` (excluding the quantified ones).
 pub fn ftv_scheme(s: &Scheme) -> HashSet<TyVarId> {
     let mut acc = ftv_ty(&s.ty);
+    for projection in &s.assoc_projections {
+        acc.insert(projection.var);
+        for arg in &projection.args {
+            acc.extend(ftv_ty(arg));
+        }
+    }
     let bound: HashSet<_> = s.bounds.iter().copied().collect();
     acc.retain(|v| !bound.contains(v));
     acc
@@ -401,6 +749,9 @@ mod tests {
     fn ftv_of_scheme_excludes_bounds() {
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: v(0),
         };
         assert!(ftv_scheme(&scheme).is_empty());
@@ -410,6 +761,9 @@ mod tests {
     fn ftv_of_scheme_keeps_non_bound_vars() {
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         assert_eq!(ftv_scheme(&scheme), HashSet::from([TyVarId(1)]));

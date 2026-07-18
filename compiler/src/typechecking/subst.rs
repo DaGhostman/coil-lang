@@ -103,7 +103,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
             Some(t) => t.clone(),
             None => Ty::Var(*v),
         },
-        Ty::Con(_) => ty.clone(),
+        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
         Ty::Fun(a, b) => Ty::Fun(Box::new(apply_ty(subst, a)), Box::new(apply_ty(subst, b))),
         Ty::App(c, args) => Ty::App(
             Box::new(apply_ty(subst, c)),
@@ -154,6 +154,27 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
                 .map(|(n, t)| (n.clone(), apply_ty(subst, t)))
                 .collect(),
         },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            let mut inner = subst.clone();
+            for bound in bounds {
+                let _ = inner.remove(*bound);
+            }
+            Ty::Forall {
+                bounds: bounds.clone(),
+                constraints: constraints
+                    .iter()
+                    .map(|c| super::ty::Constraint {
+                        class: c.class.clone(),
+                        args: c.args.iter().map(|a| apply_ty(&inner, a)).collect(),
+                    })
+                    .collect(),
+                body: Box::new(apply_ty(&inner, body)),
+            }
+        }
     }
 }
 
@@ -172,9 +193,31 @@ pub fn apply_ty_prune(subst: &Subst, ty: &Ty) -> Ty {
 /// Apply a substitution to a `Scheme`. Quantified variables are preserved.
 #[allow(dead_code)]
 pub fn apply_scheme(subst: &Subst, s: &Scheme) -> Scheme {
+    let mut inner = subst.clone();
+    for bound in &s.bounds {
+        let _ = inner.remove(*bound);
+    }
     Scheme {
         bounds: s.bounds.clone(),
-        ty: apply_ty(subst, &s.ty),
+        kinds: s.kinds.clone(),
+        constraints: s
+            .constraints
+            .iter()
+            .map(|c| super::ty::Constraint {
+                class: c.class.clone(),
+                args: c.args.iter().map(|a| apply_ty(&inner, a)).collect(),
+            })
+            .collect(),
+        assoc_projections: s
+            .assoc_projections
+            .iter()
+            .map(|p| super::ty::AssocProjection {
+                var: p.var,
+                name: p.name.clone(),
+                args: p.args.iter().map(|a| apply_ty(&inner, a)).collect(),
+            })
+            .collect(),
+        ty: apply_ty(&inner, &s.ty),
     }
 }
 
@@ -320,13 +363,14 @@ mod tests {
         let s = Subst::singleton(TyVarId(0), int());
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: v(0),
         };
         let result = apply_scheme(&s, &scheme);
         assert_eq!(result.bounds, vec![TyVarId(0)]);
-        // Note: this is technically incorrect when the substitution binds a
-        // quantified variable — `instantiate` prevents that.
-        assert_eq!(result.ty, int());
+        assert_eq!(result.ty, v(0));
     }
 
     #[test]
@@ -334,6 +378,9 @@ mod tests {
         let s = Subst::singleton(TyVarId(1), int());
         let scheme = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         let result = apply_scheme(&s, &scheme);

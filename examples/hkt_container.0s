@@ -1,0 +1,23 @@
+// Unary higher-kinded typeclass: Container<F: * -> *>.
+// Expected output: 42
+
+typeclass Container<F: * -> *> {
+    fn first<A>(F<A> xs) -> A;
+}
+
+impl Container<Option> {
+    fn first<A>(Option<A> xs) -> A {
+        return match xs {
+            Option::Some(v) => v,
+            Option::None => 0,
+        };
+    }
+}
+
+fn get<F: Container, A>(F<A> xs) -> A {
+    return first(xs);
+}
+
+fn main() {
+    print "%i", get(Option::Some(42));
+}

@@ -28,7 +28,15 @@ impl fmt::Display for Ty {
                         }
                         return write!(f, "coroutine<{}, {}>", y, s);
                     }
-                    write!(f, "{}<{}>", c, args.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))
+                    write!(
+                        f,
+                        "{}<{}>",
+                        c,
+                        args.iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 } else {
                     let inner = args
                         .iter()
@@ -99,12 +107,50 @@ impl fmt::Display for Ty {
                 }
                 write!(f, " }}")
             }
+            Ty::Existential { class } => write!(f, "{}", class),
+            Ty::Forall {
+                bounds,
+                constraints,
+                body,
+            } => {
+                let vars = bounds
+                    .iter()
+                    .map(|v| {
+                        let mut s = format!("t{}", v.raw());
+                        // Unary binder-style constraints (`T: Num`) attach to the var.
+                        let classes = constraints
+                            .iter()
+                            .filter(|c| c.is_unary_on(*v))
+                            .map(|c| c.class.as_str())
+                            .collect::<Vec<_>>();
+                        if !classes.is_empty() {
+                            s.push_str(": ");
+                            s.push_str(&classes.join(" + "));
+                        }
+                        s
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Multi-arg / non-binder constraints render as a trailing where.
+                let multi: Vec<String> = constraints
+                    .iter()
+                    .filter(|c| {
+                        c.args.len() != 1 || c.primary_var().is_none_or(|v| !bounds.contains(&v))
+                    })
+                    .map(|c| c.to_string())
+                    .collect();
+                if multi.is_empty() {
+                    write!(f, "forall {}. {}", vars, body)
+                } else {
+                    write!(f, "forall {}. {} where {}", vars, body, multi.join(", "))
+                }
+            }
         }
     }
 }
 
 fn needs_paren(t: &Ty) -> bool {
-    matches!(t, Ty::Fun(_, _))
+    matches!(t, Ty::Fun(_, _) | Ty::Forall { .. })
 }
 
 impl fmt::Display for Scheme {
@@ -183,6 +229,9 @@ mod tests {
     fn display_scheme_poly() {
         let s = Scheme {
             bounds: vec![TyVarId(0), TyVarId(1)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(Ty::Var(TyVarId(0))), Box::new(Ty::Var(TyVarId(1)))),
         };
         assert_eq!(format!("{}", s), "forall t0 t1. t0 -> t1");

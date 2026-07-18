@@ -1,7 +1,8 @@
 //! Unification (Robinson's algorithm with occurs check).
 
+use super::env::substitute_vars;
 use super::subst::{Subst, apply_ty, compose};
-use super::ty::{Ty, TyVarId, ftv_ty};
+use super::ty::{Ty, TyVarId, ftv_ty, option_inner, result_ok_err};
 
 /// Failure modes for unification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,10 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // Same type constructor (e.g. `int` with `int`).
         (Ty::Con(a), Ty::Con(b)) if a == b => Ok(subst.clone()),
 
+        // Existentials are nominal at the type level. Concrete-to-existential
+        // conversion is a pack operation recorded by inference at value sites.
+        (Ty::Existential { class: a }, Ty::Existential { class: b }) if a == b => Ok(subst.clone()),
+
         // Isorecursive encoding: Ty::Con(name) matches Sum/Constructor of same name.
         (Ty::Con(c_name), Ty::Sum { name, variants })
         | (Ty::Sum { name, variants }, Ty::Con(c_name))
@@ -91,6 +96,86 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             unify_with(&s, b1.as_ref(), b2.as_ref())
         }
 
+        (
+            Ty::Forall {
+                bounds: b1,
+                constraints: c1,
+                body: body1,
+            },
+            Ty::Forall {
+                bounds: b2,
+                constraints: c2,
+                body: body2,
+            },
+        ) => {
+            if b1.len() != b2.len() {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Forall {
+                        bounds: b1,
+                        constraints: c1,
+                        body: body1,
+                    },
+                    right: Ty::Forall {
+                        bounds: b2,
+                        constraints: c2,
+                        body: body2,
+                    },
+                });
+            }
+
+            let mapping = b2.iter().copied().zip(b1.iter().copied()).collect();
+            let renamed_body2 = substitute_vars(&body2, &mapping);
+            let mut normalized_c1 = c1
+                .iter()
+                .map(|c| {
+                    (
+                        c.class.clone(),
+                        c.args
+                            .iter()
+                            .map(|a| format!("{}", a))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut normalized_c2 = c2
+                .iter()
+                .map(|c| {
+                    let renamed_args: Vec<_> = c
+                        .args
+                        .iter()
+                        .map(|a| substitute_vars(a, &mapping))
+                        .collect();
+                    (
+                        c.class.clone(),
+                        renamed_args
+                            .iter()
+                            .map(|a| format!("{}", a))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                })
+                .collect::<Vec<_>>();
+            normalized_c1.sort();
+            normalized_c2.sort();
+            if normalized_c1 != normalized_c2 {
+                return Err(UnifyError::Mismatch {
+                    left: Ty::Forall {
+                        bounds: b1,
+                        constraints: c1,
+                        body: body1,
+                    },
+                    right: Ty::Forall {
+                        bounds: b2,
+                        constraints: c2,
+                        body: body2,
+                    },
+                });
+            }
+
+            unify_with(subst, &body1, &renamed_body2)
+        }
+
         // List types: unify the element type.
         (Ty::List(a), Ty::List(b)) => unify_with(subst, a.as_ref(), b.as_ref()),
 
@@ -109,6 +194,40 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
                 current = unify_with(&current, a, b)?;
             }
             Ok(current)
+        }
+
+        // Poly enum annotations are `Ty::App` (Option/Result and user
+        // `enum Box<T>`). Constructor owners may still be structural
+        // `Ty::Sum` (builtins) — bridge those via payload extraction.
+        // User generic constructs use `Ty::App` owners and unify via the
+        // Constructor arm below (App ↔ owner).
+        (app @ Ty::App(_, _), sum @ Ty::Sum { .. })
+        | (sum @ Ty::Sum { .. }, app @ Ty::App(_, _)) => {
+            match unify_builtin_app_sum(subst, &app, &sum) {
+                Some(result) => result,
+                None => Err(UnifyError::Mismatch {
+                    left: app,
+                    right: sum,
+                }),
+            }
+        }
+
+        // Constructor values unify with an App parent by unifying the
+        // App against the constructor's owner (Sum for builtins, App
+        // for user generic enums).
+        (app @ Ty::App(_, _), ctor @ Ty::Constructor { .. })
+        | (ctor @ Ty::Constructor { .. }, app @ Ty::App(_, _)) => {
+            let owner = match &ctor {
+                Ty::Constructor { owner, .. } => owner.as_ref().clone(),
+                _ => unreachable!(),
+            };
+            match unify_with(subst, &app, &owner) {
+                Ok(s) => Ok(s),
+                Err(_) => Err(UnifyError::Mismatch {
+                    left: app,
+                    right: ctor,
+                }),
+            }
         }
 
         // Sum types: same name, matching variant count/names/shapes.
@@ -327,6 +446,88 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
         // Anything else: the constructors are incompatible.
         (left, right) => Err(UnifyError::Mismatch { left, right }),
     }
+}
+
+fn unify_builtin_app_sum(subst: &Subst, app: &Ty, sum: &Ty) -> Option<Result<Subst, UnifyError>> {
+    let Ty::App(con, args) = app else {
+        return None;
+    };
+
+    // Concrete head: `Option<T>` / `Result<T, E>` annotations vs structural sums.
+    if let Ty::Con(name) = con.as_ref() {
+        if common::is_builtin_option_enum(name) {
+            if args.len() != 1 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let Some(inner) = option_inner(sum) else {
+                return None;
+            };
+            return Some(unify_with(subst, &args[0], &inner));
+        }
+
+        if common::is_builtin_result_enum(name) {
+            if args.len() != 2 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let Some((ok, err)) = result_ok_err(sum) else {
+                return None;
+            };
+            let s = match unify_with(subst, &args[0], &ok) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(unify_with(&s, &args[1], &err));
+        }
+
+        return None;
+    }
+
+    // Variable head (Phase 5 HKT): unify `F<A>` with builtin Option/Result by
+    // binding `F` to the constructor constant, then unifying payload args.
+    // Without this, `get(Option::Some(42))` cannot discharge `Container<F>`.
+    if let Ty::Var(var) = con.as_ref() {
+        if let Some(inner) = option_inner(sum) {
+            if args.len() != 1 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let s = match bind_var(subst, *var, Ty::Con(common::BUILTIN_OPTION_ENUM.into())) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(unify_with(&s, &args[0], &inner));
+        }
+
+        if let Some((ok, err)) = result_ok_err(sum) {
+            if args.len() != 2 {
+                return Some(Err(UnifyError::Mismatch {
+                    left: app.clone(),
+                    right: sum.clone(),
+                }));
+            }
+            let s = match bind_var(subst, *var, Ty::Con(common::BUILTIN_RESULT_ENUM.into())) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            let s = match unify_with(&s, &args[0], &ok) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(unify_with(&s, &args[1], &err));
+        }
+
+        return None;
+    }
+
+    None
 }
 
 /// Bind `var` to `ty` after the occurs check.
@@ -855,5 +1056,50 @@ mod tests {
             ],
         );
         assert!(unify(&s, &s).is_ok());
+    }
+
+    // ---- Phase 5: HKT App(Var) ↔ builtin Option/Result ----
+
+    #[test]
+    fn unify_app_var_with_option_sum_binds_constructor_head() {
+        use crate::typechecking::ty::option_ty;
+        let app = Ty::App(Box::new(v(0)), vec![v(1)]);
+        let opt = option_ty(int());
+        let s = unify(&app, &opt).unwrap();
+        assert_eq!(
+            apply_ty_prune(&s, &v(0)),
+            Ty::Con(common::BUILTIN_OPTION_ENUM.into())
+        );
+        assert_eq!(apply_ty_prune(&s, &v(1)), int());
+    }
+
+    #[test]
+    fn unify_app_var_with_option_constructor_binds_head_and_payload() {
+        use crate::typechecking::ty::option_ty;
+        let app = Ty::App(Box::new(v(0)), vec![v(1)]);
+        let owner = option_ty(int());
+        let some = ctor(owner, 1, 1);
+        let s = unify(&app, &some).unwrap();
+        assert_eq!(
+            apply_ty_prune(&s, &v(0)),
+            Ty::Con(common::BUILTIN_OPTION_ENUM.into())
+        );
+        assert_eq!(apply_ty_prune(&s, &v(1)), int());
+    }
+
+    #[test]
+    fn unify_app_var_with_binary_concrete_app_binds_by_arity() {
+        let app = Ty::App(Box::new(v(0)), vec![v(1), v(2)]);
+        let concrete = Ty::App(
+            Box::new(Ty::Con(common::BUILTIN_RESULT_ENUM.into())),
+            vec![int(), string()],
+        );
+        let s = unify(&app, &concrete).unwrap();
+        assert_eq!(
+            apply_ty_prune(&s, &v(0)),
+            Ty::Con(common::BUILTIN_RESULT_ENUM.into())
+        );
+        assert_eq!(apply_ty_prune(&s, &v(1)), int());
+        assert_eq!(apply_ty_prune(&s, &v(2)), string());
     }
 }

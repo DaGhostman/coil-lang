@@ -65,6 +65,7 @@ The typechecker validates specifiers against arguments when the format string is
 | `%f` | `float` | Float (debug-style formatting) |
 | `%s` | `string` | String contents |
 | `%z` | `bool` | `true` or `false` |
+| `%v` | `T: Show` | `show(value)` then inserted as a string |
 | `%b` | `int` | Binary representation (VM-specific) |
 | `%x` | `int` | Hex representation (VM-specific) |
 | `%u` | `int` | Unsigned-style address rendering |
@@ -72,6 +73,8 @@ The typechecker validates specifiers against arguments when the format string is
 | `%%` | *(none)* | Literal `%` |
 
 **Not supported:** `%d` (rejected by typechecker — use `%i`).
+
+`%v` works for open type parameters when the enclosing function has a `Show` bound. Concrete `%i`/`%f`/`%s`/`%z` on an unresolved type variable are rejected (help text recommends `%v`).
 
 ### Examples
 

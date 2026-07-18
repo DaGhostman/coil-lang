@@ -4,7 +4,7 @@
 
 use ast::{
     AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output,
-    Pattern, PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, Visibility,
+    Pattern, PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -180,8 +180,133 @@ impl<'pratt> Pratt<'pratt> {
                     Some(args) => (e.span(), Box::new(Expression::TypeApp { name, args })),
                     None => (e.span(), Box::new(Expression::Type(name))),
                 });
-            choice((array_type, tuple_type, named_type))
+            // `Owner::Assoc` / `Owner::Assoc<T>` — associated-type projection.
+            // Tried before bare `named_type` so `Collect::Elem` is not
+            // left as `Type("Collect")` followed by a parse failure on `::`.
+            let projection_type = text::ident()
+                .padded()
+                .then_ignore(op!("::"))
+                .then(text::ident().padded())
+                .then(
+                    type_ann
+                        .clone()
+                        .separated_by(op!(','))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(op!('<'), op!('>'))
+                        .or_not(),
+                )
+                .map_with(|((owner, name), args_opt), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::TypeProjection {
+                            owner,
+                            name,
+                            args: args_opt.unwrap_or_default(),
+                        }),
+                    )
+                });
+            // `forall T. ty` / `forall T: Num + Eq, U. ty` — universally
+            // quantified type annotation. Tried BEFORE `named_type` so
+            // that `forall` is not parsed as an identifier.
+            let forall_type = keyword!("forall")
+                .ignore_then(
+                    self.single_type_param()
+                        .separated_by(op!(","))
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(op!("."))
+                .then(type_ann.clone())
+                .map_with(|(params, ty), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Forall {
+                            params,
+                            ty: Box::new(ty),
+                        }),
+                    )
+                });
+            let atom = choice((
+                array_type,
+                tuple_type,
+                forall_type,
+                projection_type,
+                named_type,
+            ));
+            atom.clone()
+                .then(op!("->").ignore_then(type_ann.clone()).or_not())
+                .map_with(|(lhs, rhs), e| match rhs {
+                    Some(rhs) => (e.span(), Box::new(Expression::TypeFun(lhs, rhs))),
+                    None => lhs,
+                })
         })
+    }
+
+    /// One type parameter: `T`, `T: Num + Eq`, `F: * -> *`, or
+    /// `c: * -> Constraint`.
+    ///
+    /// After `:`, either class bounds or a kind annotation. A kind annotation
+    /// may be followed by class bounds separated with a comma.
+    fn single_type_param(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, TypeParam<'pratt>, extra::Err<Rich<'pratt, char>>>
+           + Clone
+           + 'pratt {
+        use crate::ast::Kind;
+
+        let kind_ann = recursive(|kind| {
+            let atom = just('*')
+                .padded()
+                .to(Kind::Type)
+                .or(keyword!("Constraint").to(Kind::Constraint))
+                .or(kind.clone().delimited_by(op!("("), op!(")")));
+
+            atom.then(op!("->").ignore_then(kind).or_not())
+                .map(|(domain, codomain)| match codomain {
+                    Some(codomain) => Kind::Arrow(Box::new(domain), Box::new(codomain)),
+                    None => domain,
+                })
+        });
+
+        let class_bound = text::ident()
+            .padded()
+            .then_ignore(op!(":").not());
+        let class_bounds = class_bound
+            .separated_by(op!("+"))
+            .at_least(1)
+            .collect::<Vec<_>>();
+
+        // After `:`, try kind first (leading `*` or `(`), else class bounds.
+        let after_colon = kind_ann
+            .then(op!(",").ignore_then(class_bounds.clone()).or_not())
+            .map(|(kind, bounds)| (bounds.unwrap_or_default(), kind))
+            .or(class_bounds.map(|bounds| (bounds, Kind::Type)));
+
+        text::ident()
+            .padded()
+            .then(op!(":").ignore_then(after_colon).or_not())
+            .map(|(name, ann)| {
+                let (bounds, kind) = ann.unwrap_or_else(|| (Vec::new(), Kind::Type));
+                TypeParam { name, bounds, kind }
+            })
+    }
+
+    /// `<T, U: Num + Eq, F: * -> *, ...>` — optional generic type parameter list.
+    ///
+    /// Returns an empty `Vec` when no `<` is found.
+    fn type_param_list(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Vec<TypeParam<'pratt>>, extra::Err<Rich<'pratt, char>>>
+           + Clone
+           + 'pratt {
+        self.single_type_param()
+            .separated_by(op!(","))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("<"), op!(">"))
+            .or_not()
+            .map(|opt| opt.unwrap_or_default())
     }
 
     fn expr(
@@ -521,6 +646,83 @@ impl<'pratt> Pratt<'pratt> {
             .delimited_by(op!("("), op!(")"))
     }
 
+    /// Parse one `where` constraint: `Convert<A, B>` or unary `Num<T>`.
+    fn where_constraint(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, ast::WhereConstraint<'pratt>, extra::Err<Rich<'pratt, char>>>
+    + Clone
+    + 'pratt {
+        text::ident()
+            .padded()
+            .then(
+                self.type_annotation()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("<"), op!(">")),
+            )
+            .map(|(class, args)| ast::WhereConstraint { class, args })
+    }
+
+    /// Optional `where Class<T1, T2>, …` clause after a function's return type.
+    fn where_clause(
+        &self,
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        Vec<ast::WhereConstraint<'pratt>>,
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+           + 'pratt {
+        keyword!("where")
+            .ignore_then(
+                self.where_constraint()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .at_least(1)
+                    .collect(),
+            )
+            .or_not()
+            .map(|opt| opt.unwrap_or_default())
+    }
+
+    /// Parses the function *signature* (`async? fn Name<T>(args) -> ret where …`)
+    /// without consuming the body block.  Used by `typeclass_decl` to parse
+    /// sig-only methods that end in `;`.
+    ///
+    /// Returns
+    /// `((((((is_coro, _), name), type_params), args), returns), where_constraints)`.
+    fn func_sig(
+        &self,
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        (
+            (
+                (
+                    (
+                        ((Option<&'pratt str>, &'pratt str), &'pratt str),
+                        Vec<TypeParam<'pratt>>,
+                    ),
+                    Output<'pratt>,
+                ),
+                Option<Output<'pratt>>,
+            ),
+            Vec<ast::WhereConstraint<'pratt>>,
+        ),
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+           + 'pratt {
+        keyword!("async")
+            .or_not()
+            .then(keyword!("fn"))
+            .then(text::ident().padded())
+            .then(self.type_param_list())
+            .then(self.arg_list())
+            .then(op!("->").ignore_then(self.type_annotation()).or_not())
+            .then(self.where_clause())
+    }
+
     fn func<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -534,21 +736,28 @@ impl<'pratt> Pratt<'pratt> {
             .or_not()
             .then(keyword!("fn"))
             .then(text::ident().padded())
+            .then(self.type_param_list())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
+            .then(self.where_clause())
             .then(self.block(stmt))
-            .map_with(|(((((is_coro, _), name), args), returns), body), e| {
-                (
-                    e.span(),
-                    Box::new(Expression::Function {
-                        name,
-                        is_coro: is_coro.is_some(),
-                        args,
-                        returns,
-                        body,
-                    }),
-                )
-            })
+            .map_with(
+                |(((((((is_coro, _), name), type_params), args), returns), where_constraints), body),
+                 e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::Function {
+                            name,
+                            is_coro: is_coro.is_some(),
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body,
+                        }),
+                    )
+                },
+            )
     }
 
     fn yield_expr_<
@@ -949,9 +1158,23 @@ impl<'pratt> Pratt<'pratt> {
         // `enum_decl` is registered before `variable()` (which lives
         // inside `stmt`) so a leading `enum` keyword is not
         // mis-parsed as `let`.
+        //
+        // Ordering notes:
+        //  - `typeclass_decl` before `type_alias` so `typeclass` keyword
+        //    is not confused with a user identifier.
+        //  - `impl_block` handles inherent impls and simple typeclass impls
+        //    (`impl Num<int>`, `impl Show<Point>`) via the type-arg heuristic;
+        //    it is tried FIRST for all `impl` forms.
+        //  - `typeclass_impl_block` is the fallback for complex type-annotation
+        //    args (e.g. `impl Foo<Option<int>>`) that `type_param_list()` inside
+        //    `impl_block` cannot parse.  Chumsky 0.12 backtracks on failure, so
+        //    `impl_block` failing (after consuming `impl Name`) causes `choice` to
+        //    retry with `typeclass_impl_block`.
         choice((
             self.class(),
+            self.typeclass_decl(stmt.clone()),
             self.impl_block(stmt.clone()),
+            self.typeclass_impl_block(stmt.clone()),
             self.func(stmt.clone()),
             self.type_alias(),
             self.use_(),
@@ -971,14 +1194,16 @@ impl<'pratt> Pratt<'pratt> {
     {
         keyword!("type")
             .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
             .then_ignore(op!("="))
             .then(self.type_annotation())
             .then_ignore(op!(";"))
-            .map_with(|(name, ty), e| {
+            .map_with(|((name, type_params), ty), e| {
                 (
                     e.span(),
                     Box::new(Expression::TypeAlias {
                         name,
+                        type_params,
                         ty: Box::new(ty),
                     }),
                 )
@@ -1203,7 +1428,8 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("class")
-            .ignore_then(text::ident())
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
             .then(
                 self.field_decl()
                     .separated_by(op!(','))
@@ -1211,10 +1437,23 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
-            .map_with(|(name, fields), e| (e.span(), Box::new(Expression::Class(name, fields))))
+            .map_with(|((name, type_params), fields), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Class {
+                        name,
+                        type_params,
+                        fields,
+                    }),
+                )
+            })
     }
 
     /// `[pub] name: Type` — a class field declaration.
+    ///
+    /// The field type is parsed via `type_annotation()` so it can accept
+    /// generic types (`name: Option<int>`), arrays (`name: [int]`), tuples,
+    /// and `forall` annotations.
     fn field_decl(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -1223,7 +1462,7 @@ impl<'pratt> Pratt<'pratt> {
             .or_not()
             .then(text::ident())
             .then_ignore(op!(":"))
-            .then(text::ident().map_with(output!(Type)))
+            .then(self.type_annotation())
             .map_with(|((vis, name), ty), e| {
                 let visibility = if vis.is_some() {
                     Visibility::Public
@@ -1238,11 +1477,94 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// `impl Owner { [pub] fn ... , ... }`
+    /// `typeclass Name<T, U: Bound> { type Elem; fn sig(…) -> ret; fn default(…) { body } }`
     ///
-    /// Methods are private by default; `pub` makes them public.
-    /// `what` (the trait name) is not yet used — implementations are
-    /// always for the owner class.
+    /// Each body item is either:
+    /// - Associated type declaration: `type Elem;`
+    /// - Signature-only method: `fn name(args) -> ret;`  (represented as a
+    ///   `Function` with an empty `Block` body).
+    /// - Default implementation: `fn name(args) -> ret { body }`.
+    fn typeclass_decl<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        // A method that ends in `;` is signature-only: emit an empty Block.
+        let sig_only = self
+            .func_sig()
+            .then_ignore(op!(";"))
+            .map_with(
+                |((((((is_coro, _), name), type_params), args), returns), where_constraints), e| {
+                    let empty_block = (e.span(), Box::new(Expression::Block(vec![])));
+                    (
+                        e.span(),
+                        Box::new(Expression::Function {
+                            name,
+                            is_coro: is_coro.is_some(),
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body: empty_block,
+                        }),
+                    )
+                },
+            );
+
+        // A method with a full block body (the default implementation).
+        let default_method = self.func(stmt);
+
+        // Associated type declaration: `type Elem;` / `type Ref<T>;`
+        let assoc_decl = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
+            .then_ignore(op!(";"))
+            .map_with(|(name, type_params), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::AssocTypeDecl {
+                        name,
+                        type_params,
+                    }),
+                )
+            });
+
+        keyword!("typeclass")
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
+            .then(
+                choice((assoc_decl, sig_only, default_method))
+                    .padded()
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|((name, type_params), methods), e| {
+                (e.span(), Box::new(Expression::TypeClass { name, type_params, methods }))
+            })
+    }
+
+    /// Inherent `impl` block OR typeclass instance.
+    ///
+    /// After `impl Name`, an optional `<…>` section is parsed via
+    /// `type_param_list()`.  The result is classified at map time:
+    ///
+    /// - No `<…>` → `Implementation` (inherent, no type params).
+    /// - `<T>`, `<T: Num>` (type-parameter shape) → `Implementation`.
+    /// - `<int>`, `<string>`, `<Point>`, etc. (concrete type args) →
+    ///   `TypeClassImpl`.
+    ///
+    /// A bare angle-bracket name is treated as a type parameter when it has
+    /// bounds (`T: Num`) or is a single uppercase letter (`T`, `U`). Multi-
+    /// character names without bounds (`Point`, `int`) are concrete instance
+    /// heads — including user enums for `impl Show<Point>`.
+    ///
+    /// For complex type-annotation args (e.g. `impl Foo<Option<int>>`),
+    /// `typeclass_impl_block` is the fallback when `impl_block` fails to parse.
     fn impl_block<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -1252,22 +1574,140 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // Known lowercase primitive type names — these can never be TypeParam
+        // names; if they appear inside `<>`, the block is a typeclass impl.
+        const PRIMITIVES: &[&str] = &["int", "float", "string", "bool", "void", "unit"];
+
+        // Associated type definition: `type Elem = int;` / `type Ref<T> = T;`
+        let assoc_def = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
+            .then_ignore(op!("="))
+            .then(self.type_annotation())
+            .then_ignore(op!(";"))
+            .map_with(|((name, type_params), ty), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::AssocTypeDef {
+                        name,
+                        type_params,
+                        ty: Box::new(ty),
+                    }),
+                )
+            });
+
         keyword!("impl")
             .ignore_then(text::ident())
+            .then(self.type_param_list())
             .then(
-                // Methods are full `fn` declarations — separate them by
-                // juxtaposition (newlines / whitespace), not commas.
-                self.method_decl(stmt)
+                // Methods (and assoc type defs for typeclass impls) are
+                // separated by juxtaposition (newlines / whitespace), not commas.
+                choice((assoc_def, self.method_decl(stmt)))
                     .repeated()
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
-            .map_with(|(owner, methods), e| {
-                // Empty `what` — trait implementations are not yet supported.
+            .map_with(|((name, type_params), methods), e| {
+                // Classify by inspecting parsed param names.
+                let looks_like_type_param = |p: &TypeParam<'_>| -> bool {
+                    if PRIMITIVES.contains(&p.name) {
+                        return false;
+                    }
+                    // Bounded names are always type parameters (`T: Num`).
+                    if !p.bounds.is_empty() {
+                        return true;
+                    }
+                    // Single uppercase letter (`T`, `U`) — type-parameter shape.
+                    let mut chars = p.name.chars();
+                    matches!(chars.next(), Some(c) if c.is_uppercase()) && chars.next().is_none()
+                };
+                let is_typeclass_impl = !type_params.is_empty()
+                    && type_params.iter().any(|p| !looks_like_type_param(p));
+                if is_typeclass_impl {
+                    // e.g. `impl Num<int>` / `impl Show<Point>` → typeclass instance.
+                    // Re-wrap each param name as a bare Type annotation.
+                    let args = type_params
+                        .into_iter()
+                        .map(|p| (e.span(), Box::new(Expression::Type(p.name))))
+                        .collect();
+                    (e.span(), Box::new(Expression::TypeClassImpl { class: name, args, methods }))
+                } else {
+                    // e.g. `impl Cell {}` or `impl Cell<T>` or `impl Cell<T: Num>`.
+                    (
+                        e.span(),
+                        Box::new(Expression::Implementation {
+                            what: "",
+                            owner: name,
+                            type_params,
+                            methods,
+                        }),
+                    )
+                }
+            })
+    }
+
+    /// Typeclass-impl block for complex type-annotation arguments, e.g.
+    /// `impl Foo<Option<int>> { … }`.
+    ///
+    /// Each angle-bracket item is parsed as a full `type_annotation`, so
+    /// this parser handles any well-formed type, including generics.  It is
+    /// registered BEFORE `impl_block` in `declaration()` so that it wins for
+    /// cases that `type_param_list` cannot represent.
+    ///
+    /// Bare uppercase idents (which look like type params) are accepted here
+    /// too — if the user writes `impl Foo<T>` and `T` is ambiguous this
+    /// parser will win only when it appears before `impl_block` in the
+    /// `choice`; that ordering is intentional (inherent impls prefer
+    /// `impl_block`).
+    fn typeclass_impl_block<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        // Associated type definition: `type Elem = int;` / `type Ref<T> = T;`
+        let assoc_def = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
+            .then_ignore(op!("="))
+            .then(self.type_annotation())
+            .then_ignore(op!(";"))
+            .map_with(|((name, type_params), ty), e| {
                 (
                     e.span(),
-                    Box::new(Expression::Implementation("", owner, methods)),
+                    Box::new(Expression::AssocTypeDef {
+                        name,
+                        type_params,
+                        ty: Box::new(ty),
+                    }),
                 )
+            });
+
+        keyword!("impl")
+            .ignore_then(text::ident())
+            .then(
+                // Require a non-empty `<` type_annotation+ `>` — without
+                // angle brackets this parser doesn't match and falls through
+                // to `impl_block`.
+                self.type_annotation()
+                    .padded()
+                    .separated_by(op!(","))
+                    .allow_trailing()
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("<"), op!(">")),
+            )
+            .then(
+                choice((assoc_def, self.method_decl(stmt)))
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|((class, args), methods), e| {
+                (e.span(), Box::new(Expression::TypeClassImpl { class, args, methods }))
             })
     }
 
@@ -1714,6 +2154,7 @@ impl<'pratt> Pratt<'pratt> {
     {
         keyword!("enum")
             .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
             .then(
                 self.enum_variant()
                     .separated_by(op!(','))
@@ -1721,8 +2162,8 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!('{'), op!('}')),
             )
-            .map_with(|(name, variants), e| {
-                (e.span(), Box::new(Expression::EnumDecl { name, variants }))
+            .map_with(|((name, type_params), variants), e| {
+                (e.span(), Box::new(Expression::EnumDecl { name, type_params, variants }))
             })
     }
 
@@ -1731,13 +2172,13 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        // Record field: `name : Type` — types are bare identifiers
-        // wrapped in `Expression::Type(...)`. Duplicate names are
-        // rejected at parse time.
+        // Record field: `name : Type` — the type is parsed via
+        // `type_annotation()` so it can be generic (`Inner<T>`), an array,
+        // or a tuple.  Duplicate names are rejected at parse time.
         let record_field_decl = text::ident()
             .padded()
             .then_ignore(op!(":"))
-            .then(text::ident().padded().map_with(output!(Type)))
+            .then(self.type_annotation().padded())
             .map_with(|(name, value), _| RecordFieldDecl { name, value })
             .labelled("record field declaration");
 
@@ -1749,9 +2190,11 @@ impl<'pratt> Pratt<'pratt> {
             .map(EnumVariantPayload::Record)
             .labelled("record variant payload");
 
-        let tuple_payload_decl = text::ident()
+        // Tuple payload: each element is a full type annotation so that
+        // generic payloads like `Node(Tree<T>, Tree<T>)` are accepted.
+        let tuple_payload_decl = self
+            .type_annotation()
             .padded()
-            .map_with(output!(Type))
             .separated_by(op!(','))
             .allow_trailing()
             .collect::<Vec<_>>()
@@ -2033,7 +2476,7 @@ mod tests {
     fn enum_parses_to_enum_decl() {
         let ast = decl_ast!("enum Option { None, Some(int) }");
         match ast {
-            Expression::EnumDecl { name, variants } => {
+            Expression::EnumDecl { name, variants, .. } => {
                 assert_eq!(name, "Option");
                 assert_eq!(variants.len(), 2);
 
@@ -2070,7 +2513,7 @@ mod tests {
     fn enum_with_record_variant_parses() {
         let ast = decl_ast!("enum Shape { Circle { x: int, y: int } }");
         match ast {
-            Expression::EnumDecl { name, variants } => {
+            Expression::EnumDecl { name, variants, .. } => {
                 assert_eq!(name, "Shape");
                 assert_eq!(variants.len(), 1);
                 match variants[0].1.as_ref() {
@@ -3154,5 +3597,796 @@ fn main() { let p = new Point(1, 2); }
         let p = Pratt::default();
         p.parse(src)
             .unwrap_or_else(|e| panic!("expected space-separated impl methods: {e:?}"));
+    }
+}
+
+// ─── Generics parser tests ────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests_generics {
+    use super::*;
+    use ast::Expression;
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    macro_rules! decl_ast {
+        ($case: literal) => {
+            Pratt::default()
+                .declaration()
+                .parse($case)
+                .into_result()
+                .expect("parse failed")
+                .1
+                .as_ref()
+                .clone()
+        };
+    }
+
+    macro_rules! stmt {
+        ($case: literal) => {
+            Pratt::default()
+                .declaration()
+                .parse($case)
+                .into_result()
+                .unwrap()
+                .1
+                .to_string()
+        };
+    }
+
+    // ── type_alias with type params ────────────────────────────────────────────
+
+    /// `type Id<T> = T;` — Display round-trips correctly.
+    #[test]
+    fn type_alias_with_single_type_param_round_trips() {
+        assert_eq!(stmt!("type Id<T> = T;"), "type Id<T> = T;");
+    }
+
+    /// `type Pair<A, B> = (A, B);` — two type params, no bounds.
+    #[test]
+    fn type_alias_with_two_type_params_round_trips() {
+        assert_eq!(stmt!("type Pair<A, B> = (A, B);"), "type Pair<A, B> = (A, B);");
+    }
+
+    /// `type Num<T: Add + Mul> = T;` — single param with two bounds.
+    #[test]
+    fn type_alias_with_bounded_type_param_round_trips() {
+        assert_eq!(stmt!("type Bounded<T: Add + Mul> = T;"), "type Bounded<T: Add + Mul> = T;");
+    }
+
+    /// AST: `type Id<T> = T;` has one type param named `T` with no bounds.
+    #[test]
+    fn type_alias_type_param_ast_structure() {
+        match decl_ast!("type Id<T> = T;") {
+            Expression::TypeAlias { name, type_params, .. } => {
+                assert_eq!(name, "Id");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert!(type_params[0].bounds.is_empty());
+            }
+            other => panic!("expected TypeAlias, got {:?}", other),
+        }
+    }
+
+    /// AST: `type Bounded<T: Num + Eq> = T;` — bounds are recorded.
+    #[test]
+    fn type_alias_bounded_param_ast_structure() {
+        match decl_ast!("type Bounded<T: Num + Eq> = T;") {
+            Expression::TypeAlias { type_params, .. } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(type_params[0].bounds, vec!["Num", "Eq"]);
+            }
+            other => panic!("expected TypeAlias, got {:?}", other),
+        }
+    }
+
+    // ── fn with type params ────────────────────────────────────────────────────
+
+    /// `fn id<T>(T x) -> T {}` — single unbounded type param.
+    #[test]
+    fn fn_with_single_type_param_parses() {
+        match decl_ast!("fn id<T>(T x) -> T {}") {
+            Expression::Function { name, type_params, .. } => {
+                assert_eq!(name, "id");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert!(type_params[0].bounds.is_empty());
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// `fn add<T: Num>(T a, T b) -> T {}` — one bounded type param.
+    #[test]
+    fn fn_with_bounded_type_param_parses() {
+        match decl_ast!("fn add<T: Num>(T a, T b) -> T {}") {
+            Expression::Function { name, type_params, .. } => {
+                assert_eq!(name, "add");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(type_params[0].bounds, vec!["Num"]);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// `fn zip<A, B>(A a, B b) -> (A, B) {}` — two unbounded type params.
+    #[test]
+    fn fn_with_two_type_params_parses() {
+        match decl_ast!("fn zip<A, B>(A a, B b) -> (A, B) {}") {
+            Expression::Function { name, type_params, .. } => {
+                assert_eq!(name, "zip");
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(type_params[0].name, "A");
+                assert_eq!(type_params[1].name, "B");
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// `fn cmp<T: Eq + Ord>(T a, T b) -> bool {}` — multiple bounds.
+    #[test]
+    fn fn_with_multiple_bounds_parses() {
+        match decl_ast!("fn cmp<T: Eq + Ord>(T a, T b) -> bool {}") {
+            Expression::Function { type_params, .. } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(type_params[0].bounds, vec!["Eq", "Ord"]);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    // ── fn with no type params (regression: type_params is empty) ─────────────
+
+    /// Plain `fn main() {}` still has an empty `type_params` list.
+    #[test]
+    fn fn_without_type_params_has_empty_list() {
+        match decl_ast!("fn main() {}") {
+            Expression::Function { type_params, .. } => {
+                assert!(type_params.is_empty());
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    // ── where clause ──────────────────────────────────────────────────────────
+
+    /// `fn f<A, B>(A x) -> B where Convert<A, B> {}` — multi-param where.
+    #[test]
+    fn fn_with_multiparam_where_clause_parses() {
+        match decl_ast!("fn f<A, B>(A x) -> B where Convert<A, B> {}") {
+            Expression::Function {
+                name,
+                type_params,
+                where_constraints,
+                ..
+            } => {
+                assert_eq!(name, "f");
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(where_constraints.len(), 1);
+                assert_eq!(where_constraints[0].class, "Convert");
+                assert_eq!(where_constraints[0].args.len(), 2);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// Unary `where Num<T>` parses alongside binder bounds remaining empty.
+    #[test]
+    fn fn_with_unary_where_clause_parses() {
+        match decl_ast!("fn g<T>(T x) -> T where Num<T> {}") {
+            Expression::Function {
+                where_constraints, ..
+            } => {
+                assert_eq!(where_constraints.len(), 1);
+                assert_eq!(where_constraints[0].class, "Num");
+                assert_eq!(where_constraints[0].args.len(), 1);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// Display round-trips a multi-param where clause.
+    #[test]
+    fn fn_with_where_clause_display_round_trips() {
+        let s = stmt!("fn f<A, B>(A x) -> B where Convert<A, B> {}");
+        assert!(
+            s.contains("where Convert<A, B>"),
+            "expected where clause in display, got: {s}"
+        );
+        assert!(s.starts_with("fn f<A, B>"), "got: {s}");
+    }
+
+    // ── enum with type params ──────────────────────────────────────────────────
+
+    /// `enum Option<T> { None, Some(T) }` — one type param.
+    #[test]
+    fn enum_with_single_type_param_parses() {
+        match decl_ast!("enum Option<T> { None, Some(T), }") {
+            Expression::EnumDecl { name, type_params, .. } => {
+                assert_eq!(name, "Option");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+            }
+            other => panic!("expected EnumDecl, got {:?}", other),
+        }
+    }
+
+    /// `enum Result<T, E> { Ok(T), Err(E) }` — two type params.
+    #[test]
+    fn enum_with_two_type_params_parses() {
+        match decl_ast!("enum Result<T, E> { Ok(T), Err(E), }") {
+            Expression::EnumDecl { name, type_params, .. } => {
+                assert_eq!(name, "Result");
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(type_params[1].name, "E");
+            }
+            other => panic!("expected EnumDecl, got {:?}", other),
+        }
+    }
+
+    // ── class with type params ─────────────────────────────────────────────────
+
+    /// `class Box<T> { value: T, }` — one type param.
+    #[test]
+    fn class_with_single_type_param_parses() {
+        match decl_ast!("class Box<T> { value: T, }") {
+            Expression::Class { name, type_params, .. } => {
+                assert_eq!(name, "Box");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+            }
+            other => panic!("expected Class, got {:?}", other),
+        }
+    }
+
+    /// `class Pair<A, B: Ord> { first: A, second: B, }` — two params, one bounded.
+    #[test]
+    fn class_with_bounded_type_params_parses() {
+        match decl_ast!("class Pair<A, B: Ord> { first: A, second: B, }") {
+            Expression::Class { name, type_params, .. } => {
+                assert_eq!(name, "Pair");
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(type_params[0].name, "A");
+                assert!(type_params[0].bounds.is_empty());
+                assert_eq!(type_params[1].name, "B");
+                assert_eq!(type_params[1].bounds, vec!["Ord"]);
+            }
+            other => panic!("expected Class, got {:?}", other),
+        }
+    }
+
+    // ── inherent impl with type params ─────────────────────────────────────────
+
+    /// `impl Cell<T> { fn get() -> T {} }` → `Implementation` with one type param.
+    #[test]
+    fn inherent_impl_with_type_param_parses() {
+        match decl_ast!("impl Cell<T> { fn get() -> T {} }") {
+            Expression::Implementation { owner, type_params, .. } => {
+                assert_eq!(owner, "Cell");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+            }
+            other => panic!("expected Implementation, got {:?}", other),
+        }
+    }
+
+    /// `impl Foo<T: Num + Eq> { fn bar() {} }` — bounded param.
+    #[test]
+    fn inherent_impl_with_bounded_type_param_parses() {
+        match decl_ast!("impl Foo<T: Num + Eq> { fn bar() {} }") {
+            Expression::Implementation { owner, type_params, .. } => {
+                assert_eq!(owner, "Foo");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(type_params[0].bounds, vec!["Num", "Eq"]);
+            }
+            other => panic!("expected Implementation, got {:?}", other),
+        }
+    }
+
+    /// `impl Point { fn sum() {} }` — no type params, inherent impl.
+    #[test]
+    fn inherent_impl_without_type_params_parses() {
+        match decl_ast!("impl Point { fn sum() {} }") {
+            Expression::Implementation { owner, type_params, .. } => {
+                assert_eq!(owner, "Point");
+                assert!(type_params.is_empty());
+            }
+            other => panic!("expected Implementation, got {:?}", other),
+        }
+    }
+
+    // ── typeclass impl (primitive type args) ───────────────────────────────────
+
+    /// `impl Num<int> { fn add(int a, int b) -> int {} }` → `TypeClassImpl`.
+    #[test]
+    fn typeclass_impl_with_primitive_type_arg_parses() {
+        match decl_ast!("impl Num<int> { fn add(int a, int b) -> int {} }") {
+            Expression::TypeClassImpl { class, args, .. } => {
+                assert_eq!(class, "Num");
+                assert_eq!(args.len(), 1);
+                // The single arg should be `Type("int")`.
+                assert!(matches!(args[0].1.as_ref(), Expression::Type("int")));
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    /// `impl Show<string> { fn show(string s) -> string {} }` — string arg.
+    #[test]
+    fn typeclass_impl_with_string_type_arg_parses() {
+        match decl_ast!("impl Show<string> { fn show(string s) -> string {} }") {
+            Expression::TypeClassImpl { class, args, .. } => {
+                assert_eq!(class, "Show");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].1.as_ref(), Expression::Type("string")));
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    /// `impl Show<Point> { … }` — user enum / multi-char concrete type arg
+    /// must parse as `TypeClassImpl`, not an inherent `Implementation` for a
+    /// class named `Show` (Phase 4 `%v` / Show).
+    #[test]
+    fn typeclass_impl_with_user_type_arg_parses() {
+        match decl_ast!("impl Show<Point> { fn show(Point p) -> string {} }") {
+            Expression::TypeClassImpl { class, args, .. } => {
+                assert_eq!(class, "Show");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].1.as_ref(), Expression::Type("Point")));
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    // ── typeclass decl ─────────────────────────────────────────────────────────
+
+    /// `typeclass Eq<T> { fn eq(T a, T b) -> bool; }` — sig-only method.
+    #[test]
+    fn typeclass_with_sig_only_method_parses() {
+        match decl_ast!("typeclass Eq<T> { fn eq(T a, T b) -> bool; }") {
+            Expression::TypeClass { name, type_params, methods } => {
+                assert_eq!(name, "Eq");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(methods.len(), 1);
+                // The sig-only method is a Function with an empty Block body.
+                match methods[0].1.as_ref() {
+                    Expression::Function { name: mname, body, .. } => {
+                        assert_eq!(*mname, "eq");
+                        assert!(matches!(body.1.as_ref(), Expression::Block(stmts) if stmts.is_empty()));
+                    }
+                    other => panic!("expected Function, got {:?}", other),
+                }
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    /// `typeclass Num<T> { fn add(T a, T b) -> T { return a + b; } }` — default method.
+    #[test]
+    fn typeclass_with_default_method_parses() {
+        match decl_ast!("typeclass Num<T> { fn add(T a, T b) -> T { return a + b; } }") {
+            Expression::TypeClass { name, type_params, methods } => {
+                assert_eq!(name, "Num");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(methods.len(), 1);
+                // A default method has a non-empty block.
+                match methods[0].1.as_ref() {
+                    Expression::Function { name: mname, body, .. } => {
+                        assert_eq!(*mname, "add");
+                        // Block is non-empty (contains the return statement).
+                        assert!(matches!(body.1.as_ref(), Expression::Block(stmts) if !stmts.is_empty()));
+                    }
+                    other => panic!("expected Function, got {:?}", other),
+                }
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    /// `typeclass Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }` — two sig-only.
+    #[test]
+    fn typeclass_with_bounded_param_and_two_methods_parses() {
+        match decl_ast!(
+            "typeclass Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }"
+        ) {
+            Expression::TypeClass { name, type_params, methods } => {
+                assert_eq!(name, "Ord");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].bounds, vec!["Eq"]);
+                assert_eq!(methods.len(), 2);
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    /// `typeclass Show { fn show() -> string; }` — no type params (plain typeclass).
+    #[test]
+    fn typeclass_without_type_params_parses() {
+        match decl_ast!("typeclass Show { fn show() -> string; }") {
+            Expression::TypeClass { name, type_params, methods } => {
+                assert_eq!(name, "Show");
+                assert!(type_params.is_empty());
+                assert_eq!(methods.len(), 1);
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    // ── forall type annotations ────────────────────────────────────────────────
+
+    /// `type F = forall T. T;` — single unbounded forall param in type alias.
+    #[test]
+    fn forall_in_type_alias_parses() {
+        match decl_ast!("type F = forall T. T;") {
+            Expression::TypeAlias { ty, type_params: alias_params, .. } => {
+                assert!(alias_params.is_empty()); // the alias itself has no params
+                match ty.1.as_ref() {
+                    Expression::Forall { params, ty: inner } => {
+                        assert_eq!(params.len(), 1);
+                        assert_eq!(params[0].name, "T");
+                        assert!(params[0].bounds.is_empty());
+                        // inner type is `T` (an identifier / Type node)
+                        assert!(matches!(
+                            inner.1.as_ref(),
+                            Expression::Type("T") | Expression::Identifier("T")
+                        ));
+                    }
+                    other => panic!("expected Forall, got {:?}", other),
+                }
+            }
+            other => panic!("expected TypeAlias, got {:?}", other),
+        }
+    }
+
+    /// `type F = forall T: Num. T;` — single bounded forall param.
+    #[test]
+    fn forall_with_bounded_param_in_type_alias_parses() {
+        match decl_ast!("type F = forall T: Num. T;") {
+            Expression::TypeAlias { ty, .. } => {
+                match ty.1.as_ref() {
+                    Expression::Forall { params, .. } => {
+                        assert_eq!(params.len(), 1);
+                        assert_eq!(params[0].name, "T");
+                        assert_eq!(params[0].bounds, vec!["Num"]);
+                    }
+                    other => panic!("expected Forall, got {:?}", other),
+                }
+            }
+            other => panic!("expected TypeAlias, got {:?}", other),
+        }
+    }
+
+    /// `type F = forall T, U. T;` — two unbounded forall params.
+    #[test]
+    fn forall_with_two_params_in_type_alias_parses() {
+        match decl_ast!("type F = forall T, U. T;") {
+            Expression::TypeAlias { ty, .. } => {
+                match ty.1.as_ref() {
+                    Expression::Forall { params, .. } => {
+                        assert_eq!(params.len(), 2);
+                        assert_eq!(params[0].name, "T");
+                        assert_eq!(params[1].name, "U");
+                    }
+                    other => panic!("expected Forall, got {:?}", other),
+                }
+            }
+            other => panic!("expected TypeAlias, got {:?}", other),
+        }
+    }
+
+    /// `forall T. T` Display round-trip: `forall T. T`
+    #[test]
+    fn forall_display_round_trips() {
+        assert_eq!(stmt!("type F = forall T. T;"), "type F = forall T. T;");
+    }
+
+    // ── Display round-trips for new forms ─────────────────────────────────────
+
+    /// `type Id<T> = T;` (already tested above — extra sanity check).
+    #[test]
+    fn type_alias_with_param_display_is_stable() {
+        // Parse and re-display must be identity.
+        let s = stmt!("type Map<K, V> = (K, V);");
+        assert_eq!(s, "type Map<K, V> = (K, V);");
+    }
+
+    /// TypeClass Display: `typeclass Eq<T> { … }`
+    #[test]
+    fn typeclass_display_round_trips() {
+        // The Display impl omits the function bodies' args (unhandled Display)
+        // so we only check that the outer structure round-trips and contains
+        // the expected substrings.
+        let s = stmt!("typeclass Show { fn show() -> string; }");
+        assert!(s.starts_with("typeclass Show {"), "got: {s}");
+        assert!(s.contains("show"), "got: {s}");
+    }
+
+    /// `F: * -> *` parses as an Arrow-kinded type parameter.
+    #[test]
+    fn constructor_kind_annotation_parses() {
+        match decl_ast!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }") {
+            Expression::TypeClass { type_params, .. } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "F");
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Type),
+                        Box::new(crate::ast::Kind::Type)
+                    )
+                );
+                assert!(type_params[0].bounds.is_empty());
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn constraint_kind_annotation_parses() {
+        match decl_ast!("fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }")
+        {
+            Expression::Function { type_params, .. } => {
+                assert_eq!(type_params.len(), 2);
+                assert_eq!(type_params[0].name, "c");
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Type),
+                        Box::new(crate::ast::Kind::Constraint)
+                    )
+                );
+                assert_eq!(type_params[1].name, "T");
+                assert_eq!(type_params[1].bounds, vec!["c"]);
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn binary_hkt_kind_annotation_is_right_associative() {
+        match decl_ast!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }") {
+            Expression::TypeClass { type_params, .. } => {
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Type),
+                        Box::new(crate::ast::Kind::Arrow(
+                            Box::new(crate::ast::Kind::Type),
+                            Box::new(crate::ast::Kind::Type)
+                        ))
+                    )
+                );
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parenthesized_kind_annotation_parses() {
+        match decl_ast!("typeclass Higher<F: (* -> *) -> *> { fn tag<G: * -> *>(F<G> xs) -> int; }") {
+            Expression::TypeClass { type_params, .. } => {
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Arrow(
+                            Box::new(crate::ast::Kind::Type),
+                            Box::new(crate::ast::Kind::Type)
+                        )),
+                        Box::new(crate::ast::Kind::Type)
+                    )
+                );
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn kind_annotation_can_be_followed_by_bound() {
+        match decl_ast!(
+            "fn use_bi<F: * -> * -> *, Bifunctor, A, B>(F<A, B> xs) -> int { return 0; }"
+        ) {
+            Expression::Function { type_params, .. } => {
+                assert_eq!(type_params.len(), 3);
+                assert_eq!(type_params[0].name, "F");
+                assert_eq!(type_params[0].bounds, vec!["Bifunctor"]);
+                assert_eq!(type_params[1].name, "A");
+                assert_eq!(type_params[2].name, "B");
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// Display keeps constructor-kind annotations on type params.
+    #[test]
+    fn constructor_kind_display_round_trips() {
+        let s = stmt!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }");
+        assert!(
+            s.contains("F: * -> *"),
+            "expected kind annotation in display, got: {s}"
+        );
+    }
+
+    #[test]
+    fn binary_hkt_kind_display_round_trips() {
+        let s = stmt!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }");
+        assert!(
+            s.contains("F: * -> * -> *"),
+            "expected binary kind annotation in display, got: {s}"
+        );
+    }
+
+    #[test]
+    fn constraint_kind_display_round_trips() {
+        let s = stmt!("fn apply_c<c: * -> Constraint, T: c>(T x) -> string { return show(x); }");
+        assert!(
+            s.contains("c: * -> Constraint"),
+            "expected constraint kind annotation in display, got: {s}"
+        );
+        assert!(s.contains("T: c"), "expected abstract bound in display, got: {s}");
+    }
+
+    /// TypeClassImpl Display: `impl Num<int> { … }`
+    #[test]
+    fn typeclass_impl_display_round_trips() {
+        let s = stmt!("impl Num<int> {}");
+        assert_eq!(s, "impl Num<int> {  }");
+    }
+
+    /// Phase 6: associated type decl + projection parse / Display round-trip.
+    #[test]
+    fn assoc_type_decl_and_projection_round_trip() {
+        match decl_ast!(
+            "typeclass Collect<C> { type Elem; fn head(C xs) -> Elem; }"
+        ) {
+            Expression::TypeClass { methods, .. } => {
+                assert!(
+                    methods
+                        .iter()
+                        .any(|m| matches!(m.1.as_ref(), Expression::AssocTypeDecl { name: "Elem", .. })),
+                    "expected AssocTypeDecl Elem, got {:?}",
+                    methods
+                );
+                // Return type of head should be bare Type("Elem") (resolved as assoc later).
+                let head = methods.iter().find_map(|m| match m.1.as_ref() {
+                    Expression::Function {
+                        name: "head",
+                        returns: Some(r),
+                        ..
+                    } => Some(r.1.as_ref()),
+                    _ => None,
+                });
+                assert!(
+                    matches!(head, Some(Expression::Type("Elem"))),
+                    "expected bare Elem return, got {:?}",
+                    head
+                );
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+
+        let proj = Pratt::default()
+            .type_annotation()
+            .parse("Collect::Elem")
+            .into_result()
+            .expect("projection parse failed");
+        assert!(
+            matches!(
+                proj.1.as_ref(),
+                Expression::TypeProjection {
+                    owner: "Collect",
+                    name: "Elem",
+                    args,
+                }
+                if args.is_empty()
+            ),
+            "expected TypeProjection, got {:?}",
+            proj.1
+        );
+        assert_eq!(format!("{}", proj.1), "Collect::Elem");
+
+        let s = stmt!(
+            "typeclass Collect<C> { type Elem; fn head(C xs) -> Elem; }"
+        );
+        assert!(s.contains("type Elem;"), "got: {s}");
+        assert!(s.contains("Collect"), "got: {s}");
+    }
+
+    /// Phase 6: assoc type def inside typeclass impl.
+    #[test]
+    fn assoc_type_def_in_impl_parses() {
+        match decl_ast!(
+            "impl Collect<Option<int>> { type Elem = int; fn head(Option<int> xs) -> int { return 0; } }"
+        ) {
+            Expression::TypeClassImpl { methods, .. } => {
+                assert!(
+                    methods.iter().any(|m| matches!(
+                        m.1.as_ref(),
+                        Expression::AssocTypeDef {
+                            name: "Elem",
+                            ..
+                        }
+                    )),
+                    "expected AssocTypeDef Elem, got {:?}",
+                    methods
+                );
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_assoc_type_decl_parses() {
+        match decl_ast!(
+            "typeclass Pointer<P> { type Ref<T>; fn get<T>(P p) -> P::Ref<T>; }"
+        ) {
+            Expression::TypeClass { methods, .. } => {
+                let assoc = methods.iter().find_map(|m| match m.1.as_ref() {
+                    Expression::AssocTypeDecl { name: "Ref", type_params } => Some(type_params),
+                    _ => None,
+                });
+                let params = assoc.expect("expected Ref associated type declaration");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "T");
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_assoc_type_def_in_impl_parses() {
+        match decl_ast!(
+            "impl Pointer<Box> { type Ref<T> = T; fn get<T>(Box p) -> T { return 0; } }"
+        ) {
+            Expression::TypeClassImpl { methods, .. } => {
+                let assoc = methods.iter().find_map(|m| match m.1.as_ref() {
+                    Expression::AssocTypeDef { name: "Ref", type_params, .. } => {
+                        Some(type_params)
+                    }
+                    _ => None,
+                });
+                let params = assoc.expect("expected Ref associated type definition");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "T");
+            }
+            other => panic!("expected TypeClassImpl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn generic_assoc_type_projection_parses_and_displays() {
+        let proj = Pratt::default()
+            .type_annotation()
+            .parse("Pointer::Ref<int>")
+            .into_result()
+            .expect("projection parse failed");
+        match proj.1.as_ref() {
+            Expression::TypeProjection { owner, name, args } => {
+                assert_eq!((*owner, *name), ("Pointer", "Ref"));
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].1.as_ref(), Expression::Type("int")));
+            }
+            other => panic!("expected TypeProjection, got {:?}", other),
+        }
+        assert_eq!(format!("{}", proj.1), "Pointer::Ref<int>");
+    }
+
+    /// Inherent impl Display: `impl Point { … }`
+    #[test]
+    fn inherent_impl_display_round_trips() {
+        let s = stmt!("impl Point {}");
+        assert_eq!(s, "impl Point {  }");
+    }
+
+    /// Inherent impl with type param Display: `impl Cell<T> { … }`
+    #[test]
+    fn inherent_impl_with_type_param_display_round_trips() {
+        let s = stmt!("impl Cell<T> {}");
+        assert_eq!(s, "impl Cell<T> {  }");
     }
 }

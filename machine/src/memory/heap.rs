@@ -214,6 +214,12 @@ impl Heap {
             Object::Coroutine(c) => {
                 c.release();
             }
+            Object::Boxed(b) => {
+                b.release();
+            }
+            Object::PolyFn(p) => {
+                p.release();
+            }
         }
     }
 
@@ -346,6 +352,9 @@ impl fmt::Display for Error {
     }
 }
 
+pub type RefBoxed = Gc<ObjBoxed>;
+pub type RefPolyFn = Gc<ObjPolyFn>;
+
 #[derive(Clone, Copy)]
 pub enum Object {
     String(RefString),
@@ -355,6 +364,8 @@ pub enum Object {
     Tuple(crate::memory::Gc<ObjTuple>),
     Array(crate::memory::Gc<ObjArray>),
     Coroutine(RefCoroutine),
+    Boxed(RefBoxed),
+    PolyFn(RefPolyFn),
 }
 
 impl Object {
@@ -368,6 +379,8 @@ impl Object {
             Self::Tuple(t) => t.mark(),
             Self::Array(a) => a.mark(),
             Self::Coroutine(c) => c.mark(),
+            Self::Boxed(b) => b.mark(),
+            Self::PolyFn(p) => p.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -384,6 +397,8 @@ impl Object {
             Self::Tuple(t) => t.unmark(),
             Self::Array(a) => a.unmark(),
             Self::Coroutine(c) => c.unmark(),
+            Self::Boxed(b) => b.unmark(),
+            Self::PolyFn(p) => p.unmark(),
         }
     }
 
@@ -398,6 +413,8 @@ impl Object {
             Self::Tuple(t) => t.is_marked(),
             Self::Array(a) => a.is_marked(),
             Self::Coroutine(c) => c.is_marked(),
+            Self::Boxed(b) => b.is_marked(),
+            Self::PolyFn(p) => p.is_marked(),
         }
     }
 
@@ -424,6 +441,18 @@ impl Object {
             Self::Tuple(_) => {}
             Self::Array(_) => {}
             Self::Coroutine(_) => {}
+            Self::Boxed(b) => {
+                if let Member::Object(o) = &b.as_ref().payload {
+                    o.mark(grey_objects);
+                }
+            }
+            Self::PolyFn(p) => {
+                for captured in p.as_ref().captured_dicts.iter().flatten() {
+                    if let Member::Object(o) = captured {
+                        o.mark(grey_objects);
+                    }
+                }
+            }
         }
     }
 
@@ -438,6 +467,8 @@ impl Object {
             Self::Tuple(t) => t.get_next(),
             Self::Array(a) => a.get_next(),
             Self::Coroutine(c) => c.get_next(),
+            Self::Boxed(b) => b.get_next(),
+            Self::PolyFn(p) => p.get_next(),
         }
     }
 
@@ -451,6 +482,8 @@ impl Object {
             Self::Tuple(t) => t.set_next(next),
             Self::Array(a) => a.set_next(next),
             Self::Coroutine(c) => c.set_next(next),
+            Self::Boxed(b) => b.set_next(next),
+            Self::PolyFn(p) => p.set_next(next),
         }
     }
 
@@ -464,6 +497,8 @@ impl Object {
             Self::Tuple(t) => t.as_ptr() as u64,
             Self::Array(a) => a.as_ptr() as u64,
             Self::Coroutine(c) => c.as_ptr() as u64,
+            Self::Boxed(b) => b.as_ptr() as u64,
+            Self::PolyFn(p) => p.as_ptr() as u64,
         }
     }
 }
@@ -478,6 +513,8 @@ impl GcSized for Object {
             Self::Tuple(t) => t.size(),
             Self::Array(a) => a.size(),
             Self::Coroutine(c) => c.size(),
+            Self::Boxed(b) => b.size(),
+            Self::PolyFn(p) => p.size(),
         }
     }
 }
@@ -492,6 +529,8 @@ impl fmt::Display for Object {
             Self::Tuple(t) => write!(f, "{}", t.as_ref()),
             Self::Array(a) => write!(f, "{}", a.as_ref()),
             Self::Coroutine(c) => write!(f, "{}", c.as_ref()),
+            Self::Boxed(_) => write!(f, "<boxed 0x{:08x}>", self.addr()),
+            Self::PolyFn(_) => write!(f, "<polyfn 0x{:08x}>", self.addr()),
         }
     }
 }
@@ -506,7 +545,9 @@ impl Object {
             | Self::Library(_)
             | Self::Tuple(_)
             | Self::Array(_)
-            | Self::Coroutine(_) => std::ptr::null(),
+            | Self::Coroutine(_)
+            | Self::Boxed(_)
+            | Self::PolyFn(_) => std::ptr::null(),
         }
     }
 }
@@ -613,6 +654,25 @@ pub struct ObjCoroutine {
     pub yield_from_resume_ip: usize,
 }
 
+/// Heap-allocated boxed value for the generics runtime.
+pub struct ObjBoxed {
+    /// `ValueTag` discriminant stored as a raw `u16`.
+    pub tag: u16,
+    /// The wrapped payload.
+    pub payload: Member,
+}
+
+/// Heap-allocated polymorphic function descriptor.
+pub struct ObjPolyFn {
+    /// Bytecode entry offset of the monomorphised body.
+    pub entry: u32,
+    /// Number of type parameters expected (reserved for future use).
+    pub type_arity: u8,
+    /// Dictionary evidence captured when this value escaped a constrained
+    /// scope. `None` leaves the position for application-time evidence.
+    pub captured_dicts: Vec<Option<Member>>,
+}
+
 impl GcSized for ObjTuple {
     fn size(&self) -> usize {
         mem::size_of::<Self>() + self.elements.capacity() * mem::size_of::<Value>()
@@ -629,6 +689,18 @@ impl GcSized for ObjCoroutine {
     fn size(&self) -> usize {
         // `saved_stack` / `saved_frames` use Rust's allocator, not the VM
         // heap byte counter (same contract as `ObjInstance`).
+        mem::size_of::<Self>()
+    }
+}
+
+impl GcSized for ObjBoxed {
+    fn size(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+}
+
+impl GcSized for ObjPolyFn {
+    fn size(&self) -> usize {
         mem::size_of::<Self>()
     }
 }

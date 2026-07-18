@@ -158,6 +158,51 @@ pub enum Instruction {
     /// ArrayLen: stack `array` -> int length.
     ArrayPush,
     ArrayLen,
+
+    // Generics runtime — append-only.
+    /// CallIndirect: stack `[value_args..., app_dicts..., target]` (TOS = target).
+    ///
+    /// Operand packing:
+    /// - `[15:0]`  = value arity (non-dictionary arguments)
+    /// - `[31:16]` = application dictionary arity (0 for plain code-offset calls)
+    ///
+    /// When the target is an `ObjPolyFn` with captured evidence, the VM merges
+    /// `captured_dicts` with the application dictionaries (preferring captures)
+    /// before setting up the callee frame. Plain integer/`CodePtr` targets ignore
+    /// captures and treat `[15:0]` as the full argument count when `[31:16] == 0`
+    /// for backward compatibility (`arity = value_arity + app_dict_arity`).
+    CallIndirect,
+    /// BoxValue: [15:0] ValueTag as u16; pop raw value → push Object::Boxed pointer
+    BoxValue,
+    /// UnboxValue: [15:0] expected ValueTag; pop Boxed → push payload or leave default on mismatch
+    UnboxValue,
+    /// MakePolyFn: [31:0] entry offset; push Object::PolyFn
+    MakePolyFn,
+    /// DynAdd / DynSub / DynMul / DynDiv / DynMod — pop b, a (boxed or immediate); push result
+    DynAdd,
+    DynSub,
+    DynMul,
+    DynDiv,
+    DynMod,
+    /// DynCmp: [7:0] kind (0=Le,1=Leq,2=Gt,3=Geq); pop b,a; push bool
+    DynCmp,
+    /// DynEq / DynNe — pop b,a; push bool
+    DynEq,
+    DynNe,
+    /// DynPrint — pop one boxed/immediate; write Display-ish to output (int/float/bool/string)
+    DynPrint,
+
+    /// CodePtr: [31:0] absolute bytecode entry offset.
+    ///
+    /// Self-identifying code pointer used by dictionary method slots and
+    /// direct `CallIndirect` targets. Distinct from `CONST` so peephole
+    /// fusion can relocate these offsets without mistaking them for data.
+    CodePtr,
+    /// MakePolyFnCapture: stack `[captured dictionaries..., CodePtr entry]` →
+    /// `ObjPolyFn`. `operands[7:0]` is the number of dictionary slots in
+    /// declaration order. A null (`0`) slot is stored as unresolved (`None`)
+    /// and filled at `CallIndirect` from application evidence.
+    MakePolyFnCapture,
 }
 
 impl From<u8> for Instruction {

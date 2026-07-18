@@ -71,6 +71,12 @@ fn example_option_prints_42() {
 }
 
 #[test]
+fn example_generics_uses_builtin_dictionary_abi() {
+    let output = run_example("examples/generics.0s");
+    assert_eq!(output, "7424.042");
+}
+
+#[test]
 fn example_result_prints_42_and_neg1() {
     let output = run_example("examples/result.0s");
     assert_eq!(output, "420-1");
@@ -131,9 +137,310 @@ fn example_classes_prints_7458() {
 }
 
 #[test]
+fn example_generic_class_prints_42() {
+    let output = run_example("examples/generic_class.0s");
+    assert_eq!(output, "42");
+}
+
+#[test]
 fn example_aliases_prints_3_4_7() {
     let output = run_example("examples/aliases.0s");
     assert_eq!(output, "347");
+}
+
+#[test]
+fn example_generic_alias_prints_7() {
+    let output = run_example("examples/generic_alias.0s");
+    assert_eq!(output, "7");
+}
+
+#[test]
+fn example_generic_enum_prints_7() {
+    let output = run_example("examples/generic_enum.0s");
+    assert_eq!(output, "7");
+}
+
+#[test]
+fn example_generics_prints_add_results_for_int_and_float() {
+    let output = run_example("examples/generics.0s");
+    assert_eq!(output, "7424.042");
+}
+
+#[test]
+fn example_typeclass_dict_forwards_dictionary_and_prints_42_twice() {
+    let output = run_example("examples/typeclass_dict.0s");
+    assert_eq!(output, "4242");
+}
+
+#[test]
+fn example_typeclass_default_calls_sibling_and_prints_42() {
+    let output = run_example("examples/typeclass_default.0s");
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn example_polyfn_supports_multi_instantiation_constraints_and_rank_n() {
+    let output = run_example("examples/polyfn.0s");
+    assert_eq!(output, "424.0424242");
+}
+
+/// Phase 4: `%v` displays through Show (builtin + user instance + format).
+#[test]
+fn example_generic_print_shows_primitives_and_user_type() {
+    let output = run_example("examples/generic_print.0s");
+    assert_eq!(output, "42hi1.5true(3,4)99");
+}
+
+/// Advanced generics Phase 4: a bare unary typeclass name is an existential type.
+#[test]
+fn example_existential_show_prints_42() {
+    let output = run_example("examples/existential_show.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 8: tuples and anonymous records have structural Show for `%v`.
+#[test]
+fn example_show_tuple_prints_structural_tuple_and_record() {
+    let output = run_example("examples/show_tuple.0s");
+    assert_eq!(output, "(1, 2){ a: 3, b: 4 }");
+}
+
+/// Constructor-kind typeclass `Container<Option>` + `get<F: Container, A>(F<A>)`.
+#[test]
+fn example_hkt_container_prints_42() {
+    let output = run_example("examples/hkt_container.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 1 advanced generics: binary HKT `Bifunctor<Result>`.
+#[test]
+fn example_hkt_bifunctor_prints_42() {
+    let output = run_example("examples/hkt_bifunctor.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 3: multi-param typeclass `Convert<A, B>` + `where` clause.
+#[test]
+fn example_multiparam_prints_42() {
+    let output = run_example("examples/multiparam.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 5: superclass / implied bounds (`Ordered<T: Equal>` → `eq_val` under `T: Ordered`).
+#[test]
+fn example_superclass_ord_prints_truetruefalse() {
+    let output = run_example("examples/superclass_ord.0s");
+    assert_eq!(output, "truetruefalse");
+}
+
+/// Advanced generics Phase 5: `c: * -> Constraint, T: c` with superclass method use.
+#[test]
+fn example_constraint_kind_prints_42() {
+    let output = run_example("examples/constraint_kind.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 6: associated types — `Collect::Elem` pinned from ground instance.
+#[test]
+fn example_assoc_type_prints_42() {
+    let output = run_example("examples/assoc_type.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 3 advanced generics: generic associated type `Pointer::Ref<A>`.
+#[test]
+fn example_gat_pointer_prints_42() {
+    let output = run_example("examples/gat_pointer.0s");
+    assert_eq!(output, "42");
+}
+
+/// Shuffled record pattern `{ y: _, x: a }` must bind declaration-order `x`.
+#[test]
+fn shuffled_record_pattern_binds_declaration_order_field() {
+    let src = r#"
+        enum E { Foo { x: int, y: int, z: int } }
+        fn main() {
+            let e = E::Foo { x: 1, y: 2, z: 3 };
+            let v = match e {
+                E::Foo { y: _, x: a, z: _ } => a,
+            };
+            print "%i", v;
+        }
+    "#;
+    assert_eq!(run_example_src(src), "1");
+}
+
+/// Phase 4: open `%v` inside a Show-bound generic body.
+#[test]
+fn generic_print_open_bound_uses_show_dictionary() {
+    let src = r#"
+        fn show_it<T: Show>(T x) {
+            print "%v,", x;
+        }
+        fn main() {
+            show_it(10);
+            show_it(20);
+        }
+    "#;
+    assert_eq!(run_example_src(src), "10,20,");
+}
+
+/// Phase 4: `format "%v"` produces a string for further use.
+#[test]
+fn format_percent_v_parity_with_print() {
+    let src = r#"
+        fn main() {
+            let s = format "%v-%v", 1, "x";
+            print "%s", s;
+        }
+    "#;
+    assert_eq!(run_example_src(src), "1-x");
+}
+
+/// Phase 4: captured dictionaries remain valid after the creating frame returns
+/// and the application site need not supply dictionaries (`app_dict_arity=0`).
+#[test]
+fn polyfn_captured_dict_survives_return() {
+    let src = r#"
+        typeclass Describable<T> {
+            fn describe_val(T x) -> int;
+        }
+        impl Describable<int> {
+            fn describe_val(int x) -> int { return x + 1; }
+        }
+        fn show<T: Describable>(T x) -> int {
+            return describe_val(x);
+        }
+        fn capture_show<T: Describable>(T _w) {
+            return show;
+        }
+        fn main() {
+            let f = capture_show(0);
+            print "%i", f(41);
+        }
+    "#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _constants) = pipeline.compile_src(src).expect("compile");
+    let capture = bytecode
+        .iter()
+        .find(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture))
+        .expect("expected MakePolyFnCapture when escaping show from a constrained scope");
+    assert_eq!(
+        capture.operand_u32() & 0xFF,
+        1,
+        "capture should reserve one Describable dict slot"
+    );
+    // Application of the returned PolyFn must not require a second MakeTuple
+    // dict at the call site — evidence lives in the capture.
+    let capture_pos = bytecode
+        .iter()
+        .position(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture))
+        .unwrap();
+    let call_indirects_after: Vec<_> = bytecode[capture_pos..]
+        .iter()
+        .filter(|b| matches!(b.bytecode(), common::Instruction::CallIndirect))
+        .collect();
+    assert!(
+        call_indirects_after
+            .iter()
+            .any(|b| (b.operand_u32() >> 16) == 0),
+        "captured PolyFn call should use app_dict_arity=0; CallIndirect operands: {:?}",
+        call_indirects_after
+            .iter()
+            .map(|b| b.operand_u32())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(run_example_src(src), "42");
+}
+
+/// Phase 4: multiparam `Convert<A,B>` capture works after return with no app dict.
+/// Both type args are witnessed at the capture call so the dict is concrete.
+#[test]
+fn polyfn_multiparam_capture_survives_return() {
+    let src = r#"
+        typeclass Convert<A, B> {
+            fn cast(A x) -> B;
+        }
+        impl Convert<int, int> {
+            fn cast(int x) -> int { return x; }
+        }
+        fn convert_fn<A, B>(A x) -> B where Convert<A, B> {
+            return cast(x);
+        }
+        fn capture_convert<A, B>(A _wa, B _wb) where Convert<A, B> {
+            return convert_fn;
+        }
+        fn main() {
+            let f = capture_convert(0, 0);
+            print "%i", f(42);
+        }
+    "#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _constants) = pipeline.compile_src(src).expect("compile");
+    let capture = bytecode
+        .iter()
+        .find(|b| matches!(b.bytecode(), common::Instruction::MakePolyFnCapture))
+        .expect("expected MakePolyFnCapture for multiparam escape");
+    assert_eq!(capture.operand_u32() & 0xFF, 1);
+    assert_eq!(run_example_src(src), "42");
+}
+
+/// Phase 1: PolyFn + fib-style arithmetic still receives peephole fusion.
+#[test]
+fn polyfn_with_fib_keeps_fused_superinstructions() {
+    use common::Instruction;
+    let src = r#"
+        fn id<T>(T x) -> T { return x; }
+        fn fib(int n) -> int {
+            if n <= 2 { return 1; }
+            return fib(n - 1) + fib(n - 2);
+        }
+        fn main() {
+            let f = id;
+            print "%i", f(fib(6));
+        }
+    "#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline.compile_src(src).expect("compile");
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn))
+    );
+    let has_fused = bytecode.iter().any(|b| {
+        matches!(
+            b.bytecode(),
+            Instruction::BinSlotImm
+                | Instruction::BinSlotImmJmpf
+                | Instruction::BinSlotSlot
+                | Instruction::CmpJmpf
+                | Instruction::BinReturn
+                | Instruction::ConstReturnImm
+                | Instruction::LoadReturnSlot
+        )
+    });
+    assert!(
+        has_fused,
+        "expected fused ops with PolyFn present; opcodes: {:?}",
+        bytecode.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    // fib(6) = 8
+    assert_eq!(output, "8");
+}
+
+#[test]
+fn monomorphized_generic_add_prints_3() {
+    let output = run_example_src(
+        r#"fn add<T: Num>(T a, T b) -> T {
+            return a + b;
+        }
+
+        fn main() {
+            print "%i", add(1, 2);
+        }"#,
+    );
+    assert_eq!(output, "3");
 }
 
 #[test]
@@ -247,14 +554,14 @@ fn let_binding_emits_store_pop_in_bytecode() {
     let (bytecode, _constants) = pipeline.compile_test("", &ast);
     assert!(!bytecode.is_empty(), "program should produce bytecode");
 
-    let store_pop_count = bytecode
+    let binding_store_pop_count = bytecode
         .iter()
-        .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+        .filter(|b| matches!(b.bytecode(), Instruction::StorePop) && b.operand_u32() == 0)
         .count();
     assert_eq!(
-        store_pop_count, 2,
-        "expected exactly 2 StorePop for one let + one re-assignment; got {}",
-        store_pop_count
+        binding_store_pop_count, 2,
+        "expected exactly 2 StorePop writes to binding slot 0 for one let + one re-assignment; got {}",
+        binding_store_pop_count
     );
 
     let store_count = bytecode

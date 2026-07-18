@@ -1,0 +1,40 @@
+// Expected output: truetruefalse
+//
+// Phase 5: typeclass superclass / implied bounds.
+// `Ordered<T: Equal>` stores Equal as a superclass. Dictionary layout is
+// flattened (Ordered methods, then Equal methods). A generic with only
+// `T: Ordered` can call `eq_val` via the implied Equal bound.
+
+typeclass Equal<T> {
+    fn eq_val(T a, T b) -> bool;
+}
+
+typeclass Ordered<T: Equal> {
+    fn lt_val(T a, T b) -> bool;
+}
+
+impl Equal<int> {
+    fn eq_val(int a, int b) -> bool {
+        return a == b;
+    }
+}
+
+impl Ordered<int> {
+    fn lt_val(int a, int b) -> bool {
+        return a < b;
+    }
+}
+
+fn cmp_eq<T: Ordered>(T a, T b) -> bool {
+    return eq_val(a, b);
+}
+
+fn cmp_lt<T: Ordered>(T a, T b) -> bool {
+    return lt_val(a, b);
+}
+
+fn main() {
+    print "%z", cmp_eq(3, 3);
+    print "%z", cmp_lt(1, 2);
+    print "%z", cmp_eq(1, 2);
+}

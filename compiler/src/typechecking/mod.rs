@@ -4,12 +4,16 @@
 //! for inference, native registration, and span-indexed type lookup.
 
 pub mod env;
+pub mod generics;
 pub mod id;
 pub mod infer;
+pub mod kind;
 pub mod pretty;
 pub mod subst;
 pub mod ty;
 pub mod unify;
 
-pub use infer::{CallbackSigDef, Checker, CStructDef};
+pub use infer::{CStructDef, CallbackSigDef, Checker};
+#[allow(unused_imports)] // public API for kind-aware callers / tests
+pub use kind::Kind;
 pub use ty::Ty;

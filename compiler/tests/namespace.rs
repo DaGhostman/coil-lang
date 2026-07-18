@@ -99,6 +99,30 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
 }
 
+fn compile_project_errors(project_root: &PathBuf, entry: &PathBuf) -> Vec<String> {
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(project_root).expect("chdir to project root");
+
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src_from_file(entry.to_str().unwrap());
+    assert!(result.is_err(), "expected compile to fail");
+    pipeline
+        .messages()
+        .iter()
+        .map(|m| m.message().to_string())
+        .collect()
+}
+
 #[test]
 fn use_single_segment_resolves_in_src_root() {
     let manifest = r#"
@@ -223,6 +247,132 @@ roots = ["./src"]
     let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "ok");
+}
+
+#[test]
+fn orphan_instance_across_modules_is_rejected() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.0s",
+            "use iface::*;\n\
+             impl Foreign<int> { fn id(int x) -> int { return x; } }\n\
+             fn main() { }\n",
+        ),
+        (
+            "src/iface.0s",
+            "typeclass Foreign<T> { fn id(T x) -> int; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.0s");
+    let msgs = compile_project_errors(&root, &entry);
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Orphan instance `Foreign<int>`")),
+        "expected orphan-instance diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+/// Phase 1: multi-module link finalizes peephole fusion once, relocating
+/// `MakePolyFn` while keeping fused fib-style ops in the entry module.
+#[test]
+fn two_module_polyfn_and_fib_fuse_and_run() {
+    use common::Instruction;
+
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    // Keep recursive `fib` in the entry namespace (empty prefix) — namespaced
+    // modules do not rewrite bare recursive calls to the FQN today.
+    let files = &[
+        (
+            "src/main.0s",
+            "use util::inc;\n\
+             fn id<T>(T x) -> T { return x; }\n\
+             fn fib(int n) -> int {\n\
+               if n <= 2 { return 1; }\n\
+               return fib(n - 1) + fib(n - 2);\n\
+             }\n\
+             fn main() {\n\
+               let f = id;\n\
+               print \"%i\", f(inc(fib(5)));\n\
+             }\n",
+        ),
+        (
+            "src/util/inc.0s",
+            "fn inc(int x) -> int { return x + 1; }\n",
+        ),
+    ];
+    let (root, entry) = build_project("two_module_polyfn_fib", manifest, files, "src/main.0s");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
+        Err(()) => {
+            for msg in pipeline.messages() {
+                eprintln!("PIPELINE ERROR: {}", msg.message());
+            }
+            panic!("two-module polyfn+fib compile failed");
+        }
+    };
+
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::MakePolyFn)),
+        "expected MakePolyFn in linked bytecode"
+    );
+    let has_fused = bytecode.iter().any(|b| {
+        matches!(
+            b.bytecode(),
+            Instruction::BinSlotImm
+                | Instruction::BinSlotImmJmpf
+                | Instruction::BinSlotSlot
+                | Instruction::CmpJmpf
+                | Instruction::BinReturn
+                | Instruction::ConstReturnImm
+                | Instruction::LoadReturnSlot
+        )
+    });
+    assert!(
+        has_fused,
+        "final-link fusion should leave fused ops; opcodes: {:?}",
+        bytecode
+            .iter()
+            .map(|b| b.bytecode())
+            .collect::<Vec<_>>()
+    );
+
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let shared = SharedBuf(Rc::clone(&buf));
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared);
+    machine.run_raw(&bytecode, &constants);
+    let _ = machine.restore_output();
+    let output = String::from_utf8(
+        Rc::try_unwrap(buf)
+            .expect("VM still holds buffer")
+            .into_inner(),
+    )
+    .expect("utf8");
+    // fib(5)=5, inc(5)=6, id(6)=6
+    assert_eq!(output, "6");
 }
 
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

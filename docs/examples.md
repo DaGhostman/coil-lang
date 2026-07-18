@@ -71,6 +71,24 @@ fn main() {
 
 ---
 
+### `examples/show_tuple.0s`
+
+**Demonstrates:** `%v` structural Show for tuples and anonymous records.
+
+```0s
+fn main() {
+    print "%v", (1, 2);
+    print "%v", { a: 3, b: 4 };
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/show_tuple.0s` |
+| **Output** | `(1, 2){ a: 3, b: 4 }` |
+
+---
+
 ### `examples/let_test.0s`
 
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).
@@ -509,6 +527,261 @@ fn main() {
 
 ---
 
+### `examples/generic_alias.0s`
+
+**Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
+
+```0s
+type Pair<T> = (T, T);
+
+fn main() {
+    let p: Pair<int> = (3, 4);
+    print "%i", p[0] + p[1];
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_alias.0s` |
+| **Output** | `7` |
+
+---
+
+### `examples/generic_enum.0s`
+
+**Demonstrates:** User generic enums — `enum Box<T> { Empty, Full(T) }` with construct/match typed as `Box<int>` (same machinery as builtin `Option` / `Result`).
+
+```0s
+enum Box<T> {
+    Empty,
+    Full(T),
+}
+
+fn unwrap(Box<int> b) -> int {
+    return match b {
+        Box::Empty => 0,
+        Box::Full(v) => v,
+    };
+}
+
+fn main() {
+    print "%i", unwrap(Box::Full(7));
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_enum.0s` |
+| **Output** | `7` |
+
+---
+
+### `examples/generics.0s`
+
+**Demonstrates:** Generic functions with a `Num` typeclass bound — one `add<T: Num>` body used at `int` and `float` call sites.
+
+```0s
+fn add<T: Num>(T a, T b) -> T {
+    return a + b;
+}
+
+fn main() {
+    print "%i", add(3, 4);
+    print "%i", add(10, 32);
+    print "%f", add(1.5, 2.5);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generics.0s` |
+| **Output** | `7424.042` |
+
+---
+
+### `examples/generic_print.0s`
+
+**Demonstrates:** Format `%v` via the `Show` typeclass — builtin instances for
+primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_print.0s` |
+| **Output** | `42hi1.5true(3,4)99` |
+
+---
+
+### `examples/existential_show.0s`
+
+**Demonstrates:** Bare-class existential `Show` in a parameter type. The call
+`print_any(42)` packs the concrete value with its `Show<int>` dictionary, and
+`show(x)` dispatches through that stored dictionary.
+
+```0s
+fn print_any(Show x) {
+    print "%s", show(x);
+}
+
+fn main() {
+    print_any(42);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/existential_show.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/hkt_container.0s`
+
+**Demonstrates:** Unary higher-kinded typeclasses (`Container<F: * -> *>`) with
+an `impl Container<Option>`, a polymorphic instance method `first<A>`, and a
+generic caller `get<F: Container, A>(F<A>) -> A`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/hkt_container.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/hkt_bifunctor.0s`
+
+**Demonstrates:** Binary higher-kinded typeclasses
+(`Bifunctor<F: * -> * -> *>`) with an `impl Bifunctor<Result>` and a
+generic caller whose parameter has both an explicit kind and bound:
+`F: * -> * -> *, Bifunctor`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/hkt_bifunctor.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/multiparam.0s`
+
+**Demonstrates:** Multi-parameter typeclass `Convert<A, B>` with a `where`
+clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/multiparam.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/typeclass_dict.0s`
+
+**Demonstrates:** User typeclass dictionaries, method sugar, and dictionary
+forwarding through a nested generic call.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/typeclass_dict.0s` |
+| **Output** | `4242` |
+
+---
+
+### `examples/typeclass_default.0s`
+
+**Demonstrates:** An omitted default method calling a sibling implementation
+through the same dictionary.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/typeclass_default.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/superclass_ord.0s`
+
+**Demonstrates:** Typeclass superclass / implied bounds —
+`typeclass Ordered<T: Equal>` stores `Equal` as a superclass; `fn cmp_eq<T: Ordered>`
+can call `eq_val` without writing `T: Ordered + Equal`. Flattened dict layout
+is subclass methods then superclass methods.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/superclass_ord.0s` |
+| **Output** | `truetruefalse` |
+
+---
+
+### `examples/constraint_kind.0s`
+
+**Demonstrates:** Constraint-kind parameters
+(`fn choose<c: * -> Constraint, T: c>(...)`). The body first selects
+`c = Ordered` through `lt_val`, then calls `eq_val` through Ordered's
+`Equal` superclass dictionary slot.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/constraint_kind.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/assoc_type.0s`
+
+**Demonstrates:** Associated types — `type Elem;` in a typeclass,
+`type Elem = int;` in the impl, bare `Elem` as a method return type,
+open `C::Elem` under `C: Collect`, and a ground `take_head(Option::Some(42))`
+call that pins the projection to `int`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/assoc_type.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/gat_pointer.0s`
+
+**Demonstrates:** Generic associated types — `type Ref<T>;` in a
+typeclass, `type Ref<T> = T;` in the impl, and an applied projection
+`P::Ref<A>` pinned by the selected `Pointer<Option>` instance.
+
+```0s
+typeclass Pointer<P: * -> *> {
+    type Ref<T>;
+    fn deref<T>(P<T> ptr) -> Ref<T>;
+}
+
+impl Pointer<Option> {
+    type Ref<T> = T;
+    fn deref<T>(Option<T> ptr) -> T { /* ... */ }
+}
+
+fn get<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A> {
+    return deref(ptr);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/gat_pointer.0s` |
+| **Output** | `42` |
+
+---
+
+### `examples/polyfn.0s`
+
+**Demonstrates:** First-class generic functions, multi-instantiation,
+constrained apply-site dictionaries, rank-n `forall` parameters, and
+captured dictionary evidence that survives returning a PolyFn
+(`app_dict_arity=0` at the use site).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/polyfn.0s` |
+| **Output** | `424.0424242` |
+
+---
+
 ## Modules & namespaces
 
 Multi-file projects using `use` and `mod`. Support files live under `examples/src/`.
@@ -698,6 +971,34 @@ fn main() {
 | **Run** | `cargo run -- examples/classes.0s` |
 | **Output** | `7458` |
 
+### `examples/generic_class.0s`
+
+**Demonstrates:** Generic class declaration (`class Cell<T>`), inherent
+`impl Cell<T>`, constructor type inference (`new Cell(42)` → `Cell<int>`),
+and a method that returns the type parameter.
+
+```0s
+class Cell<T> {
+    value: T
+}
+
+impl Cell<T> {
+    fn get() -> T {
+        return self.value;
+    }
+}
+
+fn main() {
+    let c = new Cell(42);
+    print "%i", c.get();
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/generic_class.0s` |
+| **Output** | `42` |
+
 ---
 
 ## Coroutines
@@ -788,6 +1089,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `print_literal.0s` | Basics | `hello` |
 | `format_literal.0s` | Basics | `42` |
 | `string_fmt.0s` | Basics | `hello world42-x` |
+| `show_tuple.0s` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.0s` | Basics | `51020` |
 | `const.0s` | Basics | `42hi` |
 | `for_break.0s` | Basics | `18` |
@@ -806,6 +1108,21 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
+| `generic_alias.0s` | Types | `7` |
+| `generic_enum.0s` | Enums / types | `7` |
+| `generics.0s` | Types | `7424.042` |
+| `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
+| `existential_show.0s` | Types | `42` |
+| `hkt_container.0s` | Types | `42` |
+| `hkt_bifunctor.0s` | Types | `42` |
+| `multiparam.0s` | Types | `42` |
+| `typeclass_dict.0s` | Types | `4242` |
+| `typeclass_default.0s` | Types | `42` |
+| `superclass_ord.0s` | Types | `truetruefalse` |
+| `constraint_kind.0s` | Types | `42` |
+| `assoc_type.0s` | Types | `42` |
+| `gat_pointer.0s` | Types | `42` |
+| `polyfn.0s` | Types | `424.0424242` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |
 | `src/foo/sadge.0s` | Modules | (support file) |
@@ -816,6 +1133,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `ffi_callback_ret.0s` | FFI | `1` |
 | `sum.c` | FFI | (C source, not `.0s`) |
 | `classes.0s` | Classes | `7458` |
+| `generic_class.0s` | Classes | `42` |
 | `coro.0s` | Coroutines | (see source) |
 | `coro_gen.0s` | Coroutines | `012` |
 | `coro_send.0s` | Coroutines | `hello` |

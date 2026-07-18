@@ -155,6 +155,9 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
     let bounds: Vec<TyVarId> = ty_ftv.difference(&env_ftv).copied().collect();
     Scheme {
         bounds,
+        kinds: Vec::new(),
+        constraints: Vec::new(),
+        assoc_projections: Vec::new(),
         ty: ty.clone(),
     }
 }
@@ -165,24 +168,85 @@ pub fn generalize(env: &Env, ty: &Ty) -> Scheme {
 /// The fresh variables are minted in the order they appear in
 /// `scheme.bounds`, so two instantiations of the same scheme produce
 /// different but consistently-ordered substitutions.
+///
+/// Returns the instantiated type and freshened constraints (with new
+/// variable ids substituted).
 pub fn instantiate(scheme: &Scheme, counter: &mut TyVarCounter) -> Ty {
+    instantiate_with_kinds(scheme, counter).0
+}
+
+/// Like [`instantiate`], but also returns the freshened constraints.
+///
+/// Used by call-site constraint discharge in the typechecker
+/// (`infer.rs` `Expression::Call` path).
+pub fn instantiate_with_constraints(
+    scheme: &Scheme,
+    counter: &mut TyVarCounter,
+) -> (Ty, Vec<super::ty::Constraint>) {
+    let (ty, constraints, _) = instantiate_with_kinds(scheme, counter);
+    (ty, constraints)
+}
+
+/// Instantiate a scheme, returning the freshened type, constraints, and a
+/// map from each fresh variable to its kind (Phase 5).
+pub fn instantiate_with_kinds(
+    scheme: &Scheme,
+    counter: &mut TyVarCounter,
+) -> (
+    Ty,
+    Vec<super::ty::Constraint>,
+    HashMap<TyVarId, super::kind::Kind>,
+) {
+    use super::ty::Constraint;
+    let mut fresh_kinds = HashMap::new();
     let mapping: HashMap<TyVarId, TyVarId> = scheme
         .bounds
         .iter()
-        .map(|&v| (v, counter.fresh()))
+        .enumerate()
+        .map(|(i, &v)| {
+            let fresh = counter.fresh();
+            fresh_kinds.insert(fresh, scheme.kind_at(i));
+            (v, fresh)
+        })
         .collect();
-    substitute_vars(&scheme.ty, &mapping)
+    let ty = substitute_vars(&scheme.ty, &mapping);
+    let constraints = scheme
+        .constraints
+        .iter()
+        .map(|c| Constraint {
+            class: c.class.clone(),
+            args: c
+                .args
+                .iter()
+                .map(|a| substitute_vars(a, &mapping))
+                .collect(),
+        })
+        .collect();
+    let _assoc_projections = scheme
+        .assoc_projections
+        .iter()
+        .map(|p| super::ty::AssocProjection {
+            var: mapping.get(&p.var).copied().unwrap_or(p.var),
+            name: p.name.clone(),
+            args: p
+                .args
+                .iter()
+                .map(|a| substitute_vars(a, &mapping))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    (ty, constraints, fresh_kinds)
 }
 
 /// Walk `ty`, replacing every variable in `mapping` with its mapped
 /// value. Variables not in the mapping are left alone.
-fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
+pub(crate) fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
     match ty {
         Ty::Var(v) => match mapping.get(v) {
             Some(&new) => Ty::Var(new),
             None => Ty::Var(*v),
         },
-        Ty::Con(_) => ty.clone(),
+        Ty::Con(_) | Ty::Existential { .. } => ty.clone(),
         Ty::Fun(a, b) => Ty::Fun(
             Box::new(substitute_vars(a, mapping)),
             Box::new(substitute_vars(b, mapping)),
@@ -235,6 +299,27 @@ fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> Ty {
                 .map(|(n, t)| (n.clone(), substitute_vars(t, mapping)))
                 .collect(),
         },
+        Ty::Forall {
+            bounds,
+            constraints,
+            body,
+        } => {
+            let mut inner = mapping.clone();
+            for bound in bounds {
+                inner.remove(bound);
+            }
+            Ty::Forall {
+                bounds: bounds.clone(),
+                constraints: constraints
+                    .iter()
+                    .map(|c| super::ty::Constraint {
+                        class: c.class.clone(),
+                        args: c.args.iter().map(|a| substitute_vars(a, &inner)).collect(),
+                    })
+                    .collect(),
+                body: Box::new(substitute_vars(body, &inner)),
+            }
+        }
     }
 }
 
@@ -369,6 +454,9 @@ mod tests {
             "f",
             Scheme {
                 bounds: vec![TyVarId(0)],
+                kinds: vec![],
+                constraints: vec![],
+                assoc_projections: vec![],
                 ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
             },
         );
@@ -460,6 +548,9 @@ mod tests {
         // ∀α. α -> α  ; instantiate should give β -> β for fresh β.
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
         let mut counter = TyVarCounter::new();
@@ -473,6 +564,9 @@ mod tests {
         // ∀α β. α -> β  ; instantiate gives γ -> δ.
         let s = Scheme {
             bounds: vec![TyVarId(0), TyVarId(1)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(1))),
         };
         let mut counter = TyVarCounter::new();
@@ -489,6 +583,9 @@ mod tests {
         // let-polymorphism its power.
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(Box::new(v(0)), Box::new(v(0))),
         };
         let mut counter = TyVarCounter::new();
@@ -506,6 +603,9 @@ mod tests {
         // ∀α. (α -> α) -> α -> α
         let s = Scheme {
             bounds: vec![TyVarId(0)],
+            kinds: vec![],
+            constraints: vec![],
+            assoc_projections: vec![],
             ty: Ty::Fun(
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),
                 Box::new(Ty::Fun(Box::new(v(0)), Box::new(v(0)))),

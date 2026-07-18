@@ -125,6 +125,12 @@ fn patch_targets(byte: &mut Byte, fusion_sites: &[FusionSite], pool: &mut [u64])
                 pool[idx] = adjust_target(pool[idx] as usize, fusion_sites) as u64;
             }
         }
+        // Self-identifying absolute code pointers (dictionary slots,
+        // CallIndirect targets, escaped generic fn values).
+        Instruction::CodePtr | Instruction::MakePolyFn => {
+            let t = adjust_target(byte.operand_u32() as usize, fusion_sites);
+            *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
+        }
         _ => {}
     }
 }
@@ -317,10 +323,7 @@ fn try_fuse_load_const_cmp_jmpf(window: &[Byte], pool: &mut Vec<u64>) -> Option<
     let target = window[3].operand_u32() as u64;
     let idx = pool.len();
     pool.push((target << 32) | (imm as u16 as u32 as u64));
-    Some(
-        Byte::new(Instruction::BinSlotImmJmpf)
-            .with_bin_slot_imm_jmpf(op as u8, slot, idx as u16),
-    )
+    Some(Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(op as u8, slot, idx as u16))
 }
 
 /// `BinSlotImm; JMPF t` → `BinSlotImmJmpf` (second peephole pass).
@@ -341,10 +344,7 @@ fn try_fuse_bin_slot_imm_jmpf(window: &[Byte], pool: &mut Vec<u64>) -> Option<By
     let target = window[1].operand_u32() as u64;
     let idx = pool.len();
     pool.push((target << 32) | (imm as u32 as u64));
-    Some(
-        Byte::new(Instruction::BinSlotImmJmpf)
-            .with_bin_slot_imm_jmpf(op, slot as u8, idx as u16),
-    )
+    Some(Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(op, slot as u8, idx as u16))
 }
 
 /// `LogNot; JMPF t` → `LogNotJmpf`.
@@ -635,10 +635,7 @@ mod tests {
             .iter()
             .find(|b| *b.bytecode() == Instruction::BinSlotImmJmpf)
             .expect("bin_slot_imm_jmpf fusion");
-        assert_eq!(
-            binslot.bin_slot_imm_jmpf_parts().0,
-            Instruction::LEQ as u8
-        );
+        assert_eq!(binslot.bin_slot_imm_jmpf_parts().0, Instruction::LEQ as u8);
         let jmp = bc
             .iter()
             .find(|b| *b.bytecode() == Instruction::JMP)
@@ -703,5 +700,72 @@ mod tests {
         fuse(&mut bc);
         assert_eq!(*bc[0].bytecode(), Instruction::JMP);
         assert_eq!(bc[0].operand_u32(), u32::MAX);
+    }
+
+    #[test]
+    fn code_ptr_is_relocated_by_patch_targets() {
+        // Fuse a 2-byte window before a CodePtr so its absolute target shifts.
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::CodePtr).with_operand_u32(10),
+            Byte::new(Instruction::MakePolyFn).with_operand_u32(12),
+        ];
+        fuse(&mut bc);
+        // One byte removed in the LOAD;RETURN window → targets 10→9, 12→11.
+        let code_ptr = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::CodePtr))
+            .expect("CodePtr preserved");
+        assert_eq!(code_ptr.operand_u32(), 9);
+        let poly = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakePolyFn))
+            .expect("MakePolyFn preserved");
+        assert_eq!(poly.operand_u32(), 11);
+    }
+
+    #[test]
+    fn code_ptr_wide_target_survives_fusion() {
+        let wide = 100_000u32;
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::RETURN),
+            Byte::new(Instruction::CodePtr).with_operand_u32(wide),
+        ];
+        fuse(&mut bc);
+        let code_ptr = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::CodePtr))
+            .expect("CodePtr");
+        // Window removed 1 byte; wide target must not truncate to u16.
+        assert_eq!(code_ptr.operand_u32(), wide - 1);
+        assert!(code_ptr.operand_u32() > u16::MAX as u32);
+    }
+
+    #[test]
+    fn code_ptr_is_never_folded_as_const_data() {
+        // CONST a; CONST b; ADD folds — CodePtr must not participate.
+        let mut bc = vec![
+            Byte::new(Instruction::CodePtr).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_const_inline(2),
+            Byte::new(Instruction::ADD),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 3, "CodePtr; CONST; ADD must not fold");
+        assert_eq!(*bc[0].bytecode(), Instruction::CodePtr);
+        assert_eq!(bc[0].operand_u32(), 1);
+    }
+
+    #[test]
+    fn code_ptr_return_does_not_fuse_to_const_return() {
+        let mut bc = vec![
+            Byte::new(Instruction::CodePtr).with_operand_u32(7),
+            Byte::new(Instruction::RETURN),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 2);
+        assert_eq!(*bc[0].bytecode(), Instruction::CodePtr);
+        assert_eq!(*bc[1].bytecode(), Instruction::RETURN);
     }
 }
