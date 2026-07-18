@@ -846,17 +846,16 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
+        // C-style: `for (init?; cond; step?) { body }`
         let init = choice((self.variable(), self.expr())).or_not();
         let step = self.expr().or_not();
-        keyword!("for")
-            .ignore_then(
-                init.then_ignore(op!(";"))
-                    .then(self.expr())
-                    .then_ignore(op!(";"))
-                    .then(step)
-                    .delimited_by(op!("("), op!(")")),
-            )
-            .then(self.block(stmt))
+        let c_style = init
+            .then_ignore(op!(";"))
+            .then(self.expr())
+            .then_ignore(op!(";"))
+            .then(step)
+            .delimited_by(op!("("), op!(")"))
+            .then(self.block(stmt.clone()))
             .map_with(|(((init, cond), step), body), e| {
                 (
                     e.span(),
@@ -867,7 +866,28 @@ impl<'pratt> Pratt<'pratt> {
                         body,
                     }),
                 )
-            })
+            });
+
+        // For-in: `for x in expr { body }` → Loop { identifier: Some(x), … }
+        let for_in = text::ident()
+            .padded()
+            .map_with(output!(Identifier))
+            .then_ignore(keyword!("in"))
+            .then(self.expr())
+            .then(self.block(stmt))
+            .map_with(|((identifier, iterable), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Loop {
+                        identifier: Some(identifier),
+                        iterable,
+                        body,
+                    }),
+                )
+            });
+
+        // Prefer the paren form so `for (…)` never misparses as for-in.
+        keyword!("for").ignore_then(choice((c_style, for_in)))
     }
 
     fn if_<
@@ -2476,6 +2496,42 @@ mod tests {
             },
             other => panic!("expected statement wrapper, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn for_in_parses_to_loop_with_identifier() {
+        let ast = decl_ast!("for x in counter() { print \"%i\", x; }");
+        match ast {
+            Expression::Statement(inner) => match inner.1.as_ref() {
+                Expression::Loop {
+                    identifier,
+                    iterable,
+                    body,
+                } => {
+                    match identifier.as_ref().map(|i| i.1.as_ref()) {
+                        Some(Expression::Identifier(name)) => assert_eq!(*name, "x"),
+                        other => panic!("expected Identifier(x), got {:?}", other),
+                    }
+                    assert!(matches!(iterable.1.as_ref(), Expression::Expr(_)));
+                    assert!(matches!(body.1.as_ref(), Expression::Block(_)));
+                }
+                other => panic!("expected for-in Loop, got {:?}", other),
+            },
+            other => panic!("expected statement wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn for_in_display_round_trips() {
+        let rendered = stmt!("for x in counter() { print \"%i\", x; }");
+        assert!(
+            rendered.contains("for x in"),
+            "expected for-in Display, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("counter()"),
+            "expected iterable in Display, got {rendered:?}"
+        );
     }
 
     #[test]

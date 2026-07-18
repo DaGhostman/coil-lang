@@ -51,6 +51,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
+| `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, coroutines, user `impl`s) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
@@ -71,7 +72,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [05 — Aggregates](tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
 | [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `zero.toml` |
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
-| [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from` |
+| [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
 | [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 | [10 — IO streams](tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
 
@@ -153,6 +154,6 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 | Generics & traits | `examples/generics.0s`, `examples/hkt_bifunctor.0s`, `examples/gat_pointer.0s`, `examples/existential_show.0s` |
 | Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
 | FFI | `examples/strlen.0s`, `examples/ffi_sum.0s` |
-| IO streams | `examples/io_bytes.0s`, `examples/io_file.0s`, `examples/io_eof.0s` |
-| Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s` |
+| IO streams | `examples/io_bytes.0s`, `examples/io_file.0s`, `examples/io_eof.0s`, `examples/io_udp.0s` |
+| Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s`, `examples/for_in_coro.0s` |
 | Full catalog | [examples.md](examples.md) |

@@ -1187,6 +1187,61 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+### `examples/for_in_coro.0s`
+
+**Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_in_coro.0s` |
+| **Output** | `01210` |
+
+---
+
+### `examples/for_in_array.0s`
+
+**Demonstrates:** `for x in` over an array (`Item` = element type).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_in_array.0s` |
+| **Output** | `123` |
+
+---
+
+### `examples/for_in_tuple.0s`
+
+**Demonstrates:** homogeneous tuple for-in (`Item` = element type).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_in_tuple.0s` |
+| **Output** | `123` |
+
+---
+
+### `examples/for_in_dict.0s`
+
+**Demonstrates:** homogeneous dict for-in as `(string, V)` pairs (`p[1]` prints values).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_in_dict.0s` |
+| **Output** | `12` |
+
+---
+
+### `examples/for_in_custom.0s`
+
+**Demonstrates:** user `impl IntoIterator` + `impl Iterator` on a class.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_in_custom.0s` |
+| **Output** | `012` |
+
+---
+
 ## Quick reference table
 
 | File | Category | Output (if known) |
@@ -1250,6 +1305,11 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `coro_yield_from.0s` | Coroutines | `012` |
 | `coro_interleave.0s` | Coroutines | `10,100,101,11,12,102` |
 | `coro_done.0s` | Coroutines | `falsefalsetrue` |
+| `for_in_coro.0s` | Coroutines | `01210` |
+| `for_in_array.0s` | Collections | `123` |
+| `for_in_tuple.0s` | Collections | `123` |
+| `for_in_dict.0s` | Collections | `12` |
+| `for_in_custom.0s` | Collections / traits | `012` |
 
 ## Running tests that mirror examples
 

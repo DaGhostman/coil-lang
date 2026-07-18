@@ -1,0 +1,36 @@
+// Expected output: 012
+//
+// User-defined IntoIterator + Iterator on a class. `next` mutates the
+// heap instance in place so state advances across resumes.
+
+class Counter {
+    cur: int,
+    end: int,
+}
+
+impl IntoIterator<Counter> {
+    type Item = int;
+    type IntoIter = Counter;
+    fn into_iter(Counter c) -> Counter {
+        return c;
+    }
+}
+
+impl Iterator<Counter> {
+    type Item = int;
+    fn next(Counter c) -> Option<int> {
+        if c.cur < c.end {
+            let v = c.cur;
+            c.cur = c.cur + 1;
+            return Option::Some(v);
+        }
+        return Option::None;
+    }
+}
+
+fn main() {
+    let c = new Counter(0, 3);
+    for x in c {
+        print "%i", x;
+    }
+}

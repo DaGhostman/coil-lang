@@ -245,6 +245,7 @@ impl Generics {
             vec!["T".into(), "E".into()],
         );
         self.register_nominal_type(common::BUILTIN_RESULT_ENUM, BUILTIN_MODULE);
+        self.register_nominal_type("ArrayIter", PRELUDE_MODULE);
     }
 
     pub fn register_nominal_type(&mut self, name: &str, module: &str) {
@@ -743,6 +744,47 @@ impl Generics {
             method_fqns: make_fqns("Write", "Stream", &["write"]),
             assoc_tys: HashMap::new(),
         });
+
+        // ---- Iterator / IntoIterator (unified for-in protocol) ----
+        // Carrier as first type param (same shape as Collect). Builtin
+        // arrays/tuples/dicts/coroutines are synthesised at for-in sites
+        // without a ground InstanceDef per T; users write ordinary `impl`.
+        self.typeclasses.insert(
+            "Iterator".into(),
+            TypeClassDef {
+                name: "Iterator".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["I".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![AssocTypeDecl::new("Item", vec![], vec![])],
+                methods: vec![TypeClassMethodDef {
+                    name: "next".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        self.typeclasses.insert(
+            "IntoIterator".into(),
+            TypeClassDef {
+                name: "IntoIterator".into(),
+                defined_module: PRELUDE_MODULE.into(),
+                type_params: vec!["T".into()],
+                param_kinds: vec![Kind::Type],
+                superclasses: vec![],
+                assoc_types: vec![
+                    AssocTypeDecl::new("Item", vec![], vec![]),
+                    AssocTypeDecl::new("IntoIter", vec![], vec![]),
+                ],
+                methods: vec![TypeClassMethodDef {
+                    name: "into_iter".into(),
+                    has_default: false,
+                }],
+            },
+        );
+        // Opaque prelude iterator state type (arrays materialise as this
+        // conceptually; codegen fast-paths never allocate a real class).
+        self.register_nominal_type("ArrayIter", PRELUDE_MODULE);
     }
 
     /// Whether `class` is satisfied for `ty` (builtin or registered instance).

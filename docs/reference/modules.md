@@ -48,7 +48,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.0s` files 
 
 | Module | Exports | Auto-imported? |
 |--------|---------|----------------|
-| `prelude` | `Option`, `Result` | Yes (every file) |
+| `prelude` | `Option`, `Result`, `Iterator`, `IntoIterator`, `ArrayIter` | Yes (every file) |
 | `prelude::ops` | `Add`, `Sub`, `Mul`, `Div`, `Num`, `Eq`, `Ord`, `Lt`, `Le`, `Gt`, `Ge`, `Show` | Yes (every file) |
 | `prelude::test` | `assert` | Yes (every file) |
 | `ffi` | `dload`, `declare`, `invoke` | No — write `use ffi::*;` |
