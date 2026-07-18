@@ -3930,4 +3930,100 @@ mod tests {
             "captured dictionary must survive GC"
         );
     }
+
+    fn unpack_at(slot: u16, arity: u16) -> Byte {
+        // operands[31:16]=arity, [15:0]=slot_offset (matches UnpackAt dispatch).
+        Byte::new(Instruction::UnpackAt).with_operands_u16([arity, slot])
+    }
+
+    #[test]
+    fn jump_if_match_on_non_enum_falls_through() {
+        let mut vm = Machine::<4>::default();
+        vm.run_with_pool(
+            &[
+                const_int(42),
+                jump_if_match(0, 0),
+                const_int(7),
+                Byte::new(Instruction::HALT),
+            ],
+            &[0u64],
+        );
+        assert_eq!(vm.pop().as_int(), 7);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    #[test]
+    fn jump_if_match_on_empty_stack_is_noop() {
+        let mut vm = Machine::<2>::default();
+        vm.run_with_pool(
+            &[
+                jump_if_match(0, 0),
+                const_int(3),
+                Byte::new(Instruction::HALT),
+            ],
+            &[0u64],
+        );
+        assert_eq!(vm.pop().as_int(), 3);
+    }
+
+    #[test]
+    fn unpack_on_non_enum_discards_scrutinee_without_payload() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[const_int(1), unpack(1), Byte::new(Instruction::HALT)]);
+        assert_eq!(vm.tell(), 0, "non-enum UNPACK should leave stack empty");
+    }
+
+    #[test]
+    fn unpack_at_on_non_enum_is_noop() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[
+            const_int(5),
+            unpack_at(0, 1),
+            load(0),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 5);
+    }
+
+    #[test]
+    fn get_field_missing_returns_minus_one() {
+        let mut vm = Machine::<16>::default();
+        let mut code = Vec::new();
+        code.push(const_int(1));
+        code.extend(string_lit("a"));
+        code.push(Byte::new(Instruction::MakeDict).with_operand_u32(1));
+        code.extend(string_lit("missing"));
+        code.push(Byte::new(Instruction::GetField));
+        code.push(Byte::new(Instruction::HALT));
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), -1);
+    }
+
+    #[test]
+    fn done_coro_empty_stack_pushes_false() {
+        let mut vm = Machine::<2>::default();
+        vm.run(&[
+            Byte::new(Instruction::DoneCoro),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert!(!vm.pop().as_bool());
+    }
+
+    #[test]
+    fn done_coro_on_int_pushes_false() {
+        let mut vm = Machine::<2>::default();
+        vm.run(&[
+            const_int(1),
+            Byte::new(Instruction::DoneCoro),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert!(!vm.pop().as_bool());
+    }
+
+    #[test]
+    fn load_field_on_non_enum_leaves_stack_empty() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[const_int(9), load_field(0), Byte::new(Instruction::HALT)]);
+        assert_eq!(vm.tell(), 0);
+    }
 }

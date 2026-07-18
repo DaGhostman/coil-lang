@@ -101,10 +101,10 @@ impl<T: Default, const N: usize> ArrayVec<T, N> {
 
             self.storage[current] = value;
         } else {
+            // `offset` is an index into `expansion` (0 on first spill).
             let offset = current - N;
             self.grow(offset);
 
-            promise!(offset >= N);
             promise!(offset < self.expansion.len());
 
             self.expansion[offset] = value;
@@ -305,5 +305,89 @@ impl<'iter, T: Default, const N: usize> Iterator for ArrayVecIter<'iter, T, N> {
         self.cursor += 1;
 
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_pop_within_inline_capacity() {
+        let mut v = ArrayVec::<i32, 4>::default();
+        assert!(v.is_empty());
+        v.push(1);
+        v.push(2);
+        assert_eq!(v.len(), 2);
+        assert_eq!(*v.pop(), 2);
+        assert_eq!(*v.get(), 1);
+    }
+
+    #[test]
+    fn spills_to_heap_past_inline_capacity() {
+        let mut v = ArrayVec::<i32, 2>::default();
+        for i in 0..6 {
+            v.push(i);
+        }
+        assert_eq!(v.len(), 6);
+        assert_eq!(v[0], 0);
+        assert_eq!(v[5], 5);
+        assert_eq!(*v.pop(), 5);
+        assert_eq!(v.len(), 5);
+    }
+
+    #[test]
+    fn index_mut_grows_len() {
+        let mut v = ArrayVec::<i32, 2>::default();
+        v[3] = 99;
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[3], 99);
+    }
+
+    #[test]
+    fn from_iter_and_iter_visit_all() {
+        let v: ArrayVec<i32, 2> = (0..5).collect();
+        let collected: Vec<_> = v.iter().copied().collect();
+        assert_eq!(collected, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn clear_resets_len_but_keeps_values_addressable() {
+        let mut v = ArrayVec::<i32, 2>::default();
+        v.push(7);
+        v.push(8);
+        v.clear();
+        assert!(v.is_empty());
+        v.push(1);
+        assert_eq!(*v.get(), 1);
+    }
+
+    #[test]
+    fn setup_current_and_advance_writes_slot() {
+        let mut v = ArrayVec::<i32, 2>::default();
+        v.setup_current_and_advance(|slot| *slot = 42);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], 42);
+    }
+
+    #[test]
+    fn seek_repositions_current_cursor() {
+        let mut v = ArrayVec::<i32, 4>::default();
+        v.push(1);
+        v.push(2);
+        v.seek(0);
+        assert_eq!(*v.current(), 1);
+        *v.current_mut() = 9;
+        assert_eq!(v[0], 9);
+    }
+
+    #[test]
+    fn iter_seek_skips_prefix() {
+        let v: ArrayVec<i32, 2> = (0..4).collect();
+        let mut it = v.iter();
+        it.seek(2);
+        assert_eq!(it.next(), Some(&2));
+        assert_eq!(it.next(), Some(&3));
+        assert_eq!(it.next(), None);
     }
 }

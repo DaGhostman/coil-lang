@@ -4632,4 +4632,100 @@ mod tests_generics {
             other => panic!("expected EnumDecl, got {:?}", other),
         }
     }
+
+    #[test]
+    fn parse_unclosed_block_fails() {
+        let result = Pratt::default().declaration().parse("fn main() {").into_result();
+        assert!(
+            result.is_err(),
+            "expected unclosed brace to fail, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_unclosed_paren_in_call_fails() {
+        let result = Pratt::default().declaration().parse("fn main() { foo(1; }").into_result();
+        assert!(result.is_err(), "expected unclosed call paren to fail, got {:?}", result);
+    }
+
+    #[test]
+    fn parse_unclosed_string_fails() {
+        let result = Pratt::default().declaration().parse(r#"fn main() { print "hi; }"#).into_result();
+        assert!(result.is_err(), "expected unclosed string to fail, got {:?}", result);
+    }
+
+    #[test]
+    fn parse_use_with_trailing_double_colon_fails() {
+        let result = Pratt::default()
+            .declaration()
+            .parse("use foo::;")
+            .into_result();
+        assert!(
+            result.is_err(),
+            "expected `use foo::;` to fail, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_mod_missing_semicolon_fails() {
+        // `mod foo` without `;` / body should not parse as a complete declaration.
+        let result = Pratt::default().declaration().parse("mod foo").into_result();
+        assert!(
+            result.is_err(),
+            "expected `mod foo` without terminator to fail, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_match_arm_missing_arrow_fails() {
+        let result = Pratt::default()
+            .declaration()
+            .parse("fn main() { let x = match 1 { _ 1 }; }")
+            .into_result();
+        assert!(
+            result.is_err(),
+            "expected match arm without `=>` to fail, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn parse_parenthesized_expr_is_not_one_tuple() {
+        // `(1)` must parse as a grouped expression, not a 1-tuple.
+        let result = Pratt::default().declaration().parse("fn main() { let x = (1); }").into_result();
+        assert!(result.is_ok(), "expected `(1)` to parse as group, got {:?}", result);
+        let src = result.unwrap().1.to_string();
+        assert!(!src.contains("(1,)"), "group should not render as 1-tuple: {src}");
+    }
+
+    #[test]
+    fn parse_explicit_one_tuple_requires_trailing_comma() {
+        let result = Pratt::default()
+            .declaration()
+            .parse("fn main() { let x = (1,); }")
+            .into_result();
+        assert!(result.is_ok(), "expected `(1,)` to parse as 1-tuple, got {:?}", result);
+    }
+
+    #[test]
+    fn parse_invalid_tuple_missing_comma_fails() {
+        let result = Pratt::default()
+            .declaration()
+            .parse("fn main() { let x = (1 2); }")
+            .into_result();
+        assert!(result.is_err(), "expected `(1 2)` to fail, got {:?}", result);
+    }
+
+    #[test]
+    fn parse_enum_trailing_junk_fails() {
+        let result = Pratt::default()
+            .declaration()
+            .parse("enum E { A B }")
+            .into_result();
+        assert!(result.is_err(), "expected missing comma between variants to fail, got {:?}", result);
+    }
+
 }

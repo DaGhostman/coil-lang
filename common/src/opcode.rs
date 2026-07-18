@@ -636,3 +636,98 @@ impl std::fmt::Display for ArchivedInstruction {
         write!(f, "{}", *self as u8)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_packed_round_trips_arity_and_target() {
+        let b = Byte::new(Instruction::CALL).with_call_packed(3, 0x123456);
+        assert_eq!(b.call_parts(), (3, 0x123456));
+        assert_eq!(b.value_u32(), 0x123456);
+    }
+
+    #[test]
+    fn operands_u16_pack_and_unpack() {
+        let b = Byte::new(Instruction::MakeEnum).with_operands_u16([7, 2]);
+        assert_eq!(b.operand_u16(0), 7);
+        assert_eq!(b.operand_u16(1), 2);
+        assert_eq!(b.operand_u32(), (7u32 << 16) | 2);
+    }
+
+    #[test]
+    fn const_inline_and_pool_constant_resolution() {
+        // Inline CONST uses the high bit as POOL_FLAG, so only non-negative
+        // i32 values that clear that bit are safe to encode inline.
+        let inline = Byte::new(Instruction::CONST).with_const_inline(5);
+        assert_eq!(inline.constant(&[]) as i64, 5);
+
+        let pool = Byte::new(Instruction::CONST).with_const_pool(1);
+        assert_ne!(pool.operand_u32() & Byte::POOL_FLAG, 0);
+        let constants = [0u64, 1.5f64.to_bits()];
+        assert_eq!(pool.constant(&constants), 1.5f64.to_bits());
+    }
+
+    #[test]
+    fn bin_slot_imm_sign_extends_immediate() {
+        let b = Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(
+            Instruction::ADD as u8,
+            3,
+            -7,
+        );
+        let (op, slot, imm) = b.bin_slot_imm_parts();
+        assert_eq!(op, Instruction::ADD as u8);
+        assert_eq!(slot, 3);
+        assert_eq!(imm, -7);
+    }
+
+    #[test]
+    fn bin_slot_slot_and_cmp_jmpf_and_bin_return_pack() {
+        let slot = Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(
+            Instruction::MUL as u8,
+            1,
+            2,
+        );
+        assert_eq!(
+            slot.bin_slot_slot_parts(),
+            (Instruction::MUL as u8, 1, 2)
+        );
+
+        let cmp = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(Instruction::EQ as u8, 99);
+        assert_eq!(cmp.cmp_jmpf_parts(), (Instruction::EQ as u8, 99));
+
+        let ret = Byte::new(Instruction::BinReturn).with_bin_return(Instruction::SUB as u8);
+        assert_eq!(ret.bin_return_op(), Instruction::SUB as u8);
+    }
+
+    #[test]
+    fn fused_jmpf_and_inc_dec_parts() {
+        let j = Byte::new(Instruction::BinSlotImmJmpf).with_bin_slot_imm_jmpf(
+            Instruction::LEQ as u8,
+            0,
+            4,
+        );
+        assert_eq!(
+            j.bin_slot_imm_jmpf_parts(),
+            (Instruction::LEQ as u8, 0, 4)
+        );
+
+        let n = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(12);
+        assert_eq!(n.log_not_jmpf_target(), 12);
+
+        let inc = Byte::new(Instruction::INC).with_inc_dec(5, true, false);
+        assert_eq!(inc.inc_dec_parts(), (5, true, false));
+        let dec = Byte::new(Instruction::DEC).with_inc_dec(2, false, true);
+        assert_eq!(dec.inc_dec_parts(), (2, false, true));
+    }
+
+    #[test]
+    fn instruction_from_u8_covers_last_appended_variant() {
+        // ARCHIVE stability: last variant must remain decodable.
+        let last = Instruction::DictEntries as u8;
+        let decoded: Instruction = last.into();
+        assert_eq!(decoded as u8, last);
+    }
+}
+

@@ -551,4 +551,134 @@ mod tests {
     fn parse_rejects_unrecognized_flag() {
         assert!(parse_args(&args(&["--bogus", "a.0s"])).is_err());
     }
+
+    #[test]
+    fn parse_rejects_duplicate_output_and_missing_output_path() {
+        assert!(parse_args(&args(&["compile", "a.0s", "-o"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.0s", "-o", "-x"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.0s", "-o", "x", "--output", "y"])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_too_many_args_and_reserved_compile_names() {
+        assert!(parse_args(&args(&["a.0s", "b.0s"])).is_err());
+        assert!(parse_args(&args(&["compile", "compile"])).is_err());
+        assert!(parse_args(&args(&["compile", "run"])).is_err());
+        assert!(parse_args(&args(&["compile", "test"])).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_both_log_flags_at_parse_time() {
+        // Mutual exclusion is enforced later by ReportConfig::from_cli_flags.
+        let cli = parse_args(&args(&["--log-json", "--log-lsp", "test"])).unwrap();
+        assert!(cli.log_json && cli.log_lsp);
+    }
+
+    fn unique_tmp(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "zero_script_cli_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn try_load_archive_missing_corrupt_version_and_ok() {
+        let missing = unique_tmp("missing");
+        assert!(matches!(
+            try_load_archive(missing.to_str().unwrap()),
+            Err(LoadErr::Missing)
+        ));
+
+        let corrupt = unique_tmp("corrupt");
+        std::fs::write(&corrupt, b"not-an-archive").unwrap();
+        assert!(matches!(
+            try_load_archive(corrupt.to_str().unwrap()),
+            Err(LoadErr::Corrupt)
+        ));
+        let _ = std::fs::remove_file(&corrupt);
+
+        let stale = unique_tmp("stale");
+        let stale_version = if ARCHIVE_VERSION == 1 { 2 } else { 1 };
+        let bytes = rkyv::to_bytes::<Error>(&ArchivedProgram {
+            version: stale_version,
+            constants: vec![],
+            bytecode: vec![Byte::new(common::Instruction::HALT)],
+        })
+        .unwrap();
+        std::fs::write(&stale, bytes.as_slice()).unwrap();
+        let loaded = try_load_archive(stale.to_str().unwrap());
+        assert!(
+            matches!(loaded, Err(LoadErr::Version(v)) if v == stale_version),
+            "{loaded:?}"
+        );
+        let _ = std::fs::remove_file(&stale);
+
+        let ok_path = unique_tmp("ok");
+        let ok_prog = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            constants: vec![42],
+            bytecode: vec![Byte::new(common::Instruction::HALT)],
+        };
+        let ok_bytes = rkyv::to_bytes::<Error>(&ok_prog).unwrap();
+        std::fs::write(&ok_path, ok_bytes.as_slice()).unwrap();
+        let (bc, constants) = try_load_archive(ok_path.to_str().unwrap()).expect("ok archive");
+        assert_eq!(constants, vec![42]);
+        assert_eq!(bc.len(), 1);
+        let _ = std::fs::remove_file(&ok_path);
+    }
+
+    #[test]
+    fn source_newer_than_archive_compares_mtimes() {
+        let dir = unique_tmp("mtime");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.0s");
+        let arch = dir.join("a.c0s");
+        // Archive first, then source after a short sleep so src mtime is newer.
+        std::fs::write(&arch, b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&src, b"fn main() {}").unwrap();
+        assert!(source_newer_than_archive(
+            src.to_str().unwrap(),
+            arch.to_str().unwrap()
+        ));
+        // Missing paths => false
+        assert!(!source_newer_than_archive(
+            dir.join("nope.0s").to_str().unwrap(),
+            arch.to_str().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_test_files_errors_and_discovers_nested() {
+        let missing = unique_tmp("no_tests");
+        assert!(collect_test_files(&missing).is_err());
+
+        let empty = unique_tmp("empty_tests");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(collect_test_files(&empty).is_err());
+
+        let root = unique_tmp("nested_tests");
+        let nested = root.join("more");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("b.0s"), b"fn main() {}").unwrap();
+        std::fs::write(nested.join("a.0s"), b"fn main() {}").unwrap();
+        std::fs::write(root.join("ignore.txt"), b"x").unwrap();
+        let files = collect_test_files(&root).expect("files");
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("a.0s") || files[0].ends_with("b.0s"));
+        // Sorted lexicographically by full path.
+        assert!(files[0] < files[1]);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn archive_mtime_returns_none_for_missing() {
+        assert!(archive_mtime(unique_tmp("no_mtime").to_str().unwrap()).is_none());
+    }
 }
