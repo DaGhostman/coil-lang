@@ -634,7 +634,7 @@ impl Checker {
 
     /// Scheme for a virtual `io` host native (inserted on `use io::*`).
     pub fn io_fn_scheme(kind: IoBuiltin) -> Scheme {
-        use crate::typechecking::ty::{array, byte, stream_ty};
+        use crate::typechecking::ty::{array, byte, stream_ty, tuple};
         let stream = stream_ty();
         let bytes = array(byte());
         let io_err = Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into());
@@ -644,7 +644,10 @@ impl Checker {
         let res_unit = result_app_ty(unit_ty(), io_err.clone());
         let res_stream = result_app_ty(stream.clone(), io_err.clone());
         let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
-        let res_string = result_app_ty(string(), io_err);
+        let res_string = result_app_ty(string(), io_err.clone());
+        // `(nbytes, peer_host, peer_port)` from `udp_recv_from`.
+        let recv_from_ty = tuple(vec![int(), string(), int()]);
+        let res_recv_from = result_app_ty(recv_from_ty, io_err);
         let fun = |params: &[Ty], ret: Ty| {
             params.iter().rev().fold(ret, |acc, p| {
                 Ty::Fun(Box::new(p.clone()), Box::new(acc))
@@ -664,6 +667,14 @@ impl Checker {
                 fun(&[string(), int()], res_stream)
             }
             IoBuiltin::TcpAccept | IoBuiltin::TcpAcceptWait => fun(&[stream], res_stream),
+            IoBuiltin::UdpBind | IoBuiltin::UdpConnect => {
+                fun(&[string(), int()], res_stream)
+            }
+            IoBuiltin::UdpSendTo => fun(&[stream, bytes, string(), int()], res_int),
+            IoBuiltin::UdpRecvFrom | IoBuiltin::UdpRecvFromWait => {
+                fun(&[stream, bytes], res_recv_from)
+            }
+            IoBuiltin::UdpLocalPort => fun(&[stream], res_int),
         };
         Scheme::mono(ty)
     }

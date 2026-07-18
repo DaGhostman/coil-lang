@@ -6,7 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction};
+use common::{
+    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Value,
+};
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use reporting::{
@@ -142,7 +144,8 @@ impl Pipeline {
             as_result_int, as_result_option_int, as_result_unit, as_result_value, from_bytes,
             stream_close, stream_open, stream_read, stream_read_exact, stream_read_to_end,
             stream_stderr, stream_stdin, stream_stdout, stream_write, stream_write_all, tcp_accept,
-            tcp_accept_wait, tcp_connect, tcp_listen, to_bytes, value_as_string,
+            tcp_accept_wait, tcp_connect, tcp_listen, to_bytes, udp_bind, udp_connect,
+            udp_local_port, udp_recv_from, udp_recv_from_wait, udp_send_to, value_as_string,
         };
 
         for kind in IoBuiltin::all() {
@@ -154,14 +157,20 @@ impl Pipeline {
                 | IoBuiltin::FromBytes
                 | IoBuiltin::ToBytes
                 | IoBuiltin::TcpAccept
-                | IoBuiltin::TcpAcceptWait => 1,
+                | IoBuiltin::TcpAcceptWait
+                | IoBuiltin::UdpLocalPort => 1,
                 IoBuiltin::Open
                 | IoBuiltin::Read
                 | IoBuiltin::Write
                 | IoBuiltin::ReadExact
                 | IoBuiltin::WriteAll
                 | IoBuiltin::TcpConnect
-                | IoBuiltin::TcpListen => 2,
+                | IoBuiltin::TcpListen
+                | IoBuiltin::UdpBind
+                | IoBuiltin::UdpConnect
+                | IoBuiltin::UdpRecvFrom
+                | IoBuiltin::UdpRecvFromWait => 2,
+                IoBuiltin::UdpSendTo => 4,
             };
             let args = vec![FfiType::Int; arity];
             let sig = FfiSignature::from_parts(name.clone(), args, FfiType::Int)
@@ -247,6 +256,48 @@ impl Pipeline {
                         }
                         IoBuiltin::TcpAcceptWait => {
                             let r = tcp_accept_wait(heap, args[0]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::UdpBind => {
+                            let host = match value_as_string(heap, args[0]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r = udp_bind(heap, &host, args[1].as_int());
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::UdpConnect => {
+                            let host = match value_as_string(heap, args[0]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r = udp_connect(heap, &host, args[1].as_int());
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::UdpSendTo => {
+                            let host = match value_as_string(heap, args[2]) {
+                                Ok(s) => s,
+                                Err(tag) => {
+                                    return Ok(Some(as_result_value(heap, Err(tag))));
+                                }
+                            };
+                            let r = udp_send_to(heap, args[0], args[1], &host, args[3].as_int());
+                            as_result_int(heap, r)
+                        }
+                        IoBuiltin::UdpRecvFrom => {
+                            let r = udp_recv_from(heap, args[0], args[1]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::UdpRecvFromWait => {
+                            let r = udp_recv_from_wait(heap, args[0], args[1]);
+                            as_result_value(heap, r)
+                        }
+                        IoBuiltin::UdpLocalPort => {
+                            let r = udp_local_port(heap, args[0]).map(Value::from);
                             as_result_value(heap, r)
                         }
                     };

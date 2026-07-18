@@ -48,7 +48,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
-| IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP) | Supported (non-blocking L0; no HTTP in VM) |
+| IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | String concat via `+` | Supported (`string + string` → `string`) |

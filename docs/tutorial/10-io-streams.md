@@ -67,8 +67,42 @@ See `examples/io_text.0s`.
 | `write(s, buf)` | `→ Result<int, IoError>` | Partial writes OK |
 | `read_exact` / `read_to_end` / `write_all` | sync adapters | May **block in the host** via `poll` |
 | `tcp_connect` / `tcp_listen` / `tcp_accept` | TCP | Same `Stream` + `Read`/`Write` |
+| `udp_bind` / `udp_connect` / `udp_send_to` / `udp_recv_from` | UDP | Datagram sockets; see below |
 
 `print` still uses the `PRINT` opcode (not redirected through `stdout`).
+
+---
+
+## UDP
+
+UDP sockets are also `Stream` handles (`StreamKind::Udp`). Prefer the
+datagram helpers when you need peer addresses:
+
+| Function | Signature (simplified) | Behavior |
+|----------|------------------------|----------|
+| `udp_bind(host, port)` | `→ Result<Stream, IoError>` | `port` may be `0` (ephemeral) |
+| `udp_local_port(s)` | `→ Result<int, IoError>` | Assigned local port after bind |
+| `udp_connect(host, port)` | `→ Result<Stream, IoError>` | Connected peer; then `read` / `write` work |
+| `udp_send_to(s, buf, host, port)` | `→ Result<int, IoError>` | Non-blocking `sendto` |
+| `udp_recv_from(s, buf)` | `→ Result<(int, string, int), IoError>` | `(nbytes, peer_host, peer_port)` |
+| `udp_recv_from_wait(s, buf)` | same | Blocks in the host via `poll` |
+
+```0s
+use io::*;
+
+fn main() {
+    let server = udp_bind("127.0.0.1", 0)?;
+    let port = udp_local_port(server)?;
+    let client = udp_bind("127.0.0.1", 0)?;
+    let msg: [byte] = [72, 105];
+    udp_send_to(client, msg, "127.0.0.1", port)?;
+    let buf: [byte] = [0, 0, 0, 0, 0, 0, 0, 0];
+    let t = udp_recv_from_wait(server, buf)?;
+    print "%i", t[0];
+}
+```
+
+See `examples/io_udp.0s`.
 
 ---
 

@@ -93,6 +93,18 @@ pub enum IoBuiltin {
     TcpListen,
     TcpAccept,
     TcpAcceptWait,
+    /// Bind a UDP datagram socket (`host`, `port`; `port` may be `0`).
+    UdpBind,
+    /// Create a connected UDP socket toward (`host`, `port`).
+    UdpConnect,
+    /// Send a datagram to an explicit peer.
+    UdpSendTo,
+    /// Non-blocking recv; returns `(nbytes, peer_host, peer_port)`.
+    UdpRecvFrom,
+    /// Block until a datagram arrives (host `poll`).
+    UdpRecvFromWait,
+    /// Local bound port of a UDP socket (useful after `udp_bind(..., 0)`).
+    UdpLocalPort,
 }
 
 impl IoBuiltin {
@@ -114,6 +126,12 @@ impl IoBuiltin {
             Self::TcpListen => "tcp_listen",
             Self::TcpAccept => "tcp_accept",
             Self::TcpAcceptWait => "tcp_accept_wait",
+            Self::UdpBind => "udp_bind",
+            Self::UdpConnect => "udp_connect",
+            Self::UdpSendTo => "udp_send_to",
+            Self::UdpRecvFrom => "udp_recv_from",
+            Self::UdpRecvFromWait => "udp_recv_from_wait",
+            Self::UdpLocalPort => "udp_local_port",
         }
     }
 
@@ -135,6 +153,12 @@ impl IoBuiltin {
             Self::TcpListen,
             Self::TcpAccept,
             Self::TcpAcceptWait,
+            Self::UdpBind,
+            Self::UdpConnect,
+            Self::UdpSendTo,
+            Self::UdpRecvFrom,
+            Self::UdpRecvFromWait,
+            Self::UdpLocalPort,
         ]
     }
 }

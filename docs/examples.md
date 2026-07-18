@@ -510,7 +510,7 @@ fn read_x_v(Outer o) -> int {
 
 ## IO streams
 
-Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files and EOF.
+Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text helpers, UDP.
 
 ### `examples/io_bytes.0s`
 
@@ -547,6 +547,15 @@ Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files and EOF.
 |---|---|
 | **Run** | `cargo run -- examples/io_text.0s` |
 | **Output** | `hello2` |
+
+### `examples/io_udp.0s`
+
+**Demonstrates:** `udp_bind` / `udp_local_port` / `udp_send_to` / `udp_recv_from_wait` localhost echo.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_udp.0s` |
+| **Output** | `2` |
 
 See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
 
@@ -1205,6 +1214,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `io_file.0s` | IO | `2` |
 | `io_eof.0s` | IO | `eof` |
 | `io_text.0s` | IO | `hello2` |
+| `io_udp.0s` | IO | `2` |
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |

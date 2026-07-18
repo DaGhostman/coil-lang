@@ -5,7 +5,7 @@
 //! via `poll`, but never busy-spin on `WouldBlock`.
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use common::{
     BUILTIN_IO_ERROR_VARIANTS, BUILTIN_OPTION_VARIANTS, BUILTIN_RESULT_VARIANTS, Value,
 };
 
-use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, Object, StreamKind};
+use crate::memory::{Heap, Member, ObjArray, ObjEnum, ObjStream, ObjTuple, Object, StreamKind};
 
 /// Tag indices for [`IoError`](common::BUILTIN_IO_ERROR_ENUM).
 #[repr(u32)]
@@ -506,6 +506,166 @@ pub fn tcp_accept_wait(heap: &mut Heap, listener: Value) -> Result<Value, IoErro
     }
 }
 
+// ---- UDP ----
+
+fn alloc_tuple3(heap: &mut Heap, a: Value, b: Value, c: Value) -> Value {
+    let (obj, _) = heap.alloc(
+        ObjTuple {
+            elements: vec![a, b, c],
+        },
+        Object::Tuple,
+    );
+    Value::from(obj.addr())
+}
+
+fn parse_socket_addr(host: &str, port: i64) -> Result<SocketAddr, IoErrorTag> {
+    if !(0..=65535).contains(&port) {
+        return Err(IoErrorTag::InvalidInput);
+    }
+    format!("{host}:{port}")
+        .parse()
+        .map_err(|_| IoErrorTag::InvalidInput)
+}
+
+/// Bind a non-blocking UDP socket. `port` may be `0` (ephemeral);
+/// use [`udp_local_port`] to read the assigned port.
+pub fn udp_bind(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
+    let addr = parse_socket_addr(host, port)?;
+    let sock = UdpSocket::bind(addr).map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    sock.set_nonblocking(true)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    let fd = sock.into_raw_fd();
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    alloc_stream(heap, owned, StreamKind::Udp).map_err(|e| IoErrorTag::from_kind(e.kind()))
+}
+
+/// Create a connected non-blocking UDP socket toward `(host, port)`.
+///
+/// After connect, [`stream_read`] / [`stream_write`] (and the sync adapters)
+/// work against that peer. Unconnected peers still use
+/// [`udp_send_to`] / [`udp_recv_from`].
+pub fn udp_connect(heap: &mut Heap, host: &str, port: i64) -> Result<Value, IoErrorTag> {
+    let peer = parse_socket_addr(host, port)?;
+    // Ephemeral local bind, then connect for a default peer.
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    sock.connect(peer)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    sock.set_nonblocking(true)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()))?;
+    let fd = sock.into_raw_fd();
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    alloc_stream(heap, owned, StreamKind::Udp).map_err(|e| IoErrorTag::from_kind(e.kind()))
+}
+
+/// Local UDP port (after bind / connect).
+pub fn udp_local_port(heap: &mut Heap, stream: Value) -> Result<i64, IoErrorTag> {
+    let fd = stream_raw_fd(heap, stream)?;
+    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+    let result = sock
+        .local_addr()
+        .map(|a| a.port() as i64)
+        .map_err(|e| IoErrorTag::from_kind(e.kind()));
+    let _ = sock.into_raw_fd();
+    result
+}
+
+/// Non-blocking `sendto`. Returns bytes sent.
+pub fn udp_send_to(
+    heap: &mut Heap,
+    stream: Value,
+    buf: Value,
+    host: &str,
+    port: i64,
+) -> Result<usize, IoErrorTag> {
+    let peer = parse_socket_addr(host, port)?;
+    let bytes = value_as_bytes(heap, buf)?;
+    let fd = stream_raw_fd(heap, stream)?;
+    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+    let result = match sock.send_to(&bytes, peer) {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+            Err(IoErrorTag::WouldBlock)
+        }
+        Err(e) => Err(IoErrorTag::from_kind(e.kind())),
+    };
+    let _ = sock.into_raw_fd();
+    result
+}
+
+/// Non-blocking `recvfrom` into `buf`.
+///
+/// On success returns a heap tuple `(nbytes: int, peer_host: string, peer_port: int)`.
+/// The first `nbytes` elements of `buf` are filled.
+pub fn udp_recv_from(heap: &mut Heap, stream: Value, buf: Value) -> Result<Value, IoErrorTag> {
+    let buf_addr = buf.raw() as u64;
+    let capacity = match heap.find_object_by_addr(buf_addr) {
+        Some(Object::Array(arr_gc)) => arr_gc.as_ref().elements.len(),
+        _ => return Err(IoErrorTag::InvalidInput),
+    };
+    if capacity == 0 {
+        let host = {
+            let gc = heap.intern(String::new());
+            Value::from(gc.as_ptr() as *mut u8 as u64)
+        };
+        return Ok(alloc_tuple3(
+            heap,
+            Value::from(0_i64),
+            host,
+            Value::from(0_i64),
+        ));
+    }
+    let mut tmp = vec![0u8; capacity];
+
+    let (n, peer) = {
+        let fd = stream_raw_fd(heap, stream)?;
+        let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+        let result = match sock.recv_from(&mut tmp) {
+            Ok((n, peer)) => Ok((n, peer)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                Err(IoErrorTag::WouldBlock)
+            }
+            Err(e) => Err(IoErrorTag::from_kind(e.kind())),
+        };
+        let _ = sock.into_raw_fd();
+        result?
+    };
+
+    {
+        let Some(Object::Array(mut arr_gc)) = heap.find_object_by_addr(buf_addr) else {
+            return Err(IoErrorTag::InvalidInput);
+        };
+        let arr: &mut ObjArray = arr_gc.as_mut();
+        for i in 0..n {
+            arr.elements[i] = Value::from(tmp[i] as i64);
+        }
+    }
+
+    let host_str = match peer {
+        SocketAddr::V4(a) => a.ip().to_string(),
+        SocketAddr::V6(a) => a.ip().to_string(),
+    };
+    let host = {
+        let gc = heap.intern(host_str);
+        Value::from(gc.as_ptr() as *mut u8 as u64)
+    };
+    Ok(alloc_tuple3(
+        heap,
+        Value::from(n as i64),
+        host,
+        Value::from(peer.port() as i64),
+    ))
+}
+
+/// Block until a datagram arrives, then [`udp_recv_from`].
+pub fn udp_recv_from_wait(heap: &mut Heap, stream: Value, buf: Value) -> Result<Value, IoErrorTag> {
+    loop {
+        match udp_recv_from(heap, stream, buf) {
+            Err(IoErrorTag::WouldBlock) => wait_readable(heap, stream)?,
+            other => return other,
+        }
+    }
+}
+
 /// Decode a heap string `Value` into a Rust `String`.
 pub fn value_as_string(heap: &Heap, v: Value) -> Result<String, IoErrorTag> {
     match heap.find_object_by_addr(v.raw() as u64) {
@@ -743,6 +903,55 @@ mod tests {
         let err_inner = from_bytes(&mut heap, err_buf);
         let err = as_result_value(&mut heap, err_inner);
         assert_eq!(enum_tag(&heap, err), Some(1));
+    }
+
+    fn tuple_elems(heap: &Heap, v: Value) -> Vec<Value> {
+        match heap.find_object_by_addr(v.raw() as u64) {
+            Some(Object::Tuple(gc)) => gc.as_ref().elements.clone(),
+            _ => panic!("expected tuple"),
+        }
+    }
+
+    #[test]
+    fn udp_bind_send_to_recv_from_round_trip() {
+        let mut heap = Heap::default();
+        let server = udp_bind(&mut heap, "127.0.0.1", 0).expect("bind server");
+        let port = udp_local_port(&mut heap, server).expect("local port");
+        assert!(port > 0);
+
+        let client = udp_bind(&mut heap, "127.0.0.1", 0).expect("bind client");
+        let msg = make_byte_array(&mut heap, b"Hi");
+        let n = udp_send_to(&mut heap, client, msg, "127.0.0.1", port).expect("send_to");
+        assert_eq!(n, 2);
+
+        let buf = make_byte_array(&mut heap, &[0, 0, 0, 0, 0, 0, 0, 0]);
+        let t = udp_recv_from_wait(&mut heap, server, buf).expect("recv");
+        let elems = tuple_elems(&heap, t);
+        assert_eq!(elems[0].as_int(), 2);
+        assert_eq!(elems[2].as_int(), udp_local_port(&mut heap, client).unwrap());
+        assert_eq!(&array_bytes(&heap, buf)[..2], b"Hi");
+
+        stream_close(&mut heap, server).unwrap();
+        stream_close(&mut heap, client).unwrap();
+    }
+
+    #[test]
+    fn udp_connect_write_read_round_trip() {
+        let mut heap = Heap::default();
+        let server = udp_bind(&mut heap, "127.0.0.1", 0).expect("bind server");
+        let port = udp_local_port(&mut heap, server).expect("port");
+        let client = udp_connect(&mut heap, "127.0.0.1", port).expect("connect");
+
+        let msg = make_byte_array(&mut heap, b"Yo");
+        stream_write_all(&mut heap, client, msg).expect("write_all");
+
+        let buf = make_byte_array(&mut heap, &[0, 0, 0, 0]);
+        let t = udp_recv_from_wait(&mut heap, server, buf).expect("recv");
+        assert_eq!(tuple_elems(&heap, t)[0].as_int(), 2);
+        assert_eq!(&array_bytes(&heap, buf)[..2], b"Yo");
+
+        stream_close(&mut heap, server).unwrap();
+        stream_close(&mut heap, client).unwrap();
     }
 
     #[test]

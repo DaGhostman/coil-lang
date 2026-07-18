@@ -1181,3 +1181,9 @@ fn example_io_text_prints_hello2() {
     let output = run_example("examples/io_text.0s");
     assert_eq!(output, "hello2");
 }
+
+#[test]
+fn example_io_udp_prints_2() {
+    let output = run_example("examples/io_udp.0s");
+    assert_eq!(output, "2");
+}

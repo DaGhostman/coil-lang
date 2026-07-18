@@ -369,6 +369,8 @@ pub enum StreamKind {
     File,
     Tcp,
     TcpListener,
+    /// Datagram socket (`udp_bind` / `udp_connect`).
+    Udp,
 }
 
 #[derive(Clone, Copy)]
@@ -700,7 +702,7 @@ pub struct ObjPolyFn {
     pub captured_dicts: Vec<Option<Member>>,
 }
 
-/// Host-backed non-blocking IO stream (file / stdio / TCP).
+/// Host-backed non-blocking IO stream (file / stdio / TCP / UDP).
 pub struct ObjStream {
     pub fd: Option<std::os::fd::OwnedFd>,
     pub kind: StreamKind,
