@@ -895,21 +895,21 @@ fn orphan_instance_for_foreign_class_and_structural_type_errors() {
     );
 }
 
-/// Local Self + builtin source is allowed for prelude `From` (Rust-style
-/// orphan rule: at least one local nominal head).
+/// Builtin source type is rejected: every non-variable instance arg must
+/// be a local nominal head (strict orphan rule).
 #[test]
-fn from_impl_for_local_type_with_builtin_source_is_allowed() {
+fn into_impl_for_builtin_source_is_orphan() {
     let (_ty, msgs) = check(
         r#"
-        enum Wrapper { W(int) }
-        impl From<int> for Wrapper {
-            fn from(int x) -> Wrapper { return Wrapper::W(x); }
+        class Wrapper { v: int }
+        impl Into<Wrapper> for int {
+            fn into(int x) -> Wrapper { return new Wrapper(x); }
         }
         "#,
     );
     assert!(
-        msgs.iter().all(|m| !m.contains("Orphan instance")),
-        "unexpected orphan diagnostic for From<int> for Wrapper: {:?}",
+        msgs.iter().any(|m| m.contains("Orphan instance")),
+        "expected orphan diagnostic for Into<Wrapper> for int, got: {:?}",
         msgs
     );
 }

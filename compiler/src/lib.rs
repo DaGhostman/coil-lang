@@ -4034,6 +4034,45 @@ impl Compiler {
 
                 // Method call: `recv.method(args)`.
                 if let Expression::Access(recv, method) = name.1.borrow() {
+                    // Ground trait method (`recv.into()`, …): typechecker
+                    // discharged a concrete instance into `call_dicts_at`.
+                    // Emit receiver + args + dictionary, then CallIndirect to
+                    // the instance method (dict ABI, `dict_arity = 1`).
+                    if let Some(instances) = self_id
+                        .and_then(|id| self.checker.call_dicts_at(id))
+                        .filter(|dicts| !dicts.is_empty())
+                    {
+                        let instance = &instances[0];
+                        if let Some(fqn) = instance.method_fqns.get(*method).cloned()
+                            && let Some(&offset) = self.functions.get(&fqn)
+                        {
+                            bytecode.append(&mut self.do_compile(recv));
+                            // Box the receiver when the instance method prologue
+                            // expects an unbox (same contract as Eq/Ord direct calls).
+                            if let Some(recv_ty) = self.receiver_type(recv) {
+                                Self::emit_box_if_needed(&mut bytecode, &recv_ty);
+                            }
+                            let mut nargs = 1u32; // receiver
+                            if let Some(items) = args {
+                                for arg in items {
+                                    self.append_with_existential_pack(&mut bytecode, arg);
+                                    nargs += 1;
+                                }
+                            }
+                            if Self::emit_instance_dict(
+                                &mut bytecode,
+                                &instance.class,
+                                &instance.args,
+                                &self.checker,
+                                &self.functions,
+                            ) {
+                                nargs += 1; // trailing dictionary
+                            }
+                            Self::emit_call_indirect(&mut bytecode, offset as u32, nargs);
+                            return bytecode;
+                        }
+                    }
+
                     let recv_ty = self.receiver_type(recv);
                     let owner = recv_ty
                         .as_ref()

@@ -186,6 +186,11 @@ pub struct Checker {
     /// Typeclass method signatures, keyed by `(class, method)`.
     typeclass_method_schemes: HashMap<(String, String), Scheme>,
 
+    /// Expected type pushed by annotated `let` / `const` initializers so
+    /// ground trait calls like `x.into()` can pin the conversion target
+    /// before constraint discharge (`let y: T = x.into();`).
+    current_expected: Option<Ty>,
+
     /// `type Name = T` aliases (substituted at typecheck time).
     ///
     /// Mirrors lexical scopes: lookup walks from the innermost frame
@@ -407,6 +412,7 @@ impl Checker {
             for_in_infos: HashMap::new(),
             for_in_infos_by_span: HashMap::new(),
             typeclass_method_schemes: HashMap::new(),
+            current_expected: None,
             type_aliases: vec![HashMap::new()],
             generic_aliases: HashMap::new(),
             const_scopes: vec![HashSet::new()],
@@ -746,6 +752,7 @@ impl Checker {
         self.for_in_infos.clear();
         self.for_in_infos_by_span.clear();
         self.typeclass_method_schemes.clear();
+        self.current_expected = None;
         self.type_aliases.clear();
         self.type_aliases.push(HashMap::new());
         self.generic_aliases.clear();
@@ -1160,22 +1167,8 @@ impl Checker {
             ),
         );
 
-        // From::from : ∀Self T. From<Self, T> => T → Self
         // Into::into : ∀Self T. Into<Self, T> => Self → T
         {
-            let self_v = self.counter.fresh();
-            let t_v = self.counter.fresh();
-            self.typeclass_method_schemes.insert(
-                ("From".to_string(), "from".to_string()),
-                Scheme::poly(
-                    vec![self_v, t_v],
-                    vec![Constraint {
-                        class: "From".into(),
-                        args: vec![Ty::Var(self_v), Ty::Var(t_v)],
-                    }],
-                    Ty::Fun(Box::new(Ty::Var(t_v)), Box::new(Ty::Var(self_v))),
-                ),
-            );
             let self_v = self.counter.fresh();
             let t_v = self.counter.fresh();
             self.typeclass_method_schemes.insert(
@@ -1672,6 +1665,44 @@ impl Checker {
                             }
                             return result;
                         }
+                    }
+                    // Ground trait method: `recv.into()` / `recv.show()` via a
+                    // concrete instance (no open bound). Pin the return type from
+                    // `current_expected` when present so `let y: T = x.into();`
+                    // can select among multiple `Into` targets.
+                    if let Some((class, scheme)) =
+                        self.ground_trait_method_for_receiver(method, &recv_ty)
+                    {
+                        let (fun_ty, constraints, mapping) =
+                            self.instantiate_scheme_mapped(&scheme);
+                        let mut arg_tys = vec![recv_ty];
+                        if let Some(a) = args {
+                            for arg in a {
+                                arg_tys.push(self.infer(arg));
+                            }
+                        }
+                        let result = self.apply_function(
+                            Some(&format!("{}::{}", class, method)),
+                            &fun_ty,
+                            &arg_tys,
+                            None,
+                            id,
+                            range.clone(),
+                        );
+                        if let Some(expected) = self.current_expected.clone() {
+                            self.unify(&result, &expected, &range, "expected type");
+                        }
+                        if !constraints.is_empty() {
+                            self.discharge_constraints(id, &constraints, &range);
+                            self.pin_assoc_after_discharge(
+                                &class,
+                                &constraints,
+                                Some(&scheme),
+                                &mapping,
+                                &range,
+                            );
+                        }
+                        return apply_ty_prune(&self.subst, &result);
                     }
                     let owner = match &resolved {
                         Ty::Con(n) if self.classes.contains_key(n) => n.clone(),
@@ -2875,7 +2906,7 @@ impl Checker {
                         range.clone(),
                     );
                     msg.with_help(
-                        "define the trait in this module, or define the nominal head of at least one non-variable instance argument here"
+                        "define the trait in this module, or define the nominal head of every non-variable instance argument here"
                             .to_string(),
                     );
                     self.messages.push(msg);
@@ -3472,7 +3503,14 @@ impl Checker {
                                 i += 2;
                                 continue;
                             }
+                            // Annotated lets push an expected type so ground
+                            // trait calls (`x.into()`) can pin conversion targets.
+                            let prev_expected = self.current_expected.take();
+                            if ty_opt.is_some() {
+                                self.current_expected = Some(var_ty.clone());
+                            }
                             let val_ty = self.infer(next);
+                            self.current_expected = prev_expected;
                             self.coerce_or_unify(
                                 &var_ty,
                                 &val_ty,
@@ -3523,7 +3561,12 @@ impl Checker {
                         if i + 1 < children.len() {
                             let next = &children[i + 1];
                             if !is_declaration_like(next) {
+                                let prev_expected = self.current_expected.take();
+                                if ty_opt.is_some() {
+                                    self.current_expected = Some(var_ty.clone());
+                                }
                                 let val_ty = self.infer(next);
+                                self.current_expected = prev_expected;
                                 self.coerce_or_unify(
                                     &var_ty,
                                     &val_ty,
@@ -5034,6 +5077,50 @@ impl Checker {
         candidates.into_iter().next()
     }
 
+    /// Resolve a ground trait method call on a concrete receiver
+    /// (`recv.into()`, `recv.show()`, …) when no open bound is active.
+    ///
+    /// Returns `(class, scheme)` when exactly one registered method scheme
+    /// named `method` has a first parameter that unifies with `recv_ty`.
+    fn ground_trait_method_for_receiver(
+        &mut self,
+        method: &str,
+        recv_ty: &Ty,
+    ) -> Option<(String, Scheme)> {
+        let recv = apply_ty_prune(&self.subst, recv_ty);
+        let schemes: Vec<(String, Scheme)> = self
+            .typeclass_method_schemes
+            .iter()
+            .filter(|((_, mname), _)| mname.as_str() == method)
+            .map(|((class, _), scheme)| (class.clone(), scheme.clone()))
+            .collect();
+        let mut matches: Vec<(String, Scheme)> = Vec::new();
+        for (class, scheme) in schemes {
+            // Freshen to probe the first parameter; trial unify does not
+            // commit into `self.subst`.
+            let (fun_ty, _constraints, _kinds) =
+                instantiate_with_kinds(&scheme, &mut self.counter);
+            let Some(first_param) = Self::first_fun_param(&fun_ty) else {
+                continue;
+            };
+            if unify_with(&self.subst, &first_param, &recv).is_ok() {
+                matches.push((class, scheme));
+            }
+        }
+        if matches.len() == 1 {
+            matches.pop()
+        } else {
+            None
+        }
+    }
+
+    fn first_fun_param(ty: &Ty) -> Option<Ty> {
+        match ty {
+            Ty::Fun(param, _) => Some(param.as_ref().clone()),
+            _ => None,
+        }
+    }
+
     /// Instantiate a scheme and record freshened variable kinds (Phase 5).
     fn instantiate_ty(&mut self, scheme: &Scheme) -> Ty {
         let (ty, _, kinds) = instantiate_with_kinds(scheme, &mut self.counter);
@@ -5376,14 +5463,11 @@ impl Checker {
             return true;
         }
 
-        // Rust-style: at least one non-variable arg must have a local
-        // nominal head. Requiring *every* arg to be local would reject
-        // useful conversions like `impl From<int> for Wrapper`.
         arg_exprs
             .iter()
             .zip(arg_tys.iter())
             .filter(|(_, ty)| !matches!(apply_ty_prune(&self.subst, ty), Ty::Var(_)))
-            .any(|(expr, ty)| {
+            .all(|(expr, ty)| {
                 let head = self
                     .nominal_head_from_instance_arg(expr)
                     .or_else(|| self.nominal_head_from_ty(ty));
@@ -13068,30 +13152,25 @@ fn main() { let y = apply_cast(42); }
         );
     }
 
-    /// Prelude `From` / `Into` are registered as multi-param typeclasses.
+    /// Prelude `Into` is registered as a multi-param typeclass.
     #[test]
-    fn prelude_from_into_traits_are_registered() {
+    fn prelude_into_trait_is_registered() {
         let g = Generics::new();
-        let from = g.typeclass("From").expect("From");
-        assert_eq!(from.type_params, vec!["Self".to_string(), "T".to_string()]);
-        assert_eq!(from.methods.len(), 1);
-        assert_eq!(from.methods[0].name, "from");
+        assert!(g.typeclass("From").is_none(), "From must not be registered");
         let into = g.typeclass("Into").expect("Into");
         assert_eq!(into.type_params, vec!["Self".to_string(), "T".to_string()]);
         assert_eq!(into.methods.len(), 1);
         assert_eq!(into.methods[0].name, "into");
     }
 
-    /// `from` / `into` method schemes exist after `check_program`.
+    /// `into` method scheme exists after `check_program`.
     #[test]
-    fn prelude_from_into_method_schemes_registered() {
+    fn prelude_into_method_scheme_registered() {
         let (c, _) = check("fn main() {}");
-        let from_scheme = c
-            .typeclass_method_scheme("From", "from")
-            .expect("From::from scheme");
-        assert_eq!(from_scheme.constraints.len(), 1);
-        assert_eq!(from_scheme.constraints[0].class, "From");
-        assert_eq!(from_scheme.constraints[0].args.len(), 2);
+        assert!(
+            c.typeclass_method_scheme("From", "from").is_none(),
+            "From::from must not be registered"
+        );
         let into_scheme = c
             .typeclass_method_scheme("Into", "into")
             .expect("Into::into scheme");
@@ -13100,66 +13179,19 @@ fn main() { let y = apply_cast(42); }
         assert_eq!(into_scheme.constraints[0].args.len(), 2);
     }
 
-    /// `impl From<int> for Wrapper` typechecks (local Self + builtin source).
+    /// `impl Into<B> for A` with two local classes discharges via `x.into()`.
     #[test]
-    fn prelude_from_impl_for_local_type_typechecks() {
+    fn prelude_into_method_call_with_expected_type_discharges() {
         let src = r#"
-enum Wrapper { W(int) }
-impl From<int> for Wrapper {
-    fn from(int x) -> Wrapper { return Wrapper::W(x); }
+class Celsius { c: int }
+class Fahrenheit { f: int }
+impl Into<Fahrenheit> for Celsius {
+    fn into(Celsius x) -> Fahrenheit { return new Fahrenheit(x.c); }
 }
-fn wrap<A, B>(A x) -> B where From<B, A> { return from(x); }
-fn main() { let w = wrap(42); }
-"#;
-        let (mut c, _) = check(src);
-        let msgs = c.take_messages();
-        assert!(
-            msgs.is_empty(),
-            "unexpected diagnostics: {:?}",
-            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
-        );
-        let dicts = c.all_call_site_dicts();
-        let has_from = dicts.values().any(|instances| {
-            instances.iter().any(|i| {
-                i.class == "From"
-                    && i.args.len() == 2
-                    && matches!(&i.args[1], Ty::Con(n) if n == "int")
-            })
-        });
-        assert!(
-            has_from,
-            "expected From<Wrapper, int> in call_site_dicts, got: {:?}",
-            dicts
-        );
-    }
-
-    /// Calling a From-bound helper without an instance errors.
-    #[test]
-    fn prelude_from_missing_instance_errors() {
-        let src = r#"
-fn wrap<A, B>(A x) -> B where From<B, A> { return from(x); }
-fn main() { let w = wrap(42); }
-"#;
-        let (mut c, _) = check(src);
-        let msgs = c.take_messages();
-        assert!(
-            msgs.iter()
-                .any(|m| m.message().contains("No instance") || m.message().contains("From")),
-            "expected missing-From diagnostic, got: {:?}",
-            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
-        );
-    }
-
-    /// `impl Into<Wrapper> for int` typechecks and discharges at the call site.
-    #[test]
-    fn prelude_into_impl_for_local_target_typechecks() {
-        let src = r#"
-enum Wrapper { W(int) }
-impl Into<Wrapper> for int {
-    fn into(int x) -> Wrapper { return Wrapper::W(x); }
+fn main() {
+    let c = new Celsius(0);
+    let y: Fahrenheit = c.into();
 }
-fn wrap<A, B>(A x) -> B where Into<A, B> { return into(x); }
-fn main() { let w = wrap(42); }
 "#;
         let (mut c, _) = check(src);
         let msgs = c.take_messages();
@@ -13173,13 +13205,49 @@ fn main() { let w = wrap(42); }
             instances.iter().any(|i| {
                 i.class == "Into"
                     && i.args.len() == 2
-                    && matches!(&i.args[0], Ty::Con(n) if n == "int")
+                    && matches!(&i.args[0], Ty::Con(n) if n == "Celsius")
+                    && matches!(&i.args[1], Ty::Con(n) if n == "Fahrenheit")
             })
         });
         assert!(
             has_into,
-            "expected Into<int, Wrapper> in call_site_dicts, got: {:?}",
+            "expected Into<Celsius, Fahrenheit> in call_site_dicts, got: {:?}",
             dicts
+        );
+    }
+
+    /// Calling an Into-bound helper without an instance errors.
+    #[test]
+    fn prelude_into_missing_instance_errors() {
+        let src = r#"
+fn wrap<A, B>(A x) -> B where Into<A, B> { return into(x); }
+fn main() { let w = wrap(42); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("No instance") || m.message().contains("Into")),
+            "expected missing-Into diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Builtin source type is rejected under the strict orphan rule.
+    #[test]
+    fn prelude_into_impl_for_builtin_source_is_orphan() {
+        let src = r#"
+class Wrapper { v: int }
+impl Into<Wrapper> for int {
+    fn into(int x) -> Wrapper { return new Wrapper(x); }
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Orphan instance")),
+            "expected orphan diagnostic for Into<Wrapper> for int, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
 
