@@ -324,6 +324,28 @@ fn main() {
 
 ---
 
+### `examples/assert.0s`
+
+**Demonstrates:** `prelude::test::assert` returning `Result<(), string>`, with `?` propagation and matched error messages.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/assert.0s` |
+| **Output** | `ok,assertion failed,custom` |
+
+---
+
+### `examples/panic.0s`
+
+**Demonstrates:** `panic "…"` abort (writes `panic: boom`, process exits 1).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/panic.0s` |
+| **Output** | `panic: boom` (stderr/stdout; non-zero exit) |
+
+---
+
 ### `examples/raise_try.0s`
 
 **Demonstrates:** `raise`, postfix `?`, and inferred `Result` return (implicit `Ok` wrapping).

@@ -328,6 +328,10 @@ impl<'pratt> Pratt<'pratt> {
                 keyword!("raise")
                     .ignore_then(expr.clone())
                     .map_with(|inner, e| (e.span(), Box::new(Expression::Raise(inner)))),
+                // `panic expr` as an expression atom (also a statement).
+                keyword!("panic")
+                    .ignore_then(expr.clone())
+                    .map_with(|inner, e| (e.span(), Box::new(Expression::Panic(inner)))),
                 self.format_expr(expr.clone()),
                 // `(a, b, c)` — tuple atom. MUST come before
                 // `self.call(...)` (which expects a leading
@@ -1003,6 +1007,16 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|result, e| (e.span(), Box::new(Expression::Raise(result))))
     }
 
+    fn panic_(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("panic")
+            .labelled("panic")
+            .ignore_then(self.expr())
+            .map_with(|result, e| (e.span(), Box::new(Expression::Panic(result))))
+    }
+
     fn comment(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
@@ -1058,6 +1072,7 @@ impl<'pratt> Pratt<'pratt> {
                 self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
                 self.raise_().then_ignore(op!(';')),
+                self.panic_().then_ignore(op!(';')),
                 self.yield_().then_ignore(op!(';')),
                 self.comment(),
             ))
@@ -3567,6 +3582,14 @@ mod tests_error_handling {
         match unwrap_expr(parse_expr("raise \"boom\"").as_ref()) {
             Expression::Raise(inner) => assert_eq!(inner.1.to_string(), "\"boom\""),
             other => panic!("expected Raise, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn panic_parses_as_panic_expression() {
+        match unwrap_expr(parse_expr("panic \"boom\"").as_ref()) {
+            Expression::Panic(inner) => assert_eq!(inner.1.to_string(), "\"boom\""),
+            other => panic!("expected Panic, got {:?}", other),
         }
     }
 

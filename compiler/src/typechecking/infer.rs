@@ -65,7 +65,7 @@ use super::ty::{
     unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
-use super::virtual_modules::{BuiltinExport, FfiBuiltin, VirtualModules};
+use super::virtual_modules::{BuiltinExport, FfiBuiltin, PreludeFn, VirtualModules};
 
 /// A parametric type alias (`type Pair<T> = (T, T)`).
 #[derive(Clone, Debug)]
@@ -461,6 +461,14 @@ impl Checker {
     pub fn ffi_fn_in_scope(&self, name: &str) -> Option<FfiBuiltin> {
         match self.scope_bindings.get(name)? {
             BuiltinExport::FfiFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Resolve an in-scope name to a prelude/test callable (`assert`), if any.
+    pub fn prelude_fn_in_scope(&self, name: &str) -> Option<PreludeFn> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::Fn { kind } => Some(*kind),
             _ => None,
         }
     }
@@ -1488,6 +1496,13 @@ impl Checker {
                 if ident == "len" {
                     return self.infer_array_len(args.as_deref(), range);
                 }
+                // `assert` from `prelude::test` (auto-imported or via `use`).
+                if let Some(kind) = self.prelude_fn_in_scope(&ident) {
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    return match kind {
+                        PreludeFn::Assert => self.infer_assert(arg_slice, range),
+                    };
+                }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
                 if let Some(kind) = self.ffi_fn_in_scope(&ident) {
                     let arg_slice = args.as_deref().unwrap_or(&[]);
@@ -1690,6 +1705,18 @@ impl Checker {
                 // give it the Ok type so it can appear in expression
                 // position (e.g. as a branch value).
                 ok_ty
+            }
+
+            Expression::Panic(e) => {
+                let msg_ty = self.infer(e);
+                self.unify(
+                    &msg_ty,
+                    &string(),
+                    &e.0.into_range(),
+                    "panic message",
+                );
+                // Diverging: fresh ty var so it can appear in any expression position.
+                Ty::Var(self.counter.fresh())
             }
 
             Expression::Try(inner) => {
@@ -3673,6 +3700,41 @@ impl Checker {
                 Some(format!("found `{}`; use `len(array)`", other)),
             ),
         }
+    }
+
+    /// `assert(bool)` / `assert(bool, string)` → `Result<(), string>`.
+    ///
+    /// Does not enter result-mode; callers use `?` / `match` / `raise`.
+    fn infer_assert(&mut self, args: &[Output], range: Range<usize>) -> Ty {
+        if !(1..=2).contains(&args.len()) {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("assert expects 1 or 2 arguments, got {}", args.len()),
+                range,
+                Some("use `assert(cond)` or `assert(cond, message)`".to_string()),
+            );
+        }
+
+        let cond_ty = self.infer(&args[0]);
+        self.unify(
+            &cond_ty,
+            &boolean(),
+            &args[0].0.into_range(),
+            "assert condition",
+        );
+        if let Some(msg) = args.get(1) {
+            let msg_ty = self.infer(msg);
+            self.unify(
+                &msg_ty,
+                &string(),
+                &msg.0.into_range(),
+                "assert message",
+            );
+        }
+        result_app_ty(unit_ty(), string())
     }
 
     /// Thread a curried function type through a list of argument types,
@@ -6512,6 +6574,7 @@ impl Checker {
             | Expression::Return(e)
             | Expression::ImplicitReturn(e)
             | Expression::Raise(e)
+            | Expression::Panic(e)
             | Expression::Try(e)
             | Expression::Yield(e)
             | Expression::YieldFrom(e)
@@ -11956,7 +12019,88 @@ fn main() {
         );
         assert!(c.builtin_name_in_scope("Option"));
         assert!(c.builtin_name_in_scope("Eq"));
+        assert!(c.prelude_fn_in_scope("assert").is_some());
         assert!(!c.ffi_fn_in_scope("dload").is_some());
+    }
+
+    #[test]
+    fn assert_infers_result_unit_string() {
+        let src = r#"
+fn main() {
+    let r = assert(true);
+    let _ = match r {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assert_with_message_ok() {
+        let src = r#"
+fn main() {
+    let r = assert(false, "nope");
+    let _ = match r {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assert_wrong_arity_errors() {
+        let msgs = assert_messages(r#"fn main() { let _ = assert(); }"#);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("assert expects")),
+            "expected arity diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assert_rebind_as_check_works() {
+        let src = r#"
+use prelude::test::assert as check;
+fn main() {
+    let r = check(1 == 1);
+    let _ = match r {
+        Result::Ok(_) => 1,
+        Result::Err(_) => 0,
+    };
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.prelude_fn_in_scope("check").is_some());
+        assert!(c.prelude_fn_in_scope("assert").is_none());
+    }
+
+    #[test]
+    fn panic_requires_string() {
+        let msgs = assert_messages(r#"fn main() { panic 1; }"#);
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")),
+            "expected type mismatch for panic int, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

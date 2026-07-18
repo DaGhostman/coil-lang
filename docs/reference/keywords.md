@@ -19,6 +19,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `continue` | Statement | Next iteration of innermost loop | [Syntax — Statements](syntax.md#statements) |
 | `return` | Statement | Exit function with value | [Syntax — Statements](syntax.md#statements) |
 | `raise` | Expression / stmt | Early-return `Err(e)` (result mode) | [Tutorial: Error handling](../tutorial/09-error-handling.md) |
+| `panic` | Expression / stmt | Abort with a string message | [Built-ins](built-ins.md#panic) |
 | `print` | Statement / I/O | Print to stdout | [Built-ins](built-ins.md#print) |
 | `format` | Expression / I/O | Build a formatted string | [Built-ins](built-ins.md#format) |
 | `enum` | Declaration | Sum type definition | [Types — Sum types](types.md#sum-types--enums-tysum) |
@@ -61,7 +62,7 @@ Registered in the top-level `declaration()` parser before generic statements so 
 ## Statement keywords
 
 ```
-let | const | if | else | while | for | break | continue | return | raise | print
+let | const | if | else | while | for | break | continue | return | raise | panic | print
 ```
 
 Appear inside `{ ... }` blocks via `statement()`.
@@ -71,7 +72,7 @@ Appear inside `{ ... }` blocks via `statement()`.
 ## Expression / literal keywords
 
 ```
-match | new | true | false | format | yield | resume | done | raise
+match | new | true | false | format | yield | resume | done | raise | panic
 ```
 
 Parsed as **atoms** before the generic `ident()` rule so they are never treated as variable names.

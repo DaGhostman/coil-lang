@@ -147,6 +147,8 @@ pub struct Machine<const S: usize> {
     nested_return: Option<Value>,
     /// Set when `execute` pauses before a native FFI call that may reenter the VM.
     pending_ffi: Option<PendingFfiInvoke>,
+    /// Set when a language-level `panic` aborts the VM.
+    panicked: bool,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -172,6 +174,7 @@ impl<const S: usize> Default for Machine<S> {
             nested_depth: 0,
             nested_return: None,
             pending_ffi: None,
+            panicked: false,
         }
     }
 }
@@ -767,6 +770,11 @@ impl<const S: usize> Machine<S> {
         self.alloc_counter
     }
 
+    /// True when a language-level `panic` aborted the last run.
+    pub fn panicked(&self) -> bool {
+        self.panicked
+    }
+
     pub fn run(&mut self, code: &[Byte]) {
         self.run_with_pool(code, &[]);
     }
@@ -930,7 +938,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::MakePolyFnCapture as u8);
+            promise!(*bc as u8 <= Instruction::Panic as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1550,6 +1558,19 @@ impl<const S: usize> Machine<S> {
                     } else {
                         let _ = io::stdout().flush();
                     }
+                    return false;
+                }
+                Instruction::Panic => {
+                    let ptr = self.stack.pop().as_ptr::<ObjString>();
+                    let s = unsafe { &*ptr };
+                    if let Some(out) = self.output.as_mut() {
+                        let _ = write!(out, "panic: {}", s);
+                        let _ = out.flush();
+                    } else {
+                        eprint!("panic: {}", s);
+                        let _ = io::stderr().flush();
+                    }
+                    self.panicked = true;
                     return false;
                 }
                 Instruction::STRING => {
@@ -3042,6 +3063,43 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn panic_opcode_sets_panicked_and_writes_message() {
+        let mut vm = Machine::<4>::default();
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+
+        let mut bytecode = Vec::new();
+        // STRING 4 "boom"
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(4));
+        for ch in "boom".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::Panic));
+        // Unreachable if Panic aborts.
+        bytecode.push(Byte::new(Instruction::HALT));
+
+        vm.run(&bytecode);
+        assert!(vm.panicked());
+        let _ = vm.restore_output();
+        let bytes = std::rc::Rc::try_unwrap(buf)
+            .expect("VM still holds a reference to the buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
+        assert_eq!(s, "panic: boom");
+    }
+
     fn with_output_captures_print() {
         use std::cell::RefCell;
         use std::rc::Rc;

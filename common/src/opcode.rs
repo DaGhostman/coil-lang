@@ -203,6 +203,10 @@ pub enum Instruction {
     /// declaration order. A null (`0`) slot is stored as unresolved (`None`)
     /// and filled at `CallIndirect` from application evidence.
     MakePolyFnCapture,
+
+    /// Panic: pop string message, write `panic: <msg>` to output, abort the VM.
+    /// Appended after `MakePolyFnCapture` (Phase prelude::test).
+    Panic,
 }
 
 impl From<u8> for Instruction {

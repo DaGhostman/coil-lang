@@ -1,0 +1,6 @@
+// Exercised by `zero-script test`.
+fn main() {
+    assert(true)?;
+    assert(1 == 1, "ones")?;
+    print "ok";
+}

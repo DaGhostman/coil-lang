@@ -90,6 +90,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Return(e)
         | Expression::ImplicitReturn(e)
         | Expression::Raise(e)
+        | Expression::Panic(e)
         | Expression::Try(e)
         | Expression::Yield(e)
         | Expression::YieldFrom(e)

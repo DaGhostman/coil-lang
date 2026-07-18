@@ -140,6 +140,8 @@ pub enum Expression<'expr> {
     ImplicitReturn(Output<'expr>),
     /// `raise expr` — early-return `Err(expr)` from a Result-mode function.
     Raise(Output<'expr>),
+    /// `panic expr` — abort the program with a string message.
+    Panic(Output<'expr>),
     Yield(Output<'expr>),
     YieldFrom(Output<'expr>),
     Resume(Output<'expr>, Option<Output<'expr>>),
@@ -890,6 +892,7 @@ impl<'a> Display for Expression<'a> {
             Self::Try(inner) => write!(f, "{}?", inner.1),
             Self::Coalesce(lhs, rhs) => write!(f, "{} ?? {}", lhs.1, rhs.1),
             Self::Raise(inner) => write!(f, "raise {}", inner.1),
+            Self::Panic(inner) => write!(f, "panic {}", inner.1),
             Self::Yield(inner) => write!(f, "yield {}", inner.1),
             Self::YieldFrom(inner) => write!(f, "yield from {}", inner.1),
             Self::Resume(target, None) => write!(f, "resume {}", target.1),

@@ -108,6 +108,16 @@ print "%i", none?.v ?? 0;     // None → 0
 
 ---
 
+## `assert` and `panic`
+
+`assert(cond)` / `assert(cond, msg)` (from `prelude::test`, auto-imported) returns `Result<(), string>` — use `?` or `match` like any other Result. It does not abort.
+
+`panic msg` aborts immediately with `panic: <msg>` (CLI exit code 1). Prefer `assert` when failure should be recoverable.
+
+See [Built-ins — assert / panic](../reference/built-ins.md#assert-preludetest) and `examples/assert.0s` / `examples/panic.0s`.
+
+---
+
 ## Worked example
 
 See `examples/raise_try.0s` (output `10,neg`), `examples/coalesce.0s` (`bar,hi,7,9`), and `examples/optional_chain.0s` (`42,0`).
@@ -120,6 +130,6 @@ See `examples/raise_try.0s` (output `10,neg`), `examples/coalesce.0s` (`bar,hi,7
 |----------|----------|
 | [Operators](../reference/operators.md) | Precedence for `?`, `?.`, `??` |
 | [Types](../reference/types.md) | Built-in Option / Result |
-| [Built-ins](../reference/built-ins.md) | Compiler-provided enums |
-| [Keywords](../reference/keywords.md) | `raise` |
+| [Built-ins](../reference/built-ins.md) | Compiler-provided enums, `assert`, `panic` |
+| [Keywords](../reference/keywords.md) | `raise`, `panic` |
 | [Error codes](../reference/error-codes.md) | E0114–E0117 |
