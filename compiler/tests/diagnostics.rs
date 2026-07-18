@@ -754,6 +754,51 @@ fn assoc_type_unknown_in_impl_errors() {
 }
 
 #[test]
+fn gat_impl_wrong_number_of_params_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Pointer<P: * -> *> {
+            type Ref<T>;
+            fn deref<T>(P<T> ptr) -> Ref<T>;
+        }
+        impl Pointer<Option> {
+            type Ref = int;
+            fn deref<T>(Option<T> ptr) -> T { return 0; }
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains(
+            "Associated type `Ref` in instance of `Pointer` expects 1 type parameter, got 0"
+        )),
+        "expected GAT impl arity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn gat_projection_wrong_number_of_args_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        typeclass Pointer<P: * -> *> {
+            type Ref<T>;
+            fn deref<T>(P<T> ptr) -> Ref<T>;
+        }
+        fn bad<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A, int> {
+            return deref(ptr);
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains(
+            "Associated type `Pointer::Ref` expects 1 type argument, got 2"
+        )),
+        "expected GAT projection arity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn duplicate_typeclass_errors() {
     let (_ty, msgs) = check(
         r#"

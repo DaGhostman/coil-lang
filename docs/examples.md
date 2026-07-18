@@ -702,6 +702,35 @@ call that pins the projection to `int`.
 
 ---
 
+### `examples/gat_pointer.0s`
+
+**Demonstrates:** Generic associated types — `type Ref<T>;` in a
+typeclass, `type Ref<T> = T;` in the impl, and an applied projection
+`P::Ref<A>` pinned by the selected `Pointer<Option>` instance.
+
+```0s
+typeclass Pointer<P: * -> *> {
+    type Ref<T>;
+    fn deref<T>(P<T> ptr) -> Ref<T>;
+}
+
+impl Pointer<Option> {
+    type Ref<T> = T;
+    fn deref<T>(Option<T> ptr) -> T { /* ... */ }
+}
+
+fn get<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A> {
+    return deref(ptr);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/gat_pointer.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/polyfn.0s`
 
 **Demonstrates:** First-class generic functions, multi-instantiation,
@@ -1051,6 +1080,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `typeclass_default.0s` | Types | `42` |
 | `superclass_ord.0s` | Types | `truetruefalse` |
 | `assoc_type.0s` | Types | `42` |
+| `gat_pointer.0s` | Types | `42` |
 | `polyfn.0s` | Types | `424.0424242` |
 | `operators.0s` | Operators | `801125428falsetrue3` |
 | `modules.0s` | Modules | `1a4\n45` |

@@ -83,13 +83,14 @@ fn greet() { print "hi"; }
 ```
 typeclass_decl ::= 'typeclass' IDENT type_param_list '{' typeclass_item* '}'
 typeclass_item ::= assoc_type_decl | method_sig
-assoc_type_decl ::= 'type' IDENT ';'
+assoc_type_decl ::= 'type' IDENT type_param_list? ';'
 method_sig     ::= 'fn' IDENT arg_list ('->' type_annotation)? (';' | block)
 impl_decl      ::= 'impl' IDENT type_arg_list '{' impl_item* '}'
 impl_item      ::= assoc_type_def | method_decl
-assoc_type_def ::= 'type' IDENT '=' type ';'
+assoc_type_def ::= 'type' IDENT type_param_list? '=' type ';'
 type_arg_list  ::= '<' type (',' type)* '>'
-type_projection ::= IDENT '::' IDENT   // e.g. Collect::Elem, C::Elem
+type_projection ::= IDENT '::' IDENT type_arg_list?
+                 // e.g. Collect::Elem, C::Elem, Pointer::Ref<int>, P::Ref<A>
 ```
 
 Example:
@@ -105,6 +106,16 @@ typeclass Collect<C> {
 impl Collect<Option<int>> {
     type Elem = int;
     fn head(Option<int> xs) -> int { /* … */ }
+}
+
+typeclass Pointer<P: * -> *> {
+    type Ref<T>;
+    fn deref<T>(P<T> ptr) -> Ref<T>;
+}
+
+impl Pointer<Option> {
+    type Ref<T> = T;
+    fn deref<T>(Option<T> ptr) -> T { /* … */ }
 }
 
 impl Measurable<int> {
@@ -369,9 +380,10 @@ match p {
 Used in function signatures, `let`, enum payloads, and type aliases:
 
 ```
-type_annotation ::= array_type | tuple_type | IDENT
+type_annotation ::= array_type | tuple_type | type_projection | IDENT
 array_type      ::= '[' type (';' INT)? ']'
 tuple_type      ::= '(' type (',' type)+ ')'
+type_projection ::= IDENT '::' IDENT type_arg_list?
 ```
 
 | Form | Meaning |
@@ -380,6 +392,8 @@ tuple_type      ::= '(' type (',' type)+ ')'
 | `[int]` | Dynamic-length array |
 | `[int; 5]` | Static-length array (length 5) |
 | `(int, string)` | Tuple type (comma required) |
+| `C::Elem` | Associated type projection |
+| `P::Ref<A>` | Generic associated type projection with type arguments |
 
 Primitive names are case-insensitive in the typechecker (`String` ≡ `string`).
 

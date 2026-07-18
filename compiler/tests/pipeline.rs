@@ -233,6 +233,13 @@ fn example_assoc_type_prints_42() {
     assert_eq!(output, "42");
 }
 
+/// Phase 3 advanced generics: generic associated type `Pointer::Ref<A>`.
+#[test]
+fn example_gat_pointer_prints_42() {
+    let output = run_example("examples/gat_pointer.0s");
+    assert_eq!(output, "42");
+}
+
 /// Shuffled record pattern `{ y: _, x: a }` must bind declaration-order `x`.
 #[test]
 fn shuffled_record_pattern_binds_declaration_order_field() {

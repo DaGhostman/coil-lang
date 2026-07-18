@@ -446,9 +446,11 @@ resolution stays deterministic across projects:
 - If constraint discharge ever sees two matching instances, it reports
   an ambiguous-instance error rather than selecting the first one.
 
-### Associated types
+### Associated types and GATs
 
-A typeclass may declare associated types; each impl must define them:
+A typeclass may declare associated types; each impl must define them. Associated
+types may be nullary (`type Elem;`) or generic (`type Ref<T>;`, also called a
+generic associated type / GAT):
 
 ```0s
 typeclass Collect<C> {
@@ -469,17 +471,39 @@ impl Collect<Option<int>> {
 
 - **In method signatures** inside the class, bare `Elem` (and `Collect::Elem` /
   `C::Elem`) resolve to the associated type. Method schemes quantify class
-  parameters first, then associated types.
+  parameters first, then any associated-type projection variables.
 - **Impls** must define every associated type (`type Elem = …;`) and may not
-  introduce unknown ones. Missing or extra assoc types are type errors.
-- **Projections** `Owner::Assoc` are allowed in type annotations. When the
+  introduce unknown ones. Missing or extra assoc types are type errors. A GAT
+  definition repeats its own binders, for example `type Ref<T> = T;`.
+- **Projections** `Owner::Assoc` and applied GAT projections
+  `Owner::Assoc<T, U>` are allowed in type annotations. When the
   owner is a type parameter with an active class bound that declares the
   assoc type (`fn take_head<C: Collect>(C xs) -> C::Elem`), the projection
   is an open type variable that is pinned when a ground instance is
   discharged at the call site (`take_head(Option::Some(42))` → `int`).
+- **GAT arguments are kind-checked.** `type Ref<F: * -> *>;` requires applied
+  projections such as `P::Ref<Option>` to pass a constructor-kinded argument,
+  while `P::Ref<int>` is rejected.
+
+```0s
+typeclass Pointer<P: * -> *> {
+    type Ref<T>;
+    fn deref<T>(P<T> ptr) -> Ref<T>;
+}
+
+impl Pointer<Option> {
+    type Ref<T> = T;
+    fn deref<T>(Option<T> ptr) -> T { /* ... */ }
+}
+
+fn get<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A> {
+    return deref(ptr);
+}
+```
 
 Associated types are erased at runtime (no dictionary slot); they exist only
-in the typechecker. See `examples/assoc_type.0s`.
+in the typechecker. See `examples/assoc_type.0s` and
+`examples/gat_pointer.0s`.
 
 ### Superclasses and implied bounds
 
@@ -546,8 +570,8 @@ generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
 See `examples/generics.0s`, `examples/typeclass_dict.0s`,
-`examples/superclass_ord.0s`, `examples/assoc_type.0s`, and
-`examples/polyfn.0s` for runnable demos.
+`examples/superclass_ord.0s`, `examples/assoc_type.0s`,
+`examples/gat_pointer.0s`, and `examples/polyfn.0s` for runnable demos.
 
 ### Boxing and unboxing at generic boundaries
 

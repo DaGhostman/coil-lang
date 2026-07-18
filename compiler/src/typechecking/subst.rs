@@ -370,9 +370,7 @@ mod tests {
         };
         let result = apply_scheme(&s, &scheme);
         assert_eq!(result.bounds, vec![TyVarId(0)]);
-        // Note: this is technically incorrect when the substitution binds a
-        // quantified variable — `instantiate` prevents that.
-        assert_eq!(result.ty, int());
+        assert_eq!(result.ty, v(0));
     }
 
     #[test]
