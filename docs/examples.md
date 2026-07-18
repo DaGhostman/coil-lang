@@ -872,12 +872,15 @@ fn main() {
 **Demonstrates:** Userland FFI — `dload`, `declare` with tuple argument types, `invoke` with tuple values.
 
 ```0s
+use ffi::*;
+use ffi::types::*;
+
 let lib = dload("libsum.so");
 let sum_id = declare(
     lib,
     "sum",
-    (FFIType::Int, FFIType::Int),
-    FFIType::Int,
+    (Int, Int),
+    Int,
 );
 print "%i", invoke(lib, sum_id, (40, 2));
 ```
@@ -919,7 +922,7 @@ int sum(int a, int b) { return a + b; }
 
 ### `examples/ffi_callback_ret.0s`
 
-**Demonstrates:** Opaque function-pointer return (`FFIType::Ptr`); prints `1` if non-null.
+**Demonstrates:** Opaque function-pointer return (`Ptr` from `ffi::types`); prints `1` if non-null.
 
 | | |
 |---|---|

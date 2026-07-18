@@ -74,26 +74,33 @@ You do not write those steps by hand when using `extern` blocks.
 
 ### Supported FFI types
 
-Use **`FFIType::Variant`** (compiler builtin — do not re-declare the enum) or bare type names in `declare` / `extern`:
+In runtime `declare`, import tag constructors from the virtual `ffi::types` module (`use ffi::types::*;`) or use bare lowercase / aggregate names. `extern` blocks accept bare type names without any import:
 
 | Form | C / libffi mapping |
 |------|---------------------|
-| `int` / `FFIType::Int` | `i64` |
-| `float` / `FFIType::Float` | `f64` |
-| `string` / `FFIType::String` | `const char *` |
-| `void` / `FFIType::Void` | Return-only |
+| `int` / `Int` | `i64` |
+| `float` / `Float` | `f64` |
+| `string` / `String` | `const char *` |
+| `void` / `Void` | Return-only |
 | `bool`, `int8`…`uint64`, `ptr` | Sized integers, bool, raw pointer |
-| `[int]` / `(int, float)` | Lowered to `FFIType::Ptr` (array/tuple buffer) |
-| `FFIType::Callback` | C function pointer → zero-script function |
+| `[int]` / `(int, float)` | Lowered to `Ptr` (array/tuple buffer) |
+| `Callback` | C function pointer → zero-script function |
 | `extern struct Point { x: int32, y: int32 };` | Pass-by-value C struct |
 
-Functions with no `-> ret` in `extern` blocks default to **`void`**, not `int`.
+Qualified paths like `ffi::types::Int` also work without a glob import. Functions with no `-> ret` in `extern` blocks default to **`void`**, not `int`.
 
 ---
 
 ## Path 2: Runtime `dload` / `declare` / `invoke`
 
 Use this when you want to load libraries dynamically, pick symbols at runtime, or avoid baking library paths into compile-time `extern` blocks.
+
+These names are exports of the virtual `ffi` module — **import them** before use:
+
+```0s
+use ffi::*;
+use ffi::types::*;
+```
 
 ### Example: calling a custom `sum` library
 
@@ -114,19 +121,22 @@ cc -shared -fPIC -o libsum.so examples/sum.c
 **zero-script** (`examples/ffi_sum.0s`):
 
 ```0s
+use ffi::*;
+use ffi::types::*;
+
 fn main() {
     let lib = dload("libsum.so");
     let sum_id = declare(
         lib,
         "sum",
-        (FFIType::Int, FFIType::Int),
-        FFIType::Int,
+        (Int, Int),
+        Int,
     );
     print "%i", invoke(lib, sum_id, (40, 2));
 }
 ```
 
-`FFIType` is a **compiler builtin** with fixed tags — you do not declare `enum FFIType` in source.
+Tag constructors (`Int`, `Ptr`, …) come from `ffi::types` — you do not declare them in source.
 
 **Expected output:** `42`
 
@@ -138,28 +148,29 @@ fn main() {
 | `declare(lib, name, args_tuple, ret)` | Four arguments | Function id (`int`), or `-1` on failure |
 | `invoke(lib, fn_id, args_tuple)` | Three arguments | Value matching declared return type; nothing pushed for `void` |
 
-**Phase 26 tuple form:** argument types and call arguments are **single tuple expressions**, not flat comma lists.
+Argument types and call arguments are **single tuple expressions**, not flat comma lists.
 
 ```0s
 // Correct
-declare(lib, "sum", (FFIType::Int, FFIType::Int), FFIType::Int);
+declare(lib, "sum", (Int, Int), Int);
 invoke(lib, id, (40, 2));
 
 // Wrong — diagnostics at compile time
-declare(lib, "sum", FFIType::Int, FFIType::Int);
+declare(lib, "sum", Int, Int);
 invoke(lib, id, 40, 2);
 ```
 
 ### FFI type tags
 
-The third argument to `declare` and the fourth (return) must be FFI type tags. Two forms are accepted:
+The third argument to `declare` and the fourth (return) must be FFI type tags. Accepted forms:
 
 | Form | Example |
 |------|---------|
-| Built-in `FFIType` constructor | `FFIType::Int`, `FFIType::Ptr`, `FFIType::Callback` |
+| In-scope `ffi::types` tag | `Int`, `Ptr`, `Callback` (after `use ffi::types::*;`) |
+| Qualified virtual path | `ffi::types::Int` |
 | Bare primitive / aggregate name | `int`, `void`, `[int]`, `(int, float)` |
 
-Do **not** re-declare `enum FFIType` — it is registered by the compiler with fixed tags.
+Do **not** invent a userland `enum FFIType` — tags are compiler-virtual under `ffi::types`.
 
 Runtime tag mapping:
 

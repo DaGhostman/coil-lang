@@ -319,15 +319,9 @@ impl<'pratt> Pratt<'pratt> {
                 // `self.ident()` so the identifier parser refuses
                 // to match it.
                 self.match_expr(expr.clone()),
-                // Userland FFI builtins — must come BEFORE
-                // `self.call(...)` because `dload(args)` /
-                // `declare(args)` / `invoke(args)` would
-                // otherwise match `self.call(...)` as ordinary
-                // function calls to non-existent functions.
-                self.dload(expr.clone()),
+                // `done` stays a keyword builtin. `dload` / `declare` /
+                // `invoke` are ordinary calls resolved via `use ffi::*`.
                 self.done_(expr.clone()),
-                self.declare(expr.clone()),
-                self.invoke_(expr.clone()),
                 self.resume_(expr.clone()),
                 self.yield_expr_(expr.clone()),
                 // `raise expr` as an expression atom (also a statement).
@@ -960,42 +954,6 @@ impl<'pratt> Pratt<'pratt> {
             .map_with(|(fmt, params), e| (e.span(), Box::new(Expression::Format(fmt, params))))
     }
 
-    // ============================================================
-    //  Userland FFI builtins — `dload`, `declare`, `invoke`
-    //
-    // These are expression-level (not statement-level like
-    // `print`) because they return values. They're parsed
-    // inside the atom choice so the keyword is registered with
-    // chumsky before `self.ident()` (which would otherwise
-    // match them as identifiers).
-    // ============================================================
-
-    fn dload<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
-        &self,
-        expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        text::keyword("dload")
-            .labelled("dload builtin")
-            .ignore_then(
-                expr.clone()
-                    .separated_by(op!(','))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(op!('('), op!(')')),
-            )
-            .map_with(|args, e| {
-                (
-                    e.span(),
-                    Box::new(Expression::Dload(args.into_iter().next().unwrap())),
-                )
-            })
-    }
-
     /// `done(handle)` — true when a coroutine has completed.
     fn done_<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
@@ -1023,48 +981,6 @@ impl<'pratt> Pratt<'pratt> {
                     Box::new(Expression::Done(args.into_iter().next().unwrap())),
                 )
             })
-    }
-
-    fn declare<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
-        &self,
-        expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        text::keyword("declare")
-            .labelled("declare builtin")
-            .ignore_then(
-                expr.clone()
-                    .separated_by(op!(','))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(op!('('), op!(')')),
-            )
-            .map_with(|args, e| (e.span(), Box::new(Expression::Declare(args))))
-    }
-
-    fn invoke_<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
-        &self,
-        expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        text::keyword("invoke")
-            .labelled("invoke builtin")
-            .ignore_then(
-                expr.clone()
-                    .separated_by(op!(','))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(op!('('), op!(')')),
-            )
-            .map_with(|args, e| (e.span(), Box::new(Expression::Invoke(args))))
     }
 
     fn return_(
@@ -1992,20 +1908,6 @@ impl<'pratt> Pratt<'pratt> {
     ) {
     }
 
-    fn call<
-        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
-            + Clone
-            + 'pratt,
-    >(
-        &self,
-        expr: T,
-    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
-    {
-        self.ident()
-            .then(self.params(expr))
-            .map_with(|(name, args), e| (e.span(), Box::new(Expression::Call { name, args })))
-    }
-
     /// Qualified constructor `EnumName::Variant(...)`. Must appear before `call` in the atom choice.
     fn construct<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
@@ -2055,12 +1957,38 @@ impl<'pratt> Pratt<'pratt> {
         // (Unit is the default when nothing matches).
         let shape = choice((tuple_payload, record_payload)).or_not();
 
+        // `Enum::Variant` or `ffi::types::Int` (multi-segment path;
+        // last segment is the variant, the rest is the enum/module path).
         text::ident()
             .padded()
-            .then_ignore(just("::").padded())
-            .then(text::ident().padded())
+            .separated_by(just("::").padded())
+            .at_least(2)
+            .collect::<Vec<_>>()
             .then(shape)
-            .map_with(|((enum_name, variant_name), fields), e| {
+            .map_with(|(segments, fields), e| {
+                let mut segments = segments;
+                let variant_name = segments.pop().unwrap();
+                let enum_name = if segments.len() == 1 {
+                    segments.pop().unwrap()
+                } else {
+                    // Leak into arena-less `'pratt` by joining into a
+                    // single owned string stored via Box::leak for the
+                    // AST lifetime — the parser AST borrows from the
+                    // source, so multi-segment paths need a stable
+                    // string. Join with `::` into a Cow isn't available
+                    // here; use the source-backed approach: reconstruct
+                    // from the collected idents.
+                    //
+                    // `segments` are `&str` slices into the source, but
+                    // joining them requires an owned String. Store via
+                    // the expression's span by using a concatenated
+                    // owned string leaked for the duration of the parse
+                    // (same pattern as other temporary AST strings is
+                    // not used elsewhere — instead keep two-segment
+                    // form when possible).
+                    let joined = segments.join("::");
+                    Box::leak(joined.into_boxed_str()) as &str
+                };
                 (
                     e.span(),
                     Box::new(Expression::Construct {
@@ -3502,6 +3430,56 @@ mod tests {
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }
+    }
+
+    /// `dload` / `declare` / `invoke` are ordinary identifiers (not keywords),
+    /// so a user may define `fn dload(...)` when they have not imported `ffi`.
+    #[test]
+    fn dload_is_not_a_keyword_and_can_name_a_user_function() {
+        let src = "fn dload(int x) -> int { return x; } fn main() { print \"%i\", dload(1); }";
+        let result = Pratt::default().parse(src);
+        assert!(
+            result.is_ok(),
+            "expected user fn named dload to parse, got {:?}",
+            result.err()
+        );
+        let ast = result.unwrap();
+        let src_str = format!("{}", ast.1);
+        assert!(
+            src_str.contains("dload"),
+            "display should retain dload name: {src_str}"
+        );
+    }
+
+    #[test]
+    fn ffi_types_qualified_construct_parses_multi_segment_path() {
+        let src = "let x = ffi::types::Int;";
+        let result = Pratt::default().parse(src);
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
+        let ast = result.unwrap();
+        fn find_construct<'a>(e: &'a Expression<'a>) -> Option<(&'a str, &'a str)> {
+            match e {
+                Expression::Construct {
+                    enum_name,
+                    variant_name,
+                    ..
+                } => Some((*enum_name, *variant_name)),
+                Expression::Program(items)
+                | Expression::Block(items)
+                | Expression::Fragment(items) => {
+                    items.iter().find_map(|c| find_construct(c.1.as_ref()))
+                }
+                Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::Statement(inner)
+                | Expression::ExprStatement(inner) => find_construct(inner.1.as_ref()),
+                _ => None,
+            }
+        }
+        let (enum_name, variant) =
+            find_construct(ast.1.as_ref()).expect("expected Construct(ffi::types::Int)");
+        assert_eq!(enum_name, "ffi::types");
+        assert_eq!(variant, "Int");
     }
 
     #[test]

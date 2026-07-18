@@ -62,9 +62,13 @@ pub fn tag_from_type_name(name: &str) -> Option<u32> {
     }
 }
 
-/// True when `name` is the reserved built-in FFI enum.
+/// Surface module path for FFI type tags (`use ffi::types::*;`).
+pub const FFI_TYPES_MODULE: &str = "ffi::types";
+
+/// True when `name` is the reserved built-in FFI enum (legacy `FFIType`
+/// or the namespaced `ffi::types` path).
 pub fn is_builtin_ffi_enum(name: &str) -> bool {
-    name == BUILTIN_FFI_TYPE_ENUM
+    name == BUILTIN_FFI_TYPE_ENUM || name == FFI_TYPES_MODULE
 }
 
 /// True when `enum_name::variant` is a built-in FFI type constructor.

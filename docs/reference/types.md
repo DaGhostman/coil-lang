@@ -30,7 +30,7 @@ Recursive enum references use isorecursive `Con(name)` inside variant payloads (
 
 ## Built-in `Option` and `Result`
 
-The compiler pre-registers polymorphic sum types (same mechanism as `FFIType`). **Do not redeclare them** — a user `enum Option` / `enum Result` is a duplicate-enum error.
+The compiler pre-registers polymorphic sum types under the virtual `prelude` module (auto-imported). **Do not redeclare them** while the short name is still bound — a user `enum Option` / `enum Result` is a duplicate-enum error unless you first rebind with `use prelude::Option as …`.
 
 | Type | Variants (tag order) | Annotation |
 |------|----------------------|------------|
@@ -703,7 +703,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 |------|------------|
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer; parametric aliases (`type Pair<T> = …`) expand on application |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
-| FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
+| FFI | Broad scalar/Ptr/struct/callback tags via `ffi::types` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
 | Trait runtime | User-defined trait calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |

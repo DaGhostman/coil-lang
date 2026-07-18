@@ -5,9 +5,12 @@
 // address as a zero-script callback requires a separate declare/host
 // trampoline (not automatic in this phase).
 
+use ffi::*;
+use ffi::types::*;
+
 fn main() {
     let lib = dload("libsum.so");
-    let id = declare(lib, "get_doubler", (), FFIType::Ptr);
+    let id = declare(lib, "get_doubler", (), Ptr);
     let ptr = invoke(lib, id, ());
     // Non-zero pointer address — print low 16 bits as a smoke check
     // that we got a real address back (not -1 / null).

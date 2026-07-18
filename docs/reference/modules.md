@@ -42,10 +42,38 @@ A `mod` declaration loads a module file but does not bind any names in the curre
 
 ---
 
+## Virtual modules (compiler builtins)
+
+Some `use` paths resolve to **compiler-owned virtual modules**, not `.0s` files on disk. The pipeline skips disk discovery for these paths.
+
+| Module | Exports | Auto-imported? |
+|--------|---------|----------------|
+| `prelude` | `Option`, `Result` | Yes (every file) |
+| `prelude::ops` | `Add`, `Sub`, `Mul`, `Div`, `Num`, `Eq`, `Ord`, `Lt`, `Le`, `Gt`, `Ge`, `Show` | Yes (every file) |
+| `ffi` | `dload`, `declare`, `invoke` | No — write `use ffi::*;` |
+| `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — write `use ffi::types::*;` |
+
+### Prelude rebind / redefine
+
+Short prelude names are bound in scope so `Option::Some` and `T: Eq` work without imports. To redefine a prelude name:
+
+```0s
+use prelude::ops::Eq as PreludeEq; // frees short `Eq`
+trait Eq<T> { /* your trait */ }   // now allowed
+// Builtin still reachable as `prelude::ops::Eq` or `PreludeEq`
+```
+
+Without the `as` rebind, `trait Eq` / `enum Option` is a conflict diagnostic.
+
+`zero.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops`.
+
+---
+
 ## Path resolution algorithm
 
 Given a concrete import `use a::b::c;`:
 
+0. If the path matches a **virtual module** export (see above), bind that export and stop — no disk file is loaded.
 1. Split the path into segments. All segments except the last form the **directory path**; the last segment is the **item name**.
    - Path: `["a", "b"]`
    - Item name: `"c"`

@@ -14,24 +14,27 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `format` | Expression | Build a formatted string |
 | `push` | Expression | Append to an array in place and return the array |
 | `len` | Expression | Return an array length |
-| `dload` | Expression | `dlopen` a shared library |
-| `declare` | Expression | Register FFI function signature |
-| `invoke` | Expression | Call registered FFI function |
+| `ffi::{dload,declare,invoke}` | Virtual module | Runtime FFI (requires `use ffi::*`) |
+| `ffi::types::{Int,…}` | Virtual module | FFI type-tag constructors (requires `use ffi::types::*`) |
 | `done` | Expression | `true` if a coroutine handle is finished |
-| `Option` / `Result` | Types | Compiler-built-in sum types (not user-redeclarable) |
-| `FFIType` | Type | Compiler-built-in FFI tag enum |
+| `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
+| `prelude::ops::{Add,Eq,…}` | Virtual module | Auto-imported operator traits |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
+
+Compiler builtins live in **virtual modules** (not `.0s` files). Every file gets an implicit `use prelude::*; use prelude::ops::*;`. FFI is **not** auto-imported — write `use ffi::*;` / `use ffi::types::*;` before calling `dload` / using `Int`.
 
 ---
 
 ## `Option` and `Result`
 
-Pre-registered enums with fixed tags:
+Pre-registered enums with fixed tags, exported from the virtual `prelude` module (auto-imported into every file):
 
-| Enum | Variants | Tags |
-|------|----------|------|
-| `Option` | `None`, `Some(T)` | 0, 1 |
-| `Result` | `Ok(T)`, `Err(E)` | 0, 1 |
+| Enum | Variants | Tags | Canonical path |
+|------|----------|------|----------------|
+| `Option` | `None`, `Some(T)` | 0, 1 | `prelude::Option` |
+| `Result` | `Ok(T)`, `Err(E)` | 0, 1 | `prelude::Result` |
+
+Bare `Option::Some(…)` works because of the implicit prelude. To redefine a prelude name, first free the short binding (`use prelude::Option as PreludeOption;`) then declare your own.
 
 Use constructors / `match` as usual, plus `raise`, `?`, `??`, and `?.` — see [Tutorial: Error handling](../tutorial/09-error-handling.md).
 
@@ -136,11 +139,20 @@ print "%s", s; // 42-x
 
 ---
 
-## `dload`
+## `dload` / `declare` / `invoke` (`ffi`)
+
+Runtime FFI callables are exports of the virtual `ffi` module. They are **not** keywords and are **not** in scope until you import them:
+
+```0s
+use ffi::*;
+use ffi::types::*;
+```
+
+Or import individually: `use ffi::dload;`, `use ffi::declare;`, `use ffi::invoke;`.
+
+### `dload`
 
 Load a native shared library at runtime.
-
-### Syntax
 
 ```0s
 dload(path_expr)
@@ -150,21 +162,18 @@ dload(path_expr)
 |----------|------|-------------|
 | `path_expr` | `string` | Path or name passed to `dlopen` |
 
-### Returns
-
-Library handle as `int` (heap library object address). Returns `-1` on failure.
-
-### Example
+Returns a library handle as `int` (heap library object address), or `-1` on failure.
 
 ```0s
+use ffi::*;
 let lib = dload("libsum.so");
 ```
 
-### Notes
+Notes:
 
 - Requires libffi-enabled build.
 - Prefer full paths when cwd is unpredictable.
-- Same mechanism as the string in `extern "..." { ... }` blocks.
+- Same mechanism as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::*`).
 
 ---
 
@@ -198,11 +207,9 @@ print "%z", done(h); // true
 
 ---
 
-## `declare`
+### `declare`
 
 Register a C function signature in a loaded library.
-
-### Syntax
 
 ```0s
 declare(lib, name, (arg_types...), ret_type)
@@ -215,37 +222,36 @@ declare(lib, name, (arg_types...), ret_type)
 | `(arg_types...)` | Tuple of FFI tags | One tag per parameter |
 | `ret_type` | FFI tag | Return type (`void` allowed) |
 
-### Returns
+Returns a function id (`int`), or `-1` if symbol missing or libffi rejects signature.
 
-Function id (`int`), or `-1` if symbol missing or libffi rejects signature.
+### FFI type tags (`ffi::types`)
 
-### FFI type tags
-
-Either enum constructors or bare names:
+Tag constructors live in the virtual `ffi::types` module. After `use ffi::types::*;`, write bare `Int`, `Ptr`, `Callback`, …:
 
 ```0s
-enum FFIType { Int, Float, String, Void }
+use ffi::*;
+use ffi::types::*;
 
-declare(lib, "f", (FFIType::Int, FFIType::String), FFIType::Int);
-declare(lib, "g", (int, float), void);   // bare names
+declare(lib, "f", (Int, String), Int);
+declare(lib, "g", (int, float), void);   // bare lowercase names still work
+declare(lib, "h", (ffi::types::Ptr,), Int); // qualified path needs no glob
 ```
 
 | Tag | Meaning |
 |-----|---------|
-| `int` / `FFIType::Int` | 64-bit integer |
-| `float` / `FFIType::Float` | 64-bit float |
-| `string` / `FFIType::String` | C string |
-| `void` / `FFIType::Void` | No return value only |
+| `int` / `Int` | 64-bit integer |
+| `float` / `Float` | 64-bit float |
+| `string` / `String` | C string |
+| `void` / `Void` | No return value only |
+| `Ptr` / `Callback` / … | See [FFI tutorial](../tutorial/07-ffi.md) |
 
-`void` cannot appear as an argument type.
+`void` cannot appear as an argument type. There is no global bare `FFIType` name — import `ffi::types` (or use the qualified `ffi::types::Int` path).
 
 ---
 
-## `invoke`
+### `invoke`
 
 Call a function registered with `declare`.
-
-### Syntax
 
 ```0s
 invoke(lib, fn_id, (args...))
@@ -257,17 +263,11 @@ invoke(lib, fn_id, (args...))
 | `fn_id` | `int` | Id from `declare` |
 | `(args...)` | Tuple of values | Must match declared arity and types |
 
-### Returns
-
-Value per declared return type. `void` functions push nothing meaningful — do not rely on a return value.
-
-### Example
+Returns a value per the declared return type. `void` functions push nothing meaningful — do not rely on a return value.
 
 ```0s
 print "%i", invoke(lib, sum_id, (40, 2));
 ```
-
-### Typechecker note
 
 `invoke` returns the type recorded from the matching `declare(..., ret)` (or `unit` for `void`). Bind the `declare` result with `let id = declare(...)` so the side table can refine later `invoke` calls.
 
