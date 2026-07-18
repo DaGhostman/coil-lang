@@ -191,6 +191,13 @@ fn example_generic_print_shows_primitives_and_user_type() {
     assert_eq!(output, "42hi1.5true(3,4)99");
 }
 
+/// Phase 8: tuples and anonymous records have structural Show for `%v`.
+#[test]
+fn example_show_tuple_prints_structural_tuple_and_record() {
+    let output = run_example("examples/show_tuple.0s");
+    assert_eq!(output, "(1, 2){ a: 3, b: 4 }");
+}
+
 /// Phase 5: unary HKT `Container<Option>` + `get<F: Container, A>(F<A>)`.
 #[test]
 fn example_hkt_container_prints_42() {

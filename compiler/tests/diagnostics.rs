@@ -379,6 +379,20 @@ fn format_percent_v_requires_show_bound() {
 }
 
 #[test]
+fn format_percent_v_requires_show_bound_inside_structural_tuple() {
+    let (_ty, msgs) = check(
+        "fn bad<T>(T x) { print \"%v\", (x, 1); } \
+         fn main() { bad(1); }",
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`Show`") || m.contains("Show")),
+        "expected structural `%v` with open T to require Show, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn format_percent_v_accepts_show_bound() {
     let (_ty, msgs) = check(
         "fn ok<T: Show>(T x) { print \"%v\", x; } \

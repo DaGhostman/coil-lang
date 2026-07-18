@@ -6675,8 +6675,7 @@ impl Checker {
                     }
                 }
                 other => {
-                    let lookup = show_lookup_ty(other);
-                    if !self.generics.has_instance("Show", &lookup) {
+                    if !self.is_showable_for_format(other) {
                         let mut msg = Message::error(
                             ErrorCode::FormatSpecifierMismatch,
                             format!(
@@ -6772,6 +6771,23 @@ impl Checker {
                 spec_index + 1
             ));
             self.messages.push(msg);
+        }
+    }
+
+    fn is_showable_for_format(&self, ty: &Ty) -> bool {
+        let resolved = apply_ty_prune(&self.subst, ty);
+        match resolved {
+            Ty::Var(_) => false,
+            Ty::Tuple(items) => items
+                .iter()
+                .all(|item| self.is_showable_for_format(item)),
+            Ty::Record { fields } => fields
+                .iter()
+                .all(|(_, field_ty)| self.is_showable_for_format(field_ty)),
+            other => {
+                let lookup = show_lookup_ty(&other);
+                self.generics.has_instance("Show", &lookup)
+            }
         }
     }
 
@@ -8977,6 +8993,13 @@ mod tests {
     }
 
     #[test]
+    fn format_percent_v_accepts_structural_tuple_and_record() {
+        let (mut c, _) = check(r#"print "%v%v", (1, true), { a: 3, b: "x" };"#);
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
     fn format_percent_i_on_open_type_errors() {
         let msgs = assert_messages(
             r#"fn bad<T>(T x) { print "%i", x; } fn main() { bad(1); }"#,
@@ -9001,6 +9024,18 @@ mod tests {
         assert!(
             msgs.iter().any(|m| m.message().contains("Show")),
             "expected Show requirement for `%v`, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn format_percent_v_rejects_structural_tuple_with_open_type() {
+        let msgs = assert_messages(
+            r#"fn bad<T>(T x) { print "%v", (x, 1); } fn main() { bad(1); }"#,
+        );
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Show")),
+            "expected Show requirement for structural `%v` with open T, got: {:?}",
             msgs
         );
     }

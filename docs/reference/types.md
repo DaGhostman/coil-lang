@@ -124,6 +124,8 @@ fn pair(int a, string b) -> (int, string) { return (a, b); }
 
 Annotation: `(T1, T2, ...)`. Literal syntax requires a comma: `(1,)` is a 1-tuple; `(1)` is a parenthesized expression.
 
+Tuples have structural `Show` support for `%v` when every element is showable. The printed form is `(a, b)` (and `(a,)` for a 1-tuple).
+
 ---
 
 ## Arrays (`Ty::Array`)
@@ -173,6 +175,9 @@ let n = d.x;              // field access
 - Two record literals with the same field names and compatible field types unify structurally.
 - Field access on records uses string-keyed `GetField`; enum record variants use index-based `LoadField`.
 - Duplicate field names in one literal → compile error.
+- Anonymous records have structural `Show` support for `%v` when every field is showable. Fields print in canonical name order as `{ a: 1, b: 2 }`.
+
+Structural `Show` is limited to tuples and anonymous records. Enums, classes, and other user types still need an explicit `impl Show<T>`.
 
 ---
 

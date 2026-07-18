@@ -952,22 +952,58 @@ impl Compiler {
 
         if let (Some(fmt), Some(params)) = (fmt_lit.as_deref(), params) {
             let rewritten = Self::rewrite_format_v_to_s(fmt);
-            self.emit_string_literal(&rewritten);
             let specs = Self::format_consuming_specs(fmt);
-            let mut emitted = 0usize;
-            for (param, spec) in params.iter().zip(specs.iter()) {
-                if *spec == 'v' {
-                    self.emit_show_for_format_arg(param);
-                } else {
+            let has_structural_show = params
+                .iter()
+                .zip(specs.iter())
+                .any(|(param, spec)| *spec == 'v' && self.is_structural_show_arg(param));
+            if has_structural_show {
+                let mut arg_slots = Vec::with_capacity(params.len());
+                let mut emitted = 0usize;
+                for (param, spec) in params.iter().zip(specs.iter()) {
+                    if *spec == 'v' {
+                        self.emit_show_for_format_arg(param);
+                    } else {
+                        let bc = self.do_compile(param);
+                        self.bytecode.extend(bc);
+                    }
+                    let slot = self.alloc_temp_slot();
+                    self.bytecode
+                        .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    arg_slots.push(slot);
+                    emitted += 1;
+                }
+                // Extra args beyond specifiers — still push them (VM pops by count).
+                for param in params.iter().skip(emitted) {
+                    let bc = self.do_compile(param);
+                    self.bytecode.extend(bc);
+                    let slot = self.alloc_temp_slot();
+                    self.bytecode
+                        .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                    arg_slots.push(slot);
+                }
+                self.emit_string_literal(&rewritten);
+                for slot in arg_slots {
+                    self.bytecode
+                        .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                }
+            } else {
+                self.emit_string_literal(&rewritten);
+                let mut emitted = 0usize;
+                for (param, spec) in params.iter().zip(specs.iter()) {
+                    if *spec == 'v' {
+                        self.emit_show_for_format_arg(param);
+                    } else {
+                        let bc = self.do_compile(param);
+                        self.bytecode.extend(bc);
+                    }
+                    emitted += 1;
+                }
+                // Extra args beyond specifiers — still push them (VM pops by count).
+                for param in params.iter().skip(emitted) {
                     let bc = self.do_compile(param);
                     self.bytecode.extend(bc);
                 }
-                emitted += 1;
-            }
-            // Extra args beyond specifiers — still push them (VM pops by count).
-            for param in params.iter().skip(emitted) {
-                let bc = self.do_compile(param);
-                self.bytecode.extend(bc);
             }
             self.bytecode.push(
                 Byte::new(Instruction::FORMAT).with_operand_u32(params.len() as u32),
@@ -986,6 +1022,24 @@ impl Compiler {
             self.bytecode
                 .push(Byte::new(Instruction::FORMAT).with_operand_u32(params_len));
         }
+    }
+
+    fn show_format_arg_ty(&self, arg: &Output) -> Option<Ty> {
+        let span = arg.0.into_range();
+        let span_ty = self
+            .checker
+            .lookup_for_codegen_span(span.start, span.end)
+            .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t));
+        match span_ty {
+            Some(Ty::Var(_)) | None => self.codegen_expr_ty(arg),
+            Some(other) => Some(other),
+        }
+    }
+
+    fn is_structural_show_arg(&self, arg: &Output) -> bool {
+        self.show_format_arg_ty(arg)
+            .map(|ty| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &ty))
+            .is_some_and(|ty| matches!(ty, Ty::Tuple(_) | Ty::Record { .. }))
     }
 
     /// Lower one `%v` argument to a string via the `Show` dictionary /
@@ -1019,33 +1073,20 @@ impl Compiler {
         // Prefer a fully resolved type: span cache from a shared generic body
         // may still be an open `Ty::Var` even when mono/codegen side-tables
         // know the ground type (or when the arg is a literal / construct).
-        let span_ty = self
-            .checker
-            .lookup_for_codegen_span(span.start, span.end)
-            .map(|t| crate::typechecking::subst::apply_ty_prune(self.checker.subst(), &t));
-        let arg_ty = match span_ty {
-            Some(Ty::Var(_)) | None => match arg.1.as_ref() {
-                Expression::Integer(_) => Some(crate::typechecking::ty::int()),
-                Expression::Float(_) => Some(crate::typechecking::ty::float()),
-                Expression::String(_) => Some(crate::typechecking::ty::string()),
-                Expression::Bool(_) => Some(crate::typechecking::ty::boolean()),
-                Expression::Identifier(name) => self.codegen_var_type_for(name),
-                _ => None,
-            },
-            Some(other) => Some(other),
-        };
+        let arg_ty = self.show_format_arg_ty(arg);
 
         if let Some(ty) = arg_ty.as_ref() {
+            let resolved = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty);
+            if matches!(resolved, Ty::Tuple(_) | Ty::Record { .. }) {
+                let mut arg_bc = self.do_compile(arg);
+                self.bytecode.append(&mut arg_bc);
+                self.emit_show_for_stack_value(&resolved);
+                return;
+            }
+
             // Instance heads use `Ty::Con("Point")`; construct sites often
             // produce `Constructor` / `Sum` — peel to the enum name.
-            let lookup_ty = match ty {
-                Ty::Sum { name, .. } => Ty::Con(name.clone()),
-                Ty::Constructor { owner, .. } => match owner.as_ref() {
-                    Ty::Sum { name, .. } | Ty::Con(name) => Ty::Con(name.clone()),
-                    other => other.clone(),
-                },
-                other => other.clone(),
-            };
+            let lookup_ty = Self::show_lookup_ty_for_instance(&resolved);
             if let Some(instance) = self
                 .checker
                 .generics()
@@ -1067,6 +1108,113 @@ impl Compiler {
         let mut arg_bc = self.do_compile(arg);
         self.bytecode.append(&mut arg_bc);
         self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+    }
+
+    fn show_lookup_ty_for_instance(ty: &Ty) -> Ty {
+        match ty {
+            Ty::Sum { name, .. } => Ty::Con(name.clone()),
+            Ty::Constructor { owner, .. } => Self::show_lookup_ty_for_instance(owner),
+            other => other.clone(),
+        }
+    }
+
+    fn tuple_show_format(len: usize) -> String {
+        match len {
+            0 => "()".to_string(),
+            1 => "(%s,)".to_string(),
+            _ => format!("({})", vec!["%s"; len].join(", ")),
+        }
+    }
+
+    fn record_show_format(fields: &[(String, Ty)]) -> String {
+        if fields.is_empty() {
+            return "{}".to_string();
+        }
+        let parts = fields
+            .iter()
+            .map(|(name, _)| format!("{name}: %s"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ {parts} }}")
+    }
+
+    fn emit_show_for_stack_value(&mut self, ty: &Ty) {
+        let resolved = crate::typechecking::subst::apply_ty_prune(self.checker.subst(), ty);
+        match resolved {
+            Ty::Tuple(items) => self.emit_tuple_show_for_stack_value(&items),
+            Ty::Record { fields } => self.emit_record_show_for_stack_value(&fields),
+            other => {
+                let lookup_ty = Self::show_lookup_ty_for_instance(&other);
+                if let Some(instance) = self
+                    .checker
+                    .generics()
+                    .find_instance("Show", std::slice::from_ref(&lookup_ty))
+                    .cloned()
+                    && let Some(fqn) = instance.method_fqns.get("show").cloned()
+                    && let Some(&offset) = self.functions.get(&fqn)
+                {
+                    Self::emit_box_if_needed(&mut self.bytecode, &lookup_ty);
+                    Self::emit_call_indirect(&mut self.bytecode, offset as u32, 1);
+                } else {
+                    self.bytecode.push(Byte::new(Instruction::STRINGIFY));
+                }
+            }
+        }
+    }
+
+    fn emit_tuple_show_for_stack_value(&mut self, items: &[Ty]) {
+        let tuple_slot = self.alloc_temp_slot();
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(tuple_slot));
+
+        let mut element_slots = Vec::with_capacity(items.len());
+        for (idx, item_ty) in items.iter().enumerate() {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(tuple_slot));
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_inline(idx as i32));
+            self.bytecode.push(Byte::new(Instruction::Index));
+            self.emit_show_for_stack_value(item_ty);
+            let slot = self.alloc_temp_slot();
+            self.bytecode
+                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            element_slots.push(slot);
+        }
+
+        self.emit_string_literal(&Self::tuple_show_format(items.len()));
+        for slot in element_slots {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::FORMAT).with_operand_u32(items.len() as u32));
+    }
+
+    fn emit_record_show_for_stack_value(&mut self, fields: &[(String, Ty)]) {
+        let record_slot = self.alloc_temp_slot();
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(record_slot));
+
+        let mut field_slots = Vec::with_capacity(fields.len());
+        for (name, field_ty) in fields {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(record_slot));
+            Self::emit_raw_string_literal(&mut self.bytecode, name);
+            self.bytecode.push(Byte::new(Instruction::GetField));
+            self.emit_show_for_stack_value(field_ty);
+            let slot = self.alloc_temp_slot();
+            self.bytecode
+                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            field_slots.push(slot);
+        }
+
+        self.emit_string_literal(&Self::record_show_format(fields));
+        for slot in field_slots {
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::FORMAT).with_operand_u32(fields.len() as u32));
     }
 
     /// Structurally bind scheme pattern variables to concrete call-site types.
@@ -2030,8 +2178,26 @@ impl Compiler {
 
     fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
         let resolved = match node.1.as_ref() {
+            Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
+            Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
+            Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
             Expression::String(_) | Expression::Format(_, _) => {
                 Some(Ty::Con(crate::typechecking::ty::STRING.into()))
+            }
+            Expression::Tuple(items) => {
+                let mut tys = Vec::with_capacity(items.len());
+                for item in items {
+                    tys.push(self.codegen_expr_ty(item)?);
+                }
+                Some(Ty::Tuple(tys))
+            }
+            Expression::Dict(fields) => {
+                let mut tys = Vec::with_capacity(fields.len());
+                for field in fields {
+                    tys.push((field.name.to_string(), self.codegen_expr_ty(&field.value)?));
+                }
+                tys.sort_by(|a, b| a.0.cmp(&b.0));
+                Some(Ty::Record { fields: tys })
             }
             Expression::Identifier(name) => self
                 .codegen_var_type_for(name)

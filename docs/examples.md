@@ -71,6 +71,24 @@ fn main() {
 
 ---
 
+### `examples/show_tuple.0s`
+
+**Demonstrates:** `%v` structural Show for tuples and anonymous records.
+
+```0s
+fn main() {
+    print "%v", (1, 2);
+    print "%v", { a: 3, b: 4 };
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/show_tuple.0s` |
+| **Output** | `(1, 2){ a: 3, b: 4 }` |
+
+---
+
 ### `examples/let_test.0s`
 
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).
