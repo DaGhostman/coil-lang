@@ -68,18 +68,40 @@ cargo run -- examples/fib.0s
 
 **Expected output:** `2178309`
 
-The CLI compiles `examples/fib.0s` to bytecode, serializes it into `out.c0s` in the current directory (if the file does not already exist), then loads and executes it on the VM.
+The default CLI invocation compiles `examples/fib.0s` to bytecode, serializes it into `out.c0s` in the current directory (if needed), then loads and executes it on the VM.
+
+### CLI commands
+
+| Invocation | Meaning |
+|------------|---------|
+| `zero-script <file.0s>` | Compile to `out.c0s` (cached) and run |
+| `zero-script compile <file.0s> [-o path]` | Compile only; default output is `out.c0s` |
+| `zero-script run <file.c0s>` | Execute a previously compiled archive |
+| `zero-script test` | Compile and run every `.0s` file under `./tests` |
+
+Examples:
+
+```bash
+# Compile only, custom archive path
+cargo run -- compile examples/fib.0s -o /tmp/fib.c0s
+
+# Run that archive
+cargo run -- run /tmp/fib.c0s
+
+# Project tests (expects a ./tests directory with .0s files that define main)
+cargo run -- test
+```
 
 ### Recompiling after changes
 
-The runner caches `out.c0s`. After editing a `.0s` file, delete the archive to pick up changes:
+The default (`BuildAndRun`) path caches `out.c0s`. After editing a `.0s` file, delete the archive to pick up changes, or rely on automatic invalidation:
 
 ```bash
 rm -f out.c0s
 cargo run -- examples/fib.0s
 ```
 
-If the archive version in the binary does not match the file on disk, the runner prints a version mismatch message and exits — delete `out.c0s` and run again.
+The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source. The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
 
 ## A simpler hello-world
 
