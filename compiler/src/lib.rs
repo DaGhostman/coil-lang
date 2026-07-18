@@ -1348,19 +1348,21 @@ impl Compiler {
             }
             resolved.push(concrete);
         }
-        // HKT classes look up by constructor head (`Option`), not
-        // applied types (`Option<int>`).
-        let lookup = if checker
-            .generics()
-            .typeclass(&constraint.class)
-            .map(|c| c.is_unary_hkt())
-            .unwrap_or(false)
-        {
+        // Constructor-kinded class params look up by constructor head
+        // (`Option`, `Result`), not applied types.
+        let lookup = if let Some(class_def) = checker.generics().typeclass(&constraint.class) {
             resolved
                 .iter()
-                .map(|concrete| match concrete {
-                    Ty::App(head, _) => head.as_ref().clone(),
-                    other => other.clone(),
+                .enumerate()
+                .map(|(i, concrete)| {
+                    if class_def.is_constructor_kind_at(i) {
+                        match concrete {
+                            Ty::App(head, _) => head.as_ref().clone(),
+                            other => other.clone(),
+                        }
+                    } else {
+                        concrete.clone()
+                    }
                 })
                 .collect()
         } else {

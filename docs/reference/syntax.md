@@ -114,10 +114,12 @@ impl Measurable<int> {
 
 Generic functions use `type_param_list` on `fn` (see above). Bounds use `+`
 between class names (`T: Num + Eq`). Multi-parameter classes use a trailing
-`where Class<T1, T2>` clause (unary `where Num<T>` is also accepted). Unary
-higher-kinded parameters use an explicit kind annotation (`F: * -> *`); a bound
-whose class parameter is constructor-kinded (for example `F: Container`) also
-implies that kind.
+`where Class<T1, T2>` clause (unary `where Num<T>` is also accepted).
+Higher-kinded parameters use explicit kind annotations (`F: * -> *`,
+`F: * -> * -> *`, or `F: (* -> *) -> *`); a bound whose class parameter is
+constructor-kinded (for example `F: Container`) also implies that kind. A
+parameter can carry both an explicit kind and a bound:
+`F: * -> * -> *, Bifunctor`.
 
 ### Enums
 

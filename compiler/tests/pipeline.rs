@@ -198,10 +198,17 @@ fn example_show_tuple_prints_structural_tuple_and_record() {
     assert_eq!(output, "(1, 2){ a: 3, b: 4 }");
 }
 
-/// Phase 5: unary HKT `Container<Option>` + `get<F: Container, A>(F<A>)`.
+/// Phase 5: single-argument HKT `Container<Option>` + `get<F: Container, A>(F<A>)`.
 #[test]
 fn example_hkt_container_prints_42() {
     let output = run_example("examples/hkt_container.0s");
+    assert_eq!(output, "42");
+}
+
+/// Phase 1 advanced generics: binary HKT `Bifunctor<Result>`.
+#[test]
+fn example_hkt_bifunctor_prints_42() {
+    let output = run_example("examples/hkt_bifunctor.0s");
     assert_eq!(output, "42");
 }
 
@@ -394,10 +401,7 @@ fn polyfn_with_fib_keeps_fused_superinstructions() {
     assert!(
         has_fused,
         "expected fused ops with PolyFn present; opcodes: {:?}",
-        bytecode
-            .iter()
-            .map(|b| b.bytecode())
-            .collect::<Vec<_>>()
+        bytecode.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
     );
     let output = run_bytecode(bytecode, constants, &pipeline, None);
     // fib(6) = 8
@@ -1091,4 +1095,3 @@ fn example_perf_coro_ping_prints_expected() {
     let output = run_example("examples/perf/coro_ping.0s");
     assert_eq!(output, "124750");
 }
-

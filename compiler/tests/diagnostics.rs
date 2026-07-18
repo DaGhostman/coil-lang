@@ -35,7 +35,8 @@ fn unknown_identifier_reports_helpful_message() {
 fn unknown_identifier_has_stable_error_code() {
     let msgs = check_messages("x;");
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::UnknownValue)),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::UnknownValue)),
         "expected ErrorCode::UnknownValue (E0100), got: {:?}",
         msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
@@ -45,7 +46,8 @@ fn unknown_identifier_has_stable_error_code() {
 fn type_mismatch_has_stable_error_code() {
     let msgs = check_messages(r#"let x: int = "hello";"#);
     assert!(
-        msgs.iter().any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::TypeMismatch)),
         "expected ErrorCode::TypeMismatch (E0102), got: {:?}",
         msgs.iter().map(|m| m.code()).collect::<Vec<_>>()
     );
@@ -260,8 +262,7 @@ fn match_with_all_variants_no_messages() {
 #[test]
 fn non_exhaustive_match_emits_diagnostic() {
     // One arm missing the `Some` variant → "Non-exhaustive" error.
-    let src =
-        "let x = Option::None(); match x { Option::None() => 0 };";
+    let src = "let x = Option::None(); match x { Option::None() => 0 };";
     let (_ty, msgs) = check(src);
     assert!(
         msgs.iter().any(|m| m.contains("Non-exhaustive match")),
@@ -354,10 +355,7 @@ fn format_percent_i_rejects_open_type_suggests_percent_v() {
     );
     assert!(
         msgs.iter().any(|m| {
-            m.message().contains("open type")
-                && m.help()
-                    .as_ref()
-                    .is_some_and(|h| h.contains("%v"))
+            m.message().contains("open type") && m.help().as_ref().is_some_and(|h| h.contains("%v"))
         }),
         "expected open-type `%i` diagnostic suggesting `%v`, got: {:?}",
         msgs
@@ -628,9 +626,7 @@ fn coalesce_on_int_has_stable_invalid_coalesce_code() {
 
 #[test]
 fn optional_access_on_result_has_stable_code() {
-    let msgs = check_messages(
-        "fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }",
-    );
+    let msgs = check_messages("fn main() { let r = Result::Ok({ v: 1 }); let _x = r?.v; }");
     assert!(
         msgs.iter()
             .any(|m| m.code() == Some(ErrorCode::InvalidOptionalAccess)),
@@ -658,7 +654,7 @@ fn hkt_instance_rejects_applied_type_argument() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("unary HKT")
+        msgs.iter().any(|m| m.contains("constructor-kinded class")
             && m.contains("type constructor")
             && m.contains("* -> *")),
         "expected HKT instance kind diagnostic, got: {:?}",
@@ -700,9 +696,10 @@ fn superclass_impl_requires_superclass_instance() {
         "#,
     );
     assert!(
-        msgs.iter().any(|m| m.contains("requires superclass instance")
-            && m.contains("Equal")
-            && m.contains("Ordered")),
+        msgs.iter()
+            .any(|m| m.contains("requires superclass instance")
+                && m.contains("Equal")
+                && m.contains("Ordered")),
         "expected missing Equal superclass diagnostic, got: {:?}",
         msgs
     );

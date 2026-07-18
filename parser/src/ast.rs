@@ -3,24 +3,30 @@ use std::{borrow::Borrow, fmt::Display};
 use chumsky::span::SimpleSpan;
 pub type Output<'parser> = (SimpleSpan, Box<Expression<'parser>>);
 
-/// Kind of a type parameter (Phase 5 — unary HKT).
+/// Kind of a type parameter.
 ///
 /// - [`Kind::Type`] (`*`) — ordinary type parameter (`T`, `A`)
-/// - [`Kind::Arrow`] (`* -> *`) — unary type constructor (`F` in `F<A>`)
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// - [`Kind::Arrow`] — type constructor arrows such as `* -> * -> *`
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Kind {
     /// `*` — a proper type.
     #[default]
     Type,
-    /// `* -> *` — a unary type constructor.
-    Arrow,
+    /// `domain -> codomain` — a type constructor kind.
+    Arrow(Box<Kind>, Box<Kind>),
 }
 
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Kind::Type => write!(f, "*"),
-            Kind::Arrow => write!(f, "* -> *"),
+            Kind::Arrow(domain, codomain) => {
+                match domain.as_ref() {
+                    Kind::Arrow(_, _) => write!(f, "({})", domain)?,
+                    Kind::Type => write!(f, "{}", domain)?,
+                }
+                write!(f, " -> {}", codomain)
+            }
         }
     }
 }
@@ -29,12 +35,11 @@ impl std::fmt::Display for Kind {
 ///
 /// `T` → `TypeParam { name: "T", bounds: [], kind: Type }`
 /// `T: Num + Eq` → `TypeParam { name: "T", bounds: ["Num", "Eq"], kind: Type }`
-/// `F: * -> *` → `TypeParam { name: "F", bounds: [], kind: Arrow }`
+/// `F: * -> *` → `TypeParam { name: "F", bounds: [], kind: Arrow(Type, Type) }`
 ///
-/// After `:`, a parameter takes either a kind annotation (`*` / `* -> *`)
-/// or class bounds (`Num + Eq`) — not both. Constructor kind may also be
-/// inferred later from a bound whose class parameter is `* -> *`
-/// (e.g. `F: Container`).
+/// After `:`, a parameter takes class bounds (`Num + Eq`), a kind annotation
+/// (`* -> *`), or a kind annotation followed by class bounds
+/// (`F: * -> *, Container`).
 #[derive(Clone, PartialEq, Debug)]
 pub struct TypeParam<'expr> {
     pub name: &'expr str,
@@ -448,10 +453,14 @@ fn fmt_type_params(params: &[TypeParam<'_>]) -> String {
 
 impl<'a> Display for TypeParam<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if !self.bounds.is_empty() {
+        if self.kind != Kind::Type {
+            write!(f, "{}: {}", self.name, self.kind)?;
+            if !self.bounds.is_empty() {
+                write!(f, ", {}", self.bounds.join(" + "))?;
+            }
+            Ok(())
+        } else if !self.bounds.is_empty() {
             write!(f, "{}: {}", self.name, self.bounds.join(" + "))
-        } else if self.kind != Kind::Type {
-            write!(f, "{}: {}", self.name, self.kind)
         } else {
             write!(f, "{}", self.name)
         }
@@ -716,11 +725,21 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{} = {}", n.1, e.1)
             }
             Self::Noop(n) => write!(f, "@{{ {} }}@", n.1),
-            Self::TypeAlias { name, type_params, ty } => {
+            Self::TypeAlias {
+                name,
+                type_params,
+                ty,
+            } => {
                 if type_params.is_empty() {
                     write!(f, "type {} = {};", name, ty.1)
                 } else {
-                    write!(f, "type {}{} = {};", name, fmt_type_params(type_params), ty.1)
+                    write!(
+                        f,
+                        "type {}{} = {};",
+                        name,
+                        fmt_type_params(type_params),
+                        ty.1
+                    )
                 }
             }
             Self::Dict(items) => {
@@ -730,7 +749,11 @@ impl<'a> Display for Expression<'a> {
                     .collect();
                 write!(f, "{{ {} }}", parts.join(", "))
             }
-            Self::EnumDecl { name, type_params, variants } => {
+            Self::EnumDecl {
+                name,
+                type_params,
+                variants,
+            } => {
                 let tp = if type_params.is_empty() {
                     String::new()
                 } else {
@@ -861,7 +884,11 @@ impl<'a> Display for Expression<'a> {
             Self::TypeFun(arg, ret) => write!(f, "{} -> {}", arg.1, ret.1),
             Self::AssocTypeDecl { name } => write!(f, "type {};", name),
             Self::AssocTypeDef { name, ty } => write!(f, "type {} = {};", name, ty.1),
-            Self::Class { name, type_params, fields } => {
+            Self::Class {
+                name,
+                type_params,
+                fields,
+            } => {
                 let tp = if type_params.is_empty() {
                     String::new()
                 } else {
@@ -870,7 +897,12 @@ impl<'a> Display for Expression<'a> {
                 let fs: Vec<String> = fields.iter().map(|f| f.1.to_string()).collect();
                 write!(f, "class {}{} {{ {} }}", name, tp, fs.join(", "))
             }
-            Self::Implementation { what, owner, type_params, methods } => {
+            Self::Implementation {
+                what,
+                owner,
+                type_params,
+                methods,
+            } => {
                 let tp = if type_params.is_empty() {
                     String::new()
                 } else {
@@ -880,13 +912,33 @@ impl<'a> Display for Expression<'a> {
                 if what.is_empty() {
                     write!(f, "impl {}{} {{ {} }}", owner, tp, ms.join(" "))
                 } else {
-                    write!(f, "impl {} for {}{} {{ {} }}", what, owner, tp, ms.join(" "))
+                    write!(
+                        f,
+                        "impl {} for {}{} {{ {} }}",
+                        what,
+                        owner,
+                        tp,
+                        ms.join(" ")
+                    )
                 }
             }
             Self::Forall { params, ty } => {
-                write!(f, "forall {}. {}", params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "), ty.1)
+                write!(
+                    f,
+                    "forall {}. {}",
+                    params
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    ty.1
+                )
             }
-            Self::TypeClass { name, type_params, methods } => {
+            Self::TypeClass {
+                name,
+                type_params,
+                methods,
+            } => {
                 let tp = if type_params.is_empty() {
                     String::new()
                 } else {
@@ -895,10 +947,20 @@ impl<'a> Display for Expression<'a> {
                 let ms: Vec<String> = methods.iter().map(|m| m.1.to_string()).collect();
                 write!(f, "typeclass {}{} {{ {} }}", name, tp, ms.join(" "))
             }
-            Self::TypeClassImpl { class, args, methods } => {
+            Self::TypeClassImpl {
+                class,
+                args,
+                methods,
+            } => {
                 let args_s: Vec<String> = args.iter().map(|a| a.1.to_string()).collect();
                 let ms: Vec<String> = methods.iter().map(|m| m.1.to_string()).collect();
-                write!(f, "impl {}<{}> {{ {} }}", class, args_s.join(", "), ms.join(" "))
+                write!(
+                    f,
+                    "impl {}<{}> {{ {} }}",
+                    class,
+                    args_s.join(", "),
+                    ms.join(" ")
+                )
             }
             e => write!(f, "<unhandled: {:?}>", e),
         }

@@ -495,11 +495,7 @@ fn unify_builtin_app_sum(subst: &Subst, app: &Ty, sum: &Ty) -> Option<Result<Sub
                     right: sum.clone(),
                 }));
             }
-            let s = match bind_var(
-                subst,
-                *var,
-                Ty::Con(common::BUILTIN_OPTION_ENUM.into()),
-            ) {
+            let s = match bind_var(subst, *var, Ty::Con(common::BUILTIN_OPTION_ENUM.into())) {
                 Ok(s) => s,
                 Err(e) => return Some(Err(e)),
             };
@@ -513,11 +509,7 @@ fn unify_builtin_app_sum(subst: &Subst, app: &Ty, sum: &Ty) -> Option<Result<Sub
                     right: sum.clone(),
                 }));
             }
-            let s = match bind_var(
-                subst,
-                *var,
-                Ty::Con(common::BUILTIN_RESULT_ENUM.into()),
-            ) {
+            let s = match bind_var(subst, *var, Ty::Con(common::BUILTIN_RESULT_ENUM.into())) {
                 Ok(s) => s,
                 Err(e) => return Some(Err(e)),
             };
@@ -1089,5 +1081,21 @@ mod tests {
             Ty::Con(common::BUILTIN_OPTION_ENUM.into())
         );
         assert_eq!(apply_ty_prune(&s, &v(1)), int());
+    }
+
+    #[test]
+    fn unify_app_var_with_binary_concrete_app_binds_by_arity() {
+        let app = Ty::App(Box::new(v(0)), vec![v(1), v(2)]);
+        let concrete = Ty::App(
+            Box::new(Ty::Con(common::BUILTIN_RESULT_ENUM.into())),
+            vec![int(), string()],
+        );
+        let s = unify(&app, &concrete).unwrap();
+        assert_eq!(
+            apply_ty_prune(&s, &v(0)),
+            Ty::Con(common::BUILTIN_RESULT_ENUM.into())
+        );
+        assert_eq!(apply_ty_prune(&s, &v(1)), int());
+        assert_eq!(apply_ty_prune(&s, &v(2)), string());
     }
 }

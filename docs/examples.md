@@ -624,6 +624,20 @@ generic caller `get<F: Container, A>(F<A>) -> A`.
 
 ---
 
+### `examples/hkt_bifunctor.0s`
+
+**Demonstrates:** Binary higher-kinded typeclasses
+(`Bifunctor<F: * -> * -> *>`) with an `impl Bifunctor<Result>` and a
+generic caller whose parameter has both an explicit kind and bound:
+`F: * -> * -> *, Bifunctor`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/hkt_bifunctor.0s` |
+| **Output** | `42` |
+
+---
+
 ### `examples/multiparam.0s`
 
 **Demonstrates:** Multi-parameter typeclass `Convert<A, B>` with a `where`

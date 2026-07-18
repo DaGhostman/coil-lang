@@ -230,9 +230,11 @@ impl<'pratt> Pratt<'pratt> {
         })
     }
 
-    /// One type parameter: `T`, `T: Num + Eq`, or `F: * -> *` (Phase 5).
+    /// One type parameter: `T`, `T: Num + Eq`, `F: * -> *`, or
+    /// `F: * -> * -> *, Bifunctor`.
     ///
-    /// After `:`, either a kind (`*` / `* -> *`) or class bounds — not both.
+    /// After `:`, either class bounds or a kind annotation. A kind annotation
+    /// may be followed by class bounds separated with a comma.
     fn single_type_param(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, TypeParam<'pratt>, extra::Err<Rich<'pratt, char>>>
@@ -240,16 +242,18 @@ impl<'pratt> Pratt<'pratt> {
            + 'pratt {
         use crate::ast::Kind;
 
-        // `* -> *` (unary constructor) or bare `*`.
-        let kind_ann = just('*')
-            .padded()
-            .then(
-                op!("->")
-                    .ignore_then(just('*').padded())
-                    .to(Kind::Arrow)
-                    .or_not(),
-            )
-            .map(|(_, arrow)| arrow.unwrap_or(Kind::Type));
+        let kind_ann = recursive(|kind| {
+            let atom = just('*')
+                .padded()
+                .to(Kind::Type)
+                .or(kind.clone().delimited_by(op!("("), op!(")")));
+
+            atom.then(op!("->").ignore_then(kind).or_not())
+                .map(|(domain, codomain)| match codomain {
+                    Some(codomain) => Kind::Arrow(Box::new(domain), Box::new(codomain)),
+                    None => domain,
+                })
+        });
 
         let class_bounds = text::ident()
             .padded()
@@ -257,9 +261,10 @@ impl<'pratt> Pratt<'pratt> {
             .at_least(1)
             .collect::<Vec<_>>();
 
-        // After `:`, try kind first (leading `*`), else class bounds.
+        // After `:`, try kind first (leading `*` or `(`), else class bounds.
         let after_colon = kind_ann
-            .map(|kind| (Vec::new(), kind))
+            .then(op!(",").ignore_then(class_bounds.clone()).or_not())
+            .map(|(kind, bounds)| (bounds.unwrap_or_default(), kind))
             .or(class_bounds.map(|bounds| (bounds, Kind::Type)));
 
         text::ident()
@@ -3575,7 +3580,7 @@ fn main() { let p = new Point(1, 2); }
 #[cfg(test)]
 mod tests_generics {
     use super::*;
-    use ast::{Expression, TypeParam};
+    use ast::Expression;
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -4085,10 +4090,70 @@ mod tests_generics {
             Expression::TypeClass { type_params, .. } => {
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "F");
-                assert_eq!(type_params[0].kind, crate::ast::Kind::Arrow);
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Type),
+                        Box::new(crate::ast::Kind::Type)
+                    )
+                );
                 assert!(type_params[0].bounds.is_empty());
             }
             other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn binary_hkt_kind_annotation_is_right_associative() {
+        match decl_ast!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }") {
+            Expression::TypeClass { type_params, .. } => {
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Type),
+                        Box::new(crate::ast::Kind::Arrow(
+                            Box::new(crate::ast::Kind::Type),
+                            Box::new(crate::ast::Kind::Type)
+                        ))
+                    )
+                );
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parenthesized_kind_annotation_parses() {
+        match decl_ast!("typeclass Higher<F: (* -> *) -> *> { fn tag<G: * -> *>(F<G> xs) -> int; }") {
+            Expression::TypeClass { type_params, .. } => {
+                assert_eq!(
+                    type_params[0].kind,
+                    crate::ast::Kind::Arrow(
+                        Box::new(crate::ast::Kind::Arrow(
+                            Box::new(crate::ast::Kind::Type),
+                            Box::new(crate::ast::Kind::Type)
+                        )),
+                        Box::new(crate::ast::Kind::Type)
+                    )
+                );
+            }
+            other => panic!("expected TypeClass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn kind_annotation_can_be_followed_by_bound() {
+        match decl_ast!(
+            "fn use_bi<F: * -> * -> *, Bifunctor, A, B>(F<A, B> xs) -> int { return 0; }"
+        ) {
+            Expression::Function { type_params, .. } => {
+                assert_eq!(type_params.len(), 3);
+                assert_eq!(type_params[0].name, "F");
+                assert_eq!(type_params[0].bounds, vec!["Bifunctor"]);
+                assert_eq!(type_params[1].name, "A");
+                assert_eq!(type_params[2].name, "B");
+            }
+            other => panic!("expected Function, got {:?}", other),
         }
     }
 
@@ -4099,6 +4164,15 @@ mod tests_generics {
         assert!(
             s.contains("F: * -> *"),
             "expected kind annotation in display, got: {s}"
+        );
+    }
+
+    #[test]
+    fn binary_hkt_kind_display_round_trips() {
+        let s = stmt!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }");
+        assert!(
+            s.contains("F: * -> * -> *"),
+            "expected binary kind annotation in display, got: {s}"
         );
     }
 

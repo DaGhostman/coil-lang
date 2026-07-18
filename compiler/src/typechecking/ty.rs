@@ -239,7 +239,7 @@ impl Scheme {
     pub fn kind_at(&self, i: usize) -> super::kind::Kind {
         self.kinds
             .get(i)
-            .copied()
+            .cloned()
             .unwrap_or(super::kind::Kind::Type)
     }
 }
@@ -493,9 +493,9 @@ pub fn subst_payload_params(
 ) -> EnumVariantPayloadTy {
     match payload {
         EnumVariantPayloadTy::Unit => EnumVariantPayloadTy::Unit,
-        EnumVariantPayloadTy::Tuple(tys) => EnumVariantPayloadTy::Tuple(
-            tys.iter().map(|t| subst_ty_params(t, params)).collect(),
-        ),
+        EnumVariantPayloadTy::Tuple(tys) => {
+            EnumVariantPayloadTy::Tuple(tys.iter().map(|t| subst_ty_params(t, params)).collect())
+        }
         EnumVariantPayloadTy::Record(fields) => EnumVariantPayloadTy::Record(
             fields
                 .iter()
@@ -565,9 +565,9 @@ pub fn schemaize_payload(
 ) -> EnumVariantPayloadTy {
     match payload {
         EnumVariantPayloadTy::Unit => EnumVariantPayloadTy::Unit,
-        EnumVariantPayloadTy::Tuple(tys) => EnumVariantPayloadTy::Tuple(
-            tys.iter().map(|t| schemaize_ty(t, var_to_name)).collect(),
-        ),
+        EnumVariantPayloadTy::Tuple(tys) => {
+            EnumVariantPayloadTy::Tuple(tys.iter().map(|t| schemaize_ty(t, var_to_name)).collect())
+        }
         EnumVariantPayloadTy::Record(fields) => EnumVariantPayloadTy::Record(
             fields
                 .iter()

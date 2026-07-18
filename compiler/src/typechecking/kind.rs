@@ -1,32 +1,62 @@
-//! Kind language for unary higher-kinded type parameters (Phase 5).
+//! Kind language for higher-kinded type parameters.
 //!
-//! Only two kinds are supported:
 //! - [`Kind::Type`] (`*`) — ordinary types (`int`, `Option<int>`, …)
-//! - [`Kind::Arrow`] (`* -> *`) — unary type constructors (`Option`, `F` in `F<A>`)
-//!
-//! Higher arities and kind variables are intentionally out of scope.
+//! - [`Kind::Arrow`] — type constructors, including `* -> * -> *`
+//!   and `(* -> *) -> *`.
 
 use std::fmt;
 
-/// A kind in the unary HKT fragment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// A kind in the HKT fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Kind {
     /// `*` — a proper type.
     #[default]
     Type,
-    /// `* -> *` — a unary type constructor.
-    Arrow,
+    /// `domain -> codomain` — a type constructor kind.
+    Arrow(Box<Kind>, Box<Kind>),
 }
 
 impl Kind {
+    pub fn arrow(domain: Kind, codomain: Kind) -> Self {
+        Kind::Arrow(Box::new(domain), Box::new(codomain))
+    }
+
+    /// Build a first-order constructor kind with `arity` type arguments.
+    pub fn constructor(arity: usize) -> Self {
+        (0..arity).fold(Kind::Type, |codomain, _| Kind::arrow(Kind::Type, codomain))
+    }
+
     /// True when this kind classifies a proper type (`*`).
-    pub fn is_type(self) -> bool {
+    pub fn is_type(&self) -> bool {
         matches!(self, Kind::Type)
     }
 
-    /// True when this kind classifies a unary constructor (`* -> *`).
-    pub fn is_arrow(self) -> bool {
-        matches!(self, Kind::Arrow)
+    /// True when this kind classifies a type constructor.
+    pub fn is_arrow(&self) -> bool {
+        matches!(self, Kind::Arrow(_, _))
+    }
+
+    /// Number of top-level arguments before the kind produces a proper type.
+    pub fn arity(&self) -> usize {
+        match self {
+            Kind::Type => 0,
+            Kind::Arrow(_, codomain) => 1 + codomain.arity(),
+        }
+    }
+
+    pub fn is_constructor_kind(&self) -> bool {
+        self.arity() > 0
+    }
+
+    /// Top-level argument kinds in source order.
+    pub fn argument_kinds(&self) -> Vec<Kind> {
+        let mut args = Vec::new();
+        let mut current = self;
+        while let Kind::Arrow(domain, codomain) = current {
+            args.push(domain.as_ref().clone());
+            current = codomain.as_ref();
+        }
+        args
     }
 }
 
@@ -34,7 +64,13 @@ impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Kind::Type => write!(f, "*"),
-            Kind::Arrow => write!(f, "* -> *"),
+            Kind::Arrow(domain, codomain) => {
+                match domain.as_ref() {
+                    Kind::Arrow(_, _) => write!(f, "({})", domain)?,
+                    Kind::Type => write!(f, "{}", domain)?,
+                }
+                write!(f, " -> {}", codomain)
+            }
         }
     }
 }
@@ -43,7 +79,9 @@ impl From<parser::ast::Kind> for Kind {
     fn from(k: parser::ast::Kind) -> Self {
         match k {
             parser::ast::Kind::Type => Kind::Type,
-            parser::ast::Kind::Arrow => Kind::Arrow,
+            parser::ast::Kind::Arrow(domain, codomain) => {
+                Kind::arrow((*domain).into(), (*codomain).into())
+            }
         }
     }
 }
@@ -52,7 +90,9 @@ impl From<Kind> for parser::ast::Kind {
     fn from(k: Kind) -> Self {
         match k {
             Kind::Type => parser::ast::Kind::Type,
-            Kind::Arrow => parser::ast::Kind::Arrow,
+            Kind::Arrow(domain, codomain) => {
+                parser::ast::Kind::Arrow(Box::new((*domain).into()), Box::new((*codomain).into()))
+            }
         }
     }
 }
@@ -64,6 +104,22 @@ mod tests {
     #[test]
     fn kind_display_round_trips() {
         assert_eq!(Kind::Type.to_string(), "*");
-        assert_eq!(Kind::Arrow.to_string(), "* -> *");
+        assert_eq!(Kind::constructor(1).to_string(), "* -> *");
+        assert_eq!(Kind::constructor(2).to_string(), "* -> * -> *");
+        assert_eq!(
+            Kind::arrow(Kind::constructor(1), Kind::Type).to_string(),
+            "(* -> *) -> *"
+        );
+    }
+
+    #[test]
+    fn kind_argument_kinds_follow_tree_shape() {
+        let binary = Kind::constructor(2);
+        assert_eq!(binary.arity(), 2);
+        assert_eq!(binary.argument_kinds(), vec![Kind::Type, Kind::Type]);
+
+        let higher_order = Kind::arrow(Kind::constructor(1), Kind::Type);
+        assert_eq!(higher_order.arity(), 1);
+        assert_eq!(higher_order.argument_kinds(), vec![Kind::constructor(1)]);
     }
 }

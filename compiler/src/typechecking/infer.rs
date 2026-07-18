@@ -195,7 +195,7 @@ pub struct Checker {
     /// Active typeclass constraints on in-scope type params.
     /// `(TyVarId, class_name)` — checked when applying arithmetic ops.
     active_constraints: Vec<Constraint>,
-    /// Kind of each type variable currently in play (Phase 5 — unary HKT).
+    /// Kind of each type variable currently in play.
     var_kinds: HashMap<TyVarId, Kind>,
     /// Generics registry: typeclasses, instances, generic type ctors.
     generics: super::generics::Generics,
@@ -2123,9 +2123,9 @@ impl Checker {
                     type_params.iter().map(|tp| tp.name.to_string()).collect();
                 let param_kinds: Vec<Kind> = type_params
                     .iter()
-                    .map(|tp| Kind::from(tp.kind))
+                    .map(|tp| Kind::from(tp.kind.clone()))
                     .collect();
-                // Unary classes: param bounds become direct superclasses
+                // Single-param classes: param bounds become direct superclasses
                 // (`typeclass Ordered<T: Equal>` → superclasses: ["Equal"]).
                 // Multi-param classes ignore param bounds for superclass
                 // wiring (use `where` for those constraints later).
@@ -2155,8 +2155,8 @@ impl Checker {
                 let mut class_kinds = Vec::new();
                 for (i, type_param) in type_params.iter().enumerate() {
                     let var = self.counter.fresh();
-                    let kind = param_kinds.get(i).copied().unwrap_or(Kind::Type);
-                    self.set_var_kind(var, kind);
+                    let kind = param_kinds.get(i).cloned().unwrap_or(Kind::Type);
+                    self.set_var_kind(var, kind.clone());
                     param_frame.insert(type_param.name.to_string(), var);
                     param_vars.push(var);
                     class_kinds.push(kind);
@@ -2194,7 +2194,7 @@ impl Checker {
                         for mp in method_params {
                             let var = self.counter.fresh();
                             let kind = self.resolve_type_param_kind(mp);
-                            self.set_var_kind(var, kind);
+                            self.set_var_kind(var, kind.clone());
                             method_frame.insert(mp.name.to_string(), var);
                             method_vars.push(var);
                             method_kinds.push(kind);
@@ -2218,7 +2218,7 @@ impl Checker {
                         all_bounds.extend(assoc_vars.iter().copied());
                         all_bounds.extend(method_vars);
                         let mut all_kinds = class_kinds.clone();
-                        all_kinds.extend(assoc_kinds.iter().copied());
+                        all_kinds.extend(assoc_kinds.iter().cloned());
                         all_kinds.extend(method_kinds);
                         self.typeclass_method_schemes.insert(
                             (name.to_string(), method_name.to_string()),
@@ -2267,25 +2267,8 @@ impl Checker {
                         range.clone(),
                     ));
                 }
-                // HKT classes require bare constructor heads, not applications.
                 if let Some(ref cdef) = class_def {
-                    if cdef.is_unary_hkt() {
-                        for (i, ty) in arg_tys.iter().enumerate() {
-                            if matches!(ty, Ty::App(_, _)) {
-                                self.messages.push(Message::error(
-                                    ErrorCode::GenericTypeError,
-                                    format!(
-                                        "Instance of unary HKT class `{}` expects a type constructor \
-                                         (kind `* -> *`) as argument {}, found applied type `{}`",
-                                        class,
-                                        i + 1,
-                                        ty
-                                    ),
-                                    range.clone(),
-                                ));
-                            }
-                        }
-                    }
+                    self.validate_instance_head_kinds(cdef, &arg_tys, &range);
                 }
                 let overlapping = self.generics.has_overlapping_instance(class, &arg_tys);
                 if overlapping {
@@ -2408,7 +2391,7 @@ impl Checker {
                 }
                 let mut invalid_instance = class_def.is_none() || overlapping;
                 if let Some(class_def) = class_def.as_ref() {
-                    // Superclass instances must already exist (unary args).
+                    // Superclass instances must already exist for the same args.
                     // `impl Ordered<int>` requires `Equal<int>`, transitively.
                     let mut missing_supers = Vec::new();
                     let mut seen_super = HashSet::new();
@@ -3441,7 +3424,7 @@ impl Checker {
         for tp in params {
             let var = self.counter.fresh();
             let kind = self.resolve_type_param_kind(tp);
-            self.set_var_kind(var, kind);
+            self.set_var_kind(var, kind.clone());
             frame.insert(tp.name.to_string(), var);
             bounds.push(var);
             kinds.push(kind);
@@ -3853,7 +3836,7 @@ impl Checker {
 
     /// Kind of a type variable, defaulting to `*`.
     fn kind_of_var(&self, var: TyVarId) -> Kind {
-        self.var_kinds.get(&var).copied().unwrap_or(Kind::Type)
+        self.var_kinds.get(&var).cloned().unwrap_or(Kind::Type)
     }
 
     /// Record a type variable's kind (overwrites).
@@ -3862,20 +3845,144 @@ impl Checker {
     }
 
     /// Resolve the kind of a type parameter from its AST annotation and/or
-    /// class bounds. Explicit `* -> *` wins; otherwise a bound whose class
-    /// parameter is constructor-kinded upgrades the variable to `* -> *`.
+    /// class bounds. Explicit annotations win; otherwise a single-parameter
+    /// bound whose class parameter is constructor-kinded upgrades the variable
+    /// to that constructor kind.
     fn resolve_type_param_kind(&self, tp: &parser::ast::TypeParam<'_>) -> Kind {
-        if tp.kind == parser::ast::Kind::Arrow {
-            return Kind::Arrow;
+        if tp.kind != parser::ast::Kind::Type {
+            return Kind::from(tp.kind.clone());
         }
         for bound in &tp.bounds {
             if let Some(class_def) = self.generics.typeclass(bound) {
-                if class_def.is_unary_hkt() {
-                    return Kind::Arrow;
+                if class_def.type_params.len() == 1 && class_def.is_constructor_kind_at(0) {
+                    return class_def.kind_at(0);
                 }
             }
         }
-        Kind::from(tp.kind)
+        Kind::from(tp.kind.clone())
+    }
+
+    fn bare_constructor_kind(&self, name: &str) -> Option<Kind> {
+        let canon = Self::canonical_ctor_name(name);
+        self.generics
+            .generic_type_ctors
+            .get(&canon)
+            .map(|params| Kind::constructor(params.len()))
+            .or_else(|| match canon.as_str() {
+                common::BUILTIN_OPTION_ENUM => Some(Kind::constructor(1)),
+                common::BUILTIN_RESULT_ENUM => Some(Kind::constructor(2)),
+                _ => None,
+            })
+    }
+
+    fn kind_of_type_argument(&self, ty: &Ty) -> Kind {
+        match ty {
+            Ty::Var(v) => self.kind_of_var(*v),
+            Ty::Con(name) => self.bare_constructor_kind(name).unwrap_or(Kind::Type),
+            _ => Kind::Type,
+        }
+    }
+
+    fn check_type_app_kind(
+        &mut self,
+        name: &str,
+        head_kind: &Kind,
+        arg_tys: &[Ty],
+        range: &Range<usize>,
+    ) {
+        if !head_kind.is_arrow() {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Type parameter `{}` has kind `{}`, but is applied as a type constructor",
+                    name, head_kind
+                ),
+                range.clone(),
+            ));
+            return;
+        }
+
+        let expected_args = head_kind.argument_kinds();
+        if expected_args.len() != arg_tys.len() {
+            self.messages.push(Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Type constructor `{}` expects {} type arguments, got {}",
+                    name,
+                    expected_args.len(),
+                    arg_tys.len()
+                ),
+                range.clone(),
+            ));
+            return;
+        }
+
+        for (i, (arg_ty, expected_kind)) in arg_tys.iter().zip(expected_args.iter()).enumerate() {
+            let actual_kind = self.kind_of_type_argument(arg_ty);
+            if &actual_kind != expected_kind {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Type argument {} to `{}` has kind `{}`, expected `{}`",
+                        i + 1,
+                        name,
+                        actual_kind,
+                        expected_kind
+                    ),
+                    range.clone(),
+                ));
+            }
+        }
+    }
+
+    fn validate_instance_head_kinds(
+        &mut self,
+        class_def: &TypeClassDef,
+        arg_tys: &[Ty],
+        range: &Range<usize>,
+    ) {
+        for (i, ty) in arg_tys.iter().enumerate() {
+            let expected_kind = class_def.kind_at(i);
+            if !expected_kind.is_constructor_kind() {
+                continue;
+            }
+
+            if matches!(ty, Ty::App(_, _)) {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of constructor-kinded class `{}` expects a type constructor \
+                         (kind `{}`) as argument {}, found applied type `{}`",
+                        class_def.name,
+                        expected_kind,
+                        i + 1,
+                        ty
+                    ),
+                    range.clone(),
+                ));
+                continue;
+            }
+
+            let actual_kind = match ty {
+                Ty::Con(name) => self.bare_constructor_kind(name).unwrap_or(Kind::Type),
+                Ty::Var(v) => self.kind_of_var(*v),
+                _ => Kind::Type,
+            };
+            if actual_kind != expected_kind {
+                self.messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Instance of constructor-kinded class `{}` expects argument {} \
+                         to have kind `{}`, found kind `{}`",
+                        class_def.name,
+                        i + 1,
+                        expected_kind,
+                        actual_kind
+                    ),
+                    range.clone(),
+                ));
+            }
+        }
     }
 
     /// Canonical name for a bare type constructor used as an instance head.
@@ -3912,7 +4019,7 @@ impl Checker {
             }
             Expression::TypeApp { name, args } => {
                 // Applied heads are first-order (`impl Foo<Option<int>>`).
-                // For unary-HKT classes this is diagnosed later.
+                // Constructor-kinded classes diagnose this later.
                 self.parse_type_app(name, args, arg.0.into_range())
             }
             _ => self.parse_type_name(arg),
@@ -3932,20 +4039,16 @@ impl Checker {
         }
     }
 
-    /// For HKT class constraints, look up instances by constructor head
-    /// (`Option`), not by applied types (`Option<int>`). Multi-param classes
-    /// pass every resolved argument through unchanged (except HKT heads).
+    /// For constructor-kinded class parameters, look up instances by
+    /// constructor head (`Option`, `Result`), not by applied types
+    /// (`Option<int>`, `Result<int, string>`).
     fn instance_lookup_args(&self, class: &str, args: &[Ty]) -> Vec<Ty> {
-        let class_is_hkt = self
-            .generics
-            .typeclass(class)
-            .map(|c| c.is_unary_hkt())
-            .unwrap_or(false);
-        if class_is_hkt {
+        if let Some(class_def) = self.generics.typeclass(class) {
             args.iter()
-                .map(|concrete| match concrete {
-                    Ty::App(head, _) => head.as_ref().clone(),
-                    other => other.clone(),
+                .enumerate()
+                .map(|(i, concrete)| match (class_def.is_constructor_kind_at(i), concrete) {
+                    (true, Ty::App(head, _)) => head.as_ref().clone(),
+                    _ => concrete.clone(),
                 })
                 .collect()
         } else {
@@ -4023,46 +4126,12 @@ impl Checker {
     fn parse_type_app(&mut self, name: &str, args: &[Output], range: Range<usize>) -> Ty {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.parse_type_name(a)).collect();
 
-        // Phase 5: in-scope HKT type parameter as application head (`F<A>`).
+        // In-scope constructor-kinded type parameter as application head
+        // (`F<A>`, `F<A, B>`, `F<G>`).
         for frame in self.type_params_in_scope.iter().rev() {
             if let Some(&var) = frame.get(name) {
                 let kind = self.kind_of_var(var);
-                if !kind.is_arrow() {
-                    self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Type parameter `{}` has kind `{}`, but is applied as a type constructor",
-                            name, kind
-                        ),
-                        range.clone(),
-                    ));
-                } else if arg_tys.len() != 1 {
-                    self.messages.push(Message::error(
-                        ErrorCode::GenericTypeError,
-                        format!(
-                            "Type constructor `{}` expects 1 type argument, got {}",
-                            name,
-                            arg_tys.len()
-                        ),
-                        range.clone(),
-                    ));
-                }
-                // Kind-check each argument (must be `*`).
-                for (i, arg_ty) in arg_tys.iter().enumerate() {
-                    if let Ty::Var(v) = arg_ty {
-                        if self.kind_of_var(*v).is_arrow() {
-                            self.messages.push(Message::error(
-                                ErrorCode::GenericTypeError,
-                                format!(
-                                    "Type argument {} to `{}` has kind `* -> *`, expected `*`",
-                                    i + 1,
-                                    name
-                                ),
-                                range.clone(),
-                            ));
-                        }
-                    }
-                }
+                self.check_type_app_kind(name, &kind, &arg_tys, &range);
                 return Ty::App(Box::new(Ty::Var(var)), arg_tys);
             }
         }
@@ -4823,7 +4892,7 @@ impl Checker {
         for tp in type_params {
             let var = self.counter.fresh();
             let kind = self.resolve_type_param_kind(tp);
-            self.set_var_kind(var, kind);
+            self.set_var_kind(var, kind.clone());
             param_frame.insert(tp.name.to_string(), var);
             param_vars.push(var);
             param_kinds.push(kind);
@@ -10513,6 +10582,52 @@ fn main() { let y = apply_cast(42); }
             msgs.iter().any(|m| m.message().contains("No instance")
                 || m.message().contains("Convert")),
             "expected missing-instance diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn binary_hkt_result_instance_discharges() {
+        let src = r#"
+typeclass Bifunctor<F: * -> * -> *> {
+    fn tag<A, B>(F<A, B> xs) -> int;
+}
+impl Bifunctor<Result> {
+    fn tag<A, B>(Result<A, B> xs) -> int { return 42; }
+}
+fn get_tag<F: * -> * -> *, Bifunctor, A, B>(F<A, B> xs) -> int {
+    return tag(xs);
+}
+fn main() { let x = get_tag(Result::Ok(7)); }
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().all(|m| !m.message().contains("Cannot satisfy")
+                && !m.message().contains("No instance")
+                && !m.message().contains("constructor-kinded")),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn binary_hkt_rejects_wrong_arity_constructor_instance() {
+        let src = r#"
+typeclass Bifunctor<F: * -> * -> *> {
+    fn tag<A, B>(F<A, B> xs) -> int;
+}
+impl Bifunctor<Option> {
+    fn tag<A, B>(Option<A> xs) -> int { return 0; }
+}
+"#;
+        let (mut c, _) = check(src);
+        let msgs = c.take_messages();
+        assert!(
+            msgs.iter().any(|m| m
+                .message()
+                .contains("expects argument 1 to have kind `* -> * -> *`, found kind `* -> *`")),
+            "expected binary constructor-kind mismatch, got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }

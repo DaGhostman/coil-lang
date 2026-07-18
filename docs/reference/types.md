@@ -356,6 +356,10 @@ the same constraint shape as `where Num<T>`.
 | `fn add<T: Num>(T a, T b) -> T` | `T` must satisfy the `Num` bound |
 | `fn both<T: Num + Eq>(T x) -> T` | Multiple bounds (`+`) |
 | `fn f<A, B>(A x) -> B where Convert<A, B>` | Multi-param (or unary) `where` constraint |
+| `typeclass Container<F: * -> *>` | Unary type-constructor parameter |
+| `typeclass Bifunctor<F: * -> * -> *>` | Binary type-constructor parameter |
+| `typeclass Higher<F: (* -> *) -> *>` | Higher-order constructor parameter |
+| `fn f<F: * -> * -> *, Bifunctor, A, B>(F<A, B> x)` | Explicit kind plus a class bound on one parameter |
 
 Call-site strategy:
 
@@ -573,7 +577,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | Generic **functions** / enums / aliases with type params and `T: Class` bounds; builtin `Option`/`Result` and user `enum Box<T>` as `Ty::App` (construct/match freshen payloads); builtin `Num`/`Eq`/`Ord`/`Show`; user `typeclass`/`impl` with dictionary passing; `forall` rank-n annotations; mono for ground builtin-bound calls |
-| Higher-kinded types | Unary constructor kinds only (`F: * -> *`); higher arities and kind variables are not supported |
+| Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *`; kind variables are not supported |
 | Effect system | No linear/ownership types |
 | Callback returns | Opaque `Ptr` address; re-invoke requires host/`declare` of the pointed-to symbol (no automatic trampoline) |
 | Chained field access | Typechecker validates; codegen uses side-table for simple receivers |

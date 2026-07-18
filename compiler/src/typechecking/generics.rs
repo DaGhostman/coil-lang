@@ -47,10 +47,10 @@ pub struct TypeClassDef {
     pub name: String,
     /// Type-parameter names in declaration order, e.g. `["T"]`.
     pub type_params: Vec<String>,
-    /// Kinds of each type parameter (parallel to `type_params`). Phase 5.
-    /// Empty ≡ all `*`. A unary HKT class uses `[Kind::Arrow]`.
+    /// Kinds of each type parameter (parallel to `type_params`).
+    /// Empty means every parameter has kind `*`.
     pub param_kinds: Vec<Kind>,
-    /// Direct superclass class names from unary param bounds
+    /// Direct superclass class names from single-parameter bounds
     /// (`typeclass Ord<T: Eq>` → `["Eq"]`). Empty for multi-param classes
     /// and classes without bounds.
     pub superclasses: Vec<String>,
@@ -62,12 +62,18 @@ pub struct TypeClassDef {
 impl TypeClassDef {
     /// Kind of parameter `i`, defaulting to `*`.
     pub fn kind_at(&self, i: usize) -> Kind {
-        self.param_kinds.get(i).copied().unwrap_or(Kind::Type)
+        self.param_kinds.get(i).cloned().unwrap_or(Kind::Type)
     }
 
-    /// True when this class’s first parameter is constructor-kinded (`* -> *`).
-    pub fn is_unary_hkt(&self) -> bool {
-        matches!(self.kind_at(0), Kind::Arrow)
+    /// True when parameter `i` is constructor-kinded.
+    pub fn is_constructor_kind_at(&self, i: usize) -> bool {
+        self.kind_at(i).is_constructor_kind()
+    }
+
+    /// Constructor arity of parameter `i`, if it is constructor-kinded.
+    pub fn constructor_arity_at(&self, i: usize) -> Option<usize> {
+        let kind = self.kind_at(i);
+        kind.is_constructor_kind().then(|| kind.arity())
     }
 
     /// True when `name` is a transitive superclass of this class.
@@ -272,11 +278,7 @@ impl Generics {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let known: HashSet<&str> = class_def
-            .assoc_types
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let known: HashSet<&str> = class_def.assoc_types.iter().map(String::as_str).collect();
         assoc_names
             .into_iter()
             .filter(|name| !known.contains(*name))
@@ -424,12 +426,7 @@ impl Generics {
         let make_fqns = |class: &str, ty_str: &str, methods: &[&str]| -> HashMap<String, String> {
             methods
                 .iter()
-                .map(|m| {
-                    (
-                        m.to_string(),
-                        Self::builtin_instance_fqn(class, ty_str, m),
-                    )
-                })
+                .map(|m| (m.to_string(), Self::builtin_instance_fqn(class, ty_str, m)))
                 .collect()
         };
 
@@ -653,7 +650,11 @@ mod tests {
         });
 
         assert!(generics.find_instance("Convert", &[int(), int()]).is_some());
-        assert!(generics.find_instance("Convert", &[int(), float()]).is_none());
+        assert!(
+            generics
+                .find_instance("Convert", &[int(), float()])
+                .is_none()
+        );
         assert!(generics.find_instance("Convert", &[int()]).is_none());
     }
 }
