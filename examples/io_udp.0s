@@ -1,15 +1,16 @@
-// UDP datagram round-trip via virtual `io` module.
+// UDP datagram round-trip via `io::net::udp`.
 // Server binds ephemeral port; client send_to; server recv_from_wait.
 use io::*;
+use io::net::udp::*;
 
 fn echo_once() {
-    let server = udp_bind("127.0.0.1", 0)?;
-    let port = udp_local_port(server)?;
-    let client = udp_bind("127.0.0.1", 0)?;
+    let server = bind("127.0.0.1", 0)?;
+    let port = local_port(server)?;
+    let client = bind("127.0.0.1", 0)?;
     let msg: [byte] = [72, 105]; // "Hi"
-    udp_send_to(client, msg, "127.0.0.1", port)?;
+    send_to(client, msg, "127.0.0.1", port)?;
     let buf: [byte] = [0, 0, 0, 0, 0, 0, 0, 0];
-    let t = udp_recv_from_wait(server, buf)?;
+    let t = recv_from_wait(server, buf)?;
     close(server)?;
     close(client)?;
     return format "%i", t[0];

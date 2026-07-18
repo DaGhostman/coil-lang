@@ -1748,7 +1748,7 @@ impl Compiler {
 
     /// Emit `HostInvoke` for a virtual `io` free function.
     fn emit_io_host_invoke(&mut self, kind: crate::typechecking::IoBuiltin, args: &[Output]) {
-        let name = kind.as_str();
+        let name = kind.native_name();
         let Some(native_id) = self.native_id(name) else {
             let mut message = Message::error(
                 ErrorCode::UnknownFunction,

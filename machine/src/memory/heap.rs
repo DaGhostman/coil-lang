@@ -369,7 +369,7 @@ pub enum StreamKind {
     File,
     Tcp,
     TcpListener,
-    /// Datagram socket (`udp_bind` / `udp_connect`).
+    /// Datagram socket (`io::net::udp::bind` / `connect`).
     Udp,
 }
 

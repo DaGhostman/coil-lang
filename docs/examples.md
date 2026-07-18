@@ -550,7 +550,7 @@ Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text 
 
 ### `examples/io_udp.0s`
 
-**Demonstrates:** `udp_bind` / `udp_local_port` / `udp_send_to` / `udp_recv_from_wait` localhost echo.
+**Demonstrates:** `use io::net::udp::*;` — `bind` / `local_port` / `send_to` / `recv_from_wait` localhost echo.
 
 | | |
 |---|---|

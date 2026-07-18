@@ -149,7 +149,9 @@ impl Pipeline {
         };
 
         for kind in IoBuiltin::all() {
-            let name = kind.as_str().to_string();
+            // Host registry keys stay uniquely prefixed for TCP/UDP
+            // (`tcp_connect` vs surface `connect` under `io::net::tcp`).
+            let name = kind.native_name().to_string();
             let arity = match kind {
                 IoBuiltin::Stdin | IoBuiltin::Stdout | IoBuiltin::Stderr => 0,
                 IoBuiltin::Close

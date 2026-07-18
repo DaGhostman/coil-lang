@@ -645,7 +645,7 @@ impl Checker {
         let res_stream = result_app_ty(stream.clone(), io_err.clone());
         let res_bytes = result_app_ty(bytes.clone(), io_err.clone());
         let res_string = result_app_ty(string(), io_err.clone());
-        // `(nbytes, peer_host, peer_port)` from `udp_recv_from`.
+        // `(nbytes, peer_host, peer_port)` from `io::net::udp::recv_from`.
         let recv_from_ty = tuple(vec![int(), string(), int()]);
         let res_recv_from = result_app_ty(recv_from_ty, io_err);
         let fun = |params: &[Ty], ret: Ty| {
