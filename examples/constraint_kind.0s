@@ -1,16 +1,16 @@
 // Expected output: 42
 //
 // Constraint-kind parameter:
-// - `c: * -> Constraint` is an abstract unary typeclass predicate.
+// - `c: * -> Constraint` is an abstract unary trait predicate.
 // - `T: c` says T is constrained by that predicate.
 // - Calling `lt_val` binds `c` to Ordered.
 // - Calling `eq_val` then uses Ordered's Equal superclass slot.
 
-typeclass Equal<T> {
+trait Equal<T> {
     fn eq_val(T a, T b) -> bool;
 }
 
-typeclass Ordered<T: Equal> {
+trait Ordered<T: Equal> {
     fn lt_val(T a, T b) -> bool;
 }
 

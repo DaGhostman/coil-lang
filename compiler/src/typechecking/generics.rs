@@ -30,19 +30,19 @@ pub struct TypeClassMethodDef {
 
 /// The shape of a typeclass: its name, type parameters, and methods.
 ///
-/// E.g. `typeclass Num<T> { fn add(T a, T b) -> T; fn sub(…) -> T; }`
+/// E.g. `trait Num<T> { fn add(T a, T b) -> T; fn sub(…) -> T; }`
 /// is stored as:
 /// ```text
 /// TypeClassDef { name: "Num", type_params: ["T"],
 ///     methods: [TypeClassMethodDef { name: "add", has_default: false }, …] }
 /// ```
 ///
-/// Superclasses (Phase 5): `typeclass Ordered<T: Equal>` stores
+/// Superclasses (Phase 5): `trait Ordered<T: Equal>` stores
 /// `superclasses: ["Equal"]`. Dictionary layout is flattened — subclass
 /// methods first, then each superclass’s methods in declaration order
 /// (transitively).
 ///
-/// Associated types: `typeclass Collect<C> { type Elem<A>; … }`
+/// Associated types: `trait Collect<C> { type Elem<A>; … }`
 /// stores structured declarations so generic associated types retain
 /// their own binders and kind.
 #[derive(Debug, Clone)]
@@ -57,7 +57,7 @@ pub struct TypeClassDef {
     /// Empty means every parameter has kind `*`.
     pub param_kinds: Vec<Kind>,
     /// Direct superclass class names from single-parameter bounds
-    /// (`typeclass Ord<T: Eq>` → `["Eq"]`). Empty for multi-param classes
+    /// (`trait Ord<T: Eq>` → `["Eq"]`). Empty for multi-param classes
     /// and classes without bounds.
     pub superclasses: Vec<String>,
     /// Associated type declarations in source order.
@@ -397,18 +397,48 @@ impl Generics {
     /// Build the compiler-generated FQN for a builtin instance method.
     ///
     /// Convention: `{Class}__{concrete_type_str}__{method}`
-    /// e.g. `Num__int__add`, `Ord__float__lt`, `Eq__string__eq`.
+    /// e.g. `Add__int__add`, `Ord__float__lt`, `Eq__string__eq`.
     pub fn builtin_instance_fqn(class: &str, ty_str: &str, method: &str) -> String {
         format!("{}__{}__{}", class, ty_str, method)
     }
 
     /// Register the built-in typeclasses and their builtin instances.
     fn register_builtins(&mut self) {
-        use super::ty::{boolean, float, int, string, unit};
+        use super::ty::{INT, Ty, boolean, float, int, string, unit};
 
         self.register_builtin_type_ctors();
 
+        // ---- Add / Sub / Mul / Div ----
+        // Individual arithmetic traits so a type can implement only the
+        // operations it supports. `Num` is a convenience supertrait that
+        // implies all four (see below).
+        for (name, method) in [
+            ("Add", "add"),
+            ("Sub", "sub"),
+            ("Mul", "mul"),
+            ("Div", "div"),
+        ] {
+            self.typeclasses.insert(
+                name.into(),
+                TypeClassDef {
+                    name: name.into(),
+                    defined_module: BUILTIN_MODULE.into(),
+                    type_params: vec!["T".into()],
+                    param_kinds: vec![Kind::Type],
+                    superclasses: vec![],
+                    assoc_types: vec![],
+                    methods: vec![TypeClassMethodDef {
+                        name: method.into(),
+                        has_default: false,
+                    }],
+                },
+            );
+        }
+
         // ---- Num ----
+        // Convenience bundle: `T: Num` implies Add + Sub + Mul + Div via
+        // the flattened superclass dictionary layout. Num itself has no
+        // methods; call sites resolve operators through the op traits.
         self.typeclasses.insert(
             "Num".into(),
             TypeClassDef {
@@ -416,33 +446,21 @@ impl Generics {
                 defined_module: BUILTIN_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
-                superclasses: vec![],
-                assoc_types: vec![],
-                methods: vec![
-                    TypeClassMethodDef {
-                        name: "add".into(),
-                        has_default: false,
-                    },
-                    TypeClassMethodDef {
-                        name: "sub".into(),
-                        has_default: false,
-                    },
-                    TypeClassMethodDef {
-                        name: "mul".into(),
-                        has_default: false,
-                    },
-                    TypeClassMethodDef {
-                        name: "div".into(),
-                        has_default: false,
-                    },
+                superclasses: vec![
+                    "Add".into(),
+                    "Sub".into(),
+                    "Mul".into(),
+                    "Div".into(),
                 ],
+                assoc_types: vec![],
+                methods: vec![],
             },
         );
 
         // ---- Ord ----
         // Builtin Ord does not declare Eq as a superclass (dict layouts for
-        // existing Num/Ord/Eq callers stay unchanged). User-defined classes
-        // use `typeclass Ordered<T: Equal>` for the superclass path.
+        // existing callers stay unchanged). User-defined classes
+        // use `trait Ordered<T: Equal>` for the superclass path.
         self.typeclasses.insert(
             "Ord".into(),
             TypeClassDef {
@@ -521,15 +539,40 @@ impl Generics {
                 .collect()
         };
 
-        // ---- builtin instances: int ----
-        self.instances.push(InstanceDef {
-            class: "Num".into(),
-            defined_module: BUILTIN_MODULE.into(),
-            range: 0..0,
-            args: vec![int()],
-            method_fqns: make_fqns("Num", "int", &["add", "sub", "mul", "div"]),
-            assoc_tys: HashMap::new(),
-        });
+        // ---- builtin instances: int / float arithmetic ----
+        for ty in [int(), float()] {
+            let ty_str = match &ty {
+                Ty::Con(n) if n == INT => "int",
+                _ => "float",
+            };
+            for (class, method) in [
+                ("Add", "add"),
+                ("Sub", "sub"),
+                ("Mul", "mul"),
+                ("Div", "div"),
+            ] {
+                self.instances.push(InstanceDef {
+                    class: class.into(),
+                    defined_module: BUILTIN_MODULE.into(),
+                    range: 0..0,
+                    args: vec![ty.clone()],
+                    method_fqns: make_fqns(class, ty_str, &[method]),
+                    assoc_tys: HashMap::new(),
+                });
+            }
+            // Num instance: no own methods; dict emission pulls Add/Sub/Mul/Div
+            // slots via the flattened superclass layout.
+            self.instances.push(InstanceDef {
+                class: "Num".into(),
+                defined_module: BUILTIN_MODULE.into(),
+                range: 0..0,
+                args: vec![ty.clone()],
+                method_fqns: HashMap::new(),
+                assoc_tys: HashMap::new(),
+            });
+        }
+
+        // ---- builtin instances: int Ord / Eq / Show ----
         self.instances.push(InstanceDef {
             class: "Ord".into(),
             defined_module: BUILTIN_MODULE.into(),
@@ -555,15 +598,7 @@ impl Generics {
             assoc_tys: HashMap::new(),
         });
 
-        // ---- builtin instances: float ----
-        self.instances.push(InstanceDef {
-            class: "Num".into(),
-            defined_module: BUILTIN_MODULE.into(),
-            range: 0..0,
-            args: vec![float()],
-            method_fqns: make_fqns("Num", "float", &["add", "sub", "mul", "div"]),
-            assoc_tys: HashMap::new(),
-        });
+        // ---- builtin instances: float Ord / Eq / Show ----
         self.instances.push(InstanceDef {
             class: "Ord".into(),
             defined_module: BUILTIN_MODULE.into(),

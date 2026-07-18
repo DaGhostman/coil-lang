@@ -324,9 +324,9 @@ a stale value.
 
 ---
 
-## Generics and typeclasses
+## Generics and traits
 
-Generic functions use an optional type-parameter list and typeclass bounds on parameters:
+Generic functions use an optional type-parameter list and trait bounds on parameters:
 
 ```0s
 fn add<T: Num>(T a, T b) -> T { return a + b; }
@@ -337,10 +337,10 @@ fn main() {
 }
 ```
 
-Multi-parameter typeclasses use a trailing `where` clause:
+Multi-parameter traits use a trailing `where` clause:
 
 ```0s
-typeclass Convert<A, B> { fn cast(A x) -> B; }
+trait Convert<A, B> { fn cast(A x) -> B; }
 impl Convert<int, int> { fn cast(int x) -> int { return x; } }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 ```
@@ -358,7 +358,7 @@ Kinds classify type-level parameters:
 | `* -> *` | Unary type constructor | `F: * -> *` |
 | `* -> * -> *` | Binary type constructor | `F: * -> * -> *` |
 | `(* -> *) -> *` | Higher-order type constructor | `F: (* -> *) -> *` |
-| `Constraint` | A fully applied typeclass predicate | internal result kind |
+| `Constraint` | A fully applied trait predicate | internal result kind |
 | `* -> Constraint` | Unary constraint constructor | `c: * -> Constraint` |
 
 Constraint-kind parameters let a generic abstract over the class predicate
@@ -386,10 +386,10 @@ class, `T: c` is rejected as an unsatisfied abstract constraint.
 | `fn add<T: Num>(T a, T b) -> T` | `T` must satisfy the `Num` bound |
 | `fn both<T: Num + Eq>(T x) -> T` | Multiple bounds (`+`) |
 | `fn f<A, B>(A x) -> B where Convert<A, B>` | Multi-param (or unary) `where` constraint |
-| `fn print_any(Show x)` | Bare unary typeclass name as an existential value type |
-| `typeclass Container<F: * -> *>` | Unary type-constructor parameter |
-| `typeclass Bifunctor<F: * -> * -> *>` | Binary type-constructor parameter |
-| `typeclass Higher<F: (* -> *) -> *>` | Higher-order constructor parameter |
+| `fn print_any(Show x)` | Bare unary trait name as an existential value type |
+| `trait Container<F: * -> *>` | Unary type-constructor parameter |
+| `trait Bifunctor<F: * -> * -> *>` | Binary type-constructor parameter |
+| `trait Higher<F: (* -> *) -> *>` | Higher-order constructor parameter |
 | `fn f<F: * -> * -> *, Bifunctor, A, B>(F<A, B> x)` | Explicit kind plus a class bound on one parameter |
 | `fn f<c: * -> Constraint, T: c>(T x)` | Constraint-kind parameter and abstract bound |
 
@@ -399,22 +399,22 @@ Call-site strategy:
 |-----------|---------|
 | Ground call with only **builtin** bounds (`Num`/`Ord`/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
 | Shared body / open type params with any bound | **Dictionary passing** — see below |
-| Ground or shared call with user typeclass bounds | **Dictionary passing** — see below |
+| Ground or shared call with user trait bounds | **Dictionary passing** — see below |
 | Escaped generic fn value (`let f = id;`) | `MakePolyFn` / `MakePolyFnCapture` + `CallIndirect` |
 
 ### Dictionary passing
 
-Constrained calls that are not monomorphized append one dictionary per typeclass constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets in declaration order. The callee reserves trailing locals `__dict0`, `__dict1`, …, loads the matching method slot with `Index`, and invokes it with `CallIndirect`. A generic calling another generic with the same open bound forwards its existing dictionary. Builtin classes use compiler-generated primitive method thunks through this same ABI; ground monomorphization remains an optimization.
+Constrained calls that are not monomorphized append one dictionary per trait constraint after the value arguments. Each dictionary is a `MakeTuple` of method code offsets in declaration order. The callee reserves trailing locals `__dict0`, `__dict1`, …, loads the matching method slot with `Index`, and invokes it with `CallIndirect`. A generic calling another generic with the same open bound forwards its existing dictionary. Builtin classes use compiler-generated primitive method thunks through this same ABI; ground monomorphization remains an optimization.
 
 **Flattened superclass layout.** When a unary class declares a param bound
-(`typeclass Ordered<T: Equal>`), those bounds are stored as *superclasses*.
+(`trait Ordered<T: Equal>`), those bounds are stored as *superclasses*.
 The runtime dictionary for the subclass is flattened: subclass methods first,
 then each superclass’s methods in declaration order (transitively). An
 `impl Ordered<int>` therefore requires an existing `Equal<int>` instance — its
 methods fill the trailing dict slots.
 
 ```0s
-typeclass Describable<T> { fn describe_val(T x) -> int; }
+trait Describable<T> { fn describe_val(T x) -> int; }
 impl Describable<int> { fn describe_val(int x) -> int { return x + 1; } }
 fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 // show(42) → CALL arity = 2 (value + Describable dict)
@@ -422,7 +422,7 @@ fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 
 ### Bare-class existential types
 
-A unary typeclass name in a value type position denotes an existential value:
+A unary trait name in a value type position denotes an existential value:
 
 ```0s
 fn print_any(Show x) {
@@ -444,10 +444,10 @@ the dictionary stored with the value.
 
 Rules:
 
-- Only unary typeclasses whose parameter has kind `Type` may be used this way.
+- Only unary traits whose parameter has kind `Type` may be used this way.
   Multi-parameter classes such as `Convert<A, B>` are rejected as bare value
   types.
-- If a concrete type constructor and a typeclass have the same name, the type
+- If a concrete type constructor and a trait have the same name, the type
   constructor wins.
 - Packing a concrete value requires exactly one matching instance; otherwise
   the call site reports `No instance for Class<T>`.
@@ -465,28 +465,40 @@ Default methods occupy normal dictionary slots. Every implementation method
 receives the active dictionary as a hidden trailing argument, so a default can
 call a sibling method. An omitted default slot points at the class default body.
 
-### Builtin typeclasses
+### Builtin traits
 
-The compiler pre-registers these typeclasses and instances for `int`, `float`, and (where applicable) `string`:
+The compiler pre-registers these traits and instances for `int`, `float`, and (where applicable) `string` / `bool` / `unit`:
 
-| Class | Purpose | Operators / methods |
+| Trait | Purpose | Operators / methods |
 |-------|---------|---------------------|
-| `Num` | Arithmetic | `+`, `-`, `*`, `/` (and `%` for ints) |
+| `Add` | Addition | `+` → `add` |
+| `Sub` | Subtraction | `-` → `sub` |
+| `Mul` | Multiplication | `*` → `mul` |
+| `Div` | Division | `/` → `div` |
+| `Num` | Convenience bundle | Supertrait of `Add` + `Sub` + `Mul` + `Div` (no own methods) |
 | `Ord` | Ordering | `<`, `<=`, `>`, `>=` |
 | `Eq` | Equality | `==`, `!=` |
 | `Show` | Display | `show(T) -> string`; used by format `%v` |
 
-Calling `add<T: Num>(…)` with `string` arguments is a type error when no `Num<string>` instance applies to that use (string `+` is only available through the `Num` instance wiring).
+On open/generic operands, operators require the matching op trait (or `Num`, which implies all four). Concrete `int`/`float` arithmetic still uses hardwired opcodes. String concatenation (`string + string`) is a separate path and is **not** covered by `Num`/`Add`.
 
-### User-defined typeclasses (sketch)
+### User-defined traits (sketch)
 
-Declare a class and provide instances for concrete types:
+Declare a trait and provide instances for concrete types. Prefer the
+`impl Trait for Type` form; the legacy `impl Trait<Type>` form is still accepted.
+For multi-parameter traits, `impl Trait<A, B> for T` prepends `T` as the first
+type argument (Self slot), so it is equivalent to `impl Trait<T, A, B>`.
 
 ```0s
-typeclass Measurable<T> {
+trait Measurable<T> {
     fn size(T x) -> int;
 }
 
+impl Measurable for int {
+    fn size(int x) -> int { return x; }
+}
+
+// Legacy form (still OK):
 impl Measurable<int> {
     fn size(int x) -> int { return x; }
 }
@@ -514,12 +526,12 @@ resolution stays deterministic across projects:
 
 ### Associated types and GATs
 
-A typeclass may declare associated types; each impl must define them. Associated
+A trait may declare associated types; each impl must define them. Associated
 types may be nullary (`type Elem;`) or generic (`type Ref<T>;`, also called a
 generic associated type / GAT):
 
 ```0s
-typeclass Collect<C> {
+trait Collect<C> {
     type Elem;
     fn head(C xs) -> Elem;
 }
@@ -552,7 +564,7 @@ impl Collect<Option<int>> {
   while `P::Ref<int>` is rejected.
 
 ```0s
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
@@ -573,11 +585,11 @@ in the typechecker. See `examples/assoc_type.0s` and
 
 ### Superclasses and implied bounds
 
-Unary typeclass parameter bounds declare superclasses:
+Unary trait parameter bounds declare superclasses:
 
 ```0s
-typeclass Equal<T> { fn eq_val(T a, T b) -> bool; }
-typeclass Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
+trait Equal<T> { fn eq_val(T a, T b) -> bool; }
+trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
 
 impl Equal<int> { fn eq_val(int a, int b) -> bool { return a == b; } }
 impl Ordered<int> { fn lt_val(int a, int b) -> bool { return a < b; } }
@@ -635,7 +647,7 @@ binder (rigid variables) and rejects escaping skolems. A polymorphic
 generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
-See `examples/generics.0s`, `examples/typeclass_dict.0s`,
+See `examples/generics.0s`, `examples/trait_dict.0s`,
 `examples/existential_show.0s`, `examples/hkt_container.0s`,
 `examples/hkt_bifunctor.0s`, `examples/multiparam.0s`,
 `examples/constraint_kind.0s`, `examples/superclass_ord.0s`,
@@ -685,8 +697,8 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Type aliases | Lexically scoped (stack of frames); duplicate names in the same frame are rejected; inner scopes may shadow outer; parametric aliases (`type Pair<T> = …`) expand on application |
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
-| Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `typeclass`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
-| Typeclass runtime | User-defined typeclass calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Ord`/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
+| Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
+| Typeclass runtime | User-defined trait calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Ord`/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
 | Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
 | Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |

@@ -78,14 +78,15 @@ fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn greet() { print "hi"; }
 ```
 
-### Typeclasses and impl
+### Traits and impl
 
 ```
-typeclass_decl ::= 'typeclass' IDENT type_param_list '{' typeclass_item* '}'
-typeclass_item ::= assoc_type_decl | method_sig
+trait_decl ::= 'trait' IDENT type_param_list '{' trait_item* '}'
+trait_item ::= assoc_type_decl | method_sig
 assoc_type_decl ::= 'type' IDENT type_param_list? ';'
 method_sig     ::= 'fn' IDENT arg_list ('->' type_annotation)? (';' | block)
-impl_decl      ::= 'impl' IDENT type_arg_list '{' impl_item* '}'
+impl_decl      ::= 'impl' IDENT type_arg_list? 'for' type '{' impl_item* '}'
+                 | 'impl' IDENT type_arg_list '{' impl_item* '}'   // legacy
 impl_item      ::= assoc_type_def | method_decl
 assoc_type_def ::= 'type' IDENT type_param_list? '=' type ';'
 type_arg_list  ::= '<' type (',' type)* '>'
@@ -93,41 +94,50 @@ type_projection ::= IDENT '::' IDENT type_arg_list?
                  // e.g. Collect::Elem, C::Elem, Pointer::Ref<int>, P::Ref<A>
 ```
 
+The type after `for` is prepended as the first type argument (Self slot):
+`impl Show for Foo` ≡ `impl Show<Foo>`, and
+`impl Thing<A, B> for Foo` ≡ `impl Thing<Foo, A, B>`.
+
 Example:
 
 ```0s
-typeclass Num<T> { /* builtin — see types reference */ }
+// Builtin arithmetic traits: Add / Sub / Mul / Div; Num implies all four.
 
-typeclass Collect<C> {
+trait Collect<C> {
     type Elem;
     fn head(C xs) -> Elem;
 }
 
-impl Collect<Option<int>> {
+impl Collect for Option<int> {
     type Elem = int;
     fn head(Option<int> xs) -> int { /* … */ }
 }
 
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
 
-impl Pointer<Option> {
+impl Pointer for Option {
     type Ref<T> = T;
     fn deref<T>(Option<T> ptr) -> T { /* … */ }
 }
 
+impl Measurable for int {
+    fn size(int x) -> int { return x; }
+}
+
+// Legacy angle-bracket form (still accepted):
 impl Measurable<int> {
     fn size(int x) -> int { return x; }
 }
 ```
 
 Generic functions use `type_param_list` on `fn` (see above). Bounds use `+`
-between class names (`T: Num + Eq`). Multi-parameter classes use a trailing
-`where Class<T1, T2>` clause (unary `where Num<T>` is also accepted).
+between trait names (`T: Num + Eq` or `T: Add`). Multi-parameter traits use a trailing
+`where Trait<T1, T2>` clause (unary `where Num<T>` is also accepted).
 Higher-kinded parameters use explicit kind annotations (`F: * -> *`,
-`F: * -> * -> *`, or `F: (* -> *) -> *`); a bound whose class parameter is
+`F: * -> * -> *`, or `F: (* -> *) -> *`); a bound whose trait parameter is
 constructor-kinded (for example `F: Container`) also implies that kind. A
 parameter can carry both an explicit kind and a bound:
 `F: * -> * -> *, Bifunctor`.
@@ -223,8 +233,8 @@ impl Cell<T> {
 
 Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s` and `examples/generic_class.0s`.
 
-Note: typeclass `impl` (`impl Collect<Option<int>> { … }`) uses a different
-parse path — see [Typeclasses and impl](#typeclasses-and-impl) above.
+Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
+parse path — see [Traits and impl](#traits-and-impl) above.
 
 ### Defer
 

@@ -30,7 +30,7 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `mod` | Declaration | Forward-declare / load module | [Modules](modules.md) |
 | `extern` | Declaration | FFI library block | [FFI tutorial](../tutorial/07-ffi.md) |
 | `class` | Declaration | Class with fields | [Syntax — Classes](syntax.md#classes-and-impl) |
-| `impl` | Declaration | Methods for a class | [Syntax — Classes](syntax.md#classes-and-impl) |
+| `impl` | Declaration | Class methods or trait instances (`impl Trait for T`) | [Syntax — Classes](syntax.md#classes-and-impl) / [Types — Traits](types.md#generics-and-traits) |
 | `pub` | Modifier | Public field or method | [Syntax — Classes](syntax.md#classes-and-impl) |
 | `new` | Expression | Construct class instance | [Syntax — Expressions](syntax.md#atoms-primary-forms) |
 | `defer` | Declaration | Run block on function exit | [Syntax — Defer](syntax.md#defer) |
@@ -44,15 +44,15 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 | `yield from` | Expression / stmt | Delegate to sub-coroutine | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 | `resume` | Expression | Continue coroutine handle | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
 | `with` | Resume modifier | Send value on resume (`resume h with v`) | [Tutorial: Coroutines](../tutorial/08-coroutines.md) |
-| `where` | Declaration | Constraint clause on generic functions | [Types — Generics](types.md#generics-and-typeclasses) |
-| `typeclass` | Declaration | User-defined typeclass | [Types — Generics](types.md#generics-and-typeclasses) |
+| `where` | Declaration | Constraint clause on generic functions | [Types — Generics](types.md#generics-and-traits) |
+| `trait` | Declaration | User-defined trait | [Types — Generics](types.md#generics-and-traits) |
 
 ---
 
 ## Declaration keywords
 
 ```
-fn | enum | type | typeclass | use | mod | extern | class | impl | defer | async | where
+fn | enum | type | trait | use | mod | extern | class | impl | defer | async | where
 ```
 
 Registered in the top-level `declaration()` parser before generic statements so keywords like `enum` are not misparsed as `let`.
@@ -108,7 +108,6 @@ These tokens are **not** in the parser keyword set. Using them as identifiers ma
 | `case` | Planned alias for `match`; not registered |
 | `import` | Not implemented — use `use` |
 | `struct` | FFI `extern struct` only; otherwise use `class` or record dicts |
-| `trait` | Not implemented |
 | `in` | Not implemented |
 
 ---

@@ -1160,11 +1160,12 @@ impl<'pratt> Pratt<'pratt> {
         // mis-parsed as `let`.
         //
         // Ordering notes:
-        //  - `typeclass_decl` before `type_alias` so `typeclass` keyword
+        //  - `typeclass_decl` before `type_alias` so `trait` keyword
         //    is not confused with a user identifier.
-        //  - `impl_block` handles inherent impls and simple typeclass impls
-        //    (`impl Num<int>`, `impl Show<Point>`) via the type-arg heuristic;
-        //    it is tried FIRST for all `impl` forms.
+        //  - `trait_impl_for_block` (`impl Trait for T` / `impl Trait<A,B> for T`)
+        //    is tried before other `impl` forms so `for` is unambiguous.
+        //  - `impl_block` handles inherent impls and simple trait impls
+        //    (`impl Num<int>`, `impl Show<Point>`) via the type-arg heuristic.
         //  - `typeclass_impl_block` is the fallback for complex type-annotation
         //    args (e.g. `impl Foo<Option<int>>`) that `type_param_list()` inside
         //    `impl_block` cannot parse.  Chumsky 0.12 backtracks on failure, so
@@ -1173,6 +1174,7 @@ impl<'pratt> Pratt<'pratt> {
         choice((
             self.class(),
             self.typeclass_decl(stmt.clone()),
+            self.trait_impl_for_block(stmt.clone()),
             self.impl_block(stmt.clone()),
             self.typeclass_impl_block(stmt.clone()),
             self.func(stmt.clone()),
@@ -1477,7 +1479,7 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// `typeclass Name<T, U: Bound> { type Elem; fn sig(…) -> ret; fn default(…) { body } }`
+    /// `trait Name<T, U: Bound> { type Elem; fn sig(…) -> ret; fn default(…) { body } }`
     ///
     /// Each body item is either:
     /// - Associated type declaration: `type Elem;`
@@ -1533,7 +1535,7 @@ impl<'pratt> Pratt<'pratt> {
                 )
             });
 
-        keyword!("typeclass")
+        keyword!("trait")
             .ignore_then(text::ident().padded())
             .then(self.type_param_list())
             .then(
@@ -1545,6 +1547,75 @@ impl<'pratt> Pratt<'pratt> {
             )
             .map_with(|((name, type_params), methods), e| {
                 (e.span(), Box::new(Expression::TypeClass { name, type_params, methods }))
+            })
+    }
+
+    /// Preferred trait-instance form: `impl Trait for Type { … }` or
+    /// `impl Trait<A, B> for Type { … }`.
+    ///
+    /// The type after `for` is prepended as the first type argument (Self
+    /// slot), so `impl Show for Foo` ≡ `impl Show<Foo>` and
+    /// `impl Thing<string, int> for Message` ≡ `impl Thing<Message, string, int>`.
+    fn trait_impl_for_block<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let assoc_def = keyword!("type")
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
+            .then_ignore(op!("="))
+            .then(self.type_annotation())
+            .then_ignore(op!(";"))
+            .map_with(|((name, type_params), ty), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::AssocTypeDef {
+                        name,
+                        type_params,
+                        ty: Box::new(ty),
+                    }),
+                )
+            });
+
+        let opt_bracket_args = self
+            .type_annotation()
+            .padded()
+            .separated_by(op!(","))
+            .allow_trailing()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .delimited_by(op!("<"), op!(">"))
+            .or_not()
+            .map(|opt| opt.unwrap_or_default());
+
+        keyword!("impl")
+            .ignore_then(text::ident())
+            .then(opt_bracket_args)
+            .then_ignore(keyword!("for"))
+            .then(self.type_annotation().padded())
+            .then(
+                choice((assoc_def, self.method_decl(stmt)))
+                    .repeated()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("{"), op!("}")),
+            )
+            .map_with(|(((class, bracket_args), for_ty), methods), e| {
+                let mut args = Vec::with_capacity(bracket_args.len() + 1);
+                args.push(for_ty);
+                args.extend(bracket_args);
+                (
+                    e.span(),
+                    Box::new(Expression::TypeClassImpl {
+                        class,
+                        args,
+                        methods,
+                    }),
+                )
             })
     }
 
@@ -3945,10 +4016,10 @@ mod tests_generics {
 
     // ── typeclass decl ─────────────────────────────────────────────────────────
 
-    /// `typeclass Eq<T> { fn eq(T a, T b) -> bool; }` — sig-only method.
+    /// `trait Eq<T> { fn eq(T a, T b) -> bool; }` — sig-only method.
     #[test]
     fn typeclass_with_sig_only_method_parses() {
-        match decl_ast!("typeclass Eq<T> { fn eq(T a, T b) -> bool; }") {
+        match decl_ast!("trait Eq<T> { fn eq(T a, T b) -> bool; }") {
             Expression::TypeClass { name, type_params, methods } => {
                 assert_eq!(name, "Eq");
                 assert_eq!(type_params.len(), 1);
@@ -3967,10 +4038,10 @@ mod tests_generics {
         }
     }
 
-    /// `typeclass Num<T> { fn add(T a, T b) -> T { return a + b; } }` — default method.
+    /// `trait Num<T> { fn add(T a, T b) -> T { return a + b; } }` — default method.
     #[test]
     fn typeclass_with_default_method_parses() {
-        match decl_ast!("typeclass Num<T> { fn add(T a, T b) -> T { return a + b; } }") {
+        match decl_ast!("trait Num<T> { fn add(T a, T b) -> T { return a + b; } }") {
             Expression::TypeClass { name, type_params, methods } => {
                 assert_eq!(name, "Num");
                 assert_eq!(type_params.len(), 1);
@@ -3989,11 +4060,11 @@ mod tests_generics {
         }
     }
 
-    /// `typeclass Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }` — two sig-only.
+    /// `trait Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }` — two sig-only.
     #[test]
     fn typeclass_with_bounded_param_and_two_methods_parses() {
         match decl_ast!(
-            "typeclass Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }"
+            "trait Ord<T: Eq> { fn lt(T a, T b) -> bool; fn gt(T a, T b) -> bool; }"
         ) {
             Expression::TypeClass { name, type_params, methods } => {
                 assert_eq!(name, "Ord");
@@ -4005,10 +4076,10 @@ mod tests_generics {
         }
     }
 
-    /// `typeclass Show { fn show() -> string; }` — no type params (plain typeclass).
+    /// `trait Show { fn show() -> string; }` — no type params (plain trait).
     #[test]
     fn typeclass_without_type_params_parses() {
-        match decl_ast!("typeclass Show { fn show() -> string; }") {
+        match decl_ast!("trait Show { fn show() -> string; }") {
             Expression::TypeClass { name, type_params, methods } => {
                 assert_eq!(name, "Show");
                 assert!(type_params.is_empty());
@@ -4096,21 +4167,21 @@ mod tests_generics {
         assert_eq!(s, "type Map<K, V> = (K, V);");
     }
 
-    /// TypeClass Display: `typeclass Eq<T> { … }`
+    /// TypeClass Display: `trait Eq<T> { … }`
     #[test]
     fn typeclass_display_round_trips() {
         // The Display impl omits the function bodies' args (unhandled Display)
         // so we only check that the outer structure round-trips and contains
         // the expected substrings.
-        let s = stmt!("typeclass Show { fn show() -> string; }");
-        assert!(s.starts_with("typeclass Show {"), "got: {s}");
+        let s = stmt!("trait Show { fn show() -> string; }");
+        assert!(s.starts_with("trait Show {"), "got: {s}");
         assert!(s.contains("show"), "got: {s}");
     }
 
     /// `F: * -> *` parses as an Arrow-kinded type parameter.
     #[test]
     fn constructor_kind_annotation_parses() {
-        match decl_ast!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }") {
+        match decl_ast!("trait Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }") {
             Expression::TypeClass { type_params, .. } => {
                 assert_eq!(type_params.len(), 1);
                 assert_eq!(type_params[0].name, "F");
@@ -4150,7 +4221,7 @@ mod tests_generics {
 
     #[test]
     fn binary_hkt_kind_annotation_is_right_associative() {
-        match decl_ast!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }") {
+        match decl_ast!("trait Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }") {
             Expression::TypeClass { type_params, .. } => {
                 assert_eq!(
                     type_params[0].kind,
@@ -4169,7 +4240,7 @@ mod tests_generics {
 
     #[test]
     fn parenthesized_kind_annotation_parses() {
-        match decl_ast!("typeclass Higher<F: (* -> *) -> *> { fn tag<G: * -> *>(F<G> xs) -> int; }") {
+        match decl_ast!("trait Higher<F: (* -> *) -> *> { fn tag<G: * -> *>(F<G> xs) -> int; }") {
             Expression::TypeClass { type_params, .. } => {
                 assert_eq!(
                     type_params[0].kind,
@@ -4205,7 +4276,7 @@ mod tests_generics {
     /// Display keeps constructor-kind annotations on type params.
     #[test]
     fn constructor_kind_display_round_trips() {
-        let s = stmt!("typeclass Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }");
+        let s = stmt!("trait Container<F: * -> *> { fn first<A>(F<A> xs) -> A; }");
         assert!(
             s.contains("F: * -> *"),
             "expected kind annotation in display, got: {s}"
@@ -4214,7 +4285,7 @@ mod tests_generics {
 
     #[test]
     fn binary_hkt_kind_display_round_trips() {
-        let s = stmt!("typeclass Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }");
+        let s = stmt!("trait Bifunctor<F: * -> * -> *> { fn tag<A, B>(F<A, B> xs) -> int; }");
         assert!(
             s.contains("F: * -> * -> *"),
             "expected binary kind annotation in display, got: {s}"
@@ -4234,15 +4305,54 @@ mod tests_generics {
     /// TypeClassImpl Display: `impl Num<int> { … }`
     #[test]
     fn typeclass_impl_display_round_trips() {
+        // Display prefers the Self-first `for` form.
         let s = stmt!("impl Num<int> {}");
-        assert_eq!(s, "impl Num<int> {  }");
+        assert_eq!(s, "impl Num for int {  }");
+    }
+
+    /// Preferred form: `impl Show for Point`.
+    #[test]
+    fn trait_impl_for_parses_and_prepends_self() {
+        match decl_ast!("impl Show for Point { fn show(Point p) -> string {} }") {
+            Expression::TypeClassImpl { class, args, .. } => {
+                assert_eq!(class, "Show");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(*args[0].1, Expression::Type("Point")));
+            }
+            other => panic!("expected TypeClassImpl, got {other:?}"),
+        }
+    }
+
+    /// `impl Thing<string, int> for Message` → args [Message, string, int].
+    #[test]
+    fn trait_impl_for_with_bracket_args_prepends_self() {
+        match decl_ast!(
+            "impl Thing<string, int> for Message { fn do_something(Message m, string x) -> int {} }"
+        ) {
+            Expression::TypeClassImpl { class, args, .. } => {
+                assert_eq!(class, "Thing");
+                assert_eq!(args.len(), 3);
+                assert!(matches!(*args[0].1, Expression::Type("Message")));
+                assert!(matches!(*args[1].1, Expression::Type("string")));
+                assert!(matches!(*args[2].1, Expression::Type("int")));
+            }
+            other => panic!("expected TypeClassImpl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trait_impl_for_display_round_trips() {
+        let s = stmt!("impl Show for Point {}");
+        assert_eq!(s, "impl Show for Point {  }");
+        let s2 = stmt!("impl Thing<string, int> for Message {}");
+        assert_eq!(s2, "impl Thing<string, int> for Message {  }");
     }
 
     /// Phase 6: associated type decl + projection parse / Display round-trip.
     #[test]
     fn assoc_type_decl_and_projection_round_trip() {
         match decl_ast!(
-            "typeclass Collect<C> { type Elem; fn head(C xs) -> Elem; }"
+            "trait Collect<C> { type Elem; fn head(C xs) -> Elem; }"
         ) {
             Expression::TypeClass { methods, .. } => {
                 assert!(
@@ -4291,7 +4401,7 @@ mod tests_generics {
         assert_eq!(format!("{}", proj.1), "Collect::Elem");
 
         let s = stmt!(
-            "typeclass Collect<C> { type Elem; fn head(C xs) -> Elem; }"
+            "trait Collect<C> { type Elem; fn head(C xs) -> Elem; }"
         );
         assert!(s.contains("type Elem;"), "got: {s}");
         assert!(s.contains("Collect"), "got: {s}");
@@ -4323,7 +4433,7 @@ mod tests_generics {
     #[test]
     fn generic_assoc_type_decl_parses() {
         match decl_ast!(
-            "typeclass Pointer<P> { type Ref<T>; fn get<T>(P p) -> P::Ref<T>; }"
+            "trait Pointer<P> { type Ref<T>; fn get<T>(P p) -> P::Ref<T>; }"
         ) {
             Expression::TypeClass { methods, .. } => {
                 let assoc = methods.iter().find_map(|m| match m.1.as_ref() {

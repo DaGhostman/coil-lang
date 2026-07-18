@@ -1,7 +1,7 @@
-// Multi-param typeclass + where clause (Phase 3).
+// Multi-param trait + where clause (Phase 3).
 // Convert<A, B> with an int→int identity instance; cast(42) → 42.
 
-typeclass Convert<A, B> {
+trait Convert<A, B> {
     fn cast(A x) -> B;
 }
 

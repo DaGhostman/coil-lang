@@ -5,7 +5,7 @@
 // returns the applied projection `P::Ref<A>`, pinned by the
 // `Pointer<Option>` instance to `A`.
 
-typeclass Pointer<P: * -> *> {
+trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
 }
