@@ -3438,6 +3438,7 @@ mod tests {
         let lib_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/libsum.so");
         if !lib_path.exists() {
+            if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: libsum.so not built"); }
             eprintln!("skipping: libsum.so not built");
             return;
         }

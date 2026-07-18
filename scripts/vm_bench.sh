@@ -10,7 +10,8 @@ BIN="${BIN:-$CARGO_TARGET_DIR/release/zero-script}"
 MEM_LIMIT_KB="${MEM_LIMIT_KB:-65536}"
 
 declare -A EXPECTED=(
-    ["examples/fib.0s"]="2178309"
+    ["examples/fib.0s"]="55"
+    ["examples/fib_bench.0s"]="2178309"
     ["examples/option.0s"]="42"
     ["examples/result.0s"]="420-1"
     ["examples/tree.0s"]="6"
@@ -31,7 +32,7 @@ declare -A EXPECTED=(
 
 # CPU-focused subset for poop / quick timing (no FFI, no modules).
 CPU_BENCH=(
-    examples/fib.0s
+    examples/fib_bench.0s
     examples/perf/numeric.0s
     examples/perf/operators_loop.0s
     examples/perf/match_sum.0s
@@ -73,7 +74,7 @@ if command -v poop >/dev/null 2>&1; then
     echo
     echo "== poop benchmark (fib vs lua) =="
     rm -f out.c0s
-    poop -d 6000 "$BIN examples/fib.0s" "lua benchmarks/test.lua" || true
+    poop -d 6000 "$BIN examples/fib_bench.0s" "lua benchmarks/test.lua" || true
     echo
     echo "== poop CPU bench subset =="
     for path in "${CPU_BENCH[@]}"; do
@@ -92,9 +93,9 @@ ls -lh "$BIN"
 
 if command -v valgrind >/dev/null 2>&1; then
     echo
-    echo "== callgrind on fib.0s =="
+    echo "== callgrind on fib_bench.0s =="
     rm -f out.c0s callgrind.out.*
-    valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$BIN" examples/fib.0s >/dev/null 2>&1 || true
+    valgrind --tool=callgrind --callgrind-out-file=callgrind.out "$BIN" examples/fib_bench.0s >/dev/null 2>&1 || true
     if command -v callgrind_annotate >/dev/null 2>&1; then
         callgrind_annotate callgrind.out 2>/dev/null | head -20 || true
     fi

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "true"
+
+jobs:
+  test:
+    name: cargo test + CLI harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (libffi / cc for FFI tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev build-essential
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: Language harness (`zero-script test`)
+        run: |
+          cargo build -q
+          ./target/debug/zero-script test

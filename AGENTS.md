@@ -3,7 +3,7 @@
 ## Learned User Preferences
 
 - Run tests with a 64MB memory limit to catch leaks; exceeding it likely indicates a memory leak.
-- Use `poop` for CPU performance benchmarks: `cargo build --release && poop -d 6000 "./target/release/zero-script examples/fib.0s" && rm out.c0s`.
+- Use `poop` for CPU performance benchmarks: `cargo build --release && poop -d 6000 "./target/release/zero-script examples/fib_bench.0s" && rm out.c0s`.
 - Use parallel sub-agents scoped to disjoint files or modules for large tasks (docs, comment cleanup, exploration).
 - Draft implementation plans before large language-feature work; do not edit attached plan files during implementation.
 - New language features require full HM typechecker integration and updated user-facing docs in `docs/`.
@@ -24,7 +24,7 @@
 - FFI uses compile-time `extern` blocks (no `use ffi` needed) and runtime `dload`/`declare`/`invoke` with libffi; `resolve_library` resolves paths via entry-script `base_dir`, `zero.toml` `[ffi] search_paths`, and system search; supports Ptr (arrays/tuples), C structs, and callbacks via `FfiSignatureBuilder`.
 - `ARCHIVE_VERSION` is 20; bump on incompatible bytecode, tag, or opcode changes.
 - `prelude::test::assert` is an auto-imported virtual builtin returning `Result<(), string>`; `panic` is a keyword that aborts the VM (CLI/`zero-script test` treat it as failure).
-- `fib(32)` in `examples/fib.0s` is the primary performance regression benchmark (expected output `2178309`).
+- `examples/fib.0s` is the smoke Fibonacci (`fib(10)` → `55`); `examples/fib_bench.0s` (`fib(32)` → `2178309`) is the primary performance regression benchmark.
 - The CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
 
 ## PHASE 14 - HINDLEY–MILNER TYPECHECKER (COMPLETED)

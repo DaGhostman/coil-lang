@@ -15,3 +15,4 @@ rkyv = "0.8.12"
 
 [dev-dependencies]
 machine = { path = "../machine", features = ["vm_profile"] }
+proptest = "1"

@@ -1,0 +1,12 @@
+// Exercised by `zero-script test`.
+enum Color derive Ord {
+    Red,
+    Blue,
+}
+
+fn main() {
+    assert(Color::Red < Color::Blue)?;
+    assert(Color::Red <= Color::Red)?;
+    assert(!(Color::Blue < Color::Red))?;
+    print "ok";
+}

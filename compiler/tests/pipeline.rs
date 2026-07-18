@@ -44,6 +44,15 @@ fn run_example_src_with_entry(src: &str, entry: Option<&std::path::Path>) -> Str
     run_bytecode(bytecode, constants, &pipeline, entry)
 }
 
+/// Soft-skip an FFI-dependent test outside CI. In CI (`CI` env set), skip is a
+/// hard failure so missing `cc` / libffi never silently greens the suite.
+fn ffi_soft_skip(reason: &str) {
+    if std::env::var_os("CI").is_some() {
+        panic!("FFI soft-skip forbidden in CI: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
 fn run_bytecode(
     bytecode: Vec<common::Byte>,
     constants: Vec<u64>,
@@ -141,7 +150,7 @@ fn example_tree_prints_6() {
 #[test]
 fn example_fib_still_works() {
     let output = run_example("examples/fib.0s");
-    assert_eq!(output, "2178309");
+    assert_eq!(output, "55");
 }
 
 #[test]
@@ -851,13 +860,13 @@ fn ensure_ffi_libsum_built() {
             }
         }
         Ok(s) => {
-            eprintln!(
-                "skipping FFI tests: cc returned non-zero status {}",
+            ffi_soft_skip(&format!(
+                "FFI tests: cc returned non-zero status {}",
                 s.code().unwrap_or(-1)
-            );
+            ));
         }
         Err(e) => {
-            eprintln!("skipping FFI tests: failed to invoke cc: {}", e);
+            ffi_soft_skip(&format!("FFI tests: failed to invoke cc: {e}"));
         }
     }
 }
@@ -871,7 +880,7 @@ fn example_ffi_sum_via_dlopen_prints_42() {
         .expect("compiler crate must have a parent (workspace root)");
     let libsum_so = workspace_root.join("examples/libsum.so");
     if !libsum_so.exists() {
-        eprintln!("skipping: libsum.so not built (no C compiler?)");
+        ffi_soft_skip("libsum.so not built (no C compiler?)");
         return;
     }
 
@@ -892,7 +901,7 @@ fn example_ffi_sum_via_dlopen_prints_42() {
     let output = match result {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("skipping: FFI test panicked (dlopen failure?)");
+            ffi_soft_skip("FFI test panicked (dlopen failure?)");
             return;
         }
     };
@@ -903,7 +912,7 @@ fn example_ffi_sum_via_dlopen_prints_42() {
 fn example_strlen_prints_5() {
     // Quick probe: if dlopen("libc.so.6") fails, skip.
     if machine::load_library("libc.so.6").is_err() {
-        eprintln!("skipping: libc.so.6 not loadable on this platform");
+        ffi_soft_skip("libc.so.6 not loadable on this platform");
         return;
     }
 
@@ -918,7 +927,7 @@ fn example_strlen_prints_5() {
     let output = match result {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("skipping: strlen test panicked (dlopen failure?)");
+            ffi_soft_skip("strlen test panicked (dlopen failure?)");
             return;
         }
     };
@@ -1123,8 +1132,9 @@ fn example_ffi_array_sum_prints_15() {
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
     let libsum = workspace_root.join("examples/libsum.so");
+    ensure_ffi_libsum_built();
     if !libsum.exists() {
-        eprintln!("skipping: libsum.so not built");
+        ffi_soft_skip("libsum.so not built");
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_array.0s", &libsum);
@@ -1139,7 +1149,7 @@ fn example_ffi_callback_prints_42() {
     let libsum = workspace_root.join("examples/libsum.so");
     ensure_ffi_libsum_built();
     if !libsum.exists() {
-        eprintln!("skipping: libsum.so not built");
+        ffi_soft_skip("libsum.so not built");
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_callback.0s", &libsum);
@@ -1156,7 +1166,7 @@ fn example_ffi_struct_return_prints_34() {
     // delete libsum.so here — other FFI tests in this file race on that path.
     ensure_ffi_libsum_built();
     if !libsum.exists() {
-        eprintln!("skipping: libsum.so not built");
+        ffi_soft_skip("libsum.so not built");
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_struct_ret.0s", &libsum);
@@ -1171,7 +1181,7 @@ fn example_ffi_callback_return_prints_1() {
     let libsum = workspace_root.join("examples/libsum.so");
     ensure_ffi_libsum_built();
     if !libsum.exists() {
-        eprintln!("skipping: libsum.so not built");
+        ffi_soft_skip("libsum.so not built");
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_callback_ret.0s", &libsum);
@@ -1215,6 +1225,31 @@ fn example_derive_show_eq_prints_expected() {
         output,
         "Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false"
     );
+}
+
+/// Regression: `derive Ord` must emit Lt/Le/Gt/Ge + empty Ord (PR #14 layout)
+/// and lexicographic field compare must use strict `<` so equal prefixes fall
+/// through (a Leq-primary fold would short-circuit on equal leading fields).
+#[test]
+fn derive_ord_record_payload_lexicographic_compare() {
+    let src = r#"
+enum Pair derive Ord {
+    Pair { x: int, y: int },
+}
+
+fn main() {
+    let a = Pair::Pair { x: 1, y: 2 };
+    let b = Pair::Pair { x: 1, y: 3 };
+    let c = Pair::Pair { x: 2, y: 0 };
+    print "%z,", a < b;
+    print "%z,", a < c;
+    print "%z,", b < a;
+    print "%z,", a <= a;
+    print "%z", a < a;
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "true,true,false,true,false");
 }
 
 #[test]
