@@ -2858,6 +2858,46 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([1, 1])); // Err tag=1 arity=1
     }
 
+    /// Desugar `assert(cond[, msg])` to Ok(()) / Err(msg) via MakeEnum.
+    ///
+    /// Emits into `self.bytecode` so nested absolute jumps stay valid.
+    fn emit_assert(&mut self, args: &[Output]) {
+        if args.is_empty() || args.len() > 2 {
+            return;
+        }
+
+        let mut bb = BlockBuilder::new();
+        let fail = bb.fresh_label();
+        let end = bb.fresh_label();
+
+        let cond_bc = self.do_compile(&args[0]);
+        self.bytecode.extend(cond_bc);
+        bb.emit_jump_to(fail, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+        // Success: Ok(())
+        self.bytecode.push(Byte::new_with_value(
+            Instruction::CONST,
+            Value::from(0i64).raw() as _,
+        ));
+        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+        bb.emit_jump_to(end, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let fail_pos = self.bytecode.len() as u32;
+        bb.bind_label(fail, fail_pos, &mut self.bytecode, &mut self.constants);
+        if let Some(msg) = args.get(1) {
+            let msg_bc = self.do_compile(msg);
+            self.bytecode.extend(msg_bc);
+        } else {
+            self.emit_string_literal("assertion failed");
+        }
+        Self::emit_result_err(&mut self.bytecode);
+
+        let end_pos = self.bytecode.len() as u32;
+        bb.bind_label(end, end_pos, &mut self.bytecode, &mut self.constants);
+        bb.finalize()
+            .expect("BlockBuilder::finalize: assert labels bound");
+    }
+
     fn do_compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
@@ -3477,6 +3517,18 @@ impl Compiler {
                 bytecode.append(&mut body);
             }
             Expression::Call { name, args } => {
+                // `assert` from `prelude::test` (auto-imported).
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(kind) = self.checker.prelude_fn_in_scope(fname)
+                {
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    match kind {
+                        crate::typechecking::PreludeFn::Assert => {
+                            self.emit_assert(arg_slice);
+                        }
+                    }
+                    return bytecode;
+                }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
                 if let Expression::Identifier(fname) = name.1.as_ref()
                     && let Some(kind) = self.checker.ffi_fn_in_scope(fname)
@@ -5488,6 +5540,12 @@ impl Compiler {
                 self.bytecode.extend(expr_bc);
                 Self::emit_result_err(&mut self.bytecode);
                 self.bytecode.push(Byte::new(Instruction::RETURN));
+            }
+            Expression::Panic(expr) => {
+                // `panic msg` → push msg, Panic (abort VM).
+                let expr_bc = self.do_compile(expr);
+                self.bytecode.extend(expr_bc);
+                self.bytecode.push(Byte::new(Instruction::Panic));
             }
             Expression::Try(inner) => {
                 // `e?` → if Ok/Some, leave payload; else RETURN the failure.

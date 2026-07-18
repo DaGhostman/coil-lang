@@ -19,9 +19,11 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `done` | Expression | `true` if a coroutine handle is finished |
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
 | `prelude::ops::{Add,Eq,…}` | Virtual module | Auto-imported operator traits |
+| `prelude::test::assert` | Virtual module | Auto-imported; `assert(cond[, msg]) → Result<(), string>` |
+| `panic` | Keyword | Abort with a string message (exit code 1) |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
-Compiler builtins live in **virtual modules** (not `.0s` files). Every file gets an implicit `use prelude::*; use prelude::ops::*;`. FFI is **not** auto-imported — write `use ffi::*;` / `use ffi::types::*;` before calling `dload` / using `Int`.
+Compiler builtins live in **virtual modules** (not `.0s` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*;`. FFI is **not** auto-imported — write `use ffi::*;` / `use ffi::types::*;` before calling `dload` / using `Int`.
 
 ---
 
@@ -362,6 +364,47 @@ vm.run_raw(&bytecode);
 
 ---
 
+## `assert` (`prelude::test`)
+
+Auto-imported from the virtual `prelude::test` module. Returns a `Result` — it does **not** abort by itself.
+
+### Forms
+
+| Form | Result on success | Result on failure |
+|------|-------------------|-------------------|
+| `assert(cond)` | `Result::Ok(())` | `Result::Err("assertion failed")` |
+| `assert(cond, msg)` | `Result::Ok(())` | `Result::Err(msg)` |
+
+`cond` must be `bool`; `msg` must be `string`. Propagate with `?` in a result-mode function, or `match` the value:
+
+```0s
+fn must_be_pos(int n) {
+    assert(n > 0, "expected positive")?;
+    return n;
+}
+```
+
+Rebind the short name with `use prelude::test::assert as check;` if you need `assert` free for something else.
+
+See `examples/assert.0s`.
+
+---
+
+## `panic`
+
+Keyword that aborts the program with a string message. Writes `panic: <msg>` and stops the VM; the CLI exits with code `1`. Language panics also fail `zero-script test`.
+
+```0s
+panic "unreachable";
+panic format "bad index %i", i;
+```
+
+Unlike `raise`, `panic` is not recoverable with `?` / `match`. Prefer `assert` + `?` when callers should handle failure.
+
+See `examples/panic.0s`.
+
+---
+
 ## VM opcodes (reference)
 
 User code does not name these directly; the compiler emits them:
@@ -374,6 +417,7 @@ User code does not name these directly; the compiler emits them:
 | `DeclareFFI` | `declare` |
 | `FfiInvoke` | `invoke` |
 | `HostInvoke` | Host-registered closure |
+| `Panic` | Abort after writing `panic: <msg>` |
 
 ---
 

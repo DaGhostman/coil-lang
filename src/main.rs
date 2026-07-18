@@ -216,15 +216,17 @@ enum LoadErr {
     Version(u32),
 }
 
+/// Run archived bytecode. Returns `true` when a language-level `panic` aborted.
 fn execute_archive(
     pipeline: &Pipeline,
     bytecode: &[Byte],
     constants: &[u64],
     entry: Option<&Path>,
-) {
+) -> bool {
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, entry);
     machine.run_raw(bytecode, constants);
+    machine.panicked()
 }
 
 fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
@@ -265,7 +267,9 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         eprintln!("warning: failed to flush diagnostics: {e}");
     }
 
-    execute_archive(pipeline, &bytecode, &constants, Some(Path::new(filename)));
+    if execute_archive(pipeline, &bytecode, &constants, Some(Path::new(filename))) {
+        exit(1);
+    }
 }
 
 fn cmd_compile(pipeline: &mut Pipeline, filename: &str, output: &str) {
@@ -304,7 +308,9 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
 
     // Weak base_dir: archive parent, for relative FFI dload paths.
     let entry = Path::new(archive);
-    execute_archive(pipeline, &bytecode, &constants, Some(entry));
+    if execute_archive(pipeline, &bytecode, &constants, Some(entry)) {
+        exit(1);
+    }
 }
 
 fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -364,9 +370,12 @@ fn cmd_test(config: ReportConfig) {
             Ok((bytecode, constants)) => {
                 let entry = path.as_path();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_archive(&pipeline, &bytecode, &constants, Some(entry));
+                    execute_archive(&pipeline, &bytecode, &constants, Some(entry))
                 }));
-                result.is_ok()
+                match result {
+                    Ok(panicked) => !panicked,
+                    Err(_) => false,
+                }
             }
             Err(()) => false,
         };

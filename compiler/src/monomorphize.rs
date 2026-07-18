@@ -377,6 +377,7 @@ where
         | Expression::Return(e)
         | Expression::ImplicitReturn(e)
         | Expression::Raise(e)
+        | Expression::Panic(e)
         | Expression::Try(e)
         | Expression::Yield(e)
         | Expression::YieldFrom(e)

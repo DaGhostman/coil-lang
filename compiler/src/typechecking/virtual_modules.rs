@@ -18,6 +18,9 @@ pub const FFI_MODULE: &str = "ffi";
 /// Canonical module path for FFI type-tag constructors (`Int`, `Ptr`, …).
 pub const FFI_TYPES_MODULE: &str = "ffi::types";
 
+/// Canonical module path for test helpers (`assert`).
+pub const PRELUDE_TEST_MODULE: &str = "prelude::test";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -45,6 +48,27 @@ impl FfiBuiltin {
     }
 }
 
+/// Prelude/test callables exported from virtual modules (parallel to [`FfiBuiltin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreludeFn {
+    Assert,
+}
+
+impl PreludeFn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assert => "assert",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "assert" => Some(Self::Assert),
+            _ => None,
+        }
+    }
+}
+
 /// One item exported by a virtual module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinExport {
@@ -56,6 +80,8 @@ pub enum BuiltinExport {
     FfiTag { variant: &'static str },
     /// Userland FFI callable.
     FfiFn { kind: FfiBuiltin },
+    /// Prelude/test callable (`assert`, …).
+    Fn { kind: PreludeFn },
 }
 
 impl BuiltinExport {
@@ -65,6 +91,7 @@ impl BuiltinExport {
             Self::TypeClass { name } => name,
             Self::FfiTag { variant } => variant,
             Self::FfiFn { kind } => kind.as_str(),
+            Self::Fn { kind } => kind.as_str(),
         }
     }
 }
@@ -136,6 +163,13 @@ impl VirtualModules {
             .collect();
         modules.insert(FFI_TYPES_MODULE, ffi_tags);
 
+        modules.insert(
+            PRELUDE_TEST_MODULE,
+            vec![BuiltinExport::Fn {
+                kind: PreludeFn::Assert,
+            }],
+        );
+
         Self { modules }
     }
 
@@ -188,13 +222,17 @@ impl VirtualModules {
         }
     }
 
-    /// Exports injected into every file (implicit `use prelude::*; use prelude::ops::*;`).
+    /// Exports injected into every file (implicit
+    /// `use prelude::*; use prelude::ops::*; use prelude::test::*;`).
     pub fn prelude_exports(&self) -> Vec<BuiltinExport> {
         let mut out = Vec::new();
         if let Some(e) = self.modules.get(PRELUDE_MODULE) {
             out.extend(e.iter().cloned());
         }
         if let Some(e) = self.modules.get(PRELUDE_OPS_MODULE) {
+            out.extend(e.iter().cloned());
+        }
+        if let Some(e) = self.modules.get(PRELUDE_TEST_MODULE) {
             out.extend(e.iter().cloned());
         }
         out
@@ -250,10 +288,33 @@ mod tests {
                 .any(|e| matches!(e, BuiltinExport::TypeClass { name: "Eq" }))
         );
         assert!(
+            exports.iter().any(|e| matches!(
+                e,
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Assert
+                }
+            ))
+        );
+        assert!(
             !exports
                 .iter()
                 .any(|e| matches!(e, BuiltinExport::FfiFn { .. }))
         );
+    }
+
+    #[test]
+    fn resolve_concrete_prelude_test_assert() {
+        let vm = VirtualModules::new();
+        let e = vm
+            .resolve_item(&["prelude".into(), "test".into()], "assert")
+            .expect("prelude::test::assert");
+        assert_eq!(
+            e,
+            BuiltinExport::Fn {
+                kind: PreludeFn::Assert
+            }
+        );
+        assert!(vm.resolves_use(&["prelude".into(), "test".into()], "*"));
     }
 
     #[test]

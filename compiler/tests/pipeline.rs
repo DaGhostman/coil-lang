@@ -89,6 +89,38 @@ fn example_raise_try_prints_10_neg() {
 }
 
 #[test]
+fn example_assert_prints_ok_assertion_failed_custom() {
+    let output = run_example("examples/assert.0s");
+    assert_eq!(output, "ok,assertion failed,custom");
+}
+
+#[test]
+fn panic_aborts_and_writes_message() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+fn main() {
+    panic "boom";
+}
+"#,
+        )
+        .expect("panic example should compile");
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let shared = SharedBuf(Rc::clone(&buf));
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared);
+    machine.run_raw(&bytecode, &constants);
+    assert!(machine.panicked(), "expected language-level panic");
+    let _ = machine.restore_output();
+    let bytes = Rc::try_unwrap(buf)
+        .expect("VM still holds a reference to the buffer")
+        .into_inner();
+    let s = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
+    assert_eq!(s, "panic: boom");
+}
+
+#[test]
 fn example_coalesce_prints_bar_hi_7_9() {
     let output = run_example("examples/coalesce.0s");
     assert_eq!(output, "bar,hi,7,9");

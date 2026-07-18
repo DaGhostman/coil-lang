@@ -90,6 +90,7 @@ cargo run -- run /tmp/fib.c0s
 
 # Project tests (expects a ./tests directory with .0s files that define main)
 cargo run -- test
+# Language `panic` or a Rust unwind marks the file FAILED; `assert` + `?` is fine.
 ```
 
 ### Recompiling after changes

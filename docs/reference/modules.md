@@ -50,6 +50,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.0s` files 
 |--------|---------|----------------|
 | `prelude` | `Option`, `Result` | Yes (every file) |
 | `prelude::ops` | `Add`, `Sub`, `Mul`, `Div`, `Num`, `Eq`, `Ord`, `Lt`, `Le`, `Gt`, `Ge`, `Show` | Yes (every file) |
+| `prelude::test` | `assert` | Yes (every file) |
 | `ffi` | `dload`, `declare`, `invoke` | No — write `use ffi::*;` |
 | `ffi::types` | `Int`, `Float`, `String`, `Void`, `Ptr`, `Callback`, … | No — write `use ffi::types::*;` |
 
@@ -65,7 +66,7 @@ trait Eq<T> { /* your trait */ }   // now allowed
 
 Without the `as` rebind, `trait Eq` / `enum Option` is a conflict diagnostic.
 
-`zero.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops`.
+`zero.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops` + `prelude::test`.
 
 ---
 
