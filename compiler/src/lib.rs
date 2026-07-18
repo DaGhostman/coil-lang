@@ -1572,12 +1572,12 @@ impl Compiler {
                     ("Div", "div", Instruction::DIV),
                 ],
                 [
-                    ("lt", Instruction::LE),
-                    ("le", Instruction::LEQ),
-                    ("gt", Instruction::GT),
-                    ("ge", Instruction::GEQ),
-                    ("eq", Instruction::EQ),
-                    ("ne", Instruction::NEQ),
+                    ("Lt", "lt", Instruction::LE),
+                    ("Le", "le", Instruction::LEQ),
+                    ("Gt", "gt", Instruction::GT),
+                    ("Ge", "ge", Instruction::GEQ),
+                    ("Eq", "eq", Instruction::EQ),
+                    ("Eq", "ne", Instruction::NEQ),
                 ],
             ),
             (
@@ -1590,23 +1590,20 @@ impl Compiler {
                     ("Div", "div", Instruction::DIVF),
                 ],
                 [
-                    ("lt", Instruction::LEF),
-                    ("le", Instruction::LEQF),
-                    ("gt", Instruction::GTF),
-                    ("ge", Instruction::GEQF),
-                    ("eq", Instruction::EQ),
-                    ("ne", Instruction::NEQ),
+                    ("Lt", "lt", Instruction::LEF),
+                    ("Le", "le", Instruction::LEQF),
+                    ("Gt", "gt", Instruction::GTF),
+                    ("Ge", "ge", Instruction::GEQF),
+                    ("Eq", "eq", Instruction::EQ),
+                    ("Eq", "ne", Instruction::NEQ),
                 ],
             ),
         ] {
             for (class, method, op) in arithmetic {
                 emit(self, class, ty, method, tag, op, true);
             }
-            for (method, op) in comparisons.iter().take(4) {
-                emit(self, "Ord", ty, method, tag, *op, false);
-            }
-            for (method, op) in comparisons.iter().skip(4) {
-                emit(self, "Eq", ty, method, tag, *op, false);
+            for (class, method, op) in comparisons {
+                emit(self, class, ty, method, tag, op, false);
             }
         }
         for (ty, tag) in [("string", ValueTag::String), ("bool", ValueTag::Bool)] {

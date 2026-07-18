@@ -397,7 +397,7 @@ impl Generics {
     /// Build the compiler-generated FQN for a builtin instance method.
     ///
     /// Convention: `{Class}__{concrete_type_str}__{method}`
-    /// e.g. `Add__int__add`, `Ord__float__lt`, `Eq__string__eq`.
+    /// e.g. `Add__int__add`, `Lt__float__lt`, `Eq__string__eq`.
     pub fn builtin_instance_fqn(class: &str, ty_str: &str, method: &str) -> String {
         format!("{}__{}__{}", class, ty_str, method)
     }
@@ -457,10 +457,38 @@ impl Generics {
             },
         );
 
+        // ---- Lt / Le / Gt / Ge ----
+        // Individual ordering traits so a type can implement only the
+        // comparisons it supports. `Ord` is a convenience supertrait that
+        // implies all four (see below).
+        for (name, method) in [
+            ("Lt", "lt"),
+            ("Le", "le"),
+            ("Gt", "gt"),
+            ("Ge", "ge"),
+        ] {
+            self.typeclasses.insert(
+                name.into(),
+                TypeClassDef {
+                    name: name.into(),
+                    defined_module: BUILTIN_MODULE.into(),
+                    type_params: vec!["T".into()],
+                    param_kinds: vec![Kind::Type],
+                    superclasses: vec![],
+                    assoc_types: vec![],
+                    methods: vec![TypeClassMethodDef {
+                        name: method.into(),
+                        has_default: false,
+                    }],
+                },
+            );
+        }
+
         // ---- Ord ----
-        // Builtin Ord does not declare Eq as a superclass (dict layouts for
-        // existing callers stay unchanged). User-defined classes
-        // use `trait Ordered<T: Equal>` for the superclass path.
+        // Convenience bundle: `T: Ord` implies Lt + Le + Gt + Ge via the
+        // flattened superclass dictionary layout. Ord itself has no methods.
+        // Builtin Ord does not declare Eq as a superclass. User-defined
+        // classes use `trait Ordered<T: Equal>` for that path.
         self.typeclasses.insert(
             "Ord".into(),
             TypeClassDef {
@@ -468,26 +496,14 @@ impl Generics {
                 defined_module: BUILTIN_MODULE.into(),
                 type_params: vec!["T".into()],
                 param_kinds: vec![Kind::Type],
-                superclasses: vec![],
-                assoc_types: vec![],
-                methods: vec![
-                    TypeClassMethodDef {
-                        name: "lt".into(),
-                        has_default: false,
-                    },
-                    TypeClassMethodDef {
-                        name: "le".into(),
-                        has_default: false,
-                    },
-                    TypeClassMethodDef {
-                        name: "gt".into(),
-                        has_default: false,
-                    },
-                    TypeClassMethodDef {
-                        name: "ge".into(),
-                        has_default: false,
-                    },
+                superclasses: vec![
+                    "Lt".into(),
+                    "Le".into(),
+                    "Gt".into(),
+                    "Ge".into(),
                 ],
+                assoc_types: vec![],
+                methods: vec![],
             },
         );
 
@@ -539,7 +555,7 @@ impl Generics {
                 .collect()
         };
 
-        // ---- builtin instances: int / float arithmetic ----
+        // ---- builtin instances: int / float arithmetic + ordering ----
         for ty in [int(), float()] {
             let ty_str = match &ty {
                 Ty::Con(n) if n == INT => "int",
@@ -550,6 +566,10 @@ impl Generics {
                 ("Sub", "sub"),
                 ("Mul", "mul"),
                 ("Div", "div"),
+                ("Lt", "lt"),
+                ("Le", "le"),
+                ("Gt", "gt"),
+                ("Ge", "ge"),
             ] {
                 self.instances.push(InstanceDef {
                     class: class.into(),
@@ -560,27 +580,21 @@ impl Generics {
                     assoc_tys: HashMap::new(),
                 });
             }
-            // Num instance: no own methods; dict emission pulls Add/Sub/Mul/Div
-            // slots via the flattened superclass layout.
-            self.instances.push(InstanceDef {
-                class: "Num".into(),
-                defined_module: BUILTIN_MODULE.into(),
-                range: 0..0,
-                args: vec![ty.clone()],
-                method_fqns: HashMap::new(),
-                assoc_tys: HashMap::new(),
-            });
+            // Num / Ord instances: no own methods; dict emission pulls
+            // superclass slots via the flattened layout.
+            for class in ["Num", "Ord"] {
+                self.instances.push(InstanceDef {
+                    class: class.into(),
+                    defined_module: BUILTIN_MODULE.into(),
+                    range: 0..0,
+                    args: vec![ty.clone()],
+                    method_fqns: HashMap::new(),
+                    assoc_tys: HashMap::new(),
+                });
+            }
         }
 
-        // ---- builtin instances: int Ord / Eq / Show ----
-        self.instances.push(InstanceDef {
-            class: "Ord".into(),
-            defined_module: BUILTIN_MODULE.into(),
-            range: 0..0,
-            args: vec![int()],
-            method_fqns: make_fqns("Ord", "int", &["lt", "le", "gt", "ge"]),
-            assoc_tys: HashMap::new(),
-        });
+        // ---- builtin instances: int / float Eq / Show ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
             defined_module: BUILTIN_MODULE.into(),
@@ -595,16 +609,6 @@ impl Generics {
             range: 0..0,
             args: vec![int()],
             method_fqns: make_fqns("Show", "int", &["show"]),
-            assoc_tys: HashMap::new(),
-        });
-
-        // ---- builtin instances: float Ord / Eq / Show ----
-        self.instances.push(InstanceDef {
-            class: "Ord".into(),
-            defined_module: BUILTIN_MODULE.into(),
-            range: 0..0,
-            args: vec![float()],
-            method_fqns: make_fqns("Ord", "float", &["lt", "le", "gt", "ge"]),
             assoc_tys: HashMap::new(),
         });
         self.instances.push(InstanceDef {

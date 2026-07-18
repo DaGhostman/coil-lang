@@ -397,7 +397,7 @@ Call-site strategy:
 
 | Situation | Runtime |
 |-----------|---------|
-| Ground call with only **builtin** bounds (`Num`/`Ord`/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
+| Ground call with only **builtin** bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
 | Shared body / open type params with any bound | **Dictionary passing** — see below |
 | Ground or shared call with user trait bounds | **Dictionary passing** — see below |
 | Escaped generic fn value (`let f = id;`) | `MakePolyFn` / `MakePolyFnCapture` + `CallIndirect` |
@@ -476,11 +476,18 @@ The compiler pre-registers these traits and instances for `int`, `float`, and (w
 | `Mul` | Multiplication | `*` → `mul` |
 | `Div` | Division | `/` → `div` |
 | `Num` | Convenience bundle | Supertrait of `Add` + `Sub` + `Mul` + `Div` (no own methods) |
-| `Ord` | Ordering | `<`, `<=`, `>`, `>=` |
+| `Lt` | Less-than | `<` → `lt` |
+| `Le` | Less-or-equal | `<=` → `le` |
+| `Gt` | Greater-than | `>` → `gt` |
+| `Ge` | Greater-or-equal | `>=` → `ge` |
+| `Ord` | Convenience bundle | Supertrait of `Lt` + `Le` + `Gt` + `Ge` (no own methods) |
 | `Eq` | Equality | `==`, `!=` |
 | `Show` | Display | `show(T) -> string`; used by format `%v` |
 
-On open/generic operands, operators require the matching op trait (or `Num`, which implies all four). Concrete `int`/`float` arithmetic still uses hardwired opcodes. String concatenation (`string + string`) is a separate path and is **not** covered by `Num`/`Add`.
+On open/generic operands, operators require the matching op trait (or the
+`Num` / `Ord` convenience supertrait). Concrete `int`/`float` arithmetic and
+comparisons still use hardwired opcodes. String concatenation
+(`string + string`) is a separate path and is **not** covered by `Num`/`Add`.
 
 ### User-defined traits (sketch)
 
@@ -698,7 +705,7 @@ Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. Use
 | Classes | Nominal `Ty::Con`; ctor args / fields / methods supported — no inheritance or virtual dispatch |
 | FFI | Broad scalar/Ptr/struct/callback tags via `FFIType` / `extern struct` — see [FFI tutorial](../tutorial/07-ffi.md) |
 | Generics | Generic functions/enums/aliases/classes, `T: Class` bounds, multi-param `where` constraints, `forall` annotations, user `trait`/`impl`, superclasses, orphan/coherence checks, associated types, and GATs are supported |
-| Typeclass runtime | User-defined trait calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Ord`/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
+| Trait runtime | User-defined trait calls use dictionary passing; only ground calls with builtin bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) are candidates for direct monomorphized primitive paths |
 | Existentials | Bare class names are existential value types only for unary `* -> Constraint` classes; multi-param bare existentials and constructor-kinded bare existentials are rejected |
 | Higher-kinded types | Constructor kinds such as `F: * -> *`, `F: * -> * -> *`, and `F: (* -> *) -> *` are supported; kind variables / kind polymorphism are not supported |
 | Associated types | Nullary associated types and generic associated type projections are supported; associated-type equality constraints in `where` clauses are not syntax |
