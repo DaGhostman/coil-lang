@@ -145,6 +145,31 @@ fn main() {
 
 See `examples/coro_interleave.0s` for a longer alternating-`resume` example.
 
+## Iterating with `for x in`
+
+A coroutine handle can be consumed with `for x in expr { … }`. The loop
+resumes until `done`, binding each **yielded** value to `x`. The resume that
+completes the coroutine (`return` / fall-off) does **not** enter the body
+(Python/JS-like). `break` / `continue` work as usual.
+
+```0s
+async fn counter() {
+    yield 0;
+    yield 1;
+    yield 2;
+    return 99; // completion — not printed by for-in
+}
+
+fn main() {
+    for x in counter() {
+        print "%i", x; // 012
+    }
+}
+```
+
+See `examples/for_in_coro.0s`. Arrays and other collections are not iterable
+with `for … in` yet — only `coroutine<Y, S>`.
+
 ## Recompiling
 
 Coroutines added new VM opcodes; delete stale archives after upgrading:

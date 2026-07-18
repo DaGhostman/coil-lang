@@ -1664,11 +1664,44 @@ impl Checker {
                 self.infer(body)
             }
             Expression::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, range),
-            Expression::Loop { iterable, body, .. } => {
-                let it = self.infer(iterable);
-                self.unify(&it, &boolean(), &iterable.0.into_range(), "while condition");
-                let _ = self.infer(body);
-                unit_ty()
+            Expression::Loop {
+                identifier,
+                iterable,
+                body,
+            } => {
+                if let Some(binding) = identifier {
+                    // `for x in expr { body }` — iterable must be coroutine<Y, S>;
+                    // bind `x : Y` for the body.
+                    let it = self.infer(iterable);
+                    let y_var = Ty::Var(self.counter.fresh());
+                    let s_var = Ty::Var(self.counter.fresh());
+                    let coro_ty = self.coroutine_type(y_var.clone(), s_var);
+                    self.unify(
+                        &it,
+                        &coro_ty,
+                        &iterable.0.into_range(),
+                        "for-in iterable",
+                    );
+                    let elem_ty = apply_ty_prune(&self.subst, &y_var);
+                    self.env.push();
+                    if let Expression::Identifier(name) = binding.1.as_ref() {
+                        self.env
+                            .insert_top(name.to_string(), Scheme::mono(elem_ty.clone()));
+                        self.codegen_var_types
+                            .insert(name.to_string(), elem_ty.clone());
+                    }
+                    // Consume the binding node's ID (pre-walk order) now that
+                    // the name is in scope.
+                    let _ = self.infer(binding);
+                    let _ = self.infer(body);
+                    self.env.pop();
+                    unit_ty()
+                } else {
+                    let it = self.infer(iterable);
+                    self.unify(&it, &boolean(), &iterable.0.into_range(), "while condition");
+                    let _ = self.infer(body);
+                    unit_ty()
+                }
             }
             Expression::For {
                 init,
@@ -6723,10 +6756,10 @@ impl Checker {
                 identifier,
             } => {
                 self.pre_register_enums_walk(iterable, errors);
-                self.pre_register_enums_walk(body, errors);
                 if let Some(i) = identifier {
                     self.pre_register_enums_walk(i, errors);
                 }
+                self.pre_register_enums_walk(body, errors);
             }
 
             Expression::For {
@@ -11721,6 +11754,43 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
             .codegen_var_type("x")
             .expect("x should be recorded in codegen_var_types");
         assert_eq!(apply_ty_prune(c.subst(), x_ty), int());
+    }
+
+    #[test]
+    fn for_in_coro_binds_loop_var_to_yield_type() {
+        let src = r#"
+async fn counter() { yield 0; yield 1; }
+fn main() {
+    for x in counter() {
+        let y = x;
+    }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let y_ty = c
+            .codegen_var_type("y")
+            .expect("y should be recorded in codegen_var_types");
+        assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
+        let x_ty = c
+            .codegen_var_type("x")
+            .expect("x should be recorded in codegen_var_types");
+        assert_eq!(apply_ty_prune(c.subst(), x_ty), int());
+    }
+
+    #[test]
+    fn for_in_non_coro_iterable_is_diagnostic() {
+        let (c, _) = check("fn main() { for x in 42 { } }");
+        assert!(
+            c.messages().iter().any(|m| {
+                m.message().contains("Type mismatch")
+                    && m.help()
+                        .as_ref()
+                        .is_some_and(|h| h.contains("for-in iterable"))
+            }),
+            "expected for-in type error, got {:?}",
+            c.messages()
+        );
     }
 
     #[test]

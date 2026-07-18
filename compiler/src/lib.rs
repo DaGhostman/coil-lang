@@ -3367,49 +3367,122 @@ impl Compiler {
                 self.emit_compound_assign(&mut bytecode, target, *op, rhs);
             }
             // --- Loop codegen ---
-            // Layout: [top] cond, JMPF→exit, body, JMP→top, [exit]
-            Expression::Loop { iterable, body, .. } => {
-                let mut bb = BlockBuilder::new();
-                let top_label = bb.fresh_label();
-                let exit_label = bb.fresh_label();
-                let top_label_target = self.bytecode.len() as u32;
+            // `while`: [top] cond, JMPF→exit, body, JMP→top, [exit]
+            // `for x in coro`: StorePop __h; [top] resume→x; Done; LogNot; JMPF→exit; body; JMP→top; [exit]
+            Expression::Loop {
+                identifier,
+                iterable,
+                body,
+            } => {
+                if let Some(binding) = identifier {
+                    // for-in over coroutine: resume then skip body when done
+                    // (completion value / Done-sentinel never enters the body).
+                    let handle_slot = self.alloc_temp_slot();
+                    let iter_bc = self.do_compile(iterable);
+                    self.bytecode.extend(iter_bc);
+                    self.bytecode
+                        .push(Byte::new(Instruction::StorePop).with_operand_u32(handle_slot));
 
-                let iter_bc = self.do_compile(iterable);
-                self.bytecode.extend(iter_bc);
+                    let binding_name = match binding.1.as_ref() {
+                        Expression::Identifier(n) => (*n).to_string(),
+                        _ => "__for_in_x".to_string(),
+                    };
+                    // Consume the binding Identifier's NodeId without emitting
+                    // LOAD (do_compile would load an unbound / wrong slot).
+                    let _ = self.next_emit_id();
+                    let binding_slot = self.context.variables.intern(binding_name) as u32;
 
-                bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+                    let mut bb = BlockBuilder::new();
+                    let top_label = bb.fresh_label();
+                    let exit_label = bb.fresh_label();
+                    let top_label_target = self.bytecode.len() as u32;
 
-                self.loop_stack.push((top_label, exit_label));
-                self.loop_bbs.push(bb);
-                let body_bc = self.do_compile(body);
-                self.bytecode.extend(body_bc);
-                let mut bb = self
-                    .loop_bbs
-                    .pop()
-                    .expect("loop builder stack balanced for while");
-                self.loop_stack
-                    .pop()
-                    .expect("loop label stack balanced for while");
+                    self.bytecode
+                        .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
+                    self.bytecode
+                        .push(Byte::new(Instruction::ResumeCoro).with_operand_u32(0));
+                    self.bytecode
+                        .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
 
-                bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+                    // `if done(__h) { break; }` via DoneCoro; LogNot; JMPF exit
+                    self.bytecode
+                        .push(Byte::new(Instruction::LOAD).with_operand_u32(handle_slot));
+                    self.bytecode.push(Byte::new(Instruction::DoneCoro));
+                    self.bytecode.push(Byte::new(Instruction::LogNot));
+                    bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
 
-                let exit_label_target = self.bytecode.len() as u32;
-                bb.bind_label(
-                    exit_label,
-                    exit_label_target,
-                    &mut self.bytecode,
-                    &mut self.constants,
-                );
+                    self.loop_stack.push((top_label, exit_label));
+                    self.loop_bbs.push(bb);
+                    let body_bc = self.do_compile(body);
+                    self.bytecode.extend(body_bc);
+                    let mut bb = self
+                        .loop_bbs
+                        .pop()
+                        .expect("loop builder stack balanced for for-in");
+                    self.loop_stack
+                        .pop()
+                        .expect("loop label stack balanced for for-in");
 
-                bb.bind_label(
-                    top_label,
-                    top_label_target,
-                    &mut self.bytecode,
-                    &mut self.constants,
-                );
+                    bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
 
-                bb.finalize()
-                    .expect("BlockBuilder::finalize: all targeted labels bound");
+                    let exit_label_target = self.bytecode.len() as u32;
+                    bb.bind_label(
+                        exit_label,
+                        exit_label_target,
+                        &mut self.bytecode,
+                        &mut self.constants,
+                    );
+                    bb.bind_label(
+                        top_label,
+                        top_label_target,
+                        &mut self.bytecode,
+                        &mut self.constants,
+                    );
+                    bb.finalize()
+                        .expect("BlockBuilder::finalize: for-in labels bound");
+                } else {
+                    let mut bb = BlockBuilder::new();
+                    let top_label = bb.fresh_label();
+                    let exit_label = bb.fresh_label();
+                    let top_label_target = self.bytecode.len() as u32;
+
+                    let iter_bc = self.do_compile(iterable);
+                    self.bytecode.extend(iter_bc);
+
+                    bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+                    self.loop_stack.push((top_label, exit_label));
+                    self.loop_bbs.push(bb);
+                    let body_bc = self.do_compile(body);
+                    self.bytecode.extend(body_bc);
+                    let mut bb = self
+                        .loop_bbs
+                        .pop()
+                        .expect("loop builder stack balanced for while");
+                    self.loop_stack
+                        .pop()
+                        .expect("loop label stack balanced for while");
+
+                    bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+                    let exit_label_target = self.bytecode.len() as u32;
+                    bb.bind_label(
+                        exit_label,
+                        exit_label_target,
+                        &mut self.bytecode,
+                        &mut self.constants,
+                    );
+
+                    bb.bind_label(
+                        top_label,
+                        top_label_target,
+                        &mut self.bytecode,
+                        &mut self.constants,
+                    );
+
+                    bb.finalize()
+                        .expect("BlockBuilder::finalize: all targeted labels bound");
+                }
             }
             // --- C-style for codegen ---
             // Layout: init, [top] cond, JMPF→exit, body, [continue] step, JMP→top, [exit]
@@ -6537,6 +6610,68 @@ sum = sum + i; \
         assert!(
             jmp_targets.iter().all(|target| *target != 0),
             "loop jump placeholders should be patched: {:?}",
+            jmp_targets
+        );
+    }
+
+    #[test]
+    fn for_in_coro_emits_resume_done_and_back_edge() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "async fn counter() { yield 0; yield 1; return 99; } \
+fn main() { for x in counter() { print \"%i\", x; } }",
+        );
+
+        let resume = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::ResumeCoro))
+            .count();
+        let done = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::DoneCoro))
+            .count();
+        let log_not = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::LogNot | Instruction::LogNotJmpf))
+            .count();
+        let jmpf = bc
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::JMPF | Instruction::LogNotJmpf
+                )
+            })
+            .count();
+        let jmp = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JMP))
+            .count();
+
+        assert!(resume >= 1, "expected ResumeCoro in for-in; got {resume}");
+        assert!(done >= 1, "expected DoneCoro in for-in; got {done}");
+        assert!(
+            log_not + jmpf >= 1,
+            "expected done-check exit branch (LogNot/JMPF); log_not={log_not} jmpf={jmpf}"
+        );
+        assert!(jmp >= 1, "expected back-edge JMP; got {jmp}");
+    }
+
+    #[test]
+    fn for_in_coro_break_patches_exit_jump() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "async fn counter() { yield 0; yield 1; yield 2; } \
+fn main() { for x in counter() { if x == 1 { break; } } }",
+        );
+        let jmp_targets: Vec<u32> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::JMP))
+            .map(|b| b.operand_u32())
+            .collect();
+        assert!(
+            jmp_targets.iter().all(|t| *t != 0),
+            "for-in break/back-edge JMPs should be patched: {:?}",
             jmp_targets
         );
     }

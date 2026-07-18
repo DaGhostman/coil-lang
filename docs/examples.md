@@ -1134,6 +1134,17 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+### `examples/for_in_coro.0s`
+
+**Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/for_in_coro.0s` |
+| **Output** | `01210` |
+
+---
+
 ## Quick reference table
 
 | File | Category | Output (if known) |
@@ -1192,6 +1203,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `coro_yield_from.0s` | Coroutines | `012` |
 | `coro_interleave.0s` | Coroutines | `10,100,101,11,12,102` |
 | `coro_done.0s` | Coroutines | `falsefalsetrue` |
+| `for_in_coro.0s` | Coroutines | `01210` |
 
 ## Running tests that mirror examples
 

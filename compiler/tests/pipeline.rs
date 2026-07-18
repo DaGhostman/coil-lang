@@ -904,6 +904,14 @@ fn example_coro_done_prints_false_false_true() {
     assert_eq!(output, "falsefalsetrue");
 }
 
+#[test]
+fn example_for_in_coro_prints_012_and_breaks() {
+    // counter yields 0,1,2 then returns 99 — completion must NOT print.
+    // early yields 10,20,30 — break on 20 prints only 10.
+    let output = run_example("examples/for_in_coro.0s");
+    assert_eq!(output, "01210");
+}
+
 /// Regression guard: `resume h` used INLINE as a `print` argument
 /// (no intermediate `let` binding) must not corrupt the operand
 /// stack. Pre-fix, the bare `yield expr;` statement's spurious

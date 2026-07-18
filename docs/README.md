@@ -49,7 +49,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
-| Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
+| Coroutines (`async`, `yield`, `resume`, `yield from`, `done`, `for x in`) | Supported |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
@@ -70,7 +70,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [05 — Aggregates](tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
 | [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `zero.toml` |
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
-| [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from` |
+| [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
 | [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 
 Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
@@ -151,5 +151,5 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 | Generics & traits | `examples/generics.0s`, `examples/hkt_bifunctor.0s`, `examples/gat_pointer.0s`, `examples/existential_show.0s` |
 | Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
 | FFI | `examples/strlen.0s`, `examples/ffi_sum.0s` |
-| Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s` |
+| Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s`, `examples/for_in_coro.0s` |
 | Full catalog | [examples.md](examples.md) |

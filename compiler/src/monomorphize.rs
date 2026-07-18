@@ -461,10 +461,10 @@ where
             identifier,
         } => {
             f(iterable);
-            f(body);
             if let Some(identifier) = identifier {
                 f(identifier);
             }
+            f(body);
         }
         Expression::For {
             init,

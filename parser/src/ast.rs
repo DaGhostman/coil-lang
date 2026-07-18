@@ -722,15 +722,14 @@ impl<'a> Display for Expression<'a> {
                 iterable,
                 body,
             } => {
-                write!(
-                    f,
-                    "{} {{\n{}}}",
-                    match identifier {
-                        Some(_) => String::new(),
-                        None => format!("while {}", iterable.1),
-                    },
-                    body.1
-                )
+                match identifier {
+                    Some(ident) => write!(
+                        f,
+                        "for {} in {} {{\n{}}}",
+                        ident.1, iterable.1, body.1
+                    ),
+                    None => write!(f, "while {} {{\n{}}}", iterable.1, body.1),
+                }
             }
             Self::Break => write!(f, "break"),
             Self::Continue => write!(f, "continue"),
