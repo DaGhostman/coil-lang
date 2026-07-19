@@ -995,3 +995,218 @@ fn derive_generic_class_reports_diagnostic() {
         msgs
     );
 }
+
+#[test]
+fn ffi_dload_without_use_errors() {
+    let (_ty, msgs) = check(r#"fn main() { let lib = dload("x.so"); }"#);
+    assert!(
+        msgs.iter().any(|m| m.contains("Cannot find value `dload`") || m.contains("Cannot find function `dload`")),
+        "expected missing dload without `use ffi`, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn declare_wrong_arity_errors() {
+    let msgs = check_messages(
+        r#"
+        use ffi::*;
+        fn main() {
+            let lib = dload("x.so");
+            declare(lib, "f", Int);
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::DeclareArity)
+            || m.message().contains("declare")
+            || m.message().contains("Declare")),
+        "expected DeclareArity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn invoke_wrong_arity_errors() {
+    let msgs = check_messages(
+        r#"
+        use ffi::*;
+        fn main() {
+            let lib = dload("x.so");
+            let id = 0;
+            invoke(lib, id);
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::InvokeArity)
+            || m.message().to_lowercase().contains("invoke")),
+        "expected InvokeArity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn io_stdin_without_import_errors() {
+    let (_ty, msgs) = check(r#"fn main() { let s = stdin(); }"#);
+    assert!(
+        msgs.iter().any(|m| m.contains("stdin")),
+        "expected unknown stdin without `use io`, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn array_literal_index_oob_errors() {
+    let msgs = check_messages(
+        r#"
+        fn main() {
+            let a = [0, 1, 2];
+            let x = a[3];
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::IndexOutOfBounds)
+            || m.message().contains("out of bounds")),
+        "expected IndexOutOfBounds, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn tuple_literal_index_oob_errors() {
+    let msgs = check_messages(
+        r#"
+        fn main() {
+            let t = (1, 2);
+            let x = t[5];
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::IndexOutOfBounds)
+            || m.message().contains("out of bounds")),
+        "expected tuple IndexOutOfBounds, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn index_on_int_errors() {
+    let msgs = check_messages(
+        r#"
+        fn main() {
+            let x = 5;
+            let y = x[0];
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::CannotIndex)
+            || m.message().to_lowercase().contains("index")),
+        "expected CannotIndex, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_pattern_missing_field_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        enum P { P { x: int, y: int } }
+        fn f(P p) -> int {
+            return match p {
+                P::P { x } => x,
+            };
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Missing field") || m.contains("missing field") || m.contains("`y`")),
+        "expected missing field in record pattern, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_pattern_duplicate_field_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        enum P { P { x: int, y: int } }
+        fn f(P p) -> int {
+            return match p {
+                P::P { x, x } => x,
+            };
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Duplicate field") || m.contains("duplicate field")),
+        "expected duplicate field in record pattern, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn record_pattern_shape_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        enum P { P { x: int, y: int } }
+        fn f(P p) -> int {
+            return match p {
+                P::P(x, y) => x + y,
+            };
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("shape") || m.contains("payload") || m.contains("Missing field") || m.contains("Constructor")),
+        "expected record/tuple shape mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn const_reassignment_errors() {
+    let (_ty, msgs) = check(
+        r#"
+        fn main() {
+            const x = 1;
+            x = 2;
+        }
+        "#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Cannot assign to constant `x`") || m.contains("constant")),
+        "expected const reassignment diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn panic_non_string_errors() {
+    let (_ty, msgs) = check(r#"fn main() { panic 1; }"#);
+    assert!(
+        !msgs.is_empty(),
+        "expected diagnostic for non-string panic, got: {:?}",
+        msgs
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Type mismatch") || m.contains("string")),
+        "expected string/type mismatch for panic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn array_element_type_mismatch_errors() {
+    let msgs = check_messages(r#"fn main() { let a = [1, "x"]; }"#);
+    assert!(
+        msgs.iter().any(|m| m.code() == Some(ErrorCode::ArrayElementMismatch)
+            || m.message().contains("array element")),
+        "expected ArrayElementMismatch, got: {:?}",
+        msgs
+    );
+}
+

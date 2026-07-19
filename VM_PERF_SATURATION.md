@@ -8,7 +8,7 @@
 
 | Workload | Class | Exercises | Golden output |
 |----------|-------|-----------|---------------|
-| `examples/fib.0s` | CPU / calls | recursion, `BinReturn`, `BinSlotSlot` | `2178309` |
+| `examples/fib_bench.0s` | CPU / calls | recursion, `BinReturn`, `BinSlotSlot` | `2178309` |
 | `examples/perf/numeric.0s` | CPU / loop | `BinSlotImmJmpf`, `BinSlotImm`, `StorePop` | `1999000` |
 | `examples/perf/operators_loop.0s` | CPU / ops | `Pow`, `BITAND`, `BITOR`, `LogNotJmpf` | `149912` |
 | `examples/perf/array_mut.0s` | heap / agg | `StoreIndex`, compound update | `2000` |
@@ -77,7 +77,7 @@ Peephole also extends `is_bin_op` / `is_int_bin_op` for `Pow`, `BITAND`, `BITOR`
 cargo test --workspace
 cargo test -p compiler --test perf_metrics
 cargo test -p compiler --test pipeline example_perf
-cargo build --release && rm -f out.c0s && poop -d 6000 ./target/release/zero-script examples/fib.0s
+cargo build --release && rm -f out.c0s && poop -d 6000 ./target/release/zero-script examples/fib_bench.0s
 ```
 
 All workspace tests should pass; fib dispatch stays below 18M (`perf_fib_dispatch_regression`).

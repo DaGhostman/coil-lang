@@ -17,3 +17,37 @@ pub struct ArchivedProgram {
 }
 
 pub use crate::opcode::Byte;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opcode::{Byte, Instruction};
+    use rkyv::rancor::Error;
+
+    #[test]
+    fn archive_round_trip_preserves_bytecode_and_constants() {
+        let program = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            constants: vec![1.5f64.to_bits(), 42],
+            bytecode: vec![
+                Byte::new(Instruction::CONST).with_const_inline(7),
+                Byte::new(Instruction::HALT),
+            ],
+        };
+        let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
+        let archived = rkyv::access::<ArchivedArchivedProgram, Error>(bytes.as_slice())
+            .expect("access");
+        assert_eq!(u32::from(archived.version), ARCHIVE_VERSION);
+        let back: ArchivedProgram =
+            rkyv::deserialize::<ArchivedProgram, Error>(archived).expect("deserialize");
+        assert!(back == program);
+        assert_eq!(back.version, program.version);
+        assert_eq!(back.constants, program.constants);
+        assert_eq!(back.bytecode.len(), program.bytecode.len());
+    }
+
+    #[test]
+    fn archive_version_constant_is_positive() {
+        assert!(ARCHIVE_VERSION >= 1);
+    }
+}

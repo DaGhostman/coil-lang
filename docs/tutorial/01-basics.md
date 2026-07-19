@@ -394,11 +394,11 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(32);
+    print "%i", fib(10);
 }
 ```
 
-Running this prints `2178309` (the 32nd Fibonacci number). Notice:
+Running this prints `55` (the 10th Fibonacci number). Notice:
 
 - Base case via early `return`.
 - Recursive calls in an expression (`fib(n - 1) + fib(n - 2)`).

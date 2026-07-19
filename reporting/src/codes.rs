@@ -196,19 +196,127 @@ impl std::fmt::Display for ErrorCode {
 mod tests {
     use super::*;
 
+    /// Exhaustive list — adding a variant without updating this match fails to compile.
+    fn all_error_codes() -> Vec<ErrorCode> {
+        use ErrorCode::*;
+        let sample = ParseError;
+        match sample {
+            ParseError
+            | UnknownValue
+            | UnknownFunction
+            | TypeMismatch
+            | InfiniteType
+            | NotAFunction
+            | TooManyArguments
+            | UndeclaredAssignment
+            | InvalidAssignment
+            | VariableRedeclaration
+            | ConstantRedeclaration
+            | UnknownType
+            | ReturnMismatch
+            | YieldOutsideAsync
+            | ResumeTypeMismatch
+            | InvalidTry
+            | InvalidCoalesce
+            | InvalidOptionalAccess
+            | ConflictingErrorType
+            | GenericTypeError
+            | DuplicateEnum
+            | DuplicateConstructor
+            | UnknownEnum
+            | UnknownVariant
+            | ConstructorArity
+            | PayloadShapeMismatch
+            | MissingField
+            | UnknownField
+            | DuplicateField
+            | NonExhaustiveMatch
+            | UnreachableArm
+            | UnknownConstructorPattern
+            | AmbiguousField
+            | FormatSpecifierMismatch
+            | FormatArityMismatch
+            | IndexOutOfBounds
+            | CannotIndex
+            | ArrayElementMismatch
+            | InvalidFfiType
+            | DeclareArity
+            | InvokeArity
+            | UnknownExpression
+            | CodegenError
+            | IoError
+            | ArchiveVersionMismatch
+            | InvalidCliFlags
+            | MissingInputFile => {}
+        }
+        vec![
+            ParseError,
+            UnknownValue,
+            UnknownFunction,
+            TypeMismatch,
+            InfiniteType,
+            NotAFunction,
+            TooManyArguments,
+            UndeclaredAssignment,
+            InvalidAssignment,
+            VariableRedeclaration,
+            ConstantRedeclaration,
+            UnknownType,
+            ReturnMismatch,
+            YieldOutsideAsync,
+            ResumeTypeMismatch,
+            InvalidTry,
+            InvalidCoalesce,
+            InvalidOptionalAccess,
+            ConflictingErrorType,
+            GenericTypeError,
+            DuplicateEnum,
+            DuplicateConstructor,
+            UnknownEnum,
+            UnknownVariant,
+            ConstructorArity,
+            PayloadShapeMismatch,
+            MissingField,
+            UnknownField,
+            DuplicateField,
+            NonExhaustiveMatch,
+            UnreachableArm,
+            UnknownConstructorPattern,
+            AmbiguousField,
+            FormatSpecifierMismatch,
+            FormatArityMismatch,
+            IndexOutOfBounds,
+            CannotIndex,
+            ArrayElementMismatch,
+            InvalidFfiType,
+            DeclareArity,
+            InvokeArity,
+            UnknownExpression,
+            CodegenError,
+            IoError,
+            ArchiveVersionMismatch,
+            InvalidCliFlags,
+            MissingInputFile,
+        ]
+    }
+
     #[test]
     fn codes_are_unique_strings() {
-        let all = [
-            ErrorCode::ParseError,
-            ErrorCode::UnknownValue,
-            ErrorCode::TypeMismatch,
-            ErrorCode::ArchiveVersionMismatch,
-            ErrorCode::MissingInputFile,
-        ];
+        let all = all_error_codes();
         let mut seen = std::collections::HashSet::new();
-        for c in all {
-            assert!(seen.insert(c.as_str()), "duplicate {}", c.as_str());
-            assert!(c.as_number() > 0);
+        for c in &all {
+            assert!(seen.insert(c.as_str()), "duplicate code string {}", c.as_str());
+            assert!(c.as_number() > 0, "{} should parse as positive", c.as_str());
+            assert_eq!(c.to_string(), c.as_str());
+            assert!(!c.description().is_empty());
+        }
+        assert_eq!(all.len(), seen.len());
+    }
+
+    #[test]
+    fn display_matches_as_str_for_every_code() {
+        for c in all_error_codes() {
+            assert_eq!(format!("{c}"), c.as_str());
         }
     }
 }

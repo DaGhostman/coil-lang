@@ -184,7 +184,7 @@ fn main() {
 
 ### `examples/fib.0s`
 
-**Demonstrates:** Recursive functions, `if`, and integer arithmetic.
+**Demonstrates:** Recursive functions, `if`, and integer arithmetic (smoke / docs).
 
 ```0s
 fn fib(int n) -> int {
@@ -195,13 +195,28 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(32);
+    print "%i", fib(10);
 }
 ```
 
 | | |
 |---|---|
 | **Run** | `cargo run -- examples/fib.0s` |
+| **Output** | `55` |
+
+For the release CPU / dispatch regression (`fib(32)` → `2178309`), use
+`examples/fib_bench.0s` instead.
+
+---
+
+### `examples/fib_bench.0s`
+
+**Demonstrates:** Same recursive Fibonacci as `fib.0s`, but with `fib(32)` for
+release `poop` / `perf_metrics` regression measurement.
+
+| | |
+|---|---|
+| **Run** | `cargo run --release -- examples/fib_bench.0s` |
 | **Output** | `2178309` |
 
 ---
@@ -1266,7 +1281,8 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `const.0s` | Basics | `42hi` |
 | `for_break.0s` | Basics | `18` |
 | `fizbuz.0s` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
-| `fib.0s` | Basics | `2178309` |
+| `fib.0s` | Basics | `55` |
+| `fib_bench.0s` | Perf | `2178309` |
 | `bench.0s` | Basics | `12\n` |
 | `call_test.0s` | Basics | `done` |
 | `gc.0s` | Basics | `Hello` |

@@ -4674,7 +4674,7 @@ impl Compiler {
                     &mut bytecode,
                     lhs,
                     rhs,
-                    "Ord",
+                    "Lt",
                     "lt",
                 ) {
                 } else {
@@ -4707,7 +4707,7 @@ impl Compiler {
                     &mut bytecode,
                     lhs,
                     rhs,
-                    "Ord",
+                    "Gt",
                     "gt",
                 ) {
                 } else {
@@ -4740,7 +4740,7 @@ impl Compiler {
                     &mut bytecode,
                     lhs,
                     rhs,
-                    "Ord",
+                    "Le",
                     "le",
                 ) {
                 } else {
@@ -4773,7 +4773,7 @@ impl Compiler {
                     &mut bytecode,
                     lhs,
                     rhs,
-                    "Ord",
+                    "Ge",
                     "ge",
                 ) {
                 } else {

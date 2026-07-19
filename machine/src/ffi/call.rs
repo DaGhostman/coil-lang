@@ -582,6 +582,7 @@ mod tests {
         let lib = match crate::ffi::resolve_library("c", None, &[]) {
             Ok(l) => l,
             Err(_) => {
+                if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: libc not reachable via dlopen"); }
                 eprintln!("skipping: libc not reachable via dlopen");
                 return;
             }
@@ -590,6 +591,7 @@ mod tests {
         let prepared = match prepare_cif_for_symbol(&sig, &lib, "strlen", &[]) {
             Ok(p) => p,
             Err(e) => {
+                if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: {e}"); }
                 eprintln!("skipping: {e}");
                 return;
             }
@@ -613,12 +615,14 @@ mod tests {
         }
         let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/libsum.so");
         if !lib_path.exists() {
+            if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: libsum.so not built"); }
             eprintln!("skipping: libsum.so not built");
             return;
         }
         let lib = match crate::ffi::resolve_library(lib_path.to_str().unwrap(), None, &[]) {
             Ok(l) => l,
             Err(e) => {
+                if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: {e}"); }
                 eprintln!("skipping: {e}");
                 return;
             }

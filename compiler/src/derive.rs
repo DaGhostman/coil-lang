@@ -176,13 +176,13 @@ fn expand_enum<'a>(
             messages.push(msg);
             continue;
         }
-        let impl_node = match trait_name {
-            "Show" => synth_show_enum(span, name, variants),
-            "Eq" => synth_eq_enum(span, name, variants),
-            "Ord" => synth_ord_enum(span, name, variants),
+        match trait_name {
+            "Show" => out.push(synth_show_enum(span, name, variants)),
+            "Eq" => out.push(synth_eq_enum(span, name, variants)),
+            // Ord is a no-method supertrait over Lt/Le/Gt/Ge (PR #14).
+            "Ord" => out.extend(synth_ord_enum(span, name, variants)),
             _ => unreachable!(),
-        };
-        out.push(impl_node);
+        }
     }
     out
 }
@@ -213,13 +213,12 @@ fn expand_class<'a>(
             messages.push(msg);
             continue;
         }
-        let impl_node = match trait_name {
-            "Show" => synth_show_class(span, name, field_names),
-            "Eq" => synth_eq_class(span, name, field_names),
-            "Ord" => synth_ord_class(span, name, field_names),
+        match trait_name {
+            "Show" => out.push(synth_show_class(span, name, field_names)),
+            "Eq" => out.push(synth_eq_class(span, name, field_names)),
+            "Ord" => out.extend(synth_ord_class(span, name, field_names)),
             _ => unreachable!(),
-        };
-        out.push(impl_node);
+        }
     }
     out
 }
@@ -658,21 +657,26 @@ fn eq_variant_arm<'a>(
 
 // ── Ord (enum) ──────────────────────────────────────────────────────────────
 
+/// Expand `derive Ord` into the four comparison instances plus an empty
+/// `Ord` marker, matching the builtin `int`/`float` layout after PR #14
+/// (`Ord` has no methods; `T: Ord` implies `Lt`/`Le`/`Gt`/`Ge`).
 fn synth_ord_enum<'a>(
     span: SimpleSpan,
     enum_name: &'a str,
     variants: &[VariantMeta<'a>],
-) -> Output<'a> {
+) -> Vec<Output<'a>> {
     // Encode tag order via nested matches: compare tags by walking variants
     // in declaration order. For equal tags, compare payloads field-wise.
-    let a = leak(format!("__ord_a_{}", enum_name));
-    let b = leak(format!("__ord_b_{}", enum_name));
-
-    let lt = ord_method(span, enum_name, variants, a, b, OrdOp::Lt);
-    let le = ord_method(span, enum_name, variants, a, b, OrdOp::Le);
-    let gt = ord_method(span, enum_name, variants, a, b, OrdOp::Gt);
-    let ge = ord_method(span, enum_name, variants, a, b, OrdOp::Ge);
-    typeclass_impl(span, "Ord", enum_name, vec![lt, le, gt, ge])
+    // Per-op param names avoid clobbering the flat `codegen_var_types` map.
+    let mut out = Vec::with_capacity(5);
+    for op in [OrdOp::Lt, OrdOp::Le, OrdOp::Gt, OrdOp::Ge] {
+        let a = leak(format!("__ord_{}_a_{}", op.name(), enum_name));
+        let b = leak(format!("__ord_{}_b_{}", op.name(), enum_name));
+        let method = ord_method(span, enum_name, variants, a, b, op);
+        out.push(typeclass_impl(span, op.trait_name(), enum_name, vec![method]));
+    }
+    out.push(typeclass_impl(span, "Ord", enum_name, vec![]));
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -693,11 +697,22 @@ impl OrdOp {
         }
     }
 
-    /// Strict tag/field inequality used in the lexicographic fold.
+    fn trait_name(self) -> &'static str {
+        match self {
+            OrdOp::Lt => "Lt",
+            OrdOp::Le => "Le",
+            OrdOp::Gt => "Gt",
+            OrdOp::Ge => "Ge",
+        }
+    }
+
+    /// Strict field inequality used in the lexicographic fold.
     ///
-    /// `Le`/`Ge` still use `<`/`>` here so equal prefixes fall through to
-    /// the `(== && rest)` arm; the inclusive case is handled by
-    /// [`eq_payload_result`] on the final empty-payload base.
+    /// AST note: `Expression::Le` / `Gt` are the strict `<` / `>` operators
+    /// (see `infer_comparison`); inclusive `<=` / `>=` are `Leq` / `Geq`.
+    /// Inclusive `Le`/`Ge` still use strict `<`/`>` here so equal prefixes
+    /// fall through to the `(== && rest)` arm; the inclusive case is handled
+    /// by [`eq_payload_result`] on the final empty-payload base.
     fn primary(self) -> for<'a> fn(SimpleSpan, Output<'a>, Output<'a>) -> Output<'a> {
         match self {
             OrdOp::Lt | OrdOp::Le => |s, l, r| at(s, Expression::Le(l, r)),
@@ -928,25 +943,23 @@ fn synth_eq_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Ou
     typeclass_impl(span, "Eq", name, vec![eq_m, ne_m])
 }
 
-fn synth_ord_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Output<'a> {
-    let a = leak(format!("__ord_a_{}", name));
-    let b = leak(format!("__ord_b_{}", name));
-    let mk = |op: OrdOp| {
+fn synth_ord_class<'a>(span: SimpleSpan, name: &'a str, fields: &[&'a str]) -> Vec<Output<'a>> {
+    let mut out = Vec::with_capacity(5);
+    for op in [OrdOp::Lt, OrdOp::Le, OrdOp::Gt, OrdOp::Ge] {
+        let a = leak(format!("__ord_{}_a_{}", op.name(), name));
+        let b = leak(format!("__ord_{}_b_{}", op.name(), name));
         let body = class_ord_body(span, a, b, fields, op);
-        method_fn(
+        let method = method_fn(
             span,
             op.name(),
             vec![arg(span, name, a), arg(span, name, b)],
             "bool",
             block_return(span, body),
-        )
-    };
-    typeclass_impl(
-        span,
-        "Ord",
-        name,
-        vec![mk(OrdOp::Lt), mk(OrdOp::Le), mk(OrdOp::Gt), mk(OrdOp::Ge)],
-    )
+        );
+        out.push(typeclass_impl(span, op.trait_name(), name, vec![method]));
+    }
+    out.push(typeclass_impl(span, "Ord", name, vec![]));
+    out
 }
 
 fn class_ord_body<'a>(

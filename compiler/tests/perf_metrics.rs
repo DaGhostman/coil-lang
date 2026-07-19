@@ -67,7 +67,7 @@ fn perf_match_sum_emits_jump_if_match() {
 
 #[test]
 fn perf_fib_dispatch_regression() {
-    let (bc, pool) = compile("examples/fib.0s");
+    let (bc, pool) = compile("examples/fib_bench.0s");
     let dispatches = run_dispatch(bc, pool);
     assert!(
         dispatches < 18_000_000,

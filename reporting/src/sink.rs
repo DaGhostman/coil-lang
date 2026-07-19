@@ -42,3 +42,44 @@ pub fn create_sink(
         ReportFormat::Lsp => Box::new(LspSink::new(sources, writer)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codes::ErrorCode;
+    use crate::config::{ReportConfig, ReportFormat};
+    use crate::diagnostic::Diagnostic;
+    use crate::source::SourceMap;
+    use std::io::Cursor;
+
+    #[test]
+    fn create_sink_builds_pretty_sarif_and_lsp() {
+        for format in [ReportFormat::Pretty, ReportFormat::Sarif, ReportFormat::Lsp] {
+            let config = ReportConfig { format };
+            let mut sink = create_sink(&config, SourceMap::new(), Box::new(Cursor::new(Vec::new())));
+            assert!(!sink.had_errors());
+            sink.emit(Diagnostic::error("boom").with_code(ErrorCode::ParseError));
+            assert!(sink.had_errors());
+            sink.finish().expect("finish");
+        }
+    }
+
+    #[test]
+    fn emit_all_forwards_every_diagnostic() {
+        let config = ReportConfig {
+            format: ReportFormat::Lsp,
+        };
+        let buf = Cursor::new(Vec::new());
+        let mut sink = create_sink(&config, SourceMap::new(), Box::new(buf));
+        emit_all(
+            &mut *sink,
+            [
+                Diagnostic::warning("one"),
+                Diagnostic::error("two").with_code(ErrorCode::TypeMismatch),
+            ],
+        );
+        assert!(sink.had_errors());
+        sink.finish().expect("finish");
+    }
+}
+

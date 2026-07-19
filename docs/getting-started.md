@@ -44,7 +44,9 @@ A successful build produces the `zero-script` binary (via `src/main.rs`) plus th
 
 ## Run your first program
 
-The canonical starter example computes the 32nd Fibonacci number recursively:
+The canonical starter example computes the 10th Fibonacci number recursively
+(fast enough for debug builds; the release CPU bench uses
+`examples/fib_bench.0s` with `fib(32)`):
 
 ```0s
 fn fib(int n) -> int {
@@ -56,7 +58,7 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(32);
+    print "%i", fib(10);
 }
 ```
 
@@ -66,7 +68,7 @@ Run it:
 cargo run -- examples/fib.0s
 ```
 
-**Expected output:** `2178309`
+**Expected output:** `55`
 
 The default CLI invocation compiles `examples/fib.0s` to bytecode, serializes it into `out.c0s` in the current directory (if needed), then loads and executes it on the VM.
 
