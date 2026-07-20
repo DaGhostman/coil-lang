@@ -459,7 +459,11 @@ impl Object {
                 }
             }
             Self::Library(_) => {}
-            // Tuple/array/coroutine saved stacks are traced in `Machine::gc_collect`.
+            // Array/Tuple store raw `Value` element pointers (not `Member`).
+            // Transitive marking walks those addresses in
+            // `Machine::gc_collect`'s grey-stack loop via
+            // `mark_aggregate_elements`. Coroutine `saved_stack` /
+            // `yield_from` are rooted in the same place.
             Self::Tuple(_) => {}
             Self::Array(_) => {}
             Self::Coroutine(_) => {}
