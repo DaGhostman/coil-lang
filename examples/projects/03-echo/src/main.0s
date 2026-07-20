@@ -1,0 +1,89 @@
+// 03-echo — single-process TCP echo (listen + connect + exchange).
+//
+// Only one file-module `use` resolves per entry, so server/client live here;
+// framing helpers come from `protocol.0s`. Fixed port (TCP has no local_port).
+// Array index assign is unreliable — buffers are built with push / one-byte reads.
+//
+// Expected output: ok
+
+use io::*;
+use io::net::tcp::*;
+use protocol::*;
+
+async fn greeting_bytes() {
+    yield 65;
+    yield 66;
+    return 0;
+}
+
+fn run_echo() {
+    let port = 41235;
+    let listener = listen("127.0.0.1", port)?;
+    let client = connect("127.0.0.1", port)?;
+    let server = accept_wait(listener)?;
+
+    let h = greeting_bytes();
+    let ya = resume h;
+    let yb = resume h;
+    let _done = resume h;
+    let a: byte = 65;
+    let b: byte = 66;
+    // Sanity: coroutine yielded 'A'/'B' (ints); we still send the byte literals.
+    if ya != 65 {
+        close(client)?;
+        close(server)?;
+        close(listener)?;
+        return "bad-coro";
+    }
+    if yb != 66 {
+        close(client)?;
+        close(server)?;
+        close(listener)?;
+        return "bad-coro";
+    }
+
+    let body: [byte] = [a];
+    push(body, b);
+    let frame = encode_frame(body);
+    write_all(client, frame)?;
+
+    let s0: [byte] = [0];
+    let s1: [byte] = [0];
+    let s2: [byte] = [0];
+    read_exact(server, s0)?;
+    read_exact(server, s1)?;
+    read_exact(server, s2)?;
+
+    let reply: [byte] = [s0[0]];
+    push(reply, s1[0]);
+    push(reply, s2[0]);
+    write_all(server, reply)?;
+
+    let c0: [byte] = [0];
+    let c1: [byte] = [0];
+    let c2: [byte] = [0];
+    read_exact(client, c0)?;
+    read_exact(client, c1)?;
+    read_exact(client, c2)?;
+
+    close(client)?;
+    close(server)?;
+    close(listener)?;
+
+    let back: [byte] = [c0[0]];
+    push(back, c1[0]);
+    push(back, c2[0]);
+    let expect: [byte] = [a];
+    push(expect, b);
+    if payload_eq(back, expect) == 1 {
+        return "ok";
+    }
+    return "bad";
+}
+
+fn main() {
+    print "%s", match run_echo() {
+        Result::Ok(s) => s,
+        Result::Err(_) => "err",
+    };
+}

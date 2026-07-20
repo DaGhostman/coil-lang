@@ -1893,6 +1893,13 @@ impl Compiler {
     }
 
     /// Emit `HostInvoke` for a virtual `io` free function.
+    ///
+    /// Nested IO calls (e.g. `read_to_end(stdin())`) also write directly to
+    /// `self.bytecode` via this helper. Emit the native-id `CONST` **before**
+    /// compiling arguments so the runtime stack is `[id, arg0, …]` — the order
+    /// `HostInvoke` expects. Compiling args into a side buffer first left nested
+    /// invokes *above* the id and `MakeTuple` packed the wrong values (piped
+    /// stdin then looked empty).
     fn emit_io_host_invoke(&mut self, kind: crate::typechecking::IoBuiltin, args: &[Output]) {
         let name = kind.native_name();
         let Some(native_id) = self.native_id(name) else {
@@ -1908,14 +1915,15 @@ impl Compiler {
             self.messages.push(message);
             return;
         };
-        let mut arg_bc = Vec::new();
-        for arg in args {
-            arg_bc.append(&mut self.do_compile(arg));
-        }
         let arity = args.len();
         self.bytecode
             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-        self.bytecode.append(&mut arg_bc);
+        for arg in args {
+            // Nested IO HostInvoke writes to `self.bytecode`; also fold any
+            // bytes returned in the local vec (non-IO subexpressions).
+            let mut arg_bc = self.do_compile(arg);
+            self.bytecode.append(&mut arg_bc);
+        }
         self.bytecode
             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
         self.bytecode.push(
@@ -4482,18 +4490,21 @@ impl Compiler {
                             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
                         self.emit_result_unwrap_or_panic();
                     } else if let Some(&native_id) = self.native.get(&n) {
-                        let mut arg_bc = Vec::new();
+                        // Same stack order as `emit_io_host_invoke`: id first,
+                        // then args (nested HostInvoke may write to `self.bytecode`).
                         let arity = if let Some(items) = args {
-                            for arg in items {
-                                arg_bc.append(&mut self.do_compile(arg));
-                            }
                             items.len()
                         } else {
                             0
                         };
                         self.bytecode
                             .push(Byte::new(Instruction::CONST).with_value_u32(native_id as u32));
-                        self.bytecode.append(&mut arg_bc);
+                        if let Some(items) = args {
+                            for arg in items {
+                                let mut arg_bc = self.do_compile(arg);
+                                self.bytecode.append(&mut arg_bc);
+                            }
+                        }
                         self.bytecode
                             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
                         self.bytecode.push(

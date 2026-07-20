@@ -1,0 +1,12 @@
+// Pure unit test: protocol encode/decode (no sockets).
+use protocol::*;
+
+fn main() {
+    let body: [byte] = [65, 66];
+    let frame = encode_frame(body);
+    assert(frame_len(frame) == 2, "len")?;
+    assert(payload_eq(frame, body) == 1, "roundtrip")?;
+    let other: [byte] = [65, 67];
+    assert(payload_eq(frame, other) == 0, "mismatch")?;
+    print "ok";
+}

@@ -1,0 +1,18 @@
+// Pure unit test: parse_line byte commands (no stdin / REPL).
+use world::*;
+
+fn main() {
+    let look: [byte] = [108, 111, 111, 107];
+    let c = parse_line(look);
+    assert(cmd_kind(c) == 0, "look")?;
+
+    let go_n: [byte] = [103, 111, 32, 110, 111, 114, 116, 104];
+    c = parse_line(go_n);
+    assert(cmd_kind(c) == 1, "go")?;
+    assert(cmd_dir(c) == 0, "north")?;
+
+    let bad: [byte] = [120, 121, 122];
+    c = parse_line(bad);
+    assert(cmd_kind(c) == 8, "unknown")?;
+    print "ok";
+}

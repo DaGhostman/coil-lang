@@ -1,0 +1,14 @@
+// Unit test: advancing a task moves Todo -> Doing -> Done.
+use board::*;
+
+fn main() {
+    let b = empty_board();
+    b = add_task(b, "ship");
+    assert(b[1].status == 0, "starts Todo")?;
+    advance_task(b, 1);
+    assert(b[1].status == 1, "now Doing")?;
+    advance_task(b, 1);
+    assert(b[1].status == 2, "now Done")?;
+    assert(count_done(b) == 1, "one done")?;
+    print "ok";
+}

@@ -55,7 +55,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
-Browse runnable demos in [Examples](examples.md).
+Browse runnable demos in [Examples](examples.md). Multi-file showcase apps (todo board, text adventure, TCP echo) live under [`examples/projects/`](../examples/projects/README.md).
 
 ## Documentation
 
@@ -100,6 +100,7 @@ Look up syntax and semantics when you already know what you need.
 | Document | Contents |
 |----------|----------|
 | [Examples](examples.md) | Every file in `examples/`, grouped by topic, with expected output |
+| [Showcase projects](../examples/projects/README.md) | Multi-file apps (`01-todo`, `02-adventure`, `03-echo`) + co-located tests |
 
 ## Repository layout
 
@@ -110,6 +111,7 @@ zero-script/
 ├── compiler/        # HM typechecker, codegen, pipeline, peephole
 ├── machine/         # VM, heap/GC, FFI (libffi)
 ├── examples/        # Runnable .0s demos (see examples.md)
+│   └── projects/    # Showcase multi-file apps + co-located tests
 ├── docs/            # This documentation
 ├── src/main.rs      # CLI: default build+run, compile, run, test
 └── zero.toml.example  # Example project manifest

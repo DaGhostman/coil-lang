@@ -1,0 +1,12 @@
+// Unit test: adding tasks grows the board.
+use board::*;
+
+fn main() {
+    let b = empty_board();
+    assert(board_len(b) == 0, "empty")?;
+    b = add_task(b, "alpha");
+    b = add_task(b, "beta");
+    assert(board_len(b) == 2, "two tasks")?;
+    assert(count_done(b) == 0, "none done yet")?;
+    print "ok";
+}

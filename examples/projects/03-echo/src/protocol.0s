@@ -1,0 +1,102 @@
+// Length-prefixed frame helpers for the echo demo.
+// Each fn is self-contained (sibling calls do not resolve in dependency modules).
+// Frame layout: [nbytes:byte][payload…]
+
+fn encode_frame([byte] body) -> [byte] {
+    let n = len(body);
+    let nb: byte = 0;
+    if n == 1 {
+        nb = 1;
+    }
+    if n == 2 {
+        nb = 2;
+    }
+    if n == 3 {
+        nb = 3;
+    }
+    if n == 4 {
+        nb = 4;
+    }
+    if n >= 5 {
+        nb = 5;
+    }
+    let frame: [byte] = [nb];
+    let i = 0;
+    while i < n {
+        if i < 5 {
+            push(frame, body[i]);
+        }
+        i = i + 1;
+    }
+    return frame;
+}
+
+fn frame_len([byte] frame) -> int {
+    if len(frame) < 1 {
+        return 0;
+    }
+    let b = frame[0];
+    let one: byte = 1;
+    let two: byte = 2;
+    let three: byte = 3;
+    let four: byte = 4;
+    let five: byte = 5;
+    if b == one {
+        return 1;
+    }
+    if b == two {
+        return 2;
+    }
+    if b == three {
+        return 3;
+    }
+    if b == four {
+        return 4;
+    }
+    if b == five {
+        return 5;
+    }
+    return 0;
+}
+
+// Inlined frame_len — sibling calls are unresolved in non-entry modules.
+fn payload_eq([byte] frame, [byte] expect) -> int {
+    let n = 0;
+    if len(frame) >= 1 {
+        let b = frame[0];
+        let one: byte = 1;
+        let two: byte = 2;
+        let three: byte = 3;
+        let four: byte = 4;
+        let five: byte = 5;
+        if b == one {
+            n = 1;
+        }
+        if b == two {
+            n = 2;
+        }
+        if b == three {
+            n = 3;
+        }
+        if b == four {
+            n = 4;
+        }
+        if b == five {
+            n = 5;
+        }
+    }
+    if n != len(expect) {
+        return 0;
+    }
+    if len(frame) < n + 1 {
+        return 0;
+    }
+    let i = 0;
+    while i < n {
+        if frame[i + 1] != expect[i] {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}

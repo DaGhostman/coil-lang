@@ -1278,6 +1278,46 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+## Showcase projects
+
+Larger multi-file apps live under [`examples/projects/`](../examples/projects/README.md).
+Each project has its own `zero.toml`, co-located `tests/`, and `NOTES.md`.
+
+| Project | Focus | How to run |
+|---------|--------|------------|
+| `01-todo` | Classes, arrays, modules | `cargo run --release -- examples/projects/01-todo/src/main.0s` |
+| `02-adventure` | Interactive stdin REPL + save/load | Play interactively, or pipe a transcript under `timeout` (see below) |
+| `03-echo` | TCP + coroutines + protocol module | `timeout 10s cargo run --release -- examples/projects/03-echo/src/main.0s` |
+
+### Playing `02-adventure`
+
+```bash
+cargo run --release -- examples/projects/02-adventure/src/main.0s
+```
+
+Commands at the `>` prompt: `look`, `go north|south|east|west`, `take` / `take key`,
+`inventory`, `save`, `load`, `help`, `quit`.
+
+CI / non-interactive (always wrap with `timeout` so a hung REPL cannot block):
+
+```bash
+printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
+  timeout 10s cargo run --release -- examples/projects/02-adventure/src/main.0s
+```
+
+### Per-project tests
+
+`zero-script test` only scans `./tests` relative to CWD:
+
+```bash
+cd examples/projects/01-todo
+cargo run --release --manifest-path ../../../Cargo.toml -- test
+```
+
+Repeat for `02-adventure` and `03-echo`. See [`examples/projects/README.md`](../examples/projects/README.md).
+
+---
+
 ## Quick reference table
 
 | File | Category | Output (if known) |
