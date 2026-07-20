@@ -375,6 +375,49 @@ roots = ["./src"]
     assert_eq!(output, "6");
 }
 
+/// P2a: two glob imports must both resolve after discovery scans every dep.
+#[test]
+fn two_glob_imports_both_resolve() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.0s",
+            "use a::*;\nuse b::*;\nfn main() { from_a(); from_b(); }\n",
+        ),
+        ("src/a.0s", "fn from_a() { print \"%i\", 1; }\n"),
+        ("src/b.0s", "fn from_b() { print \"%i\", 2; }\n"),
+    ];
+    let (root, entry) = build_project("two_glob_imports", manifest, files, "src/main.0s");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "12");
+}
+
+/// P2b: bare sibling calls inside a non-entry module resolve to `ns::name`.
+#[test]
+fn sibling_bare_call_in_namespaced_module() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        (
+            "src/main.0s",
+            "use util::*;\nfn main() { print \"%i\", public_fn(); }\n",
+        ),
+        (
+            "src/util.0s",
+            "fn helper() -> int { return 7; }\n\
+             fn public_fn() -> int { return helper(); }\n",
+        ),
+    ];
+    let (root, entry) = build_project("sibling_bare_call", manifest, files, "src/main.0s");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "7");
+}
+
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CwdLockGuard(std::sync::MutexGuard<'static, ()>);

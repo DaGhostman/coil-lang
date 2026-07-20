@@ -27,7 +27,6 @@
 - `examples/fib.0s` is the smoke Fibonacci (`fib(10)` → `55`); `examples/fib_bench.0s` (`fib(32)` → `2178309`) is the primary performance regression benchmark.
 - CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
 - `zero-script test [path] [--fail-fast]` discovers `**/*.0s` under an optional directory (default `./tests`). Top-level `test("desc") { … }` cases (string literal name, Result-mode body) replace per-file `main`; the harness runs each case in an isolated VM. Legacy files with only `fn main()` still count as one case.
-- `zero-script test [path] [--fail-fast]` discovers `**/*.0s` under an optional directory (default `./tests`). Top-level `test("desc") { … }` cases (string literal name, Result-mode body) replace per-file `main`; the harness runs each case in an isolated VM. Legacy files with only `fn main()` still count as one case.
 
 ## PHASE 14 - HINDLEY–MILNER TYPECHECKER (COMPLETED)
 

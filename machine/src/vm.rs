@@ -144,10 +144,12 @@ pub struct Machine<const S: usize> {
     program_constants: Vec<u64>,
     /// When > 0, `RETURN` captures into `nested_return` instead of unwinding to caller.
     nested_depth: u32,
-    /// Frame stack length at the start of the active [`call_function`] —
-    /// only a `RETURN` that pops back to this depth should capture
-    /// `nested_return` (inner `CALL`s must still unwind normally).
-    nested_frame_depth: usize,
+    /// Stack of frame-stack lengths at each active [`call_function`] entry.
+    /// Only a `RETURN` that pops back to `last()` should capture `nested_return`
+    /// (inner `CALL`s must still unwind normally). A stack (not a scalar) is
+    /// required so nested `call_function` reentrancy (FFI callbacks) does not
+    /// overwrite the outer depth.
+    nested_frame_depths: Vec<usize>,
     nested_return: Option<Value>,
     /// Set when `execute` pauses before a native FFI call that may reenter the VM.
     pending_ffi: Option<PendingFfiInvoke>,
@@ -176,7 +178,7 @@ impl<const S: usize> Default for Machine<S> {
             program_code: Vec::new(),
             program_constants: Vec::new(),
             nested_depth: 0,
-            nested_frame_depth: 0,
+            nested_frame_depths: Vec::new(),
             nested_return: None,
             pending_ffi: None,
             panicked: false,
@@ -412,9 +414,11 @@ impl<const S: usize> Machine<S> {
             current = reference.get_next();
         }
         for root in &root_objects {
+            Self::mark_aggregate_elements(heap, root, &mut gray);
             root.mark_references(&mut gray);
         }
         while let Some(obj) = gray.pop() {
+            Self::mark_aggregate_elements(heap, &obj, &mut gray);
             obj.mark_references(&mut gray);
         }
 
@@ -422,6 +426,35 @@ impl<const S: usize> Machine<S> {
         unsafe { heap.sweep() };
 
         *alloc_counter = 0;
+    }
+
+    /// Trace heap pointers stored as raw `Value`s inside arrays/tuples.
+    /// `Object::mark_references` cannot do this alone — those aggregates
+    /// keep `Vec<Value>`, not `Member::Object`.
+    fn mark_aggregate_elements(heap: &Heap, obj: &Object, gray: &mut Vec<Object>) {
+        match obj {
+            Object::Array(gc) => {
+                for v in &gc.as_ref().elements {
+                    Self::mark_value_if_heap(heap, *v, gray);
+                }
+            }
+            Object::Tuple(gc) => {
+                for v in &gc.as_ref().elements {
+                    Self::mark_value_if_heap(heap, *v, gray);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_value_if_heap(heap: &Heap, v: Value, gray: &mut Vec<Object>) {
+        let addr = v.raw() as u64;
+        if addr == 0 || !heap.contains_addr(addr as *mut u8) {
+            return;
+        }
+        if let Some(child) = Self::find_object_by_addr(heap, addr) {
+            child.mark(gray);
+        }
     }
 }
 
@@ -913,7 +946,7 @@ impl<const S: usize> Machine<S> {
         });
         // Capture only when RETURN reaches this frame depth (the
         // call_function entry), not when inner CALLs return.
-        self.nested_frame_depth = self.frames.len();
+        self.nested_frame_depths.push(self.frames.len());
         let code: &[Byte] = unsafe {
             std::slice::from_raw_parts(self.program_code.as_ptr().cast(), self.program_code.len())
         };
@@ -934,9 +967,7 @@ impl<const S: usize> Machine<S> {
         let _ = self.frames.pop();
         self.stack.seek(saved_sp);
         self.nested_depth -= 1;
-        if self.nested_depth == 0 {
-            self.nested_frame_depth = 0;
-        }
+        let _ = self.nested_frame_depths.pop();
         self.nested_return.take().unwrap_or_default()
     }
 
@@ -1227,8 +1258,10 @@ impl<const S: usize> Machine<S> {
                     let s = unsafe { &*ptr };
                     if let Some(out) = self.output.as_mut() {
                         let _ = write!(out, "{}", s);
+                        let _ = out.flush();
                     } else {
                         print!("{}", s);
+                        let _ = io::stdout().flush();
                     }
                 }
                 Instruction::JMP => {
@@ -1274,7 +1307,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
-                    if self.nested_depth > 0 && self.frames.len() == self.nested_frame_depth {
+                    let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+                    if self.nested_depth > 0 && self.frames.len() == nested_target {
                         self.nested_return = Some(ret_val);
                         return false;
                     }
@@ -1997,7 +2031,15 @@ impl<const S: usize> Machine<S> {
                                     Member::Object(o) => Value::from(o.addr()),
                                 };
                                 self.stack.push(value);
+                            } else {
+                                // OOB field index — keep stack balanced.
+                                self.stack.push(Value::default());
                             }
+                        } else {
+                            // Non-enum receiver (e.g. class Instance misrouted
+                            // through LoadField). Push a sentinel so the pop
+                            // above does not leave the stack short.
+                            self.stack.push(Value::default());
                         }
                     }
                 }
@@ -2031,12 +2073,18 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::StorePop => {
-                    // Pop TOS into `sp + slot`; trim temporaries above that slot
-                    // so fused ops (BinSlotSlot, etc.) don't leave stale stack cells.
+                    // Pop TOS into `sp + slot`. Extend the cursor when the slot
+                    // is newly allocated, but NEVER shrink past higher locals —
+                    // locals and the operand stack share memory (Phase 18E).
+                    // Unconditional `seek(slot + 1)` orphans later slots and
+                    // makes early-loop flags appear not to stick.
                     let slot = sp + opcode.operand_u32() as usize;
                     let val = self.stack.pop();
                     self.stack[slot] = val;
-                    self.stack.seek(slot + 1);
+                    let tell = self.stack.tell();
+                    if tell < slot + 1 {
+                        self.stack.seek(slot + 1);
+                    }
                 }
                 Instruction::MakeCoro => {
                     let (arity, target) = opcode.call_parts();
@@ -2956,25 +3004,24 @@ mod tests {
     }
 
     #[test]
-    fn load_field_out_of_bounds_silent_noop() {
+    fn load_field_out_of_bounds_pushes_default() {
         let mut vm = Machine::<4>::default();
         vm.run(&[
             // Build enum (tag=0, arity=2) with payload [42, 99].
             const_int(99),
             const_int(42),
             make_enum(0, 2),
-            // LoadField(5): field_index 5 is past arity=2. The
-            // VM should consume the enum and push nothing.
+            // LoadField(5): field_index 5 is past arity=2.
+            // Pop enum, push Value::default() so Access stays balanced.
             load_field(5),
             Byte::new(Instruction::HALT),
         ]);
-        // After LoadField(5), the stack should be empty
-        // (enum popped, no field pushed).
         assert_eq!(
             vm.tell(),
-            0,
-            "out-of-bounds LoadField should leave the stack empty"
+            1,
+            "out-of-bounds LoadField should leave a default value"
         );
+        assert_eq!(vm.pop(), Value::default());
     }
 
     /// `BinSlotSlot` applies an int binary op between two locals.
@@ -3413,6 +3460,170 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 10);
     }
 
+    /// P0: reassigning a low slot must not truncate the cursor past
+    /// higher locals (shared operand-stack / locals area).
+    #[test]
+    fn store_pop_preserves_higher_locals_and_cursor() {
+        let mut vm = Machine::<8>::default();
+        vm.run(&[
+            const_int(10),
+            store_pop(0),
+            const_int(20),
+            store_pop(1),
+            const_int(30),
+            store_pop(2),
+            // Reassign slot 0 while slots 1 and 2 are live.
+            const_int(99),
+            store_pop(0),
+            load(0),
+            load(1),
+            load(2),
+            Byte::new(Instruction::HALT),
+        ]);
+        assert_eq!(vm.pop().as_int(), 30, "slot 2 must survive StorePop 0");
+        assert_eq!(vm.pop().as_int(), 20, "slot 1 must survive StorePop 0");
+        assert_eq!(vm.pop().as_int(), 99, "slot 0 must hold the new value");
+    }
+
+    /// P1: heap objects stored in an array survive GC when the array is rooted.
+    #[test]
+    fn array_elements_survive_gc() {
+        let mut vm = Machine::<64>::default();
+        // STRING "hi" → MakeArray(1) → store slot 0 → allocate 128 enums →
+        // load slot 0 → Index 0 → PRINT → HALT
+        let mut code = Vec::new();
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(2));
+        for ch in "hi".chars() {
+            code.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        code.push(Byte::new(Instruction::MakeArray).with_operand_u32(1));
+        code.push(store_pop(0));
+        for _ in 0..128 {
+            code.push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+            code.push(Byte::new(Instruction::POP));
+        }
+        code.push(load(0));
+        code.push(const_int(0));
+        code.push(Byte::new(Instruction::Index));
+        code.push(Byte::new(Instruction::PRINT));
+        code.push(Byte::new(Instruction::HALT));
+
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        vm.run(&code);
+        let _ = vm.restore_output();
+        let bytes = std::rc::Rc::try_unwrap(buf)
+            .expect("VM still holds buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert_eq!(s, "hi", "array string element must survive GC pressure");
+    }
+
+    /// P1 sibling: heap objects stored in a tuple survive GC when the
+    /// tuple is rooted. Arrays were covered above; tuples share the
+    /// same `mark_aggregate_elements` path and must not regress alone.
+    #[test]
+    fn tuple_elements_survive_gc() {
+        let mut vm = Machine::<64>::default();
+        // STRING "ok" → MakeTuple(1) → store slot 0 → allocate 128 enums →
+        // load slot 0 → Index 0 → PRINT → HALT
+        let mut code = Vec::new();
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(2));
+        for ch in "ok".chars() {
+            code.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        code.push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
+        code.push(store_pop(0));
+        for _ in 0..128 {
+            code.push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+            code.push(Byte::new(Instruction::POP));
+        }
+        code.push(load(0));
+        code.push(const_int(0));
+        code.push(Byte::new(Instruction::Index));
+        code.push(Byte::new(Instruction::PRINT));
+        code.push(Byte::new(Instruction::HALT));
+
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        vm.run(&code);
+        let _ = vm.restore_output();
+        let bytes = std::rc::Rc::try_unwrap(buf)
+            .expect("VM still holds buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert_eq!(s, "ok", "tuple string element must survive GC pressure");
+    }
+
+    /// P5: PRINT flushes so redirected sinks observe output before HALT.
+    /// HALT also flushes, so a single PRINT+HALT program must flush ≥2 times
+    /// (once from PRINT, once from HALT). Pre-fix PRINT skipped flush → 1.
+    #[test]
+    fn print_flushes_output_sink() {
+        use std::sync::{Arc, Mutex};
+        struct FlushCountingWriter {
+            buf: Arc<Mutex<Vec<u8>>>,
+            flushes: Arc<Mutex<usize>>,
+        }
+        impl std::io::Write for FlushCountingWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.buf.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                *self.flushes.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let flushes = Arc::new(Mutex::new(0usize));
+        let mut vm = Machine::<16>::default();
+        vm.with_output(FlushCountingWriter {
+            buf: Arc::clone(&buf),
+            flushes: Arc::clone(&flushes),
+        });
+
+        let mut bytecode = Vec::new();
+        bytecode.push(Byte::new(Instruction::STRING).with_operand_u32(3));
+        for ch in "xyz".chars() {
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        bytecode.push(Byte::new(Instruction::PRINT));
+        bytecode.push(Byte::new(Instruction::HALT));
+        vm.run(&bytecode);
+        let _ = vm.restore_output();
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "xyz");
+        assert!(
+            *flushes.lock().unwrap() >= 2,
+            "PRINT+HALT must each flush; got {} flush(es)",
+            *flushes.lock().unwrap()
+        );
+    }
+
     /// Host native dispatch via explicit signature registry.
     #[test]
     fn host_invoke_dispatches_rust_closure() {
@@ -3520,7 +3731,7 @@ mod tests {
     }
 
     /// Inner `CALL`/`RETURN` must unwind normally under `call_function`.
-    /// Without `nested_frame_depth`, the inner RETURN would capture early
+    /// Without `nested_frame_depths`, the inner RETURN would capture early
     /// and return 7 instead of continuing the outer body (7+1=8).
     #[test]
     fn call_function_captures_only_outer_return_not_inner_call() {
@@ -3544,6 +3755,68 @@ mod tests {
         );
         let out = vm.call_function(0, &[]);
         assert_eq!(out.as_int(), 8);
+    }
+
+    /// Nested `call_function` (FFI callback reentrancy) must not clobber the
+    /// outer frame-depth target — outer RETURN still captures a non-default value.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn nested_call_function_preserves_outer_return() {
+        use crate::ffi::FfiSignature;
+        use crate::memory::FfiType;
+
+        let lib_name = crate::ffi::platform_shared_lib_filename("sum");
+        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples")
+            .join(&lib_name);
+        if !lib_path.exists() {
+            if std::env::var_os("CI").is_some() {
+                panic!("FFI soft-skip forbidden in CI: {lib_name} not built");
+            }
+            eprintln!("skipping: {lib_name} not built");
+            return;
+        }
+
+        let mut vm = Machine::<512>::default();
+        let lib_val = vm
+            .load_userland_library(lib_path.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("load {lib_name}: {e}"));
+        let sig = FfiSignature::from_parts(
+            "apply_cb",
+            vec![FfiType::Callback(0), FfiType::Int],
+            FfiType::Int,
+        )
+        .unwrap();
+        let fn_id = vm
+            .register_ffi_function(lib_val, sig)
+            .unwrap_or_else(|e| panic!("declare apply_cb: {e}"));
+
+        // 0: identity callback — LOAD 0; RETURN
+        // 2: outer — FfiInvoke apply_cb(callback@0, 21); POP Result; CONST 99; RETURN
+        install_program(
+            &mut vm,
+            &[
+                load(0),
+                Byte::new(Instruction::RETURN),
+                // outer entry (offset 2); args: lib, fn_id
+                load(0),
+                load(1),
+                Byte::new(Instruction::CodePtr).with_operand_u32(0),
+                const_int(21),
+                Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+                Byte::new(Instruction::FfiInvoke).with_operand_u32(2),
+                Byte::new(Instruction::POP),
+                const_int(99),
+                Byte::new(Instruction::RETURN),
+            ],
+        );
+
+        let out = vm.call_function(2, &[lib_val, Value::from(fn_id as i64)]);
+        assert_eq!(
+            out.as_int(),
+            99,
+            "outer call_function must capture its RETURN after nested callback"
+        );
     }
 
     /// C → zero-script callback via `apply_cb` in libsum.so.
@@ -4148,9 +4421,10 @@ mod tests {
     }
 
     #[test]
-    fn load_field_on_non_enum_leaves_stack_empty() {
+    fn load_field_on_non_enum_pushes_default() {
         let mut vm = Machine::<4>::default();
         vm.run(&[const_int(9), load_field(0), Byte::new(Instruction::HALT)]);
-        assert_eq!(vm.tell(), 0);
+        assert_eq!(vm.tell(), 1);
+        assert_eq!(vm.pop(), Value::default());
     }
 }
