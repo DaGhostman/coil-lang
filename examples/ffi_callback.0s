@@ -10,15 +10,15 @@ fn doubler(int x) -> int {
 fn main() {
     let lib = match dload("sum") {
         Result::Ok(h) => h,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let id = match declare(lib, "apply_cb", (Callback, Int), Int) {
         Result::Ok(i) => i,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let n = match invoke(lib, id, (doubler, 21)) {
         Result::Ok(v) => v,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     print "%i", n;
 }

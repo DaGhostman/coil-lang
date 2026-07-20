@@ -29,16 +29,51 @@ pub const BUILTIN_IO_ERROR_VARIANTS: &[&str] = &[
     "Other",
 ];
 
-/// True when `name` is a reserved built-in enum (`Option`, `Result`, `IoError`, or `FFIType`).
+/// Built-in `ErrorKind` enum name (virtual `ffi` module).
+pub const BUILTIN_FFI_ERROR_KIND_ENUM: &str = "ErrorKind";
+
+/// `ErrorKind` variants in tag order (userland FFI failures).
+pub const BUILTIN_FFI_ERROR_KIND_VARIANTS: &[&str] = &[
+    "LibraryNotFound",
+    "SymbolNotFound",
+    "ArityMismatch",
+    "Libffi",
+    "InvalidSignature",
+    "InvalidHandle",
+    "Unsupported",
+    "Other",
+];
+
+/// Built-in `Error` enum name (virtual `ffi` module).
+///
+/// Single record variant `Error { kind: ErrorKind, message: string }` so
+/// callers can check `e.kind` and read `e.message` without string matching.
+pub const BUILTIN_FFI_ERROR_ENUM: &str = "Error";
+
+/// Sole variant of [`BUILTIN_FFI_ERROR_ENUM`].
+pub const BUILTIN_FFI_ERROR_VARIANT: &str = "Error";
+
+/// True when `name` is a reserved built-in enum (`Option`, `Result`, `IoError`,
+/// `Error` / `ErrorKind`, or `FFIType`).
 pub fn is_builtin_enum(name: &str) -> bool {
     is_builtin_option_enum(name)
         || is_builtin_result_enum(name)
         || is_builtin_io_error_enum(name)
+        || is_builtin_ffi_error_enum(name)
+        || is_builtin_ffi_error_kind_enum(name)
         || is_builtin_ffi_enum(name)
 }
 
 pub fn is_builtin_io_error_enum(name: &str) -> bool {
     name == BUILTIN_IO_ERROR_ENUM
+}
+
+pub fn is_builtin_ffi_error_enum(name: &str) -> bool {
+    name == BUILTIN_FFI_ERROR_ENUM
+}
+
+pub fn is_builtin_ffi_error_kind_enum(name: &str) -> bool {
+    name == BUILTIN_FFI_ERROR_KIND_ENUM
 }
 
 pub fn is_builtin_option_enum(name: &str) -> bool {

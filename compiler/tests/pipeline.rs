@@ -988,13 +988,16 @@ fn main() {
     let r = dload("this_library_definitely_does_not_exist_xyzzy");
     let msg = match r {
         Result::Ok(_) => "ok",
-        Result::Err(_) => "err",
+        Result::Err(e) => match e.kind {
+            ErrorKind::LibraryNotFound => "missing",
+            _ => "other",
+        },
     };
     print "%s", msg;
 }
 "#;
     let output = run_example_src(src);
-    assert_eq!(output, "err");
+    assert_eq!(output, "missing");
 }
 
 #[test]

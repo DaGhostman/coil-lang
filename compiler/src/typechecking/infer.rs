@@ -486,6 +486,25 @@ impl Checker {
             self.register_builtin_io_error();
         }
 
+        // Lazily register `Error` / `ErrorKind` when the virtual `ffi`
+        // module is brought into scope (enum or any FFI builtin).
+        let needs_ffi_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_FFI_ERROR_ENUM
+            } | BuiltinExport::Enum {
+                name: common::BUILTIN_FFI_ERROR_KIND_ENUM
+            } | BuiltinExport::FfiFn { .. }
+        );
+        if needs_ffi_error {
+            if !self.enums.contains_key(common::BUILTIN_FFI_ERROR_KIND_ENUM) {
+                self.register_builtin_ffi_error_kind();
+            }
+            if !self.enums.contains_key(common::BUILTIN_FFI_ERROR_ENUM) {
+                self.register_builtin_ffi_error();
+            }
+        }
+
         let canonical = export.short_name().to_string();
         if local != canonical {
             // `use prelude::ops::Eq as PreludeEq` frees the short name.
@@ -666,6 +685,51 @@ impl Checker {
         for (i, vn) in variant_names.iter().enumerate() {
             tag_map.insert(vn.clone(), i as u32);
         }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
+    }
+
+    /// Pre-register `ffi::ErrorKind` unit variants.
+    fn register_builtin_ffi_error_kind(&mut self) {
+        use common::{BUILTIN_FFI_ERROR_KIND_ENUM, BUILTIN_FFI_ERROR_KIND_VARIANTS};
+        let name = BUILTIN_FFI_ERROR_KIND_ENUM.to_string();
+        let variant_names: Vec<String> = BUILTIN_FFI_ERROR_KIND_VARIANTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let payloads = variant_names
+            .iter()
+            .map(|_| EnumVariantPayloadTy::Unit)
+            .collect();
+        let arities = vec![0; variant_names.len()];
+        let mut tag_map = BTreeMap::new();
+        for (i, vn) in variant_names.iter().enumerate() {
+            tag_map.insert(vn.clone(), i as u32);
+        }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
+    }
+
+    /// Pre-register `ffi::Error` as a single record variant
+    /// `Error { kind: ErrorKind, message: string }`.
+    fn register_builtin_ffi_error(&mut self) {
+        use common::{BUILTIN_FFI_ERROR_ENUM, BUILTIN_FFI_ERROR_KIND_ENUM, BUILTIN_FFI_ERROR_VARIANT};
+        let name = BUILTIN_FFI_ERROR_ENUM.to_string();
+        let variant_names = vec![BUILTIN_FFI_ERROR_VARIANT.to_string()];
+        let payloads = vec![EnumVariantPayloadTy::Record(vec![
+            (
+                "kind".into(),
+                Ty::Con(BUILTIN_FFI_ERROR_KIND_ENUM.into()),
+            ),
+            ("message".into(), string()),
+        ])];
+        let arities = vec![2];
+        let mut tag_map = BTreeMap::new();
+        tag_map.insert(BUILTIN_FFI_ERROR_VARIANT.to_string(), 0u32);
         self.enums.insert(name.clone(), variant_names);
         self.enum_tags.insert(name.clone(), tag_map);
         self.enum_payloads.insert(name.clone(), payloads);
@@ -5709,6 +5773,8 @@ impl Checker {
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             "ioerror" => Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into()),
+            "error" => Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()),
+            "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),
             _ => {
                 // Prefer concrete type constructors over bare-class existentials
                 // when a name collision exists.
@@ -6070,8 +6136,8 @@ impl Checker {
                 None,
             );
         }
-        // dload → Result<int, string>
-        result_app_ty(int(), string())
+        // dload → Result<int, Error>
+        result_app_ty(int(), Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()))
     }
 
     fn infer_ffi_declare(&mut self, args: &[Output], range: Range<usize>) -> Ty {
@@ -6121,8 +6187,8 @@ impl Checker {
             ));
             self.messages.push(m);
         }
-        // declare → Result<int, string> (fn id or error)
-        result_app_ty(int(), string())
+        // declare → Result<int, Error> (fn id or typed FFI error)
+        result_app_ty(int(), Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()))
     }
 
     fn infer_ffi_invoke(&mut self, args: &[Output], range: Range<usize>) -> Ty {
@@ -6178,8 +6244,8 @@ impl Checker {
             ));
             self.messages.push(m);
         }
-        // invoke → Result<T, string>
-        result_app_ty(ret_ty, string())
+        // invoke → Result<T, Error>
+        result_app_ty(ret_ty, Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()))
     }
 
     /// Resolve an FFI type expression to `(tag, aux)` for codegen.
@@ -12647,7 +12713,7 @@ extern struct Point {
 use ffi::*;
 use ffi::types::*;
 
-fn main() -> Result<(), string> {
+fn main() -> Result<(), Error> {
     let lib = dload("sum")?;
     let make_id = declare(
         lib,
@@ -12951,7 +13017,7 @@ fn main() {
         let src = r#"
 use ffi::*;
 use ffi::types::*;
-fn main() -> Result<(), string> {
+fn main() -> Result<(), Error> {
     let lib = dload("x.so")?;
     let id = declare(lib, "sum", (Int, Int), Int)?;
     let _ = invoke(lib, id, (1, 2))?;
@@ -12971,7 +13037,7 @@ fn main() -> Result<(), string> {
     fn ffi_types_qualified_path_works_without_import() {
         let src = r#"
 use ffi::*;
-fn main() -> Result<(), string> {
+fn main() -> Result<(), Error> {
     let lib = dload("x.so")?;
     let id = declare(lib, "sum", (ffi::types::Int, ffi::types::Int), ffi::types::Int)?;
     let _ = invoke(lib, id, (1, 2))?;
@@ -12983,6 +13049,37 @@ fn main() -> Result<(), string> {
             "unexpected: {:?}",
             c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn ffi_error_kind_field_is_matchable() {
+        let src = r#"
+use ffi::*;
+fn main() {
+    let r = dload("missing");
+    let _ = match r {
+        Result::Ok(h) => h,
+        Result::Err(e) => match e.kind {
+            ErrorKind::LibraryNotFound => 0,
+            ErrorKind::SymbolNotFound => 1,
+            ErrorKind::ArityMismatch => 2,
+            ErrorKind::Libffi => 3,
+            ErrorKind::InvalidSignature => 4,
+            ErrorKind::InvalidHandle => 5,
+            ErrorKind::Unsupported => 6,
+            ErrorKind::Other => 7,
+        },
+    };
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages().is_empty(),
+            "unexpected: {:?}",
+            c.messages().iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.enums.contains_key(common::BUILTIN_FFI_ERROR_ENUM));
+        assert!(c.enums.contains_key(common::BUILTIN_FFI_ERROR_KIND_ENUM));
     }
 
     #[test]

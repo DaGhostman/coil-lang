@@ -1229,8 +1229,9 @@ impl Compiler {
     }
 
     /// Unwrap a `Result` on top of the stack: on `Ok`, leave the payload;
-    /// on `Err`, `Panic` with the error string. Used by `extern` lowering
-    /// so failed `dload`/`declare`/`invoke` never reach unsafe FFI calls.
+    /// on `Err(ffi::Error)`, panic with the error's `message` string.
+    /// Used by `extern` lowering so failed `dload`/`declare`/`invoke`
+    /// never reach unsafe FFI calls.
     fn emit_result_unwrap_or_panic(&mut self) {
         // Result::Ok = tag 0 (arity 1), Result::Err = tag 1 (arity 1).
         let mut bb = BlockBuilder::new();
@@ -1240,9 +1241,12 @@ impl Compiler {
             BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
             &mut self.bytecode,
         );
-        // Miss: Err (or non-Result) still on stack — unpack payload and panic.
+        // Miss: Err still on stack — unpack `ffi::Error`, then LoadField
+        // message (field index 1: kind=0, message=1) and Panic.
         self.bytecode
             .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
+        self.bytecode
+            .push(Byte::new(Instruction::LoadField).with_operand_u32(1));
         self.bytecode.push(Byte::new(Instruction::Panic));
 
         let success_pos = self.bytecode.len() as u32;

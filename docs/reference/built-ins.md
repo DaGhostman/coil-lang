@@ -14,7 +14,7 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `format` | Expression | Build a formatted string |
 | `push` | Expression | Append to an array in place and return the array |
 | `len` | Expression | Return an array length |
-| `ffi::{dload,declare,invoke}` | Virtual module | Runtime FFI (requires `use ffi::*`) |
+| `ffi::{dload,declare,invoke,Error,ErrorKind}` | Virtual module | Runtime FFI + typed errors (requires `use ffi::*`) |
 | `ffi::types::{Int,…}` | Virtual module | FFI type-tag constructors (requires `use ffi::types::*`) |
 | `io::{open,read,write,…}` | Virtual module | Non-blocking streams + sync adapters (requires `use io::*`) |
 | `done` | Expression | `true` if a coroutine handle is finished |
@@ -165,13 +165,13 @@ dload(path_expr)
 |----------|------|-------------|
 | `path_expr` | `string` | Basename, path, or alias passed to the library resolver |
 
-Returns `Result<int, string>` — `Ok` is the library handle (heap object address). Failure is `Err`, never `-1`.
+Returns `Result<int, Error>` — `Ok` is the library handle (heap object address). Failure is `Err(Error)`, never `-1`.
 
 ```0s
 use ffi::*;
 let lib = match dload("sum") {
     Result::Ok(h) => h,
-    Result::Err(msg) => panic msg,
+    Result::Err(e) => panic e.message,
 };
 ```
 
@@ -180,7 +180,8 @@ Notes:
 - Requires libffi-enabled build.
 - `dload("sum")` resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` and `[ffi] search_paths`.
 - `dload("c")` / `extern "c"` is the portable libc alias.
-- Same resolver as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::*`; it unwraps Results and panics on failure).
+- Same resolver as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::*`; it unwraps Results and panics on `e.message`).
+- Check `e.kind` (`ErrorKind::LibraryNotFound`, …) for recovery; use `e.message` for display.
 
 ---
 
@@ -229,7 +230,7 @@ declare(lib, name, (arg_types...), ret_type)
 | `(arg_types...)` | Tuple of FFI tags | One tag per parameter |
 | `ret_type` | FFI tag | Return type (`void` allowed) |
 
-Returns `Result<int, string>` — `Ok` is the function id; `Err` if the symbol is missing or libffi rejects the signature.
+Returns `Result<int, Error>` — `Ok` is the function id; `Err` if the symbol is missing or libffi rejects the signature (`ErrorKind::SymbolNotFound`, `Libffi`, …).
 
 ### FFI type tags (`ffi::types`)
 
@@ -270,15 +271,26 @@ invoke(lib, fn_id, (args...))
 | `fn_id` | `int` | Id from a successful `declare` |
 | `(args...)` | Tuple of values | Must match declared arity and types |
 
-Returns `Result<T, string>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = match declare(...) { ... }` so the side table can refine later `invoke` calls.
+Returns `Result<T, Error>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = declare(...)?` (or match) so the side table can refine later `invoke` calls.
 
 ```0s
 let n = match invoke(lib, sum_id, (40, 2)) {
     Result::Ok(v) => v,
-    Result::Err(msg) => panic msg,
+    Result::Err(e) => panic e.message,
 };
 print "%i", n;
 ```
+
+### `Error` / `ErrorKind`
+
+Virtual `ffi` exports (via `use ffi::*`):
+
+| Name | Shape |
+|------|-------|
+| `ErrorKind` | Unit enum — `LibraryNotFound`, `SymbolNotFound`, `ArityMismatch`, `Libffi`, `InvalidSignature`, `InvalidHandle`, `Unsupported`, `Other` |
+| `Error` | `Error { kind: ErrorKind, message: string }` — access `e.kind` / `e.message` |
+
+Match on `e.kind` for recovery; use `e.message` for logging / `panic`.
 
 ---
 

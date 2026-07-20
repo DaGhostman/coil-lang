@@ -331,12 +331,14 @@ impl<const S: usize> Machine<S> {
         obj: &mut Object,
         sig: crate::ffi::FfiSignature,
         layouts: &[CStructLayout],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, crate::ffi::FfiError> {
         if let crate::memory::Object::Library(gc) = obj {
             let obj_lib: &mut crate::memory::ObjLibrary = (**gc).as_mut();
-            crate::ffi::register_on_library(obj_lib, sig, layouts).map_err(|e| e.to_string())
+            crate::ffi::register_on_library(obj_lib, sig, layouts)
         } else {
-            Err("not a library object".to_string())
+            Err(crate::ffi::FfiError::InvalidHandle(
+                "not a library object".into(),
+            ))
         }
     }
 
@@ -812,6 +814,7 @@ impl<const S: usize> Machine<S> {
                     crate::memory::Object::Library(gc) => gc,
                     _ => {
                         self.push_result_err(
+                            crate::ffi::FfiErrorKindTag::InvalidHandle,
                             "invalid library handle (not a loaded library)".into(),
                         );
                         return;
@@ -824,7 +827,7 @@ impl<const S: usize> Machine<S> {
                     let args = match self.materialize_callback_args(&ffi_sig, &pending.args) {
                         Ok(a) => a,
                         Err(e) => {
-                            self.push_result_err(e.to_string());
+                            self.push_ffi_error(e);
                             return;
                         }
                     };
@@ -841,19 +844,19 @@ impl<const S: usize> Machine<S> {
                         &mut closure_ptrs,
                     )
                 } else {
-                    Err(crate::ffi::FfiError::Unsupported(
+                    Err(crate::ffi::FfiError::InvalidHandle(
                         "function id out of range".into(),
                     ))
                 }
             }
-            None => Err(crate::ffi::FfiError::Unsupported(
+            None => Err(crate::ffi::FfiError::InvalidHandle(
                 "invalid library handle".into(),
             )),
         };
         match invoke_result {
             Ok(Some(v)) => self.push_result_ok(v),
             Ok(None) => self.push_result_ok(Value::default()),
-            Err(e) => self.push_result_err(e.to_string()),
+            Err(e) => self.push_ffi_error(e),
         }
     }
 
@@ -863,12 +866,16 @@ impl<const S: usize> Machine<S> {
         self.stack.push(v);
     }
 
-    /// Push `Result::Err(string)` for userland FFI builtins.
-    fn push_result_err(&mut self, message: String) {
-        let gc = self.heap.intern(message);
-        let err = Value::from(gc.as_ptr() as *mut u8 as u64);
-        let v = crate::io::alloc_result_err(&mut self.heap, err);
+    /// Push `Result::Err(ffi::Error)` for userland FFI builtins.
+    fn push_result_err(&mut self, kind: crate::ffi::FfiErrorKindTag, message: String) {
+        let v = crate::ffi::alloc_result_ffi_err(&mut self.heap, kind, message);
         self.stack.push(v);
+    }
+
+    /// Map an [`FfiError`](crate::ffi::FfiError) into `Result::Err(ffi::Error)`.
+    fn push_ffi_error(&mut self, err: crate::ffi::FfiError) {
+        let kind = crate::ffi::FfiErrorKindTag::from_ffi_error(&err);
+        self.push_result_err(kind, err.to_string());
     }
 
     /// Call a zero-script function at `offset` reentrantly (for FFI callbacks).
@@ -1428,7 +1435,7 @@ impl<const S: usize> Machine<S> {
                             _ => String::new(),
                         }
                     };
-                    // Push `Result::Ok(handle)` or `Result::Err(string)`.
+                    // Push `Result::Ok(handle)` or `Result::Err(ffi::Error)`.
                     match crate::ffi::resolve_library(
                         &path,
                         self.base_dir.as_deref(),
@@ -1445,7 +1452,7 @@ impl<const S: usize> Machine<S> {
                             self.push_result_ok(Value::from(addr as *mut u8));
                         }
                         Err(e) => {
-                            self.push_result_err(e.to_string());
+                            self.push_ffi_error(e);
                         }
                     }
                 }
@@ -1526,15 +1533,18 @@ impl<const S: usize> Machine<S> {
                                     self.push_result_ok(Value::from(id as i64));
                                 }
                                 Err(e) => {
-                                    self.push_result_err(e.to_string());
+                                    self.push_ffi_error(e);
                                 }
                             }
                         }
                         None => {
-                            self.push_result_err(format!(
-                                "FFI declare: library at 0x{:x} is not loaded",
-                                lib_addr
-                            ));
+                            self.push_result_err(
+                                crate::ffi::FfiErrorKindTag::InvalidHandle,
+                                format!(
+                                    "FFI declare: library at 0x{:x} is not loaded",
+                                    lib_addr
+                                ),
+                            );
                         }
                     }
                 }

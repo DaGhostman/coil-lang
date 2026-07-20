@@ -17,8 +17,8 @@
 // `dload("sum")` resolves to the platform filename via
 // `[ffi] search_paths` in `zero.toml` (./examples).
 //
-// Each of dload / declare / invoke returns `Result`; unwrap
-// with match (or `?` in a Result-returning function).
+// Each of dload / declare / invoke returns `Result<_, Error>`;
+// unwrap with match (or `?` in a Result-returning function).
 //
 // Expected output: `42` (40 + 2).
 
@@ -28,15 +28,15 @@ use ffi::types::*;
 fn main() {
     let lib = match dload("sum") {
         Result::Ok(h) => h,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let sum_id = match declare(lib, "sum", (Int, Int), Int) {
         Result::Ok(id) => id,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let n = match invoke(lib, sum_id, (40, 2)) {
         Result::Ok(v) => v,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     print "%i", n;
 }
