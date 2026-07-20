@@ -1388,6 +1388,22 @@ fn example_io_udp_prints_2() {
     assert_eq!(output, "2");
 }
 
+/// Nested IO HostInvoke (`read_to_end(open(...)?)`) must leave the stream on
+/// the stack as the MakeTuple element, not the outer native id.
+#[test]
+fn example_io_nested_host_prints_3() {
+    let output = run_example("examples/io_nested_host.0s");
+    assert_eq!(output, "3");
+}
+
+/// Nested IO as the first of two HostInvoke args (`write_all(open(...), buf)`).
+/// Outer arity > 1 — MakeTuple must pack the stream, not the outer native id.
+#[test]
+fn example_io_nested_write_prints_2() {
+    let output = run_example("examples/io_nested_write.0s");
+    assert_eq!(output, "2");
+}
+
 /// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
 #[test]
 fn harness_virtual_main_passes_when_all_asserts_ok() {
