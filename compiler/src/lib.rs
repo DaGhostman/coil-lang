@@ -5665,20 +5665,30 @@ impl Compiler {
             } => {
                 use parser::ast::EnumConstructPayload;
                 // Look up the variant's tag and arity in the
-                // typechecker's tables. The typechecker would
-                // already have rejected this construct if the
-                // enum / variant isn't registered, so the
-                // `expect`s below only fire when something is
-                // seriously out of sync (e.g., the typechecker
-                // was bypassed).
-                let tag = self
-                    .checker
-                    .tag_for(enum_name, variant_name)
-                    .expect("Construct: enum/variant not registered with typechecker");
+                // typechecker's tables. Unknown enum/variant is a
+                // type error with recovery — still walk children for
+                // NodeId alignment, but do not emit MakeEnum (and do
+                // not panic: release builds use panic=abort).
+                let Some(tag) = self.checker.tag_for(enum_name, variant_name) else {
+                    match fields {
+                        EnumConstructPayload::Unit => {}
+                        EnumConstructPayload::Tuple(args) => {
+                            for arg in args {
+                                bytecode.append(&mut self.do_compile(arg));
+                            }
+                        }
+                        EnumConstructPayload::Record(parts) => {
+                            for part in parts {
+                                bytecode.append(&mut self.do_compile(&part.value));
+                            }
+                        }
+                    }
+                    return bytecode;
+                };
                 let arity = self
                     .checker
                     .arity_for(enum_name, variant_name)
-                    .expect("Construct: arity missing from typechecker");
+                    .unwrap_or(0);
 
                 // Emit args in reverse declaration order for MAKE_ENUM stack discipline.
                 match fields {
