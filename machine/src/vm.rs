@@ -894,9 +894,12 @@ impl<const S: usize> Machine<S> {
         args_ptr: *const Value,
         len: usize,
     ) -> Value {
-        let vm = &mut *(vm.cast::<Self>());
-        let args = std::slice::from_raw_parts(args_ptr, len);
-        vm.call_function(offset, args)
+        // Edition 2024: bodies of `unsafe fn` are safe by default.
+        unsafe {
+            let vm = &mut *(vm.cast::<Self>());
+            let args = std::slice::from_raw_parts(args_ptr, len);
+            vm.call_function(offset, args)
+        }
     }
 
     /// Run compiler-produced bytecode (archived layout, no `.c0s` round-trip).
@@ -906,7 +909,7 @@ impl<const S: usize> Machine<S> {
     }
 
     #[inline(always)]
-    fn execute(&mut self, code: &[Byte], constants: &[u64], mut start_ip: usize) -> bool {
+    fn execute(&mut self, code: &[Byte], constants: &[u64], start_ip: usize) -> bool {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 

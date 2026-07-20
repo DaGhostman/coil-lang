@@ -326,6 +326,22 @@ pub fn invoke_via_libffi(
         });
     }
 
+    // libffi 5's `Arg<'arg>` borrows the marshalling storage, so we cannot
+    // push into a Vec while an Arg still holds a reference into it. Phase 1
+    // fills typed storage; phase 2 builds Args from the finished buffers.
+    enum ArgSlot {
+        I64(usize),
+        I8(usize),
+        I16(usize),
+        I32(usize),
+        U8(usize),
+        U16(usize),
+        U32(usize),
+        U64(usize),
+        F64(usize),
+        Ptr(usize),
+    }
+
     let mut i64_storage: Vec<i64> = Vec::new();
     let mut i8_storage: Vec<i8> = Vec::new();
     let mut i16_storage: Vec<i16> = Vec::new();
@@ -340,49 +356,49 @@ pub fn invoke_via_libffi(
     let mut array_buffers: Vec<Vec<i64>> = Vec::new();
     let mut array_copy_back: Vec<(u64, usize)> = Vec::new();
     let mut struct_bufs: Vec<Vec<u8>> = Vec::new();
-    let mut ffi_args: Vec<Arg> = Vec::with_capacity(sig.arity());
+    let mut slots: Vec<ArgSlot> = Vec::with_capacity(sig.arity());
 
     for (i, (ty, value)) in sig.args.iter().zip(args.iter()).enumerate() {
         match ty {
             FfiType::Int => {
+                slots.push(ArgSlot::I64(i64_storage.len()));
                 i64_storage.push(value.as_int());
-                ffi_args.push(Arg::new(i64_storage.last().unwrap()));
             }
             FfiType::Int8 => {
+                slots.push(ArgSlot::I8(i8_storage.len()));
                 i8_storage.push(value.as_int() as i8);
-                ffi_args.push(Arg::new(i8_storage.last().unwrap()));
             }
             FfiType::Int16 => {
+                slots.push(ArgSlot::I16(i16_storage.len()));
                 i16_storage.push(value.as_int() as i16);
-                ffi_args.push(Arg::new(i16_storage.last().unwrap()));
             }
             FfiType::Int32 => {
+                slots.push(ArgSlot::I32(i32_storage.len()));
                 i32_storage.push(value.as_int() as i32);
-                ffi_args.push(Arg::new(i32_storage.last().unwrap()));
             }
             FfiType::UInt8 => {
+                slots.push(ArgSlot::U8(u8_storage.len()));
                 u8_storage.push(value.as_int() as u8);
-                ffi_args.push(Arg::new(u8_storage.last().unwrap()));
             }
             FfiType::UInt16 => {
+                slots.push(ArgSlot::U16(u16_storage.len()));
                 u16_storage.push(value.as_int() as u16);
-                ffi_args.push(Arg::new(u16_storage.last().unwrap()));
             }
             FfiType::UInt32 => {
+                slots.push(ArgSlot::U32(u32_storage.len()));
                 u32_storage.push(value.as_int() as u32);
-                ffi_args.push(Arg::new(u32_storage.last().unwrap()));
             }
             FfiType::UInt64 => {
+                slots.push(ArgSlot::U64(u64_storage.len()));
                 u64_storage.push(value.as_int() as u64);
-                ffi_args.push(Arg::new(u64_storage.last().unwrap()));
             }
             FfiType::Float => {
+                slots.push(ArgSlot::F64(f64_storage.len()));
                 f64_storage.push(value.as_float());
-                ffi_args.push(Arg::new(f64_storage.last().unwrap()));
             }
             FfiType::Bool => {
+                slots.push(ArgSlot::U8(u8_storage.len()));
                 u8_storage.push(if value.as_bool() { 1 } else { 0 });
-                ffi_args.push(Arg::new(u8_storage.last().unwrap()));
             }
             FfiType::String => {
                 let heap = ctx.heap();
@@ -393,8 +409,8 @@ pub fn invoke_via_libffi(
                     let s = unsafe { CStr::from_ptr(ptr) };
                     str_storage.push(CString::new(s.to_bytes()).unwrap_or_default());
                 }
-                let c_ptr = str_storage.last().unwrap().as_ptr();
-                ffi_args.push(Arg::new(&c_ptr));
+                slots.push(ArgSlot::Ptr(ptr_storage.len()));
+                ptr_storage.push(str_storage.last().unwrap().as_ptr() as *mut c_void);
             }
             FfiType::Ptr => {
                 let (ptr, heap_addr) =
@@ -402,12 +418,12 @@ pub fn invoke_via_libffi(
                 if let Some(addr) = heap_addr {
                     array_copy_back.push((addr, array_buffers.len() - 1));
                 }
+                slots.push(ArgSlot::Ptr(ptr_storage.len()));
                 ptr_storage.push(ptr);
-                ffi_args.push(Arg::new(ptr_storage.last().unwrap()));
             }
             FfiType::Callback(_) => {
+                slots.push(ArgSlot::Ptr(ptr_storage.len()));
                 ptr_storage.push(value.raw() as *mut c_void);
-                ffi_args.push(Arg::new(ptr_storage.last().unwrap()));
             }
             FfiType::Struct(id) => {
                 let layouts: Vec<CStructLayout> = ctx.layouts().to_vec();
@@ -418,12 +434,28 @@ pub fn invoke_via_libffi(
                 let mut buf = Vec::new();
                 pack_struct(ctx.heap(), value, &layout, &layouts, &mut buf)?;
                 struct_bufs.push(buf);
-                let ptr = struct_bufs.last().unwrap().as_ptr() as *mut c_void;
-                ffi_args.push(Arg::new(&ptr));
+                slots.push(ArgSlot::Ptr(ptr_storage.len()));
+                ptr_storage.push(struct_bufs.last().unwrap().as_ptr() as *mut c_void);
             }
             FfiType::Void => return Err(FfiError::VoidArgument { index: i }),
         }
     }
+
+    let ffi_args: Vec<Arg> = slots
+        .iter()
+        .map(|slot| match *slot {
+            ArgSlot::I64(i) => Arg::new(&i64_storage[i]),
+            ArgSlot::I8(i) => Arg::new(&i8_storage[i]),
+            ArgSlot::I16(i) => Arg::new(&i16_storage[i]),
+            ArgSlot::I32(i) => Arg::new(&i32_storage[i]),
+            ArgSlot::U8(i) => Arg::new(&u8_storage[i]),
+            ArgSlot::U16(i) => Arg::new(&u16_storage[i]),
+            ArgSlot::U32(i) => Arg::new(&u32_storage[i]),
+            ArgSlot::U64(i) => Arg::new(&u64_storage[i]),
+            ArgSlot::F64(i) => Arg::new(&f64_storage[i]),
+            ArgSlot::Ptr(i) => Arg::new(&ptr_storage[i]),
+        })
+        .collect();
 
     match sig.ret {
         FfiType::Void => {
