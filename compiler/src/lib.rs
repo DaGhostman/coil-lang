@@ -9726,4 +9726,62 @@ fn main() { \
         );
     }
 
+    /// Generic HostInvoke Call path (`self.native`) has the same id-before-args
+    /// contract as `emit_io_host_invoke` — nested `outer(inner())` must not
+    /// leave the inner invoke above the outer id.
+    ///
+    /// Mirrors `nested_io_host_invoke_emits_outer_const_before_inner_host_invoke`:
+    /// require two `HostInvoke`s and assert the outer id `CONST` precedes the
+    /// *inner* `HostInvoke` (not merely the first one).
+    #[test]
+    fn nested_generic_host_invoke_emits_outer_id_before_inner_invoke() {
+        use common::Instruction;
+        use crate::typechecking::ty::int;
+
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    outer(inner());
+}
+"#,
+            )
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        compiler.register("inner", &[], &int());
+        compiler.register("outer", &[int()], &int());
+        let outer_id = compiler.native_id("outer").expect("outer registered") as u32;
+        let bc = compiler.compile("", &mut ast);
+
+        let host_idxs: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::HostInvoke))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            host_idxs.len() >= 2,
+            "expected nested HostInvoke (inner + outer); got {}; opcodes: {:?}",
+            host_idxs.len(),
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        let outer_host = *host_idxs.last().expect("outer HostInvoke");
+        let outer_const = bc[..outer_host]
+            .iter()
+            .rposition(|b| {
+                matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == outer_id
+            })
+            .expect("outer id CONST before outer HostInvoke");
+        let inner_host = host_idxs
+            .iter()
+            .copied()
+            .find(|&i| i < outer_host)
+            .expect("inner HostInvoke before outer");
+        assert!(
+            outer_const < inner_host,
+            "outer native-id CONST must precede nested HostInvoke \
+             (const@{outer_const} vs inner@{inner_host})"
+        );
+    }
+
 }
