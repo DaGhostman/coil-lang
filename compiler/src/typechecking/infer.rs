@@ -13996,7 +13996,7 @@ test("second") { assert(1 == 1)?; }
 
     #[test]
     fn test_case_rejects_bare_int_return_outside_result_wrap() {
-        // Bodies are Result-mode: a bare `return 1;` must not typecheck as Ok.
+        // Ok type is `unit`, so `return 1` must not typecheck.
         let msgs = assert_messages(
             r#"
 test("bad") {

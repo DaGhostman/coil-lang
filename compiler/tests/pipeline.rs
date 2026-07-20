@@ -1468,6 +1468,43 @@ test("c") { assert(1 + 1 == 2)?; }
     assert_eq!(results, [("a", true), ("b", false), ("c", true)]);
 }
 
+/// Hard-`panic` path: each case is still isolated (fresh VM + unwind fence),
+/// matching `run_test_case` in the CLI so a VM abort does not fail-fast.
+#[test]
+fn harness_isolated_call_function_continues_after_hard_panic() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+test("boom") { panic "x"; }
+test("after") { assert(true)?; }
+"#,
+        )
+        .expect("compile");
+    let cases = pipeline.test_cases().to_vec();
+    assert_eq!(
+        cases.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["boom", "after"]
+    );
+
+    let mut results = Vec::new();
+    for (name, offset) in &cases {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut machine = Machine::<128>::default();
+            pipeline.wire_host_natives(&mut machine);
+            machine.load_program(&bytecode, &constants);
+            let ret = machine.call_function(*offset, &[]);
+            !machine.panicked() && machine.result_is_ok(ret)
+        }));
+        let ok = match outcome {
+            Ok(ok) => ok,
+            Err(_) => false,
+        };
+        results.push((name.as_str(), ok));
+    }
+    assert_eq!(results, [("boom", false), ("after", true)]);
+}
+
 /// Match arms that reuse a binding name with different payload types
 /// must resolve field access against *that arm's* type. A flat
 /// `codegen_var_types` side-table last-wins would make `p.y` emit
