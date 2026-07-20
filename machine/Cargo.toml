@@ -10,8 +10,8 @@ vm_profile = []
 [dependencies]
 common = { path = "../common" }
 rkyv = "0.8.12"
-libloading = "0.8"
-libffi = "4.0.0"
+libloading = "0.9"
+libffi = "5.1.1"
 libc = "0.2"
 
 [dev-dependencies]

@@ -38,14 +38,17 @@ unsafe extern "C" fn vm_int_to_int_trampoline(
     args: *const *const c_void,
     userdata: &mut Option<VmCallbackState>,
 ) {
-    let Some(state) = userdata.as_mut() else {
-        return;
-    };
-    let arg_ptr = *args;
-    let arg = *(arg_ptr as *const i64);
-    let args = [Value::from(arg)];
-    let out = (state.call_fn)(state.vm, state.fn_offset, args.as_ptr(), args.len());
-    *result = out.as_int();
+    // Edition 2024: bodies of `unsafe fn`/`unsafe extern` are safe by default.
+    unsafe {
+        let Some(state) = userdata.as_mut() else {
+            return;
+        };
+        let arg_ptr = *args;
+        let arg = *(arg_ptr as *const i64);
+        let args = [Value::from(arg)];
+        let out = (state.call_fn)(state.vm, state.fn_offset, args.as_ptr(), args.len());
+        *result = out.as_int();
+    }
 }
 
 /// Build a libffi CIF for a callback signature (same as a normal function CIF).
@@ -96,8 +99,10 @@ mod tests {
             args_ptr: *const Value,
             len: usize,
         ) -> Value {
-            let args = std::slice::from_raw_parts(args_ptr, len);
-            Value::from(args[0].as_int() * 2)
+            unsafe {
+                let args = std::slice::from_raw_parts(args_ptr, len);
+                Value::from(args[0].as_int() * 2)
+            }
         }
         let cif = callback_cif(&[FfiType::Int], FfiType::Int, &[]).unwrap();
         let closure =
