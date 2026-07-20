@@ -79,6 +79,11 @@ See each project's `NOTES.md` for detail. Highlights:
 
 1. **IO HostInvoke from dependency modules is broken** — keep `open` / TCP /
    `stdin` calls in the entry `main.0s`; dep modules stay pure helpers.
+   **Symptom:** a helper in a non-entry module that calls `open`/`write_all`
+   can abort at runtime (`jump_if_match_target` with an empty constant pool —
+   the `Result` unwrap after HostInvoke). Likely multi-file compile /
+   constant-pool / `JumpIfMatch` wiring when the call site is not the entry
+   file. Not fixed in this PR; work around by keeping Stream IO in `main.0s`.
 2. **`use` of a sibling module from a non-entry file** may not resolve free-fn
    calls — call shared helpers from the entry, or keep dep modules self-contained.
 3. No `read_line` builtin; adventure uses `read_to_end` + `\n` split (Ctrl+D / pipe).

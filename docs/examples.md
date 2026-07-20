@@ -572,6 +572,16 @@ Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text 
 | **Run** | `cargo run -- examples/io_udp.0s` |
 | **Output** | `2` |
 
+### `examples/io_nested_host.0s`
+
+**Demonstrates:** Nested IO HostInvoke — `read_to_end(open(...)?)` must leave the
+stream (not the outer native id) on the stack for `MakeTuple`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_nested_host.0s` |
+| **Output** | `3` |
+
 See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
 
 ---
@@ -1354,6 +1364,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `io_eof.0s` | IO | `eof` |
 | `io_text.0s` | IO | `hello2` |
 | `io_udp.0s` | IO | `2` |
+| `io_nested_host.0s` | IO | `3` |
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
