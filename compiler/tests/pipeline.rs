@@ -1527,3 +1527,41 @@ fn main() {
     );
     assert_eq!(output, "99");
 }
+
+/// P6: match-bound constructor payloads must land in `codegen_var_types`
+/// so field access uses the payload enum's LoadField index — not the
+/// defensive `LoadField(0)` fallback (which silently returns the wrong
+/// field when the target is not field 0).
+#[test]
+fn match_bound_enum_field_access_uses_correct_index() {
+    let output = run_example_src(
+        r#"
+enum Info {
+    Info { kind: int, code: int },
+}
+
+enum Wrap {
+    Empty,
+    Full(Info),
+}
+
+fn read_code(Wrap w) -> int {
+    return match w {
+        Wrap::Empty => 0,
+        Wrap::Full(e) => e.code,
+    };
+}
+
+fn main() {
+    let w = Wrap::Full(Info::Info { kind: 1, code: 42 });
+    print "%i", read_code(w);
+    print "%i", match w {
+        Wrap::Empty => 0,
+        Wrap::Full(e) => e.kind,
+    };
+}
+"#,
+    );
+    // Pre-fix: e.code → LoadField(0) → kind (1), not code (42).
+    assert_eq!(output, "421");
+}

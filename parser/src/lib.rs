@@ -4810,4 +4810,45 @@ mod tests_generics {
             other => panic!("expected Function, got {:?}", other),
         }
     }
+
+    /// P3 sibling: `yield -1;` must be Yield(Negate(...)), not
+    /// `Sub(Identifier("yield"), 1)` via expr_statement.
+    #[test]
+    fn yield_negative_literal_parses_as_yield() {
+        fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+            match expr {
+                Expression::Expr(inner) | Expression::Group(inner) => {
+                    unwrap_expr(inner.1.as_ref())
+                }
+                other => other,
+            }
+        }
+        match decl_ast!("async fn coro() { yield -1; }") {
+            Expression::Function { body, .. } => {
+                fn has_yield_negate(expr: &Expression<'_>) -> bool {
+                    match expr {
+                        Expression::Yield(inner) => {
+                            matches!(unwrap_expr(inner.1.as_ref()), Expression::Negate(_))
+                        }
+                        Expression::Block(children)
+                        | Expression::Program(children)
+                        | Expression::Fragment(children) => {
+                            children.iter().any(|c| has_yield_negate(c.1.as_ref()))
+                        }
+                        Expression::Statement(inner)
+                        | Expression::ExprStatement(inner)
+                        | Expression::Group(inner)
+                        | Expression::Expr(inner) => has_yield_negate(inner.1.as_ref()),
+                        _ => false,
+                    }
+                }
+                assert!(
+                    has_yield_negate(body.1.as_ref()),
+                    "expected Yield(Negate(...)); got {}",
+                    body.1
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
 }
