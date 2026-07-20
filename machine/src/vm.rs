@@ -3683,6 +3683,80 @@ mod tests {
         assert_eq!(out.as_int(), 42);
     }
 
+    /// `load_program` is the public entry used by `zero-script test` —
+    /// without it, harness cases cannot `call_function` against compiled
+    /// bytecode.
+    #[test]
+    fn load_program_enables_call_function() {
+        let mut vm = Machine::<512>::default();
+        let code = [
+            load(0),
+            const_int(3),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ];
+        let raw: Vec<RawByte> = unsafe {
+            std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
+        };
+        vm.load_program(&raw, &[]);
+        let out = vm.call_function(0, &[Value::from(39_i64)]);
+        assert_eq!(out.as_int(), 42);
+        assert!(!vm.panicked());
+    }
+
+    /// Harness soft-pass checks `Result::Ok` via tag 0.
+    #[test]
+    fn result_is_ok_true_for_tag_zero_enum() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[const_int(1), make_enum(0, 1), Byte::new(Instruction::HALT)]);
+        let v = vm.pop();
+        assert!(vm.result_is_ok(v), "tag 0 must count as Ok");
+    }
+
+    /// Harness soft-fail checks `Result::Err` via tag 1.
+    #[test]
+    fn result_is_ok_false_for_tag_one_enum() {
+        let mut vm = Machine::<4>::default();
+        vm.run(&[const_int(1), make_enum(1, 1), Byte::new(Instruction::HALT)]);
+        let v = vm.pop();
+        assert!(!vm.result_is_ok(v), "tag 1 must count as Err");
+    }
+
+    /// Non-enum values (and missing heap objects) are not Ok.
+    #[test]
+    fn result_is_ok_false_for_immediate() {
+        let vm = Machine::<4>::default();
+        assert!(!vm.result_is_ok(Value::from(0_i64)));
+        assert!(!vm.result_is_ok(Value::from(42_i64)));
+    }
+
+    /// Inner `CALL`/`RETURN` must unwind normally under `call_function`.
+    /// Without `nested_frame_depths`, the inner RETURN would capture early
+    /// and return 7 instead of continuing the outer body (7+1=8).
+    #[test]
+    fn call_function_captures_only_outer_return_not_inner_call() {
+        let mut vm = Machine::<512>::default();
+        // 0: CALL → 4
+        // 1: CONST 1
+        // 2: ADD
+        // 3: RETURN   (outer — captured by call_function)
+        // 4: CONST 7
+        // 5: RETURN   (inner — must unwind, not capture)
+        install_program(
+            &mut vm,
+            &[
+                Byte::new(Instruction::CALL).with_call_packed(0, 4),
+                const_int(1),
+                Byte::new(Instruction::ADD),
+                Byte::new(Instruction::RETURN),
+                const_int(7),
+                Byte::new(Instruction::RETURN),
+            ],
+        );
+        let out = vm.call_function(0, &[]);
+        assert_eq!(out.as_int(), 8);
+    }
+
     /// Nested `call_function` (FFI callback reentrancy) must not clobber the
     /// outer frame-depth target — outer RETURN still captures a non-default value.
     #[test]

@@ -6652,8 +6652,8 @@ mod tests {
         let mut ast = Pratt::default()
             .parse(
                 r#"
-test("one") { assert(true); }
-test("two") { assert(true); }
+test("one") { assert(true)?; }
+test("two") { assert(true)?; }
 "#,
             )
             .expect("parse failed");
@@ -6683,13 +6683,20 @@ test("two") { assert(true); }
             "test_cases[1] must track peephole relocation of __zs_test_1"
         );
 
-        let calls_in_main = bc[main_off..]
+        let main_bc = &bc[main_off..];
+        let calls_in_main = main_bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::CALL))
             .count();
         assert!(
             calls_in_main >= 2,
             "virtual main should CALL each harness case; got {calls_in_main}"
+        );
+        assert!(
+            main_bc
+                .iter()
+                .any(|b| matches!(b.bytecode(), Instruction::Panic)),
+            "virtual main must Panic on aggregate soft-fail"
         );
     }
 
@@ -9650,5 +9657,5 @@ fn main() { \
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
+
 }
-// temp - will remove

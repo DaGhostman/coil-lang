@@ -1388,6 +1388,123 @@ fn example_io_udp_prints_2() {
     assert_eq!(output, "2");
 }
 
+/// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
+#[test]
+fn harness_virtual_main_passes_when_all_asserts_ok() {
+    let output = run_example_src(
+        r#"
+test("ok") {
+    assert(true)?;
+}
+"#,
+    );
+    assert_eq!(output, "");
+}
+
+/// Soft-fail path prints `> Test "…" failed` and aborts via Panic.
+#[test]
+fn harness_virtual_main_prints_failure_and_panics() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+test("broken") {
+    assert(false)?;
+}
+"#,
+        )
+        .expect("compile");
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let shared = SharedBuf(Rc::clone(&buf));
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared);
+    pipeline.wire_host_natives(&mut machine);
+    machine.run_raw(&bytecode, &constants);
+    let _ = machine.restore_output();
+    assert!(
+        machine.panicked(),
+        "virtual main must panic when a case fails"
+    );
+    let bytes = Rc::try_unwrap(buf)
+        .expect("VM still holds a reference to the buffer")
+        .into_inner();
+    let output = String::from_utf8(bytes).expect("utf-8");
+    assert!(
+        output.contains("> Test \"broken\" failed"),
+        "expected failure banner, got {output:?}"
+    );
+}
+
+/// CLI-style isolation: each case is `call_function`'d independently so a
+/// soft failure does not prevent later cases from running.
+#[test]
+fn harness_isolated_call_function_continues_after_soft_fail() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+test("a") { assert(true)?; }
+test("b") { assert(false)?; }
+test("c") { assert(1 + 1 == 2)?; }
+"#,
+        )
+        .expect("compile");
+    let cases = pipeline.test_cases().to_vec();
+    assert_eq!(cases.len(), 3);
+    assert_eq!(
+        cases.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+
+    let mut results = Vec::new();
+    for (name, offset) in &cases {
+        let mut machine = Machine::<128>::default();
+        pipeline.wire_host_natives(&mut machine);
+        machine.load_program(&bytecode, &constants);
+        let ret = machine.call_function(*offset, &[]);
+        let ok = !machine.panicked() && machine.result_is_ok(ret);
+        results.push((name.as_str(), ok));
+    }
+    assert_eq!(results, [("a", true), ("b", false), ("c", true)]);
+}
+
+/// Hard-`panic` path: each case is still isolated (fresh VM + unwind fence),
+/// matching `run_test_case` in the CLI so a VM abort does not fail-fast.
+#[test]
+fn harness_isolated_call_function_continues_after_hard_panic() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+test("boom") { panic "x"; }
+test("after") { assert(true)?; }
+"#,
+        )
+        .expect("compile");
+    let cases = pipeline.test_cases().to_vec();
+    assert_eq!(
+        cases.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["boom", "after"]
+    );
+
+    let mut results = Vec::new();
+    for (name, offset) in &cases {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut machine = Machine::<128>::default();
+            pipeline.wire_host_natives(&mut machine);
+            machine.load_program(&bytecode, &constants);
+            let ret = machine.call_function(*offset, &[]);
+            !machine.panicked() && machine.result_is_ok(ret)
+        }));
+        let ok = match outcome {
+            Ok(ok) => ok,
+            Err(_) => false,
+        };
+        results.push((name.as_str(), ok));
+    }
+    assert_eq!(results, [("boom", false), ("after", true)]);
+}
+
 /// Match arms that reuse a binding name with different payload types
 /// must resolve field access against *that arm's* type. A flat
 /// `codegen_var_types` side-table last-wins would make `p.y` emit
