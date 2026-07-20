@@ -1090,12 +1090,14 @@ impl<'pratt> Pratt<'pratt> {
                 self.type_alias(),
                 self.variable().then_ignore(op!(';')),
                 self.constant().then_ignore(op!(';')),
-                self.expr_statement(),
+                // Statement keywords before `expr_statement`: otherwise
+                // `return -1;` parses as `Sub(Identifier("return"), 1)`.
                 self.print().then_ignore(op!(';')),
                 self.return_().then_ignore(op!(';')),
                 self.raise_().then_ignore(op!(';')),
                 self.panic_().then_ignore(op!(';')),
                 self.yield_().then_ignore(op!(';')),
+                self.expr_statement(),
                 self.comment(),
             ))
         })
@@ -3283,7 +3285,9 @@ mod tests {
             Expression::Function { body, .. } => match body.1.as_ref() {
                 Expression::Block(stmts) => match stmts[0].1.as_ref() {
                     Expression::Statement(stmt) => match stmt.1.as_ref() {
-                        Expression::Yield(y) => expect_yield_42(y.1.as_ref()),
+                        // `yield` is preferred over `expr_statement`, so the
+                        // node is bare `Yield` (not `ExprStatement(Yield)`).
+                        Expression::Yield(_) => expect_yield_42(stmt.1.as_ref()),
                         Expression::ExprStatement(inner) => {
                             expect_yield_42(inner.1.as_ref());
                         }
@@ -4728,4 +4732,123 @@ mod tests_generics {
         assert!(result.is_err(), "expected missing comma between variants to fail, got {:?}", result);
     }
 
+    /// P3: `return -1;` is a Return of negated int, not `return - 1` subtraction.
+    #[test]
+    fn return_negative_literal_parses_as_return() {
+        fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+            match expr {
+                Expression::Expr(inner) | Expression::Group(inner) => {
+                    unwrap_expr(inner.1.as_ref())
+                }
+                other => other,
+            }
+        }
+        match decl_ast!("fn f() -> int { return -1; }") {
+            Expression::Function { body, .. } => {
+                fn has_return_negate(expr: &Expression<'_>) -> bool {
+                    match expr {
+                        Expression::Return(inner) => {
+                            matches!(unwrap_expr(inner.1.as_ref()), Expression::Negate(_))
+                        }
+                        Expression::Block(children)
+                        | Expression::Program(children)
+                        | Expression::Fragment(children) => {
+                            children.iter().any(|c| has_return_negate(c.1.as_ref()))
+                        }
+                        Expression::Statement(inner)
+                        | Expression::ExprStatement(inner)
+                        | Expression::Group(inner)
+                        | Expression::Expr(inner) => has_return_negate(inner.1.as_ref()),
+                        _ => false,
+                    }
+                }
+                assert!(
+                    has_return_negate(body.1.as_ref()),
+                    "expected Return(Negate(...)); got {}",
+                    body.1
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn return_subtraction_still_parses() {
+        fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+            match expr {
+                Expression::Expr(inner) | Expression::Group(inner) => {
+                    unwrap_expr(inner.1.as_ref())
+                }
+                other => other,
+            }
+        }
+        match decl_ast!("fn f() -> int { return 0 - 1; }") {
+            Expression::Function { body, .. } => {
+                fn has_return_sub(expr: &Expression<'_>) -> bool {
+                    match expr {
+                        Expression::Return(inner) => {
+                            matches!(unwrap_expr(inner.1.as_ref()), Expression::Sub(_, _))
+                        }
+                        Expression::Block(children)
+                        | Expression::Program(children)
+                        | Expression::Fragment(children) => {
+                            children.iter().any(|c| has_return_sub(c.1.as_ref()))
+                        }
+                        Expression::Statement(inner)
+                        | Expression::ExprStatement(inner)
+                        | Expression::Group(inner)
+                        | Expression::Expr(inner) => has_return_sub(inner.1.as_ref()),
+                        _ => false,
+                    }
+                }
+                assert!(
+                    has_return_sub(body.1.as_ref()),
+                    "expected Return(Sub(...)); got {}",
+                    body.1
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    /// P3 sibling: `yield -1;` must be Yield(Negate(...)), not
+    /// `Sub(Identifier("yield"), 1)` via expr_statement.
+    #[test]
+    fn yield_negative_literal_parses_as_yield() {
+        fn unwrap_expr<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+            match expr {
+                Expression::Expr(inner) | Expression::Group(inner) => {
+                    unwrap_expr(inner.1.as_ref())
+                }
+                other => other,
+            }
+        }
+        match decl_ast!("async fn coro() { yield -1; }") {
+            Expression::Function { body, .. } => {
+                fn has_yield_negate(expr: &Expression<'_>) -> bool {
+                    match expr {
+                        Expression::Yield(inner) => {
+                            matches!(unwrap_expr(inner.1.as_ref()), Expression::Negate(_))
+                        }
+                        Expression::Block(children)
+                        | Expression::Program(children)
+                        | Expression::Fragment(children) => {
+                            children.iter().any(|c| has_yield_negate(c.1.as_ref()))
+                        }
+                        Expression::Statement(inner)
+                        | Expression::ExprStatement(inner)
+                        | Expression::Group(inner)
+                        | Expression::Expr(inner) => has_yield_negate(inner.1.as_ref()),
+                        _ => false,
+                    }
+                }
+                assert!(
+                    has_yield_negate(body.1.as_ref()),
+                    "expected Yield(Negate(...)); got {}",
+                    body.1
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
 }

@@ -1424,3 +1424,181 @@ fn main() {
     );
     assert_eq!(output, "24");
 }
+
+/// P0: early-loop flag reassignment sticks while later locals stay live.
+#[test]
+fn store_pop_early_flag_sticks_with_later_locals() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let got = 0;
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let i = 0;
+    while i < 3 {
+        got = 1;
+        i = i + 1;
+    }
+    print "%i", got;
+    print "%i", a + b + c;
+}
+"#,
+    );
+    assert_eq!(output, "16");
+}
+
+/// P1: empty array + push + index round-trip (and under GC pressure).
+#[test]
+fn empty_array_push_and_index_round_trip() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let arr: [int] = [];
+    push(arr, 4);
+    push(arr, 1);
+    push(arr, 4);
+    print "%i", len(arr);
+    print "%i", arr[0];
+    print "%i", arr[2];
+    let i = 0;
+    while i < 80 {
+        push(arr, i);
+        i = i + 1;
+    }
+    print "%i", arr[0];
+}
+"#,
+    );
+    // len=3, arr[0]=4, arr[2]=4, arr[0]=4 after growth
+    assert_eq!(output, "3444");
+}
+
+/// P1: `arr[i] = x` then read-back.
+#[test]
+fn array_index_store_round_trip() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let arr = [0, 0, 0];
+    arr[1] = 42;
+    print "%i", arr[0];
+    print "%i", arr[1];
+    print "%i", arr[2];
+}
+"#,
+    );
+    assert_eq!(output, "0420");
+}
+
+/// P3: `return -1;` compiles and runs.
+#[test]
+fn return_negative_one_works() {
+    let output = run_example_src(
+        r#"
+fn neg() -> int { return -1; }
+fn main() {
+    print "%i", neg();
+    print "%i", 0 - 1;
+}
+"#,
+    );
+    assert_eq!(output, "-1-1");
+}
+
+/// P4: natural Ok/Ok/Err arm order (Err last) must not panic at codegen.
+#[test]
+fn nested_match_ok_arms_before_err_dispatches() {
+    let output = run_example_src(
+        r#"
+fn unwrap_result(Result r) -> int {
+    return match r {
+        Result::Ok(Option::Some(v)) => v,
+        Result::Ok(Option::None) => 0,
+        Result::Err(_) => -1,
+    };
+}
+fn main() {
+    print "%i", unwrap_result(Result::Ok(Option::Some(42)));
+    print "%i", unwrap_result(Result::Ok(Option::None));
+    print "%i", unwrap_result(Result::Err("oops"));
+}
+"#,
+    );
+    assert_eq!(output, "420-1");
+}
+
+/// P6: class field holding an enum round-trips via GetField.
+#[test]
+fn class_enum_field_access_round_trip() {
+    let output = run_example_src(
+        r#"
+enum Status {
+    Ready,
+    Done(int),
+}
+
+class Box {
+    status: Status,
+}
+
+impl Box {
+    fn get() -> Status {
+        return self.status;
+    }
+}
+
+fn main() {
+    let b = new Box(Status::Done(9));
+    let s = b.get();
+    print "%i", match s {
+        Status::Ready => 0,
+        Status::Done(v) => v,
+    };
+    print "%i", match b.status {
+        Status::Ready => 0,
+        Status::Done(v) => v,
+    };
+}
+"#,
+    );
+    assert_eq!(output, "99");
+}
+
+/// P6: match-bound constructor payloads must land in `codegen_var_types`
+/// so field access uses the payload enum's LoadField index — not the
+/// defensive `LoadField(0)` fallback (which silently returns the wrong
+/// field when the target is not field 0).
+#[test]
+fn match_bound_enum_field_access_uses_correct_index() {
+    let output = run_example_src(
+        r#"
+enum Info {
+    Info { kind: int, code: int },
+}
+
+enum Wrap {
+    Empty,
+    Full(Info),
+}
+
+fn read_code(Wrap w) -> int {
+    return match w {
+        Wrap::Empty => 0,
+        Wrap::Full(e) => e.code,
+    };
+}
+
+fn main() {
+    let w = Wrap::Full(Info::Info { kind: 1, code: 42 });
+    print "%i", read_code(w);
+    print "%i", match w {
+        Wrap::Empty => 0,
+        Wrap::Full(e) => e.kind,
+    };
+}
+"#,
+    );
+    // Pre-fix: e.code → LoadField(0) → kind (1), not code (42).
+    assert_eq!(output, "421");
+}
