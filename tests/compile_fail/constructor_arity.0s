@@ -1,0 +1,9 @@
+// Expected: compile failure — constructor arity mismatch.
+enum Opt {
+    Some(int),
+    None,
+}
+
+fn main() {
+    let o = Opt::Some(1, 2);
+}

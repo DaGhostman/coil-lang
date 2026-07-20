@@ -1,0 +1,57 @@
+// Array literals, index, mutation, push, len, for-in.
+test("literal index") {
+    let a = [10, 20, 30];
+    assert(a[0] == 10)?;
+    assert(a[1] == 20)?;
+    assert(a[2] == 30)?;
+}
+
+test("store index") {
+    let a = [1, 2, 3];
+    a[1] = 99;
+    assert(a[1] == 99)?;
+    assert(a[0] == 1)?;
+}
+
+test("compound index assign") {
+    let a = [10, 20, 30];
+    a[1] += 5;
+    assert(a[1] == 25)?;
+}
+
+test("len of literal") {
+    let a = [1, 2, 3, 4];
+    assert(len(a) == 4)?;
+}
+
+test("push grows array") {
+    let a = [1];
+    push(a, 2);
+    push(a, 3);
+    assert(len(a) == 3)?;
+    assert(a[0] == 1)?;
+    assert(a[1] == 2)?;
+    assert(a[2] == 3)?;
+}
+
+test("empty then push") {
+    let a = [0];
+    a[0] = 7;
+    push(a, 8);
+    assert(len(a) == 2)?;
+    assert(a[1] == 8)?;
+}
+
+test("for in array") {
+    let sum = 0;
+    for x in [1, 2, 3, 4] {
+        sum = sum + x;
+    }
+    assert(sum == 10)?;
+}
+
+test("nested array index") {
+    let a = [[1, 2], [3, 4]];
+    assert(a[0][1] == 2)?;
+    assert(a[1][0] == 3)?;
+}

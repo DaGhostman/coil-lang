@@ -44,6 +44,7 @@ fn print_help() {
          \x20 compile    Compile an entry file (must define main) to a .c0s archive\n\
          \x20 run        Execute a previously compiled .c0s archive\n\
          \x20 test       Compile and run every .0s file under [path] (default: ./tests)\n\
+         \x20             Files under a `compile_fail/` directory must FAIL to compile\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` (default: out.c0s)\n\
@@ -375,6 +376,13 @@ fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// Negative syntax / type tests live under any path segment named `compile_fail`.
+/// Those files must fail to compile; a successful compile is a harness failure.
+fn is_compile_fail(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == "compile_fail")
+}
+
 fn run_test_case(
     pipeline: &Pipeline,
     bytecode: &[Byte],
@@ -426,67 +434,105 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
             break;
         }
         let display = path.display().to_string();
+        let expect_compile_fail = is_compile_fail(path);
         let format = config.format;
-        let mut pipeline = Pipeline::with_reporter(config.clone(), writer_for(format));
+        // Expected failures still typecheck; suppress ariadne noise so the
+        // harness summary stays readable when many compile_fail files exist.
+        let mut pipeline = if expect_compile_fail {
+            Pipeline::with_reporter(config.clone(), Box::new(std::io::sink()))
+        } else {
+            Pipeline::with_reporter(config.clone(), writer_for(format))
+        };
 
-        let compiled = pipeline.compile_src_from_file(&display);
+        // catch_unwind: type errors that slip into codegen can panic; for
+        // compile_fail that still counts as "did not compile successfully".
+        let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipeline.compile_src_from_file(&display)
+        }));
         let cases: Vec<(String, u32)> = pipeline.test_cases().to_vec();
         let _ = pipeline.finish_reporting();
 
-        let file_ok = match compiled {
-            Ok((bytecode, constants)) => {
-                let entry = path.as_path();
-                if cases.is_empty() {
-                    // Legacy: whole-file `main` is one opaque case.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute_archive(&pipeline, &bytecode, &constants, Some(entry))
-                    }));
-                    let ok = match result {
-                        Ok(panicked) => !panicked,
-                        Err(_) => false,
-                    };
-                    if ok {
-                        passed += 1;
-                    } else {
-                        failed += 1;
-                        eprintln!("> Test \"{display}\" failed");
-                        if fail_fast {
-                            stop = true;
-                        }
-                    }
-                    ok
-                } else {
-                    let mut any_fail = false;
-                    for (name, offset) in &cases {
-                        let ok = run_test_case(
-                            &pipeline,
-                            &bytecode,
-                            &constants,
-                            Some(entry),
-                            name,
-                            *offset,
-                        );
-                        if ok {
-                            passed += 1;
-                        } else {
-                            failed += 1;
-                            any_fail = true;
-                            if fail_fast {
-                                stop = true;
-                                break;
-                            }
-                        }
-                    }
-                    !any_fail
-                }
-            }
-            Err(()) => {
+        let file_ok = if expect_compile_fail {
+            let rejected = match &compiled {
+                Ok(Err(())) => true,
+                Err(_) => true, // panic during compile ⇒ not a successful build
+                Ok(Ok(_)) => false,
+            };
+            if rejected {
+                passed += 1;
+                true
+            } else {
                 failed += 1;
-                eprintln!("> Test \"{display}\" failed");
+                eprintln!("> Test \"{display}\" failed (expected compile failure)");
                 if fail_fast {
                     stop = true;
                 }
                 false
+            }
+        } else {
+            match compiled {
+                Err(_) => {
+                    failed += 1;
+                    eprintln!("> Test \"{display}\" failed (compiler panicked)");
+                    if fail_fast {
+                        stop = true;
+                    }
+                    false
+                }
+                Ok(Err(())) => {
+                    failed += 1;
+                    eprintln!("> Test \"{display}\" failed");
+                    if fail_fast {
+                        stop = true;
+                    }
+                    false
+                }
+                Ok(Ok((bytecode, constants))) => {
+                    let entry = path.as_path();
+                    if cases.is_empty() {
+                        // Legacy: whole-file `main` is one opaque case.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            execute_archive(&pipeline, &bytecode, &constants, Some(entry))
+                        }));
+                        let ok = match result {
+                            Ok(panicked) => !panicked,
+                            Err(_) => false,
+                        };
+                        if ok {
+                            passed += 1;
+                        } else {
+                            failed += 1;
+                            eprintln!("> Test \"{display}\" failed");
+                            if fail_fast {
+                                stop = true;
+                            }
+                        }
+                        ok
+                    } else {
+                        let mut any_fail = false;
+                        for (name, offset) in &cases {
+                            let ok = run_test_case(
+                                &pipeline,
+                                &bytecode,
+                                &constants,
+                                Some(entry),
+                                name,
+                                *offset,
+                            );
+                            if ok {
+                                passed += 1;
+                            } else {
+                                failed += 1;
+                                any_fail = true;
+                                if fail_fast {
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                        }
+                        !any_fail
+                    }
+                }
             }
         };
 
@@ -828,6 +874,14 @@ mod tests {
         assert!(files[0] < files[1]);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn is_compile_fail_detects_path_segment() {
+        assert!(is_compile_fail(Path::new("tests/compile_fail/bad.0s")));
+        assert!(is_compile_fail(Path::new("/tmp/compile_fail/x.0s")));
+        assert!(!is_compile_fail(Path::new("tests/arithmetic.0s")));
+        assert!(!is_compile_fail(Path::new("tests/compile_fail_not/x.0s")));
     }
 
     #[test]
