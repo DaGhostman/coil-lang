@@ -5,7 +5,7 @@ zero-script can call code outside the VM in two ways:
 1. **Compile-time `extern` blocks** — declare C functions in source; the compiler emits `dload`, `declare`, and `invoke` bytecode for you.
 2. **Runtime `dload` / `declare` / `invoke`** — load a shared library and call functions entirely from script, with no recompile.
 
-Both paths use **libffi** for dynamic dispatch. Signatures are **explicit** — there is no runtime type guessing.
+Both paths use **libffi** for dynamic dispatch. Signatures are **explicit** — there is no runtime type guessing. Runtime `dload` / `declare` / `invoke` each return `prelude::Result` (not a sentinel `-1`).
 
 ---
 
@@ -37,7 +37,7 @@ An `extern` block names a shared library and lists function signatures. Calls to
 From `examples/strlen.0s`:
 
 ```0s
-extern "libc.so.6" {
+extern "c" {
     fn strlen(string s) -> int;
 }
 
@@ -49,6 +49,8 @@ fn main() {
 
 **Expected output:** `5`
 
+`extern "c"` is the portable libc alias — the resolver maps it to `libc.so.6` (Linux), `libSystem` (macOS), `ucrtbase` (Windows), and so on. On load/declare failure the compiler-emitted unwrap panics with a clear message.
+
 ### Syntax
 
 ```
@@ -58,7 +60,7 @@ extern_fn    ::= 'fn' IDENT '(' arg_list ')' ('->' type_name)? ';'
 
 | Part | Meaning |
 |------|---------|
-| `"libc.so.6"` | Path or soname passed to `dlopen` at runtime |
+| `"c"` | Portable libc alias (or any path / soname / basename) |
 | `fn strlen(string s) -> int;` | Signature only — no body, trailing `;` required |
 | `strlen("hello")` | Ordinary call site; compiler wires FFI behind the scenes |
 
@@ -66,9 +68,9 @@ extern_fn    ::= 'fn' IDENT '(' arg_list ')' ('->' type_name)? ';'
 
 For each `extern` function the compiler roughly:
 
-1. Calls `dload("libc.so.6")` once and stores the library handle.
-2. Calls `declare(lib, "strlen", (string), int)` and stores the function id.
-3. At each call site, pushes arguments and executes `FfiInvoke`.
+1. Calls `dload(...)` once and stores the library handle (`Result` unwrapped — panic on `Err`).
+2. Calls `declare(lib, "strlen", (string), int)` and stores the function id (same unwrap).
+3. At each call site, pushes arguments and executes `FfiInvoke` (unwraps `Result` again).
 
 You do not write those steps by hand when using `extern` blocks.
 
@@ -112,10 +114,15 @@ int sum(int a, int b) {
 }
 ```
 
-**Build the shared library:**
+**Build the shared library** (from repo root):
 
 ```bash
-cc -shared -fPIC -o libsum.so examples/sum.c
+# Linux
+cc -shared -fPIC -o examples/libsum.so examples/sum.c
+# macOS
+cc -dynamiclib -o examples/libsum.dylib examples/sum.c
+# Windows
+clang -shared -o examples/sum.dll examples/sum.c
 ```
 
 **zero-script** (`examples/ffi_sum.0s`):
@@ -125,18 +132,23 @@ use ffi::*;
 use ffi::types::*;
 
 fn main() {
-    let lib = dload("libsum.so");
-    let sum_id = declare(
-        lib,
-        "sum",
-        (Int, Int),
-        Int,
-    );
-    print "%i", invoke(lib, sum_id, (40, 2));
+    let lib = match dload("sum") {
+        Result::Ok(h) => h,
+        Result::Err(msg) => panic msg,
+    };
+    let sum_id = match declare(lib, "sum", (Int, Int), Int) {
+        Result::Ok(id) => id,
+        Result::Err(msg) => panic msg,
+    };
+    let n = match invoke(lib, sum_id, (40, 2)) {
+        Result::Ok(v) => v,
+        Result::Err(msg) => panic msg,
+    };
+    print "%i", n;
 }
 ```
 
-Tag constructors (`Int`, `Ptr`, …) come from `ffi::types` — you do not declare them in source.
+`dload("sum")` resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` and `[ffi] search_paths` in `zero.toml`. Tag constructors (`Int`, `Ptr`, …) come from `ffi::types` — you do not declare them in source.
 
 **Expected output:** `42`
 
@@ -144,9 +156,9 @@ Tag constructors (`Int`, `Ptr`, …) come from `ffi::types` — you do not decla
 
 | Builtin | Signature | Returns |
 |---------|-----------|---------|
-| `dload(path)` | One string argument | Library handle (`int` at bytecode level — heap object address) |
-| `declare(lib, name, args_tuple, ret)` | Four arguments | Function id (`int`), or `-1` on failure |
-| `invoke(lib, fn_id, args_tuple)` | Three arguments | Value matching declared return type; nothing pushed for `void` |
+| `dload(path)` | One string argument | `Result<int, string>` — `Ok` = library handle |
+| `declare(lib, name, args_tuple, ret)` | Four arguments | `Result<int, string>` — `Ok` = function id; `Err` on missing symbol / libffi error |
+| `invoke(lib, fn_id, args_tuple)` | Three arguments | `Result<T, string>` — `T` from the matching `declare` return tag |
 
 Argument types and call arguments are **single tuple expressions**, not flat comma lists.
 
@@ -159,6 +171,8 @@ invoke(lib, id, (40, 2));
 declare(lib, "sum", Int, Int);
 invoke(lib, id, 40, 2);
 ```
+
+Unwrap with `match` (as above) or `?` inside a `Result`-returning function. Failed `dload` / `declare` no longer return `-1` or `0`.
 
 ### FFI type tags
 
@@ -190,22 +204,25 @@ Runtime tag mapping:
 ### Minimal workflow
 
 1. Write C functions with C linkage and stable symbol names.
-2. Compile with `-shared -fPIC`.
-3. Place the `.so` where `dlopen` can find it, or pass a full path to `dload`.
+2. Compile as a shared library for your platform (see table below).
+3. Place the artifact where `[ffi] search_paths` or the dynamic linker can find it, or pass a full path to `dload`.
 
-```bash
-cc -shared -fPIC -o libsum.so sum.c
-```
+| Platform | Command |
+|----------|---------|
+| Linux | `cc -shared -fPIC -o examples/libsum.so examples/sum.c` |
+| macOS | `cc -dynamiclib -o examples/libsum.dylib examples/sum.c` |
+| Windows | `clang -shared -o examples/sum.dll examples/sum.c` |
 
 ### Naming and loading
 
 | Approach | Example | Notes |
 |----------|---------|-------|
-| Full path | `dload("libsum.so")` | Most portable when cwd is known |
-| Soname | `dload("libc.so.6")` | Depends on dynamic linker search path |
+| Basename | `dload("sum")` | Resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` + `[ffi] search_paths` |
+| Portable libc | `extern "c"` / `dload("c")` | Maps to the platform C library |
+| Full path | `dload("/abs/path/libsum.so")` | Bypasses search when the exact file is known |
 | Relative path | `dload("./vendor/libfoo.so")` | Works if cwd at runtime matches |
 
-The `extern` block string and the `dload` path use the same `dlopen` mechanism.
+The `extern` block string and the `dload` path use the same resolver (`base_dir`, `[ffi] search_paths`, system search).
 
 ### C function guidelines
 
@@ -239,7 +256,7 @@ All dynamic calls go through **libffi**:
 - `DeclareFFI` prepares a libffi call interface (`ffi_cif`) at declare time.
 - `FfiInvoke` marshals zero-script values into libffi arguments and invokes the function pointer.
 
-If libffi rejects a signature combination, declare returns `-1` and the VM surfaces an error. Build failures mentioning `libffi` mean the development headers are missing — install the platform package from [Prerequisites](#prerequisites).
+If libffi rejects a signature combination, `declare` returns `Result::Err`. Build failures mentioning `libffi` mean the development headers are missing — install the platform package from [Prerequisites](#prerequisites).
 
 ---
 
@@ -262,10 +279,10 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 | Limitation | Detail |
 |------------|--------|
-| Explicit signatures | Wrong arity or tag → runtime failure or `-1` from `declare` |
+| Explicit signatures | Wrong arity or tag → `Result::Err` from `declare` / `invoke` |
 | Struct returns | `extern struct` + `declare(..., Point)` returns a record; fields via `.x` |
 | Callback returns | Opaque `Ptr` / function address — no auto-trampoline; re-`declare` to call |
-| `invoke` return typing | Refined from `let id = declare(..., ret)` when `fn_id` is that binding; else `int` |
+| `invoke` return typing | `Result<T, string>` where `T` is refined from `let id = declare(..., ret)` when `fn_id` is that binding; else falls back |
 
 ### Safety
 
@@ -281,10 +298,11 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 | Limitation | Detail |
 |------------|--------|
-| Failed `dload` | Returns `-1`; check before `declare` |
-| Failed `declare` | Returns `-1` (missing symbol, libffi error) |
-| No automatic `out.c0s` invalidation for new `.so` | Rebuild C libraries separately; bytecode does not embed `.so` contents |
-| Archive version | FFI opcode layout is part of `ARCHIVE_VERSION`; stale `.c0s` files are rejected after compiler upgrades |
+| Failed `dload` | `Result::Err(string)` — match or `?`; never `-1` |
+| Failed `declare` | `Result::Err` (missing symbol, libffi error) |
+| `extern` failure | Compiler unwraps Results and panics with a clear message |
+| No automatic `out.c0s` invalidation for new `.so` | Rebuild C libraries separately; bytecode does not embed shared-library contents |
+| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **21**); stale `.c0s` files are rejected after compiler upgrades |
 
 ---
 
@@ -294,16 +312,16 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 |--------------------|--------------------------------------|
 | Library and API are fixed at compile time | You need runtime plugin loading |
 | You want ordinary call syntax | You build tooling or REPL-style scripts |
-| Examples: libc `strlen`, fixed vendor SDK | Examples: hot-plug extensions, user-provided `.so` |
+| Examples: libc `strlen` via `extern "c"`, fixed vendor SDK | Examples: hot-plug extensions, user-provided shared libs |
 
 ---
 
 ## Exercises
 
 1. Run `examples/strlen.0s` and confirm output `5`. Change the string and predict the new length.
-2. Build `libsum.so` from `examples/sum.c` and run `examples/ffi_sum.0s`.
-3. Add a C function `int triple(int x) { return x * 3; }`, export it from the same `.so`, and call it via `declare`/`invoke`.
-4. Try an incorrect signature (e.g. declare `sum` with one `int` argument) and observe the failure mode.
+2. Build the platform `libsum` artifact from `examples/sum.c` and run `examples/ffi_sum.0s`.
+3. Add a C function `int triple(int x) { return x * 3; }`, export it from the same library, and call it via `declare`/`invoke` (unwrap the `Result`s).
+4. Try an incorrect signature (e.g. declare `sum` with one `int` argument) and observe `Result::Err`.
 
 ---
 

@@ -163,20 +163,24 @@ dload(path_expr)
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| `path_expr` | `string` | Path or name passed to `dlopen` |
+| `path_expr` | `string` | Basename, path, or alias passed to the library resolver |
 
-Returns a library handle as `int` (heap library object address), or `-1` on failure.
+Returns `Result<int, string>` — `Ok` is the library handle (heap object address). Failure is `Err`, never `-1`.
 
 ```0s
 use ffi::*;
-let lib = dload("libsum.so");
+let lib = match dload("sum") {
+    Result::Ok(h) => h,
+    Result::Err(msg) => panic msg,
+};
 ```
 
 Notes:
 
 - Requires libffi-enabled build.
-- Prefer full paths when cwd is unpredictable.
-- Same mechanism as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::*`).
+- `dload("sum")` resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` and `[ffi] search_paths`.
+- `dload("c")` / `extern "c"` is the portable libc alias.
+- Same resolver as the string in `extern "..." { ... }` blocks (`extern` does **not** require `use ffi::*`; it unwraps Results and panics on failure).
 
 ---
 
@@ -220,12 +224,12 @@ declare(lib, name, (arg_types...), ret_type)
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| `lib` | `int` | Handle from `dload` |
+| `lib` | `int` | Handle from a successful `dload` (`Result::Ok`) |
 | `name` | `string` | Symbol name for `dlsym` |
 | `(arg_types...)` | Tuple of FFI tags | One tag per parameter |
 | `ret_type` | FFI tag | Return type (`void` allowed) |
 
-Returns a function id (`int`), or `-1` if symbol missing or libffi rejects signature.
+Returns `Result<int, string>` — `Ok` is the function id; `Err` if the symbol is missing or libffi rejects the signature.
 
 ### FFI type tags (`ffi::types`)
 
@@ -263,16 +267,18 @@ invoke(lib, fn_id, (args...))
 | Argument | Type | Description |
 |----------|------|-------------|
 | `lib` | `int` | Same library handle |
-| `fn_id` | `int` | Id from `declare` |
+| `fn_id` | `int` | Id from a successful `declare` |
 | `(args...)` | Tuple of values | Must match declared arity and types |
 
-Returns a value per the declared return type. `void` functions push nothing meaningful — do not rely on a return value.
+Returns `Result<T, string>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = match declare(...) { ... }` so the side table can refine later `invoke` calls.
 
 ```0s
-print "%i", invoke(lib, sum_id, (40, 2));
+let n = match invoke(lib, sum_id, (40, 2)) {
+    Result::Ok(v) => v,
+    Result::Err(msg) => panic msg,
+};
+print "%i", n;
 ```
-
-`invoke` returns the type recorded from the matching `declare(..., ret)` (or `unit` for `void`). Bind the `declare` result with `let id = declare(...)` so the side table can refine later `invoke` calls.
 
 ---
 
@@ -281,7 +287,7 @@ print "%i", invoke(lib, sum_id, (40, 2));
 Not separate builtins — the compiler lowers extern declarations to `dload` / `declare` / `invoke` sequences. User code calls look like normal functions:
 
 ```0s
-extern "libc.so.6" {
+extern "c" {
     fn strlen(string s) -> int;
 }
 
@@ -290,7 +296,7 @@ fn main() {
 }
 ```
 
-See [FFI tutorial](../tutorial/07-ffi.md).
+`extern "c"` is the portable libc alias. Compiler-emitted setup unwraps `dload`/`declare`/`invoke` Results and panics with a clear message on failure. See [FFI tutorial](../tutorial/07-ffi.md).
 
 ---
 

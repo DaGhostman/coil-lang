@@ -203,12 +203,12 @@ extern_fn    ::= 'fn' IDENT arg_list ('->' IDENT)? ';'
 Example:
 
 ```0s
-extern "libc.so.6" {
+extern "c" {
     fn strlen(string s) -> int;
 }
 ```
 
-See [FFI tutorial](../tutorial/07-ffi.md).
+`extern "c"` is the portable libc alias. See [FFI tutorial](../tutorial/07-ffi.md).
 
 ### Classes and impl
 

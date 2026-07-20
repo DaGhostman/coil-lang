@@ -8,7 +8,7 @@ cargo run -- examples/<file>.0s
 
 Delete `out.c0s` after editing source to force recompilation.
 
-> **Note:** The CLI uses multi-file discovery (`Pipeline::compile_src_from_file`) when a `zero.toml` is present, so `use` / `mod` examples such as `modules.0s` work from `cargo run`. FFI examples need **libffi** and sometimes a built shared library (`examples/libsum.so`).
+> **Note:** The CLI uses multi-file discovery (`Pipeline::compile_src_from_file`) when a `zero.toml` is present, so `use` / `mod` examples such as `modules.0s` work from `cargo run`. FFI examples need **libffi** and sometimes a built shared library (`libsum.so` / `libsum.dylib` / `sum.dll`).
 
 ---
 
@@ -975,10 +975,10 @@ Calling C from zero-script. Requires **libffi**.
 
 ### `examples/strlen.0s`
 
-**Demonstrates:** Compile-time `extern` block — no manual `dload`/`declare` in source. The compiler emits library load and symbol registration bytecode.
+**Demonstrates:** Compile-time `extern` block — no manual `dload`/`declare` in source. The compiler emits library load and symbol registration bytecode (unwraps `Result`, panics on failure).
 
 ```0s
-extern "libc.so.6" {
+extern "c" {
     fn strlen(string s) -> int;
 }
 
@@ -992,34 +992,41 @@ fn main() {
 |---|---|
 | **Run** | `cargo run -- examples/strlen.0s` |
 | **Output** | `5` |
-| **Requires** | `libc.so.6` available to the dynamic linker (typical on Linux) |
+| **Requires** | Platform C library via `extern "c"` (`libc.so.6` / `libSystem` / `ucrtbase`, …) |
 
 ---
 
 ### `examples/ffi_sum.0s`
 
-**Demonstrates:** Userland FFI — `dload`, `declare` with tuple argument types, `invoke` with tuple values.
+**Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result`; unwrap with `match` (or `?`).
 
 ```0s
 use ffi::*;
 use ffi::types::*;
 
-let lib = dload("libsum.so");
-let sum_id = declare(
-    lib,
-    "sum",
-    (Int, Int),
-    Int,
-);
-print "%i", invoke(lib, sum_id, (40, 2));
+fn main() {
+    let lib = match dload("sum") {
+        Result::Ok(h) => h,
+        Result::Err(msg) => panic msg,
+    };
+    let sum_id = match declare(lib, "sum", (Int, Int), Int) {
+        Result::Ok(id) => id,
+        Result::Err(msg) => panic msg,
+    };
+    let n = match invoke(lib, sum_id, (40, 2)) {
+        Result::Ok(v) => v,
+        Result::Err(msg) => panic msg,
+    };
+    print "%i", n;
+}
 ```
 
 | | |
 |---|---|
 | **Run** | Build the shared library first, then run |
-| **Build helper** | `cc -shared -fPIC -o libsum.so examples/sum.c` (from repo root) |
+| **Build helper** | Linux: `cc -shared -fPIC -o examples/libsum.so examples/sum.c`; macOS: `-dynamiclib` → `libsum.dylib`; Windows: `clang -shared` → `sum.dll` |
 | **Output** | `42` |
-| **Note** | Use an absolute path in `dload(...)` for portability across working directories |
+| **Note** | `dload("sum")` resolves via `platform_lib_names` + `[ffi] search_paths` (no absolute path required) |
 
 ---
 
@@ -1034,7 +1041,9 @@ int sum(int a, int b) { return a + b; }
 
 | | |
 |---|---|
-| **Compile** | `cc -shared -fPIC -o examples/libsum.so examples/sum.c` |
+| **Compile (Linux)** | `cc -shared -fPIC -o examples/libsum.so examples/sum.c` |
+| **Compile (macOS)** | `cc -dynamiclib -o examples/libsum.dylib examples/sum.c` |
+| **Compile (Windows)** | `clang -shared -o examples/sum.dll examples/sum.c` |
 
 ---
 
@@ -1044,7 +1053,7 @@ int sum(int a, int b) { return a + b; }
 
 | | |
 |---|---|
-| **Run** | Build `examples/libsum.so`, then `cargo run -- examples/ffi_struct_ret.0s` |
+| **Run** | Build the platform `libsum` artifact, then `cargo run -- examples/ffi_struct_ret.0s` |
 | **Output** | `34` |
 
 ---
@@ -1055,14 +1064,14 @@ int sum(int a, int b) { return a + b; }
 
 | | |
 |---|---|
-| **Run** | Build `examples/libsum.so`, then `cargo run -- examples/ffi_callback_ret.0s` |
+| **Run** | Build the platform `libsum` artifact, then `cargo run -- examples/ffi_callback_ret.0s` |
 | **Output** | `1` |
 
 ---
 
 ### `examples/ffi_callback.0s` / `examples/ffi_array.0s`
 
-**Demonstrates:** Callback trampolines and pointer/array FFI shapes (see source). Require `libsum.so` / libffi.
+**Demonstrates:** Callback trampolines and pointer/array FFI shapes (see source). Require the platform `libsum` shared library / libffi.
 
 ---
 
