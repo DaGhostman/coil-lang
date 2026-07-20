@@ -4467,14 +4467,13 @@ impl Compiler {
                     };
 
                     if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
-                        // Stage arg bytecode in a local Vec to
-                        // release the `&mut self.bytecode` borrow
-                        // before the loop calls `self.do_compile`.
-                        let mut arg_bc = Vec::new();
+                        // Same discipline as HostInvoke: emit lib/fn_id first,
+                        // then compile args onto `self.bytecode`. Nested IO
+                        // HostInvoke writes directly to `self.bytecode` and
+                        // returns an empty slice — staging args into a side
+                        // Vec first left those bytes *before* the LOADs, so
+                        // MakeTuple packed the wrong stack values.
                         let arity = if let Some(items) = args {
-                            for arg in items {
-                                arg_bc.append(&mut self.do_compile(arg));
-                            }
                             items.len()
                         } else {
                             0
@@ -4483,7 +4482,12 @@ impl Compiler {
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(fn_id_slot));
-                        self.bytecode.append(&mut arg_bc);
+                        if let Some(items) = args {
+                            for arg in items {
+                                let mut arg_bc = self.do_compile(arg);
+                                self.bytecode.append(&mut arg_bc);
+                            }
+                        }
                         self.bytecode
                             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
                         self.bytecode
@@ -9546,6 +9550,59 @@ print \"%i\", len(a); \
             "CodePtr must carry full 32-bit targets (> u16::MAX)"
         );
         assert!(matches!(bc[1].bytecode(), Instruction::CallIndirect));
+    }
+
+    /// Nested IO HostInvoke (`read_to_end(stdin())`) must emit the outer
+    /// native-id `CONST` *before* the nested `HostInvoke` in bytecode.
+    /// Staging args into a side buffer first left nested invokes above the
+    /// id (piped stdin then looked empty).
+    #[test]
+    fn nested_io_host_invoke_emits_outer_const_before_inner_host_invoke() {
+        use common::Instruction;
+        let src = "\
+use io::*; \
+fn main() { \
+  let _ = read_to_end(stdin()); \
+}";
+        let mut ast = Pratt::default().parse(src).expect("parse failed");
+        let mut compiler = Compiler::default();
+        // Stable ids matching Pipeline::register_io_natives order is not
+        // required — only that outer CONST(id=read_to_end) precedes the
+        // inner HostInvoke for stdin.
+        compiler.register_native_id("stdin", 1);
+        compiler.register_native_id("read_to_end", 2);
+        let bc = compiler.compile("", &mut ast);
+
+        let host_idxs: Vec<usize> = bc
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::HostInvoke))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            host_idxs.len() >= 2,
+            "expected nested HostInvoke (stdin + read_to_end); got {}",
+            host_idxs.len()
+        );
+        let outer_host = *host_idxs.last().expect("outer HostInvoke");
+        // Outer native id is CONST value 2, emitted before its args (which
+        // include the inner HostInvoke).
+        let outer_const = bc[..outer_host]
+            .iter()
+            .rposition(|b| {
+                matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == 2
+            })
+            .expect("outer read_to_end CONST(id=2) before outer HostInvoke");
+        let inner_host = host_idxs
+            .iter()
+            .copied()
+            .find(|&i| i < outer_host)
+            .expect("inner stdin HostInvoke before outer");
+        assert!(
+            outer_const < inner_host,
+            "outer native-id CONST must precede nested HostInvoke \
+             (const@{outer_const} vs inner@{inner_host})"
+        );
     }
 
     /// `invoke(..., (fn, …))` callback args must use relocatable `CodePtr`,

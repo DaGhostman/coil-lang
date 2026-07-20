@@ -21,9 +21,11 @@ and a sibling module imported via `use board::*;`.
 
 ## Ergonomics / gaps noticed
 
-1. **Enum fields on classes** — `t.status == Status::Todo` has crashed the VM;
+1. **Chained `board[i].status` inside `assert(...)`** can soft-fail under the
+   `test("…")` harness — bind `let t = board[i];` first, then assert on `t.status`.
+2. **Enum fields on classes** — `t.status == Status::Todo` has crashed the VM;
    status is stored as `int` instead.
-2. **Empty `[Task] = []` is unreliable** — boards use a sentinel task at index 0.
-3. **No `\n` string escapes** — demo separates fields with `" | "`.
-4. **`zero-script test` only scans `./tests` relative to CWD** — must `cd` into
+3. **Empty `[Task] = []` is unreliable** — boards use a sentinel task at index 0.
+4. **No `\n` string escapes** — demo separates fields with `" | "`.
+5. **`zero-script test` only scans `./tests` relative to CWD** — must `cd` into
    the project (no `--project` flag yet).
