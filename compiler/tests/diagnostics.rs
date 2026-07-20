@@ -1012,7 +1012,10 @@ fn declare_wrong_arity_errors() {
         r#"
         use ffi::*;
         fn main() {
-            let lib = dload("x.so");
+            let lib = match dload("x.so") {
+                Result::Ok(h) => h,
+                Result::Err(_) => 0,
+            };
             declare(lib, "f", Int);
         }
         "#,
@@ -1032,7 +1035,10 @@ fn invoke_wrong_arity_errors() {
         r#"
         use ffi::*;
         fn main() {
-            let lib = dload("x.so");
+            let lib = match dload("x.so") {
+                Result::Ok(h) => h,
+                Result::Err(_) => 0,
+            };
             let id = 0;
             invoke(lib, id);
         }

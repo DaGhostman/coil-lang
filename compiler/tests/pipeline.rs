@@ -819,42 +819,52 @@ fn example_nested_records_prints_99() {
     assert_eq!(output, "99");
 }
 
-fn ensure_ffi_libsum_built() {
+fn ensure_ffi_libsum_built() -> std::path::PathBuf {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
     let sum_c = workspace_root.join("examples/sum.c");
-    let libsum_so = workspace_root.join("examples/libsum.so");
+    let lib_name = machine::platform_shared_lib_filename("sum");
+    let libsum = workspace_root.join("examples").join(&lib_name);
 
-    // Always rebuild if the source is newer than the .so, or
-    // if the .so doesn't exist.
-    let needs_build = match (sum_c.metadata(), libsum_so.metadata()) {
+    // Always rebuild if the source is newer than the shared lib, or
+    // if the shared lib doesn't exist.
+    let needs_build = match (sum_c.metadata(), libsum.metadata()) {
         (Ok(src_meta), Ok(so_meta)) => src_meta.modified().ok() > so_meta.modified().ok(),
-        (Ok(_), Err(_)) => true, // .so doesn't exist
+        (Ok(_), Err(_)) => true,
         _ => false,
     };
-    if !needs_build && libsum_so.exists() {
-        return;
+    if !needs_build && libsum.exists() {
+        return libsum;
     }
 
-    let status = std::process::Command::new("cc")
-        .arg("-shared")
-        .arg("-fPIC")
+    let mut cmd = std::process::Command::new("cc");
+    #[cfg(target_os = "macos")]
+    {
+        cmd.arg("-dynamiclib");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        cmd.arg("-shared").arg("-fPIC");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        cmd.arg("-shared");
+    }
+    let status = cmd
         .arg("-O2")
         .arg("-o")
-        .arg(&libsum_so)
+        .arg(&libsum)
         .arg(&sum_c)
         .status();
     match status {
         Ok(s) if s.success() => {
-            // cc already wrote the file and updated its mtime.
-            // Never use File::create here — it truncates the .so.
-            if let Ok(meta) = std::fs::metadata(&libsum_so)
+            if let Ok(meta) = std::fs::metadata(&libsum)
                 && meta.len() < 256
             {
                 eprintln!(
                     "warning: {} looks truncated ({} bytes) after cc build",
-                    libsum_so.display(),
+                    libsum.display(),
                     meta.len()
                 );
             }
@@ -869,30 +879,30 @@ fn ensure_ffi_libsum_built() {
             ffi_soft_skip(&format!("FFI tests: failed to invoke cc: {e}"));
         }
     }
+    libsum
 }
 
 #[test]
 fn example_ffi_sum_via_dlopen_prints_42() {
-    ensure_ffi_libsum_built();
+    let libsum = ensure_ffi_libsum_built();
+    if !libsum.exists() {
+        ffi_soft_skip(&format!("{} not built (no C compiler?)", libsum.display()));
+        return;
+    }
 
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
-    let libsum_so = workspace_root.join("examples/libsum.so");
-    if !libsum_so.exists() {
-        ffi_soft_skip("libsum.so not built (no C compiler?)");
-        return;
-    }
 
     // Absolute dload path avoids cwd races in parallel tests.
     let full = workspace_root.join("examples/ffi_sum.0s");
-    let lib_abs = libsum_so
+    let lib_abs = libsum
         .canonicalize()
-        .unwrap_or_else(|_| libsum_so.clone());
+        .unwrap_or_else(|_| libsum.clone());
     let mut src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
     src = src.replace(
-        "dload(\"libsum.so\")",
+        "dload(\"sum\")",
         &format!("dload(\"{}\")", lib_abs.display()),
     );
 
@@ -910,9 +920,9 @@ fn example_ffi_sum_via_dlopen_prints_42() {
 
 #[test]
 fn example_strlen_prints_5() {
-    // Quick probe: if dlopen("libc.so.6") fails, skip.
-    if machine::load_library("libc.so.6").is_err() {
-        ffi_soft_skip("libc.so.6 not loadable on this platform");
+    // Quick probe: if the portable `c` alias fails, skip outside CI.
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable on this platform via resolve_library(\"c\")");
         return;
     }
 
@@ -932,6 +942,59 @@ fn example_strlen_prints_5() {
         }
     };
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
+}
+
+#[test]
+fn extern_missing_library_panics_with_message() {
+    let src = r#"
+extern "this_library_definitely_does_not_exist_xyzzy" {
+    fn noop() -> int;
+}
+fn main() {
+    print "%i", noop();
+}
+"#;
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("should compile (load failure is runtime)");
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let shared = SharedBuf(Rc::clone(&buf));
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared);
+    pipeline.wire_vm_ffi(&mut machine, None);
+    pipeline.wire_host_natives(&mut machine);
+    machine.run_raw(&bytecode, &constants);
+    assert!(
+        machine.panicked(),
+        "missing library should panic, not segfault"
+    );
+    let _ = machine.restore_output();
+    let bytes = Rc::try_unwrap(buf)
+        .expect("VM still holds a reference to the buffer")
+        .into_inner();
+    let output = String::from_utf8(bytes).expect("utf-8");
+    assert!(
+        output.contains("panic:") && output.contains("not found"),
+        "expected panic message about missing library, got: {output:?}"
+    );
+}
+
+#[test]
+fn userland_dload_missing_library_returns_err() {
+    let src = r#"
+use ffi::*;
+fn main() {
+    let r = dload("this_library_definitely_does_not_exist_xyzzy");
+    let msg = match r {
+        Result::Ok(_) => "ok",
+        Result::Err(_) => "err",
+    };
+    print "%s", msg;
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "err");
 }
 
 #[test]
@@ -1120,7 +1183,7 @@ fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
     let mut src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
     src = src.replace(
-        "dload(\"libsum.so\")",
+        "dload(\"sum\")",
         &format!("dload(\"{}\")", lib_abs.display()),
     );
     run_example_src_with_entry(&src, Some(full.as_path()))
@@ -1128,13 +1191,9 @@ fn run_ffi_example_with_lib(path: &str, lib_path: &std::path::Path) -> String {
 
 #[test]
 fn example_ffi_array_sum_prints_15() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let libsum = workspace_root.join("examples/libsum.so");
-    ensure_ffi_libsum_built();
+    let libsum = ensure_ffi_libsum_built();
     if !libsum.exists() {
-        ffi_soft_skip("libsum.so not built");
+        ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_array.0s", &libsum);
@@ -1143,13 +1202,9 @@ fn example_ffi_array_sum_prints_15() {
 
 #[test]
 fn example_ffi_callback_prints_42() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let libsum = workspace_root.join("examples/libsum.so");
-    ensure_ffi_libsum_built();
+    let libsum = ensure_ffi_libsum_built();
     if !libsum.exists() {
-        ffi_soft_skip("libsum.so not built");
+        ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_callback.0s", &libsum);
@@ -1158,15 +1213,9 @@ fn example_ffi_callback_prints_42() {
 
 #[test]
 fn example_ffi_struct_return_prints_34() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let libsum = workspace_root.join("examples/libsum.so");
-    // Rebuild when sum.c is newer (mtime check inside ensure_*). Do not
-    // delete libsum.so here — other FFI tests in this file race on that path.
-    ensure_ffi_libsum_built();
+    let libsum = ensure_ffi_libsum_built();
     if !libsum.exists() {
-        ffi_soft_skip("libsum.so not built");
+        ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_struct_ret.0s", &libsum);
@@ -1175,13 +1224,9 @@ fn example_ffi_struct_return_prints_34() {
 
 #[test]
 fn example_ffi_callback_return_prints_1() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("compiler crate must have a parent (workspace root)");
-    let libsum = workspace_root.join("examples/libsum.so");
-    ensure_ffi_libsum_built();
+    let libsum = ensure_ffi_libsum_built();
     if !libsum.exists() {
-        ffi_soft_skip("libsum.so not built");
+        ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
     let output = run_ffi_example_with_lib("examples/ffi_callback_ret.0s", &libsum);

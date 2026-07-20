@@ -3558,8 +3558,12 @@ impl Checker {
                             let pruned = apply_ty_prune(&self.subst, &var_ty);
                             self.codegen_var_types.insert(name.to_string(), pruned);
                             // `let id = declare(...)` may wrap Declare/Call in
-                            // ExprStatement/Statement — unwrap before matching.
+                            // ExprStatement/Statement/`?` — unwrap before matching.
                             let init = unwrap_expr_wrappers(next);
+                            let init = match init.1.as_ref() {
+                                Expression::Try(inner) => unwrap_expr_wrappers(inner),
+                                _ => init,
+                            };
                             let declare_args = match init.1.as_ref() {
                                 Expression::Declare(dargs) => Some(dargs.as_slice()),
                                 Expression::Call { name: callee, args }
@@ -6066,7 +6070,8 @@ impl Checker {
                 None,
             );
         }
-        int()
+        // dload → Result<int, string>
+        result_app_ty(int(), string())
     }
 
     fn infer_ffi_declare(&mut self, args: &[Output], range: Range<usize>) -> Ty {
@@ -6116,7 +6121,8 @@ impl Checker {
             ));
             self.messages.push(m);
         }
-        int()
+        // declare → Result<int, string> (fn id or error)
+        result_app_ty(int(), string())
     }
 
     fn infer_ffi_invoke(&mut self, args: &[Output], range: Range<usize>) -> Ty {
@@ -6172,7 +6178,8 @@ impl Checker {
             ));
             self.messages.push(m);
         }
-        ret_ty
+        // invoke → Result<T, string>
+        result_app_ty(ret_ty, string())
     }
 
     /// Resolve an FFI type expression to `(tag, aux)` for codegen.
@@ -12640,15 +12647,15 @@ extern struct Point {
 use ffi::*;
 use ffi::types::*;
 
-fn main() {
-    let lib = dload("libsum.so");
+fn main() -> Result<(), string> {
+    let lib = dload("sum")?;
     let make_id = declare(
         lib,
         "make_point",
         (Int32, Int32),
         Point,
-    );
-    let p = invoke(lib, make_id, (3, 4));
+    )?;
+    let p = invoke(lib, make_id, (3, 4))?;
     print "%i", p.x;
     print "%i", p.y;
 }
@@ -12944,10 +12951,10 @@ fn main() {
         let src = r#"
 use ffi::*;
 use ffi::types::*;
-fn main() {
-    let lib = dload("x.so");
-    let id = declare(lib, "sum", (Int, Int), Int);
-    let _ = invoke(lib, id, (1, 2));
+fn main() -> Result<(), string> {
+    let lib = dload("x.so")?;
+    let id = declare(lib, "sum", (Int, Int), Int)?;
+    let _ = invoke(lib, id, (1, 2))?;
 }
 "#;
         let (c, _) = check(src);
@@ -12964,10 +12971,10 @@ fn main() {
     fn ffi_types_qualified_path_works_without_import() {
         let src = r#"
 use ffi::*;
-fn main() {
-    let lib = dload("x.so");
-    let id = declare(lib, "sum", (ffi::types::Int, ffi::types::Int), ffi::types::Int);
-    let _ = invoke(lib, id, (1, 2));
+fn main() -> Result<(), string> {
+    let lib = dload("x.so")?;
+    let id = declare(lib, "sum", (ffi::types::Int, ffi::types::Int), ffi::types::Int)?;
+    let _ = invoke(lib, id, (1, 2))?;
 }
 "#;
         let (c, _) = check(src);

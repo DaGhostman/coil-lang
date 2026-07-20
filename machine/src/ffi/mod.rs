@@ -13,7 +13,7 @@ pub use call::{
 pub use closure::{OwnedClosure, VmCallFn, callback_cif, make_int_callback};
 pub use libloading::Library;
 pub use registry::{HostClosureFn, NativeFn, Natives};
-pub use resolve::{library_candidates, resolve_library};
+pub use resolve::{library_candidates, platform_shared_lib_filename, resolve_library};
 pub use signature::{FfiError, FfiSignature, FfiSignatureBuilder};
 
 use std::path::{Path, PathBuf};

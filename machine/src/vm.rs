@@ -810,15 +810,24 @@ impl<const S: usize> Machine<S> {
             Some(obj) => {
                 let l = match obj.as_ref() {
                     crate::memory::Object::Library(gc) => gc,
-                    _ => return,
+                    _ => {
+                        self.push_result_err(
+                            "invalid library handle (not a loaded library)".into(),
+                        );
+                        return;
+                    }
                 };
                 let lib_ref: &crate::memory::ObjLibrary = l.as_ref();
                 if pending.function_id < lib_ref.signatures.len() {
                     let registered = &lib_ref.signatures[pending.function_id];
                     let ffi_sig = registered.ffi_signature();
-                    let args = self
-                        .materialize_callback_args(&ffi_sig, &pending.args)
-                        .unwrap_or(pending.args);
+                    let args = match self.materialize_callback_args(&ffi_sig, &pending.args) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.push_result_err(e.to_string());
+                            return;
+                        }
+                    };
                     let mut ctx = crate::ffi::InvokeContext::new(
                         &mut self.heap as *mut Heap,
                         &self.struct_layouts,
@@ -842,13 +851,24 @@ impl<const S: usize> Machine<S> {
             )),
         };
         match invoke_result {
-            Ok(Some(v)) => self.stack.push(v),
-            Ok(None) => {}
-            #[cfg(debug_assertions)]
-            Err(e) => eprintln!("FFI invoke failed: {e}"),
-            #[cfg(not(debug_assertions))]
-            Err(_) => {}
+            Ok(Some(v)) => self.push_result_ok(v),
+            Ok(None) => self.push_result_ok(Value::default()),
+            Err(e) => self.push_result_err(e.to_string()),
         }
+    }
+
+    /// Push `Result::Ok(payload)` for userland FFI builtins.
+    fn push_result_ok(&mut self, payload: Value) {
+        let v = crate::io::alloc_result_ok(&mut self.heap, payload);
+        self.stack.push(v);
+    }
+
+    /// Push `Result::Err(string)` for userland FFI builtins.
+    fn push_result_err(&mut self, message: String) {
+        let gc = self.heap.intern(message);
+        let err = Value::from(gc.as_ptr() as *mut u8 as u64);
+        let v = crate::io::alloc_result_err(&mut self.heap, err);
+        self.stack.push(v);
     }
 
     /// Call a zero-script function at `offset` reentrantly (for FFI callbacks).
@@ -1408,10 +1428,7 @@ impl<const S: usize> Machine<S> {
                             _ => String::new(),
                         }
                     };
-                    // Try loading the library. On failure, push
-                    // 0 (a null pointer) and let the source
-                    // surface a runtime error. Subsequent invokes
-                    // on this library will fail at dispatch time.
+                    // Push `Result::Ok(handle)` or `Result::Err(string)`.
                     match crate::ffi::resolve_library(
                         &path,
                         self.base_dir.as_deref(),
@@ -1425,12 +1442,10 @@ impl<const S: usize> Machine<S> {
                             let addr = object.addr();
                             self.userland_libraries
                                 .insert(addr, std::sync::Arc::new(object));
-                            self.stack.push(Value::from(addr as *mut u8));
+                            self.push_result_ok(Value::from(addr as *mut u8));
                         }
                         Err(e) => {
-                            #[cfg(debug_assertions)]
-                            eprintln!("FFI: failed to load library `{}`: {}", path, e);
-                            self.stack.push(Value::from(0u64));
+                            self.push_result_err(e.to_string());
                         }
                     }
                 }
@@ -1492,7 +1507,7 @@ impl<const S: usize> Machine<S> {
                     let lib_val = self.stack.pop();
                     let lib_addr = lib_val.raw() as u64;
                     let lib_obj = self.userland_libraries.get(&lib_addr).cloned();
-                    let result_id = match lib_obj {
+                    match lib_obj {
                         Some(obj_arc) => {
                             let mut owned = *obj_arc;
                             let ffi_sig = crate::ffi::FfiSignature {
@@ -1508,25 +1523,19 @@ impl<const S: usize> Machine<S> {
                                 Ok(id) => {
                                     self.userland_libraries
                                         .insert(lib_addr, std::sync::Arc::new(owned));
-                                    Some(id)
+                                    self.push_result_ok(Value::from(id as i64));
                                 }
-                                Err(_e) => {
-                                    #[cfg(debug_assertions)]
-                                    eprintln!("FFI declare: {}", _e);
-                                    None
+                                Err(e) => {
+                                    self.push_result_err(e.to_string());
                                 }
                             }
                         }
                         None => {
-                            #[cfg(debug_assertions)]
-                            eprintln!("FFI declare: library at 0x{:x} is not loaded", lib_addr);
-                            None
+                            self.push_result_err(format!(
+                                "FFI declare: library at 0x{:x} is not loaded",
+                                lib_addr
+                            ));
                         }
-                    };
-                    if let Some(id) = result_id {
-                        self.stack.push(Value::from(id as i64));
-                    } else {
-                        self.stack.push(Value::from(-1_i64));
                     }
                 }
                 Instruction::HostInvoke => {
@@ -3438,14 +3447,19 @@ mod tests {
         use crate::memory::FfiType;
         use std::ffi::c_void;
 
-        let lib_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/libsum.so");
+        let lib_name = crate::ffi::platform_shared_lib_filename("sum");
+        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples")
+            .join(&lib_name);
         if !lib_path.exists() {
-            if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: libsum.so not built"); }
-            eprintln!("skipping: libsum.so not built");
+            if std::env::var_os("CI").is_some() {
+                panic!("FFI soft-skip forbidden in CI: {lib_name} not built");
+            }
+            eprintln!("skipping: {lib_name} not built");
             return;
         }
-        let lib = resolve_library(lib_path.to_str().unwrap(), None, &[]).expect("load libsum.so");
+        let lib = resolve_library(lib_path.to_str().unwrap(), None, &[])
+            .unwrap_or_else(|e| panic!("load {lib_name}: {e}"));
 
         let mut vm = Machine::<512>::default();
         install_program(
