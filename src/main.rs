@@ -687,6 +687,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_fail_fast_on_non_test_commands() {
+        assert!(parse_args(&args(&["--fail-fast", "examples/fib.0s"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.0s", "--fail-fast"])).is_err());
+        assert!(parse_args(&args(&["run", "out.c0s", "--fail-fast"])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_reserved_test_path_names() {
+        assert!(parse_args(&args(&["test", "compile"])).is_err());
+        assert!(parse_args(&args(&["test", "run"])).is_err());
+        assert!(parse_args(&args(&["test", "test"])).is_err());
+    }
+
+    #[test]
     fn parse_rejects_unrecognized_flag() {
         assert!(parse_args(&args(&["--bogus", "a.0s"])).is_err());
     }

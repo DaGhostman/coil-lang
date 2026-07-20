@@ -9452,5 +9452,72 @@ fn main() { \
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
+
+    /// `test("…") { … }` records harness metadata and emits a synthetic
+    /// `__zs_test_N` function (no user `main`).
+    #[test]
+    fn test_case_emits_metadata_and_virtual_main() {
+        use common::Instruction;
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+test("addition") {
+    assert(1 + 1 == 2)?;
+}
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &mut ast);
+        assert_eq!(compiler.test_cases().len(), 1);
+        assert_eq!(compiler.test_cases()[0].0, "addition");
+        assert!(
+            compiler.functions.contains_key("main"),
+            "virtual main required for standalone runs"
+        );
+        assert!(
+            compiler.functions.contains_key("__zs_test_0"),
+            "synthetic case fn missing"
+        );
+        // Virtual main calls each case, then may Panic on aggregate failure.
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "virtual main must CALL case bodies"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::Panic)),
+            "virtual main must Panic when any case failed"
+        );
+    }
+
+    /// Multiple cases keep source order in harness metadata.
+    #[test]
+    fn test_cases_preserve_source_order_in_metadata() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+test("a") { assert(true)?; }
+test("b") { assert(true)?; }
+"#,
+            )
+            .expect("parse");
+        let mut compiler = Compiler::default();
+        let _ = compiler.compile("", &mut ast);
+        let names: Vec<&str> = compiler
+            .test_cases()
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(compiler.functions.contains_key("__zs_test_0"));
+        assert!(compiler.functions.contains_key("__zs_test_1"));
+        // Case offsets must be distinct (peephole may move them, but not merge).
+        assert_ne!(
+            compiler.test_cases()[0].1,
+            compiler.test_cases()[1].1,
+            "two cases must not share the same bytecode offset"
+        );
+    }
 }
 // temp - will remove

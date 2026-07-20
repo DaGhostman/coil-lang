@@ -13965,6 +13965,46 @@ test(name) { assert(true)?; }
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn test_case_registers_multiple_names_in_source_order() {
+        let (mut c, _) = check(
+            r#"
+test("first") { assert(true)?; }
+test("second") { assert(1 == 1)?; }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            c.test_case_names(),
+            &["first".to_string(), "second".to_string()]
+        );
+        assert!(c.fn_is_result_mode("__zs_test_0"));
+        assert!(c.fn_is_result_mode("__zs_test_1"));
+    }
+
+    #[test]
+    fn test_case_rejects_bare_int_return_outside_result_wrap() {
+        // Bodies are Result-mode: a bare `return 1;` must not typecheck as Ok.
+        let msgs = assert_messages(
+            r#"
+test("bad") {
+    return 1;
+}
+"#,
+        );
+        assert!(
+            msgs.iter().any(|m| m.message().contains("Type mismatch")
+                || m.message().contains("mismatch")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
 }
 
 
