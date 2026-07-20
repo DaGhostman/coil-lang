@@ -668,7 +668,6 @@ impl Pipeline {
         let mut already_scanned: Vec<PathBuf> = Vec::new();
         #[cfg(debug_assertions)]
         let mut depth = 0usize;
-        let mut prev_len = self.worklist.len();
         loop {
             let item = match self.worklist.pop_front() {
                 Some(i) => i,
@@ -728,16 +727,19 @@ impl Pipeline {
                 }
             };
             self.enqueue_uses(&ast);
-            // Termination check: if the worklist
-            // length didn't change after this pass,
-            // we're done. This is true when
-            // `enqueue_uses` found no new
-            // dependencies.
-            let new_len = self.worklist.len();
-            if new_len == prev_len {
+            // Only stop when every worklist entry has been
+            // scanned. Length-stable checks alone are wrong:
+            // scanning the first of two deps (`use a::*; use
+            // b::*;`) adds nothing new while `b` is still
+            // unscanned — glob expansion then sees an empty
+            // functions table for that module.
+            if self
+                .worklist
+                .iter()
+                .all(|w| already_scanned.contains(&w.file))
+            {
                 break;
             }
-            prev_len = new_len;
         }
         #[cfg(debug_assertions)]
         eprintln!(

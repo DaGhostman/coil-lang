@@ -8049,10 +8049,16 @@ impl Checker {
             Pattern::Binding { name } => {
                 // `name => body` binds `name` to the scrutinee in
                 // the arm's env. This makes the arm cover every
-                // case (Rust semantics).
+                // case (Rust semantics). Also record in the
+                // codegen side-table so `e.kind` on a match-bound
+                // enum (e.g. `Result::Err(e)`) emits LoadField,
+                // not GetField.
+                let pruned = apply_ty_prune(&self.subst, expected_ty);
                 self.env
-                    .insert_top(name.to_string(), Scheme::mono(expected_ty.clone()));
-                expected_ty.clone()
+                    .insert_top(name.to_string(), Scheme::mono(pruned.clone()));
+                self.codegen_var_types
+                    .insert(name.to_string(), pruned.clone());
+                pruned
             }
             Pattern::Constructor {
                 enum_name,

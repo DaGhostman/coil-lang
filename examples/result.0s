@@ -3,9 +3,9 @@
 // dispatch. Output: 420-1
 fn unwrap_result(Result r) -> int {
     return match r {
-        Result::Err(_) => -1,
         Result::Ok(Option::Some(v)) => v,
         Result::Ok(Option::None) => 0,
+        Result::Err(_) => -1,
     };
 }
 
