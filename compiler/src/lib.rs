@@ -323,6 +323,102 @@ fn emit_inner_test<'compiler>(
     }
 }
 
+/// Collect `name → Ty` for every binding in a match pattern.
+///
+/// Used so Access codegen (`p.y`) sees the *current arm's* binding type
+/// rather than whatever last arm wrote into the flat
+/// `codegen_var_types` side-table (same name reused across arms with
+/// different payload types would otherwise emit the wrong `LoadField`).
+///
+/// Open schema placeholders (`Ty::Var`, or `Ty::Con("T")` type-param
+/// markers from poly enums like `Option` / `Result` / `Box<T>`) are
+/// **not** inserted — they would shadow the instantiated binding type
+/// that `infer_pattern` already wrote into `codegen_var_types`.
+fn collect_pattern_binding_types(
+    checker: &Checker,
+    pattern: &Pattern<'_>,
+    out: &mut HashMap<String, Ty>,
+) {
+    match pattern {
+        Pattern::Wildcard => {}
+        Pattern::Binding { .. } => {
+            // Bare `name =>` needs the scrutinee type from the side-table;
+            // caller may fill that in. Constructor/record payloads below
+            // carry declared field types.
+        }
+        Pattern::Constructor {
+            enum_name,
+            variant_name,
+            payload,
+        } => {
+            let decl = checker.payload_tys_for(enum_name, variant_name);
+            match payload {
+                PatternPayload::Unit => {}
+                PatternPayload::Tuple(parts) => {
+                    for (i, part) in parts.iter().enumerate() {
+                        let expected = decl.get(i).map(|(_, ty)| ty);
+                        collect_pattern_binding_types_with_expected(
+                            checker, enum_name, part, expected, out,
+                        );
+                    }
+                }
+                PatternPayload::Record(fields) => {
+                    let by_name: HashMap<&str, &Ty> = decl
+                        .iter()
+                        .map(|(n, ty)| (n.as_str(), ty))
+                        .collect();
+                    for pf in fields {
+                        let expected = by_name.get(pf.name).copied();
+                        collect_pattern_binding_types_with_expected(
+                            checker,
+                            enum_name,
+                            &pf.pattern,
+                            expected,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True when `ty` is a poly-enum schema placeholder for `enum_name`
+/// (type-param `Con("T")` / `Con("E")` / …) or an open `Ty::Var`.
+fn is_open_schema_ty(checker: &Checker, enum_name: &str, ty: &Ty) -> bool {
+    match ty {
+        Ty::Var(_) => true,
+        Ty::Con(name) => checker
+            .generics()
+            .generic_type_ctors
+            .get(enum_name)
+            .is_some_and(|params| params.iter().any(|p| p == name)),
+        _ => false,
+    }
+}
+
+fn collect_pattern_binding_types_with_expected(
+    checker: &Checker,
+    enum_name: &str,
+    pattern: &Pattern<'_>,
+    expected: Option<&Ty>,
+    out: &mut HashMap<String, Ty>,
+) {
+    match pattern {
+        Pattern::Wildcard => {}
+        Pattern::Binding { name } => {
+            if let Some(ty) = expected {
+                if !is_open_schema_ty(checker, enum_name, ty) {
+                    out.insert(name.to_string(), ty.clone());
+                }
+            }
+        }
+        Pattern::Constructor { .. } => {
+            collect_pattern_binding_types(checker, pattern, out);
+        }
+    }
+}
+
 /// Next free binding slot for match payloads.
 ///
 /// `base` is the first payload slot (`context.variables.len()` at match
@@ -5954,6 +6050,23 @@ impl Compiler {
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
 
+                        // Per-arm binding types override the flat
+                        // `codegen_var_types` side-table so Access on
+                        // a reused binding name (`p.y` vs `p.h`) sees
+                        // this arm's payload type, not the last arm's.
+                        let mut arm_binding_tys = HashMap::new();
+                        collect_pattern_binding_types(
+                            &self.checker,
+                            &arm.pattern,
+                            &mut arm_binding_tys,
+                        );
+                        if let Pattern::Binding { name } = &arm.pattern {
+                            if let Some(ty) = self.checker.codegen_var_type(name) {
+                                arm_binding_tys.insert(name.to_string(), ty.clone());
+                            }
+                        }
+                        self.mono_codegen_var_types.push(arm_binding_tys);
+
                         // Emit the arm body. Borrow-checker
                         // note: stage the bytes in a local so
                         // the `&mut self` from `do_compile`
@@ -5961,6 +6074,8 @@ impl Compiler {
                         // `&mut self.bytecode` from `extend`.
                         let body_bc = self.do_compile(&arm.body);
                         self.bytecode.extend(body_bc);
+
+                        self.mono_codegen_var_types.pop();
 
                         // Restore the prior `match_bindings`
                         // (usually `None` — we only save/restore
