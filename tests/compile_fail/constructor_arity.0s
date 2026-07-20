@@ -1,9 +1,10 @@
 // Expected: compile failure — constructor arity mismatch.
-enum Opt {
-    Some(int),
-    None,
+// Avoid Some/None: those collide with prelude Option.
+enum MyOpt {
+    Yea(int),
+    Nada,
 }
 
 fn main() {
-    let o = Opt::Some(1, 2);
+    let o = MyOpt::Yea(1, 2);
 }

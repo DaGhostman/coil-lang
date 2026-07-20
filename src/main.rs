@@ -44,7 +44,7 @@ fn print_help() {
          \x20 compile    Compile an entry file (must define main) to a .c0s archive\n\
          \x20 run        Execute a previously compiled .c0s archive\n\
          \x20 test       Compile and run every .0s file under [path] (default: ./tests)\n\
-         \x20             Files under a `compile_fail/` directory must FAIL to compile\n\
+         \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` (default: out.c0s)\n\
@@ -436,16 +436,17 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
         let display = path.display().to_string();
         let expect_compile_fail = is_compile_fail(path);
         let format = config.format;
-        // Expected failures still typecheck; suppress ariadne noise so the
-        // harness summary stays readable when many compile_fail files exist.
+        // Expected compile rejection: suppress ariadne noise so the harness
+        // summary stays readable when many compile_fail files exist.
         let mut pipeline = if expect_compile_fail {
             Pipeline::with_reporter(config.clone(), Box::new(std::io::sink()))
         } else {
             Pipeline::with_reporter(config.clone(), writer_for(format))
         };
 
-        // catch_unwind: type errors that slip into codegen can panic; for
-        // compile_fail that still counts as "did not compile successfully".
+        // catch_unwind isolates a compiler ICE from aborting the whole
+        // harness under panic=unwind. Release builds use panic=abort, so
+        // compile_fail fixtures must reject via Ok(Err(())), not panic.
         let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pipeline.compile_src_from_file(&display)
         }));
@@ -453,21 +454,29 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
         let _ = pipeline.finish_reporting();
 
         let file_ok = if expect_compile_fail {
-            let rejected = match &compiled {
-                Ok(Err(())) => true,
-                Err(_) => true, // panic during compile ⇒ not a successful build
-                Ok(Ok(_)) => false,
-            };
-            if rejected {
-                passed += 1;
-                true
-            } else {
-                failed += 1;
-                eprintln!("> Test \"{display}\" failed (expected compile failure)");
-                if fail_fast {
-                    stop = true;
+            // Only a clean diagnostic rejection counts. A panic is a
+            // harness failure (and aborts under release panic=abort).
+            match &compiled {
+                Ok(Err(())) => {
+                    passed += 1;
+                    true
                 }
-                false
+                Ok(Ok(_)) => {
+                    failed += 1;
+                    eprintln!("> Test \"{display}\" failed (expected compile failure)");
+                    if fail_fast {
+                        stop = true;
+                    }
+                    false
+                }
+                Err(_) => {
+                    failed += 1;
+                    eprintln!("> Test \"{display}\" failed (compiler panicked)");
+                    if fail_fast {
+                        stop = true;
+                    }
+                    false
+                }
             }
         } else {
             match compiled {
