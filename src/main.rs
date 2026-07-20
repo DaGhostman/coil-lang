@@ -383,6 +383,13 @@ fn is_compile_fail(path: &Path) -> bool {
         .any(|c| c.as_os_str() == "compile_fail")
 }
 
+/// Classify a `catch_unwind` compile result for a `compile_fail/` file.
+/// Only a clean diagnostic rejection (`Ok(Err(()))`) is harness success.
+/// Panic does not count (release builds use `panic = "abort"`).
+fn compile_fail_rejected<T>(compiled: &std::thread::Result<Result<T, ()>>) -> bool {
+    matches!(compiled, Ok(Err(())))
+}
+
 fn run_test_case(
     pipeline: &Pipeline,
     bytecode: &[Byte],
@@ -413,17 +420,11 @@ fn run_test_case(
     }
 }
 
-fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
-    let root = path.unwrap_or_else(|| TESTS_DIR.to_string());
-    let tests_dir = Path::new(&root);
-    let files = match collect_test_files(tests_dir) {
-        Ok(f) => f,
-        Err(msg) => {
-            let format = config.format;
-            let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
-            fail_and_exit(&mut pipeline, ErrorCode::IoError, msg);
-        }
-    };
+/// Run the test harness over `root` and return `(passed, failed)` without exiting.
+/// Extracted from `cmd_test` so unit tests can assert compile_fail inversion and
+/// fail-fast behavior without terminating the process.
+fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<(usize, usize), String> {
+    let files = collect_test_files(root)?;
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -456,27 +457,24 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
         let file_ok = if expect_compile_fail {
             // Only a clean diagnostic rejection counts. A panic is a
             // harness failure (and aborts under release panic=abort).
-            match &compiled {
-                Ok(Err(())) => {
-                    passed += 1;
-                    true
-                }
-                Ok(Ok(_)) => {
-                    failed += 1;
-                    eprintln!("> Test \"{display}\" failed (expected compile failure)");
-                    if fail_fast {
-                        stop = true;
+            if compile_fail_rejected(&compiled) {
+                passed += 1;
+                true
+            } else {
+                failed += 1;
+                match &compiled {
+                    Ok(Ok(_)) => {
+                        eprintln!("> Test \"{display}\" failed (expected compile failure)");
                     }
-                    false
-                }
-                Err(_) => {
-                    failed += 1;
-                    eprintln!("> Test \"{display}\" failed (compiler panicked)");
-                    if fail_fast {
-                        stop = true;
+                    Err(_) => {
+                        eprintln!("> Test \"{display}\" failed (compiler panicked)");
                     }
-                    false
+                    Ok(Err(())) => unreachable!("compile_fail_rejected is true for Ok(Err)"),
                 }
+                if fail_fast {
+                    stop = true;
+                }
+                false
             }
         } else {
             match compiled {
@@ -551,6 +549,21 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
             eprintln!("FAILED {display}");
         }
     }
+
+    Ok((passed, failed))
+}
+
+fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
+    let root = path.unwrap_or_else(|| TESTS_DIR.to_string());
+    let tests_dir = Path::new(&root);
+    let (passed, failed) = match run_test_suite(config.clone(), tests_dir, fail_fast) {
+        Ok(counts) => counts,
+        Err(msg) => {
+            let format = config.format;
+            let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
+            fail_and_exit(&mut pipeline, ErrorCode::IoError, msg);
+        }
+    };
 
     eprintln!();
     eprintln!(
@@ -889,8 +902,84 @@ mod tests {
     fn is_compile_fail_detects_path_segment() {
         assert!(is_compile_fail(Path::new("tests/compile_fail/bad.0s")));
         assert!(is_compile_fail(Path::new("/tmp/compile_fail/x.0s")));
+        assert!(is_compile_fail(Path::new("suite/nested/compile_fail/deep/x.0s")));
         assert!(!is_compile_fail(Path::new("tests/arithmetic.0s")));
         assert!(!is_compile_fail(Path::new("tests/compile_fail_not/x.0s")));
+        assert!(!is_compile_fail(Path::new("tests/my_compile_fail/x.0s")));
+    }
+
+    #[test]
+    fn compile_fail_rejected_requires_clean_diagnostic_err() {
+        let rejected_err: std::thread::Result<Result<(), ()>> = Ok(Err(()));
+        assert!(compile_fail_rejected(&rejected_err));
+
+        let unexpected_ok: std::thread::Result<Result<(), ()>> = Ok(Ok(()));
+        assert!(!compile_fail_rejected(&unexpected_ok));
+
+        // Panic is NOT a clean rejection (release panic=abort aborts anyway).
+        let panicked: std::thread::Result<Result<(), ()>> = Err(Box::new("boom"));
+        assert!(!compile_fail_rejected(&panicked));
+    }
+
+    #[test]
+    fn run_test_suite_compile_fail_inversion_and_mixed_tree() {
+        let root = unique_tmp("compile_fail_suite");
+        let cf = root.join("compile_fail");
+        let pos = root.join("positive");
+        std::fs::create_dir_all(&cf).unwrap();
+        std::fs::create_dir_all(&pos).unwrap();
+
+        // Type error under compile_fail/ ⇒ harness pass.
+        std::fs::write(
+            cf.join("bad.0s"),
+            "fn main() {\n  let x: int = \"no\";\n}\n",
+        )
+        .unwrap();
+        // Well-typed under compile_fail/ ⇒ harness failure (inverted).
+        std::fs::write(
+            cf.join("unexpected_ok.0s"),
+            "fn main() {\n  print \"%i\", 1;\n}\n",
+        )
+        .unwrap();
+        // Normal positive case still runs.
+        std::fs::write(
+            pos.join("ok.0s"),
+            "test(\"ok\") {\n  assert(true)?;\n}\n",
+        )
+        .unwrap();
+
+        let (passed, failed) =
+            run_test_suite(ReportConfig::default(), &root, false).expect("suite runs");
+        assert_eq!(passed, 2, "bad compile_fail + positive ok");
+        assert_eq!(failed, 1, "unexpected_ok under compile_fail must fail");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_test_suite_fail_fast_stops_after_unexpected_compile_ok() {
+        let root = unique_tmp("compile_fail_fail_fast");
+        let cf = root.join("compile_fail");
+        std::fs::create_dir_all(&cf).unwrap();
+
+        // Lexicographic order: a_ok before z_bad — fail-fast must stop after a_ok.
+        std::fs::write(
+            cf.join("a_ok.0s"),
+            "fn main() {\n  print \"%i\", 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cf.join("z_bad.0s"),
+            "fn main() {\n  let x: int = \"no\";\n}\n",
+        )
+        .unwrap();
+
+        let (passed, failed) =
+            run_test_suite(ReportConfig::default(), &root, true).expect("suite runs");
+        assert_eq!(failed, 1, "a_ok should fail (unexpected compile success)");
+        assert_eq!(passed, 0, "fail-fast must not reach z_bad");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
