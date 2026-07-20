@@ -10,7 +10,7 @@ extern struct Point {
     y: int32,
 };
 
-fn main() -> Result<(), string> {
+fn main() -> Result<(), Error> {
     let lib = dload("sum")?;
     let make_id = declare(lib, "make_point", (Int32, Int32), Point)?;
     let p = invoke(lib, make_id, (3, 4))?;

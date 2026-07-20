@@ -134,15 +134,15 @@ use ffi::types::*;
 fn main() {
     let lib = match dload("sum") {
         Result::Ok(h) => h,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let sum_id = match declare(lib, "sum", (Int, Int), Int) {
         Result::Ok(id) => id,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let n = match invoke(lib, sum_id, (40, 2)) {
         Result::Ok(v) => v,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     print "%i", n;
 }
@@ -156,9 +156,31 @@ fn main() {
 
 | Builtin | Signature | Returns |
 |---------|-----------|---------|
-| `dload(path)` | One string argument | `Result<int, string>` — `Ok` = library handle |
-| `declare(lib, name, args_tuple, ret)` | Four arguments | `Result<int, string>` — `Ok` = function id; `Err` on missing symbol / libffi error |
-| `invoke(lib, fn_id, args_tuple)` | Three arguments | `Result<T, string>` — `T` from the matching `declare` return tag |
+| `dload(path)` | One string argument | `Result<int, Error>` — `Ok` = library handle |
+| `declare(lib, name, args_tuple, ret)` | Four arguments | `Result<int, Error>` — `Ok` = function id |
+| `invoke(lib, fn_id, args_tuple)` | Three arguments | `Result<T, Error>` — `T` from the matching `declare` return tag |
+
+`Error` (from `use ffi::*`) is a record-shaped enum with fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kind` | `ErrorKind` | Typed failure category (match this — do not string-match) |
+| `message` | `string` | Human-readable detail (safe for `panic` / logging) |
+
+`ErrorKind` variants: `LibraryNotFound`, `SymbolNotFound`, `ArityMismatch`, `Libffi`, `InvalidSignature`, `InvalidHandle`, `Unsupported`, `Other`.
+
+```0s
+match dload("missing") {
+    Result::Ok(h) => h,
+    Result::Err(e) => match e.kind {
+        ErrorKind::LibraryNotFound => {
+            // fallback / alternate path
+            panic e.message;
+        }
+        _ => panic e.message,
+    },
+}
+```
 
 Argument types and call arguments are **single tuple expressions**, not flat comma lists.
 
@@ -282,7 +304,7 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 | Explicit signatures | Wrong arity or tag → `Result::Err` from `declare` / `invoke` |
 | Struct returns | `extern struct` + `declare(..., Point)` returns a record; fields via `.x` |
 | Callback returns | Opaque `Ptr` / function address — no auto-trampoline; re-`declare` to call |
-| `invoke` return typing | `Result<T, string>` where `T` is refined from `let id = declare(..., ret)` when `fn_id` is that binding; else falls back |
+| `invoke` return typing | `Result<T, Error>` where `T` is refined from `let id = declare(..., ret)` when `fn_id` is that binding; else falls back |
 
 ### Safety
 

@@ -45,6 +45,8 @@ pub enum FfiError {
         detail: String,
     },
     Unsupported(String),
+    /// Bad library handle or out-of-range function id at invoke/declare time.
+    InvalidHandle(String),
 }
 
 impl std::fmt::Display for FfiError {
@@ -69,6 +71,7 @@ impl std::fmt::Display for FfiError {
                 )
             }
             Self::Unsupported(msg) => write!(f, "unsupported FFI signature: {msg}"),
+            Self::InvalidHandle(msg) => write!(f, "{msg}"),
         }
     }
 }

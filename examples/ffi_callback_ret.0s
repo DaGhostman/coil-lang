@@ -11,15 +11,15 @@ use ffi::types::*;
 fn main() {
     let lib = match dload("sum") {
         Result::Ok(h) => h,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let id = match declare(lib, "get_doubler", (), Ptr) {
         Result::Ok(i) => i,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let ptr = match invoke(lib, id, ()) {
         Result::Ok(v) => v,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     // Non-zero pointer address — print low 16 bits as a smoke check
     // that we got a real address back (not -1 / null).

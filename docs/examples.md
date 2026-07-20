@@ -998,7 +998,7 @@ fn main() {
 
 ### `examples/ffi_sum.0s`
 
-**Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result`; unwrap with `match` (or `?`).
+**Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result<_, Error>`; unwrap with `match` (or `?`). Check `e.kind` for typed recovery.
 
 ```0s
 use ffi::*;
@@ -1007,15 +1007,15 @@ use ffi::types::*;
 fn main() {
     let lib = match dload("sum") {
         Result::Ok(h) => h,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let sum_id = match declare(lib, "sum", (Int, Int), Int) {
         Result::Ok(id) => id,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     let n = match invoke(lib, sum_id, (40, 2)) {
         Result::Ok(v) => v,
-        Result::Err(msg) => panic msg,
+        Result::Err(e) => panic e.message,
     };
     print "%i", n;
 }

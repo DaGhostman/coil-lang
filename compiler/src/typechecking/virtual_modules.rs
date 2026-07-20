@@ -330,6 +330,12 @@ impl VirtualModules {
         modules.insert(
             FFI_MODULE,
             vec![
+                BuiltinExport::Enum {
+                    name: common::BUILTIN_FFI_ERROR_ENUM,
+                },
+                BuiltinExport::Enum {
+                    name: common::BUILTIN_FFI_ERROR_KIND_ENUM,
+                },
                 BuiltinExport::FfiFn {
                     kind: FfiBuiltin::Dload,
                 },
