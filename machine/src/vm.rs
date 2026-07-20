@@ -3503,6 +3503,53 @@ mod tests {
         assert_eq!(s, "hi", "array string element must survive GC pressure");
     }
 
+    /// P1 sibling: heap objects stored in a tuple survive GC when the
+    /// tuple is rooted. Arrays were covered above; tuples share the
+    /// same `mark_aggregate_elements` path and must not regress alone.
+    #[test]
+    fn tuple_elements_survive_gc() {
+        let mut vm = Machine::<64>::default();
+        // STRING "ok" → MakeTuple(1) → store slot 0 → allocate 128 enums →
+        // load slot 0 → Index 0 → PRINT → HALT
+        let mut code = Vec::new();
+        code.push(Byte::new(Instruction::STRING).with_operand_u32(2));
+        for ch in "ok".chars() {
+            code.push(Byte::new(Instruction::DATA).with_operand_u32(ch as u32));
+        }
+        code.push(Byte::new(Instruction::MakeTuple).with_operand_u32(1));
+        code.push(store_pop(0));
+        for _ in 0..128 {
+            code.push(Byte::new(Instruction::MakeEnum).with_operands_u16([0, 0]));
+            code.push(Byte::new(Instruction::POP));
+        }
+        code.push(load(0));
+        code.push(const_int(0));
+        code.push(Byte::new(Instruction::Index));
+        code.push(Byte::new(Instruction::PRINT));
+        code.push(Byte::new(Instruction::HALT));
+
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        vm.run(&code);
+        let _ = vm.restore_output();
+        let bytes = std::rc::Rc::try_unwrap(buf)
+            .expect("VM still holds buffer")
+            .into_inner();
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert_eq!(s, "ok", "tuple string element must survive GC pressure");
+    }
+
     /// P5: PRINT flushes so redirected sinks observe output before HALT.
     /// HALT also flushes, so a single PRINT+HALT program must flush ≥2 times
     /// (once from PRINT, once from HALT). Pre-fix PRINT skipped flush → 1.
