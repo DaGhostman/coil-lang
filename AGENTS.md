@@ -25,7 +25,8 @@
 - `ARCHIVE_VERSION` is 22; bump on incompatible bytecode, tag, or opcode changes.
 - `prelude::test::assert` is an auto-imported virtual builtin returning `Result<(), string>`; `panic` is a keyword that aborts the VM (CLI/`zero-script test` treat it as failure).
 - `examples/fib.0s` is the smoke Fibonacci (`fib(10)` → `55`); `examples/fib_bench.0s` (`fib(32)` → `2178309`) is the primary performance regression benchmark.
-- The CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
+- CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
+- `zero-script test [path] [--fail-fast]` discovers `**/*.0s` under an optional directory (default `./tests`). Top-level `test("desc") { … }` cases (string literal name, Result-mode body) replace per-file `main`; the harness runs each case in an isolated VM. Legacy files with only `fn main()` still count as one case.
 
 ## PHASE 14 - HINDLEY–MILNER TYPECHECKER (COMPLETED)
 

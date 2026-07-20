@@ -79,7 +79,7 @@ The default CLI invocation compiles `examples/fib.0s` to bytecode, serializes it
 | `zero-script <file.0s>` | Compile to `out.c0s` (cached) and run |
 | `zero-script compile <file.0s> [-o path]` | Compile only; default output is `out.c0s` |
 | `zero-script run <file.c0s>` | Execute a previously compiled archive |
-| `zero-script test` | Compile and run every `.0s` file under `./tests` |
+| `zero-script test [path] [--fail-fast]` | Compile and run every `.0s` under `[path]` (default `./tests`) |
 
 Examples:
 
@@ -90,10 +90,25 @@ cargo run -- compile examples/fib.0s -o /tmp/fib.c0s
 # Run that archive
 cargo run -- run /tmp/fib.c0s
 
-# Project tests (expects a ./tests directory with .0s files that define main)
+# Project tests (default root ./tests)
 cargo run -- test
-# Language `panic` or a Rust unwind marks the file FAILED; `assert` + `?` is fine.
+cargo run -- test ./tests
+cargo run -- test --fail-fast   # stop after the first failed case
 ```
+
+A test file can declare multiple cases without `fn main`:
+
+```0s
+test("addition works") {
+    assert(1 + 1 == 2)?;
+}
+
+test("subtraction works") {
+    assert(5 - 3 == 2, "arith")?;
+}
+```
+
+Each `test("…") { … }` body runs in Result mode. A failed `assert`/`?` or a language `panic` fails that case; by default the harness continues to the next case (each case runs in an isolated VM so a panic does not skip later cases). Failures print `> Test "<description>" failed`. Files without `test(...)` cases still use a single `fn main()` as one opaque case.
 
 ### Recompiling after changes
 

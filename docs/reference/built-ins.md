@@ -469,9 +469,23 @@ See `examples/assert.0s`.
 
 ---
 
+## `test("…") { … }` (harness cases)
+
+Top-level declaration used by `zero-script test`. The name must be a **string literal**. The body is typechecked in Result mode (`Result<(), string>`), so `assert(...)?` and `raise` work as in a result-mode function.
+
+```0s
+test("addition works") {
+    assert(1 + 1 == 2)?;
+}
+```
+
+Do **not** also define `fn main` in a file that uses `test(...)` cases — the compiler injects a virtual `main` for standalone runs. The `zero-script test` CLI runs each case in an isolated VM (so a `panic` in one case does not skip later cases) and prints `> Test "<description>" failed` on failure. Pass `--fail-fast` to stop after the first failed case.
+
+---
+
 ## `panic`
 
-Keyword that aborts the program with a string message. Writes `panic: <msg>` and stops the VM; the CLI exits with code `1`. Language panics also fail `zero-script test`.
+Keyword that aborts the program with a string message. Writes `panic: <msg>` and stops the VM; the CLI exits with code `1`. Under `zero-script test`, a language panic fails the current case only (the next case still runs unless `--fail-fast` is set).
 
 ```0s
 panic "unreachable";

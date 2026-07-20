@@ -296,6 +296,15 @@ pub enum Expression<'expr> {
         ty: Box<Output<'expr>>,
     },
 
+    /// Top-level `test("description") { … }` case for `zero-script test`.
+    ///
+    /// The name expression should be a string literal; the body is a block
+    /// typechecked in Result mode (`Result<(), string>`).
+    TestCase {
+        name: Output<'expr>,
+        body: Output<'expr>,
+    },
+
     /// Top-level `enum` declaration.
     EnumDecl {
         name: &'expr str,
@@ -705,6 +714,9 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::Defer(b) => write!(f, "defer {}", b.1),
+            Self::TestCase { name, body } => {
+                write!(f, "test({}) {{\n{}}}", name.1, body.1)
+            }
             Self::Call { name, args } => {
                 write!(
                     f,

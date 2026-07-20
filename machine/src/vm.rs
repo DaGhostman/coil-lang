@@ -144,6 +144,12 @@ pub struct Machine<const S: usize> {
     program_constants: Vec<u64>,
     /// When > 0, `RETURN` captures into `nested_return` instead of unwinding to caller.
     nested_depth: u32,
+    /// Stack of frame-stack lengths at each active [`call_function`] entry.
+    /// Only a `RETURN` that pops back to `last()` should capture `nested_return`
+    /// (inner `CALL`s must still unwind normally). A stack (not a scalar) is
+    /// required so nested `call_function` reentrancy (FFI callbacks) does not
+    /// overwrite the outer depth.
+    nested_frame_depths: Vec<usize>,
     nested_return: Option<Value>,
     /// Set when `execute` pauses before a native FFI call that may reenter the VM.
     pending_ffi: Option<PendingFfiInvoke>,
@@ -172,6 +178,7 @@ impl<const S: usize> Default for Machine<S> {
             program_code: Vec::new(),
             program_constants: Vec::new(),
             nested_depth: 0,
+            nested_frame_depths: Vec::new(),
             nested_return: None,
             pending_ffi: None,
             panicked: false,
@@ -808,6 +815,21 @@ impl<const S: usize> Machine<S> {
         self.panicked
     }
 
+    /// Load bytecode for reentrant [`call_function`] without running `main`.
+    pub fn load_program(&mut self, code: &[RawByte], constants: &[u64]) {
+        self.program_code = code.to_vec();
+        self.program_constants = constants.to_vec();
+        self.panicked = false;
+    }
+
+    /// True when `value` is a heap `Result::Ok` (enum tag 0).
+    pub fn result_is_ok(&self, value: Value) -> bool {
+        match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
+            Some(Object::Enum(gc)) => gc.as_ref().tag == 0,
+            _ => false,
+        }
+    }
+
     pub fn run(&mut self, code: &[Byte]) {
         self.run_with_pool(code, &[]);
     }
@@ -922,6 +944,9 @@ impl<const S: usize> Machine<S> {
             f.seek(0);
             f.set(callee_sp);
         });
+        // Capture only when RETURN reaches this frame depth (the
+        // call_function entry), not when inner CALLs return.
+        self.nested_frame_depths.push(self.frames.len());
         let code: &[Byte] = unsafe {
             std::slice::from_raw_parts(self.program_code.as_ptr().cast(), self.program_code.len())
         };
@@ -942,6 +967,7 @@ impl<const S: usize> Machine<S> {
         let _ = self.frames.pop();
         self.stack.seek(saved_sp);
         self.nested_depth -= 1;
+        let _ = self.nested_frame_depths.pop();
         self.nested_return.take().unwrap_or_default()
     }
 
@@ -1281,7 +1307,8 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
-                    if self.nested_depth > 0 {
+                    let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+                    if self.nested_depth > 0 && self.frames.len() == nested_target {
                         self.nested_return = Some(ret_val);
                         return false;
                     }
@@ -3654,6 +3681,68 @@ mod tests {
         );
         let out = vm.call_function(0, &[Value::from(21_i64)]);
         assert_eq!(out.as_int(), 42);
+    }
+
+    /// Nested `call_function` (FFI callback reentrancy) must not clobber the
+    /// outer frame-depth target — outer RETURN still captures a non-default value.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn nested_call_function_preserves_outer_return() {
+        use crate::ffi::FfiSignature;
+        use crate::memory::FfiType;
+
+        let lib_name = crate::ffi::platform_shared_lib_filename("sum");
+        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples")
+            .join(&lib_name);
+        if !lib_path.exists() {
+            if std::env::var_os("CI").is_some() {
+                panic!("FFI soft-skip forbidden in CI: {lib_name} not built");
+            }
+            eprintln!("skipping: {lib_name} not built");
+            return;
+        }
+
+        let mut vm = Machine::<512>::default();
+        let lib_val = vm
+            .load_userland_library(lib_path.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("load {lib_name}: {e}"));
+        let sig = FfiSignature::from_parts(
+            "apply_cb",
+            vec![FfiType::Callback(0), FfiType::Int],
+            FfiType::Int,
+        )
+        .unwrap();
+        let fn_id = vm
+            .register_ffi_function(lib_val, sig)
+            .unwrap_or_else(|e| panic!("declare apply_cb: {e}"));
+
+        // 0: identity callback — LOAD 0; RETURN
+        // 2: outer — FfiInvoke apply_cb(callback@0, 21); POP Result; CONST 99; RETURN
+        install_program(
+            &mut vm,
+            &[
+                load(0),
+                Byte::new(Instruction::RETURN),
+                // outer entry (offset 2); args: lib, fn_id
+                load(0),
+                load(1),
+                Byte::new(Instruction::CodePtr).with_operand_u32(0),
+                const_int(21),
+                Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+                Byte::new(Instruction::FfiInvoke).with_operand_u32(2),
+                Byte::new(Instruction::POP),
+                const_int(99),
+                Byte::new(Instruction::RETURN),
+            ],
+        );
+
+        let out = vm.call_function(2, &[lib_val, Value::from(fn_id as i64)]);
+        assert_eq!(
+            out.as_int(),
+            99,
+            "outer call_function must capture its RETURN after nested callback"
+        );
     }
 
     /// C → zero-script callback via `apply_cb` in libsum.so.
