@@ -157,10 +157,13 @@ fn emit_inner_test<'compiler>(
     use parser::ast::PatternPayload;
     match payload {
         PatternPayload::Unit => {
-            // No payload to test. The pass_label is always None for Unit
-            // (it's the last arm in a group with no sub-pattern). Emit
-            // nothing — the test falls through to the next arm's
-            // fail handler.
+            // Unit inner (e.g. `Option::None`): always matches.
+            // JMP to the arm body when we have a pass_label —
+            // required when a later tag group follows so we
+            // don't fall through into that group's body.
+            if let Some(label) = pass_label {
+                bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
+            }
         }
         PatternPayload::Tuple(parts) => {
             // POP/STORE for wildcards/bindings; JUMP_IF_MATCH for nested constructors.
@@ -316,6 +319,102 @@ fn emit_inner_test<'compiler>(
             if !any_nested_ctor && let Some(label) = pass_label {
                 bb.emit_jump_to(label, BbJumpKind::Unconditional, bytecode);
             }
+        }
+    }
+}
+
+/// Collect `name → Ty` for every binding in a match pattern.
+///
+/// Used so Access codegen (`p.y`) sees the *current arm's* binding type
+/// rather than whatever last arm wrote into the flat
+/// `codegen_var_types` side-table (same name reused across arms with
+/// different payload types would otherwise emit the wrong `LoadField`).
+///
+/// Open schema placeholders (`Ty::Var`, or `Ty::Con("T")` type-param
+/// markers from poly enums like `Option` / `Result` / `Box<T>`) are
+/// **not** inserted — they would shadow the instantiated binding type
+/// that `infer_pattern` already wrote into `codegen_var_types`.
+fn collect_pattern_binding_types(
+    checker: &Checker,
+    pattern: &Pattern<'_>,
+    out: &mut HashMap<String, Ty>,
+) {
+    match pattern {
+        Pattern::Wildcard => {}
+        Pattern::Binding { .. } => {
+            // Bare `name =>` needs the scrutinee type from the side-table;
+            // caller may fill that in. Constructor/record payloads below
+            // carry declared field types.
+        }
+        Pattern::Constructor {
+            enum_name,
+            variant_name,
+            payload,
+        } => {
+            let decl = checker.payload_tys_for(enum_name, variant_name);
+            match payload {
+                PatternPayload::Unit => {}
+                PatternPayload::Tuple(parts) => {
+                    for (i, part) in parts.iter().enumerate() {
+                        let expected = decl.get(i).map(|(_, ty)| ty);
+                        collect_pattern_binding_types_with_expected(
+                            checker, enum_name, part, expected, out,
+                        );
+                    }
+                }
+                PatternPayload::Record(fields) => {
+                    let by_name: HashMap<&str, &Ty> = decl
+                        .iter()
+                        .map(|(n, ty)| (n.as_str(), ty))
+                        .collect();
+                    for pf in fields {
+                        let expected = by_name.get(pf.name).copied();
+                        collect_pattern_binding_types_with_expected(
+                            checker,
+                            enum_name,
+                            &pf.pattern,
+                            expected,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True when `ty` is a poly-enum schema placeholder for `enum_name`
+/// (type-param `Con("T")` / `Con("E")` / …) or an open `Ty::Var`.
+fn is_open_schema_ty(checker: &Checker, enum_name: &str, ty: &Ty) -> bool {
+    match ty {
+        Ty::Var(_) => true,
+        Ty::Con(name) => checker
+            .generics()
+            .generic_type_ctors
+            .get(enum_name)
+            .is_some_and(|params| params.iter().any(|p| p == name)),
+        _ => false,
+    }
+}
+
+fn collect_pattern_binding_types_with_expected(
+    checker: &Checker,
+    enum_name: &str,
+    pattern: &Pattern<'_>,
+    expected: Option<&Ty>,
+    out: &mut HashMap<String, Ty>,
+) {
+    match pattern {
+        Pattern::Wildcard => {}
+        Pattern::Binding { name } => {
+            if let Some(ty) = expected {
+                if !is_open_schema_ty(checker, enum_name, ty) {
+                    out.insert(name.to_string(), ty.clone());
+                }
+            }
+        }
+        Pattern::Constructor { .. } => {
+            collect_pattern_binding_types(checker, pattern, out);
         }
     }
 }
@@ -3020,24 +3119,26 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::SetField));
             }
             Expression::Index(arr, idx) => {
+                // Always stash the RHS — `StoreIndex` pops value/index/array.
+                // Dropping with POP when `leave_value_on_stack == false` left
+                // StoreIndex without a value (stack underflow / wrong write).
                 let tmp_arr = self.alloc_temp_slot();
                 let tmp_idx = self.alloc_temp_slot();
                 let tmp_val = self.alloc_temp_slot();
-                if leave_value_on_stack {
-                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
-                } else {
-                    bytecode.push(Byte::new(Instruction::POP));
-                }
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_val));
                 bytecode.append(&mut self.do_compile(arr));
                 bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_arr));
                 bytecode.append(&mut self.do_compile(idx));
                 bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp_idx));
                 bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_arr));
                 bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_idx));
-                if leave_value_on_stack {
-                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
-                }
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_val));
                 bytecode.push(Byte::new(Instruction::StoreIndex));
+                if leave_value_on_stack {
+                    // StoreIndex leaves the value on the stack; keep it.
+                } else {
+                    bytecode.push(Byte::new(Instruction::POP));
+                }
             }
             _ => {
                 bytecode.push(Byte::new(Instruction::POP));
@@ -4337,6 +4438,25 @@ impl Compiler {
                         .get(&identifier)
                         .cloned()
                         .unwrap_or_else(|| identifier.clone());
+                    // Non-entry modules register `ns::name`, but sibling
+                    // calls use the bare name. Typecheck inserts bare
+                    // names so TC can pass while codegen misses — retry
+                    // the current module FQN before reporting unknown.
+                    let n = if self.functions.contains_key(&n)
+                        || self.extern_runtime_functions.contains_key(&n)
+                        || self.native.contains_key(&n)
+                    {
+                        n
+                    } else if !self.namespace.is_empty() {
+                        let qualified = format!("{}::{}", self.namespace, n);
+                        if self.functions.contains_key(&qualified) {
+                            qualified
+                        } else {
+                            n
+                        }
+                    } else {
+                        n
+                    };
 
                     if let Some(&(lib_slot, fn_id_slot)) = self.extern_runtime_functions.get(&n) {
                         // Stage arg bytecode in a local Vec to
@@ -5596,26 +5716,28 @@ impl Compiler {
                     // not at the historical hardcoded slot 1.
                     let payload_base = self.context.variables.len() as u32;
 
-                    let arm_labels: Vec<Option<crate::block_builder::Label>> = arms
-                        .iter()
-                        .enumerate()
-                        .map(|(i, arm)| {
-                            let is_last = i == arms.len() - 1;
-                            if !is_last && matches!(&arm.pattern, Pattern::Constructor { .. }) {
-                                Some(bb.fresh_label())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
                     let tag_groups = group_arms_by_outer_tag(arms, &self.checker);
+                    // Forward pass emits JUMP_IF_MATCH for every non-last
+                    // group, and also for the last group when any group is
+                    // multi-arm. Allocate labels for those targets — not
+                    // merely for `!is_last && Constructor` in source order
+                    // (that missed the last group's first arm when Err
+                    // followed two Ok arms, panicking at emit time).
+                    let any_multi_arm_group = tag_groups.iter().any(|g| g.arm_indices.len() > 1);
+                    let mut arm_labels: Vec<Option<crate::block_builder::Label>> =
+                        vec![None; arms.len()];
+                    for (g_idx, group) in tag_groups.iter().enumerate() {
+                        let is_last_group = g_idx == tag_groups.len() - 1;
+                        if !is_last_group || any_multi_arm_group {
+                            let first_arm_idx = group.arm_indices[0];
+                            arm_labels[first_arm_idx] = Some(bb.fresh_label());
+                        }
+                    }
 
                     let scrutinee_bc = self.do_compile(scrutinee);
                     self.bytecode.extend(scrutinee_bc);
 
                     // Forward pass: outer-tag dispatch + last-arm scrutinee consumer.
-                    let any_multi_arm_group = tag_groups.iter().any(|g| g.arm_indices.len() > 1);
                     for (g_idx, group) in tag_groups.iter().enumerate() {
                         let is_last_group = g_idx == tag_groups.len() - 1;
                         if !is_last_group || any_multi_arm_group {
@@ -5812,21 +5934,21 @@ impl Compiler {
                             test_chain_arms.insert(arm_idx);
                         }
 
-                        // Emit the test chain for each arm
-                        // in source order. The last arm in
-                        // the group has `pass_label = None`
-                        // (no JMP — falls through to its
-                        // body); non-last arms have a fresh
-                        // `pass_label` that the reverse pass
-                        // binds to the arm's body.
+                        // Emit the test chain for each arm in
+                        // source order. Every arm gets a
+                        // `pass_label` JMP to its body —
+                        // including the last arm in the group.
+                        // Fall-through after the last arm is
+                        // only safe when that arm's body is
+                        // emitted immediately after the test
+                        // chain (i.e. the group is source-last).
+                        // With a later tag group (e.g. Ok/Ok
+                        // then Err), fall-through would land in
+                        // the wrong body's bytecode.
                         for (rank, &arm_idx) in group.arm_indices.iter().enumerate() {
                             let is_last_in_group = rank == group.arm_indices.len() - 1;
 
-                            let pass_label = if !is_last_in_group {
-                                Some(bb.fresh_label())
-                            } else {
-                                None
-                            };
+                            let pass_label = Some(bb.fresh_label());
 
                             // `fail_label` is the NEXT arm's
                             // body label (so the runtime
@@ -5948,19 +6070,10 @@ impl Compiler {
                         // For arms in test chain groups,
                         // bind the test chain's
                         // `pass_label` to the start of
-                        // this arm's body. The
-                        // `emit_inner_test` call in the
-                        // test chain pass emitted
-                        // `JMP → pass_label` at the end
-                        // of the arm's sub-pattern
-                        // consumer; binding it here
-                        // routes a successful test to
-                        // this arm's body. The last arm
-                        // in the group has
-                        // `pass_label = None` (no JMP
-                        // emitted — falls through to
-                        // its body), so this `if let`
-                        // is a no-op for it.
+                        // this arm's body. Every test-chain
+                        // arm (including the last) gets a
+                        // pass_label so dispatch works when
+                        // another tag group follows.
                         if let Some(Some(label)) = pass_labels.get(&i) {
                             bb.bind_label(
                                 *label,
@@ -6099,6 +6212,23 @@ impl Compiler {
                         let saved_bindings = self.context.match_bindings.take();
                         self.context.match_bindings = Some(arm_bindings);
 
+                        // Per-arm binding types override the flat
+                        // `codegen_var_types` side-table so Access on
+                        // a reused binding name (`p.y` vs `p.h`) sees
+                        // this arm's payload type, not the last arm's.
+                        let mut arm_binding_tys = HashMap::new();
+                        collect_pattern_binding_types(
+                            &self.checker,
+                            &arm.pattern,
+                            &mut arm_binding_tys,
+                        );
+                        if let Pattern::Binding { name } = &arm.pattern {
+                            if let Some(ty) = self.checker.codegen_var_type(name) {
+                                arm_binding_tys.insert(name.to_string(), ty.clone());
+                            }
+                        }
+                        self.mono_codegen_var_types.push(arm_binding_tys);
+
                         // Emit the arm body. Borrow-checker
                         // note: stage the bytes in a local so
                         // the `&mut self` from `do_compile`
@@ -6106,6 +6236,8 @@ impl Compiler {
                         // `&mut self.bytecode` from `extend`.
                         let body_bc = self.do_compile(&arm.body);
                         self.bytecode.extend(body_bc);
+
+                        self.mono_codegen_var_types.pop();
 
                         // Restore the prior `match_bindings`
                         // (usually `None` — we only save/restore
@@ -6170,25 +6302,39 @@ impl Compiler {
                 let is_class = receiver_ty
                     .as_ref()
                     .is_some_and(|ty| self.checker.ty_is_class(ty));
-                if is_record || is_class {
-                    // Push the field-name string on TOP of the
-                    // receiver (which is already on the stack
-                    // from `do_compile(receiver)` above). GetField
-                    // pops the field-name (top) and the receiver,
-                    // pushes the value.
-                    self.emit_field_name(&mut bytecode, field);
-                    bytecode.push(Byte::new(Instruction::GetField));
+                // LoadField only for confirmed sum record payloads.
+                // Prefer GetField for classes and anonymous records.
+                // `extract_enum_name` alone is unsafe (Ty::Con class
+                // names look like enums) — require field_index_for
+                // or an is_class check. Unknown receivers that are
+                // not classes fall back to LoadField(0) (legacy
+                // defensive path) rather than GetField, which would
+                // corrupt ObjEnum stacks.
+                let enum_field_index = if !is_record && !is_class {
+                    self.enum_name_for_receiver(receiver).and_then(|name| {
+                        if self.checker.is_class(&name) {
+                            return None;
+                        }
+                        self.checker
+                            .field_index_for(&name, field)
+                            .map(|(_variant, idx)| idx)
+                    })
                 } else {
-                    let enum_name = self.enum_name_for_receiver(receiver);
-                    let field_index = enum_name
-                        .as_ref()
-                        .and_then(|name| self.checker.field_index_for(name, field))
-                        .map(|(_variant, idx)| idx)
-                        .unwrap_or(0);
-
+                    None
+                };
+                if let Some(field_index) = enum_field_index {
                     bytecode.push(
                         Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
                     );
+                } else if is_record || is_class {
+                    self.emit_field_name(&mut bytecode, field);
+                    bytecode.push(Byte::new(Instruction::GetField));
+                } else {
+                    // Unknown receiver — do not emit GetField (enum
+                    // match bindings historically lacked side-table
+                    // types). LoadField(0) keeps the stack balanced;
+                    // VM hardens non-enum receivers.
+                    bytecode.push(Byte::new(Instruction::LoadField).with_operand_u32(0));
                 }
             }
 
@@ -6321,19 +6467,27 @@ impl Compiler {
                 let is_class = inner_ty
                     .as_ref()
                     .is_some_and(|ty| self.checker.ty_is_class(ty));
-                if is_record || is_class {
-                    Self::emit_raw_string_literal(&mut self.bytecode, field);
-                    self.bytecode.push(Byte::new(Instruction::GetField));
+                let enum_field_index = if !is_record && !is_class {
+                    inner_ty.as_ref().and_then(extract_enum_name).and_then(|name| {
+                        if self.checker.is_class(&name) {
+                            return None;
+                        }
+                        self.checker
+                            .field_index_for(&name, field)
+                            .map(|(_variant, idx)| idx)
+                    })
                 } else {
-                    let enum_name = inner_ty.as_ref().and_then(extract_enum_name);
-                    let field_index = enum_name
-                        .as_ref()
-                        .and_then(|name| self.checker.field_index_for(name, field))
-                        .map(|(_variant, idx)| idx)
-                        .unwrap_or(0);
+                    None
+                };
+                if let Some(field_index) = enum_field_index {
                     self.bytecode.push(
                         Byte::new(Instruction::LoadField).with_operand_u32(field_index as u32),
                     );
+                } else if is_record || is_class {
+                    Self::emit_raw_string_literal(&mut self.bytecode, field);
+                    self.bytecode.push(Byte::new(Instruction::GetField));
+                } else {
+                    self.bytecode.push(Byte::new(Instruction::LoadField).with_operand_u32(0));
                 }
                 Self::emit_ok_or_some_wrap(&mut self.bytecode, true);
 
@@ -8189,13 +8343,12 @@ fn main() {
     /// pattern (where the first arm triggers the test chain and
     /// the second arm's inner pattern is Unit), the resulting
     /// bytecode has:
-    /// - 2 JUMP_IF_MATCH (outer Result::Ok + inner Option::Some)
-    /// - 1 POP for the inner Unit sub-pattern (the test
-    /// chain's POP, not the reverse pass's redundant POP).
+    /// - 3 JUMP_IF_MATCH (outer Result::Ok + inner Some + inner None)
+    /// - no reverse-pass POP for the inner Unit (consume_values=false)
     ///
-    /// The pre-fix codegen would have emitted 2 POPs for the
-    /// inner Unit sub-pattern (1 from the test chain + 1 from
-    /// the reverse pass). The fix reduces this to 1.
+    /// Every test-chain arm gets a pass_label, so `Option::None`
+    /// dispatches via JUMP_IF_MATCH rather than fall-through POP
+    /// (required when a later outer-tag group follows the Ok group).
     #[test]
     fn test_chain_none_arm_does_not_double_pop() {
         use common::Instruction;
@@ -8206,11 +8359,10 @@ fn main() {
         // sub-pattern). The test chain emits:
         // - 1 JUMP_IF_MATCH for the outer Result::Ok
         // - 1 JUMP_IF_MATCH for the inner Option::Some
-        // - 1 POP for the inner Option::None (Unit, no pass label)
+        // - 1 JUMP_IF_MATCH for the inner Option::None (pass_label)
         //
-        // The reverse pass, post-fix, emits 0 POPs for the
-        // inner Unit sub-pattern (the test chain handled it).
-        // Pre-fix, the reverse pass would emit 1 redundant POP.
+        // The reverse pass emits 0 POPs for the inner Unit
+        // sub-pattern (`consume_values = false`).
         let src = "fn main() { \
  let x = Result::Ok(Option::Some(42)); \
  let _ = match x { \
@@ -8221,23 +8373,23 @@ fn main() {
         let mut ast = Pratt::default().parse(src).expect("parse failed");
         let bc = Compiler::default().compile("test", &mut ast);
 
-        // Exactly 2 JUMP_IF_MATCH (outer Ok + inner Some).
+        // Outer Ok + inner Some + inner None (last arm has pass_label).
         let jimp_count = bc
             .iter()
             .filter(|b| matches!(b.bytecode(), Instruction::JumpIfMatch))
             .count();
         assert_eq!(
-            jimp_count, 2,
-            "expected exactly 2 JUMP_IF_MATCH (outer Ok + inner Some); got {}",
+            jimp_count, 3,
+            "expected exactly 3 JUMP_IF_MATCH (outer Ok + inner Some + inner None); got {}",
             jimp_count
         );
 
         // POPs expected:
-        // - 1 from the test chain for the inner Unit (`Option::None`)
         // - 1 from Match's end-label `DUPLICATE; POP` fusion barrier
         //   (Phase P0 — keeps peephole from fusing last-arm CONST with
-        //   a following RETURN). The reverse pass must NOT add a third
-        //   redundant POP for the Unit sub-pattern.
+        //   a following RETURN). The reverse pass must NOT add a
+        //   redundant POP for the Unit sub-pattern; None uses
+        //   JUMP_IF_MATCH now, not a test-chain POP.
         //
         // Note: `let _ = match x { ... }` is an Assignment (no
         // ExprStatement wrapper), so it doesn't add another POP.
@@ -8246,8 +8398,8 @@ fn main() {
             .filter(|b| matches!(b.bytecode(), Instruction::POP))
             .count();
         assert_eq!(
-            pop_count, 2,
-            "expected 2 POPs (test-chain Unit + match end barrier); got {} (3+ means reverse-pass double-pop regression)",
+            pop_count, 1,
+            "expected 1 POP (match end barrier only); got {} (2+ means reverse-pass double-pop regression)",
             pop_count
         );
     }
