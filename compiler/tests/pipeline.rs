@@ -1387,3 +1387,40 @@ fn example_io_udp_prints_2() {
     let output = run_example("examples/io_udp.0s");
     assert_eq!(output, "2");
 }
+
+/// Match arms that reuse a binding name with different payload types
+/// must resolve field access against *that arm's* type. A flat
+/// `codegen_var_types` side-table last-wins would make `p.y` emit
+/// `LoadField(0)` (against Rect) and return `x` instead of `y`.
+#[test]
+fn match_arm_reused_binding_name_field_access_uses_arm_type() {
+    let output = run_example_src(
+        r#"
+enum Point {
+    Point { x: int, y: int },
+}
+
+enum Rect {
+    Rect { w: int, h: int },
+}
+
+enum Shape {
+    Pt(Point),
+    Rc(Rect),
+}
+
+fn get(Shape s) -> int {
+    return match s {
+        Shape::Pt(p) => p.y,
+        Shape::Rc(p) => p.h,
+    };
+}
+
+fn main() {
+    print "%i", get(Shape::Pt(Point::Point { x: 1, y: 2 }));
+    print "%i", get(Shape::Rc(Rect::Rect { w: 3, h: 4 }));
+}
+"#,
+    );
+    assert_eq!(output, "24");
+}
