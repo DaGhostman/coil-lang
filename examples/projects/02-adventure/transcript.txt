@@ -1,0 +1,8 @@
+look
+go north
+take key
+inventory
+go south
+go east
+look
+quit

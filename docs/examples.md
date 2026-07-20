@@ -572,6 +572,16 @@ Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text 
 | **Run** | `cargo run -- examples/io_udp.0s` |
 | **Output** | `2` |
 
+### `examples/io_nested_host.0s`
+
+**Demonstrates:** Nested IO HostInvoke — `read_to_end(open(...)?)` must leave the
+stream (not the outer native id) on the stack for `MakeTuple`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/io_nested_host.0s` |
+| **Output** | `3` |
+
 See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
 
 ---
@@ -1278,6 +1288,53 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+## Showcase projects
+
+Larger multi-file apps live under [`examples/projects/`](../examples/projects/README.md).
+Each project has its own `zero.toml`, co-located `tests/`, and `NOTES.md`.
+
+| Project | Focus | How to run |
+|---------|--------|------------|
+| `01-todo` | Classes, arrays, modules | `./examples/projects/01-todo/demo.sh` |
+| `02-adventure` | Interactive stdin REPL + save/load | `./examples/projects/02-adventure/demo.sh` (or `--ci`) |
+| `03-echo` | TCP + coroutines + protocol module | `./examples/projects/03-echo/demo.sh` |
+
+Convenience from repo root:
+
+```bash
+./examples/projects/run-demos.sh    # all three demos (adventure uses transcript.txt)
+./examples/projects/run-tests.sh    # co-located tests for all three
+```
+
+### Playing `02-adventure`
+
+Reads all of stdin (`read_to_end`) then splits lines — on a TTY end with **Ctrl+D**,
+or pipe a transcript. Modules: `world` / `commands` / `save` + entry `main`.
+
+```bash
+./examples/projects/02-adventure/demo.sh
+```
+
+Commands: `look`, `go north|south|east|west`, `take` / `take key`,
+`inventory`, `save`, `load`, `help`, `quit`.
+
+CI / non-interactive (always under `timeout`; canned input in `transcript.txt`):
+
+```bash
+./examples/projects/02-adventure/demo.sh --ci
+```
+
+### Per-project tests
+
+```bash
+./examples/projects/run-tests.sh
+```
+
+Or `cd` into a project and run `zero-script test` (harness is CWD-`./tests` only).
+See [`examples/projects/README.md`](../examples/projects/README.md).
+
+---
+
 ## Quick reference table
 
 | File | Category | Output (if known) |
@@ -1307,6 +1364,7 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 | `io_eof.0s` | IO | `eof` |
 | `io_text.0s` | IO | `hello2` |
 | `io_udp.0s` | IO | `2` |
+| `io_nested_host.0s` | IO | `3` |
 | `array_grow.0s` | Collections | `414` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
