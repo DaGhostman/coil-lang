@@ -3383,9 +3383,7 @@ impl Compiler {
             Value::from(0i64).raw() as _,
         ));
         self.bytecode.push(Byte::new(Instruction::EQ));
-        // jump to end if failed == 0 (EQ true → skip panic via JMPF? EQ pushes bool;
-        // JMPF jumps when false, so if EQ is true (failed==0) we fall through... wait
-        // We want: if failed != 0 → panic. So LOAD failed; CONST 0; EQ; JMPF panic (if not equal, EQ is false, JMPF taken).
+        // failed == 0 → EQ true → fall through JMPF; else JMPF → panic.
         bb.emit_jump_to(panic_lbl, BbJumpKind::JumpIfFalse, &mut self.bytecode);
         bb.emit_jump_to(end_lbl, BbJumpKind::Unconditional, &mut self.bytecode);
 
@@ -6491,6 +6489,54 @@ mod tests {
         let mut compiler = Compiler::default();
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
+    }
+
+    /// `test("…")` cases become `__zs_test_N` functions; standalone runs get a virtual `main`.
+    #[test]
+    fn test_case_emits_synthetic_fns_virtual_main_and_relocates_offsets() {
+        use common::Instruction;
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+test("one") { assert(true); }
+test("two") { assert(true); }
+"#,
+            )
+            .expect("parse failed");
+        let mut compiler = Compiler::default();
+        let bc = compiler.compile("", &mut ast);
+
+        assert_eq!(compiler.test_cases().len(), 2);
+        assert_eq!(compiler.test_cases()[0].0, "one");
+        assert_eq!(compiler.test_cases()[1].0, "two");
+
+        let syn0 = compiler.get_function("__zs_test_0");
+        let syn1 = compiler.get_function("__zs_test_1");
+        let main_off = compiler.get_function("main");
+        assert!(syn0 < bc.len(), "__zs_test_0 offset out of range");
+        assert!(syn1 < bc.len(), "__zs_test_1 offset out of range");
+        assert!(main_off < bc.len(), "virtual main offset out of range");
+        assert_ne!(syn0, syn1, "synthetic test fns must be distinct");
+        assert_ne!(main_off, syn0, "virtual main must be distinct from cases");
+
+        // Peephole relocates test_cases offsets to match fused function entries.
+        assert_eq!(
+            compiler.test_cases()[0].1, syn0 as u32,
+            "test_cases[0] must track peephole relocation of __zs_test_0"
+        );
+        assert_eq!(
+            compiler.test_cases()[1].1, syn1 as u32,
+            "test_cases[1] must track peephole relocation of __zs_test_1"
+        );
+
+        let calls_in_main = bc[main_off..]
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CALL))
+            .count();
+        assert!(
+            calls_in_main >= 2,
+            "virtual main should CALL each harness case; got {calls_in_main}"
+        );
     }
 
     /// End-to-end: a simple integer expression compiles to bytecode

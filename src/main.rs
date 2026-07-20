@@ -820,4 +820,41 @@ mod tests {
     fn archive_mtime_returns_none_for_missing() {
         assert!(archive_mtime(unique_tmp("no_mtime").to_str().unwrap()).is_none());
     }
+
+    /// Fresh VM per case: soft-fail / panic in earlier cases must not skip later ones.
+    #[test]
+    fn harness_isolates_cases_and_continues_after_failures() {
+        let src = r#"
+test("soft fail") {
+    assert(false)?;
+}
+test("panics") {
+    panic "boom";
+}
+test("still runs") {
+    assert(true)?;
+}
+"#;
+        let mut pipeline = Pipeline::new();
+        let (bytecode, constants) = pipeline
+            .compile_src(src)
+            .expect("multi-case harness source should compile");
+        let cases = pipeline.test_cases().to_vec();
+        assert_eq!(cases.len(), 3, "expected three test(\"…\") cases");
+        assert_eq!(cases[0].0, "soft fail");
+        assert_eq!(cases[1].0, "panics");
+        assert_eq!(cases[2].0, "still runs");
+
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        for (name, offset) in &cases {
+            if run_test_case(&pipeline, &bytecode, &constants, None, name, *offset) {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        assert_eq!(failed, 2, "soft-fail + panic should each count as failures");
+        assert_eq!(passed, 1, "later case must still run after earlier failures");
+    }
 }
