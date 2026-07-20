@@ -1425,6 +1425,45 @@ fn main() {
     assert_eq!(output, "24");
 }
 
+/// Polymorphic payloads (`Option<Point>`, `Box<T>`) must not push
+/// registry schema placeholders (`Con("T")`) onto the per-arm override
+/// stack — that shadows the instantiated side-table type and makes
+/// `p.y` emit `LoadField(0)` (returns `x` / `1` instead of `y` / `2`).
+#[test]
+fn match_poly_payload_field_access_uses_instantiated_type() {
+    let output = run_example_src(
+        r#"
+enum Point {
+    Point { x: int, y: int },
+}
+
+enum Box<T> {
+    Full(T),
+}
+
+fn from_option(Option<Point> o) -> int {
+    return match o {
+        Option::None => 0,
+        Option::Some(p) => p.y,
+    };
+}
+
+fn from_box(Box<Point> b) -> int {
+    return match b {
+        Box::Full(p) => p.y,
+    };
+}
+
+fn main() {
+    print "%i", from_option(Option::Some(Point::Point { x: 1, y: 2 }));
+    print "%i", from_box(Box::Full(Point::Point { x: 1, y: 2 }));
+}
+"#,
+    );
+    // Broken override → "11"; correct → "22".
+    assert_eq!(output, "22");
+}
+
 /// P0: early-loop flag reassignment sticks while later locals stay live.
 #[test]
 fn store_pop_early_flag_sticks_with_later_locals() {

@@ -329,6 +329,11 @@ fn emit_inner_test<'compiler>(
 /// rather than whatever last arm wrote into the flat
 /// `codegen_var_types` side-table (same name reused across arms with
 /// different payload types would otherwise emit the wrong `LoadField`).
+///
+/// Open schema placeholders (`Ty::Var`, or `Ty::Con("T")` type-param
+/// markers from poly enums like `Option` / `Result` / `Box<T>`) are
+/// **not** inserted — they would shadow the instantiated binding type
+/// that `infer_pattern` already wrote into `codegen_var_types`.
 fn collect_pattern_binding_types(
     checker: &Checker,
     pattern: &Pattern<'_>,
@@ -353,7 +358,7 @@ fn collect_pattern_binding_types(
                     for (i, part) in parts.iter().enumerate() {
                         let expected = decl.get(i).map(|(_, ty)| ty);
                         collect_pattern_binding_types_with_expected(
-                            checker, part, expected, out,
+                            checker, enum_name, part, expected, out,
                         );
                     }
                 }
@@ -365,7 +370,11 @@ fn collect_pattern_binding_types(
                     for pf in fields {
                         let expected = by_name.get(pf.name).copied();
                         collect_pattern_binding_types_with_expected(
-                            checker, &pf.pattern, expected, out,
+                            checker,
+                            enum_name,
+                            &pf.pattern,
+                            expected,
+                            out,
                         );
                     }
                 }
@@ -374,8 +383,23 @@ fn collect_pattern_binding_types(
     }
 }
 
+/// True when `ty` is a poly-enum schema placeholder for `enum_name`
+/// (type-param `Con("T")` / `Con("E")` / …) or an open `Ty::Var`.
+fn is_open_schema_ty(checker: &Checker, enum_name: &str, ty: &Ty) -> bool {
+    match ty {
+        Ty::Var(_) => true,
+        Ty::Con(name) => checker
+            .generics()
+            .generic_type_ctors
+            .get(enum_name)
+            .is_some_and(|params| params.iter().any(|p| p == name)),
+        _ => false,
+    }
+}
+
 fn collect_pattern_binding_types_with_expected(
     checker: &Checker,
+    enum_name: &str,
     pattern: &Pattern<'_>,
     expected: Option<&Ty>,
     out: &mut HashMap<String, Ty>,
@@ -384,7 +408,9 @@ fn collect_pattern_binding_types_with_expected(
         Pattern::Wildcard => {}
         Pattern::Binding { name } => {
             if let Some(ty) = expected {
-                out.insert(name.to_string(), ty.clone());
+                if !is_open_schema_ty(checker, enum_name, ty) {
+                    out.insert(name.to_string(), ty.clone());
+                }
             }
         }
         Pattern::Constructor { .. } => {
