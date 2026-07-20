@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Play or CI-drive the adventure demo.
 #
-#   ./demo.sh           # interactive (type commands, then Ctrl+D)
+#   ./demo.sh           # interactive on a TTY; otherwise read stdin under timeout
 #   ./demo.sh --ci      # pipe transcript.txt under timeout
 set -euo pipefail
 
@@ -20,18 +20,6 @@ fi
 rm -f "$ROOT/out.c0s" "$HERE/out.c0s"
 
 case "${1:-}" in
-  --ci | -c | "")
-    if [[ "${1:-}" == "--ci" || "${1:-}" == "-c" ]]; then
-      timeout "${TIMEOUT_SECS}s" "$BIN" "$ENTRY" <"$HERE/transcript.txt"
-    else
-      # Default: interactive when stdin is a TTY, else treat as CI pipe.
-      if [[ -t 0 ]]; then
-        exec "$BIN" "$ENTRY"
-      else
-        timeout "${TIMEOUT_SECS}s" "$BIN" "$ENTRY"
-      fi
-    fi
-    ;;
   --help | -h)
     cat <<'EOF'
 Usage: demo.sh [--ci]
@@ -40,6 +28,16 @@ Usage: demo.sh [--ci]
   (no args, pipe)  read stdin under timeout
   --ci / -c        pipe transcript.txt under timeout
 EOF
+    ;;
+  --ci | -c)
+    timeout "${TIMEOUT_SECS}s" "$BIN" "$ENTRY" <"$HERE/transcript.txt"
+    ;;
+  "")
+    if [[ -t 0 ]]; then
+      exec "$BIN" "$ENTRY"
+    else
+      timeout "${TIMEOUT_SECS}s" "$BIN" "$ENTRY"
+    fi
     ;;
   *)
     echo "Unknown option: $1 (try --help)" >&2
