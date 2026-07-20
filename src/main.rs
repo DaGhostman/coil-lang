@@ -18,7 +18,10 @@ enum Command {
     BuildAndRun { filename: String },
     Compile { filename: String, output: String },
     Run { archive: String },
-    Test,
+    Test {
+        path: Option<String>,
+        fail_fast: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,16 +37,17 @@ fn print_help() {
          \x20 zero-script [--log-json | --log-lsp] <file.0s>\n\
          \x20 zero-script [--log-json | --log-lsp] compile <file.0s> [-o|--output <path>]\n\
          \x20 zero-script [--log-json | --log-lsp] run <file.c0s>\n\
-         \x20 zero-script [--log-json | --log-lsp] test\n\
+         \x20 zero-script [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \n\
          Commands:\n\
          \x20 (default)  Compile <file.0s> to out.c0s (cached) and run it\n\
          \x20 compile    Compile an entry file (must define main) to a .c0s archive\n\
          \x20 run        Execute a previously compiled .c0s archive\n\
-         \x20 test       Compile and run every .0s file under ./tests\n\
+         \x20 test       Compile and run every .0s file under [path] (default: ./tests)\n\
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` (default: out.c0s)\n\
+         \x20 --fail-fast          With `test`, stop after the first failed case\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
          \x20 -h, --help           Show this help\n\
@@ -55,6 +59,7 @@ fn print_help() {
 fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut log_json = false;
     let mut log_lsp = false;
+    let mut fail_fast = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
 
@@ -64,6 +69,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         match arg.as_str() {
             "--log-json" => log_json = true,
             "--log-lsp" => log_lsp = true,
+            "--fail-fast" => fail_fast = true,
             "-h" | "--help" => {
                 print_help();
                 exit(0);
@@ -82,7 +88,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, -o/--output, or a command/file)");
+                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, -o/--output, or a command/file)");
             }
             _ => positionals.push(arg.clone()),
         }
@@ -95,13 +101,31 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile`");
             }
-            Command::Test
+            Command::Test {
+                path: None,
+                fail_fast,
+            }
+        }
+        [cmd, path] if cmd == "test" => {
+            if output.is_some() {
+                return Err("-o/--output is only valid with `compile`");
+            }
+            if path == "compile" || path == "run" || path == "test" {
+                return Err("test path must be a directory");
+            }
+            Command::Test {
+                path: Some(path.clone()),
+                fail_fast,
+            }
         }
         [cmd] if cmd == "compile" => return Err("compile requires an entry file"),
         [cmd] if cmd == "run" => return Err("run requires a .c0s archive path"),
         [cmd, filename] if cmd == "compile" => {
             if filename == "compile" || filename == "run" || filename == "test" {
                 return Err("compile requires an entry file");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
             }
             Command::Compile {
                 filename: filename.clone(),
@@ -112,6 +136,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile`");
             }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
             Command::Run {
                 archive: archive.clone(),
             }
@@ -119,6 +146,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         [filename] => {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile`");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
             }
             Command::BuildAndRun {
                 filename: filename.clone(),
@@ -345,8 +375,39 @@ fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn cmd_test(config: ReportConfig) {
-    let tests_dir = Path::new(TESTS_DIR);
+fn run_test_case(
+    pipeline: &Pipeline,
+    bytecode: &[Byte],
+    constants: &[u64],
+    entry: Option<&Path>,
+    name: &str,
+    offset: u32,
+) -> bool {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut machine = Machine::<256>::default();
+        pipeline.wire_vm_ffi(&mut machine, entry);
+        pipeline.wire_host_natives(&mut machine);
+        machine.load_program(bytecode, constants);
+        let ret = machine.call_function(offset, &[]);
+        !machine.panicked() && machine.result_is_ok(ret)
+    }));
+    match result {
+        Ok(ok) => {
+            if !ok {
+                eprintln!("> Test \"{name}\" failed");
+            }
+            ok
+        }
+        Err(_) => {
+            eprintln!("> Test \"{name}\" failed");
+            false
+        }
+    }
+}
+
+fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
+    let root = path.unwrap_or_else(|| TESTS_DIR.to_string());
+    let tests_dir = Path::new(&root);
     let files = match collect_test_files(tests_dir) {
         Ok(f) => f,
         Err(msg) => {
@@ -358,34 +419,80 @@ fn cmd_test(config: ReportConfig) {
 
     let mut passed = 0usize;
     let mut failed = 0usize;
+    let mut stop = false;
 
     for path in &files {
+        if stop {
+            break;
+        }
         let display = path.display().to_string();
         let format = config.format;
         let mut pipeline = Pipeline::with_reporter(config.clone(), writer_for(format));
 
         let compiled = pipeline.compile_src_from_file(&display);
+        let cases: Vec<(String, u32)> = pipeline.test_cases().to_vec();
         let _ = pipeline.finish_reporting();
 
-        let ok = match compiled {
+        let file_ok = match compiled {
             Ok((bytecode, constants)) => {
                 let entry = path.as_path();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_archive(&pipeline, &bytecode, &constants, Some(entry))
-                }));
-                match result {
-                    Ok(panicked) => !panicked,
-                    Err(_) => false,
+                if cases.is_empty() {
+                    // Legacy: whole-file `main` is one opaque case.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute_archive(&pipeline, &bytecode, &constants, Some(entry))
+                    }));
+                    let ok = match result {
+                        Ok(panicked) => !panicked,
+                        Err(_) => false,
+                    };
+                    if ok {
+                        passed += 1;
+                    } else {
+                        failed += 1;
+                        eprintln!("> Test \"{display}\" failed");
+                        if fail_fast {
+                            stop = true;
+                        }
+                    }
+                    ok
+                } else {
+                    let mut any_fail = false;
+                    for (name, offset) in &cases {
+                        let ok = run_test_case(
+                            &pipeline,
+                            &bytecode,
+                            &constants,
+                            Some(entry),
+                            name,
+                            *offset,
+                        );
+                        if ok {
+                            passed += 1;
+                        } else {
+                            failed += 1;
+                            any_fail = true;
+                            if fail_fast {
+                                stop = true;
+                                break;
+                            }
+                        }
+                    }
+                    !any_fail
                 }
             }
-            Err(()) => false,
+            Err(()) => {
+                failed += 1;
+                eprintln!("> Test \"{display}\" failed");
+                if fail_fast {
+                    stop = true;
+                }
+                false
+            }
         };
 
-        if ok {
-            passed += 1;
+        if file_ok {
             eprintln!("ok   {display}");
         } else {
-            failed += 1;
             eprintln!("FAILED {display}");
         }
     }
@@ -431,7 +538,7 @@ fn main() {
     };
 
     match cli.command {
-        Command::Test => cmd_test(config),
+        Command::Test { path, fail_fast } => cmd_test(config, path, fail_fast),
         command => {
             let format = config.format;
             let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
@@ -441,7 +548,7 @@ fn main() {
                     cmd_compile(&mut pipeline, &filename, &output)
                 }
                 Command::Run { archive } => cmd_run(&mut pipeline, &archive),
-                Command::Test => unreachable!(),
+                Command::Test { .. } => unreachable!(),
             }
         }
     }
@@ -519,7 +626,33 @@ mod tests {
     #[test]
     fn parse_test() {
         let cli = parse_args(&args(&["test"])).unwrap();
-        assert_eq!(cli.command, Command::Test);
+        assert_eq!(
+            cli.command,
+            Command::Test {
+                path: None,
+                fail_fast: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_test_with_path_and_fail_fast() {
+        let cli = parse_args(&args(&["test", "./tests", "--fail-fast"])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Test {
+                path: Some("./tests".into()),
+                fail_fast: true,
+            }
+        );
+        let cli = parse_args(&args(&["--fail-fast", "test"])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Test {
+                path: None,
+                fail_fast: true,
+            }
+        );
     }
 
     #[test]
@@ -530,7 +663,13 @@ mod tests {
 
         let cli = parse_args(&args(&["test", "--log-lsp"])).unwrap();
         assert!(cli.log_lsp);
-        assert_eq!(cli.command, Command::Test);
+        assert_eq!(
+            cli.command,
+            Command::Test {
+                path: None,
+                fail_fast: false,
+            }
+        );
     }
 
     #[test]

@@ -203,6 +203,10 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
             pre_walk(args, table);
             pre_walk(body, table);
         }
+        Expression::TestCase { name, body } => {
+            pre_walk(name, table);
+            pre_walk(body, table);
+        }
 
         Expression::Branch(cond, body) => {
             if let Some(c) = cond {

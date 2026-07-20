@@ -259,6 +259,12 @@ pub struct Checker {
     /// Function names whose return type is (or was inferred as) `Option<_>`.
     option_mode_fns: HashSet<String>,
 
+    /// Literal descriptions from top-level `test("…") { … }` declarations
+    /// (source order). Used by codegen / the test harness.
+    test_case_names: Vec<String>,
+    /// Span of a user-written `fn main` when present (conflict with test cases).
+    main_decl_span: Option<Range<usize>>,
+
     // ── Generics ──────────────────────────────────────────────────────────────
     /// Type parameters currently in scope (name → fresh TyVarId).
     /// Pushed when entering a generic function, popped on exit.
@@ -437,6 +443,8 @@ impl Checker {
             fn_option_mode: None,
             result_mode_fns: HashSet::new(),
             option_mode_fns: HashSet::new(),
+            test_case_names: Vec::new(),
+            main_decl_span: None,
             type_params_in_scope: Vec::new(),
             active_constraints: Vec::new(),
             abstract_constraint_bindings: Vec::new(),
@@ -845,6 +853,8 @@ impl Checker {
         self.fn_option_mode = None;
         self.result_mode_fns.clear();
         self.option_mode_fns.clear();
+        self.test_case_names.clear();
+        self.main_decl_span = None;
         self.generics.generic_type_ctors.clear();
         self.generics.register_builtin_type_ctors();
         self.generics.generic_fns.clear();
@@ -883,6 +893,22 @@ impl Checker {
         // the substitution is closed and every scrutinee type can
         // be fully resolved.
         self.run_pending_exhaustiveness();
+
+        // `test("…") { … }` cases provide a virtual main — reject a
+        // user-written `fn main` in the same file.
+        if !self.test_case_names.is_empty()
+            && let Some(span) = self.main_decl_span.clone()
+        {
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                "test files with `test(...)` cases must not define `main`".into(),
+                span,
+            );
+            msg.with_help(
+                "remove `fn main`; the test harness provides a virtual main".into(),
+            );
+            self.messages.push(msg);
+        }
 
         // Return the fully-resolved type so callers see e.g. `Foo`
         // rather than `Var(0)` even when the type was inferred
@@ -2447,6 +2473,9 @@ impl Checker {
                 where_constraints,
                 body,
             } => {
+                if *name == "main" {
+                    self.main_decl_span = Some(range.clone());
+                }
                 self.infer_function(
                     name,
                     type_params,
@@ -2459,6 +2488,11 @@ impl Checker {
                     *is_coro,
                 );
                 unit_ty()
+            }
+
+            // ---- `test("…") { … }` harness cases ----
+            Expression::TestCase { name, body } => {
+                self.infer_test_case(name, body, &range)
             }
             Expression::Implementation {
                 owner,
@@ -6081,6 +6115,16 @@ impl Checker {
         self.result_mode_fns.contains(fn_name)
     }
 
+    /// Literal names of top-level `test("…") { … }` cases (source order).
+    pub fn test_case_names(&self) -> &[String] {
+        &self.test_case_names
+    }
+
+    /// Synthetic function name for the `n`-th harness test case.
+    pub fn test_case_fn_name(index: usize) -> String {
+        format!("__zs_test_{index}")
+    }
+
     /// Whether `fn_name` returns (or was inferred to return) `Option<_>`.
     pub fn fn_is_option_mode(&self, fn_name: &str) -> bool {
         self.option_mode_fns.contains(fn_name)
@@ -6607,6 +6651,51 @@ impl Checker {
             }
         }
         subst_ty_params(&fty, &map)
+    }
+
+    // ============================================================
+    //  Test harness cases
+    // ============================================================
+
+    /// Typecheck `test("desc") { body }` — name must be a string literal;
+    /// body runs in Result<(), string> mode.
+    fn infer_test_case(&mut self, name: &Output, body: &Output, range: &Range<usize>) -> Ty {
+        let name_ty = self.infer(name);
+        self.unify(&name_ty, &string(), &name.0.into_range(), "test case name");
+
+        let desc = match unwrap_expr_wrappers(name).1.as_ref() {
+            Expression::String(s) => (*s).to_string(),
+            _ => {
+                let _ = self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    "test case name must be a string literal".into(),
+                    name.0.into_range(),
+                    Some("write `test(\"description\") { … }`".into()),
+                );
+                format!("test_{}", self.test_case_names.len())
+            }
+        };
+        let case_index = self.test_case_names.len();
+        self.test_case_names.push(desc);
+        let fn_name = Self::test_case_fn_name(case_index);
+
+        let prev_result_mode = self.fn_result_mode.take();
+        let prev_option_mode = self.fn_option_mode.take();
+        let prev_ret = self.current_return_ty.take();
+        self.fn_result_mode = Some((unit_ty(), string()));
+        self.current_return_ty = Some(unit_ty());
+
+        self.push_scope();
+        let _ = self.infer(body);
+        self.pop_scope();
+
+        self.result_mode_fns.insert(fn_name);
+        self.current_return_ty = prev_ret;
+        self.fn_result_mode = prev_result_mode;
+        self.fn_option_mode = prev_option_mode;
+
+        let _ = range;
+        unit_ty()
     }
 
     // ============================================================
@@ -7249,6 +7338,11 @@ impl Checker {
 
             Expression::Function { args, body, .. } => {
                 self.pre_register_enums_walk(args, errors);
+                self.pre_register_enums_walk(body, errors);
+            }
+
+            Expression::TestCase { name, body } => {
+                self.pre_register_enums_walk(name, errors);
                 self.pre_register_enums_walk(body, errors);
             }
 
@@ -13820,6 +13914,58 @@ fn main() {
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn test_case_accepts_assert_in_result_mode() {
+        let (mut c, _) = check(
+            r#"
+test("ok") {
+    assert(true)?;
 }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(c.test_case_names(), &["ok".to_string()]);
+        assert!(c.fn_is_result_mode("__zs_test_0"));
+    }
+
+    #[test]
+    fn test_case_rejects_main_alongside_cases() {
+        let msgs = assert_messages(
+            r#"
+test("a") { assert(true)?; }
+fn main() { print "x"; }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("must not define `main`")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_case_name_must_be_string_literal() {
+        let msgs = assert_messages(
+            r#"
+let name = "x";
+test(name) { assert(true)?; }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("string literal")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+}
+
 
 

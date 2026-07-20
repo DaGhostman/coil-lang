@@ -144,6 +144,10 @@ pub struct Machine<const S: usize> {
     program_constants: Vec<u64>,
     /// When > 0, `RETURN` captures into `nested_return` instead of unwinding to caller.
     nested_depth: u32,
+    /// Frame stack length at the start of the active [`call_function`] —
+    /// only a `RETURN` that pops back to this depth should capture
+    /// `nested_return` (inner `CALL`s must still unwind normally).
+    nested_frame_depth: usize,
     nested_return: Option<Value>,
     /// Set when `execute` pauses before a native FFI call that may reenter the VM.
     pending_ffi: Option<PendingFfiInvoke>,
@@ -172,6 +176,7 @@ impl<const S: usize> Default for Machine<S> {
             program_code: Vec::new(),
             program_constants: Vec::new(),
             nested_depth: 0,
+            nested_frame_depth: 0,
             nested_return: None,
             pending_ffi: None,
             panicked: false,
@@ -777,6 +782,21 @@ impl<const S: usize> Machine<S> {
         self.panicked
     }
 
+    /// Load bytecode for reentrant [`call_function`] without running `main`.
+    pub fn load_program(&mut self, code: &[RawByte], constants: &[u64]) {
+        self.program_code = code.to_vec();
+        self.program_constants = constants.to_vec();
+        self.panicked = false;
+    }
+
+    /// True when `value` is a heap `Result::Ok` (enum tag 0).
+    pub fn result_is_ok(&self, value: Value) -> bool {
+        match Self::find_object_by_addr(&self.heap, value.raw() as u64) {
+            Some(Object::Enum(gc)) => gc.as_ref().tag == 0,
+            _ => false,
+        }
+    }
+
     pub fn run(&mut self, code: &[Byte]) {
         self.run_with_pool(code, &[]);
     }
@@ -891,6 +911,9 @@ impl<const S: usize> Machine<S> {
             f.seek(0);
             f.set(callee_sp);
         });
+        // Capture only when RETURN reaches this frame depth (the
+        // call_function entry), not when inner CALLs return.
+        self.nested_frame_depth = self.frames.len();
         let code: &[Byte] = unsafe {
             std::slice::from_raw_parts(self.program_code.as_ptr().cast(), self.program_code.len())
         };
@@ -911,6 +934,9 @@ impl<const S: usize> Machine<S> {
         let _ = self.frames.pop();
         self.stack.seek(saved_sp);
         self.nested_depth -= 1;
+        if self.nested_depth == 0 {
+            self.nested_frame_depth = 0;
+        }
         self.nested_return.take().unwrap_or_default()
     }
 
@@ -1248,7 +1274,7 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
-                    if self.nested_depth > 0 {
+                    if self.nested_depth > 0 && self.frames.len() == self.nested_frame_depth {
                         self.nested_return = Some(ret_val);
                         return false;
                     }

@@ -499,6 +499,10 @@ where
             }
             f(body);
         }
+        Expression::TestCase { name, body } => {
+            f(name);
+            f(body);
+        }
         Expression::TypeApp { args, .. } => {
             for arg in args {
                 f(arg);

@@ -413,6 +413,13 @@ pub struct Compiler {
     /// as `Result<T, E>` via `raise` / `?` (wrap bare `return` in `Ok`).
     compiling_result_mode: bool,
 
+    /// Harness metadata: `(description, bytecode offset)` for each
+    /// top-level `test("…") { … }` case, in source order.
+    test_cases: Vec<(String, u32)>,
+
+    /// True when a user-written `fn main` was emitted this compile.
+    user_main_defined: bool,
+
     /// Local variable names that hold an `ObjPolyFn` heap pointer
     /// (i.e. `let f = some_generic_fn;`). When these are invoked via
     /// `Expression::Call`, the codegen emits `CallIndirect` instead
@@ -465,6 +472,8 @@ impl Default for Compiler {
             loop_bbs: Vec::new(),
             compiling_method: false,
             compiling_result_mode: false,
+            test_cases: Vec::new(),
+            user_main_defined: false,
             polyfn_vars: HashSet::new(),
             polyfn_sources: HashMap::new(),
             mono_plan: MonoPlan::default(),
@@ -477,6 +486,11 @@ impl Default for Compiler {
 impl Compiler {
     pub fn constants(&self) -> &[u64] {
         &self.constants
+    }
+
+    /// Harness test cases emitted this compile: `(description, fn offset)`.
+    pub fn test_cases(&self) -> &[(String, u32)] {
+        &self.test_cases
     }
 
     pub fn intern_constant(&mut self, value: u64) -> u32 {
@@ -3296,6 +3310,103 @@ impl Compiler {
             .expect("BlockBuilder::finalize: assert labels bound");
     }
 
+    /// Emit a synthetic `main` that runs every harness test case in one VM
+    /// (standalone `cargo run -- tests/foo.0s`). Prints
+    /// `> Test "<name>" failed` on soft failures and panics with
+    /// `"tests failed"` if any case failed.
+    fn emit_virtual_test_main(&mut self) {
+        let cases: Vec<(String, u32)> = self.test_cases.clone();
+        if cases.is_empty() {
+            return;
+        }
+
+        let main_offset = self.bytecode.len();
+        self.functions.insert("main".to_string(), main_offset);
+
+        let prev_vars = std::mem::take(&mut self.context.variables);
+        self.context.variables = Interner::default();
+        // slot 0 = failed count
+        let failed_slot = self.context.variables.intern("failed".to_string()) as u32;
+        self.bytecode.push(Byte::new_with_value(
+            Instruction::CONST,
+            Value::from(0i64).raw() as _,
+        ));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(failed_slot));
+
+        let mut bb = BlockBuilder::new();
+        for (desc, offset) in &cases {
+            self.bytecode.push(
+                Byte::new(Instruction::CALL).with_call_packed(0, *offset),
+            );
+            // Jump if Result::Err (tag 1) — on match, payload (message) is pushed.
+            let fail = bb.fresh_label();
+            let done = bb.fresh_label();
+            bb.emit_jump_to(
+                fail,
+                BbJumpKind::JumpIfMatch { tag: 1, arity: 1 },
+                &mut self.bytecode,
+            );
+            // Ok path: discard whole Result enum.
+            self.bytecode.push(Byte::new(Instruction::POP));
+            bb.emit_jump_to(done, BbJumpKind::Unconditional, &mut self.bytecode);
+
+            let fail_pos = self.bytecode.len() as u32;
+            bb.bind_label(fail, fail_pos, &mut self.bytecode, &mut self.constants);
+            // Discard Err message payload.
+            self.bytecode.push(Byte::new(Instruction::POP));
+            let msg = format!("> Test \"{desc}\" failed\n");
+            self.emit_string_literal(&msg);
+            self.bytecode.push(Byte::new(Instruction::PRINT));
+            // failed += 1
+            self.bytecode
+                .push(Byte::new(Instruction::LOAD).with_operand_u32(failed_slot));
+            self.bytecode.push(Byte::new_with_value(
+                Instruction::CONST,
+                Value::from(1i64).raw() as _,
+            ));
+            self.bytecode.push(Byte::new(Instruction::ADD));
+            self.bytecode
+                .push(Byte::new(Instruction::StorePop).with_operand_u32(failed_slot));
+
+            let done_pos = self.bytecode.len() as u32;
+            bb.bind_label(done, done_pos, &mut self.bytecode, &mut self.constants);
+        }
+
+        // if failed != 0 { panic "tests failed" }
+        let panic_lbl = bb.fresh_label();
+        let end_lbl = bb.fresh_label();
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(failed_slot));
+        self.bytecode.push(Byte::new_with_value(
+            Instruction::CONST,
+            Value::from(0i64).raw() as _,
+        ));
+        self.bytecode.push(Byte::new(Instruction::EQ));
+        // jump to end if failed == 0 (EQ true → skip panic via JMPF? EQ pushes bool;
+        // JMPF jumps when false, so if EQ is true (failed==0) we fall through... wait
+        // We want: if failed != 0 → panic. So LOAD failed; CONST 0; EQ; JMPF panic (if not equal, EQ is false, JMPF taken).
+        bb.emit_jump_to(panic_lbl, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+        bb.emit_jump_to(end_lbl, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let panic_pos = self.bytecode.len() as u32;
+        bb.bind_label(panic_lbl, panic_pos, &mut self.bytecode, &mut self.constants);
+        self.emit_string_literal("tests failed");
+        self.bytecode.push(Byte::new(Instruction::Panic));
+
+        let end_pos = self.bytecode.len() as u32;
+        bb.bind_label(end_lbl, end_pos, &mut self.bytecode, &mut self.constants);
+        self.bytecode.push(Byte::new_with_value(
+            Instruction::CONST,
+            Value::default().raw() as _,
+        ));
+        self.bytecode.push(Byte::new(Instruction::RETURN));
+
+        bb.finalize()
+            .expect("BlockBuilder::finalize: virtual test main labels bound");
+        self.context.variables = prev_vars;
+    }
+
     fn do_compile<'compiler>(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'compiler>>),
@@ -3356,6 +3467,9 @@ impl Compiler {
                 children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
                 });
+                if !self.test_cases.is_empty() && !self.user_main_defined {
+                    self.emit_virtual_test_main();
+                }
             }
             // --- Let / const bindings ---
             Expression::Fragment(children) => {
@@ -3438,6 +3552,9 @@ impl Compiler {
                 } else {
                     format!("{}::{}", self.namespace, name)
                 };
+                if *name == "main" {
+                    self.user_main_defined = true;
+                }
                 self.module_items
                     .entry(self.namespace.clone())
                     .or_default()
@@ -5333,6 +5450,53 @@ impl Compiler {
             Expression::TypeAlias { ty, .. } => {
                 bytecode.append(&mut self.do_compile(ty));
             }
+            Expression::TestCase { name, body } => {
+                // Consume name NodeIds (discard emitted string bytes).
+                let _ = self.do_compile(name);
+                let desc = match name.1.as_ref() {
+                    Expression::String(s) => (*s).to_string(),
+                    Expression::Expr((_, inner)) => match inner.as_ref() {
+                        Expression::String(s) => (*s).to_string(),
+                        _ => format!("test_{}", self.test_cases.len()),
+                    },
+                    _ => format!("test_{}", self.test_cases.len()),
+                };
+                let case_index = self.test_cases.len();
+                let fn_name = crate::typechecking::Checker::test_case_fn_name(case_index);
+                let offset = self.bytecode.len() as u32;
+                self.functions.insert(fn_name.clone(), offset as usize);
+                self.test_cases.push((desc, offset));
+
+                let prev_fn_vars = std::mem::take(&mut self.context.variables);
+                let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
+                let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
+                self.context.variables = Interner::default();
+
+                let prev_result_mode = self.compiling_result_mode;
+                self.compiling_result_mode = self.checker.fn_is_result_mode(&fn_name);
+
+                let mut body_bc = self.do_compile(body);
+                self.bytecode.append(&mut body_bc);
+
+                if !matches!(
+                    self.bytecode.last().map(|b| b.bytecode()),
+                    Some(Instruction::RETURN)
+                ) {
+                    self.bytecode.push(Byte::new_with_value(
+                        Instruction::CONST,
+                        Value::default().raw() as _,
+                    ));
+                    if self.compiling_result_mode {
+                        Self::emit_ok_or_some_wrap(&mut self.bytecode, false);
+                    }
+                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                }
+
+                self.compiling_result_mode = prev_result_mode;
+                self.context.variables = prev_fn_vars;
+                self.polyfn_vars = prev_fn_polyfn_vars;
+                self.polyfn_sources = prev_fn_polyfn_sources;
+            }
             Expression::ExternStruct(decl) => {
                 for (_, ty) in &decl.fields {
                     bytecode.append(&mut self.do_compile(ty));
@@ -6226,6 +6390,8 @@ impl Compiler {
         self.constants.clear();
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
+        self.test_cases.clear();
+        self.user_main_defined = false;
         self.checker.set_current_module(module);
         // Expand `derive` clauses to synthetic `impl` AST before the
         // ID pre-walk / typecheck (see `derive::expand_program`).
@@ -6257,6 +6423,9 @@ impl Compiler {
         let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
+        }
+        for (_, offset) in self.test_cases.iter_mut() {
+            *offset = peephole::adjust_target(*offset as usize, &fusion_sites) as u32;
         }
         for offset in self.mono_offsets.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);

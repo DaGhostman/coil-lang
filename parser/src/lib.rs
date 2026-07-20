@@ -1130,6 +1130,7 @@ impl<'pratt> Pratt<'pratt> {
             self.trait_impl_for_block(stmt.clone()),
             self.impl_block(stmt.clone()),
             self.typeclass_impl_block(stmt.clone()),
+            self.test_case(stmt.clone()),
             self.func(stmt.clone()),
             self.type_alias(),
             self.use_(),
@@ -1140,6 +1141,31 @@ impl<'pratt> Pratt<'pratt> {
             self.extern_block(),
             stmt.clone(),
         ))
+    }
+
+    /// `test("description") { … }` — harness test case declaration.
+    fn test_case<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        stmt: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("test")
+            .ignore_then(
+                self.expr()
+                    .delimited_by(op!("("), op!(")")),
+            )
+            .then(self.block(stmt))
+            .map_with(|(name, body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::TestCase { name, body }),
+                )
+            })
+            .labelled("test case")
     }
 
     /// `type Name = T;` — type alias declaration.
@@ -3598,6 +3624,50 @@ mod tests {
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }
+    }
+
+    #[test]
+    fn parse_test_case_declaration() {
+        let src = r#"test("addition works") { assert(1 + 1 == 2)?; }"#;
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::TestCase { name, body } => {
+                    fn is_string_lit(e: &Expression<'_>) -> bool {
+                        match e {
+                            Expression::String("addition works") => true,
+                            Expression::Expr((_, inner)) | Expression::Group((_, inner)) => {
+                                is_string_lit(inner)
+                            }
+                            _ => false,
+                        }
+                    }
+                    assert!(
+                        is_string_lit(name.1.as_ref()),
+                        "expected string literal name, got {:?}",
+                        name.1
+                    );
+                    assert!(matches!(body.1.as_ref(), Expression::Block(_)));
+                }
+                other => panic!("expected TestCase, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_case_display_round_trips_name() {
+        let src = r#"test("x") { assert(true)?; }"#;
+        let ast = Pratt::default()
+            .declaration()
+            .parse(src)
+            .into_result()
+            .expect("parse");
+        let displayed = format!("{}", ast.1);
+        assert!(
+            displayed.contains("test(\"x\")"),
+            "display should retain test name: {displayed}"
+        );
     }
 }
 

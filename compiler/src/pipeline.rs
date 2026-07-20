@@ -1058,6 +1058,11 @@ impl Pipeline {
         ))
     }
 
+    /// Harness test cases from the last compile (`description`, bytecode offset).
+    pub fn test_cases(&self) -> &[(String, u32)] {
+        self.compiler.test_cases()
+    }
+
     /// Borrow host-registered native function metadata.
     pub fn natives(&self) -> &[NativeDecl] {
         &self.natives

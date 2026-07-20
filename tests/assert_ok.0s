@@ -1,6 +1,8 @@
 // Exercised by `zero-script test`.
-fn main() {
+test("assert true") {
     assert(true)?;
+}
+
+test("assert equality with message") {
     assert(1 == 1, "ones")?;
-    print "ok";
 }
