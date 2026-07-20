@@ -1,9 +1,8 @@
 // 02-adventure — text adventure over stdin/stdout.
 //
-// Input strategy: `read_to_end(stdin)` once, then split on `\n`.
-// A per-line `read_exact` loop segfaults after a couple of lines in practice.
-// That means interactive TTY play needs Ctrl+D (EOF) after typing commands,
-// or a piped/redirected transcript. Always wrap automation with `timeout`:
+// Modules: world (rooms/player), commands (byte parse), save (encode/decode).
+// File IO and stdin live here (entry file) — see NOTES.md.
+// Input: `read_to_end` once, then split on `\n` (batch / Ctrl+D on a TTY).
 //
 //   rm -f out.c0s
 //   printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
@@ -11,32 +10,11 @@
 
 use io::*;
 use world::*;
-
-class SaveData {
-    room: int,
-    has_key: int,
-}
+use commands::*;
+use save::*;
 
 fn save_player(string path, int room, int has_key) {
-    let z: byte = 0;
-    let one: byte = 1;
-    let two: byte = 2;
-    let hi: byte = 0;
-    let lo: byte = 0;
-    if room == 1 {
-        hi = one;
-    }
-    if room == 2 {
-        hi = two;
-    }
-    if has_key == 1 {
-        lo = one;
-    }
-    if room == 0 {
-        hi = z;
-    }
-    let payload: [byte] = [hi];
-    push(payload, lo);
+    let payload = encode_save(room, has_key);
     let s = open(path, "w")?;
     write_all(s, payload)?;
     close(s)?;
@@ -47,25 +25,7 @@ fn load_player(string path) {
     let s = open(path, "r")?;
     let got = read_to_end(s)?;
     close(s)?;
-    if len(got) < 2 {
-        panic "save too short";
-    }
-    let one: byte = 1;
-    let two: byte = 2;
-    let r = 0;
-    let k = 0;
-    let rb = got[0];
-    let kb = got[1];
-    if rb == one {
-        r = 1;
-    }
-    if rb == two {
-        r = 2;
-    }
-    if kb == one {
-        k = 1;
-    }
-    return new SaveData(r, k);
+    return decode_save(got);
 }
 
 fn print_look(Player p) {
@@ -90,7 +50,6 @@ fn print_help() {
 }
 
 fn handle_line(Player p, [byte] line, string save_path) -> int {
-    // returns 1 = keep running, 0 = quit
     if len(line) == 0 {
         return 1;
     }
@@ -183,8 +142,6 @@ fn main() {
     let nl: byte = 10;
     let cr: byte = 13;
 
-    // Bind stdin before read_to_end. Nested `read_to_end(stdin())` used to
-    // miscompile (IO HostInvoke arg order); keep the split form for clarity.
     let input = stdin();
     let raw = match read_to_end(input) {
         Result::Ok(b) => b,
@@ -199,7 +156,6 @@ fn main() {
             running = 0;
         }
         if running == 1 {
-            // Collect one line into `line` (no CR/LF)
             let line: [byte] = [z];
             let collecting = 1;
             while collecting == 1 {
@@ -220,10 +176,6 @@ fn main() {
                 }
             }
             print "> ";
-            // Strip sentinel at index 0
-            if len(line) == 1 {
-                // empty line
-            }
             if len(line) > 1 {
                 let out: [byte] = [line[1]];
                 let j = 2;

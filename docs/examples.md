@@ -1291,19 +1291,25 @@ Each project has its own `zero.toml`, co-located `tests/`, and `NOTES.md`.
 
 ### Playing `02-adventure`
 
+Reads all of stdin (`read_to_end`) then splits lines — on a TTY end with **Ctrl+D**,
+or pipe a transcript. Modules: `world` / `commands` / `save` + entry `main`.
+
 ```bash
+rm -f out.c0s
 cargo run --release -- examples/projects/02-adventure/src/main.0s
 ```
 
-Commands at the `>` prompt: `look`, `go north|south|east|west`, `take` / `take key`,
+Commands: `look`, `go north|south|east|west`, `take` / `take key`,
 `inventory`, `save`, `load`, `help`, `quit`.
 
-CI / non-interactive (always wrap with `timeout` so a hung REPL cannot block):
+CI / non-interactive (always wrap with `timeout`):
 
 ```bash
+rm -f out.c0s
 printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
   timeout 10s cargo run --release -- examples/projects/02-adventure/src/main.0s
 ```
+
 
 ### Per-project tests
 

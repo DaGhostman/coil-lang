@@ -54,15 +54,25 @@ cargo run --release --manifest-path ../../../Cargo.toml -- test
 That awkward `cd` + `--manifest-path` is intentional documentation of current
 ergonomics (no `zero-script test --project …` yet).
 
+## Module layout (matches the plan)
+
+| Project | Modules |
+|---------|---------|
+| `01-todo` | `board.0s` + `main.0s` |
+| `02-adventure` | `world.0s` + `commands.0s` + `save.0s` + `main.0s` |
+| `03-echo` | `protocol.0s` + `server.0s` + `client.0s` + `main.0s` |
+
 ## Rolled-up language / tooling gaps
 
 See each project's `NOTES.md` for detail. Highlights:
 
-1. No `read_line` builtin; adventure uses `read_to_end` + `\n` split (Ctrl+D / pipe).
-2. No `\n` escapes in string literals (prompts use spaces).
-3. Prefer `let s = stdin(); read_to_end(s)` — nested `read_to_end(stdin())` was a
+1. **IO HostInvoke from dependency modules is broken** — keep `open` / TCP /
+   `stdin` calls in the entry `main.0s`; dep modules stay pure helpers.
+2. **`use` of a sibling module from a non-entry file** may not resolve free-fn
+   calls — call shared helpers from the entry, or keep dep modules self-contained.
+3. No `read_line` builtin; adventure uses `read_to_end` + `\n` split (Ctrl+D / pipe).
+4. No `\n` escapes in string literals (prompts use spaces).
+5. Prefer `let s = stdin(); read_to_end(s)` — nested `read_to_end(stdin())` was a
    HostInvoke arg-order bug (fixed; regression: `examples/io_nested_host.0s`).
-4. Avoid `x < 0` for EOF/sentinels (unsigned-style compares); use `==` / positive sentinels.
-5. Test harness is CWD-`./tests` only; no fixtures / stdout assertions.
-6. Adventure unit tests stay pure (parse/move); pipe a transcript with `timeout`
-   for end-to-end checks.
+6. Avoid `x < 0` for EOF/sentinels; use `==` / positive sentinels.
+7. Test harness is CWD-`./tests` only; pipe adventure transcripts under `timeout`.

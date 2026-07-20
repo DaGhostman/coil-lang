@@ -1,6 +1,33 @@
 // Length-prefixed frame helpers for the echo demo.
-// Each fn is self-contained (sibling calls do not resolve in dependency modules).
-// Frame layout: [nbytes:byte][payload…]
+// Frame layout: [nbytes:byte][payload…] (payload capped at 5 for the demo).
+
+fn frame_len([byte] frame) -> int {
+    if len(frame) < 1 {
+        return 0;
+    }
+    let b = frame[0];
+    let one: byte = 1;
+    let two: byte = 2;
+    let three: byte = 3;
+    let four: byte = 4;
+    let five: byte = 5;
+    if b == one {
+        return 1;
+    }
+    if b == two {
+        return 2;
+    }
+    if b == three {
+        return 3;
+    }
+    if b == four {
+        return 4;
+    }
+    if b == five {
+        return 5;
+    }
+    return 0;
+}
 
 fn encode_frame([byte] body) -> [byte] {
     let n = len(body);
@@ -31,60 +58,8 @@ fn encode_frame([byte] body) -> [byte] {
     return frame;
 }
 
-fn frame_len([byte] frame) -> int {
-    if len(frame) < 1 {
-        return 0;
-    }
-    let b = frame[0];
-    let one: byte = 1;
-    let two: byte = 2;
-    let three: byte = 3;
-    let four: byte = 4;
-    let five: byte = 5;
-    if b == one {
-        return 1;
-    }
-    if b == two {
-        return 2;
-    }
-    if b == three {
-        return 3;
-    }
-    if b == four {
-        return 4;
-    }
-    if b == five {
-        return 5;
-    }
-    return 0;
-}
-
-// Inlined frame_len — sibling calls are unresolved in non-entry modules.
 fn payload_eq([byte] frame, [byte] expect) -> int {
-    let n = 0;
-    if len(frame) >= 1 {
-        let b = frame[0];
-        let one: byte = 1;
-        let two: byte = 2;
-        let three: byte = 3;
-        let four: byte = 4;
-        let five: byte = 5;
-        if b == one {
-            n = 1;
-        }
-        if b == two {
-            n = 2;
-        }
-        if b == three {
-            n = 3;
-        }
-        if b == four {
-            n = 4;
-        }
-        if b == five {
-            n = 5;
-        }
-    }
+    let n = frame_len(frame);
     if n != len(expect) {
         return 0;
     }

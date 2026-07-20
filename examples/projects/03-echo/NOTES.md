@@ -2,8 +2,9 @@
 
 ## What it shows
 
-Single-process TCP echo: `io::net::tcp` listen/connect/accept_wait, a tiny
-length-prefixed protocol module, and a coroutine that supplies payload bytes.
+Single-process TCP echo: `io::net::tcp` listen/connect/accept_wait, length-prefixed
+framing (`protocol.0s`), pure server/client helpers, and a coroutine that
+supplies payload bytes. Stream IO stays in `main.0s`.
 
 ## Run
 
@@ -13,28 +14,32 @@ timeout 10s cargo run --release -- examples/projects/03-echo/src/main.0s
 # ok
 ```
 
-Always wrap with `timeout` — a wedged accept/connect must not hang the runner.
+Always wrap with `timeout`.
 
 ## Test
 
 ```bash
 cd examples/projects/03-echo
-cargo run --release --manifest-path ../../../Cargo.toml -- test
+timeout 60s cargo run --release --manifest-path ../../../Cargo.toml -- test
 ```
 
-`protocol_roundtrip.0s` is pure (no sockets).
+## Layout
 
-## Layout vs plan
-
-Plan called for `protocol.0s` + `server.0s` + `client.0s`. Today **only the
-first file-module `use` resolves** in an entry, so server/client orchestration
-lives in `main.0s` and framing stays in `protocol.0s`.
+| File | Role |
+|------|------|
+| `src/protocol.0s` | `encode_frame` / `frame_len` / `payload_eq` (sibling calls) |
+| `src/server.0s` | Pure echo policy (`echo_reply`) |
+| `src/client.0s` | Pure request body + fixed port |
+| `src/main.0s` | listen → connect → accept → exchange (all Stream IO) |
 
 ## Ergonomics / gaps noticed
 
-1. TCP has **no `local_port`** (UDP does) — demos must use a fixed port.
-2. Preferred order: `listen` → `connect` → `accept_wait` (connect may complete
-   while the connection sits in the accept backlog).
-3. Array index assign (`buf[i] = x`) is unreliable — prefer `push` / one-byte reads.
-4. Multiple file-module `use` from one entry is broken.
-5. Test harness is CWD-`./tests` only.
+1. **IO HostInvoke from a dependency module is broken** — TCP helpers that
+   call `listen`/`write_all`/… must live in the entry file.
+2. **`use sibling::*` inside a non-entry module** may not resolve free-fn
+   calls (`payload_eq` from `server.0s` failed) — keep dep modules self-contained
+   or call shared helpers only from the entry.
+3. TCP has **no `local_port`** — fixed port `41235`.
+4. Preferred order: `listen` → `connect` → `accept_wait`.
+5. Prefer `push` / one-byte reads over index assign.
+6. Test harness is CWD-`./tests` only.

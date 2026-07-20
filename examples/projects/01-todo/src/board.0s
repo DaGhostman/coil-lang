@@ -1,9 +1,7 @@
 // Todo board logic — imported by main and by tests via `use board::*;`.
 //
-// Status is an int (0=Todo, 1=Doing, 2=Done) because comparing an enum
-// field on a class instance (`t.status == Status::Todo`) currently crashes
-// the VM (opcode index OOB). Sibling free-fn calls inside a non-entry
-// module also do not resolve, so helpers stay inlined / duplicated as needed.
+// Status is an int (0=Todo, 1=Doing, 2=Done): comparing an enum field on a
+// class instance (`t.status == Status::Todo`) has crashed the VM in the past.
 // Index 0 is a sentinel Task — real tasks live at indices 1..len-1.
 
 class Task {
