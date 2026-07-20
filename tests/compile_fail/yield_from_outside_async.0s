@@ -1,0 +1,3 @@
+fn main() {
+    yield from 1;
+}
