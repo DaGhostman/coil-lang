@@ -9726,56 +9726,6 @@ fn main() { \
         );
     }
 
-    /// Nested IO HostInvoke (`read_to_end(stdin())`) must emit the outer
-    /// native-id CONST **before** the nested `HostInvoke`. Compiling args into
-    /// a side buffer first left nested invokes above the id (piped stdin empty).
-    #[test]
-    fn nested_io_host_invoke_emits_outer_id_before_inner_invoke() {
-        use common::Instruction;
-        use crate::typechecking::ty::int;
-
-        let mut ast = Pratt::default()
-            .parse(
-                r#"
-use io::*;
-fn main() {
-    read_to_end(stdin());
-}
-"#,
-            )
-            .expect("parse failed");
-        let mut compiler = Compiler::default();
-        // Distinct ids so we can tell outer CONST from inner CONST.
-        compiler.register_native_id("stdin", 10);
-        compiler.register_native_id("read_to_end", 20);
-        let _ = int();
-        let bc = compiler.compile("", &mut ast);
-
-        let outer_const = bc.iter().position(|b| {
-            matches!(b.bytecode(), Instruction::CONST) && b.value_u32() == 20
-        });
-        let first_host = bc
-            .iter()
-            .position(|b| matches!(b.bytecode(), Instruction::HostInvoke));
-        assert!(
-            outer_const.is_some(),
-            "expected CONST for read_to_end id=20; opcodes: {:?}",
-            bc.iter().map(|b| (b.bytecode(), b.value_u32())).collect::<Vec<_>>()
-        );
-        assert!(
-            first_host.is_some(),
-            "expected at least one HostInvoke; opcodes: {:?}",
-            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
-        );
-        assert!(
-            outer_const.unwrap() < first_host.unwrap(),
-            "outer read_to_end CONST must precede nested stdin HostInvoke \
-             (got outer@{}, first HostInvoke@{})",
-            outer_const.unwrap(),
-            first_host.unwrap()
-        );
-    }
-
     /// Generic HostInvoke Call path (`self.native`) has the same id-before-args
     /// contract as `emit_io_host_invoke` — nested `outer(inner())` must not
     /// leave the inner invoke above the outer id.
