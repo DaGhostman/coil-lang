@@ -645,10 +645,15 @@ mod tests {
         extern "C" fn doubler(x: i64) -> i64 {
             x * 2
         }
-        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/libsum.so");
+        let lib_name = crate::ffi::platform_shared_lib_filename("sum");
+        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples")
+            .join(&lib_name);
         if !lib_path.exists() {
-            if std::env::var_os("CI").is_some() { panic!("FFI soft-skip forbidden in CI: libsum.so not built"); }
-            eprintln!("skipping: libsum.so not built");
+            if std::env::var_os("CI").is_some() {
+                panic!("FFI soft-skip forbidden in CI: {lib_name} not built");
+            }
+            eprintln!("skipping: {lib_name} not built");
             return;
         }
         let lib = match crate::ffi::resolve_library(lib_path.to_str().unwrap(), None, &[]) {

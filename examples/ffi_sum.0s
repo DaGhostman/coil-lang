@@ -6,36 +6,37 @@
 //
 // The corresponding C source is `sum.c` in this directory:
 //
-//   int sum(int a, int b) { return a + b; }
+//   int64_t sum(int64_t a, int64_t b) { return a + b; }
 //
-// Build the shared library with:
+// Build the shared library (from repo root):
 //
-//   cc -shared -fPIC -o libsum.so sum.c
+//   Linux:  cc -shared -fPIC -o examples/libsum.so examples/sum.c
+//   macOS:  cc -dynamiclib -o examples/libsum.dylib examples/sum.c
+//   Windows: clang -shared -o examples/sum.dll examples/sum.c
 //
-// then keep `libsum.so` in the current directory (or anywhere
-// `dlopen` can find it — the binary must be loadable by the
-// dynamic linker for the runtime to resolve the symbol).
+// `dload("sum")` resolves to the platform filename via
+// `[ffi] search_paths` in `zero.toml` (./examples).
+//
+// Each of dload / declare / invoke returns `Result`; unwrap
+// with match (or `?` in a Result-returning function).
 //
 // Expected output: `42` (40 + 2).
-//
-// The pipeline test runner compiles this file in-memory and
-// passes the resulting bytecode to a fresh `Machine`. Userland
-// FFI is self-contained in the script via `dload`/`declare`/`invoke`.
 
 use ffi::*;
 use ffi::types::*;
 
 fn main() {
-    // `dload("<full path>")` is the most portable form — no
-    // dependence on cwd or LD_LIBRARY_PATH at runtime.
-    let lib = dload("libsum.so");
-    // `declare` / `invoke` take argument types and values as tuples.
-    // Tag constructors (`Int`, …) come from `ffi::types`.
-    let sum_id = declare(
-        lib,
-        "sum",
-        (Int, Int),
-        Int,
-    );
-    print "%i", invoke(lib, sum_id, (40, 2));
+    let lib = match dload("sum") {
+        Result::Ok(h) => h,
+        Result::Err(msg) => panic msg,
+    };
+    let sum_id = match declare(lib, "sum", (Int, Int), Int) {
+        Result::Ok(id) => id,
+        Result::Err(msg) => panic msg,
+    };
+    let n = match invoke(lib, sum_id, (40, 2)) {
+        Result::Ok(v) => v,
+        Result::Err(msg) => panic msg,
+    };
+    print "%i", n;
 }

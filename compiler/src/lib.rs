@@ -1228,6 +1228,34 @@ impl Compiler {
             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
     }
 
+    /// Unwrap a `Result` on top of the stack: on `Ok`, leave the payload;
+    /// on `Err`, `Panic` with the error string. Used by `extern` lowering
+    /// so failed `dload`/`declare`/`invoke` never reach unsafe FFI calls.
+    fn emit_result_unwrap_or_panic(&mut self) {
+        // Result::Ok = tag 0 (arity 1), Result::Err = tag 1 (arity 1).
+        let mut bb = BlockBuilder::new();
+        let success = bb.fresh_label();
+        bb.emit_jump_to(
+            success,
+            BbJumpKind::JumpIfMatch { tag: 0, arity: 1 },
+            &mut self.bytecode,
+        );
+        // Miss: Err (or non-Result) still on stack — unpack payload and panic.
+        self.bytecode
+            .push(Byte::new(Instruction::Unpack).with_operand_u32(1));
+        self.bytecode.push(Byte::new(Instruction::Panic));
+
+        let success_pos = self.bytecode.len() as u32;
+        bb.bind_label(
+            success,
+            success_pos,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.finalize()
+            .expect("BlockBuilder::finalize: FFI Result unwrap success label bound");
+    }
+
     /// Lower one `%v` argument to a string via the `Show` dictionary /
     /// concrete instance method, leaving an `ObjString` on the stack.
     fn emit_show_for_format_arg(&mut self, arg: &Output) {
@@ -4213,6 +4241,7 @@ impl Compiler {
                             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
                         self.bytecode
                             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
+                        self.emit_result_unwrap_or_panic();
                     } else if let Some(&native_id) = self.native.get(&n) {
                         let mut arg_bc = Vec::new();
                         let arity = if let Some(items) = args {
@@ -5197,6 +5226,7 @@ impl Compiler {
                     let mut bc = self.do_compile(&path_expr);
                     self.bytecode.append(&mut bc);
                     self.bytecode.push(Byte::new(Instruction::FfiLoad));
+                    self.emit_result_unwrap_or_panic();
                     self.bytecode
                         .push(Byte::new(Instruction::StorePop).with_operand_u32(lib_slot));
                 }
@@ -5274,6 +5304,7 @@ impl Compiler {
                     // Emit DeclareFFI.
                     self.bytecode
                         .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(arity));
+                    self.emit_result_unwrap_or_panic();
                     // Store the function id.
                     self.bytecode
                         .push(Byte::new(Instruction::StorePop).with_operand_u32(fn_id_slot));

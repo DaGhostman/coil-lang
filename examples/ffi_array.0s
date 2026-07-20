@@ -4,8 +4,18 @@ use ffi::*;
 use ffi::types::*;
 
 fn main() {
-    let lib = dload("libsum.so");
-    let id = declare(lib, "sum_array", (Ptr, Int), Int);
+    let lib = match dload("sum") {
+        Result::Ok(h) => h,
+        Result::Err(msg) => panic msg,
+    };
+    let id = match declare(lib, "sum_array", (Ptr, Int), Int) {
+        Result::Ok(i) => i,
+        Result::Err(msg) => panic msg,
+    };
     let arr = [1, 2, 3, 4, 5];
-    print "%i", invoke(lib, id, (arr, 5));
+    let n = match invoke(lib, id, (arr, 5)) {
+        Result::Ok(v) => v,
+        Result::Err(msg) => panic msg,
+    };
+    print "%i", n;
 }

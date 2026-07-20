@@ -8,7 +8,17 @@ fn doubler(int x) -> int {
 }
 
 fn main() {
-    let lib = dload("libsum.so");
-    let id = declare(lib, "apply_cb", (Callback, Int), Int);
-    print "%i", invoke(lib, id, (doubler, 21));
+    let lib = match dload("sum") {
+        Result::Ok(h) => h,
+        Result::Err(msg) => panic msg,
+    };
+    let id = match declare(lib, "apply_cb", (Callback, Int), Int) {
+        Result::Ok(i) => i,
+        Result::Err(msg) => panic msg,
+    };
+    let n = match invoke(lib, id, (doubler, 21)) {
+        Result::Ok(v) => v,
+        Result::Err(msg) => panic msg,
+    };
+    print "%i", n;
 }

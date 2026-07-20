@@ -10,15 +10,10 @@ extern struct Point {
     y: int32,
 };
 
-fn main() {
-    let lib = dload("libsum.so");
-    let make_id = declare(
-        lib,
-        "make_point",
-        (Int32, Int32),
-        Point,
-    );
-    let p = invoke(lib, make_id, (3, 4));
+fn main() -> Result<(), string> {
+    let lib = dload("sum")?;
+    let make_id = declare(lib, "make_point", (Int32, Int32), Point)?;
+    let p = invoke(lib, make_id, (3, 4))?;
     print "%i", p.x;
     print "%i", p.y;
 }
