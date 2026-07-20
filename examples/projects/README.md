@@ -10,18 +10,25 @@ repo-root `tests/` (that tree is for language/compiler harness cases).
 | `02-adventure` | Interactive stdin REPL + modules + save/load | playable text adventure |
 | `03-echo` | TCP + coroutines + protocol module | single-process echo → `ok` |
 
-## Run demos
+## Run demos (scripts)
+
+From the repo root (builds a release binary if needed):
 
 ```bash
-rm -f out.c0s
-cargo run --release -- examples/projects/01-todo/src/main.0s
-
-# Adventure is interactive — for CI always wrap with timeout when piping:
-printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
-  timeout 10s cargo run --release -- examples/projects/02-adventure/src/main.0s
-
-timeout 10s cargo run --release -- examples/projects/03-echo/src/main.0s
+./examples/projects/run-demos.sh     # todo + adventure transcript + echo
+./examples/projects/run-tests.sh     # co-located tests for all three
 ```
+
+Per project:
+
+```bash
+./examples/projects/01-todo/demo.sh
+./examples/projects/02-adventure/demo.sh          # interactive on a TTY
+./examples/projects/02-adventure/demo.sh --ci     # pipe transcript.txt under timeout
+./examples/projects/03-echo/demo.sh
+```
+
+Adventure CI input lives in `02-adventure/transcript.txt`.
 
 ### Playing the adventure
 
@@ -29,25 +36,29 @@ The adventure reads **all of stdin** then splits lines (batch/`read_to_end`).
 On a TTY, type commands and send **Ctrl+D** when done (or pipe a transcript).
 
 ```bash
-rm -f out.c0s
-cargo run --release -- examples/projects/02-adventure/src/main.0s
+./examples/projects/02-adventure/demo.sh
 ```
 
 Commands: `look`, `go north|south|east|west`, `take` / `take key`,
 `inventory`, `save`, `load`, `help`, `quit` / `exit`.
 
+Manual equivalent (no scripts):
+
+```bash
+rm -f out.c0s
+cargo run --release -- examples/projects/01-todo/src/main.0s
+timeout 10s cargo run --release -- examples/projects/02-adventure/src/main.0s \
+  < examples/projects/02-adventure/transcript.txt
+timeout 10s cargo run --release -- examples/projects/03-echo/src/main.0s
+```
+
 ## Per-project unit tests
 
-`zero-script test` only scans **`./tests` relative to CWD**. From each project:
+Prefer `./examples/projects/run-tests.sh`. The harness only scans
+**`./tests` relative to CWD**, so the script `cd`s into each project:
 
 ```bash
 cd examples/projects/01-todo
-cargo run --release --manifest-path ../../../Cargo.toml -- test
-
-cd ../02-adventure
-cargo run --release --manifest-path ../../../Cargo.toml -- test
-
-cd ../03-echo
 cargo run --release --manifest-path ../../../Cargo.toml -- test
 ```
 

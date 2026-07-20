@@ -13,8 +13,7 @@ The REPL reads **all of stdin** with `read_to_end` then splits on `\n`. On a
 TTY type commands and end with **Ctrl+D** (EOF), or pipe a transcript:
 
 ```bash
-rm -f out.c0s
-cargo run --release -- examples/projects/02-adventure/src/main.0s
+./examples/projects/02-adventure/demo.sh
 ```
 
 Commands: `look`, `go north` / `south` / `east` / `west`, `take` / `take key`,
@@ -23,10 +22,11 @@ Commands: `look`, `go north` / `south` / `east` / `west`, `take` / `take key`,
 ## CI / canned transcript (always use `timeout`)
 
 ```bash
-rm -f out.c0s
-printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
-  timeout 10s ./target/release/zero-script examples/projects/02-adventure/src/main.0s
+./examples/projects/02-adventure/demo.sh --ci
+# or: ./examples/projects/run-demos.sh
 ```
+
+Input file: `transcript.txt` (Hall → Library → key → Garden → quit).
 
 Expected gist: Hall → Library (take key) → inventory → Hall → Garden → look →
 `Bye.`
@@ -34,8 +34,8 @@ Expected gist: Hall → Library (take key) → inventory → Hall → Garden →
 ## Test
 
 ```bash
-cd examples/projects/02-adventure
-timeout 60s cargo run --release --manifest-path ../../../Cargo.toml -- test
+./examples/projects/run-tests.sh
+# or: cd examples/projects/02-adventure && …/zero-script test
 ```
 
 ## Layout

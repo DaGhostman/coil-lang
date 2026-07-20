@@ -9,18 +9,17 @@ supplies payload bytes. Stream IO stays in `main.0s`.
 ## Run
 
 ```bash
-rm -f out.c0s
-timeout 10s cargo run --release -- examples/projects/03-echo/src/main.0s
+./examples/projects/03-echo/demo.sh
 # ok
 ```
 
-Always wrap with `timeout`.
+Always under `timeout` (the script wraps it).
 
 ## Test
 
 ```bash
-cd examples/projects/03-echo
-timeout 60s cargo run --release --manifest-path ../../../Cargo.toml -- test
+./examples/projects/run-tests.sh
+# or: cd examples/projects/03-echo && …/zero-script test
 ```
 
 ## Layout

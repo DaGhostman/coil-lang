@@ -1285,9 +1285,16 @@ Each project has its own `zero.toml`, co-located `tests/`, and `NOTES.md`.
 
 | Project | Focus | How to run |
 |---------|--------|------------|
-| `01-todo` | Classes, arrays, modules | `cargo run --release -- examples/projects/01-todo/src/main.0s` |
-| `02-adventure` | Interactive stdin REPL + save/load | Play interactively, or pipe a transcript under `timeout` (see below) |
-| `03-echo` | TCP + coroutines + protocol module | `timeout 10s cargo run --release -- examples/projects/03-echo/src/main.0s` |
+| `01-todo` | Classes, arrays, modules | `./examples/projects/01-todo/demo.sh` |
+| `02-adventure` | Interactive stdin REPL + save/load | `./examples/projects/02-adventure/demo.sh` (or `--ci`) |
+| `03-echo` | TCP + coroutines + protocol module | `./examples/projects/03-echo/demo.sh` |
+
+Convenience from repo root:
+
+```bash
+./examples/projects/run-demos.sh    # all three demos (adventure uses transcript.txt)
+./examples/projects/run-tests.sh    # co-located tests for all three
+```
 
 ### Playing `02-adventure`
 
@@ -1295,32 +1302,26 @@ Reads all of stdin (`read_to_end`) then splits lines — on a TTY end with **Ctr
 or pipe a transcript. Modules: `world` / `commands` / `save` + entry `main`.
 
 ```bash
-rm -f out.c0s
-cargo run --release -- examples/projects/02-adventure/src/main.0s
+./examples/projects/02-adventure/demo.sh
 ```
 
 Commands: `look`, `go north|south|east|west`, `take` / `take key`,
 `inventory`, `save`, `load`, `help`, `quit`.
 
-CI / non-interactive (always wrap with `timeout`):
+CI / non-interactive (always under `timeout`; canned input in `transcript.txt`):
 
 ```bash
-rm -f out.c0s
-printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
-  timeout 10s cargo run --release -- examples/projects/02-adventure/src/main.0s
+./examples/projects/02-adventure/demo.sh --ci
 ```
-
 
 ### Per-project tests
 
-`zero-script test` only scans `./tests` relative to CWD:
-
 ```bash
-cd examples/projects/01-todo
-cargo run --release --manifest-path ../../../Cargo.toml -- test
+./examples/projects/run-tests.sh
 ```
 
-Repeat for `02-adventure` and `03-echo`. See [`examples/projects/README.md`](../examples/projects/README.md).
+Or `cd` into a project and run `zero-script test` (harness is CWD-`./tests` only).
+See [`examples/projects/README.md`](../examples/projects/README.md).
 
 ---
 

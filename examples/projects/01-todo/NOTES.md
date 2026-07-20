@@ -8,16 +8,15 @@ and a sibling module imported via `use board::*;`.
 ## Run
 
 ```bash
-rm -f out.c0s
-cargo run --release -- examples/projects/01-todo/src/main.0s
+./examples/projects/01-todo/demo.sh
 # board:3 done:1 | 1:write tests [Doing] | 2:ship demo [Todo] | 3:nap [Done] |
 ```
 
 ## Test
 
 ```bash
-cd examples/projects/01-todo
-timeout 60s cargo run --release --manifest-path ../../../Cargo.toml -- test
+./examples/projects/run-tests.sh
+# or: cd examples/projects/01-todo && …/zero-script test
 ```
 
 ## Ergonomics / gaps noticed
