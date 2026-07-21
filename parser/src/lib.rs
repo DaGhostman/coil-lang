@@ -18,7 +18,7 @@ use chumsky::{
     error::Rich,
     extra,
     pratt::{infix, left, none, postfix, prefix, right},
-    prelude::{choice, just, none_of, recursive},
+    prelude::{choice, empty, just, none_of, recursive},
     text,
 };
 use reporting::{ErrorCode, Label, Message};
@@ -1374,6 +1374,87 @@ impl<'pratt> Pratt<'pratt> {
             .labelled("extern struct declaration")
     }
 
+    /// Extern-only parameter list: fixed `T name` args plus optional trailing bare `...`.
+    /// Language rest (`T... name`) is rejected with a clear diagnostic.
+    fn extern_arg_list(
+        &self,
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        (Output<'pratt>, bool),
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+           + 'pratt {
+        #[derive(Clone)]
+        enum ExternArg<'a> {
+            Fixed(Output<'a>),
+            /// Matched `T... name` — rejected after the list is collected.
+            IllegalRest,
+        }
+
+        let illegal_rest = self
+            .type_annotation()
+            .then_ignore(just("...").padded())
+            .then(text::ident().padded())
+            .to(ExternArg::IllegalRest);
+        let fixed_arg = self
+            .type_annotation()
+            .then(text::ident().padded())
+            .map_with(|(ty, name), e| {
+                ExternArg::Fixed((e.span(), Box::new(Expression::Argument(ty, name, false))))
+            });
+        // Prefer illegal-rest so `int... xs` is recognized (then rejected).
+        let arg = illegal_rest.or(fixed_arg);
+
+        let bare_only = just("...")
+            .padded()
+            .map_with(|_, e| {
+                (
+                    (e.span(), Box::new(Expression::Fragment(Vec::new()))),
+                    true,
+                )
+            });
+
+        let fixed_then_ellipsis = arg
+            .separated_by(op!(','))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .then(
+                op!(',')
+                    .ignore_then(just("...").padded())
+                    .or_not()
+                    .map(|o| o.is_some()),
+            )
+            .try_map(|(args, variadic), span| {
+                if args.iter().any(|a| matches!(a, ExternArg::IllegalRest)) {
+                    return Err(Rich::custom(
+                        span,
+                        "use bare `...` for C varargs; `T... name` is only for language rest parameters",
+                    ));
+                }
+                let fixed: Vec<Output<'_>> = args
+                    .into_iter()
+                    .filter_map(|a| match a {
+                        ExternArg::Fixed(o) => Some(o),
+                        ExternArg::IllegalRest => None,
+                    })
+                    .collect();
+                Ok((
+                    (span, Box::new(Expression::Fragment(fixed))),
+                    variadic,
+                ))
+            });
+
+        let empty = empty().map_with(|_, e| {
+            (
+                (e.span(), Box::new(Expression::Fragment(Vec::new()))),
+                false,
+            )
+        });
+
+        choice((bare_only, fixed_then_ellipsis, empty)).delimited_by(op!("("), op!(")"))
+    }
+
     /// `extern "libname" { fn name(args) -> ret; ... }` — declare
     /// external (FFI) functions from a shared library.
     ///
@@ -1396,14 +1477,15 @@ impl<'pratt> Pratt<'pratt> {
         // as long as the final `map_with` produces an `Output`.
         let extern_function_decl = keyword!("fn")
             .then(text::ident().padded())
-            .then(self.arg_list())
+            .then(self.extern_arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             // The trailing `;` is required (no body).
             .then_ignore(op!(";"))
-            .map_with(|(((_, name), args), returns), _e| ExternFunction {
+            .map_with(|(((_, name), (args, variadic)), returns), _e| ExternFunction {
                 name,
                 args,
                 returns,
+                variadic,
             });
 
         // Inline string-literal parser for the library name.
@@ -3738,9 +3820,57 @@ mod tests {
                 assert_eq!(f.name, "puts");
                 // Returns: none
                 assert!(f.returns.is_none());
+                assert!(!f.variadic);
             }
             other => panic!("expected ExternBlock, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_extern_block_variadic_ellipsis() {
+        let ast = decl_ast!("extern \"c\" { fn printf(string fmt, ...) -> int; }");
+        match ast {
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                assert_eq!(library, "c");
+                assert_eq!(declarations.len(), 1);
+                let f = &declarations[0];
+                assert_eq!(f.name, "printf");
+                assert!(f.variadic);
+                assert!(f.returns.is_some());
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_block_bare_ellipsis_only() {
+        let ast = decl_ast!("extern \"c\" { fn weird(...) -> int; }");
+        match ast {
+            Expression::ExternBlock { declarations, .. } => {
+                assert!(declarations[0].variadic);
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_rejects_language_rest_syntax() {
+        use chumsky::Parser;
+        let src = "extern \"c\" { fn bad(int... xs) -> int; }";
+        let result = Pratt::default().declaration().parse(src);
+        assert!(
+            result.has_errors(),
+            "expected parse error for T... name in extern"
+        );
+        let errs = result.into_errors();
+        let msg = format!("{:?}", errs);
+        assert!(
+            msg.contains("bare `...`") || msg.contains("C varargs"),
+            "unexpected error text: {msg}"
+        );
     }
 
     #[test]
@@ -3755,6 +3885,7 @@ mod tests {
                 assert_eq!(declarations.len(), 2);
                 assert_eq!(declarations[0].name, "puts");
                 assert!(declarations[0].returns.is_none());
+                assert!(!declarations[0].variadic);
                 assert_eq!(declarations[1].name, "strlen");
                 assert!(declarations[1].returns.is_some());
                 assert!(matches!(

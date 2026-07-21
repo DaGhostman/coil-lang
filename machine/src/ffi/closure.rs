@@ -62,6 +62,7 @@ pub fn callback_cif(
             name: String::new(),
             args: args.to_vec(),
             ret,
+            variadic: false,
         },
         layouts,
     )

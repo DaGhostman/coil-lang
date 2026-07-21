@@ -419,6 +419,8 @@ pub struct ExternFunction<'expr> {
     pub name: &'expr str,
     pub args: Output<'expr>,
     pub returns: Option<Output<'expr>>,
+    /// C-style varargs (`fn printf(string fmt, ...)`) — bare `...`, not language `T... xs`.
+    pub variadic: bool,
 }
 
 /// C-layout struct for FFI: `extern struct Name { field: type, ... }`.
