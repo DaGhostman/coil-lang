@@ -285,20 +285,18 @@ could materialize when you *ask* for an array. That helper is
 
 If you never need “range → array”, we simply never add `collect`.
 
-### Implementation sketch (lazy int ranges — v1)
+### Implementation sketch (lazy int/byte ranges — v1)
 
 1. **Parser:** infix `..` / `..=` → `Expression::Range { start, end, inclusive }`.
-2. **Typechecker:** unify start/end as `int`; result `Ty::Con("Range")`
-   or a small `Ty::Range { inclusive, elem }` if we want length
-   metadata for const bounds.
+2. **Typechecker:** unify start/end as `int` or `byte` (same for both);
+   result is a range type carrying that element type.
 3. **Runtime:** either
    - **(A)** class instance + prelude `impl Iterator` (works today with
      Custom for-in), or
    - **(B)** `ForInKind::Range` codegen: counter in locals, compare,
      increment — **no heap**, best for `for x in 0..n`.
 4. Prefer **(B)** for the common `for` case + **(A)** so `0..n` is a
-   first-class value you can pass around / `resume`-style consume via
-   `next`.
+   first-class value you can pass around / consume via `next`.
 
 Coroutine alternative (`async fn range(s,e) { while s < e { yield s; s = s + 1; } }`)
 already works for laziness but is heavier; keep as user workaround,
@@ -320,7 +318,7 @@ not the builtin.
 
 - Generic `Range<T: Ord>`.
 - Step syntax (`0..10 step 2`) — use C-style `for` or a `range_step` helper later.
-- Eager `[0..n]` array sugar until collect API exists.
+- Eager `[0..n]` array sugar / range→array materialize (only if ever needed).
 - Infinite ranges / open-ended `0..`.
 
 ---
