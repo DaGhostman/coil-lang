@@ -3403,6 +3403,16 @@ mod tests {
     }
 
     #[test]
+    fn range_chain_is_rejected_as_non_associative() {
+        // `..` is non-associative — `a..b..c` must not parse.
+        let result = Pratt::default().parse("1..2..3");
+        assert!(
+            result.is_err(),
+            "expected parse error for chained range 1..2..3, got Ok"
+        );
+    }
+
+    #[test]
     fn compound_assign_parses_at_assignment_precedence() {
         let ast = expr_ast!("x += 1 + 2");
         let inner = match ast {

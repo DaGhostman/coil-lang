@@ -123,6 +123,99 @@ fn main() {
 }
 
 #[test]
+fn duplicate_named_argument_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn greet(string name, int age) {}
+fn main() {
+    greet(name: "Ada", name: "Grace");
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Duplicate named argument `name`")),
+        "expected duplicate named argument diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn named_call_under_applied_is_rejected() {
+    // Named calls must supply every remaining parameter (no partial
+    // application once any arg is named).
+    let (_ty, msgs) = check(
+        r#"
+fn greet(string name, int age) {}
+fn main() {
+    greet(name: "Ada");
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("under-applied") || m.contains("Missing argument `age`")
+        }),
+        "expected under-applied / missing named-arg diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn let_tuple_destructure_arity_mismatch_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let (a, b) = (1, 2, 3);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("tuple pattern has")
+                || m.contains("Type mismatch")
+                || m.contains("let tuple destructure")
+        }),
+        "expected tuple destructure arity diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn let_tuple_destructure_on_non_tuple_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let (a, b) = 42;
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot destructure type") && m.contains("tuple pattern")),
+        "expected cannot-destructure-with-tuple diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn let_record_duplicate_field_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let { x, x } = { x: 1, y: 2 };
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Duplicate field `x` in record pattern")),
+        "expected duplicate field in let record pattern, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn calling_non_function_produces_helpful_message() {
     // `x` is bound to an int (not a function). Calling it should
     // produce a clear diagnostic instead of silently doing the wrong

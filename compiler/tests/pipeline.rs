@@ -685,10 +685,66 @@ fn example_named_args_prints_ada36_grace40() {
     assert_eq!(output, "Ada36Grace40");
 }
 
+/// Critical regression: shuffled named args must reorder to declaration
+/// order at runtime. Happy-path goldens only exercise source-order and
+/// positional-prefix forms; a missing codegen reorder would still typecheck
+/// here (string then int) but print the wrong values.
+#[test]
+fn named_args_shuffled_order_prints_correct_values() {
+    let output = run_example_src(
+        r#"
+fn greet(string name, int age) {
+    print "%s", name;
+    print "%i", age;
+}
+
+fn main() {
+    greet(age: 36, name: "Ada");
+    greet(age: 40, name: "Grace");
+}
+"#,
+    );
+    assert_eq!(output, "Ada36Grace40");
+}
+
+/// Rest packing with a named fixed prefix + trailing positionals (P4 + P2).
+#[test]
+fn rest_after_named_fixed_prefix_packs_trailing() {
+    let output = run_example_src(
+        r#"
+fn f(int a, int... xs) -> int {
+    return a + len(xs);
+}
+
+fn main() {
+    print "%i", f(a: 10, 1, 2, 3);
+    print "%i", f(a: 7);
+}
+"#,
+    );
+    assert_eq!(output, "137");
+}
+
 #[test]
 fn example_let_destructure_prints_12342() {
     let output = run_example("examples/let_destructure.0s");
     assert_eq!(output, "12342");
+}
+
+/// Nested let destructure must bind inner tuple slots correctly (not swap).
+#[test]
+fn let_nested_tuple_destructure_binds_in_order() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let (a, (b, c)) = (1, (2, 3));
+    print "%i", a;
+    print "%i", b;
+    print "%i", c;
+}
+"#,
+    );
+    assert_eq!(output, "123");
 }
 
 #[test]
@@ -1202,6 +1258,25 @@ fn example_range_prints_01234012356() {
     // float 1.0..4.0 → 1.02.03.0
     let output = run_example("examples/range.0s");
     assert_eq!(output, "012340123561.02.03.0");
+}
+
+/// Half-open vs inclusive endpoints: `0..1` yields only 0; `0..=1` yields 0,1.
+#[test]
+fn range_half_open_excludes_end_inclusive_includes_end() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    for x in 0..1 {
+        print "%i", x;
+    }
+    print ",";
+    for x in 0..=1 {
+        print "%i", x;
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0,01");
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument

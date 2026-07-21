@@ -10278,4 +10278,164 @@ fn main() {
         );
     }
 
+    /// Named call args are reordered to declaration order before CALL.
+    /// Source order is `age` then `name`; bytecode must push name (STRING)
+    /// then age (CONST) so a missing reorder still typechecks but fails here.
+    #[test]
+    fn named_call_shuffled_args_emits_declaration_order() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn greet(string name, int age) {
+    print "%s", name;
+    print "%i", age;
+}
+fn main() {
+    greet(age: 36, name: "Ada");
+}
+"#,
+        );
+        // Find the CALL in main (arity 2) — skip any earlier CALLs.
+        let call_idx = bc
+            .iter()
+            .rposition(|b| {
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 == 2
+            })
+            .expect("expected CALL arity 2 for greet");
+        // Walk backward from CALL over the two arg pushes: STRING then CONST.
+        let mut saw_string = false;
+        let mut saw_const = false;
+        let mut order = Vec::new();
+        for b in bc[..call_idx].iter().rev() {
+            match b.bytecode() {
+                Instruction::STRING | Instruction::FORMAT => {
+                    order.push("string");
+                    saw_string = true;
+                    if saw_const {
+                        break;
+                    }
+                }
+                Instruction::CONST => {
+                    order.push("const");
+                    saw_const = true;
+                    if saw_string {
+                        break;
+                    }
+                }
+                // Skip peephole / prologue noise between arg pushes.
+                Instruction::POP
+                | Instruction::DUPLICATE
+                | Instruction::JMP
+                | Instruction::JMPF
+                | Instruction::CALL
+                | Instruction::RETURN
+                | Instruction::PRINT => {}
+                _ => {
+                    // Keep scanning; Format/Print in greet body appear earlier.
+                }
+            }
+            if order.len() >= 2 {
+                break;
+            }
+        }
+        // Reverse to source-of-stack order: first pushed is declaration-first.
+        order.reverse();
+        assert_eq!(
+            order,
+            vec!["string", "const"],
+            "expected STRING (name) then CONST (age) before CALL; got {:?}. \
+             Missing reorder would emit CONST then STRING.",
+            order
+        );
+    }
+
+    /// Rest calls pack trailing args into MakeArray and CALL with arity =
+    /// fixed + 1 (here fixed=0 → arity 1).
+    #[test]
+    fn rest_call_emits_make_array_before_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() {
+    let n = sum(1, 2, 3);
+}
+"#,
+        );
+        let make_array = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .expect("expected MakeArray for rest packing");
+        assert_eq!(
+            make_array.operand_u32(),
+            3,
+            "sum(1,2,3) should MakeArray(3); got {}",
+            make_array.operand_u32()
+        );
+        let call = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 == 1)
+            .expect("expected CALL arity 1 (rest packed as one slot)");
+        let make_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .unwrap();
+        let call_pos = bc.iter().position(|b| std::ptr::eq(b, call)).unwrap();
+        assert!(
+            make_pos < call_pos,
+            "MakeArray must precede CALL (make@{make_pos} call@{call_pos})"
+        );
+    }
+
+    /// Empty rest call still emits MakeArray(0) so the rest formal is `[]`.
+    #[test]
+    fn rest_empty_call_emits_make_array_zero() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() {
+    let n = sum();
+}
+"#,
+        );
+        let make_array = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .expect("expected MakeArray(0) for empty rest");
+        assert_eq!(make_array.operand_u32(), 0);
+    }
+
+    /// `let (a, b) = (1, 2)` desugars to Index + StorePop per binding.
+    #[test]
+    fn let_tuple_destructure_emits_index_and_store_pop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let (a, b) = (1, 2);
+    print "%i", a;
+    print "%i", b;
+}
+"#,
+        );
+        let index_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::Index))
+            .count();
+        assert!(
+            index_count >= 2,
+            "expected ≥2 Index for tuple let destructure; got {index_count}"
+        );
+        let store_pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .count();
+        // RHS temp + a + b (at least 3).
+        assert!(
+            store_pop_count >= 3,
+            "expected ≥3 StorePop (tmp + a + b); got {store_pop_count}"
+        );
+    }
+
 }
