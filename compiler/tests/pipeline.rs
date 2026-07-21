@@ -962,12 +962,21 @@ fn example_strlen_prints_5() {
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
 }
 
+/// Serialize fd-1 redirection: parallel tests + libtest status lines share
+/// process stdout, so nested `dup2` would corrupt capture.
+#[cfg(unix)]
+static OS_STDOUT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Capture bytes written to OS stdout (fd 1) while `f` runs.
 /// Needed for libc `printf`, which bypasses the VM's `PRINT` sink.
 #[cfg(unix)]
 fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
+
+    let _guard = OS_STDOUT_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     unsafe {
         let mut pipefd = [0i32; 2];
@@ -994,6 +1003,31 @@ fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
         let s = String::from_utf8_lossy(&buf).into_owned();
         (result, s)
     }
+}
+
+/// Drop noise that lands in a process-wide stdout pipe under `cargo test`
+/// parallelism: debug heap traces and libtest harness status lines.
+#[cfg(unix)]
+fn clean_captured_os_stdout(output: &str) -> String {
+    output
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            if t.is_empty() {
+                return false;
+            }
+            // Debug heap: `0x… alloc …` / `0x… free …`
+            if t.contains(" alloc ") || t.contains(" free ") {
+                return false;
+            }
+            // libtest: `test foo::bar ... ok` (other threads finish mid-capture)
+            if t.starts_with("test ") && t.contains(" ... ") {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -1029,16 +1063,11 @@ fn example_ffi_printf_prints_hello_42() {
                 return;
             }
         };
-        // Debug builds print heap alloc/free traces to OS stdout; strip them.
-        let cleaned: String = output
-            .lines()
-            .filter(|l| !(l.contains(" alloc ") || l.contains(" free ")))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let cleaned = clean_captured_os_stdout(&output);
         assert_eq!(
             cleaned.trim(),
             "hello 42",
-            "printf(\"hello %i\", 42) should write to OS stdout"
+            "printf(\"hello %i\", 42) should write to OS stdout (raw={output:?})"
         );
     }
 }
