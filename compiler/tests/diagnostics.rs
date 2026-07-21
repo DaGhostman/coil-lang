@@ -141,6 +141,23 @@ fn main() {
 }
 
 #[test]
+fn duplicate_let_pattern_binder_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let (x, x) = (1, 2);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Duplicate binder `x` in let pattern")),
+        "expected duplicate binder diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn named_call_under_applied_is_rejected() {
     // Named calls must supply every remaining parameter (no partial
     // application once any arg is named).
@@ -200,10 +217,11 @@ fn main() {
 
 #[test]
 fn let_record_duplicate_field_is_rejected() {
+    // Distinct binders so this stays a *field* diagnostic (not binder).
     let (_ty, msgs) = check(
         r#"
 fn main() {
-    let { x, x } = { x: 1, y: 2 };
+    let { x: a, x: b } = { x: 1, y: 2 };
 }
 "#,
     );

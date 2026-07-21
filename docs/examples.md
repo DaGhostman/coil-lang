@@ -1072,7 +1072,7 @@ extern "c" {
 }
 
 fn main() {
-    printf("hello %i", 42);
+    printf("hello %lld", 42);
 }
 ```
 

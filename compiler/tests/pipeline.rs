@@ -1023,6 +1023,27 @@ fn example_strlen_prints_5() {
 #[cfg(unix)]
 static OS_STDOUT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Restores process stdout (fd 1) on drop — including panics inside `f`.
+#[cfg(unix)]
+struct StdoutFdGuard {
+    old_stdout: i32,
+}
+
+#[cfg(unix)]
+impl Drop for StdoutFdGuard {
+    fn drop(&mut self) {
+        if self.old_stdout < 0 {
+            return;
+        }
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            let _ = libc::dup2(self.old_stdout, 1);
+            libc::close(self.old_stdout);
+        }
+        self.old_stdout = -1;
+    }
+}
+
 /// Capture bytes written to OS stdout (fd 1) while `f` runs.
 /// Needed for libc `printf`, which bypasses the VM's `PRINT` sink.
 #[cfg(unix)]
@@ -1030,11 +1051,11 @@ fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
-    let _guard = OS_STDOUT_CAPTURE_LOCK
+    let _lock = OS_STDOUT_CAPTURE_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
-    unsafe {
+    let (read_fd, guard) = unsafe {
         let mut pipefd = [0i32; 2];
         assert_eq!(libc::pipe(pipefd.as_mut_ptr()), 0);
         let read_fd = pipefd[0];
@@ -1043,21 +1064,23 @@ fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
         assert!(old_stdout >= 0);
         assert_eq!(libc::dup2(write_fd, 1), 1);
         libc::close(write_fd);
+        (read_fd, StdoutFdGuard { old_stdout })
+    };
 
-        let result = f();
+    // Catch panics so we can restore fd 1 (via `guard`) before rethrowing —
+    // otherwise later tests inherit a broken stdout.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    drop(guard);
 
-        // NULL flushes all open output streams (stdout is a macro on some platforms).
-        libc::fflush(std::ptr::null_mut());
-        assert_eq!(libc::dup2(old_stdout, 1), 1);
-        libc::close(old_stdout);
+    let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let mut buf = Vec::new();
+    let _ = file.read_to_end(&mut buf);
+    drop(file);
 
-        let mut file = std::fs::File::from_raw_fd(read_fd);
-        let mut buf = Vec::new();
-        let _ = file.read_to_end(&mut buf);
-        drop(file);
-
-        let s = String::from_utf8_lossy(&buf).into_owned();
-        (result, s)
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    match result {
+        Ok(r) => (r, s),
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
@@ -1123,7 +1146,7 @@ fn example_ffi_printf_prints_hello_42() {
         assert_eq!(
             cleaned.trim(),
             "hello 42",
-            "printf(\"hello %i\", 42) should write to OS stdout (raw={output:?})"
+            "printf(\"hello %lld\", 42) should write to OS stdout (raw={output:?})"
         );
     }
 }
@@ -1258,6 +1281,40 @@ fn example_range_prints_01234012356() {
     // float 1.0..4.0 → 1.02.03.0
     let output = run_example("examples/range.0s");
     assert_eq!(output, "012340123561.02.03.0");
+}
+
+/// Inner-block destructure must not clobber an outer binding's slot.
+#[test]
+fn let_destructure_block_shadow_preserves_outer_binding() {
+    let output = run_example_src(
+        r#"
+enum A { A { z: int, x: int }, }
+enum B { B { y: int }, }
+fn main() {
+  let outer = { a: A::A { z: 10, x: 42 } };
+  let { a } = outer;
+  { let inner = { a: B::B { y: 7 } }; let { a } = inner; }
+  print "%i", a.x;
+}
+"#,
+    );
+    assert_eq!(output, "42", "outer `a` must survive inner-block shadow");
+}
+
+/// Rest-only generic with a typeclass constraint needs a call-site dict.
+#[test]
+fn generic_rest_only_show_call_emits_dict_and_prints() {
+    let output = run_example_src(
+        r#"
+fn show_all<T: Show>(T... xs) {
+    print "%v", xs[0];
+}
+fn main() {
+    show_all(1);
+}
+"#,
+    );
+    assert_eq!(output, "1");
 }
 
 /// Half-open vs inclusive endpoints: `0..1` yields only 0; `0..=1` yields 0,1.

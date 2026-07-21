@@ -468,6 +468,11 @@ struct Context {
     /// Per-arm pattern bindings (slot 1..N). Overrides global `variables` in arm bodies.
     match_bindings: Option<HashMap<String, u32>>,
 
+    /// Block-local binding overlays. When `Some`, shadowed names allocate a
+    /// fresh slot instead of reusing the outer Interner id (so exiting the
+    /// block leaves the outer binding's stack value intact).
+    block_bindings: Option<HashMap<String, u32>>,
+
     prev: Option<Box<Self>>,
 }
 
@@ -628,6 +633,8 @@ impl<'ctx> Context {
             symbols: self.symbols.clone(),
             classes: self.classes.clone(),
             match_bindings: self.match_bindings.clone(),
+            // Fresh overlay so inner `let` / destructure can shadow outer names.
+            block_bindings: Some(HashMap::new()),
             prev: Some(Box::new(self.to_owned())),
         }
     }
@@ -895,10 +902,68 @@ impl Compiler {
         {
             return Some(slot);
         }
+        // Innermost block overlay first (walk `prev` for nested blocks).
+        let mut ctx = Some(&self.context);
+        while let Some(c) = ctx {
+            if let Some(map) = &c.block_bindings
+                && let Some(&slot) = map.get(name)
+            {
+                return Some(slot);
+            }
+            ctx = c.prev.as_deref();
+        }
         self.context
             .variables
             .key(&name.to_string())
             .map(|s| s as u32)
+    }
+
+    /// Allocate a locals slot for a `let` / destructure binder.
+    ///
+    /// Inside a block (`block_bindings = Some`), re-binding a name that is
+    /// already visible in an outer scope gets a **fresh** slot so the outer
+    /// value is not overwritten.
+    fn alloc_binding_slot(&mut self, name: &str) -> u32 {
+        if let Some(map) = &self.context.block_bindings
+            && let Some(&slot) = map.get(name)
+        {
+            return slot;
+        }
+        if self.context.block_bindings.is_none() {
+            return self.context.variables.intern(name.to_string()) as u32;
+        }
+        let shadows_outer = {
+            let in_vars = self
+                .context
+                .variables
+                .key(&name.to_string())
+                .is_some();
+            let mut in_ancestor = false;
+            let mut ctx = self.context.prev.as_deref();
+            while let Some(c) = ctx {
+                if let Some(map) = &c.block_bindings
+                    && map.contains_key(name)
+                {
+                    in_ancestor = true;
+                    break;
+                }
+                ctx = c.prev.as_deref();
+            }
+            in_vars || in_ancestor
+        };
+        if shadows_outer {
+            self.temp_counter += 1;
+            let synthetic = format!("__shadow_{}_{}", name, self.temp_counter);
+            let slot = self.context.variables.intern(synthetic) as u32;
+            self.context
+                .block_bindings
+                .as_mut()
+                .expect("block_bindings checked above")
+                .insert(name.to_string(), slot);
+            slot
+        } else {
+            self.context.variables.intern(name.to_string()) as u32
+        }
     }
 
     /// Unwrap a [`Expression::NamedArg`] to its value expression.
@@ -964,7 +1029,11 @@ impl Compiler {
         for arg in args {
             match arg.1.as_ref() {
                 Expression::NamedArg(name, value) => {
+                    // Typechecker rejects naming the rest param; recover by
+                    // packing the value into the rest array so CALL arity
+                    // stays aligned with the callee.
                     if rest_name == Some(*name) {
+                        rest.push(value);
                         continue;
                     }
                     if let Some(idx) = param_names[..fixed_count]
@@ -1807,6 +1876,19 @@ impl Compiler {
                 for (p, c) in t1.iter().zip(t2.iter()) {
                     Self::bind_scheme_vars(p, c, map);
                 }
+            }
+            // Rest packs are `[T]` / `[T; N]` — bind `T` from the element.
+            (
+                Ty::Array {
+                    element: e1,
+                    ..
+                },
+                Ty::Array {
+                    element: e2,
+                    ..
+                },
+            ) => {
+                Self::bind_scheme_vars(e1, e2, map);
             }
             _ => {}
         }
@@ -2779,6 +2861,30 @@ impl Compiler {
         self.context.variables.intern(name) as u32
     }
 
+    /// Synthesize the packed rest-array type for a call's trailing args
+    /// (`[T]` / `[T; N]`), mirroring typechecker `infer_and_reorder_call_args`.
+    fn synthesize_rest_array_ty(&self, rest: &[&Output<'_>]) -> crate::typechecking::Ty {
+        use crate::typechecking::ty::{array, array_fixed};
+        let mut elem: Option<crate::typechecking::Ty> = None;
+        for arg in rest {
+            if let Some(t) = self.codegen_expr_ty(arg) {
+                match &elem {
+                    None => elem = Some(t),
+                    Some(prev) if prev != &t => {
+                        // Prefer the first element type; unify already ran in TC.
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let element = elem.unwrap_or_else(crate::typechecking::ty::int);
+        if rest.is_empty() {
+            array(element)
+        } else {
+            array_fixed(element, rest.len())
+        }
+    }
+
     /// Bind names from an irrefutable `let` pattern by reading from
     /// `src_slot` (tuple via `Index`, record via `GetField`).
     fn emit_let_pattern_binds(
@@ -2792,7 +2898,7 @@ impl Compiler {
             LetPattern::Wildcard => {}
             LetPattern::Binding { name } => {
                 bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
-                let slot = self.context.variables.intern(name.to_string()) as u32;
+                let slot = self.alloc_binding_slot(name);
                 bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
             }
             LetPattern::Tuple(parts) => {
@@ -2805,7 +2911,7 @@ impl Compiler {
                                 Byte::new(Instruction::CONST).with_const_inline(idx as i32),
                             );
                             bytecode.push(Byte::new(Instruction::Index));
-                            let slot = self.context.variables.intern(name.to_string()) as u32;
+                            let slot = self.alloc_binding_slot(name);
                             bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
@@ -2830,7 +2936,7 @@ impl Compiler {
                             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
                             Self::emit_raw_string_literal(bytecode, pf.name);
                             bytecode.push(Byte::new(Instruction::GetField));
-                            let slot = self.context.variables.intern(name.to_string()) as u32;
+                            let slot = self.alloc_binding_slot(name);
                             bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
                         }
                         nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
@@ -2875,7 +2981,7 @@ impl Compiler {
 
         // Consume binding Identifier NodeId (iterable → binding → body).
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -3039,7 +3145,7 @@ impl Compiler {
 
         // Consume binding Identifier NodeId (iterable → binding → body).
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -3136,7 +3242,7 @@ impl Compiler {
             .push(Byte::new(Instruction::StorePop).with_operand_u32(handle_slot));
 
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -3218,7 +3324,7 @@ impl Compiler {
             .push(Byte::new(Instruction::StorePop).with_operand_u32(it_slot));
 
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -3290,15 +3396,7 @@ impl Compiler {
     }
 
     fn variable_slot(&mut self, name: &str) -> Option<u32> {
-        if let Some(map) = &self.context.match_bindings {
-            if let Some(&slot) = map.get(name) {
-                return Some(slot);
-            }
-        }
-        self.context
-            .variables
-            .key(&name.to_string())
-            .map(|s| s as u32)
+        self.lookup_slot(name)
     }
 
     fn is_float_ty(&self, _node: &Output) -> bool {
@@ -4048,7 +4146,7 @@ impl Compiler {
                         // high while JumpIfMatch still pushed at the real
                         // cursor.
                         self.append_with_existential_pack(&mut bytecode, &children[1]);
-                        let slot = self.context.variables.intern(name.clone()) as u32;
+                        let slot = self.alloc_binding_slot(&name);
                         if is_const {
                             self.context.constants.insert(slot as usize, true);
                         }
@@ -5027,8 +5125,9 @@ impl Compiler {
                         // from the shared body, but Show-bound calls always take
                         // this path.
                         let dict_count = if is_generic {
-                            let (fixed, _, _) = self.split_call_args_for_rest(&n, arg_slice);
-                            let call_arg_tys: Vec<crate::typechecking::Ty> = fixed
+                            let (fixed, rest, pack_rest) =
+                                self.split_call_args_for_rest(&n, arg_slice);
+                            let mut call_arg_tys: Vec<crate::typechecking::Ty> = fixed
                                 .iter()
                                 .map(|arg| {
                                     self.codegen_expr_ty(arg).expect(
@@ -5036,6 +5135,11 @@ impl Compiler {
                                     )
                                 })
                                 .collect();
+                            // Rest-only generics (`T... xs`) have empty `fixed`;
+                            // bind `T` from the packed `[T]` / `[T; N]` arg.
+                            if pack_rest {
+                                call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
+                            }
                             let mut forwarded = 0;
                             if let Some(indices) = self_id
                                 .and_then(|id| self.checker.forwarded_dicts_at(id))

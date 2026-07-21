@@ -368,7 +368,7 @@ Stretch   — optional range→array materialize (only if wanted)
 | 3 | Call-site `sum(...xs)` spread: **deferred** |
 | 4 | Destructure: `let (a, b) = …` (not `let a, b = ...(… )`) |
 | 5 | Same phase: `let { x, y } = d;` for records/dicts |
-| 6 | Ranges: `a..b` / `a..=b`, elements **`int` or `byte`**, always lazy |
+| 6 | Ranges: `a..b` / `a..=b` as `Range<T: Ord>` / `RangeInclusive<T: Ord>` (ships `int`/`byte`/`float` `for-in`), always lazy |
 | 7 | “Static” ≠ auto-array; `0..n` never allocates the full sequence. Optional later materialize helper only if needed — **not required to ship ranges** |
 
 Implementation can proceed phase-by-phase with HM diagnostics, a
@@ -382,6 +382,6 @@ minimal example per feature, and docs updates under `docs/`.
 |---------|----------------|-------|
 | Named params (call reorder) | Ready | Locked |
 | Let tuple/record destructure | Ready | Locked |
-| Lazy `int`/`byte` ranges + `for` | Ready | Locked |
+| Lazy `Range<T: Ord>` + `for` (`int`/`byte`/`float`) | Ready | Locked |
 | Variadic rest → `[T]` | After P2 | Medium; keep rules tight |
 | Call-site spread / defaults / generic ranges / unpack `...` let | **Defer** | By decision or low confidence |

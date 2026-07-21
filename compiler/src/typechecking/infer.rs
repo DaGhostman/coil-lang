@@ -157,6 +157,12 @@ pub struct Checker {
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
+    /// Per-scope save of prior [`codegen_var_types`] entries for names
+    /// overwritten in that scope. On pop, shadowed names are restored so
+    /// Access after a block sees the outer type again. Newly introduced
+    /// names stay in the flat map (codegen runs after check_program).
+    codegen_var_types_scopes: Vec<std::collections::HashMap<String, Option<Ty>>>,
+
     /// Declaration-order parameter names for each function, keyed by the
     /// same name used at call resolution (simple name for free functions,
     /// `Owner::method` for inherent methods). Used to reorder named
@@ -436,6 +442,7 @@ impl Checker {
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
+            codegen_var_types_scopes: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
             fn_has_rest: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
@@ -850,6 +857,7 @@ impl Checker {
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
+        self.codegen_var_types_scopes.clear();
         self.fn_param_names.clear();
         self.fn_has_rest.clear();
         self.call_site_dicts.clear();
@@ -1006,6 +1014,59 @@ impl Checker {
         } else {
             self.type_aliases.push(HashMap::new());
         }
+    }
+
+    /// Begin a `{ … }` block overlay for codegen var types. Function
+    /// frames must NOT use this — restoring across function `push_scope`
+    /// would revive an earlier function's parameter type over a later
+    /// `let` of the same name (breaks escaped PolyFn typing).
+    fn push_block_codegen_scope(&mut self) {
+        self.codegen_var_types_scopes.push(HashMap::new());
+    }
+
+    fn pop_block_codegen_scope(&mut self) {
+        if let Some(frame) = self.codegen_var_types_scopes.pop() {
+            for (name, prev) in frame {
+                match prev {
+                    Some(ty) => {
+                        self.codegen_var_types.insert(name, ty);
+                    }
+                    None => {
+                        // Binding introduced in this block — keep for
+                        // post-check Access / LoadField.
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a binding's type for codegen. Inside a `{ … }` block overlay,
+    /// remember the previous flat-map entry so [`pop_block_codegen_scope`]
+    /// can restore shadows — but only when an *outer block in this nesting*
+    /// already introduced the name. Flat-map leftovers from other functions
+    /// must not be restored (that would revive `apply_id`'s `f` over `let f = id`).
+    fn record_codegen_var_type(&mut self, name: String, ty: Ty) {
+        if !self.codegen_var_types_scopes.is_empty() {
+            let save = {
+                let scopes = &self.codegen_var_types_scopes;
+                let outer_introduced = scopes
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .any(|frame| frame.contains_key(&name));
+                if outer_introduced {
+                    self.codegen_var_types.get(&name).cloned()
+                } else {
+                    None
+                }
+            };
+            self.codegen_var_types_scopes
+                .last_mut()
+                .expect("non-empty scopes")
+                .entry(name.clone())
+                .or_insert(save);
+        }
+        self.codegen_var_types.insert(name, ty);
     }
 
     fn register_type_alias(&mut self, name: &str, alias_ty: Ty, range: Range<usize>) {
@@ -1551,10 +1612,12 @@ impl Checker {
             // own scope.
             Expression::Block(children) => {
                 self.push_scope();
+                self.push_block_codegen_scope();
                 let mut last_ty = unit_ty();
                 for child in children {
                     last_ty = self.infer(child);
                 }
+                self.pop_block_codegen_scope();
                 self.pop_scope();
                 last_ty
             }
@@ -1644,8 +1707,7 @@ impl Checker {
                             if self.env.lookup(var_name).is_some() {
                                 self.env
                                     .insert_top(var_name.to_string(), Scheme::mono(val_ty.clone()));
-                                self.codegen_var_types
-                                    .insert(var_name.to_string(), val_ty.clone());
+                                self.record_codegen_var_type(var_name.to_string(), val_ty.clone());
                             }
                             return val_ty;
                         }
@@ -2342,8 +2404,7 @@ impl Checker {
                     if let Expression::Identifier(name) = binding.1.as_ref() {
                         self.env
                             .insert_top(name.to_string(), Scheme::mono(elem_ty.clone()));
-                        self.codegen_var_types
-                            .insert(name.to_string(), elem_ty.clone());
+                        self.record_codegen_var_type(name.to_string(), elem_ty.clone());
                     }
                     // Consume the binding node's ID (pre-walk order) now that
                     // the name is in scope.
@@ -3905,8 +3966,7 @@ impl Checker {
                     };
                     self.env
                         .insert_top(name.to_string(), Scheme::mono(var_ty.clone()));
-                    self.codegen_var_types
-                        .insert(name.to_string(), var_ty.clone());
+                    self.record_codegen_var_type(name.to_string(), var_ty.clone());
                     last_ty = unit_ty();
 
                     // Try to consume the next sibling as the initializer.
@@ -3923,8 +3983,7 @@ impl Checker {
                             {
                                 let _ = self.infer(next);
                                 self.env.insert_top(name.to_string(), source_scheme.clone());
-                                self.codegen_var_types
-                                    .insert(name.to_string(), source_scheme.ty.clone());
+                                self.record_codegen_var_type(name.to_string(), source_scheme.ty.clone());
                                 last_ty = source_scheme.ty;
                                 i += 2;
                                 continue;
@@ -3948,7 +4007,7 @@ impl Checker {
                             // so Access codegen sees Record/enum types, not the
                             // pre-unify fresh variable.
                             let pruned = apply_ty_prune(&self.subst, &var_ty);
-                            self.codegen_var_types.insert(name.to_string(), pruned);
+                            self.record_codegen_var_type(name.to_string(), pruned);
                             // `let id = declare(...)` may wrap Declare/Call in
                             // ExprStatement/Statement/`?` — unwrap before matching.
                             let init = unwrap_expr_wrappers(next);
@@ -3997,7 +4056,7 @@ impl Checker {
                     if let Expression::Identifier(n) = name.1.as_ref() {
                         self.env
                             .insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
-                        self.codegen_var_types.insert(n.to_string(), var_ty.clone());
+                        self.record_codegen_var_type(n.to_string(), var_ty.clone());
                         self.insert_const_binding(n.to_string());
                         if i + 1 < children.len() {
                             let next = &children[i + 1];
@@ -4016,7 +4075,7 @@ impl Checker {
                                     "const binding",
                                 );
                                 let pruned = apply_ty_prune(&self.subst, &var_ty);
-                                self.codegen_var_types.insert(n.to_string(), pruned);
+                                self.record_codegen_var_type(n.to_string(), pruned);
                                 i += 1;
                             }
                         }
@@ -4491,8 +4550,7 @@ impl Checker {
                 if let Expression::Identifier(name) = args[0].1.as_ref() {
                     self.env
                         .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
-                    self.codegen_var_types
-                        .insert((*name).to_string(), dynamic.clone());
+                    self.record_codegen_var_type((*name).to_string(), dynamic.clone());
                 }
                 dynamic
             }
@@ -4505,8 +4563,7 @@ impl Checker {
                 if let Expression::Identifier(name) = args[0].1.as_ref() {
                     self.env
                         .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
-                    self.codegen_var_types
-                        .insert((*name).to_string(), dynamic.clone());
+                    self.record_codegen_var_type((*name).to_string(), dynamic.clone());
                 }
                 dynamic
             }
@@ -7444,14 +7501,12 @@ impl Checker {
         self.push_scope();
         if let Some(self_ty) = self_ty {
             // Method receiver — side-table for codegen Access/Call.
-            self.codegen_var_types
-                .insert("self".to_string(), self_ty.clone());
+            self.record_codegen_var_type("self".to_string(), self_ty.clone());
         }
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
-            self.codegen_var_types
-                .insert(arg_name.clone(), arg_ty.clone());
+            self.record_codegen_var_type(arg_name.clone(), arg_ty.clone());
         }
         let _ = self.infer(body);
         self.pop_scope();
@@ -9069,8 +9124,7 @@ impl Checker {
                 let pruned = apply_ty_prune(&self.subst, expected_ty);
                 self.env
                     .insert_top(name.to_string(), Scheme::mono(pruned.clone()));
-                self.codegen_var_types
-                    .insert(name.to_string(), pruned.clone());
+                self.record_codegen_var_type(name.to_string(), pruned.clone());
                 pruned
             }
             Pattern::Constructor {
@@ -9264,6 +9318,60 @@ impl Checker {
         expected_ty: &Ty,
         pattern_range: &Range<usize>,
     ) -> Ty {
+        // Reject `let (x, x) = …` / nested duplicate binders up front.
+        {
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = Self::first_duplicate_let_binder(pattern, &mut seen) {
+                return self.error_with_help(
+                    ErrorCode::VariableRedeclaration,
+                    format!("Duplicate binder `{dup}` in let pattern"),
+                    pattern_range.clone(),
+                    Some("each name may appear at most once in a let pattern".to_string()),
+                );
+            }
+        }
+        self.infer_let_pattern_inner(pattern, expected_ty, pattern_range)
+    }
+
+    fn first_duplicate_let_binder<'a>(
+        pattern: &'a parser::ast::LetPattern<'a>,
+        seen: &mut std::collections::HashSet<&'a str>,
+    ) -> Option<&'a str> {
+        use parser::ast::LetPattern;
+        match pattern {
+            LetPattern::Wildcard => None,
+            LetPattern::Binding { name } => {
+                if !seen.insert(*name) {
+                    Some(*name)
+                } else {
+                    None
+                }
+            }
+            LetPattern::Tuple(parts) => {
+                for p in parts {
+                    if let Some(d) = Self::first_duplicate_let_binder(p, seen) {
+                        return Some(d);
+                    }
+                }
+                None
+            }
+            LetPattern::Record(fields) => {
+                for pf in fields {
+                    if let Some(d) = Self::first_duplicate_let_binder(&pf.pattern, seen) {
+                        return Some(d);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn infer_let_pattern_inner(
+        &mut self,
+        pattern: &parser::ast::LetPattern,
+        expected_ty: &Ty,
+        pattern_range: &Range<usize>,
+    ) -> Ty {
         use parser::ast::LetPattern;
         let expected = apply_ty_prune(&self.subst, expected_ty);
         match pattern {
@@ -9271,8 +9379,7 @@ impl Checker {
             LetPattern::Binding { name } => {
                 self.env
                     .insert_top(name.to_string(), Scheme::mono(expected.clone()));
-                self.codegen_var_types
-                    .insert(name.to_string(), expected.clone());
+                self.record_codegen_var_type(name.to_string(), expected.clone());
                 expected
             }
             LetPattern::Tuple(parts) => {
@@ -9314,7 +9421,7 @@ impl Checker {
                     }
                 };
                 for (sub, ty) in parts.iter().zip(elem_tys.iter()) {
-                    let _ = self.infer_let_pattern(sub, ty, pattern_range);
+                    let _ = self.infer_let_pattern_inner(sub, ty, pattern_range);
                 }
                 expected_ty.clone()
             }
@@ -9389,7 +9496,7 @@ impl Checker {
                             )),
                         );
                     };
-                    let _ = self.infer_let_pattern(&pf.pattern, fty, pattern_range);
+                    let _ = self.infer_let_pattern_inner(&pf.pattern, fty, pattern_range);
                 }
                 expected_ty.clone()
             }

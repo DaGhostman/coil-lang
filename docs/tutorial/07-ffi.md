@@ -63,7 +63,8 @@ extern "c" {
 }
 
 fn main() {
-    printf("hello %i", 42);   // → hello 42
+    // Language `int` → libffi i64; use a 64-bit conversion (`%lld`), not `%i`.
+    printf("hello %lld", 42);   // → hello 42
 }
 ```
 
@@ -75,7 +76,7 @@ use ffi::types::*;
 
 let lib = dload("c")?;
 let id = declare(lib, "printf", (String,), Int, true)?;
-invoke(lib, id, ("hello %i", 42))?;
+invoke(lib, id, ("hello %lld", 42))?;
 ```
 
 Arity rule: call/invoke argument count must be `>=` the fixed prefix length.
@@ -356,7 +357,7 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 | Failed `declare` | `Result::Err` (missing symbol, libffi error) |
 | `extern` failure | Compiler unwraps Results and panics with a clear message |
 | No automatic `out.c0s` invalidation for new `.so` | Rebuild C libraries separately; bytecode does not embed shared-library contents |
-| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **21**); stale `.c0s` files are rejected after compiler upgrades |
+| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **23**); stale `.c0s` files are rejected after compiler upgrades |
 
 ---
 
