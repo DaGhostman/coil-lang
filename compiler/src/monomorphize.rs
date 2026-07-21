@@ -261,9 +261,10 @@ pub fn ground_type_name(checker: &Checker, expr: &Output) -> Option<String> {
                 ty,
             ))
         }),
-        Expression::Group(inner) | Expression::Expr(inner) | Expression::Statement(inner) => {
-            ground_type_name(checker, inner)
-        }
+        Expression::NamedArg(_, inner)
+        | Expression::Group(inner)
+        | Expression::Expr(inner)
+        | Expression::Statement(inner) => ground_type_name(checker, inner),
         _ => None,
     }
 }
@@ -421,6 +422,10 @@ where
         | Expression::Index(l, r) => {
             f(l);
             f(r);
+        }
+        Expression::Range { start, end, .. } => {
+            f(start);
+            f(end);
         }
         Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
             f(fmt);
@@ -589,6 +594,7 @@ where
         | Expression::ExternStruct(_)
         | Expression::Forall { .. } => {}
         Expression::LetDestructure { rhs, .. } => f(rhs),
+        Expression::NamedArg(_, value) => f(value),
     }
 }
 

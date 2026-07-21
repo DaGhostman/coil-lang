@@ -31,6 +31,7 @@ Associativity:
 | **Logical AND** | `&&` | Both operands `bool` → `bool` |
 | **Logical OR** | `\|\|` | Both operands `bool` → `bool` |
 | **Comparison** | `==`, `!=`, `<`, `<=`, `>`, `>=` | Operands same type → `bool` |
+| **Range** | `..`, `..=` | Non-associative; `int`/`byte` bounds → lazy `Range` / `RangeInclusive` |
 | **Coalesce** | `??` | Right-associative; Option / Result only (see below) |
 | **Assignment** | `=`, `+=`, `-=`, … | Lowest — right-associative |
 

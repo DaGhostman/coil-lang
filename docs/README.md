@@ -39,6 +39,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 |------|--------|
 | Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
+| Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; no partial named calls) |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
 | Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |
@@ -51,8 +52,8 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
-| `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, coroutines, user `impl`s) |
-| Ranges (`a..b` / `a..=b`) | **Planned** — lazy `int`/`byte` only; no auto array materialize ([syntax](reference/syntax.md#planned-ranges-lazy)) |
+| `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
+| Ranges (`a..b` / `a..=b`) | Supported — lazy `int`/`byte` only; no auto array materialize ([syntax](reference/syntax.md#ranges-lazy)) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 

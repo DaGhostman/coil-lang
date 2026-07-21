@@ -17,7 +17,7 @@ use chumsky::{
     IterParser, Parser,
     error::Rich,
     extra,
-    pratt::{infix, left, postfix, prefix, right},
+    pratt::{infix, left, none, postfix, prefix, right},
     prelude::{choice, just, none_of, recursive},
     text,
 };
@@ -32,6 +32,8 @@ enum Precedence {
     Xor,
     And,
     Equal,
+    /// `..` / `..=` — below comparisons, non-associative (Phase P3).
+    Range,
     Compare,
     Binary,
     Term,
@@ -438,6 +440,23 @@ impl<'pratt> Pratt<'pratt> {
                                 "<=" => Expression::Leq(lhs, rhs),
                                 "<" => Expression::Le(lhs, rhs),
                                 _ => unreachable!("No more comparison operators"),
+                            }),
+                        )
+                    },
+                ),
+                // `..=` before `..` so the digraph wins. Non-associative
+                // (reject `a..b..c`). Float `1.0` stays an atom; postfix
+                // `.field` requires an ident after `.`, so `0..10` is fine.
+                infix(
+                    none(Precedence::Range as u16),
+                    choice((op!("..="), op!(".."))),
+                    |lhs, op, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(Expression::Range {
+                                start: lhs,
+                                end: rhs,
+                                inclusive: op == "..=",
                             }),
                         )
                     },
@@ -1989,8 +2008,20 @@ impl<'pratt> Pratt<'pratt> {
         extra::Err<Rich<'pratt, char>>,
     > + Clone
     + 'pratt {
-        expr.clone()
-            .separated_by(op!(','))
+        // Named call-site arg: `ident : expr` → `NamedArg`. Tried before
+        // bare `expr` so `f(a: 1)` does not parse as a labelled type /
+        // weird binary form. Positional `expr` still wins when there is
+        // no colon after the identifier.
+        let named = text::ident()
+            .padded()
+            .then_ignore(op!(":"))
+            .then(expr.clone())
+            .map_with(|(name, value), e| {
+                (e.span(), Box::new(Expression::NamedArg(name, value)))
+            })
+            .labelled("named argument");
+        let arg = named.or(expr.clone());
+        arg.separated_by(op!(','))
             .allow_trailing()
             .collect::<Vec<_>>()
             .or_not()
@@ -3114,6 +3145,54 @@ mod tests {
     }
 
     #[test]
+    fn named_call_args_parse_to_named_arg() {
+        let ast = expr_ast!("f(a: 1, b: 2)");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Call { name, args } => {
+                match name.1.as_ref() {
+                    Expression::Identifier(n) => assert_eq!(*n, "f"),
+                    other => panic!("expected Identifier(f), got {:?}", other),
+                }
+                let args = args.expect("call should have args");
+                assert_eq!(args.len(), 2);
+                match args[0].1.as_ref() {
+                    Expression::NamedArg(n, val) => {
+                        assert_eq!(*n, "a");
+                        assert!(
+                            matches!(val.1.as_ref(), Expression::Integer(1)),
+                            "expected Integer(1), got {:?}",
+                            val.1
+                        );
+                    }
+                    other => panic!("expected NamedArg(a, 1), got {:?}", other),
+                }
+                match args[1].1.as_ref() {
+                    Expression::NamedArg(n, val) => {
+                        assert_eq!(*n, "b");
+                        assert!(
+                            matches!(val.1.as_ref(), Expression::Integer(2)),
+                            "expected Integer(2), got {:?}",
+                            val.1
+                        );
+                    }
+                    other => panic!("expected NamedArg(b, 2), got {:?}", other),
+                }
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn named_call_args_display_round_trips() {
+        same!("f(a: 1, b: 2)");
+        same!("greet(\"Ada\", age: 36)");
+    }
+
+    #[test]
     fn postfix_field_access_chains_left_to_right() {
         let ast = expr_ast!("p.x.y");
         let inner = match ast {
@@ -3161,6 +3240,46 @@ mod tests {
             "expected Float(1.0), got {:?}",
             inner
         );
+    }
+
+    #[test]
+    fn range_half_open_parses() {
+        same!("0..10");
+        let inner = match expr_ast!("0..10") {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Range {
+                inclusive: false, ..
+            } => {}
+            other => panic!("expected half-open Range, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn range_inclusive_parses() {
+        same!("0..=10");
+        let inner = match expr_ast!("0..=10") {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Range {
+                inclusive: true, ..
+            } => {}
+            other => panic!("expected inclusive Range, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn range_does_not_break_float_or_field_access() {
+        let float = match expr_ast!("1.0") {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        assert!(matches!(float, Expression::Float(_)));
+        same!("point.x");
     }
 
     #[test]

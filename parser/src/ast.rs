@@ -184,6 +184,13 @@ pub enum Expression<'expr> {
     Le(Output<'expr>, Output<'expr>),
     Gt(Output<'expr>, Output<'expr>),
 
+    /// Lazy `int`/`byte` range: `start..end` (half-open) or `start..=end` (closed).
+    Range {
+        start: Output<'expr>,
+        end: Output<'expr>,
+        inclusive: bool,
+    },
+
     List(Vec<Output<'expr>>),
     Array(Vec<Output<'expr>>),
     Expr(Output<'expr>),
@@ -249,6 +256,12 @@ pub enum Expression<'expr> {
         name: Output<'expr>,
         args: Option<Vec<Output<'expr>>>,
     },
+
+    /// Named call-site argument: `name: value` (Phase P2).
+    ///
+    /// Only valid inside [`Call`] argument lists (and other `params()`
+    /// sites that reuse the same parser). Display renders as `name: value`.
+    NamedArg(&'expr str, Output<'expr>),
 
     Break,
     Continue,
@@ -626,6 +639,17 @@ impl<'a> Display for Expression<'a> {
             Self::Le(lhs, rhs) => write!(f, "{} < {}", lhs.borrow().1, rhs.borrow().1),
             Self::Eq(lhs, rhs) => write!(f, "{} == {}", lhs.borrow().1, rhs.borrow().1),
             Self::Neq(lhs, rhs) => write!(f, "{} != {}", lhs.borrow().1, rhs.borrow().1),
+            Self::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                if *inclusive {
+                    write!(f, "{}..={}", start.borrow().1, end.borrow().1)
+                } else {
+                    write!(f, "{}..{}", start.borrow().1, end.borrow().1)
+                }
+            }
             Self::CompoundAssign(lhs, op, rhs) => {
                 let sym = match op {
                     AssignOp::Add => "+=",
@@ -789,6 +813,7 @@ impl<'a> Display for Expression<'a> {
                         .join(", "))
                 )
             }
+            Self::NamedArg(name, value) => write!(f, "{}: {}", name, value.1),
             Self::Loop {
                 identifier,
                 iterable,

@@ -680,6 +680,12 @@ fn example_let_reassignment_works() {
 }
 
 #[test]
+fn example_named_args_prints_ada36_grace40() {
+    let output = run_example("examples/named_args.0s");
+    assert_eq!(output, "Ada36Grace40");
+}
+
+#[test]
 fn example_let_destructure_prints_12342() {
     let output = run_example("examples/let_destructure.0s");
     assert_eq!(output, "12342");
@@ -1072,6 +1078,13 @@ fn example_for_in_dict_prints_12() {
 fn example_for_in_custom_prints_012() {
     let output = run_example("examples/for_in_custom.0s");
     assert_eq!(output, "012");
+}
+
+#[test]
+fn example_range_prints_01234012356() {
+    // 0..5 → 01234; 0..=3 → 0123; 10..0 empty; byte 5..=6 → 56
+    let output = run_example("examples/range.0s");
+    assert_eq!(output, "01234012356");
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument

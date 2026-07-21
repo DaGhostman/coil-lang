@@ -326,7 +326,7 @@ atom ::= match_expr
 | Array | `[e1, e2, ...]` or `[]` | Homogeneous elements |
 | Dict | `{ name: expr, ... }` | Anonymous record |
 | Construct | `Enum::Variant(...)` | Qualified constructor |
-| Call | `f(args)` | Includes user functions and FFI-wrapped extern fns |
+| Call | `f(args)` | Args are positional `expr` and/or named `name: expr` (positional prefix, then named; no positional after named). Includes user functions and FFI-wrapped extern fns |
 | Instantiate | `new Class(args)` | Class construction |
 | Match | `match expr '{' arm (',' arm)* '}'` | See patterns below |
 | Index | `expr '[' expr ']'` | Postfix |
@@ -462,22 +462,26 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| Range operators `a..b` / `a..=b` | **Planned** — see below |
 | Named call args, `Type... rest`, `let (a, b) = …` | **Planned** — [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md) |
 
-### Planned: ranges (lazy)
+### Ranges (lazy)
 
 Half-open `start..end` and closed `start..=end`, with element type
 **`int` or `byte`** (both bounds the same). A range is a **lazy**
 iterable: `for x in 0..n` pulls one value at a time and does **not**
-allocate an array of length `n`.
+allocate an array of length `n`. Decreasing ranges (`10..0`) are empty
+(Rust-like). First-class values work (`let r = 0..n; for x in r`).
 
-Until this lands, use C-style `for`, an array, a coroutine, or a user
-`Iterator` (see `examples/for_in_custom.0s`).
+```0s
+for x in 0..5 { print "%i", x; }   // 01234
+let r = 0..=3;
+for x in r { print "%i", x; }      // 0123
+```
 
-**Deferred (not part of the initial range feature):** turning a range
-into a concrete array (e.g. a future `collect(0..5)` → `[0, 1, 2, 3, 4]`).
-That would be an explicit helper later; `0..n` itself stays lazy.
+See `examples/range.0s`.
+
+**Deferred:** turning a range into a concrete array (e.g. a future
+`collect(0..5)` → `[0, 1, 2, 3, 4]`), floats, generic `Ord`, step syntax.
 
 Full design lock-in: [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md).
 

@@ -885,6 +885,55 @@ impl Compiler {
             .map(|s| s as u32)
     }
 
+    /// Unwrap a [`Expression::NamedArg`] to its value expression.
+    fn call_arg_value<'a>(arg: &'a Output<'a>) -> &'a Output<'a> {
+        match arg.1.as_ref() {
+            Expression::NamedArg(_, value) => value,
+            _ => arg,
+        }
+    }
+
+    /// Reorder call-site args into declaration order when any arg is named.
+    ///
+    /// Returns references to the *value* expressions (NamedArg wrappers
+    /// stripped). Positional-only calls keep source order.
+    fn reorder_call_args_for_codegen<'a>(
+        &self,
+        fn_name: &str,
+        args: &'a [Output<'a>],
+    ) -> Vec<&'a Output<'a>> {
+        let has_named = args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+        if !has_named {
+            return args.iter().collect();
+        }
+        let Some(param_names) = self.checker.fn_param_names(fn_name) else {
+            return args.iter().map(Self::call_arg_value).collect();
+        };
+        let n = param_names.len();
+        let mut slots: Vec<Option<&'a Output<'a>>> = vec![None; n];
+        let mut next_pos = 0usize;
+        for arg in args {
+            match arg.1.as_ref() {
+                Expression::NamedArg(name, value) => {
+                    if let Some(idx) = param_names.iter().position(|p| p == *name) {
+                        slots[idx] = Some(value);
+                    }
+                }
+                _ => {
+                    if next_pos < n {
+                        if slots[next_pos].is_none() {
+                            slots[next_pos] = Some(arg);
+                        }
+                        next_pos += 1;
+                    }
+                }
+            }
+        }
+        slots.into_iter().flatten().collect()
+    }
+
     fn next_emit_id(&mut self) -> Option<crate::typechecking::id::NodeId> {
         let id = self.checker.id_table().ids().get(self.emit_idx).copied();
         if id.is_some() {
@@ -2414,7 +2463,8 @@ impl Compiler {
 
     fn mono_call_offset(&self, fn_name: &str, args: Option<&Vec<Output<'_>>>) -> Option<usize> {
         let args = args?;
-        let arg_types = args
+        let ordered = self.reorder_call_args_for_codegen(fn_name, args);
+        let arg_types = ordered
             .iter()
             .map(|arg| monomorphize::ground_type_name(&self.checker, arg))
             .collect::<Option<Vec<_>>>()?;
@@ -2779,6 +2829,133 @@ impl Compiler {
         self.emit_for_in_array_loop(body, binding_name, true, None);
     }
 
+    /// Lazy `int`/`byte` range for-in (Phase P3).
+    ///
+    /// Fast path when the iterable is a `Range` literal: locals for
+    /// `cur`/`end` only — no heap. First-class range values
+    /// (`let r = 0..n; for x in r`) are dicts `{start,end,inclusive}`
+    /// unpacked via `GetField`.
+    fn emit_for_in_range(
+        &mut self,
+        iterable: &Output<'_>,
+        body: &Output<'_>,
+        binding_name: &str,
+        inclusive: bool,
+    ) {
+        let cur_slot = self.alloc_temp_slot();
+        let end_slot = self.alloc_temp_slot();
+
+        match iterable.1.as_ref() {
+            Expression::Range { start, end, .. } => {
+                // Consume the Range node's ID (pre-walk: Range → start → end).
+                let _ = self.next_emit_id();
+                let start_bc = self.do_compile(start);
+                self.bytecode.extend(start_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+                let end_bc = self.do_compile(end);
+                self.bytecode.extend(end_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(end_slot));
+            }
+            _ => {
+                let range_slot = self.alloc_temp_slot();
+                let iter_bc = self.do_compile(iterable);
+                self.bytecode.extend(iter_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(range_slot));
+
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(range_slot));
+                Self::emit_raw_string_literal(&mut self.bytecode, "start");
+                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(range_slot));
+                Self::emit_raw_string_literal(&mut self.bytecode, "end");
+                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(end_slot));
+            }
+        }
+
+        // Consume binding Identifier NodeId (iterable → binding → body).
+        let _ = self.next_emit_id();
+        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label();
+        let continue_label = bb.fresh_label();
+        let exit_label = bb.fresh_label();
+        let top_label_target = self.bytecode.len() as u32;
+
+        // cond: cur < end  (half-open) or cur <= end (inclusive)
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(end_slot));
+        self.bytecode.push(Byte::new(if inclusive {
+            Instruction::LEQ
+        } else {
+            Instruction::LE
+        }));
+        bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+        // x = cur
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+
+        self.loop_stack.push((continue_label, exit_label));
+        self.loop_bbs.push(bb);
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        let mut bb = self
+            .loop_bbs
+            .pop()
+            .expect("loop builder stack balanced for for-in range");
+        self.loop_stack
+            .pop()
+            .expect("loop label stack balanced for for-in range");
+
+        let continue_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            continue_label,
+            continue_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        // cur = cur + 1
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::CONST).with_const_inline(1));
+        self.bytecode.push(Byte::new(Instruction::ADD));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let exit_label_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            exit_label,
+            exit_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.bind_label(
+            top_label,
+            top_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.finalize()
+            .expect("BlockBuilder::finalize: for-in range labels bound");
+    }
+
     /// Coroutine for-in: resume → bind; skip body when `done` (completion
     /// value excluded). Same layout as the Phase CORO for-in path.
     fn emit_for_in_coro(&mut self, iterable: &Output<'_>, body: &Output<'_>, binding_name: &str) {
@@ -3018,6 +3195,7 @@ impl Compiler {
 
     fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
         let resolved = match node.1.as_ref() {
+            Expression::NamedArg(_, value) => return self.codegen_expr_ty(value),
             Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
             Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
             Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
@@ -3639,6 +3817,10 @@ impl Compiler {
             // `mod foo;` — pipeline loads the file; no bytecode.
             Expression::Module(_, _body) => {}
             Expression::Group(e) => bytecode.append(&mut self.do_compile(e)),
+            // Named call-site arg — compile the value (defensive; Call reorders).
+            Expression::NamedArg(_, value) => {
+                bytecode.append(&mut self.do_compile(value));
+            }
             Expression::Program(children) => {
                 children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
@@ -3907,6 +4089,27 @@ impl Compiler {
                 let arity = items.len() as u32;
                 bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(arity));
             }
+            // Lazy range value: dict `{ start, end, inclusive }` so
+            // first-class `let r = 0..n; for x in r` works via GetField.
+            // Direct `for x in 0..n` uses the no-heap fast path instead.
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let mut start_bc = self.do_compile(start);
+                bytecode.append(&mut start_bc);
+                Self::emit_raw_string_literal(&mut bytecode, "start");
+                let mut end_bc = self.do_compile(end);
+                bytecode.append(&mut end_bc);
+                Self::emit_raw_string_literal(&mut bytecode, "end");
+                bytecode.push(
+                    Byte::new(Instruction::CONST)
+                        .with_const_inline(if *inclusive { 1 } else { 0 }),
+                );
+                Self::emit_raw_string_literal(&mut bytecode, "inclusive");
+                bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(3));
+            }
             // `t[i]` — pop the index (top), pop the target,
             // push the element at `target[index]`. The Index
             // opcode carries no operand (the index is at the top
@@ -4097,6 +4300,14 @@ impl Compiler {
                         }
                         ForInKind::Coroutine => {
                             self.emit_for_in_coro(iterable, body, &binding_name);
+                        }
+                        ForInKind::Range { inclusive } => {
+                            self.emit_for_in_range(
+                                iterable,
+                                body,
+                                &binding_name,
+                                inclusive,
+                            );
                         }
                         ForInKind::Custom {
                             into_iter_fqn,
@@ -4433,11 +4644,14 @@ impl Compiler {
                         .cloned();
                     if let Some(fqn) = fqn {
                         if let Some(offset) = self.functions.get(&fqn).copied() {
-                            // Push receiver first (slot 0), then args.
+                            // Push receiver first (slot 0), then args
+                            // (reordered when any arg is named).
                             bytecode.append(&mut self.do_compile(recv));
                             let mut nargs = 0u32;
                             if let Some(items) = args {
-                                for arg in items {
+                                let ordered =
+                                    self.reorder_call_args_for_codegen(&fqn, items);
+                                for arg in ordered {
                                     self.append_with_existential_pack(&mut bytecode, arg);
                                     nargs += 1;
                                 }
@@ -4597,15 +4811,17 @@ impl Compiler {
                         // If the callee is a generic function, box each concrete arg
                         // at the call boundary (concrete→generic).
                         let is_generic = self.checker.is_generic_fn(&n) && mono_offset.is_none();
-                        if let Some(arg_list) = args {
-                            for arg in arg_list {
-                                self.append_with_existential_pack(&mut bytecode, arg);
-                                if is_generic {
-                                    // Reuse the original HM result. Re-running inference here
-                                    // would occur after the function scope has been popped.
-                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                    }
+                        let ordered_args: Vec<&Output> = args
+                            .as_ref()
+                            .map(|items| self.reorder_call_args_for_codegen(&n, items))
+                            .unwrap_or_default();
+                        for arg in &ordered_args {
+                            self.append_with_existential_pack(&mut bytecode, arg);
+                            if is_generic {
+                                // Reuse the original HM result. Re-running inference here
+                                // would occur after the function scope has been popped.
+                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
                                 }
                             }
                         }
@@ -4619,19 +4835,14 @@ impl Compiler {
                         // from the shared body, but Show-bound calls always take
                         // this path.
                         let dict_count = if is_generic {
-                            let call_arg_tys: Vec<crate::typechecking::Ty> = args
-                                .as_ref()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .map(|arg| {
-                                            self.codegen_expr_ty(arg).expect(
-                                                "typechecked call argument must have a codegen type",
-                                            )
-                                        })
-                                        .collect()
+                            let call_arg_tys: Vec<crate::typechecking::Ty> = ordered_args
+                                .iter()
+                                .map(|arg| {
+                                    self.codegen_expr_ty(arg).expect(
+                                        "typechecked call argument must have a codegen type",
+                                    )
                                 })
-                                .unwrap_or_default();
+                                .collect();
                             let mut forwarded = 0;
                             if let Some(indices) = self_id
                                 .and_then(|id| self.checker.forwarded_dicts_at(id))
@@ -4665,8 +4876,7 @@ impl Compiler {
                             0
                         };
 
-                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32
-                            + dict_count as u32;
+                        let arity = ordered_args.len() as u32 + dict_count as u32;
                         if is_instance_method_fqn(&self.checker, &n) {
                             Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
                         } else if self.coroutine_fns.contains(&n) {

@@ -69,6 +69,8 @@ pub enum ForInKind {
     Dict,
     /// Resume/Done loop (completion value excluded from body).
     Coroutine,
+    /// Lazy `int`/`byte` range counter loop (`0..n` / `0..=n`).
+    Range { inclusive: bool },
     /// Dictionary ABI: `into_iter` then `next` → `Option<Item>`.
     Custom {
         into_iter_fqn: String,
@@ -84,9 +86,9 @@ pub struct ForInInfo {
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty,
-    schemaize_payload, schemaize_ty, string, subst_payload_params, subst_ty_params,
-    unit as unit_ty,
+    list, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, result_app_ty,
+    result_ok_err, result_ty, schemaize_payload, schemaize_ty, string, subst_payload_params,
+    subst_ty_params, unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
 use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};
@@ -152,6 +154,12 @@ pub struct Checker {
 
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
+
+    /// Declaration-order parameter names for each function, keyed by the
+    /// same name used at call resolution (simple name for free functions,
+    /// `Owner::method` for inherent methods). Used to reorder named
+    /// call-site arguments (Phase P2).
+    fn_param_names: std::collections::HashMap<String, Vec<String>>,
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
@@ -406,6 +414,7 @@ impl Checker {
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
+            fn_param_names: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
             call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
@@ -813,6 +822,7 @@ impl Checker {
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
+        self.fn_param_names.clear();
         self.call_site_dicts.clear();
         self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
@@ -1404,6 +1414,8 @@ impl Checker {
             | Expression::Comment(_)
             | Expression::Break
             | Expression::Continue => unit_ty(),
+            // Named call-site arg wrapper — type is the value's type.
+            Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
             Expression::Use {
                 path,
@@ -1608,6 +1620,11 @@ impl Checker {
             }
 
             // ---- Arithmetic / bitwise ----
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+            } => self.infer_range(start, end, *inclusive, range),
             Expression::Add(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "+"),
             Expression::Sub(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "-"),
             Expression::Mul(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "*"),
@@ -1681,8 +1698,60 @@ impl Checker {
             Expression::Call { name, args } => {
                 // Method call: `recv.method(args)` — Access callee.
                 if let Expression::Access(recv, method) = name.1.as_ref() {
+                    let method_args = args.as_deref().unwrap_or(&[]);
+                    let method_has_named = method_args
+                        .iter()
+                        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
                     let recv_ty = self.infer(recv);
                     let resolved = apply_ty_prune(&self.subst, &recv_ty);
+
+                    // Named args on methods: only inherent class methods.
+                    if method_has_named {
+                        let class_owner = match &resolved {
+                            Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
+                            Ty::App(head, _) => match head.as_ref() {
+                                Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(owner) = class_owner.as_ref()
+                            && let Some(scheme) = self
+                                .methods
+                                .get(owner)
+                                .and_then(|m| m.get(*method))
+                                .map(|(_, s)| s.clone())
+                        {
+                            let fun_ty = self.instantiate_ty(&scheme);
+                            let fqn = format!("{}::{}", owner, method);
+                            let mut arg_tys = vec![recv_ty];
+                            let (tys, _) =
+                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
+                            arg_tys.extend(tys);
+                            return self.apply_function(
+                                Some(&fqn),
+                                &fun_ty,
+                                &arg_tys,
+                                None,
+                                id,
+                                range,
+                            );
+                        }
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Named arguments are not supported on this call to `{}`",
+                                method
+                            ),
+                            range,
+                            Some(
+                                "named arguments are supported on ordinary functions and inherent methods"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+
                     if let Ty::Existential { class } = &resolved
                         && let Some((owner, method_slot, scheme)) =
                             self.existential_method_candidate(class, method)
@@ -1870,14 +1939,43 @@ impl Checker {
                     }
                 };
 
+                let raw_args = args.as_deref().unwrap_or(&[]);
+                let has_named = raw_args
+                    .iter()
+                    .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
                 if ident == "push" {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            "Named arguments are not supported on `push`".to_string(),
+                            range,
+                            Some("use positional arguments: `push(arr, value)`".to_string()),
+                        );
+                    }
                     return self.infer_array_push(args.as_deref(), range);
                 }
                 if ident == "len" {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            "Named arguments are not supported on `len`".to_string(),
+                            range,
+                            Some("use positional arguments: `len(arr)`".to_string()),
+                        );
+                    }
                     return self.infer_array_len(args.as_deref(), range);
                 }
                 // `assert` from `prelude::test` (auto-imported or via `use`).
                 if let Some(kind) = self.prelude_fn_in_scope(&ident) {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!("Named arguments are not supported on `{}`", ident),
+                            range,
+                            Some("use positional arguments".to_string()),
+                        );
+                    }
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         PreludeFn::Assert => self.infer_assert(arg_slice, range),
@@ -1885,6 +1983,14 @@ impl Checker {
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
                 if let Some(kind) = self.ffi_fn_in_scope(&ident) {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!("Named arguments are not supported on `{}`", ident),
+                            range,
+                            Some("FFI builtins take positional arguments only".to_string()),
+                        );
+                    }
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
@@ -1902,6 +2008,71 @@ impl Checker {
                             ident
                         )),
                     );
+                }
+
+                // Named call-site args: skip trait UFCS and resolve an ordinary
+                // function (partial application is rejected when any arg is named).
+                if has_named {
+                    let scheme = self.env.lookup(&ident).cloned();
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
+                        match scheme {
+                            Some(s) => {
+                                let (fun_ty, constraints, mapping) =
+                                    self.instantiate_scheme_mapped(&s);
+                                (fun_ty, constraints, mapping, Some(s))
+                            }
+                            None => {
+                                return self.error(
+                                    ErrorCode::UnknownFunction,
+                                    format!("Cannot find function `{}`", ident),
+                                    range,
+                                );
+                            }
+                        };
+                    let (arg_tys, ordered_args) =
+                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                    let result = self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    );
+                    if !fresh_constraints.is_empty() {
+                        self.discharge_constraints(id, &fresh_constraints, &range);
+                        if let Some(scheme) = original_scheme.as_ref() {
+                            self.pin_assoc_after_discharge(
+                                "",
+                                &fresh_constraints,
+                                Some(scheme),
+                                &fresh_mapping,
+                                &range,
+                            );
+                        }
+                    }
+                    // Named calls must fully apply — reject leftover Fun.
+                    let resolved = apply_ty_prune(&self.subst, &result);
+                    if matches!(resolved, Ty::Fun(_, _)) {
+                        let mut msg = Message::error(
+                            ErrorCode::MissingField,
+                            format!(
+                                "Call to `{}` with named arguments is under-applied",
+                                ident
+                            ),
+                            range.clone(),
+                        );
+                        msg.with_help(
+                            "when any argument is named, all remaining parameters must be supplied"
+                                .to_string(),
+                        );
+                        self.messages.push(msg);
+                    }
+                    return result;
                 }
 
                 // Bare/UFCS trait method call: `method(x)`.
@@ -3830,6 +4001,74 @@ impl Checker {
             }
         }
         boolean()
+    }
+
+    /// Lazy `start..end` / `start..=end` — bounds must unify to `int` or `byte`.
+    fn infer_range(
+        &mut self,
+        start: &Output,
+        end: &Output,
+        inclusive: bool,
+        range: Range<usize>,
+    ) -> Ty {
+        let st = self.infer(start);
+        let et = self.infer(end);
+        let sp = apply_ty_prune(&self.subst, &st);
+        let ep = apply_ty_prune(&self.subst, &et);
+        // Coerce int literals under a `byte` peer (same as annotated `byte` lets).
+        if Self::is_byte_ty(&sp) && Self::byte_literal_coercion(end).is_ok() {
+            let _ = self.unify(&et, &crate::typechecking::ty::byte(), &end.0.into_range(), "range end");
+        } else if Self::is_byte_ty(&ep) && Self::byte_literal_coercion(start).is_ok() {
+            let _ = self.unify(
+                &st,
+                &crate::typechecking::ty::byte(),
+                &start.0.into_range(),
+                "range start",
+            );
+        }
+        let elem = self.unify(&st, &et, &range, "range bounds");
+        let pruned = apply_ty_prune(&self.subst, &elem);
+        let ok = matches!(&pruned, Ty::Con(n) if n == "int" || n == "byte")
+            || matches!(&pruned, Ty::Var(_));
+        if !ok {
+            let _ = self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "range bounds must be `int` or `byte`, found `{}`",
+                    pruned
+                ),
+                range.clone(),
+                Some("both ends of `a..b` / `a..=b` must share type `int` or `byte`".to_string()),
+            );
+            return if inclusive {
+                range_inclusive_ty(Ty::Var(self.counter.fresh()))
+            } else {
+                range_ty(Ty::Var(self.counter.fresh()))
+            };
+        }
+        // Pin open vars to `int` when neither bound constrains further
+        // (literals typically already unify to int).
+        if matches!(&pruned, Ty::Var(_)) {
+            let _ = self.unify(&elem, &int(), &range, "range element type");
+        }
+        let elem = apply_ty_prune(&self.subst, &elem);
+        // After pin, reject non-int/byte (e.g. float that slipped through).
+        if !matches!(&elem, Ty::Con(n) if n == "int" || n == "byte") {
+            let _ = self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "range bounds must be `int` or `byte`, found `{}`",
+                    elem
+                ),
+                range,
+                Some("both ends of `a..b` / `a..=b` must share type `int` or `byte`".to_string()),
+            );
+        }
+        if inclusive {
+            range_inclusive_ty(elem)
+        } else {
+            range_ty(elem)
+        }
     }
 
     fn infer_arith(
@@ -6588,6 +6827,12 @@ impl Checker {
                         Some(&owner_ty),
                         *is_coro,
                     );
+                    // Method calls resolve as `Owner::method`; mirror that
+                    // key for named-arg reorder (self is never named).
+                    if let Some(names) = self.fn_param_names.get(*name).cloned() {
+                        self.fn_param_names
+                            .insert(format!("{}::{}", owner, name), names);
+                    }
                     let scheme = if param_vars.is_empty() {
                         Scheme::mono(fun_ty)
                     } else {
@@ -6772,6 +7017,11 @@ impl Checker {
             None
         };
         let arg_tys = self.parse_arg_list(args);
+        // Record declaration-order param names for named call-site args.
+        self.fn_param_names.insert(
+            name.to_string(),
+            arg_tys.iter().map(|(n, _)| n.clone()).collect(),
+        );
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
             let send_ty = Ty::Var(self.counter.fresh());
@@ -7008,6 +7258,193 @@ impl Checker {
         out
     }
 
+    /// Declaration-order parameter names for `fn_name`, if recorded.
+    pub fn fn_param_names(&self, fn_name: &str) -> Option<&[String]> {
+        self.fn_param_names.get(fn_name).map(|v| v.as_slice())
+    }
+
+    /// Infer call arguments, reordering named args into declaration order.
+    ///
+    /// When any argument is [`Expression::NamedArg`], every remaining
+    /// parameter must be supplied (no partial application). Returns
+    /// `(arg_tys, ordered_value_exprs)` in declaration order.
+    fn infer_and_reorder_call_args<'a>(
+        &mut self,
+        fn_name: &str,
+        args: &'a [Output<'a>],
+        range: &Range<usize>,
+    ) -> (Vec<Ty>, Vec<Output<'a>>) {
+        let has_named = args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+        if !has_named {
+            let mut tys = Vec::with_capacity(args.len());
+            let mut exprs = Vec::with_capacity(args.len());
+            for arg in args {
+                tys.push(self.infer(arg));
+                exprs.push(arg.clone());
+            }
+            return (tys, exprs);
+        }
+
+        let Some(param_names) = self.fn_param_names.get(fn_name).cloned() else {
+            let mut msg = Message::error(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Named arguments are not supported on this call to `{}`",
+                    fn_name
+                ),
+                range.clone(),
+            );
+            msg.with_help(
+                "named arguments require a known function with declared parameter names"
+                    .to_string(),
+            );
+            self.messages.push(msg);
+            let mut tys = Vec::with_capacity(args.len());
+            let mut exprs = Vec::with_capacity(args.len());
+            for arg in args {
+                tys.push(self.infer(arg));
+                exprs.push(match arg.1.as_ref() {
+                    Expression::NamedArg(_, v) => v.clone(),
+                    _ => arg.clone(),
+                });
+            }
+            return (tys, exprs);
+        };
+
+        let n = param_names.len();
+        let mut slots: Vec<Option<(Ty, Output)>> = vec![None; n];
+        let mut next_pos = 0usize;
+        let mut seen_named = false;
+
+        for arg in args {
+            match arg.1.as_ref() {
+                Expression::NamedArg(name, _) => {
+                    seen_named = true;
+                    let ty = self.infer(arg);
+                    let value = match arg.1.as_ref() {
+                        Expression::NamedArg(_, v) => v.clone(),
+                        _ => unreachable!(),
+                    };
+                    match param_names.iter().position(|p| p == *name) {
+                        Some(idx) => {
+                            if slots[idx].is_some() {
+                                self.messages.push(Message::error(
+                                    ErrorCode::DuplicateField,
+                                    format!(
+                                        "Duplicate named argument `{}` in call to `{}`",
+                                        name, fn_name
+                                    ),
+                                    arg.0.into_range(),
+                                ));
+                            } else {
+                                slots[idx] = Some((ty, value));
+                            }
+                        }
+                        None => {
+                            let mut msg = Message::error(
+                                ErrorCode::UnknownField,
+                                format!(
+                                    "Unknown named argument `{}` in call to `{}`",
+                                    name, fn_name
+                                ),
+                                arg.0.into_range(),
+                            );
+                            if param_names.is_empty() {
+                                msg.with_help(format!(
+                                    "`{}` takes no parameters",
+                                    fn_name
+                                ));
+                            } else {
+                                msg.with_help(format!(
+                                    "expected one of: {}",
+                                    param_names.join(", ")
+                                ));
+                            }
+                            self.messages.push(msg);
+                        }
+                    }
+                }
+                _ => {
+                    if seen_named {
+                        let mut msg = Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Positional argument after named argument in call to `{}`",
+                                fn_name
+                            ),
+                            arg.0.into_range(),
+                        );
+                        msg.with_help(
+                            "all positional arguments must come before named arguments"
+                                .to_string(),
+                        );
+                        self.messages.push(msg);
+                    }
+                    let ty = self.infer(arg);
+                    if next_pos >= n {
+                        self.messages.push(Message::error(
+                            ErrorCode::TooManyArguments,
+                            format!(
+                                "Function `{}` was called with too many arguments",
+                                fn_name
+                            ),
+                            arg.0.into_range(),
+                        ));
+                    } else {
+                        if slots[next_pos].is_some() {
+                            // Named arg already filled this slot — still advance.
+                        } else {
+                            slots[next_pos] = Some((ty, arg.clone()));
+                        }
+                        next_pos += 1;
+                    }
+                }
+            }
+        }
+
+        let mut tys = Vec::with_capacity(n);
+        let mut exprs = Vec::with_capacity(n);
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some((ty, expr)) => {
+                    tys.push(ty);
+                    exprs.push(expr);
+                }
+                None => {
+                    let mut msg = Message::error(
+                        ErrorCode::MissingField,
+                        format!(
+                            "Missing argument `{}` in call to `{}`",
+                            param_names[i], fn_name
+                        ),
+                        range.clone(),
+                    );
+                    msg.with_help(
+                        "when any argument is named, all remaining parameters must be supplied"
+                            .to_string(),
+                    );
+                    self.messages.push(msg);
+                    tys.push(Ty::Var(self.counter.fresh()));
+                    // Placeholder so arity stays aligned; unify sees a fresh var.
+                    if let Some(a) = args.first() {
+                        exprs.push(match a.1.as_ref() {
+                            Expression::NamedArg(_, v) => v.clone(),
+                            _ => a.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // If placeholders couldn't be built, drop exprs so apply_function
+        // skips per-arg expression hooks.
+        if exprs.len() != tys.len() {
+            exprs.clear();
+        }
+        (tys, exprs)
+    }
+
     // ============================================================
     //  Enums and pattern matching
     // ============================================================
@@ -7232,7 +7669,8 @@ impl Checker {
             | Expression::Adjust { target: e, .. }
             | Expression::Defer(e)
             | Expression::Member(e)
-            | Expression::LetDestructure { rhs: e, .. } => {
+            | Expression::LetDestructure { rhs: e, .. }
+            | Expression::NamedArg(_, e) => {
                 self.pre_register_enums_walk(e, errors);
             }
 
@@ -7279,6 +7717,10 @@ impl Checker {
             | Expression::Coalesce(l, r) => {
                 self.pre_register_enums_walk(l, errors);
                 self.pre_register_enums_walk(r, errors);
+            }
+            Expression::Range { start, end, .. } => {
+                self.pre_register_enums_walk(start, errors);
+                self.pre_register_enums_walk(end, errors);
             }
 
             Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
@@ -9365,7 +9807,7 @@ impl Checker {
                     format!("type `{}` is not iterable", te),
                     iterable_range.clone(),
                     Some(
-                        "implement `IntoIterator` / `Iterator`, or use an array, homogeneous tuple/dict, or coroutine"
+                        "implement `IntoIterator` / `Iterator`, or use an array, homogeneous tuple/dict, range, or coroutine"
                             .to_string(),
                     ),
                 );
@@ -9435,6 +9877,19 @@ impl Checker {
             Ty::App(head, args) => {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") && args.len() == 2 {
                     return Some((args[0].clone(), ForInKind::Coroutine));
+                }
+                if matches!(head.as_ref(), Ty::Con(n) if n == "Range") && args.len() == 1 {
+                    return Some((
+                        args[0].clone(),
+                        ForInKind::Range { inclusive: false },
+                    ));
+                }
+                if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1
+                {
+                    return Some((
+                        args[0].clone(),
+                        ForInKind::Range { inclusive: true },
+                    ));
                 }
                 None
             }
@@ -12798,6 +13253,55 @@ fn main() {
         assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
         let y_ty = c.codegen_var_type("y").expect("y");
         assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
+    }
+
+    #[test]
+    fn range_literal_infers_range_int() {
+        let (c, _) = check("fn main() { let r = 0..10; }");
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_ty(int())
+        );
+    }
+
+    #[test]
+    fn range_inclusive_infers_range_inclusive_int() {
+        let (c, _) = check("fn main() { let r = 0..=10; }");
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_inclusive_ty(int())
+        );
+    }
+
+    #[test]
+    fn for_in_range_binds_element_type() {
+        let src = r#"
+fn main() {
+    for x in 0..5 {
+        let y = x;
+    }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let y_ty = c.codegen_var_type("y").expect("y");
+        assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
+    }
+
+    #[test]
+    fn range_rejects_float_bounds() {
+        let (c, _) = check("fn main() { let r = 1.0..2.0; }");
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("int") || m.message().contains("byte")),
+            "expected range bound type error, got {:?}",
+            c.messages()
+        );
     }
 
     #[test]

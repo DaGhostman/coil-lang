@@ -378,7 +378,7 @@ There is **no general standard library** yet. The following are **not** built-in
 
 | Category | Examples |
 |----------|----------|
-| Collections API | `sort`; range→array materialize (lazy `a..b` / `a..=b` for `int`/`byte` is **planned** — see [Syntax — Planned: ranges](syntax.md#planned-ranges-lazy); `push` / `len` / `for-in` are builtins) |
+| Collections API | `sort`; range→array materialize (lazy `a..b` / `a..=b` for `int`/`byte` is supported — see [Syntax — ranges](syntax.md#ranges-lazy); `push` / `len` / `for-in` are builtins) |
 | String ops | slice, trim (concat via `+` / `format`; UTF-8 via `io::from_bytes` / `to_bytes`) |
 | Math | `sin`, `sqrt`, `random` |
 | High-level file helpers | path utilities beyond `io::open` / `read_to_end` / `write_all` |

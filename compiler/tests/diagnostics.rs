@@ -87,6 +87,42 @@ fn arity_mismatch_mentions_function_name() {
 }
 
 #[test]
+fn positional_after_named_argument_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn greet(string name, int age) {}
+fn main() {
+    greet(age: 36, "Ada");
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Positional argument after named argument")),
+        "expected positional-after-named diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn unknown_named_argument_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn greet(string name, int age) {}
+fn main() {
+    greet(name: "Ada", years: 36);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Unknown named argument `years`")),
+        "expected unknown named argument diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn calling_non_function_produces_helpful_message() {
     // `x` is bound to an int (not a function). Calling it should
     // produce a clear diagnostic instead of silently doing the wrong

@@ -111,6 +111,29 @@ fn main() {
 
 ---
 
+### `examples/named_args.0s`
+
+**Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
+
+```0s
+fn greet(string name, int age) {
+    print "%s", name;
+    print "%i", age;
+}
+
+fn main() {
+    greet(name: "Ada", age: 36);
+    greet("Grace", age: 40);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/named_args.0s` |
+| **Output** | `Ada36Grace40` |
+
+---
+
 ### `examples/const.0s`
 
 **Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
@@ -1255,6 +1278,18 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+### `examples/range.0s`
+
+**Demonstrates:** lazy `int`/`byte` ranges (`0..n`, `0..=n`), first-class
+range values, empty decreasing ranges.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/range.0s` |
+| **Output** | `01234012356` |
+
+---
+
 ### `examples/for_in_array.0s`
 
 **Demonstrates:** `for x in` over an array (`Item` = element type).
@@ -1355,6 +1390,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `string_fmt.0s` | Basics | `hello world42-x` |
 | `show_tuple.0s` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.0s` | Basics | `51020` |
+| `named_args.0s` | Basics | `Ada36Grace40` |
 | `const.0s` | Basics | `42hi` |
 | `for_break.0s` | Basics | `18` |
 | `fizbuz.0s` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
@@ -1418,6 +1454,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `for_in_tuple.0s` | Collections | `123` |
 | `for_in_dict.0s` | Collections | `12` |
 | `for_in_custom.0s` | Collections / traits | `012` |
+| `range.0s` | Ranges | `01234012356` |
 
 ## Running tests that mirror examples
 
