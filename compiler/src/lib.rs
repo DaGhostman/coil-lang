@@ -10296,10 +10296,11 @@ fn main() {
 "#,
         );
         // Find the CALL in main (arity 2) — skip any earlier CALLs.
+        // call_parts() = (arity, target).
         let call_idx = bc
             .iter()
             .rposition(|b| {
-                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 == 2
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2
             })
             .expect("expected CALL arity 2 for greet");
         // Walk backward from CALL over the two arg pushes: STRING then CONST.
@@ -10374,17 +10375,21 @@ fn main() {
         );
         let call = bc
             .iter()
-            .find(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 == 1)
+            .find(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 1)
             .expect("expected CALL arity 1 (rest packed as one slot)");
         let make_pos = bc
             .iter()
             .position(|b| matches!(b.bytecode(), Instruction::MakeArray))
             .unwrap();
-        let call_pos = bc.iter().position(|b| std::ptr::eq(b, call)).unwrap();
+        let call_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 1)
+            .unwrap();
         assert!(
             make_pos < call_pos,
             "MakeArray must precede CALL (make@{make_pos} call@{call_pos})"
         );
+        let _ = call;
     }
 
     /// Empty rest call still emits MakeArray(0) so the rest formal is `[]`.
