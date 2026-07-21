@@ -95,6 +95,25 @@ use super::ty::{
 use super::unify::{UnifyError, unify_with};
 use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};
 
+/// One candidate in a compile-time arity overload set.
+///
+/// Stored in [`Checker::overload_sets`] keyed by the function's simple
+/// (or qualified) name.  Codegen uses the span-indexed
+/// [`Checker::selected_overloads_by_span`] to decide which ABI to emit.
+#[derive(Clone, Debug)]
+pub struct OverloadCandidate {
+    /// Number of fixed (non-rest) parameters.
+    pub fixed_arity: usize,
+    /// True when the last parameter is a rest pack (`T... name`).
+    pub is_rest: bool,
+    /// The function's HM scheme (monomorphic for non-generic functions,
+    /// poly for generics).
+    pub scheme: Scheme,
+    /// Declaration-order parameter names (including the rest name when
+    /// present).
+    pub param_names: Vec<String>,
+}
+
 /// A parametric type alias (`type Pair<T> = (T, T)`).
 #[derive(Clone, Debug)]
 struct GenericAliasDef {
@@ -178,6 +197,20 @@ pub struct Checker {
     /// Whether the last parameter of `fn_name` is a rest pack (`T... name`).
     /// When true, call sites pack trailing args into a single `[T]` (P4).
     fn_has_rest: std::collections::HashMap<String, bool>,
+
+    /// All overload candidates for each function name.
+    ///
+    /// Populated at the end of each `infer_function` call.  When a name has
+    /// exactly one candidate this is functionally equivalent to the legacy
+    /// `fn_param_names` / `fn_has_rest` path; when there are multiple
+    /// candidates, call-site resolution uses [`Checker::select_overload`].
+    overload_sets: std::collections::HashMap<String, Vec<OverloadCandidate>>,
+
+    /// Call-site selection results keyed by source span `(start, end)`.
+    ///
+    /// Populated by `select_overload` during inference; consumed by codegen
+    /// to decide how many args to emit and whether to pack rest.
+    pub selected_overloads_by_span: std::collections::HashMap<(usize, usize), (usize, bool)>,
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
@@ -336,6 +369,12 @@ pub struct Checker {
     /// Typeclass currently being defined (Phase 6 — bare/`Class::` assoc resolution).
     current_typeclass: Option<String>,
 
+    /// Set to `true` only when `infer_function` is called for a genuine
+    /// top-level user function (not a trait prototype, typeclass impl method,
+    /// or class impl method). Checked inside `infer_function` to decide
+    /// whether the candidate should be added to `overload_sets`.
+    registering_overloadable_fn: bool,
+
     /// Projections encountered while building a scheme. Each is quantified
     /// alongside the method/function binders and later pinned from the selected
     /// instance.
@@ -452,6 +491,8 @@ impl Checker {
             fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
             fn_has_rest: std::collections::HashMap::new(),
+            overload_sets: std::collections::HashMap::new(),
+            selected_overloads_by_span: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
             call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
@@ -504,6 +545,7 @@ impl Checker {
             generic_fns: HashSet::new(),
             fn_dict_arity: HashMap::new(),
             current_typeclass: None,
+            registering_overloadable_fn: false,
             current_assoc_projections: None,
             open_assoc_projections: HashMap::new(),
         };
@@ -868,6 +910,8 @@ impl Checker {
         self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
         self.fn_has_rest.clear();
+        self.overload_sets.clear();
+        self.selected_overloads_by_span.clear();
         self.call_site_dicts.clear();
         self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
@@ -1499,6 +1543,72 @@ impl Checker {
 
             // ---- Names ----
             Expression::Identifier(name) => {
+                // When `name` has multiple overload candidates and appears in
+                // value position, try to narrow using `current_expected`.
+                if self.is_overloaded(name) {
+                    let candidates: Vec<OverloadCandidate> = self
+                        .overload_sets
+                        .get(*name)
+                        .cloned()
+                        .unwrap_or_default();
+                    // If exactly one candidate matches current_expected, pick it.
+                    let expected = self.current_expected.clone();
+                    let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
+                        candidates
+                            .iter()
+                            .filter(|c| {
+                                // Instantiate the candidate's scheme and try to
+                                // unify against expected. Use a fresh subst so
+                                // we don't pollute the running subst.
+                                let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
+                                crate::typechecking::unify::unify(&fun_ty, exp).is_ok()
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    if matching.len() == 1 {
+                        // Unique match — record and return its type.
+                        let candidate = matching[0].clone();
+                        self.selected_overloads_by_span.insert(
+                            (range.start, range.end),
+                            (candidate.fixed_arity, candidate.is_rest),
+                        );
+                        return self.instantiate_ty(&candidate.scheme);
+                    } else if matching.len() > 1 || expected.is_none() {
+                        // Multiple matches or no expected type — ambiguous.
+                        // For the single-candidate case there is no ambiguity even
+                        // without context, but we already checked `is_overloaded`
+                        // (len > 1), so ambiguous.
+                        let arities: Vec<String> = candidates
+                            .iter()
+                            .map(|c| {
+                                if c.is_rest {
+                                    format!("{}+ args (rest)", c.fixed_arity)
+                                } else {
+                                    format!("{} args", c.fixed_arity)
+                                }
+                            })
+                            .collect();
+                        return self.error_with_help(
+                            ErrorCode::AmbiguousOverload,
+                            format!(
+                                "Ambiguous overload: `{}` has multiple candidates in value position",
+                                name
+                            ),
+                            range,
+                            Some(format!(
+                                "available overloads: {}; annotate the expected type to disambiguate",
+                                arities.join(", ")
+                            )),
+                        );
+                    }
+                    // matching.len() == 0 but is_overloaded — fall through to
+                    // the normal env lookup (will return a Var or the last
+                    // inserted scheme, which may unify later).
+                }
+
                 let scheme = self.env.lookup(name).cloned();
                 match scheme {
                     Some(s) => self.instantiate_ty(&s),
@@ -2137,8 +2247,93 @@ impl Checker {
                     );
                 }
 
+                // ── Overload-dispatch: select candidate by argc ───────────────
+                // Must happen before `has_named` and `fn_has_rest` branches so
+                // the correct candidate's param_names / is_rest are used.
+                if self.is_overloaded(&ident) {
+                    let argc = raw_args.len();
+                    // Clone candidate to avoid borrow conflict with `self`.
+                    let candidate_opt = self.select_overload(&ident, argc).cloned();
+                    match candidate_opt {
+                        None => {
+                            // No candidate accepts this arity — emit a
+                            // "no overload" error listing the available arities.
+                            let available: Vec<String> = self
+                                .overload_sets
+                                .get(&ident)
+                                .map(|cs| {
+                                    cs.iter()
+                                        .map(|c| {
+                                            if c.is_rest {
+                                                format!("{}+ args (rest)", c.fixed_arity)
+                                            } else {
+                                                format!("{} args", c.fixed_arity)
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            return self.error_with_help(
+                                ErrorCode::WrongArity,
+                                format!(
+                                    "No overload of `{}` accepts {} argument{}",
+                                    ident,
+                                    argc,
+                                    if argc == 1 { "" } else { "s" }
+                                ),
+                                range,
+                                Some(format!("available arities: {}", available.join(", "))),
+                            );
+                        }
+                        Some(candidate) => {
+                            // Record the selection for codegen.
+                            self.selected_overloads_by_span.insert(
+                                (range.start, range.end),
+                                (candidate.fixed_arity, candidate.is_rest),
+                            );
+                            let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) = {
+                                let (fun_ty, constraints, mapping) =
+                                    self.instantiate_scheme_mapped(&candidate.scheme);
+                                (fun_ty, constraints, mapping, Some(candidate.scheme.clone()))
+                            };
+                            let (arg_tys, ordered_args) = self
+                                .infer_and_reorder_call_args_with_candidate(
+                                    &ident,
+                                    &candidate,
+                                    raw_args,
+                                    &range,
+                                );
+                            let result = self.apply_function(
+                                Some(&ident),
+                                &fun_ty,
+                                &arg_tys,
+                                if ordered_args.is_empty() {
+                                    None
+                                } else {
+                                    Some(&ordered_args)
+                                },
+                                id,
+                                range.clone(),
+                            );
+                            if !fresh_constraints.is_empty() {
+                                self.discharge_constraints(id, &fresh_constraints, &range);
+                                if let Some(scheme) = original_scheme.as_ref() {
+                                    self.pin_assoc_after_discharge(
+                                        "",
+                                        &fresh_constraints,
+                                        Some(scheme),
+                                        &fresh_mapping,
+                                        &range,
+                                    );
+                                }
+                            }
+                            return result;
+                        }
+                    }
+                }
+
                 // Named call-site args: skip trait UFCS and resolve an ordinary
-                // function (partial application is rejected when any arg is named).
+                // function (partial application is allowed — residual Fun is OK).
                 if has_named {
                     let scheme = self.env.lookup(&ident).cloned();
                     let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
@@ -2182,23 +2377,9 @@ impl Checker {
                             );
                         }
                     }
-                    // Named calls must fully apply — reject leftover Fun.
-                    let resolved = apply_ty_prune(&self.subst, &result);
-                    if matches!(resolved, Ty::Fun(_, _)) {
-                        let mut msg = Message::error(
-                            ErrorCode::MissingField,
-                            format!(
-                                "Call to `{}` with named arguments is under-applied",
-                                ident
-                            ),
-                            range.clone(),
-                        );
-                        msg.with_help(
-                            "when any argument is named, all remaining parameters must be supplied"
-                                .to_string(),
-                        );
-                        self.messages.push(msg);
-                    }
+                    // Named under-apply is now allowed (residual Fun is returned
+                    // for partial application). Error only on unknown/duplicate
+                    // named args (handled inside infer_and_reorder_call_args).
                     return result;
                 }
 
@@ -2839,6 +3020,12 @@ impl Checker {
                 if *name == "main" {
                     self.main_decl_span = Some(range.clone());
                 }
+                // A genuine top-level user function is overloadable.
+                // Trait prototype bodies are re-walked here via `self.infer(m)`
+                // from inside the trait handler (where `current_typeclass` is
+                // set), so we suppress overload registration in that context.
+                let prev_overloadable = self.registering_overloadable_fn;
+                self.registering_overloadable_fn = self.current_typeclass.is_none();
                 self.infer_function(
                     name,
                     type_params,
@@ -2850,6 +3037,7 @@ impl Checker {
                     None,
                     *is_coro,
                 );
+                self.registering_overloadable_fn = prev_overloadable;
                 unit_ty()
             }
 
@@ -7646,6 +7834,100 @@ impl Checker {
                 .insert(name.to_string(), resolved_param_constraints.len());
         }
 
+        // ── Overload-set registration ──────────────────────────────────────
+        // Only genuine top-level user functions are registered as overloads.
+        // Trait prototype bodies and typeclass/impl method bodies suppress
+        // registration via `registering_overloadable_fn = false` at their
+        // call sites.
+        if !self.registering_overloadable_fn {
+            return fun_ty;
+        }
+        // Compute fixed_arity from the registered param names (which already
+        // account for parse_arg_list's is_rest treatment).
+        let param_names_for_overload = self.fn_param_names
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        let fixed_arity_for_overload = if has_rest {
+            param_names_for_overload.len().saturating_sub(1)
+        } else {
+            param_names_for_overload.len()
+        };
+
+        // Resolve the final scheme so the candidate carries the closed type.
+        let candidate_scheme = match self.env.lookup(name) {
+            Some(s) => s.clone(),
+            None => Scheme::mono(fun_ty.clone()),
+        };
+
+        let new_candidate = OverloadCandidate {
+            fixed_arity: fixed_arity_for_overload,
+            is_rest: has_rest,
+            scheme: candidate_scheme,
+            param_names: param_names_for_overload,
+        };
+
+        // Check for arity conflicts with existing candidates.
+        let candidates = self.overload_sets.entry(name.to_string()).or_default();
+        let mut conflict = false;
+        for existing in candidates.iter() {
+            let overlap = if existing.is_rest && new_candidate.is_rest {
+                // Two rest functions always overlap.
+                true
+            } else if !existing.is_rest && !new_candidate.is_rest {
+                // Two fixed functions conflict iff same arity.
+                existing.fixed_arity == new_candidate.fixed_arity
+            } else {
+                // One fixed (N), one rest (K params before rest):
+                // overlap when N >= K (the fixed fn covers arities that
+                // the rest fn also accepts).
+                let (fixed_n, rest_k) = if existing.is_rest {
+                    (new_candidate.fixed_arity, existing.fixed_arity)
+                } else {
+                    (existing.fixed_arity, new_candidate.fixed_arity)
+                };
+                fixed_n >= rest_k
+            };
+            if overlap {
+                conflict = true;
+                let msg_text = if existing.is_rest && new_candidate.is_rest {
+                    format!(
+                        "Duplicate rest function `{}`: two rest-parameter overloads always conflict",
+                        name
+                    )
+                } else if !existing.is_rest && !new_candidate.is_rest {
+                    format!(
+                        "Duplicate function `{}` with arity {}",
+                        name, new_candidate.fixed_arity
+                    )
+                } else {
+                    let (fixed_n, rest_k) = if existing.is_rest {
+                        (new_candidate.fixed_arity, existing.fixed_arity)
+                    } else {
+                        (existing.fixed_arity, new_candidate.fixed_arity)
+                    };
+                    format!(
+                        "Overload conflict for `{}`: fixed arity {} overlaps rest (min-arity {})",
+                        name, fixed_n, rest_k
+                    )
+                };
+                let mut err = Message::error(
+                    ErrorCode::DuplicateOverload,
+                    msg_text,
+                    range.clone(),
+                );
+                err.with_help(
+                    "choose distinct arities, or make the fixed overload have fewer params than the rest's fixed prefix".to_string(),
+                );
+                self.messages.push(err);
+                break;
+            }
+        }
+        if !conflict {
+            candidates.push(new_candidate);
+        }
+        // ── end overload-set registration ─────────────────────────────────
+
         fun_ty
     }
 
@@ -7691,6 +7973,41 @@ impl Checker {
     /// Whether `fn_name` has a trailing rest parameter (`T... name`).
     pub fn fn_has_rest(&self, fn_name: &str) -> bool {
         self.fn_has_rest.get(fn_name).copied().unwrap_or(false)
+    }
+
+    /// All registered overload candidates for `fn_name`, if any.
+    pub fn overload_candidates(&self, fn_name: &str) -> Option<&[OverloadCandidate]> {
+        self.overload_sets.get(fn_name).map(|v| v.as_slice())
+    }
+
+    /// True when `fn_name` has more than one overload candidate.
+    pub fn is_overloaded(&self, fn_name: &str) -> bool {
+        self.overload_sets
+            .get(fn_name)
+            .map_or(false, |v| v.len() > 1)
+    }
+
+    /// Select the best overload candidate for a call with `argc` arguments.
+    ///
+    /// Resolution order:
+    /// 1. Fixed candidate whose `fixed_arity == argc`.
+    /// 2. Rest candidate whose `fixed_arity <= argc`.
+    /// 3. `None` — caller emits a missing-arity diagnostic.
+    pub fn select_overload(&self, fn_name: &str, argc: usize) -> Option<&OverloadCandidate> {
+        let candidates = self.overload_sets.get(fn_name)?;
+        // Prefer exact fixed match.
+        if let Some(c) = candidates.iter().find(|c| !c.is_rest && c.fixed_arity == argc) {
+            return Some(c);
+        }
+        // Fall back to rest candidate that can accept `argc`.
+        candidates.iter().find(|c| c.is_rest && c.fixed_arity <= argc)
+    }
+
+    /// The call-site selection result for the call spanning `(start, end)`.
+    ///
+    /// Returns `(fixed_arity, is_rest)` of the chosen candidate.
+    pub fn selected_overload_at(&self, start: usize, end: usize) -> Option<(usize, bool)> {
+        self.selected_overloads_by_span.get(&(start, end)).copied()
     }
 
     /// Infer call arguments, reordering named args and packing rest.
@@ -7987,6 +8304,46 @@ impl Checker {
             exprs.clear();
         }
         (tys, exprs)
+    }
+
+    /// Like [`infer_and_reorder_call_args`] but uses `candidate`'s
+    /// `param_names` and `is_rest` rather than the global maps.
+    ///
+    /// Used by the overload-dispatch path so each overload's ABI is applied
+    /// independently of what `fn_param_names` / `fn_has_rest` happen to store.
+    fn infer_and_reorder_call_args_with_candidate<'a>(
+        &mut self,
+        fn_name: &str,
+        candidate: &OverloadCandidate,
+        args: &'a [Output<'a>],
+        range: &Range<usize>,
+    ) -> (Vec<Ty>, Vec<Output<'a>>) {
+        // Save any existing entries, overwrite with candidate's data, call the
+        // shared implementation, then restore so we don't clobber the maps.
+        let prev_params = self
+            .fn_param_names
+            .insert(fn_name.to_string(), candidate.param_names.clone());
+        let prev_rest = self
+            .fn_has_rest
+            .insert(fn_name.to_string(), candidate.is_rest);
+        let result = self.infer_and_reorder_call_args(fn_name, args, range);
+        match prev_params {
+            Some(v) => {
+                self.fn_param_names.insert(fn_name.to_string(), v);
+            }
+            None => {
+                self.fn_param_names.remove(fn_name);
+            }
+        }
+        match prev_rest {
+            Some(v) => {
+                self.fn_has_rest.insert(fn_name.to_string(), v);
+            }
+            None => {
+                self.fn_has_rest.remove(fn_name);
+            }
+        }
+        result
     }
 
     // ============================================================
@@ -15443,6 +15800,182 @@ fn main() { let n = f(a: 1, 2, 3); }
             "unexpected: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
+    }
+
+    // ── Arity overload tests ──────────────────────────────────────────────────
+
+    /// Two fixed-arity overloads with distinct arities — both register without
+    /// error and calls dispatch to the right one.
+    #[test]
+    fn overload_two_fixed_arities_dispatch() {
+        let (mut c, _) = check(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int y) -> int { return x + y; }
+fn main() {
+    let a = f(1);
+    let b = f(1, 2);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        // Both candidates should be registered.
+        assert_eq!(c.overload_candidates("f").map(|v| v.len()), Some(2));
+    }
+
+    /// Duplicate fixed arity is a `DuplicateOverload` error.
+    #[test]
+    fn overload_duplicate_fixed_arity_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int y) -> int { return y + 1; }
+fn main() { let a = f(1); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::DuplicateOverload)),
+            "expected DuplicateOverload, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Fixed N=1 vs rest with K=1 fixed prefix (N >= K) — overlap error.
+    #[test]
+    fn overload_fixed_vs_rest_overlap_when_n_ge_k() {
+        let msgs = assert_messages(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int... xs) -> int { return x + len(xs); }
+fn main() { let a = f(1); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::DuplicateOverload)),
+            "expected DuplicateOverload for N>=K overlap, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Fixed N=1 vs rest with K=2 fixed prefix (N < K) — allowed.
+    #[test]
+    fn overload_fixed_vs_rest_allowed_when_n_lt_k() {
+        let (mut c, _) = check(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int y, int... xs) -> int { return x + y + len(xs); }
+fn main() {
+    let a = f(1);
+    let b = f(1, 2);
+    let c = f(1, 2, 3);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected diagnostics: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert_eq!(c.overload_candidates("f").map(|v| v.len()), Some(2));
+    }
+
+    /// Two rest overloads always conflict.
+    #[test]
+    fn overload_two_rests_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn f(int... xs) -> int { return len(xs); }
+fn f(string s, int... xs) -> int { return len(xs); }
+fn main() { let a = f(1, 2); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::DuplicateOverload)),
+            "expected DuplicateOverload for two rests, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Calling an overloaded function with an arity that matches no candidate
+    /// produces a `WrongArity` diagnostic.
+    #[test]
+    fn overload_no_matching_arity_produces_wrong_arity() {
+        let msgs = assert_messages(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int y) -> int { return x + y; }
+fn main() { let a = f(1, 2, 3); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::WrongArity)),
+            "expected WrongArity, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Named-arg under-apply is now allowed (no "under-applied" error).
+    /// The result type should be a residual `Fun` (partial application).
+    #[test]
+    fn named_under_apply_no_longer_errors() {
+        let (mut c, _) = check(
+            r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() { let partial = add(a: 1); }
+"#,
+        );
+        let msgs = c.take_messages();
+        // The old "under-applied" error must not appear.
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.message().contains("under-applied")),
+            "unexpected under-apply error: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `select_overload` helper: exact fixed match wins over rest.
+    #[test]
+    fn select_overload_exact_fixed_beats_rest() {
+        let (c, _) = check(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int y, int... xs) -> int { return x; }
+fn main() {}
+"#,
+        );
+        let selected = c.select_overload("f", 1);
+        assert!(selected.is_some(), "no overload selected");
+        let sel = selected.unwrap();
+        assert!(!sel.is_rest, "should select the fixed arity-1 overload");
+        assert_eq!(sel.fixed_arity, 1);
+    }
+
+    /// `select_overload` helper: falls back to rest when no exact fixed match.
+    #[test]
+    fn select_overload_falls_back_to_rest() {
+        let (c, _) = check(
+            r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int y, int... xs) -> int { return x; }
+fn main() {}
+"#,
+        );
+        let selected = c.select_overload("f", 5);
+        assert!(selected.is_some(), "no overload selected for 5 args");
+        let sel = selected.unwrap();
+        assert!(sel.is_rest, "should select the rest overload for 5 args");
     }
 }
 
