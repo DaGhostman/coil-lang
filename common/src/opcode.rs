@@ -212,6 +212,19 @@ pub enum Instruction {
     /// `ObjTuple(2)` pairs `(key_string, value)` in table iteration order.
     /// Used by homogeneous-record `IntoIterator` / `for x in dict`.
     DictEntries,
+
+    /// MakeFn — allocate a first-class monomorphic function / partial / lambda.
+    ///
+    /// Stack (bottom → TOS):
+    /// `[captures..., filled_param_values..., filled_mask, entry]`
+    /// Operand packing:
+    /// - `[7:0]`   = capture count
+    /// - `[15:8]`  = filled param count
+    /// - `[23:16]` = arity (fixed N, or rest nfixed)
+    /// - `[24]`    = is_rest flag
+    /// `filled_mask` is an int on the stack (bit i ⇒ fixed param i is bound).
+    /// `entry` is a code offset (CodePtr / int).
+    MakeFn,
 }
 
 impl From<u8> for Instruction {
@@ -725,7 +738,7 @@ mod tests {
     #[test]
     fn instruction_from_u8_covers_last_appended_variant() {
         // ARCHIVE stability: last variant must remain decodable.
-        let last = Instruction::DictEntries as u8;
+        let last = Instruction::MakeFn as u8;
         let decoded: Instruction = last.into();
         assert_eq!(decoded as u8, last);
     }

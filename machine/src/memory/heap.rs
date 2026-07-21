@@ -220,6 +220,9 @@ impl Heap {
             Object::PolyFn(p) => {
                 p.release();
             }
+            Object::Fn(f) => {
+                f.release();
+            }
             Object::Stream(s) => {
                 // Closing the fd happens in ObjStream::drop via release.
                 s.release();
@@ -358,6 +361,7 @@ impl fmt::Display for Error {
 
 pub type RefBoxed = Gc<ObjBoxed>;
 pub type RefPolyFn = Gc<ObjPolyFn>;
+pub type RefFn = Gc<ObjFn>;
 pub type RefStream = Gc<ObjStream>;
 
 /// Kind of host-backed IO stream.
@@ -384,6 +388,7 @@ pub enum Object {
     Coroutine(RefCoroutine),
     Boxed(RefBoxed),
     PolyFn(RefPolyFn),
+    Fn(RefFn),
     Stream(RefStream),
 }
 
@@ -400,6 +405,7 @@ impl Object {
             Self::Coroutine(c) => c.mark(),
             Self::Boxed(b) => b.mark(),
             Self::PolyFn(p) => p.mark(),
+            Self::Fn(f) => f.mark(),
             Self::Stream(s) => s.mark(),
         };
         if marked {
@@ -419,6 +425,7 @@ impl Object {
             Self::Coroutine(c) => c.unmark(),
             Self::Boxed(b) => b.unmark(),
             Self::PolyFn(p) => p.unmark(),
+            Self::Fn(f) => f.unmark(),
             Self::Stream(s) => s.unmark(),
         }
     }
@@ -436,6 +443,7 @@ impl Object {
             Self::Coroutine(c) => c.is_marked(),
             Self::Boxed(b) => b.is_marked(),
             Self::PolyFn(p) => p.is_marked(),
+            Self::Fn(f) => f.is_marked(),
             Self::Stream(s) => s.is_marked(),
         }
     }
@@ -479,6 +487,11 @@ impl Object {
                     }
                 }
             }
+            Self::Fn(_) => {
+                // `captures` / `captured_args` are raw `Value`s (like Array
+                // elements); Machine::gc_collect traces them via the root set
+                // when the ObjFn itself is reachable.
+            }
             Self::Stream(_) => {}
         }
     }
@@ -496,6 +509,7 @@ impl Object {
             Self::Coroutine(c) => c.get_next(),
             Self::Boxed(b) => b.get_next(),
             Self::PolyFn(p) => p.get_next(),
+            Self::Fn(f) => f.get_next(),
             Self::Stream(s) => s.get_next(),
         }
     }
@@ -512,6 +526,7 @@ impl Object {
             Self::Coroutine(c) => c.set_next(next),
             Self::Boxed(b) => b.set_next(next),
             Self::PolyFn(p) => p.set_next(next),
+            Self::Fn(f) => f.set_next(next),
             Self::Stream(s) => s.set_next(next),
         }
     }
@@ -528,6 +543,7 @@ impl Object {
             Self::Coroutine(c) => c.as_ptr() as u64,
             Self::Boxed(b) => b.as_ptr() as u64,
             Self::PolyFn(p) => p.as_ptr() as u64,
+            Self::Fn(f) => f.as_ptr() as u64,
             Self::Stream(s) => s.as_ptr() as u64,
         }
     }
@@ -545,6 +561,7 @@ impl GcSized for Object {
             Self::Coroutine(c) => c.size(),
             Self::Boxed(b) => b.size(),
             Self::PolyFn(p) => p.size(),
+            Self::Fn(f) => f.size(),
             Self::Stream(s) => s.size(),
         }
     }
@@ -562,6 +579,7 @@ impl fmt::Display for Object {
             Self::Coroutine(c) => write!(f, "{}", c.as_ref()),
             Self::Boxed(_) => write!(f, "<boxed 0x{:08x}>", self.addr()),
             Self::PolyFn(_) => write!(f, "<polyfn 0x{:08x}>", self.addr()),
+            Self::Fn(_) => write!(f, "<fn 0x{:08x}>", self.addr()),
             Self::Stream(_) => write!(f, "<stream 0x{:08x}>", self.addr()),
         }
     }
@@ -580,6 +598,7 @@ impl Object {
             | Self::Coroutine(_)
             | Self::Boxed(_)
             | Self::PolyFn(_)
+            | Self::Fn(_)
             | Self::Stream(_) => std::ptr::null(),
         }
     }
@@ -711,6 +730,22 @@ pub struct ObjPolyFn {
     pub captured_dicts: Vec<Option<Member>>,
 }
 
+/// First-class monomorphic function / partial / explicit-capture lambda.
+pub struct ObjFn {
+    /// Bytecode entry of the body.
+    pub entry: u32,
+    /// Fixed arity, or rest `nfixed` when `is_rest`.
+    pub arity: u32,
+    /// Trailing rest parameter packs extra args into `[T]`.
+    pub is_rest: bool,
+    /// Bitmask of which fixed param slots are already filled (partial apply).
+    pub filled_mask: u32,
+    /// Values for filled param slots (decl order among filled bits).
+    pub captured_args: Vec<Value>,
+    /// Explicit `use (x, y)` capture snapshot (leading frame locals).
+    pub captures: Vec<Value>,
+}
+
 /// Host-backed non-blocking IO stream (file / stdio / TCP / UDP).
 pub struct ObjStream {
     pub fd: Option<std::os::fd::OwnedFd>,
@@ -766,6 +801,13 @@ impl GcSized for ObjBoxed {
 
 impl GcSized for ObjPolyFn {
     fn size(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+}
+
+impl GcSized for ObjFn {
+    fn size(&self) -> usize {
+        // Vec payloads use Rust's allocator (same as ObjArray elements).
         mem::size_of::<Self>()
     }
 }
