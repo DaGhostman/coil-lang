@@ -3,7 +3,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// Bump when bytecode encoding or `Byte` layout changes incompatibly.
-pub const ARCHIVE_VERSION: u32 = 23;
+pub const ARCHIVE_VERSION: u32 = 24;
 
 /// Serialized program with constant pool and bytecode.
 #[derive(Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
