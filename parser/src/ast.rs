@@ -116,8 +116,8 @@ pub enum Expression<'expr> {
     Bool(bool),
     Module(String, Output<'expr>),
 
-    /// Function parameter `(T name)` with a full type annotation.
-    Argument(Output<'expr>, &'expr str),
+    /// Function parameter `T name` or rest `T... name` (`is_rest`).
+    Argument(Output<'expr>, &'expr str, bool),
     Identifier(&'expr str),
     Type(&'expr str),
     /// Generic type application in annotations: `Option<int>`, `Result<int, string>`.
@@ -814,6 +814,13 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::NamedArg(name, value) => write!(f, "{}: {}", name, value.1),
+            Self::Argument(ty, name, is_rest) => {
+                if *is_rest {
+                    write!(f, "{}... {}", ty.1, name)
+                } else {
+                    write!(f, "{} {}", ty.1, name)
+                }
+            }
             Self::Loop {
                 identifier,
                 iterable,

@@ -161,6 +161,10 @@ pub struct Checker {
     /// call-site arguments (Phase P2).
     fn_param_names: std::collections::HashMap<String, Vec<String>>,
 
+    /// Whether the last parameter of `fn_name` is a rest pack (`T... name`).
+    /// When true, call sites pack trailing args into a single `[T]` (P4).
+    fn_has_rest: std::collections::HashMap<String, bool>,
+
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
     /// Span fallback when pre-walk / infer NodeIds are misaligned in
@@ -415,6 +419,7 @@ impl Checker {
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
             fn_param_names: std::collections::HashMap::new(),
+            fn_has_rest: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
             call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
@@ -823,6 +828,7 @@ impl Checker {
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
         self.fn_param_names.clear();
+        self.fn_has_rest.clear();
         self.call_site_dicts.clear();
         self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
@@ -1474,7 +1480,7 @@ impl Checker {
                         items
                             .iter()
                             .filter_map(|item| {
-                                if let Expression::Argument(ty, _) = item.1.as_ref() {
+                                if let Expression::Argument(ty, _, _) = item.1.as_ref() {
                                     Some(self.parse_type_name(ty))
                                 } else {
                                     None
@@ -1857,14 +1863,22 @@ impl Checker {
                             .map(|(_, s)| s.clone())
                     {
                         let fun_ty = self.instantiate_ty(&scheme);
+                        let fqn = format!("{}::{}", owner, method);
                         let mut arg_tys = vec![recv_ty];
-                        if let Some(a) = args {
+                        if self.fn_has_rest(&fqn) {
+                            let (tys, _) = self.infer_and_reorder_call_args(
+                                &fqn,
+                                method_args,
+                                &range,
+                            );
+                            arg_tys.extend(tys);
+                        } else if let Some(a) = args {
                             for arg in a {
                                 arg_tys.push(self.infer(arg));
                             }
                         }
                         return self.apply_function(
-                            Some(&format!("{}::{}", owner, method)),
+                            Some(&fqn),
                             &fun_ty,
                             &arg_tys,
                             None,
@@ -2071,6 +2085,54 @@ impl Checker {
                                 .to_string(),
                         );
                         self.messages.push(msg);
+                    }
+                    return result;
+                }
+
+                // Rest-parameter calls pack trailing args; skip UFCS trait
+                // resolution so we don't double-infer (NodeId alignment).
+                if self.fn_has_rest(&ident) {
+                    let scheme = self.env.lookup(&ident).cloned();
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
+                        match scheme {
+                            Some(s) => {
+                                let (fun_ty, constraints, mapping) =
+                                    self.instantiate_scheme_mapped(&s);
+                                (fun_ty, constraints, mapping, Some(s))
+                            }
+                            None => {
+                                return self.error(
+                                    ErrorCode::UnknownFunction,
+                                    format!("Cannot find function `{}`", ident),
+                                    range,
+                                );
+                            }
+                        };
+                    let (call_arg_tys, ordered_args) =
+                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                    let result = self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &call_arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    );
+                    if !fresh_constraints.is_empty() {
+                        self.discharge_constraints(id, &fresh_constraints, &range);
+                        if let Some(scheme) = original_scheme.as_ref() {
+                            self.pin_assoc_after_discharge(
+                                "",
+                                &fresh_constraints,
+                                Some(scheme),
+                                &fresh_mapping,
+                                &range,
+                            );
+                        }
                     }
                     return result;
                 }
@@ -2693,7 +2755,14 @@ impl Checker {
                 self.pop_type_params_for_type_parsing(pushed);
                 unit_ty()
             }
-            Expression::Argument(ty, _name) => self.parse_type_name(ty),
+            Expression::Argument(ty, _name, is_rest) => {
+                let elem = self.parse_type_name(ty);
+                if *is_rest {
+                    array(elem)
+                } else {
+                    elem
+                }
+            }
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
             Expression::Access(receiver, field) => {
@@ -6829,9 +6898,12 @@ impl Checker {
                     );
                     // Method calls resolve as `Owner::method`; mirror that
                     // key for named-arg reorder (self is never named).
+                    let fqn = format!("{}::{}", owner, name);
                     if let Some(names) = self.fn_param_names.get(*name).cloned() {
-                        self.fn_param_names
-                            .insert(format!("{}::{}", owner, name), names);
+                        self.fn_param_names.insert(fqn.clone(), names);
+                    }
+                    if let Some(has) = self.fn_has_rest.get(*name).copied() {
+                        self.fn_has_rest.insert(fqn, has);
                     }
                     let scheme = if param_vars.is_empty() {
                         Scheme::mono(fun_ty)
@@ -7022,6 +7094,11 @@ impl Checker {
             name.to_string(),
             arg_tys.iter().map(|(n, _)| n.clone()).collect(),
         );
+        let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
+            if children.last().is_some_and(|c| {
+                matches!(c.1.as_ref(), Expression::Argument(_, _, true))
+            }));
+        self.fn_has_rest.insert(name.to_string(), has_rest);
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
             let send_ty = Ty::Var(self.counter.fresh());
@@ -7245,13 +7322,33 @@ impl Checker {
     }
 
     /// Parse a function's argument list (a `Fragment` of
-    /// `Argument(ty, name)` nodes).
+    /// `Argument(ty, name, is_rest)` nodes). Rest params become `[T]`.
     fn parse_arg_list(&mut self, args: &Output) -> Vec<(String, Ty)> {
         let mut out = Vec::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
-            for child in children {
-                if let Expression::Argument(ty, name) = child.1.as_ref() {
-                    out.push((name.to_string(), self.parse_type_name(ty)));
+            let n = children.len();
+            for (i, child) in children.iter().enumerate() {
+                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref() {
+                    if *is_rest {
+                        if i + 1 != n {
+                            let mut msg = Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Rest parameter `{}` must be the last parameter",
+                                    name
+                                ),
+                                child.0.into_range(),
+                            );
+                            msg.with_help(
+                                "write fixed parameters first, then `T... name`".to_string(),
+                            );
+                            self.messages.push(msg);
+                        }
+                        let elem = self.parse_type_name(ty);
+                        out.push((name.to_string(), array(elem)));
+                    } else {
+                        out.push((name.to_string(), self.parse_type_name(ty)));
+                    }
                 }
             }
         }
@@ -7263,11 +7360,20 @@ impl Checker {
         self.fn_param_names.get(fn_name).map(|v| v.as_slice())
     }
 
-    /// Infer call arguments, reordering named args into declaration order.
+    /// Whether `fn_name` has a trailing rest parameter (`T... name`).
+    pub fn fn_has_rest(&self, fn_name: &str) -> bool {
+        self.fn_has_rest.get(fn_name).copied().unwrap_or(false)
+    }
+
+    /// Infer call arguments, reordering named args and packing rest.
     ///
-    /// When any argument is [`Expression::NamedArg`], every remaining
-    /// parameter must be supplied (no partial application). Returns
-    /// `(arg_tys, ordered_value_exprs)` in declaration order.
+    /// When any argument is [`Expression::NamedArg`], every fixed
+    /// parameter must be supplied (no partial application). Rest
+    /// parameters are positional-only at the call site and pack into
+    /// a single `[T]` (empty when no trailing args). Returns
+    /// `(arg_tys, ordered_value_exprs)` in declaration order; for rest
+    /// functions the last "expr" is a synthetic stand-in when packing
+    /// (callers that need element exprs use codegen's split helper).
     fn infer_and_reorder_call_args<'a>(
         &mut self,
         fn_name: &str,
@@ -7277,7 +7383,9 @@ impl Checker {
         let has_named = args
             .iter()
             .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
-        if !has_named {
+        let has_rest = self.fn_has_rest.get(fn_name).copied().unwrap_or(false);
+
+        if !has_named && !has_rest {
             let mut tys = Vec::with_capacity(args.len());
             let mut exprs = Vec::with_capacity(args.len());
             for arg in args {
@@ -7288,19 +7396,21 @@ impl Checker {
         }
 
         let Some(param_names) = self.fn_param_names.get(fn_name).cloned() else {
-            let mut msg = Message::error(
-                ErrorCode::GenericTypeError,
-                format!(
-                    "Named arguments are not supported on this call to `{}`",
-                    fn_name
-                ),
-                range.clone(),
-            );
-            msg.with_help(
-                "named arguments require a known function with declared parameter names"
-                    .to_string(),
-            );
-            self.messages.push(msg);
+            if has_named {
+                let mut msg = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Named arguments are not supported on this call to `{}`",
+                        fn_name
+                    ),
+                    range.clone(),
+                );
+                msg.with_help(
+                    "named arguments require a known function with declared parameter names"
+                        .to_string(),
+                );
+                self.messages.push(msg);
+            }
             let mut tys = Vec::with_capacity(args.len());
             let mut exprs = Vec::with_capacity(args.len());
             for arg in args {
@@ -7313,21 +7423,50 @@ impl Checker {
             return (tys, exprs);
         };
 
-        let n = param_names.len();
-        let mut slots: Vec<Option<(Ty, Output)>> = vec![None; n];
+        let fixed_count = if has_rest {
+            param_names.len().saturating_sub(1)
+        } else {
+            param_names.len()
+        };
+        let rest_name = if has_rest {
+            param_names.get(fixed_count).cloned()
+        } else {
+            None
+        };
+        let fixed_names = &param_names[..fixed_count];
+
+        let mut slots: Vec<Option<(Ty, Output)>> = vec![None; fixed_count];
+        let mut rest_elems: Vec<(Ty, Output)> = Vec::new();
         let mut next_pos = 0usize;
         let mut seen_named = false;
 
         for arg in args {
             match arg.1.as_ref() {
                 Expression::NamedArg(name, _) => {
+                    if rest_name.as_deref() == Some(*name) {
+                        let mut msg = Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Cannot pass rest parameter `{}` by name in call to `{}`",
+                                name, fn_name
+                            ),
+                            arg.0.into_range(),
+                        );
+                        msg.with_help(
+                            "rest parameters are positional-only; pass trailing values after fixed args"
+                                .to_string(),
+                        );
+                        self.messages.push(msg);
+                        let _ = self.infer(arg);
+                        continue;
+                    }
                     seen_named = true;
                     let ty = self.infer(arg);
                     let value = match arg.1.as_ref() {
                         Expression::NamedArg(_, v) => v.clone(),
                         _ => unreachable!(),
                     };
-                    match param_names.iter().position(|p| p == *name) {
+                    match fixed_names.iter().position(|p| p == *name) {
                         Some(idx) => {
                             if slots[idx].is_some() {
                                 self.messages.push(Message::error(
@@ -7351,15 +7490,15 @@ impl Checker {
                                 ),
                                 arg.0.into_range(),
                             );
-                            if param_names.is_empty() {
+                            if fixed_names.is_empty() {
                                 msg.with_help(format!(
-                                    "`{}` takes no parameters",
+                                    "`{}` has no named parameters",
                                     fn_name
                                 ));
                             } else {
                                 msg.with_help(format!(
                                     "expected one of: {}",
-                                    param_names.join(", ")
+                                    fixed_names.join(", ")
                                 ));
                             }
                             self.messages.push(msg);
@@ -7367,7 +7506,36 @@ impl Checker {
                     }
                 }
                 _ => {
-                    if seen_named {
+                    let ty = self.infer(arg);
+                    // Skip fixed slots already filled by name so trailing
+                    // positionals can pack into rest after `f(a: 1, 2, 3)`.
+                    while next_pos < fixed_count && slots[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos < fixed_count {
+                        if seen_named {
+                            let mut msg = Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Positional argument after named argument in call to `{}`",
+                                    fn_name
+                                ),
+                                arg.0.into_range(),
+                            );
+                            msg.with_help(
+                                "all positional arguments must come before named arguments"
+                                    .to_string(),
+                            );
+                            self.messages.push(msg);
+                        }
+                        slots[next_pos] = Some((ty, arg.clone()));
+                        next_pos += 1;
+                    } else if has_rest {
+                        // Trailing positionals after fixed (and after named
+                        // fixed args) pack into the rest array.
+                        rest_elems.push((ty, arg.clone()));
+                        next_pos += 1;
+                    } else if seen_named {
                         let mut msg = Message::error(
                             ErrorCode::GenericTypeError,
                             format!(
@@ -7381,9 +7549,7 @@ impl Checker {
                                 .to_string(),
                         );
                         self.messages.push(msg);
-                    }
-                    let ty = self.infer(arg);
-                    if next_pos >= n {
+                    } else {
                         self.messages.push(Message::error(
                             ErrorCode::TooManyArguments,
                             format!(
@@ -7392,20 +7558,21 @@ impl Checker {
                             ),
                             arg.0.into_range(),
                         ));
-                    } else {
-                        if slots[next_pos].is_some() {
-                            // Named arg already filled this slot — still advance.
-                        } else {
-                            slots[next_pos] = Some((ty, arg.clone()));
-                        }
-                        next_pos += 1;
                     }
                 }
             }
         }
 
-        let mut tys = Vec::with_capacity(n);
-        let mut exprs = Vec::with_capacity(n);
+        // Positional-only under-application of fixed params: do not
+        // synthesize an empty rest pack (preserves partial application).
+        let pack_rest = has_rest
+            && (has_named
+                || next_pos >= fixed_count
+                || args.len() >= fixed_count
+                || fixed_count == 0);
+
+        let mut tys = Vec::with_capacity(fixed_count + usize::from(pack_rest));
+        let mut exprs = Vec::with_capacity(fixed_count + usize::from(pack_rest));
         for (i, slot) in slots.into_iter().enumerate() {
             match slot {
                 Some((ty, expr)) => {
@@ -7413,32 +7580,81 @@ impl Checker {
                     exprs.push(expr);
                 }
                 None => {
-                    let mut msg = Message::error(
-                        ErrorCode::MissingField,
-                        format!(
-                            "Missing argument `{}` in call to `{}`",
-                            param_names[i], fn_name
-                        ),
-                        range.clone(),
-                    );
-                    msg.with_help(
-                        "when any argument is named, all remaining parameters must be supplied"
-                            .to_string(),
-                    );
-                    self.messages.push(msg);
-                    tys.push(Ty::Var(self.counter.fresh()));
-                    // Placeholder so arity stays aligned; unify sees a fresh var.
-                    if let Some(a) = args.first() {
-                        exprs.push(match a.1.as_ref() {
-                            Expression::NamedArg(_, v) => v.clone(),
-                            _ => a.clone(),
-                        });
+                    if has_named || pack_rest {
+                        let mut msg = Message::error(
+                            ErrorCode::MissingField,
+                            format!(
+                                "Missing argument `{}` in call to `{}`",
+                                fixed_names[i], fn_name
+                            ),
+                            range.clone(),
+                        );
+                        if has_named {
+                            msg.with_help(
+                                "when any argument is named, all fixed parameters must be supplied"
+                                    .to_string(),
+                            );
+                        }
+                        self.messages.push(msg);
+                        tys.push(Ty::Var(self.counter.fresh()));
+                        if let Some(a) = args.first() {
+                            exprs.push(match a.1.as_ref() {
+                                Expression::NamedArg(_, v) => v.clone(),
+                                _ => a.clone(),
+                            });
+                        }
+                    } else {
+                        // Partial application — stop before first hole.
+                        break;
                     }
                 }
             }
         }
-        // If placeholders couldn't be built, drop exprs so apply_function
-        // skips per-arg expression hooks.
+
+        if pack_rest {
+            let mut elem_ty: Option<Ty> = None;
+            for (t, _) in &rest_elems {
+                let t_pruned = apply_ty_prune(&self.subst, t);
+                match &elem_ty {
+                    None => elem_ty = Some(t_pruned),
+                    Some(prev) => {
+                        let prev_pruned = apply_ty_prune(&self.subst, prev);
+                        if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
+                            let _ = self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!(
+                                    "rest argument type mismatch: expected `{}`, found `{}`",
+                                    prev_pruned, t_pruned
+                                ),
+                                range.clone(),
+                                Some(
+                                    "all trailing rest arguments must share the same element type"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+            let rest_ty = if rest_elems.is_empty() {
+                array(element)
+            } else {
+                array_fixed(element, rest_elems.len())
+            };
+            tys.push(rest_ty);
+            // Stand-in for apply_function's expression hooks (array packing
+            // is a codegen concern). Prefer the first rest elem if any.
+            if let Some((_, e)) = rest_elems.first() {
+                exprs.push(e.clone());
+            } else if let Some(a) = args.first() {
+                exprs.push(match a.1.as_ref() {
+                    Expression::NamedArg(_, v) => v.clone(),
+                    _ => a.clone(),
+                });
+            }
+        }
+
         if exprs.len() != tys.len() {
             exprs.clear();
         }
@@ -7646,7 +7862,7 @@ impl Checker {
             | Expression::Module(_, _)
             | Expression::Variable(_, _)
             | Expression::Constant(_, _)
-            | Expression::Argument(_, _)
+            | Expression::Argument(_, _, _)
             | Expression::Field(_, _, _)
             | Expression::ExternBlock { .. }
             | Expression::ExternStruct(_) => {}
@@ -14660,6 +14876,91 @@ test("bad") {
             msgs.iter().any(|m| m.message().contains("Type mismatch")
                 || m.message().contains("mismatch")),
             "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rest_param_packs_trailing_args_as_array() {
+        let (mut c, _) = check(
+            r#"
+fn sum(int... xs) -> int {
+    return len(xs);
+}
+fn main() {
+    let n = sum(1, 2, 3);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.fn_has_rest("sum"));
+        assert_eq!(c.fn_param_names("sum"), Some(&["xs".to_string()][..]));
+    }
+
+    #[test]
+    fn rest_param_empty_call_packs_empty_array() {
+        let (mut c, _) = check(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() { let n = sum(); }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rest_param_must_be_last() {
+        let msgs = assert_messages(
+            r#"
+fn bad(int... xs, int y) -> int { return y; }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("must be the last parameter")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rest_param_cannot_be_named_at_call_site() {
+        let msgs = assert_messages(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() { let n = sum(xs: [1, 2]); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Cannot pass rest parameter")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn named_fixed_then_positional_rest_is_allowed() {
+        let (mut c, _) = check(
+            r#"
+fn f(int a, int... xs) -> int { return a + len(xs); }
+fn main() { let n = f(a: 1, 2, 3); }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }

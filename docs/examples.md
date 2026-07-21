@@ -134,6 +134,28 @@ fn main() {
 
 ---
 
+### `examples/variadic.0s`
+
+**Demonstrates:** Trailing rest parameters (`T... name`) packing into a dynamic array, including an empty rest and named fixed args followed by positional rest.
+
+```0s
+fn sum(int... xs) -> int { /* len + loop */ }
+fn greet(string name, string... extras) -> string { /* concat */ }
+
+fn main() {
+    print "%i", sum(1, 2, 3);           // 6
+    print "%i", sum();                  // 0
+    print "%s", greet(name: "Hi", "!", "?"); // Hi!?
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/variadic.0s` |
+| **Output** | `60Hi!?` |
+
+---
+
 ### `examples/const.0s`
 
 **Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
@@ -1391,6 +1413,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `show_tuple.0s` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.0s` | Basics | `51020` |
 | `named_args.0s` | Basics | `Ada36Grace40` |
+| `variadic.0s` | Basics | `60Hi!?` |
 | `const.0s` | Basics | `42hi` |
 | `for_break.0s` | Basics | `18` |
 | `fizbuz.0s` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |

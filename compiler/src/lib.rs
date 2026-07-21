@@ -897,41 +897,130 @@ impl Compiler {
     ///
     /// Returns references to the *value* expressions (NamedArg wrappers
     /// stripped). Positional-only calls keep source order.
+    ///
+    /// For rest functions (`T... xs`), returns only the fixed prefix —
+    /// use [`emit_call_args_with_rest`] for full packing.
     fn reorder_call_args_for_codegen<'a>(
         &self,
         fn_name: &str,
         args: &'a [Output<'a>],
     ) -> Vec<&'a Output<'a>> {
+        let (fixed, _rest, _pack) = self.split_call_args_for_rest(fn_name, args);
+        fixed
+    }
+
+    /// Split call args into fixed formals + rest elements (P4).
+    ///
+    /// Returns `(fixed, rest_elems, pack_rest)`. When `pack_rest` is true,
+    /// codegen must emit `MakeArray` even if `rest_elems` is empty.
+    fn split_call_args_for_rest<'a>(
+        &self,
+        fn_name: &str,
+        args: &'a [Output<'a>],
+    ) -> (Vec<&'a Output<'a>>, Vec<&'a Output<'a>>, bool) {
         let has_named = args
             .iter()
             .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
-        if !has_named {
-            return args.iter().collect();
+        let has_rest = self.checker.fn_has_rest(fn_name);
+        if !has_named && !has_rest {
+            return (args.iter().collect(), Vec::new(), false);
         }
         let Some(param_names) = self.checker.fn_param_names(fn_name) else {
-            return args.iter().map(Self::call_arg_value).collect();
+            return (
+                args.iter().map(Self::call_arg_value).collect(),
+                Vec::new(),
+                false,
+            );
         };
-        let n = param_names.len();
-        let mut slots: Vec<Option<&'a Output<'a>>> = vec![None; n];
+        let fixed_count = if has_rest {
+            param_names.len().saturating_sub(1)
+        } else {
+            param_names.len()
+        };
+        let rest_name = if has_rest {
+            param_names.get(fixed_count).map(|s| s.as_str())
+        } else {
+            None
+        };
+        let mut slots: Vec<Option<&'a Output<'a>>> = vec![None; fixed_count];
+        let mut rest = Vec::new();
         let mut next_pos = 0usize;
         for arg in args {
             match arg.1.as_ref() {
                 Expression::NamedArg(name, value) => {
-                    if let Some(idx) = param_names.iter().position(|p| p == *name) {
+                    if rest_name == Some(*name) {
+                        continue;
+                    }
+                    if let Some(idx) = param_names[..fixed_count]
+                        .iter()
+                        .position(|p| p == *name)
+                    {
                         slots[idx] = Some(value);
                     }
                 }
                 _ => {
-                    if next_pos < n {
-                        if slots[next_pos].is_none() {
-                            slots[next_pos] = Some(arg);
-                        }
+                    while next_pos < fixed_count && slots[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos < fixed_count {
+                        slots[next_pos] = Some(arg);
+                        next_pos += 1;
+                    } else if has_rest {
+                        rest.push(arg);
+                        next_pos += 1;
+                    } else {
                         next_pos += 1;
                     }
                 }
             }
         }
-        slots.into_iter().flatten().collect()
+        let pack_rest = has_rest
+            && (has_named
+                || next_pos >= fixed_count
+                || args.len() >= fixed_count
+                || fixed_count == 0);
+        let fixed: Vec<_> = slots.into_iter().flatten().collect();
+        if pack_rest {
+            (fixed, rest, true)
+        } else {
+            (fixed, Vec::new(), false)
+        }
+    }
+
+    /// Emit value args for a call, packing rest into `MakeArray` when needed.
+    /// Returns the CALL arity (fixed + 1 if rest packed).
+    fn emit_call_args_with_rest(
+        &mut self,
+        fn_name: &str,
+        args: &[Output<'_>],
+        bytecode: &mut Vec<Byte>,
+        box_generic: bool,
+    ) -> u32 {
+        let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
+
+        for arg in &fixed {
+            self.append_with_existential_pack(bytecode, arg);
+            if box_generic {
+                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                }
+            }
+        }
+        if pack_rest {
+            for arg in &rest {
+                self.append_with_existential_pack(bytecode, arg);
+                if box_generic {
+                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                    }
+                }
+            }
+            bytecode.push(
+                Byte::new(Instruction::MakeArray).with_operand_u32(rest.len() as u32),
+            );
+            return (fixed.len() + 1) as u32;
+        }
+        fixed.len() as u32
     }
 
     fn next_emit_id(&mut self) -> Option<crate::typechecking::id::NodeId> {
@@ -2449,7 +2538,7 @@ impl Compiler {
         let mut overrides = HashMap::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
             for child in children {
-                if let Expression::Argument(ty, name) = child.1.as_ref()
+                if let Expression::Argument(ty, name, _is_rest) = child.1.as_ref()
                     && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
                         ty.1.as_ref()
                     && let Some(concrete) = type_param_tys.get(tp_name)
@@ -4645,17 +4734,18 @@ impl Compiler {
                     if let Some(fqn) = fqn {
                         if let Some(offset) = self.functions.get(&fqn).copied() {
                             // Push receiver first (slot 0), then args
-                            // (reordered when any arg is named).
+                            // (reordered when any arg is named; rest packed).
                             bytecode.append(&mut self.do_compile(recv));
-                            let mut nargs = 0u32;
-                            if let Some(items) = args {
-                                let ordered =
-                                    self.reorder_call_args_for_codegen(&fqn, items);
-                                for arg in ordered {
-                                    self.append_with_existential_pack(&mut bytecode, arg);
-                                    nargs += 1;
-                                }
-                            }
+                            let nargs = if let Some(items) = args {
+                                self.emit_call_args_with_rest(
+                                    &fqn,
+                                    items,
+                                    &mut bytecode,
+                                    false,
+                                )
+                            } else {
+                                0
+                            };
                             bytecode.push(
                                 Byte::new(Instruction::CALL)
                                     .with_call_packed(1 + nargs, offset as u32),
@@ -4811,20 +4901,13 @@ impl Compiler {
                         // If the callee is a generic function, box each concrete arg
                         // at the call boundary (concrete→generic).
                         let is_generic = self.checker.is_generic_fn(&n) && mono_offset.is_none();
-                        let ordered_args: Vec<&Output> = args
-                            .as_ref()
-                            .map(|items| self.reorder_call_args_for_codegen(&n, items))
-                            .unwrap_or_default();
-                        for arg in &ordered_args {
-                            self.append_with_existential_pack(&mut bytecode, arg);
-                            if is_generic {
-                                // Reuse the original HM result. Re-running inference here
-                                // would occur after the function scope has been popped.
-                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                }
-                            }
-                        }
+                        let arg_slice = args.as_deref().unwrap_or(&[]);
+                        let value_arity = self.emit_call_args_with_rest(
+                            &n,
+                            arg_slice,
+                            &mut bytecode,
+                            is_generic,
+                        );
 
                         // ── Dictionary-passing calling convention ──────────────────
                         // For non-monomorphized generic calls, append one dict tuple
@@ -4835,7 +4918,8 @@ impl Compiler {
                         // from the shared body, but Show-bound calls always take
                         // this path.
                         let dict_count = if is_generic {
-                            let call_arg_tys: Vec<crate::typechecking::Ty> = ordered_args
+                            let (fixed, _, _) = self.split_call_args_for_rest(&n, arg_slice);
+                            let call_arg_tys: Vec<crate::typechecking::Ty> = fixed
                                 .iter()
                                 .map(|arg| {
                                     self.codegen_expr_ty(arg).expect(
@@ -4876,7 +4960,7 @@ impl Compiler {
                             0
                         };
 
-                        let arity = ordered_args.len() as u32 + dict_count as u32;
+                        let arity = value_arity + dict_count as u32;
                         if is_instance_method_fqn(&self.checker, &n) {
                             Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
                         } else if self.coroutine_fns.contains(&n) {
@@ -4978,7 +5062,7 @@ impl Compiler {
                     }
                 } // end non-method Call
             }
-            Expression::Argument(ty, n) => {
+            Expression::Argument(ty, n, _is_rest) => {
                 let _ = self.context.variables.intern(n.to_string());
                 if matches!(ty.1.as_ref(), Expression::Forall { .. }) {
                     self.polyfn_vars.insert(n.to_string());
@@ -5795,7 +5879,7 @@ impl Compiler {
                     let mut arg_type_tags: Vec<u32> = Vec::new();
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
-                            if let Expression::Argument(type_expr, _param_name) = arg.1.as_ref() {
+                            if let Expression::Argument(type_expr, _param_name, _) = arg.1.as_ref() {
                                 if let Some((tag, aux)) =
                                     ffi_type_tag_from_output(&self.checker, type_expr)
                                 {

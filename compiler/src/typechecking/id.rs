@@ -69,7 +69,7 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Module(_, _)
         | Expression::Variable(_, _)
         | Expression::Constant(_, _)
-        | Expression::Argument(_, _)
+        | Expression::Argument(_, _, _)
         | Expression::Field(_, _, _) => {}
 
         Expression::LetDestructure { rhs, .. } => pre_walk(rhs, table),

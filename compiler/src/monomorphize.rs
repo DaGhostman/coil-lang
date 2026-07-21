@@ -143,7 +143,7 @@ fn signature_from_function(type_params: &[TypeParam<'_>], args: &Output) -> Gene
     let mut param_type_params = Vec::new();
     if let Expression::Fragment(children) = args.1.as_ref() {
         for child in children {
-            if let Expression::Argument(ty, _) = child.1.as_ref() {
+            if let Expression::Argument(ty, _, _) = child.1.as_ref() {
                 param_type_params.push(type_param_ref_index(ty, &type_param_names));
             }
         }
@@ -588,7 +588,7 @@ where
         | Expression::Continue
         | Expression::Variable(_, _)
         | Expression::Constant(_, _)
-        | Expression::Argument(_, _)
+        | Expression::Argument(_, _, _)
         | Expression::Field(_, _, _)
         | Expression::ExternBlock { .. }
         | Expression::ExternStruct(_)

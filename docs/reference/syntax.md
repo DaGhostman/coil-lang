@@ -66,8 +66,14 @@ kind            ::= '*' | 'Constraint' | kind '->' kind | '(' kind ')'
 class_bound     ::= IDENT
 where_clause    ::= 'where' where_constraint (',' where_constraint)*
 where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
-arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
+arg_list      ::= '(' (arg (',' arg)*)? ')'
+arg           ::= type_annotation '...'? IDENT   // trailing `T... name` is rest → `[T]`
 ```
+
+Call sites may use named arguments (`name: expr`) after any positional
+prefix. Rest parameters are positional-only and pack trailing values
+into one array (including empty). Call-site spread (`f(...xs)`) is not
+supported yet.
 
 Examples:
 
@@ -76,6 +82,9 @@ fn add(int a, int b) -> int { return a + b; }
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn greet() { print "hi"; }
+fn sum(int... xs) -> int { return len(xs); }
+sum(1, 2, 3);   // xs == [1, 2, 3]
+sum();          // xs == []
 ```
 
 ### Traits and impl
@@ -462,7 +471,7 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| Named call args, `Type... rest`, `let (a, b) = …` | **Planned** — [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md) |
+| Call-site spread (`f(...xs)`) | **Deferred** — [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md) |
 
 ### Ranges (lazy)
 

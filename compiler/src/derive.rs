@@ -326,7 +326,7 @@ fn method_fn<'a>(
 }
 
 fn arg<'a>(span: SimpleSpan, ty: &'a str, name: &'a str) -> Output<'a> {
-    at(span, Expression::Argument(ty_name(span, ty), name))
+    at(span, Expression::Argument(ty_name(span, ty), name, false))
 }
 
 fn typeclass_impl<'a>(

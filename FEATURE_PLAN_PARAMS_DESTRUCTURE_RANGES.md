@@ -1,6 +1,6 @@
 # Feature plan — variadics, named params, let-destructuring, ranges
 
-Status: **syntax locked** (2026-07-21) — ready for phased implementation.
+Status: **implemented** (P1 let-destructure, P2 named args, P3 ranges, P4 rest) — call-site spread still deferred.
 
 This plan covers four related ergonomics features. Decisions below
 reflect user confirmation; see [Locked decisions](#locked-decisions).

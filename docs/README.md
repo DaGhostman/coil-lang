@@ -40,6 +40,8 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; no partial named calls) |
+| Rest parameters (`T... xs`) | Supported (trailing only; packs to `[T]`; no call-site `...xs` spread) |
+| Let destructuring (`let (a, b) = …`, `let { x, y } = …`) | Supported (tuple / record; no enum ctor patterns in `let`) |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
 | Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |

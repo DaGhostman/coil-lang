@@ -654,10 +654,22 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        let arg = self
+        // `T... name` (rest) or `T name` (fixed). Rest must be last —
+        // enforced in the typechecker.
+        let rest_arg = self
+            .type_annotation()
+            .then_ignore(just("...").padded())
+            .then(text::ident().padded())
+            .map_with(|(ty, name), e| {
+                (e.span(), Box::new(Expression::Argument(ty, name, true)))
+            });
+        let fixed_arg = self
             .type_annotation()
             .then(text::ident().padded())
-            .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
+            .map_with(|(ty, name), e| {
+                (e.span(), Box::new(Expression::Argument(ty, name, false)))
+            });
+        let arg = rest_arg.or(fixed_arg);
 
         arg.separated_by(op!(','))
             .allow_trailing()
@@ -3239,6 +3251,32 @@ mod tests {
             matches!(inner, Expression::Float(_)),
             "expected Float(1.0), got {:?}",
             inner
+        );
+    }
+
+    #[test]
+    fn rest_param_parses_in_arg_list() {
+        let src = "fn sum(int... xs) -> int { return 0; }";
+        let ast = Pratt::default().parse(src).expect("parse");
+        let func = match ast.1.as_ref() {
+            Expression::Program(items) => items[0].1.as_ref(),
+            other => other,
+        };
+        let found = match func {
+            Expression::Function { args, .. } => match args.1.as_ref() {
+                Expression::Fragment(items) => {
+                    matches!(items[0].1.as_ref(), Expression::Argument(_, "xs", true))
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(found, "expected Argument(..., xs, true) in arg list");
+        // Display round-trip for the rest form.
+        assert!(
+            format!("{}", func).contains("int... xs"),
+            "display should show rest syntax, got {}",
+            func
         );
     }
 
