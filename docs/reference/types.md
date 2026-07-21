@@ -405,6 +405,7 @@ Call-site strategy:
 | Situation | Runtime |
 |-----------|---------|
 | Ground call with only **builtin** bounds (`Num`/`Add`/…/`Ord`/`Lt`/…/`Eq`/`Show`) | May **monomorphize** into a specialized clone (unboxed `ADD`, etc.) |
+| Ground call with named args and/or rest packs (`T...`) under the same builtin bounds | Same monomorphization path — args are reordered/packed to match formals before keying |
 | Shared body / open type params with any bound | **Dictionary passing** — see below |
 | Ground or shared call with user trait bounds | **Dictionary passing** — see below |
 | Escaped generic fn value (`let f = id;`) | `MakePolyFn` / `MakePolyFnCapture` + `CallIndirect` |

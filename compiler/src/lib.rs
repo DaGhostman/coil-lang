@@ -63,22 +63,63 @@ fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u3
 
 /// Fallback FFI tag from a call-site expression when the typechecker did not
 /// record tags (recovery / missing side-table entry).
-fn ffi_tag_for_expr_fallback(expr: &Output) -> (u32, u32) {
+///
+/// Returns `None` for unknown shapes — callers must not invent `INT` and
+/// silently mis-promote; prefer skipping the variadic tag tuple or emitting
+/// a diagnostic instead.
+fn ffi_tag_for_expr_fallback(expr: &Output) -> Option<(u32, u32)> {
     use common::tag;
     match expr.1.as_ref() {
-        Expression::Float(_) => (tag::FLOAT, 0),
-        Expression::String(_) => (tag::STRING, 0),
-        Expression::Bool(_) => (tag::BOOL, 0),
-        Expression::Integer(_) => (tag::INT, 0),
+        Expression::Float(_) => Some((tag::FLOAT, 0)),
+        Expression::String(_) => Some((tag::STRING, 0)),
+        Expression::Bool(_) => Some((tag::BOOL, 0)),
+        Expression::Integer(_) => Some((tag::INT, 0)),
         Expression::Expr(inner) | Expression::Group(inner) | Expression::Statement(inner) => {
             ffi_tag_for_expr_fallback(inner)
         }
-        _ => (tag::INT, 0),
+        _ => None,
     }
 }
 
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
+}
+
+/// Resolve variadic FFI arg tags from the typechecker side-table, falling back
+/// to literal shapes only. Unknown expressions yield no tags (and a diagnostic)
+/// rather than silently promoting as `INT`.
+fn resolve_variadic_ffi_tags(
+    checker: &Checker,
+    span: (usize, usize),
+    args: &[&Output<'_>],
+    messages: &mut Vec<Message>,
+) -> Option<Vec<(u32, u32)>> {
+    if let Some(tags) = checker.variadic_arg_tags_at(span) {
+        return Some(tags.to_vec());
+    }
+    let mut tags = Vec::with_capacity(args.len());
+    for arg in args {
+        match ffi_tag_for_expr_fallback(arg) {
+            Some(t) => tags.push(t),
+            None => {
+                let range = arg.0.start..arg.0.end;
+                let mut m = Message::error(
+                    ErrorCode::GenericTypeError,
+                    "cannot determine FFI type tag for variadic argument".into(),
+                    range.clone(),
+                );
+                m.push(DiagLabel::new(
+                    "variadic FFI arg tags missing from typechecker; \
+                     use a literal or ensure the call is typechecked"
+                        .to_string(),
+                    range,
+                ));
+                messages.push(m);
+                return None;
+            }
+        }
+    }
+    Some(tags)
 }
 
 fn is_instance_method_fqn(checker: &Checker, name: &str) -> bool {
@@ -1573,22 +1614,20 @@ impl Compiler {
 
         let mut operand = arity & 0xFFFF;
         if variadic {
-            let tags = self
-                .checker
-                .variadic_arg_tags_at((span.start, span.end))
-                .map(|t| t.to_vec())
-                .unwrap_or_else(|| {
-                    tuple_elements
-                        .iter()
-                        .map(|e| ffi_tag_for_expr_fallback(e))
-                        .collect()
-                });
-            for &(tag, aux) in &tags {
-                emit_ffi_type_const(&mut self.bytecode, tag, aux);
+            let args: Vec<_> = tuple_elements.iter().collect();
+            if let Some(tags) = resolve_variadic_ffi_tags(
+                &self.checker,
+                (span.start, span.end),
+                &args,
+                &mut self.messages,
+            ) {
+                for &(tag, aux) in &tags {
+                    emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                }
+                self.bytecode
+                    .push(Byte::new(Instruction::MakeTuple).with_operand_u32(tags.len() as u32));
+                operand |= 1 << 16;
             }
-            self.bytecode
-                .push(Byte::new(Instruction::MakeTuple).with_operand_u32(tags.len() as u32));
-            operand |= 1 << 16;
         }
 
         self.bytecode
@@ -5066,28 +5105,23 @@ impl Compiler {
                         let mut operand = arity as u32 & 0xFFFF;
                         if variadic {
                             let call_span = (span.start, span.end);
-                            let tags = self
-                                .checker
-                                .variadic_arg_tags_at(call_span)
-                                .map(|t| t.to_vec())
-                                .unwrap_or_else(|| {
-                                    args.as_ref()
-                                        .map(|items| {
-                                            items
-                                                .iter()
-                                                .map(|e| ffi_tag_for_expr_fallback(e))
-                                                .collect()
-                                        })
-                                        .unwrap_or_default()
-                                });
-                            for &(tag, aux) in &tags {
-                                emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                            let arg_refs: Vec<_> =
+                                args.as_ref().map(|items| items.iter().collect()).unwrap_or_default();
+                            if let Some(tags) = resolve_variadic_ffi_tags(
+                                &self.checker,
+                                call_span,
+                                &arg_refs,
+                                &mut self.messages,
+                            ) {
+                                for &(tag, aux) in &tags {
+                                    emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                                }
+                                self.bytecode.push(
+                                    Byte::new(Instruction::MakeTuple)
+                                        .with_operand_u32(tags.len() as u32),
+                                );
+                                operand |= 1 << 16;
                             }
-                            self.bytecode.push(
-                                Byte::new(Instruction::MakeTuple)
-                                    .with_operand_u32(tags.len() as u32),
-                            );
-                            operand |= 1 << 16;
                         }
                         self.bytecode
                             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));

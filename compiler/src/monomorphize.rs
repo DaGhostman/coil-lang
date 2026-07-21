@@ -227,14 +227,6 @@ fn candidate_for_call(
     }
 
     let args = args.unwrap_or(&[]);
-    // Named call args need the same reorder/pack as codegen; skip for MVP.
-    if args
-        .iter()
-        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)))
-    {
-        return None;
-    }
-
     let has_rest = sig.param_is_rest.last().copied().unwrap_or(false);
     let fixed_count = if has_rest {
         sig.param_type_params.len().saturating_sub(1)
@@ -242,11 +234,16 @@ fn candidate_for_call(
         sig.param_type_params.len()
     };
 
+    // Reorder/pack like codegen (`split_call_args_for_rest`) so named calls
+    // (`add(b: 2, a: 1)`) and rest packs share the same mono key.
+    let (fixed_args, rest_args, pack_rest) =
+        split_call_args_for_mono(fn_name, args, checker, has_rest, fixed_count)?;
+
     if !has_rest {
-        if args.len() != sig.param_type_params.len() {
+        if fixed_args.len() != sig.param_type_params.len() {
             return None;
         }
-    } else if args.len() < fixed_count {
+    } else if fixed_args.len() < fixed_count {
         return None;
     }
 
@@ -264,33 +261,27 @@ fn candidate_for_call(
         Some(())
     };
 
-    if !has_rest {
-        for (arg, tp_idx) in args.iter().zip(sig.param_type_params.iter()) {
-            let arg_ty = ground_type_name(checker, arg)?;
-            bind(&mut subst, *tp_idx, &arg_ty)?;
-            arg_types.push(arg_ty);
-        }
+    let fixed_tps = if has_rest {
+        &sig.param_type_params[..fixed_count]
     } else {
-        let (fixed_args, rest_args) = args.split_at(fixed_count);
-        for (arg, tp_idx) in fixed_args
-            .iter()
-            .zip(sig.param_type_params.iter().take(fixed_count))
-        {
-            let arg_ty = ground_type_name(checker, arg)?;
-            bind(&mut subst, *tp_idx, &arg_ty)?;
-            arg_types.push(arg_ty);
-        }
+        sig.param_type_params.as_slice()
+    };
+    for (arg, tp_idx) in fixed_args.iter().zip(fixed_tps.iter()) {
+        let arg_ty = ground_type_name(checker, arg)?;
+        bind(&mut subst, *tp_idx, &arg_ty)?;
+        arg_types.push(arg_ty);
+    }
 
+    if pack_rest {
         // One key slot per rest formal: the *element* ground type (not the
         // packed `[T]` / `[T; N]`), matching `mono_call_offset`.
         let rest_tp = sig.param_type_params.get(fixed_count).copied().flatten();
         if rest_args.is_empty() {
-            // Empty rest: T must already be pinned by a fixed formal.
             let elem = rest_tp.and_then(|i| subst[i].clone())?;
             arg_types.push(elem);
         } else {
             let mut elem_ty: Option<String> = None;
-            for arg in rest_args {
+            for arg in &rest_args {
                 let t = ground_type_name(checker, arg)?;
                 match &elem_ty {
                     None => elem_ty = Some(t.clone()),
@@ -301,6 +292,9 @@ fn candidate_for_call(
             }
             arg_types.push(elem_ty?);
         }
+    } else if has_rest {
+        // Declares rest but call did not pack — not a mono candidate.
+        return None;
     }
 
     let subst = subst.into_iter().collect::<Option<Vec<_>>>()?;
@@ -311,6 +305,72 @@ fn candidate_for_call(
         },
         arg_types,
     })
+}
+
+/// Mirror of codegen `split_call_args_for_rest` for mono planning.
+fn split_call_args_for_mono<'a>(
+    fn_name: &str,
+    args: &'a [Output<'a>],
+    checker: &Checker,
+    has_rest: bool,
+    fixed_count: usize,
+) -> Option<(Vec<&'a Output<'a>>, Vec<&'a Output<'a>>, bool)> {
+    let has_named = args
+        .iter()
+        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+    if !has_named && !has_rest {
+        return Some((args.iter().collect(), Vec::new(), false));
+    }
+    let param_names = checker.fn_param_names(fn_name)?;
+    let rest_name = if has_rest {
+        param_names.get(fixed_count).map(|s| s.as_str())
+    } else {
+        None
+    };
+    let mut slots: Vec<Option<&'a Output<'a>>> = vec![None; fixed_count];
+    let mut rest = Vec::new();
+    let mut next_pos = 0usize;
+    for arg in args {
+        match arg.1.as_ref() {
+            Expression::NamedArg(name, value) => {
+                if rest_name == Some(*name) {
+                    rest.push(value);
+                    continue;
+                }
+                if let Some(idx) = param_names[..fixed_count]
+                    .iter()
+                    .position(|p| p == *name)
+                {
+                    slots[idx] = Some(value);
+                }
+            }
+            _ => {
+                while next_pos < fixed_count && slots[next_pos].is_some() {
+                    next_pos += 1;
+                }
+                if next_pos < fixed_count {
+                    slots[next_pos] = Some(arg);
+                    next_pos += 1;
+                } else if has_rest {
+                    rest.push(arg);
+                    next_pos += 1;
+                } else {
+                    next_pos += 1;
+                }
+            }
+        }
+    }
+    let pack_rest = has_rest
+        && (has_named
+            || next_pos >= fixed_count
+            || args.len() >= fixed_count
+            || fixed_count == 0);
+    let fixed: Vec<_> = slots.into_iter().flatten().collect();
+    if pack_rest {
+        Some((fixed, rest, true))
+    } else {
+        Some((fixed, Vec::new(), false))
+    }
 }
 
 pub fn ground_type_name(checker: &Checker, expr: &Output) -> Option<String> {
@@ -699,6 +759,17 @@ mod tests {
         assert_eq!(plan.specializations[0].key.fn_name, "twice_first");
         assert_eq!(plan.specializations[0].key.subst, vec!["int"]);
         assert_eq!(plan.specializations[0].arg_types, vec!["int"]);
+    }
+
+    #[test]
+    fn plans_named_arg_ground_bounded_generic_call() {
+        let plan = plan(
+            "fn add<T: Num>(T a, T b) -> T { return a + b; } \
+             fn main() { print \"%i\", add(b: 2, a: 1); }",
+        );
+        assert_eq!(plan.specializations.len(), 1);
+        assert_eq!(plan.specializations[0].key.subst, vec!["int"]);
+        assert_eq!(plan.specializations[0].arg_types, vec!["int", "int"]);
     }
 
     #[test]
