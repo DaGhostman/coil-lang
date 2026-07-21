@@ -462,7 +462,24 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| `for x in` over ranges (`0..n`) | Not implemented — use C-style `for` or an array |
+| Range operators `a..b` / `a..=b` | **Planned** — see below |
+| Named call args, `Type... rest`, `let (a, b) = …` | **Planned** — [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md) |
+
+### Planned: ranges (lazy)
+
+Half-open `start..end` and closed `start..=end`, with element type
+**`int` or `byte`** (both bounds the same). A range is a **lazy**
+iterable: `for x in 0..n` pulls one value at a time and does **not**
+allocate an array of length `n`.
+
+Until this lands, use C-style `for`, an array, a coroutine, or a user
+`Iterator` (see `examples/for_in_custom.0s`).
+
+**Deferred (not part of the initial range feature):** turning a range
+into a concrete array (e.g. a future `collect(0..5)` → `[0, 1, 2, 3, 4]`).
+That would be an explicit helper later; `0..n` itself stays lazy.
+
+Full design lock-in: [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md).
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 

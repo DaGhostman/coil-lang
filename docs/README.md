@@ -52,6 +52,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
 | `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, coroutines, user `impl`s) |
+| Ranges (`a..b` / `a..=b`) | **Planned** — lazy `int`/`byte` only; no auto array materialize ([syntax](reference/syntax.md#planned-ranges-lazy)) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
