@@ -117,6 +117,8 @@ struct PendingFfiInvoke {
     lib_addr: u64,
     function_id: usize,
     args: Vec<Value>,
+    /// Per-arg FFI type tags for variadic calls (`None` when fixed-arity).
+    arg_types: Option<Vec<crate::memory::FfiType>>,
     resume_ip: usize,
     resume_sp: usize,
 }
@@ -899,6 +901,7 @@ impl<const S: usize> Machine<S> {
                         &registered.prepared,
                         &ffi_sig,
                         &args,
+                        pending.arg_types.as_deref(),
                         &mut ctx,
                         &mut closure_ptrs,
                     )
@@ -1525,8 +1528,27 @@ impl<const S: usize> Machine<S> {
                 Instruction::FfiInvoke => {
                     let raw = opcode.operand_u32();
                     let _arity = (raw & 0xFFFF) as usize;
+                    let has_arg_tags = (raw & (1 << 16)) != 0;
 
-                    // Stack (bottom → top): lib, fn_id, args_tuple.
+                    // Stack (bottom → top): lib, fn_id, args_tuple [, tags_tuple].
+                    let arg_types = if has_arg_tags {
+                        let tags_val = self.stack.pop();
+                        let tags_addr = tags_val.raw() as u64;
+                        let tags: Vec<crate::memory::FfiType> =
+                            match Self::find_object_by_addr(&self.heap, tags_addr) {
+                                Some(crate::memory::Object::Tuple(gc)) => gc
+                                    .as_ref()
+                                    .elements
+                                    .iter()
+                                    .map(|v| Self::ffi_type_from_value(v, &self.heap))
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                        Some(tags)
+                    } else {
+                        None
+                    };
+
                     let tuple_val = self.stack.pop();
                     let tuple_addr = tuple_val.raw() as u64;
 
@@ -1546,6 +1568,7 @@ impl<const S: usize> Machine<S> {
                         lib_addr,
                         function_id,
                         args,
+                        arg_types,
                         resume_ip: ip,
                         resume_sp: sp,
                     });
@@ -1554,6 +1577,7 @@ impl<const S: usize> Machine<S> {
                 Instruction::DeclareFFI => {
                     let raw = opcode.operand_u32();
                     let _arity = (raw & 0xFFFF) as usize;
+                    let variadic = (raw & (1 << 16)) != 0;
 
                     // Stack (bottom → top): lib, name, args_tuple, ret_tag.
                     let ret_tag_val = self.stack.pop();
@@ -1587,6 +1611,7 @@ impl<const S: usize> Machine<S> {
                                 name,
                                 args: arg_types,
                                 ret: ret_type,
+                                variadic,
                             };
                             match Self::register_signature_on_object(
                                 &mut owned,
@@ -4042,7 +4067,7 @@ mod tests {
         let args = [Value::from(cb_ptr as u64), Value::from(21_i64)];
         let mut ctx = InvokeContext::new(&mut vm.heap as *mut Heap, &vm.struct_layouts);
         let mut closure_ptrs = Vec::new();
-        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closure_ptrs)
+        let ret = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closure_ptrs)
             .unwrap()
             .unwrap();
         assert_eq!(ret.as_int(), 42);

@@ -84,12 +84,48 @@ pub fn prepare_cif(sig: &FfiSignature, layouts: &[CStructLayout]) -> Result<Prep
     })
 }
 
+/// Prepare a per-invoke CIF for a C varargs call (`ffi_prep_cif_var`).
+pub fn prepare_variadic_cif(
+    arg_types: &[FfiType],
+    nfixed: usize,
+    ret: FfiType,
+    layouts: &[CStructLayout],
+) -> Result<Cif, FfiError> {
+    if nfixed > arg_types.len() {
+        return Err(FfiError::ArityMismatch {
+            expected: nfixed,
+            got: arg_types.len(),
+        });
+    }
+    let libffi_args: Result<Vec<Type>, FfiError> = arg_types
+        .iter()
+        .copied()
+        .map(|t| ffi_type_to_libffi(t, layouts))
+        .collect();
+    let ret_type = ffi_type_to_libffi(ret, layouts)?;
+    Ok(Cif::new_variadic(libffi_args?, nfixed, ret_type))
+}
+
+/// Default C argument promotions for the `...` region.
+pub fn promote_variadic_arg_type(ty: FfiType) -> FfiType {
+    match ty {
+        FfiType::Bool | FfiType::Int8 | FfiType::Int16 | FfiType::UInt8 | FfiType::UInt16 => {
+            FfiType::Int
+        }
+        // Float is already f64 in our ABI mapping (matches `float` → `double` promotion).
+        other => other,
+    }
+}
+
 pub fn prepare_cif_for_symbol(
     sig: &FfiSignature,
     library: &libloading::Library,
     symbol: &str,
     layouts: &[CStructLayout],
 ) -> Result<PreparedCall, FfiError> {
+    // Variadic: resolve symbol now; CIF is rebuilt per invoke. We still
+    // prepare a fixed-prefix CIF as a placeholder so `PreparedCall` stays
+    // uniform (call path ignores it when `sig.variadic`).
     let mut prepared = prepare_cif(sig, layouts)?;
     prepared.addr = resolve_symbol(library, symbol)?;
     Ok(prepared)
@@ -316,15 +352,60 @@ pub fn invoke_via_libffi(
     prepared: &PreparedCall,
     sig: &FfiSignature,
     args: &[Value],
+    // Full per-arg FFI types for variadic calls (length == `args.len()`),
+    // before default promotions on the `...` tail. Ignored when not variadic.
+    variadic_arg_types: Option<&[FfiType]>,
     ctx: &mut InvokeContext,
     _callback_closures: &mut Vec<*mut c_void>,
 ) -> Result<Option<Value>, FfiError> {
-    if args.len() != sig.arity() {
-        return Err(FfiError::ArityMismatch {
-            expected: sig.arity(),
-            got: args.len(),
-        });
-    }
+    let nfixed = sig.arity();
+    let effective_types: Vec<FfiType> = if sig.variadic {
+        if args.len() < nfixed {
+            return Err(FfiError::ArityMismatch {
+                expected: nfixed,
+                got: args.len(),
+            });
+        }
+        let tags = variadic_arg_types.ok_or_else(|| {
+            FfiError::Unsupported(
+                "variadic FFI invoke requires per-argument type tags".into(),
+            )
+        })?;
+        if tags.len() != args.len() {
+            return Err(FfiError::ArityMismatch {
+                expected: args.len(),
+                got: tags.len(),
+            });
+        }
+        tags.iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                if i < nfixed {
+                    // Prefer the declared fixed type when present.
+                    sig.args.get(i).copied().unwrap_or(*ty)
+                } else {
+                    promote_variadic_arg_type(*ty)
+                }
+            })
+            .collect()
+    } else {
+        if args.len() != nfixed {
+            return Err(FfiError::ArityMismatch {
+                expected: nfixed,
+                got: args.len(),
+            });
+        }
+        sig.args.clone()
+    };
+
+    // For variadic calls, build a fresh CIF; fixed-arity uses the declare-time CIF.
+    let variadic_cif;
+    let cif: &Cif = if sig.variadic {
+        variadic_cif = prepare_variadic_cif(&effective_types, nfixed, sig.ret, ctx.layouts())?;
+        &variadic_cif
+    } else {
+        &prepared.cif
+    };
 
     // libffi 5's `Arg<'arg>` borrows the marshalling storage, so we cannot
     // push into a Vec while an Arg still holds a reference into it. Phase 1
@@ -356,9 +437,9 @@ pub fn invoke_via_libffi(
     let mut array_buffers: Vec<Vec<i64>> = Vec::new();
     let mut array_copy_back: Vec<(u64, usize)> = Vec::new();
     let mut struct_bufs: Vec<Vec<u8>> = Vec::new();
-    let mut slots: Vec<ArgSlot> = Vec::with_capacity(sig.arity());
+    let mut slots: Vec<ArgSlot> = Vec::with_capacity(effective_types.len());
 
-    for (i, (ty, value)) in sig.args.iter().zip(args.iter()).enumerate() {
+    for (i, (ty, value)) in effective_types.iter().zip(args.iter()).enumerate() {
         match ty {
             FfiType::Int => {
                 slots.push(ArgSlot::I64(i64_storage.len()));
@@ -460,33 +541,33 @@ pub fn invoke_via_libffi(
     match sig.ret {
         FfiType::Void => {
             unsafe {
-                prepared.cif.call::<()>(prepared.addr, &ffi_args);
+                cif.call::<()>(prepared.addr, &ffi_args);
             }
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(None)
         }
         FfiType::Int | FfiType::Int32 | FfiType::Int16 | FfiType::Int8 => {
-            let ret = unsafe { prepared.cif.call::<i64>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<i64>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret)))
         }
         FfiType::UInt8 | FfiType::UInt16 | FfiType::UInt32 | FfiType::UInt64 => {
-            let ret = unsafe { prepared.cif.call::<u64>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<u64>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret as i64)))
         }
         FfiType::Float => {
-            let ret = unsafe { prepared.cif.call::<f64>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<f64>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret)))
         }
         FfiType::Bool => {
-            let ret = unsafe { prepared.cif.call::<u8>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<u8>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret != 0)))
         }
         FfiType::String => {
-            let ret = unsafe { prepared.cif.call::<*mut c_char>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<*mut c_char>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             if ret.is_null() {
                 Ok(Some(Value::from(0u64)))
@@ -500,7 +581,7 @@ pub fn invoke_via_libffi(
             }
         }
         FfiType::Ptr => {
-            let ret = unsafe { prepared.cif.call::<*mut c_void>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<*mut c_void>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret as u64)))
         }
@@ -508,7 +589,7 @@ pub fn invoke_via_libffi(
         // requires a host/`declare` of the pointed-to symbol; no trampoline
         // is built from a returned callback address in this phase.
         FfiType::Callback(_) => {
-            let ret = unsafe { prepared.cif.call::<*mut c_void>(prepared.addr, &ffi_args) };
+            let ret = unsafe { cif.call::<*mut c_void>(prepared.addr, &ffi_args) };
             copy_array_buffers_back(ctx.heap(), &array_copy_back, &array_buffers);
             Ok(Some(Value::from(ret as u64)))
         }
@@ -524,7 +605,7 @@ pub fn invoke_via_libffi(
             let mut ret_buf = vec![0u8; buf_len];
             unsafe {
                 libffi::raw::ffi_call(
-                    prepared.cif.as_raw_ptr(),
+                    cif.as_raw_ptr(),
                     Some(*prepared.addr.as_safe_fun()),
                     ret_buf.as_mut_ptr() as *mut c_void,
                     ffi_args.as_ptr() as *mut *mut c_void,
@@ -541,6 +622,7 @@ pub fn invoke_via_libffi(
 mod tests {
     use super::*;
     use crate::ffi::load_library;
+    use crate::ffi::FfiSignatureBuilder;
 
     extern "C" fn add_two(a: i64, b: i64) -> i64 {
         a + b
@@ -563,7 +645,7 @@ mod tests {
         let args = [Value::from(40_i64), Value::from(2_i64)];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closures)
+        let ret = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures)
             .unwrap()
             .unwrap();
         assert_eq!(ret.as_int(), 42);
@@ -583,7 +665,7 @@ mod tests {
         let args = [Value::from(3_i64)];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closures).unwrap();
+        let ret = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures).unwrap();
         assert!(ret.is_none());
         assert_eq!(HITS.load(Ordering::SeqCst), 3);
     }
@@ -602,7 +684,7 @@ mod tests {
         let args = [Value::from(2.5_f64), Value::from(4.0_f64)];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closures)
+        let ret = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures)
             .unwrap()
             .unwrap();
         assert!((ret.as_float() - 10.0).abs() < f64::EPSILON);
@@ -633,7 +715,7 @@ mod tests {
         let args = [Value::from(obj.addr())];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closures)
+        let ret = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures)
             .unwrap()
             .unwrap();
         assert_eq!(ret.as_int(), 5);
@@ -678,7 +760,7 @@ mod tests {
         ];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let ret = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closures)
+        let ret = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures)
             .unwrap()
             .unwrap();
         assert_eq!(ret.as_int(), 42);
@@ -720,7 +802,7 @@ mod tests {
         let args = [Value::from(1_i64)];
         let mut ctx = InvokeContext::new(&mut heap, &[]);
         let mut closures = Vec::new();
-        let err = invoke_via_libffi(&prepared, &sig, &args, &mut ctx, &mut closures).unwrap_err();
+        let err = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures).unwrap_err();
         assert!(matches!(
             err,
             FfiError::ArityMismatch {
@@ -728,5 +810,130 @@ mod tests {
                 got: 1
             }
         ));
+    }
+
+    #[test]
+    fn promote_variadic_arg_type_widens_narrow_ints() {
+        assert_eq!(promote_variadic_arg_type(FfiType::Bool), FfiType::Int);
+        assert_eq!(promote_variadic_arg_type(FfiType::Int8), FfiType::Int);
+        assert_eq!(promote_variadic_arg_type(FfiType::Int16), FfiType::Int);
+        assert_eq!(promote_variadic_arg_type(FfiType::UInt8), FfiType::Int);
+        assert_eq!(promote_variadic_arg_type(FfiType::UInt16), FfiType::Int);
+        assert_eq!(promote_variadic_arg_type(FfiType::Float), FfiType::Float);
+        assert_eq!(promote_variadic_arg_type(FfiType::String), FfiType::String);
+        assert_eq!(promote_variadic_arg_type(FfiType::Int), FfiType::Int);
+    }
+
+    #[test]
+    fn variadic_invoke_requires_at_least_nfixed_args() {
+        let sig = FfiSignatureBuilder::new("printf")
+            .arg(FfiType::String)
+            .ret(FfiType::Int)
+            .variadic()
+            .build()
+            .unwrap();
+        let mut prepared = prepare_cif(&sig, &[]).unwrap();
+        prepared.addr = CodePtr::from_ptr(add_two as *mut c_void);
+        let mut heap = Heap::default();
+        let args: [Value; 0] = [];
+        let mut ctx = InvokeContext::new(&mut heap, &[]);
+        let mut closures = Vec::new();
+        let err = invoke_via_libffi(&prepared, &sig, &args, Some(&[]), &mut ctx, &mut closures)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FfiError::ArityMismatch {
+                expected: 1,
+                got: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn variadic_invoke_requires_type_tags() {
+        let sig = FfiSignatureBuilder::new("printf")
+            .arg(FfiType::String)
+            .ret(FfiType::Int)
+            .variadic()
+            .build()
+            .unwrap();
+        let mut prepared = prepare_cif(&sig, &[]).unwrap();
+        prepared.addr = CodePtr::from_ptr(add_two as *mut c_void);
+        let mut heap = Heap::default();
+        let (obj, _gc) = heap.alloc(ObjString::from("hi"), Object::String);
+        let args = [Value::from(obj.addr())];
+        let mut ctx = InvokeContext::new(&mut heap, &[]);
+        let mut closures = Vec::new();
+        let err = invoke_via_libffi(&prepared, &sig, &args, None, &mut ctx, &mut closures)
+            .unwrap_err();
+        assert!(matches!(err, FfiError::Unsupported(_)));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn variadic_invoke_libc_snprintf_formats_int() {
+        use std::ffi::CStr;
+
+        let lib = match crate::ffi::resolve_library("c", None, &[]) {
+            Ok(l) => l,
+            Err(_) => {
+                if std::env::var_os("CI").is_some() {
+                    panic!("FFI soft-skip forbidden in CI: libc not reachable via dlopen");
+                }
+                eprintln!("skipping: libc not reachable via dlopen");
+                return;
+            }
+        };
+
+        // Fixed prefix: Ptr (buf), Int (size), String (fmt); then variadic Int.
+        let sig = FfiSignatureBuilder::new("snprintf")
+            .arg(FfiType::Ptr)
+            .arg(FfiType::Int)
+            .arg(FfiType::String)
+            .ret(FfiType::Int)
+            .variadic()
+            .build()
+            .unwrap();
+        let prepared = match prepare_cif_for_symbol(&sig, &lib, "snprintf", &[]) {
+            Ok(p) => p,
+            Err(e) => {
+                if std::env::var_os("CI").is_some() {
+                    panic!("FFI soft-skip forbidden in CI: {e}");
+                }
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+
+        let mut heap = Heap::default();
+        let mut buf = vec![0u8; 64];
+        let (fmt_obj, _gc) = heap.alloc(ObjString::from("hello %i"), Object::String);
+        let args = [
+            Value::from(buf.as_mut_ptr() as u64),
+            Value::from(64_i64),
+            Value::from(fmt_obj.addr()),
+            Value::from(42_i64),
+        ];
+        let tags = [
+            FfiType::Ptr,
+            FfiType::Int,
+            FfiType::String,
+            FfiType::Int,
+        ];
+        let mut ctx = InvokeContext::new(&mut heap, &[]);
+        let mut closures = Vec::new();
+        let ret = invoke_via_libffi(
+            &prepared,
+            &sig,
+            &args,
+            Some(&tags),
+            &mut ctx,
+            &mut closures,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ret.as_int() > 0);
+        let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        assert_eq!(s.to_string_lossy(), "hello 42");
     }
 }

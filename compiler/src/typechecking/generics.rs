@@ -245,6 +245,13 @@ impl Generics {
             vec!["T".into(), "E".into()],
         );
         self.register_nominal_type(common::BUILTIN_RESULT_ENUM, BUILTIN_MODULE);
+        // Lazy ranges (`a..b` / `a..=b`) — element type must satisfy `Ord`.
+        self.generic_type_ctors
+            .insert("Range".into(), vec!["T".into()]);
+        self.register_nominal_type("Range", PRELUDE_MODULE);
+        self.generic_type_ctors
+            .insert("RangeInclusive".into(), vec!["T".into()]);
+        self.register_nominal_type("RangeInclusive", PRELUDE_MODULE);
         self.register_nominal_type("ArrayIter", PRELUDE_MODULE);
     }
 
@@ -731,7 +738,7 @@ impl Generics {
             assoc_tys: HashMap::new(),
         });
 
-        // ---- byte: Eq + Show ----
+        // ---- byte: Eq + Show + Ord (int opcodes; needed for `byte` ranges) ----
         self.instances.push(InstanceDef {
             class: "Eq".into(),
             defined_module: PRELUDE_OPS_MODULE.into(),
@@ -746,6 +753,29 @@ impl Generics {
             range: 0..0,
             args: vec![super::ty::byte()],
             method_fqns: make_fqns("Show", "byte", &["show"]),
+            assoc_tys: HashMap::new(),
+        });
+        for (class, method) in [
+            ("Lt", "lt"),
+            ("Le", "le"),
+            ("Gt", "gt"),
+            ("Ge", "ge"),
+        ] {
+            self.instances.push(InstanceDef {
+                class: class.into(),
+                defined_module: PRELUDE_OPS_MODULE.into(),
+                range: 0..0,
+                args: vec![super::ty::byte()],
+                method_fqns: make_fqns(class, "byte", &[method]),
+                assoc_tys: HashMap::new(),
+            });
+        }
+        self.instances.push(InstanceDef {
+            class: "Ord".into(),
+            defined_module: PRELUDE_OPS_MODULE.into(),
+            range: 0..0,
+            args: vec![super::ty::byte()],
+            method_fqns: HashMap::new(),
             assoc_tys: HashMap::new(),
         });
 

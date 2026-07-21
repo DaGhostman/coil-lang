@@ -89,9 +89,13 @@ pub enum Instruction {
 
     // FFI — stack bottom→top unless noted.
     FfiLoad,
-    // FfiInvoke: lib, fn_id, args_tuple
+    // FfiInvoke: [15:0] arity (informational);
+    //            [16] = has_arg_type_tags (C varargs call);
+    // stack: lib, fn_id, args_tuple [, tags_tuple if bit 16]
     FfiInvoke,
-    // DeclareFFI: [15:0] arg arity; stack: lib, name, args_tuple, ret_tag
+    // DeclareFFI: [15:0] fixed arity (tag tuple length);
+    //             [16] = variadic flag (C `...`);
+    // stack: lib, name, args_tuple (fixed tags only), ret_tag
     DeclareFFI,
 
     // Aggregates — MakeTuple/MakeArray/MakeDict: [15:0] arity; Index: no operand

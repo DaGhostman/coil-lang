@@ -61,8 +61,65 @@ fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u3
     checker.ffi_type_tag_from_output(expr)
 }
 
+/// Fallback FFI tag from a call-site expression when the typechecker did not
+/// record tags (recovery / missing side-table entry).
+///
+/// Returns `None` for unknown shapes — callers must not invent `INT` and
+/// silently mis-promote; prefer skipping the variadic tag tuple or emitting
+/// a diagnostic instead.
+fn ffi_tag_for_expr_fallback(expr: &Output) -> Option<(u32, u32)> {
+    use common::tag;
+    match expr.1.as_ref() {
+        Expression::Float(_) => Some((tag::FLOAT, 0)),
+        Expression::String(_) => Some((tag::STRING, 0)),
+        Expression::Bool(_) => Some((tag::BOOL, 0)),
+        Expression::Integer(_) => Some((tag::INT, 0)),
+        Expression::Expr(inner) | Expression::Group(inner) | Expression::Statement(inner) => {
+            ffi_tag_for_expr_fallback(inner)
+        }
+        _ => None,
+    }
+}
+
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
+}
+
+/// Resolve variadic FFI arg tags from the typechecker side-table, falling back
+/// to literal shapes only. Unknown expressions yield no tags (and a diagnostic)
+/// rather than silently promoting as `INT`.
+fn resolve_variadic_ffi_tags(
+    checker: &Checker,
+    span: (usize, usize),
+    args: &[&Output<'_>],
+    messages: &mut Vec<Message>,
+) -> Option<Vec<(u32, u32)>> {
+    if let Some(tags) = checker.variadic_arg_tags_at(span) {
+        return Some(tags.to_vec());
+    }
+    let mut tags = Vec::with_capacity(args.len());
+    for arg in args {
+        match ffi_tag_for_expr_fallback(arg) {
+            Some(t) => tags.push(t),
+            None => {
+                let range = arg.0.start..arg.0.end;
+                let mut m = Message::error(
+                    ErrorCode::GenericTypeError,
+                    "cannot determine FFI type tag for variadic argument".into(),
+                    range.clone(),
+                );
+                m.push(DiagLabel::new(
+                    "variadic FFI arg tags missing from typechecker; \
+                     use a literal or ensure the call is typechecked"
+                        .to_string(),
+                    range,
+                ));
+                messages.push(m);
+                return None;
+            }
+        }
+    }
+    Some(tags)
 }
 
 fn is_instance_method_fqn(checker: &Checker, name: &str) -> bool {
@@ -452,6 +509,11 @@ struct Context {
     /// Per-arm pattern bindings (slot 1..N). Overrides global `variables` in arm bodies.
     match_bindings: Option<HashMap<String, u32>>,
 
+    /// Block-local binding overlays. When `Some`, shadowed names allocate a
+    /// fresh slot instead of reusing the outer Interner id (so exiting the
+    /// block leaves the outer binding's stack value intact).
+    block_bindings: Option<HashMap<String, u32>>,
+
     prev: Option<Box<Self>>,
 }
 
@@ -612,6 +674,8 @@ impl<'ctx> Context {
             symbols: self.symbols.clone(),
             classes: self.classes.clone(),
             match_bindings: self.match_bindings.clone(),
+            // Fresh overlay so inner `let` / destructure can shadow outer names.
+            block_bindings: Some(HashMap::new()),
             prev: Some(Box::new(self.to_owned())),
         }
     }
@@ -879,10 +943,194 @@ impl Compiler {
         {
             return Some(slot);
         }
+        // Innermost block overlay first (walk `prev` for nested blocks).
+        let mut ctx = Some(&self.context);
+        while let Some(c) = ctx {
+            if let Some(map) = &c.block_bindings
+                && let Some(&slot) = map.get(name)
+            {
+                return Some(slot);
+            }
+            ctx = c.prev.as_deref();
+        }
         self.context
             .variables
             .key(&name.to_string())
             .map(|s| s as u32)
+    }
+
+    /// Allocate a locals slot for a `let` / destructure binder.
+    ///
+    /// Inside a block (`block_bindings = Some`), re-binding a name that is
+    /// already visible in an outer scope gets a **fresh** slot so the outer
+    /// value is not overwritten.
+    fn alloc_binding_slot(&mut self, name: &str) -> u32 {
+        if let Some(map) = &self.context.block_bindings
+            && let Some(&slot) = map.get(name)
+        {
+            return slot;
+        }
+        if self.context.block_bindings.is_none() {
+            return self.context.variables.intern(name.to_string()) as u32;
+        }
+        let shadows_outer = {
+            let in_vars = self
+                .context
+                .variables
+                .key(&name.to_string())
+                .is_some();
+            let mut in_ancestor = false;
+            let mut ctx = self.context.prev.as_deref();
+            while let Some(c) = ctx {
+                if let Some(map) = &c.block_bindings
+                    && map.contains_key(name)
+                {
+                    in_ancestor = true;
+                    break;
+                }
+                ctx = c.prev.as_deref();
+            }
+            in_vars || in_ancestor
+        };
+        if shadows_outer {
+            self.temp_counter += 1;
+            let synthetic = format!("__shadow_{}_{}", name, self.temp_counter);
+            let slot = self.context.variables.intern(synthetic) as u32;
+            self.context
+                .block_bindings
+                .as_mut()
+                .expect("block_bindings checked above")
+                .insert(name.to_string(), slot);
+            slot
+        } else {
+            self.context.variables.intern(name.to_string()) as u32
+        }
+    }
+
+    /// Unwrap a [`Expression::NamedArg`] to its value expression.
+    fn call_arg_value<'a>(arg: &'a Output<'a>) -> &'a Output<'a> {
+        match arg.1.as_ref() {
+            Expression::NamedArg(_, value) => value,
+            _ => arg,
+        }
+    }
+
+    /// Split call args into fixed formals + rest elements (P4).
+    ///
+    /// Returns `(fixed, rest_elems, pack_rest)`. When `pack_rest` is true,
+    /// codegen must emit `MakeArray` even if `rest_elems` is empty.
+    fn split_call_args_for_rest<'a>(
+        &self,
+        fn_name: &str,
+        args: &'a [Output<'a>],
+    ) -> (Vec<&'a Output<'a>>, Vec<&'a Output<'a>>, bool) {
+        let has_named = args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+        let has_rest = self.checker.fn_has_rest(fn_name);
+        if !has_named && !has_rest {
+            return (args.iter().collect(), Vec::new(), false);
+        }
+        let Some(param_names) = self.checker.fn_param_names(fn_name) else {
+            return (
+                args.iter().map(Self::call_arg_value).collect(),
+                Vec::new(),
+                false,
+            );
+        };
+        let fixed_count = if has_rest {
+            param_names.len().saturating_sub(1)
+        } else {
+            param_names.len()
+        };
+        let rest_name = if has_rest {
+            param_names.get(fixed_count).map(|s| s.as_str())
+        } else {
+            None
+        };
+        let mut slots: Vec<Option<&'a Output<'a>>> = vec![None; fixed_count];
+        let mut rest = Vec::new();
+        let mut next_pos = 0usize;
+        for arg in args {
+            match arg.1.as_ref() {
+                Expression::NamedArg(name, value) => {
+                    // Typechecker rejects naming the rest param; recover by
+                    // packing the value into the rest array so CALL arity
+                    // stays aligned with the callee.
+                    if rest_name == Some(*name) {
+                        rest.push(value);
+                        continue;
+                    }
+                    if let Some(idx) = param_names[..fixed_count]
+                        .iter()
+                        .position(|p| p == *name)
+                    {
+                        slots[idx] = Some(value);
+                    }
+                }
+                _ => {
+                    while next_pos < fixed_count && slots[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos < fixed_count {
+                        slots[next_pos] = Some(arg);
+                        next_pos += 1;
+                    } else if has_rest {
+                        rest.push(arg);
+                        next_pos += 1;
+                    } else {
+                        next_pos += 1;
+                    }
+                }
+            }
+        }
+        let pack_rest = has_rest
+            && (has_named
+                || next_pos >= fixed_count
+                || args.len() >= fixed_count
+                || fixed_count == 0);
+        let fixed: Vec<_> = slots.into_iter().flatten().collect();
+        if pack_rest {
+            (fixed, rest, true)
+        } else {
+            (fixed, Vec::new(), false)
+        }
+    }
+
+    /// Emit value args for a call, packing rest into `MakeArray` when needed.
+    /// Returns the CALL arity (fixed + 1 if rest packed).
+    fn emit_call_args_with_rest(
+        &mut self,
+        fn_name: &str,
+        args: &[Output<'_>],
+        bytecode: &mut Vec<Byte>,
+        box_generic: bool,
+    ) -> u32 {
+        let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
+
+        for arg in &fixed {
+            self.append_with_existential_pack(bytecode, arg);
+            if box_generic {
+                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                    Self::emit_box_if_needed(bytecode, &arg_ty);
+                }
+            }
+        }
+        if pack_rest {
+            for arg in &rest {
+                self.append_with_existential_pack(bytecode, arg);
+                if box_generic {
+                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                        Self::emit_box_if_needed(bytecode, &arg_ty);
+                    }
+                }
+            }
+            bytecode.push(
+                Byte::new(Instruction::MakeArray).with_operand_u32(rest.len() as u32),
+            );
+            return (fixed.len() + 1) as u32;
+        }
+        fixed.len() as u32
     }
 
     fn next_emit_id(&mut self) -> Option<crate::typechecking::id::NodeId> {
@@ -1204,7 +1452,7 @@ impl Compiler {
     }
 
     fn emit_ffi_declare(&mut self, span: SimpleSpan, args: &[Output]) {
-        if args.len() != 4 {
+        if args.len() != 4 && args.len() != 5 {
             let mut m = Message::error(
                 ErrorCode::DeclareArity,
                 "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)"
@@ -1213,7 +1461,7 @@ impl Compiler {
             );
             m.push(DiagLabel::new(
                 format!(
-                    "expected 4 arguments (lib, name, args_tuple, ret_type); got {}",
+                    "expected 4 or 5 arguments (lib, name, args_tuple, ret_type[, variadic]); got {}",
                     args.len()
                 ),
                 span.into_range(),
@@ -1227,6 +1475,26 @@ impl Compiler {
         let name = &args[1];
         let args_tuple = &args[2];
         let ret_type = &args[3];
+        let variadic = if args.len() == 5 {
+            match args[4].1.as_ref() {
+                Expression::Bool(b) => *b,
+                _ => {
+                    let mut m = Message::error(
+                        ErrorCode::DeclareArity,
+                        "declare(...) 5th argument (variadic) must be a bool literal".to_string(),
+                        args[4].0.into_range(),
+                    );
+                    m.push(DiagLabel::new(
+                        "use `true` or `false`".to_string(),
+                        args[4].0.into_range(),
+                    ));
+                    self.messages.push(m);
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
         let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
             Expression::Tuple(items) => items.to_vec(),
@@ -1270,7 +1538,10 @@ impl Compiler {
             self.bytecode.extend(ret_bc);
         }
 
-        let operand = arity & 0xFFFF;
+        let mut operand = arity & 0xFFFF;
+        if variadic {
+            operand |= 1 << 16;
+        }
         self.bytecode
             .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
     }
@@ -1298,6 +1569,11 @@ impl Compiler {
         let lib = &args[0];
         let fn_id = &args[1];
         let args_tuple = &args[2];
+
+        let variadic = match fn_id.1.as_ref() {
+            Expression::Identifier(name) => self.checker.is_ffi_declare_variadic(name),
+            _ => false,
+        };
 
         let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
             Expression::Tuple(items) => items.to_vec(),
@@ -1336,7 +1612,24 @@ impl Compiler {
         self.bytecode
             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
 
-        let operand = arity & 0xFFFF;
+        let mut operand = arity & 0xFFFF;
+        if variadic {
+            let args: Vec<_> = tuple_elements.iter().collect();
+            if let Some(tags) = resolve_variadic_ffi_tags(
+                &self.checker,
+                (span.start, span.end),
+                &args,
+                &mut self.messages,
+            ) {
+                for &(tag, aux) in &tags {
+                    emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                }
+                self.bytecode
+                    .push(Byte::new(Instruction::MakeTuple).with_operand_u32(tags.len() as u32));
+                operand |= 1 << 16;
+            }
+        }
+
         self.bytecode
             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
     }
@@ -1606,6 +1899,19 @@ impl Compiler {
                 for (p, c) in t1.iter().zip(t2.iter()) {
                     Self::bind_scheme_vars(p, c, map);
                 }
+            }
+            // Rest packs are `[T]` / `[T; N]` — bind `T` from the element.
+            (
+                Ty::Array {
+                    element: e1,
+                    ..
+                },
+                Ty::Array {
+                    element: e2,
+                    ..
+                },
+            ) => {
+                Self::bind_scheme_vars(e1, e2, map);
             }
             _ => {}
         }
@@ -2400,12 +2706,18 @@ impl Compiler {
         let mut overrides = HashMap::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
             for child in children {
-                if let Expression::Argument(ty, name) = child.1.as_ref()
+                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref()
                     && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
                         ty.1.as_ref()
                     && let Some(concrete) = type_param_tys.get(tp_name)
                 {
-                    overrides.insert(name.to_string(), concrete.clone());
+                    // Rest formals are packed arrays at runtime (`MakeArray`).
+                    let ty = if *is_rest {
+                        crate::typechecking::ty::array(concrete.clone())
+                    } else {
+                        concrete.clone()
+                    };
+                    overrides.insert(name.to_string(), ty);
                 }
             }
         }
@@ -2414,10 +2726,32 @@ impl Compiler {
 
     fn mono_call_offset(&self, fn_name: &str, args: Option<&Vec<Output<'_>>>) -> Option<usize> {
         let args = args?;
-        let arg_types = args
-            .iter()
-            .map(|arg| monomorphize::ground_type_name(&self.checker, arg))
-            .collect::<Option<Vec<_>>>()?;
+        // Keep keying in sync with `monomorphize::candidate_for_call`: one
+        // ground type per formal, with rest contributing its *element* type.
+        let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
+        let mut arg_types = Vec::with_capacity(fixed.len() + usize::from(pack_rest));
+        for arg in &fixed {
+            arg_types.push(monomorphize::ground_type_name(&self.checker, arg)?);
+        }
+        if pack_rest {
+            if rest.is_empty() {
+                // Empty rest: only match when a fixed formal already pinned T.
+                // Without a rest element we can't invent a ground type here;
+                // specializations with empty rest still key the rest slot from
+                // subst — look up by trying each specialization's arg_types
+                // prefix match below via exact equality, so require the rest
+                // element type from the first fixed arg that shares the rest
+                // type param. Fallback: skip mono (shared body).
+                return None;
+            }
+            let elem = monomorphize::ground_type_name(&self.checker, rest[0])?;
+            for arg in rest.iter().skip(1) {
+                if monomorphize::ground_type_name(&self.checker, arg)? != elem {
+                    return None;
+                }
+            }
+            arg_types.push(elem);
+        }
         let spec = self
             .mono_plan
             .specialization_for_call(fn_name, &arg_types)?;
@@ -2577,6 +2911,99 @@ impl Compiler {
         self.context.variables.intern(name) as u32
     }
 
+    /// Synthesize the packed rest-array type for a call's trailing args
+    /// (`[T]` / `[T; N]`), mirroring typechecker `infer_and_reorder_call_args`.
+    fn synthesize_rest_array_ty(&self, rest: &[&Output<'_>]) -> crate::typechecking::Ty {
+        use crate::typechecking::ty::{array, array_fixed};
+        let mut elem: Option<crate::typechecking::Ty> = None;
+        for arg in rest {
+            if let Some(t) = self.codegen_expr_ty(arg) {
+                match &elem {
+                    None => elem = Some(t),
+                    Some(prev) if prev != &t => {
+                        // Prefer the first element type; unify already ran in TC.
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let element = elem.unwrap_or_else(crate::typechecking::ty::int);
+        if rest.is_empty() {
+            array(element)
+        } else {
+            array_fixed(element, rest.len())
+        }
+    }
+
+    /// Bind names from an irrefutable `let` pattern by reading from
+    /// `src_slot` (tuple via `Index`, record via `GetField`).
+    fn emit_let_pattern_binds(
+        &mut self,
+        pattern: &parser::ast::LetPattern<'_>,
+        src_slot: u32,
+        bytecode: &mut Vec<Byte>,
+    ) {
+        use parser::ast::LetPattern;
+        match pattern {
+            LetPattern::Wildcard => {}
+            LetPattern::Binding { name } => {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                let slot = self.alloc_binding_slot(name);
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            }
+            LetPattern::Tuple(parts) => {
+                for (idx, part) in parts.iter().enumerate() {
+                    match part {
+                        LetPattern::Wildcard => {}
+                        LetPattern::Binding { name } => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            bytecode.push(
+                                Byte::new(Instruction::CONST).with_const_inline(idx as i32),
+                            );
+                            bytecode.push(Byte::new(Instruction::Index));
+                            let slot = self.alloc_binding_slot(name);
+                            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                        }
+                        nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            bytecode.push(
+                                Byte::new(Instruction::CONST).with_const_inline(idx as i32),
+                            );
+                            bytecode.push(Byte::new(Instruction::Index));
+                            let nested_slot = self.alloc_temp_slot();
+                            bytecode
+                                .push(Byte::new(Instruction::StorePop).with_operand_u32(nested_slot));
+                            self.emit_let_pattern_binds(nested, nested_slot, bytecode);
+                        }
+                    }
+                }
+            }
+            LetPattern::Record(fields) => {
+                for pf in fields {
+                    match &pf.pattern {
+                        LetPattern::Wildcard => {}
+                        LetPattern::Binding { name } => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            Self::emit_raw_string_literal(bytecode, pf.name);
+                            bytecode.push(Byte::new(Instruction::GetField));
+                            let slot = self.alloc_binding_slot(name);
+                            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                        }
+                        nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            Self::emit_raw_string_literal(bytecode, pf.name);
+                            bytecode.push(Byte::new(Instruction::GetField));
+                            let nested_slot = self.alloc_temp_slot();
+                            bytecode
+                                .push(Byte::new(Instruction::StorePop).with_operand_u32(nested_slot));
+                            self.emit_let_pattern_binds(nested, nested_slot, bytecode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// `for x in` over an array already on the operand stack (or just
     /// compiled). Observationally identical to `ArrayIter::next`.
     ///
@@ -2604,7 +3031,7 @@ impl Compiler {
 
         // Consume binding Identifier NodeId (iterable → binding → body).
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -2710,6 +3137,151 @@ impl Compiler {
         self.emit_for_in_array_loop(body, binding_name, true, None);
     }
 
+    /// Lazy range for-in (`int`/`byte`/`float`).
+    ///
+    /// Fast path when the iterable is a `Range` literal: locals for
+    /// `cur`/`end` only — no heap. First-class range values
+    /// (`let r = 0..n; for x in r`) are dicts `{start,end,inclusive}`
+    /// unpacked via `GetField`.
+    ///
+    /// `float` selects LEF/LEQF/ADDF with step `1.0`; otherwise LE/LEQ/ADD
+    /// with step `1` (shared by `int` and `byte`).
+    fn emit_for_in_range(
+        &mut self,
+        iterable: &Output<'_>,
+        body: &Output<'_>,
+        binding_name: &str,
+        inclusive: bool,
+        float: bool,
+    ) {
+        let cur_slot = self.alloc_temp_slot();
+        let end_slot = self.alloc_temp_slot();
+
+        match iterable.1.as_ref() {
+            Expression::Range { start, end, .. } => {
+                // Consume the Range node's ID (pre-walk: Range → start → end).
+                let _ = self.next_emit_id();
+                let start_bc = self.do_compile(start);
+                self.bytecode.extend(start_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+                let end_bc = self.do_compile(end);
+                self.bytecode.extend(end_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(end_slot));
+            }
+            _ => {
+                let range_slot = self.alloc_temp_slot();
+                let iter_bc = self.do_compile(iterable);
+                self.bytecode.extend(iter_bc);
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(range_slot));
+
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(range_slot));
+                Self::emit_raw_string_literal(&mut self.bytecode, "start");
+                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+
+                self.bytecode
+                    .push(Byte::new(Instruction::LOAD).with_operand_u32(range_slot));
+                Self::emit_raw_string_literal(&mut self.bytecode, "end");
+                self.bytecode.push(Byte::new(Instruction::GetField));
+                self.bytecode
+                    .push(Byte::new(Instruction::StorePop).with_operand_u32(end_slot));
+            }
+        }
+
+        // Consume binding Identifier NodeId (iterable → binding → body).
+        let _ = self.next_emit_id();
+        let binding_slot = self.alloc_binding_slot(binding_name);
+
+        let mut bb = BlockBuilder::new();
+        let top_label = bb.fresh_label();
+        let continue_label = bb.fresh_label();
+        let exit_label = bb.fresh_label();
+        let top_label_target = self.bytecode.len() as u32;
+
+        // cond: cur < end  (half-open) or cur <= end (inclusive)
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(end_slot));
+        self.bytecode.push(Byte::new(if float {
+            if inclusive {
+                Instruction::LEQF
+            } else {
+                Instruction::LEF
+            }
+        } else if inclusive {
+            Instruction::LEQ
+        } else {
+            Instruction::LE
+        }));
+        bb.emit_jump_to(exit_label, BbJumpKind::JumpIfFalse, &mut self.bytecode);
+
+        // x = cur
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(binding_slot));
+
+        self.loop_stack.push((continue_label, exit_label));
+        self.loop_bbs.push(bb);
+        let body_bc = self.do_compile(body);
+        self.bytecode.extend(body_bc);
+        let mut bb = self
+            .loop_bbs
+            .pop()
+            .expect("loop builder stack balanced for for-in range");
+        self.loop_stack
+            .pop()
+            .expect("loop label stack balanced for for-in range");
+
+        let continue_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            continue_label,
+            continue_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        // cur = cur + 1  (or + 1.0 for float)
+        self.bytecode
+            .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
+        if float {
+            let bits = Value::from(1.0_f64).raw() as u64;
+            let idx = self.intern_constant(bits);
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            self.bytecode.push(Byte::new(Instruction::ADDF));
+        } else {
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_inline(1));
+            self.bytecode.push(Byte::new(Instruction::ADD));
+        }
+        self.bytecode
+            .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
+
+        bb.emit_jump_to(top_label, BbJumpKind::Unconditional, &mut self.bytecode);
+
+        let exit_label_target = self.bytecode.len() as u32;
+        bb.bind_label(
+            exit_label,
+            exit_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.bind_label(
+            top_label,
+            top_label_target,
+            &mut self.bytecode,
+            &mut self.constants,
+        );
+        bb.finalize()
+            .expect("BlockBuilder::finalize: for-in range labels bound");
+    }
+
     /// Coroutine for-in: resume → bind; skip body when `done` (completion
     /// value excluded). Same layout as the Phase CORO for-in path.
     fn emit_for_in_coro(&mut self, iterable: &Output<'_>, body: &Output<'_>, binding_name: &str) {
@@ -2720,7 +3292,7 @@ impl Compiler {
             .push(Byte::new(Instruction::StorePop).with_operand_u32(handle_slot));
 
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -2802,7 +3374,7 @@ impl Compiler {
             .push(Byte::new(Instruction::StorePop).with_operand_u32(it_slot));
 
         let _ = self.next_emit_id();
-        let binding_slot = self.context.variables.intern(binding_name.to_string()) as u32;
+        let binding_slot = self.alloc_binding_slot(binding_name);
 
         let mut bb = BlockBuilder::new();
         let top_label = bb.fresh_label();
@@ -2874,15 +3446,7 @@ impl Compiler {
     }
 
     fn variable_slot(&mut self, name: &str) -> Option<u32> {
-        if let Some(map) = &self.context.match_bindings {
-            if let Some(&slot) = map.get(name) {
-                return Some(slot);
-            }
-        }
-        self.context
-            .variables
-            .key(&name.to_string())
-            .map(|s| s as u32)
+        self.lookup_slot(name)
     }
 
     fn is_float_ty(&self, _node: &Output) -> bool {
@@ -2949,6 +3513,7 @@ impl Compiler {
 
     fn codegen_expr_ty(&self, node: &Output) -> Option<Ty> {
         let resolved = match node.1.as_ref() {
+            Expression::NamedArg(_, value) => return self.codegen_expr_ty(value),
             Expression::Integer(_) => Some(Ty::Con(crate::typechecking::ty::INT.into())),
             Expression::Float(_) => Some(Ty::Con(crate::typechecking::ty::FLOAT.into())),
             Expression::Bool(_) => Some(Ty::Con(crate::typechecking::ty::BOOL.into())),
@@ -3570,6 +4135,10 @@ impl Compiler {
             // `mod foo;` — pipeline loads the file; no bytecode.
             Expression::Module(_, _body) => {}
             Expression::Group(e) => bytecode.append(&mut self.do_compile(e)),
+            // Named call-site arg — compile the value (defensive; Call reorders).
+            Expression::NamedArg(_, value) => {
+                bytecode.append(&mut self.do_compile(value));
+            }
             Expression::Program(children) => {
                 children.iter().for_each(|child| {
                     bytecode.append(&mut self.do_compile(child));
@@ -3578,6 +4147,14 @@ impl Compiler {
                     self.emit_virtual_test_main();
                 }
             }
+            // --- `let (a, b) = expr` / `let { x, y } = expr` ---
+            Expression::LetDestructure { pattern, rhs } => {
+                self.append_with_existential_pack(&mut bytecode, rhs);
+                let tmp = self.alloc_temp_slot();
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
+                self.emit_let_pattern_binds(pattern, tmp, &mut bytecode);
+            }
+
             // --- Let / const bindings ---
             Expression::Fragment(children) => {
                 // `let x = expr` / `const x = expr` → compile RHS, then
@@ -3619,7 +4196,7 @@ impl Compiler {
                         // high while JumpIfMatch still pushed at the real
                         // cursor.
                         self.append_with_existential_pack(&mut bytecode, &children[1]);
-                        let slot = self.context.variables.intern(name.clone()) as u32;
+                        let slot = self.alloc_binding_slot(&name);
                         if is_const {
                             self.context.constants.insert(slot as usize, true);
                         }
@@ -3830,6 +4407,27 @@ impl Compiler {
                 let arity = items.len() as u32;
                 bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(arity));
             }
+            // Lazy range value: dict `{ start, end, inclusive }` so
+            // first-class `let r = 0..n; for x in r` works via GetField.
+            // Direct `for x in 0..n` uses the no-heap fast path instead.
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let mut start_bc = self.do_compile(start);
+                bytecode.append(&mut start_bc);
+                Self::emit_raw_string_literal(&mut bytecode, "start");
+                let mut end_bc = self.do_compile(end);
+                bytecode.append(&mut end_bc);
+                Self::emit_raw_string_literal(&mut bytecode, "end");
+                bytecode.push(
+                    Byte::new(Instruction::CONST)
+                        .with_const_inline(if *inclusive { 1 } else { 0 }),
+                );
+                Self::emit_raw_string_literal(&mut bytecode, "inclusive");
+                bytecode.push(Byte::new(Instruction::MakeDict).with_operand_u32(3));
+            }
             // `t[i]` — pop the index (top), pop the target,
             // push the element at `target[index]`. The Index
             // opcode carries no operand (the index is at the top
@@ -4020,6 +4618,15 @@ impl Compiler {
                         }
                         ForInKind::Coroutine => {
                             self.emit_for_in_coro(iterable, body, &binding_name);
+                        }
+                        ForInKind::Range { inclusive, float } => {
+                            self.emit_for_in_range(
+                                iterable,
+                                body,
+                                &binding_name,
+                                inclusive,
+                                float,
+                            );
                         }
                         ForInKind::Custom {
                             into_iter_fqn,
@@ -4356,15 +4963,19 @@ impl Compiler {
                         .cloned();
                     if let Some(fqn) = fqn {
                         if let Some(offset) = self.functions.get(&fqn).copied() {
-                            // Push receiver first (slot 0), then args.
+                            // Push receiver first (slot 0), then args
+                            // (reordered when any arg is named; rest packed).
                             bytecode.append(&mut self.do_compile(recv));
-                            let mut nargs = 0u32;
-                            if let Some(items) = args {
-                                for arg in items {
-                                    self.append_with_existential_pack(&mut bytecode, arg);
-                                    nargs += 1;
-                                }
-                            }
+                            let nargs = if let Some(items) = args {
+                                self.emit_call_args_with_rest(
+                                    &fqn,
+                                    items,
+                                    &mut bytecode,
+                                    false,
+                                )
+                            } else {
+                                0
+                            };
                             bytecode.push(
                                 Byte::new(Instruction::CALL)
                                     .with_call_packed(1 + nargs, offset as u32),
@@ -4478,6 +5089,7 @@ impl Compiler {
                         } else {
                             0
                         };
+                        let variadic = self.checker.is_extern_variadic(&n);
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                         self.bytecode
@@ -4490,8 +5102,29 @@ impl Compiler {
                         }
                         self.bytecode
                             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                        let mut operand = arity as u32 & 0xFFFF;
+                        if variadic {
+                            let call_span = (span.start, span.end);
+                            let arg_refs: Vec<_> =
+                                args.as_ref().map(|items| items.iter().collect()).unwrap_or_default();
+                            if let Some(tags) = resolve_variadic_ffi_tags(
+                                &self.checker,
+                                call_span,
+                                &arg_refs,
+                                &mut self.messages,
+                            ) {
+                                for &(tag, aux) in &tags {
+                                    emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                                }
+                                self.bytecode.push(
+                                    Byte::new(Instruction::MakeTuple)
+                                        .with_operand_u32(tags.len() as u32),
+                                );
+                                operand |= 1 << 16;
+                            }
+                        }
                         self.bytecode
-                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
+                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
                         self.emit_result_unwrap_or_panic();
                     } else if let Some(&native_id) = self.native.get(&n) {
                         // Same stack order as `emit_io_host_invoke`: id first,
@@ -4520,18 +5153,13 @@ impl Compiler {
                         // If the callee is a generic function, box each concrete arg
                         // at the call boundary (concrete→generic).
                         let is_generic = self.checker.is_generic_fn(&n) && mono_offset.is_none();
-                        if let Some(arg_list) = args {
-                            for arg in arg_list {
-                                self.append_with_existential_pack(&mut bytecode, arg);
-                                if is_generic {
-                                    // Reuse the original HM result. Re-running inference here
-                                    // would occur after the function scope has been popped.
-                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                    }
-                                }
-                            }
-                        }
+                        let arg_slice = args.as_deref().unwrap_or(&[]);
+                        let value_arity = self.emit_call_args_with_rest(
+                            &n,
+                            arg_slice,
+                            &mut bytecode,
+                            is_generic,
+                        );
 
                         // ── Dictionary-passing calling convention ──────────────────
                         // For non-monomorphized generic calls, append one dict tuple
@@ -4542,19 +5170,21 @@ impl Compiler {
                         // from the shared body, but Show-bound calls always take
                         // this path.
                         let dict_count = if is_generic {
-                            let call_arg_tys: Vec<crate::typechecking::Ty> = args
-                                .as_ref()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .map(|arg| {
-                                            self.codegen_expr_ty(arg).expect(
-                                                "typechecked call argument must have a codegen type",
-                                            )
-                                        })
-                                        .collect()
+                            let (fixed, rest, pack_rest) =
+                                self.split_call_args_for_rest(&n, arg_slice);
+                            let mut call_arg_tys: Vec<crate::typechecking::Ty> = fixed
+                                .iter()
+                                .map(|arg| {
+                                    self.codegen_expr_ty(arg).expect(
+                                        "typechecked call argument must have a codegen type",
+                                    )
                                 })
-                                .unwrap_or_default();
+                                .collect();
+                            // Rest-only generics (`T... xs`) have empty `fixed`;
+                            // bind `T` from the packed `[T]` / `[T; N]` arg.
+                            if pack_rest {
+                                call_arg_tys.push(self.synthesize_rest_array_ty(&rest));
+                            }
                             let mut forwarded = 0;
                             if let Some(indices) = self_id
                                 .and_then(|id| self.checker.forwarded_dicts_at(id))
@@ -4588,8 +5218,7 @@ impl Compiler {
                             0
                         };
 
-                        let arity = args.as_ref().map(|items| items.len()).unwrap_or(0) as u32
-                            + dict_count as u32;
+                        let arity = value_arity + dict_count as u32;
                         if is_instance_method_fqn(&self.checker, &n) {
                             Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
                         } else if self.coroutine_fns.contains(&n) {
@@ -4691,7 +5320,7 @@ impl Compiler {
                     }
                 } // end non-method Call
             }
-            Expression::Argument(ty, n) => {
+            Expression::Argument(ty, n, _is_rest) => {
                 let _ = self.context.variables.intern(n.to_string());
                 if matches!(ty.1.as_ref(), Expression::Forall { .. }) {
                     self.polyfn_vars.insert(n.to_string());
@@ -5508,7 +6137,7 @@ impl Compiler {
                     let mut arg_type_tags: Vec<u32> = Vec::new();
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
-                            if let Expression::Argument(type_expr, _param_name) = arg.1.as_ref() {
+                            if let Expression::Argument(type_expr, _param_name, _) = arg.1.as_ref() {
                                 if let Some((tag, aux)) =
                                     ffi_type_tag_from_output(&self.checker, type_expr)
                                 {
@@ -5555,9 +6184,13 @@ impl Compiler {
                         .and_then(|r| ffi_type_tag_from_output(&self.checker, r))
                         .unwrap_or((tag::VOID, 0));
                     emit_ffi_type_const(&mut self.bytecode, ret_tag, ret_aux);
-                    // Emit DeclareFFI.
+                    // Emit DeclareFFI (bit 16 = C varargs).
+                    let mut operand = arity & 0xFFFF;
+                    if decl.variadic {
+                        operand |= 1 << 16;
+                    }
                     self.bytecode
-                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(arity));
+                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
                     self.emit_result_unwrap_or_panic();
                     // Store the function id.
                     self.bytecode
@@ -9791,6 +10424,171 @@ fn main() {
             outer_const < inner_host,
             "outer native-id CONST must precede nested HostInvoke \
              (const@{outer_const} vs inner@{inner_host})"
+        );
+    }
+
+    /// Named call args are reordered to declaration order before CALL.
+    /// Source order is `age` then `name`; bytecode must push name (STRING)
+    /// then age (CONST) so a missing reorder still typechecks but fails here.
+    #[test]
+    fn named_call_shuffled_args_emits_declaration_order() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn greet(string name, int age) {
+    print "%s", name;
+    print "%i", age;
+}
+fn main() {
+    greet(age: 36, name: "Ada");
+}
+"#,
+        );
+        // Find the CALL in main (arity 2) — skip any earlier CALLs.
+        // call_parts() = (arity, target).
+        let call_idx = bc
+            .iter()
+            .rposition(|b| {
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 2
+            })
+            .expect("expected CALL arity 2 for greet");
+        // Walk backward from CALL over the two arg pushes: STRING then CONST.
+        let mut saw_string = false;
+        let mut saw_const = false;
+        let mut order = Vec::new();
+        for b in bc[..call_idx].iter().rev() {
+            match b.bytecode() {
+                Instruction::STRING | Instruction::FORMAT => {
+                    order.push("string");
+                    saw_string = true;
+                    if saw_const {
+                        break;
+                    }
+                }
+                Instruction::CONST => {
+                    order.push("const");
+                    saw_const = true;
+                    if saw_string {
+                        break;
+                    }
+                }
+                // Skip peephole / prologue noise between arg pushes.
+                Instruction::POP
+                | Instruction::DUPLICATE
+                | Instruction::JMP
+                | Instruction::JMPF
+                | Instruction::CALL
+                | Instruction::RETURN
+                | Instruction::PRINT => {}
+                _ => {
+                    // Keep scanning; Format/Print in greet body appear earlier.
+                }
+            }
+            if order.len() >= 2 {
+                break;
+            }
+        }
+        // Reverse to source-of-stack order: first pushed is declaration-first.
+        order.reverse();
+        assert_eq!(
+            order,
+            vec!["string", "const"],
+            "expected STRING (name) then CONST (age) before CALL; got {:?}. \
+             Missing reorder would emit CONST then STRING.",
+            order
+        );
+    }
+
+    /// Rest calls pack trailing args into MakeArray and CALL with arity =
+    /// fixed + 1 (here fixed=0 → arity 1).
+    #[test]
+    fn rest_call_emits_make_array_before_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() {
+    let n = sum(1, 2, 3);
+}
+"#,
+        );
+        let make_array = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .expect("expected MakeArray for rest packing");
+        assert_eq!(
+            make_array.operand_u32(),
+            3,
+            "sum(1,2,3) should MakeArray(3); got {}",
+            make_array.operand_u32()
+        );
+        let call = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 1)
+            .expect("expected CALL arity 1 (rest packed as one slot)");
+        let make_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .unwrap();
+        let call_pos = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::CALL) && b.call_parts().0 == 1)
+            .unwrap();
+        assert!(
+            make_pos < call_pos,
+            "MakeArray must precede CALL (make@{make_pos} call@{call_pos})"
+        );
+        let _ = call;
+    }
+
+    /// Empty rest call still emits MakeArray(0) so the rest formal is `[]`.
+    #[test]
+    fn rest_empty_call_emits_make_array_zero() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() {
+    let n = sum();
+}
+"#,
+        );
+        let make_array = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::MakeArray))
+            .expect("expected MakeArray(0) for empty rest");
+        assert_eq!(make_array.operand_u32(), 0);
+    }
+
+    /// `let (a, b) = (1, 2)` desugars to Index + StorePop per binding.
+    #[test]
+    fn let_tuple_destructure_emits_index_and_store_pop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            r#"
+fn main() {
+    let (a, b) = (1, 2);
+    print "%i", a;
+    print "%i", b;
+}
+"#,
+        );
+        let index_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::Index))
+            .count();
+        assert!(
+            index_count >= 2,
+            "expected ≥2 Index for tuple let destructure; got {index_count}"
+        );
+        let store_pop_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::StorePop))
+            .count();
+        // RHS temp + a + b (at least 3).
+        assert!(
+            store_pop_count >= 3,
+            "expected ≥3 StorePop (tmp + a + b); got {store_pop_count}"
         );
     }
 

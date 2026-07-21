@@ -9,7 +9,7 @@ mod signature;
 
 pub use call::{
     InvokeContext, PreparedCall, invoke_via_libffi, prepare_cif, prepare_cif_for_symbol,
-    resolve_symbol,
+    prepare_variadic_cif, promote_variadic_arg_type, resolve_symbol,
 };
 pub use closure::{OwnedClosure, VmCallFn, callback_cif, make_int_callback};
 pub use error::{

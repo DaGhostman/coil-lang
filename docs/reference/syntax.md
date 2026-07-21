@@ -66,8 +66,14 @@ kind            ::= '*' | 'Constraint' | kind '->' kind | '(' kind ')'
 class_bound     ::= IDENT
 where_clause    ::= 'where' where_constraint (',' where_constraint)*
 where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
-arg_list      ::= '(' (type_annotation IDENT (',' type_annotation IDENT)*)? ')'
+arg_list      ::= '(' (arg (',' arg)*)? ')'
+arg           ::= type_annotation '...'? IDENT   // trailing `T... name` is rest → `[T]`
 ```
+
+Call sites may use named arguments (`name: expr`) after any positional
+prefix. Rest parameters are positional-only and pack trailing values
+into one array (including empty). Call-site spread (`f(...xs)`) is not
+supported yet.
 
 Examples:
 
@@ -76,6 +82,9 @@ fn add(int a, int b) -> int { return a + b; }
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
 fn greet() { print "hi"; }
+fn sum(int... xs) -> int { return len(xs); }
+sum(1, 2, 3);   // xs == [1, 2, 3]
+sum();          // xs == []
 ```
 
 ### Traits and impl
@@ -196,15 +205,21 @@ See [Modules reference](modules.md).
 ### Extern (FFI)
 
 ```
-extern_block ::= 'extern' STRING '{' extern_fn* '}'
-extern_fn    ::= 'fn' IDENT arg_list ('->' IDENT)? ';'
+extern_block    ::= 'extern' STRING '{' extern_fn* '}'
+extern_fn       ::= 'fn' IDENT extern_arg_list ('->' type)? ';'
+extern_arg_list ::= '(' (T name (',' T name)* (',' '...')? | '...')? ')'
 ```
+
+Fixed parameters use `T name` (same as ordinary FFI args). A trailing bare
+`...` marks C-style varargs (`printf`-style). Language rest `T... name` is
+rejected inside `extern` — use bare `...` instead.
 
 Example:
 
 ```0s
 extern "c" {
     fn strlen(string s) -> int;
+    fn printf(string fmt, ...) -> int;
 }
 ```
 
@@ -326,7 +341,7 @@ atom ::= match_expr
 | Array | `[e1, e2, ...]` or `[]` | Homogeneous elements |
 | Dict | `{ name: expr, ... }` | Anonymous record |
 | Construct | `Enum::Variant(...)` | Qualified constructor |
-| Call | `f(args)` | Includes user functions and FFI-wrapped extern fns |
+| Call | `f(args)` | Args are positional `expr` and/or named `name: expr` (positional prefix, then named; no positional after named). Includes user functions and FFI-wrapped extern fns |
 | Instantiate | `new Class(args)` | Class construction |
 | Match | `match expr '{' arm (',' arm)* '}'` | See patterns below |
 | Index | `expr '[' expr ']'` | Postfix |
@@ -462,7 +477,35 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| `for x in` over ranges (`0..n`) | Not implemented — use C-style `for` or an array |
+| Call-site spread (`f(...xs)`) | **Deferred** — [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md) |
+
+### Ranges (lazy)
+
+Half-open `start..end` and closed `start..=end` produce
+**`Range<T: Ord>`** / **`RangeInclusive<T: Ord>`** (both bounds unify).
+A range is a **lazy** iterable: `for x in 0..n` pulls one value at a
+time and does **not** allocate an array of length `n`. Decreasing
+ranges (`10..0`) are empty (Rust-like). First-class values work
+(`let r = 0..n; for x in r`).
+
+Construction needs only `Ord`. **`for` iteration** steps with `+1` /
+`+1.0` for `int`, `byte`, and `float` (other `Ord` types may form a
+range value but are not iterable yet).
+
+```0s
+for x in 0..5 { print "%i", x; }   // 01234
+let r = 0..=3;
+for x in r { print "%i", x; }      // 0123
+for x in 1.0..4.0 { print "%f", x; } // 1.02.03.0
+```
+
+See `examples/range.0s`.
+
+**Deferred:** turning a range into a concrete array (e.g. a future
+`collect(0..5)` → `[0, 1, 2, 3, 4]`), step syntax, iterating non-numeric
+`Ord` types.
+
+Full design lock-in: [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md).
 
 See [README](../README.md) language-at-a-glance table for the live feature matrix.
 
