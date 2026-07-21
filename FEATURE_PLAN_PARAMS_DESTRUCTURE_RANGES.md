@@ -1,11 +1,9 @@
 # Feature plan — variadics, named params, let-destructuring, ranges
 
-Status: **draft for syntax / scope review** (no implementation yet).
+Status: **syntax locked** (2026-07-21) — ready for phased implementation.
 
-This plan covers four related ergonomics features. Each section lists
-recommended syntax, how it maps onto today's compiler/VM, confidence,
-and what to defer. **Please confirm the syntax choices marked
-"VERIFY"** before any implementation branch starts.
+This plan covers four related ergonomics features. Decisions below
+reflect user confirmation; see [Locked decisions](#locked-decisions).
 
 ---
 
@@ -32,7 +30,7 @@ Key files: `parser/src/{ast,lib}.rs`, `compiler/src/typechecking/infer.rs`
 
 ## 1. Named parameters
 
-### Recommended syntax (VERIFY)
+### Syntax (locked)
 
 ```0s
 fn greet(string name, int age) { ... }
@@ -93,11 +91,11 @@ Low risk: pure frontend + TC bookkeeping; bytecode unchanged.
 
 ## 2. Variadics (rest parameters)
 
-### Recommended syntax (VERIFY)
+### Syntax (locked)
 
 ```0s
 // Trailing rest only — packs into a dynamic array
-fn sum(int... xs) -> int {   // or: fn sum(...[int] xs)
+fn sum(int... xs) -> int {
     let n = len(xs);
     // ...
 }
@@ -106,28 +104,20 @@ sum(1, 2, 3);           // xs == [1, 2, 3]
 sum();                  // xs == []
 ```
 
-Alternative decl forms (pick one):
+Decl form is `Type... name` as a special `Argument` shape (not a
+general type operator). Works for any element type (`int...`,
+`byte...`, `string...`, etc.).
 
-| Form | Pros | Cons |
-|------|------|------|
-| `int... xs` | Short, C++/JS-familiar | New `...` token in type position |
-| `...[int] xs` | Makes `[int]` explicit | Noisier |
-| `xs: [int]...` | — | Fights existing `Type name` order |
-
-**Recommendation:** `Type... name` as a special `Argument` shape
-(not a general type operator).
-
-### Call-site spread (VERIFY — optional v1)
+### Call-site spread — deferred
 
 ```0s
 let xs = [1, 2, 3];
-sum(...xs);             // unpack array into rest
-sum(0, ...xs, 9);       // if we allow mid-list spread — harder
+sum(...xs);             // NOT in v1
 ```
 
-**Recommendation for v1:** support **decl rest only**; defer call-site
-`...expr` spread (needs runtime arity + copy into the rest array, and
-interacts badly with `CALL`'s compile-time packed arity).
+Decl rest only for now. Call-site `...expr` needs runtime arity +
+copy into the rest array and fights `CALL`'s compile-time packed
+arity.
 
 ### Implementation sketch
 
@@ -177,41 +167,25 @@ if we also want:
 
 ## 3. Let-destructuring
 
-### Your sketch vs alternatives (VERIFY — please pick)
+### Syntax (locked)
 
-You wrote:
-
-```0s
-let a, b = ...(1, 2);
-```
-
-| Option | Example | Fit with today |
-|--------|---------|----------------|
-| **A. Tuple pattern (recommended)** | `let (a, b) = (1, 2);` | Reuses match `Pattern` / `PatternPayload::Tuple` |
-| **B. Bare multi-bind** | `let a, b = (1, 2);` | Needs new Fragment shape; RHS must be tuple |
-| **C. Explicit unpack** | `let a, b = ...(1, 2);` | Invents `...` as unary unpack; clashes with rest/spread meaning |
-| **D. Record pattern** | `let { x, y } = p;` | Reuses record patterns; `p` must be record/dict/enum-record |
-
-**Recommendation: A (+ D in the same phase).**
-
-Reasons against **C**:
-
-1. `...` is the natural token for rest/spread (§2); overloading it as
-   "unpack RHS of let" is confusing.
-2. Match already teaches `(a, b)` / `{ x, y }` patterns — `let` should
-   use the same grammar.
-3. Option A needs almost no new user mental model.
-
-Also allow nested / wildcard / rest-in-pattern later:
+Tuple + record patterns on `let` (same grammar as match irrefutable
+shapes). Rejected: `let a, b = ...(1, 2)` (`...` reserved for rest).
 
 ```0s
-let (a, b) = pair;
-let (head, ...) = xs;          // DEFER — pattern rest
-let Point::Point { x, y } = p; // DEFER or v2 — full constructor patterns in let
-let { x, y } = { x: 1, y: 2 }; // v1 if dict/record
+let (a, b) = (1, 2);
+let (a, _) = t;
+let { x, y } = d;              // Ty::Record / dict
 ```
 
-### v1 scope (recommended)
+Deferred for later:
+
+```0s
+let (head, ...) = xs;          // pattern rest
+let Point::Point { x, y } = p; // enum constructor patterns in let
+```
+
+### v1 scope
 
 ```0s
 let (a, b) = (1, 2);
@@ -265,61 +239,51 @@ Ranges that are either:
 1. **Statically created** — both bounds known at compile time, or
 2. **Lazy** — resolve to a generator / iterator of the element type.
 
-### Recommended surface syntax (VERIFY)
+### Syntax (locked)
 
 ```0s
-0..10        // half-open Range { start: 0, end: 10 }  → 0..9
-0..=10       // closed RangeInclusive                 → 0..10
-a..b         // runtime bounds (same type)
+0..10        // half-open  → yields 0,1,…,9
+0..=10       // closed     → yields 0,1,…,10
+a..b         // runtime bounds (same element type)
 ```
 
 Precedence: `..` / `..=` below comparisons, non-associative
 (reject `a..b..c`).
 
-### Type model (recommended)
+### Element types (locked)
+
+**`int` and `byte` only** in v1. Both bounds must unify to the same
+of those two (`0_byte..10` / annotated byte literals, or plain `int`).
+Floats, strings, generic `Ord` — deferred.
+
+### Type model
 
 ```0s
-// Prelude nominals (compiler-provided, like Iterator), not userland:
-struct Range<T> { start: T, end: T }             // half-open
-struct RangeInclusive<T> { start: T, end: T }
+// Prelude nominals (compiler-provided), not userland:
+// Range<int> / Range<byte> / RangeInclusive<…>
 ```
 
-v1: **`T = int` only** (matches `for_in_custom.0s` Counter).
+Lazy semantics via `IntoIterator` / `Iterator`, **or** a
+`ForInKind::Range` fast path for `for x in 0..n` (preferred for
+perf — no heap iterator).
 
-Lazy semantics:
+### What “static” meant (clarification — not a separate feature)
 
-```0s
-impl IntoIterator for Range<int> { ... }
-impl Iterator for RangeIter { type Item = int; fn next(...) -> Option<int>; }
-```
+Your original ask mentioned ranges that are “statically created **OR**
+resolve to a generator lazily.” That was two possible *implementations*
+of the same syntax, not two user-facing APIs:
 
-So `for x in 0..10 { }` uses existing `ForInKind::Custom` **or** a
-new fast-path `ForInKind::Range` (better perf, no heap iterator — same
-idea as array for-in).
+| Reading | Meaning | Locked choice |
+|---------|---------|---------------|
+| Lazy (always) | `0..n` is a small range value; `for` / `next` pulls one element at a time | **This is v1** |
+| “Static” / eager | Somehow turn `0..5` into the array `[0,1,2,3,4]` up front | **Not implied by `0..n`** |
 
-### "Statically created" — two interpretations
+So: writing `0..1_000_000` must **not** allocate a million-element
+array. A later helper (name TBD — e.g. `collect(0..5)` → `[int]`)
+could materialize when you *ask* for an array. That helper is
+**optional stretch**, not required for ranges to ship.
 
-| Meaning | Proposal |
-|---------|----------|
-| **S1. Const bounds → type-level length** | `0..5` has known length 5; may coerce to `[int; 5]` via explicit `collect` **or** stay a range value whose length is `Static(5)` for OOB-style checks | Optional stretch |
-| **S2. Const bounds → eager array materialization** | `let xs = [0..5];` or `array(0..5)` builds `[0,1,2,3,4]` at compile/runtime | Separate API; don't make `0..5` itself an array |
-
-**Recommendation:** ranges are **always lazy values** (cheap struct /
-iterator). Add an explicit conversion later:
-
-```0s
-let xs = collect(0..5);   // → [int] dynamic, or [int; 5] if const
-```
-
-Do **not** make `0..n` silently allocate an array — that surprises
-anyone writing `for x in 0..1_000_000`.
-
-If you specifically want a static array sugar, prefer a distinct form
-(VERIFY):
-
-```0s
-let xs = [0..5];          // sugar for fixed array fill — DEFER or separate feature
-```
+If you never need “range → array”, we simply never add `collect`.
 
 ### Implementation sketch (lazy int ranges — v1)
 
@@ -345,8 +309,9 @@ not the builtin.
 | Piece | Confidence |
 |-------|------------|
 | Lazy `0..n` / `0..=n` + `for x in` (`ForInKind::Range`) | **high** |
+| `byte` ranges (same codegen, `byte` element type) | **high** (byte is already a 0..=255 immediate) |
 | First-class `Range` value + `Iterator` impl | **high** (pattern already in tree) |
-| Const-length / `[int; N]` materialization | **medium** — defer to stretch |
+| Optional later: materialize range → `[T]` | **medium** — only if needed |
 | `Range<T>` for arbitrary `Ord` / floats / chars | **low** — **defer** |
 | Float ranges with step | **low** — **defer** |
 | Decreasing ranges (`10..0`) without explicit step | Define as empty (Rust-like) in v1 |
@@ -371,13 +336,13 @@ Phase P1 — Let destructuring (tuple + record, irrefutable)
 Phase P2 — Named call-site args (reorder only)
            [high confidence, no VM changes]
 
-Phase P3 — Lazy int ranges (`..` / `..=` + for-in fast path)
+Phase P3 — Lazy `int`/`byte` ranges (`..` / `..=` + for-in fast path)
            [high confidence; docs already list the gap]
 
 Phase P4 — Variadic rest (`Type... name` → `[T]`)
            [medium; do after named so arity rules are settled]
 
-Stretch   — collect(range) / const-length arrays
+Stretch   — optional range→array materialize (only if wanted)
            — call-site spread `...xs`
            — defaults (not in this plan — needs arity + partial-app design)
 ```
@@ -390,24 +355,25 @@ Stretch   — collect(range) / const-length arrays
 | Refutable `let` / `let else` | Needs failure path; use `match` |
 | Mid-list / multi spread | Runtime arity explosion |
 | Generic / float ranges | Low confidence without `Ord` + step story |
+| Call-site `...xs` spread | Deferred by decision |
+| Silent eager array from `0..n` | Surprising; ranges stay lazy |
 
 ---
 
-## Decision checklist (please reply)
+## Locked decisions
 
-Confirm or rewrite each:
+| # | Decision |
+|---|----------|
+| 1 | Named calls: `f(a: 1, b: 2)`; positional prefix then named; no positional after named |
+| 2 | Rest decl: `fn sum(int... xs)` (`Type... name`) |
+| 3 | Call-site `sum(...xs)` spread: **deferred** |
+| 4 | Destructure: `let (a, b) = …` (not `let a, b = ...(… )`) |
+| 5 | Same phase: `let { x, y } = d;` for records/dicts |
+| 6 | Ranges: `a..b` / `a..=b`, elements **`int` or `byte`**, always lazy |
+| 7 | “Static” ≠ auto-array; `0..n` never allocates the full sequence. Optional later materialize helper only if needed — **not required to ship ranges** |
 
-1. **Named calls:** `f(a: 1, b: 2)` with positional-then-named only — OK?
-2. **Rest decl:** `fn sum(int... xs)` vs `fn sum(...[int] xs)` — which?
-3. **Rest at calls:** defer `sum(...xs)` spread — OK?
-4. **Destructure:** prefer `let (a, b) = (1, 2);` over `let a, b = ...(1, 2);` — OK?
-5. **Record let:** include `let { x, y } = d;` in same phase as tuple let — OK?
-6. **Ranges:** half-open `a..b` + closed `a..=b`, int-only, always lazy; no silent array alloc — OK?
-7. **Static ranges:** stretch `collect(0..n)` later, not part of v1 — OK?
-
-Once these are locked, implementation can proceed phase-by-phase with
-HM diagnostics, a minimal example per feature, and docs updates under
-`docs/` as usual.
+Implementation can proceed phase-by-phase with HM diagnostics, a
+minimal example per feature, and docs updates under `docs/`.
 
 ---
 
@@ -415,8 +381,8 @@ HM diagnostics, a minimal example per feature, and docs updates under
 
 | Feature | Ship readiness | Notes |
 |---------|----------------|-------|
-| Named params (call reorder) | Ready to implement | After syntax OK |
-| Let tuple/record destructure | Ready to implement | Prefer pattern syntax A/D |
-| Lazy int ranges + `for` | Ready to implement | Fast-path or Iterator |
-| Variadic rest → `[T]` | Implement after P2 | Medium; keep rules tight |
-| Call-site spread / defaults / generic ranges / unpack `...` let | **Defer** | Low confidence or design conflict |
+| Named params (call reorder) | Ready | Locked |
+| Let tuple/record destructure | Ready | Locked |
+| Lazy `int`/`byte` ranges + `for` | Ready | Locked |
+| Variadic rest → `[T]` | After P2 | Medium; keep rules tight |
+| Call-site spread / defaults / generic ranges / unpack `...` let | **Defer** | By decision or low confidence |
