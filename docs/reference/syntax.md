@@ -475,22 +475,29 @@ These appear in planning docs but are **not** parsed from source today:
 
 ### Ranges (lazy)
 
-Half-open `start..end` and closed `start..=end`, with element type
-**`int` or `byte`** (both bounds the same). A range is a **lazy**
-iterable: `for x in 0..n` pulls one value at a time and does **not**
-allocate an array of length `n`. Decreasing ranges (`10..0`) are empty
-(Rust-like). First-class values work (`let r = 0..n; for x in r`).
+Half-open `start..end` and closed `start..=end` produce
+**`Range<T: Ord>`** / **`RangeInclusive<T: Ord>`** (both bounds unify).
+A range is a **lazy** iterable: `for x in 0..n` pulls one value at a
+time and does **not** allocate an array of length `n`. Decreasing
+ranges (`10..0`) are empty (Rust-like). First-class values work
+(`let r = 0..n; for x in r`).
+
+Construction needs only `Ord`. **`for` iteration** steps with `+1` /
+`+1.0` for `int`, `byte`, and `float` (other `Ord` types may form a
+range value but are not iterable yet).
 
 ```0s
 for x in 0..5 { print "%i", x; }   // 01234
 let r = 0..=3;
 for x in r { print "%i", x; }      // 0123
+for x in 1.0..4.0 { print "%f", x; } // 1.02.03.0
 ```
 
 See `examples/range.0s`.
 
 **Deferred:** turning a range into a concrete array (e.g. a future
-`collect(0..5)` → `[0, 1, 2, 3, 4]`), floats, generic `Ord`, step syntax.
+`collect(0..5)` → `[0, 1, 2, 3, 4]`), step syntax, iterating non-numeric
+`Ord` types.
 
 Full design lock-in: [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md).
 

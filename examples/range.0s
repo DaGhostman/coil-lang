@@ -1,7 +1,8 @@
-// Expected output: 01234012356
+// Expected output: 012340123561.02.03.0
 //
-// Lazy int/byte ranges: half-open `a..b`, closed `a..=b`, first-class
-// values, and byte bounds. Decreasing ranges are empty (Rust-like).
+// Lazy Range<T: Ord>: half-open `a..b`, closed `a..=b`, first-class
+// values, byte/float bounds. Decreasing ranges are empty (Rust-like).
+// Iteration steps by +1 / +1.0 for int/byte/float.
 
 fn main() {
     // Half-open: 0..5 → 0,1,2,3,4
@@ -25,5 +26,10 @@ fn main() {
     let hi: byte = 6;
     for b in lo..=hi {
         print "%i", b;
+    }
+
+    // Float range (Ord + numeric step): 1.0..4.0 → 1.0,2.0,3.0
+    for x in 1.0..4.0 {
+        print "%f", x;
     }
 }

@@ -1302,8 +1302,8 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ### `examples/range.0s`
 
-**Demonstrates:** lazy `int`/`byte` ranges (`0..n`, `0..=n`), first-class
-range values, empty decreasing ranges.
+**Demonstrates:** lazy `Range<T: Ord>` (`0..n`, `0..=n`, float bounds),
+first-class range values, empty decreasing ranges.
 
 | | |
 |---|---|
@@ -1477,7 +1477,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `for_in_tuple.0s` | Collections | `123` |
 | `for_in_dict.0s` | Collections | `12` |
 | `for_in_custom.0s` | Collections / traits | `012` |
-| `range.0s` | Ranges | `01234012356` |
+| `range.0s` | Ranges | `012340123561.02.03.0` |
 
 ## Running tests that mirror examples
 

@@ -2918,18 +2918,22 @@ impl Compiler {
         self.emit_for_in_array_loop(body, binding_name, true, None);
     }
 
-    /// Lazy `int`/`byte` range for-in (Phase P3).
+    /// Lazy range for-in (`int`/`byte`/`float`).
     ///
     /// Fast path when the iterable is a `Range` literal: locals for
     /// `cur`/`end` only — no heap. First-class range values
     /// (`let r = 0..n; for x in r`) are dicts `{start,end,inclusive}`
     /// unpacked via `GetField`.
+    ///
+    /// `float` selects LEF/LEQF/ADDF with step `1.0`; otherwise LE/LEQ/ADD
+    /// with step `1` (shared by `int` and `byte`).
     fn emit_for_in_range(
         &mut self,
         iterable: &Output<'_>,
         body: &Output<'_>,
         binding_name: &str,
         inclusive: bool,
+        float: bool,
     ) {
         let cur_slot = self.alloc_temp_slot();
         let end_slot = self.alloc_temp_slot();
@@ -2985,7 +2989,13 @@ impl Compiler {
             .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
         self.bytecode
             .push(Byte::new(Instruction::LOAD).with_operand_u32(end_slot));
-        self.bytecode.push(Byte::new(if inclusive {
+        self.bytecode.push(Byte::new(if float {
+            if inclusive {
+                Instruction::LEQF
+            } else {
+                Instruction::LEF
+            }
+        } else if inclusive {
             Instruction::LEQ
         } else {
             Instruction::LE
@@ -3017,12 +3027,20 @@ impl Compiler {
             &mut self.bytecode,
             &mut self.constants,
         );
-        // cur = cur + 1
+        // cur = cur + 1  (or + 1.0 for float)
         self.bytecode
             .push(Byte::new(Instruction::LOAD).with_operand_u32(cur_slot));
-        self.bytecode
-            .push(Byte::new(Instruction::CONST).with_const_inline(1));
-        self.bytecode.push(Byte::new(Instruction::ADD));
+        if float {
+            let bits = Value::from(1.0_f64).raw() as u64;
+            let idx = self.intern_constant(bits);
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            self.bytecode.push(Byte::new(Instruction::ADDF));
+        } else {
+            self.bytecode
+                .push(Byte::new(Instruction::CONST).with_const_inline(1));
+            self.bytecode.push(Byte::new(Instruction::ADD));
+        }
         self.bytecode
             .push(Byte::new(Instruction::StorePop).with_operand_u32(cur_slot));
 
@@ -4390,12 +4408,13 @@ impl Compiler {
                         ForInKind::Coroutine => {
                             self.emit_for_in_coro(iterable, body, &binding_name);
                         }
-                        ForInKind::Range { inclusive } => {
+                        ForInKind::Range { inclusive, float } => {
                             self.emit_for_in_range(
                                 iterable,
                                 body,
                                 &binding_name,
                                 inclusive,
+                                float,
                             );
                         }
                         ForInKind::Custom {

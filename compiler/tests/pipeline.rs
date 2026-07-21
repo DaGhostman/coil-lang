@@ -1088,9 +1088,10 @@ fn example_for_in_custom_prints_012() {
 
 #[test]
 fn example_range_prints_01234012356() {
-    // 0..5 → 01234; 0..=3 → 0123; 10..0 empty; byte 5..=6 → 56
+    // 0..5 → 01234; 0..=3 → 0123; 10..0 empty; byte 5..=6 → 56;
+    // float 1.0..4.0 → 1.02.03.0
     let output = run_example("examples/range.0s");
-    assert_eq!(output, "01234012356");
+    assert_eq!(output, "012340123561.02.03.0");
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument

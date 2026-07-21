@@ -1,6 +1,6 @@
 # Feature plan — variadics, named params, let-destructuring, ranges
 
-Status: **implemented** (P1 let-destructure, P2 named args, P3 ranges, P4 rest) — call-site spread still deferred.
+Status: **implemented** (P1 let-destructure, P2 named args, P3 ranges, P4 rest, generic `Range<T: Ord>` + float for-in) — call-site spread still deferred.
 
 This plan covers four related ergonomics features. Decisions below
 reflect user confirmation; see [Locked decisions](#locked-decisions).
@@ -252,15 +252,16 @@ Precedence: `..` / `..=` below comparisons, non-associative
 
 ### Element types (locked)
 
-**`int` and `byte` only** in v1. Both bounds must unify to the same
-of those two (`0_byte..10` / annotated byte literals, or plain `int`).
-Floats, strings, generic `Ord` — deferred.
+**`T: Ord`** for construction (`Range<T>` / `RangeInclusive<T>`). Both
+bounds unify. Builtins with `Ord`: `int`, `byte`, `float`. **`for`
+iteration** steps `+1` / `+1.0` for `int` / `byte` / `float` only;
+other `Ord` types may form values but are not iterable yet.
 
 ### Type model
 
 ```0s
 // Prelude nominals (compiler-provided), not userland:
-// Range<int> / Range<byte> / RangeInclusive<…>
+// Range<T: Ord> / RangeInclusive<T: Ord>
 ```
 
 Lazy semantics via `IntoIterator` / `Iterator`, **or** a
@@ -310,13 +311,13 @@ not the builtin.
 | `byte` ranges (same codegen, `byte` element type) | **high** (byte is already a 0..=255 immediate) |
 | First-class `Range` value + `Iterator` impl | **high** (pattern already in tree) |
 | Optional later: materialize range → `[T]` | **medium** — only if needed |
-| `Range<T>` for arbitrary `Ord` / floats / chars | **low** — **defer** |
-| Float ranges with step | **low** — **defer** |
+| `Range<T: Ord>` construction + float for-in step | **done** (non-numeric Ord for-in still deferred) |
+| Float ranges with custom step | **low** — **defer** |
 | Decreasing ranges (`10..0`) without explicit step | Define as empty (Rust-like) in v1 |
 
 ### Defer
 
-- Generic `Range<T: Ord>`.
+- Iterating non-numeric `Ord` types (needs `Add`/`Step` story).
 - Step syntax (`0..10 step 2`) — use C-style `for` or a `range_step` helper later.
 - Eager `[0..n]` array sugar / range→array materialize (only if ever needed).
 - Infinite ranges / open-ended `0..`.
@@ -352,7 +353,7 @@ Stretch   — optional range→array materialize (only if wanted)
 | Default parameter values | Needs call-arity lowering + interaction with partial application; design not locked |
 | Refutable `let` / `let else` | Needs failure path; use `match` |
 | Mid-list / multi spread | Runtime arity explosion |
-| Generic / float ranges | Low confidence without `Ord` + step story |
+| Custom-step / non-numeric Ord for-in | Needs `Add`/`Step` story |
 | Call-site `...xs` spread | Deferred by decision |
 | Silent eager array from `0..n` | Surprising; ranges stay lazy |
 

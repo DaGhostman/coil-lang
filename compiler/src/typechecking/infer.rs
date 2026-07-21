@@ -69,8 +69,10 @@ pub enum ForInKind {
     Dict,
     /// Resume/Done loop (completion value excluded from body).
     Coroutine,
-    /// Lazy `int`/`byte` range counter loop (`0..n` / `0..=n`).
-    Range { inclusive: bool },
+    /// Lazy range counter loop (`0..n` / `0..=n`).
+    /// `float` selects LEF/LEQF/ADDF + step `1.0`; otherwise int/byte
+    /// opcodes (LE/LEQ/ADD + step `1`).
+    Range { inclusive: bool, float: bool },
     /// Dictionary ABI: `into_iter` then `next` → `Option<Item>`.
     Custom {
         into_iter_fqn: String,
@@ -4072,7 +4074,7 @@ impl Checker {
         boolean()
     }
 
-    /// Lazy `start..end` / `start..=end` — bounds must unify to `int` or `byte`.
+    /// Lazy `start..end` / `start..=end` — bounds unify to `T` with `T: Ord`.
     fn infer_range(
         &mut self,
         start: &Output,
@@ -4096,47 +4098,69 @@ impl Checker {
             );
         }
         let elem = self.unify(&st, &et, &range, "range bounds");
-        let pruned = apply_ty_prune(&self.subst, &elem);
-        let ok = matches!(&pruned, Ty::Con(n) if n == "int" || n == "byte")
-            || matches!(&pruned, Ty::Var(_));
-        if !ok {
-            let _ = self.error_with_help(
-                ErrorCode::GenericTypeError,
-                format!(
-                    "range bounds must be `int` or `byte`, found `{}`",
-                    pruned
-                ),
-                range.clone(),
-                Some("both ends of `a..b` / `a..=b` must share type `int` or `byte`".to_string()),
-            );
+        if !self.require_ord_for_range(&elem, &range) {
             return if inclusive {
                 range_inclusive_ty(Ty::Var(self.counter.fresh()))
             } else {
                 range_ty(Ty::Var(self.counter.fresh()))
             };
         }
-        // Pin open vars to `int` when neither bound constrains further
-        // (literals typically already unify to int).
-        if matches!(&pruned, Ty::Var(_)) {
-            let _ = self.unify(&elem, &int(), &range, "range element type");
-        }
         let elem = apply_ty_prune(&self.subst, &elem);
-        // After pin, reject non-int/byte (e.g. float that slipped through).
-        if !matches!(&elem, Ty::Con(n) if n == "int" || n == "byte") {
-            let _ = self.error_with_help(
-                ErrorCode::GenericTypeError,
-                format!(
-                    "range bounds must be `int` or `byte`, found `{}`",
-                    elem
-                ),
-                range,
-                Some("both ends of `a..b` / `a..=b` must share type `int` or `byte`".to_string()),
-            );
-        }
         if inclusive {
             range_inclusive_ty(elem)
         } else {
             range_ty(elem)
+        }
+    }
+
+    /// Ensure range element type satisfies `Ord` (instance or active bound).
+    /// Unconstrained free type variables default to `int` (has `Ord`).
+    fn require_ord_for_range(&mut self, elem: &Ty, range: &Range<usize>) -> bool {
+        let pruned = apply_ty_prune(&self.subst, elem);
+        match &pruned {
+            Ty::Var(v) => {
+                if self.user_dict_index(*v, "Ord").is_none() {
+                    self.bind_matching_abstract_constraints(Some(*v), "Ord");
+                }
+                if self.user_dict_index(*v, "Ord").is_some() {
+                    return true;
+                }
+                let in_scope = self
+                    .type_params_in_scope
+                    .iter()
+                    .any(|frame| frame.values().any(|&id| id == *v));
+                if in_scope {
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "range bounds require bound `Ord`".to_string(),
+                        range.clone(),
+                        Some(
+                            "add a `T: Ord` bound, or use a concrete ordered type (`int`, `byte`, `float`)"
+                                .to_string(),
+                        ),
+                    );
+                    return false;
+                }
+                // Free var — pin to int (literals / unconstrained inference).
+                let _ = self.unify(elem, &int(), range, "range element type");
+                true
+            }
+            other => {
+                if self.generics.has_instance("Ord", other) {
+                    true
+                } else {
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("range bounds require `T: Ord`, found `{}`", other),
+                        range.clone(),
+                        Some(
+                            "both ends of `a..b` / `a..=b` must share a type that implements `Ord`"
+                                .to_string(),
+                        ),
+                    );
+                    false
+                }
+            }
         }
     }
 
@@ -10095,22 +10119,56 @@ impl Checker {
                     return Some((args[0].clone(), ForInKind::Coroutine));
                 }
                 if matches!(head.as_ref(), Ty::Con(n) if n == "Range") && args.len() == 1 {
-                    return Some((
-                        args[0].clone(),
-                        ForInKind::Range { inclusive: false },
-                    ));
+                    return self.range_for_in_kind(&args[0], false, range);
                 }
                 if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1
                 {
-                    return Some((
-                        args[0].clone(),
-                        ForInKind::Range { inclusive: true },
-                    ));
+                    return self.range_for_in_kind(&args[0], true, range);
                 }
                 None
             }
             _ => None,
         }
+    }
+
+    /// `for` over `Range<T>` / `RangeInclusive<T>` — iteration needs a
+    /// stepped numeric element (`int` / `byte` / `float`). Construction
+    /// only requires `Ord`; non-steppable Ord types get a diagnostic.
+    fn range_for_in_kind(
+        &mut self,
+        elem: &Ty,
+        inclusive: bool,
+        range: &Range<usize>,
+    ) -> Option<(Ty, ForInKind)> {
+        let elem = apply_ty_prune(&self.subst, elem);
+        let float = match &elem {
+            Ty::Con(n) if n == "float" => true,
+            Ty::Con(n) if n == "int" || n == "byte" => false,
+            other => {
+                let _ = self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!("cannot iterate over `Range<{}>`", other),
+                    range.clone(),
+                    Some(
+                        "`for` over a range requires element type `int`, `byte`, or `float` \
+                         (construction only needs `Ord`; stepping needs a numeric successor)"
+                            .to_string(),
+                    ),
+                );
+                // Recovery: int-style opcodes so codegen still emits.
+                return Some((
+                    elem,
+                    ForInKind::Range {
+                        inclusive,
+                        float: false,
+                    },
+                ));
+            }
+        };
+        Some((
+            elem,
+            ForInKind::Range { inclusive, float },
+        ))
     }
 
     /// All types unify to one element type, or diagnose heterogeneity.
@@ -13509,13 +13567,79 @@ fn main() {
     }
 
     #[test]
-    fn range_rejects_float_bounds() {
+    fn range_accepts_float_bounds() {
         let (c, _) = check("fn main() { let r = 1.0..2.0; }");
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_ty(float())
+        );
+    }
+
+    #[test]
+    fn range_rejects_string_bounds_without_ord() {
+        let (c, _) = check(r#"fn main() { let r = "a".."z"; }"#);
         assert!(
             c.messages()
                 .iter()
-                .any(|m| m.message().contains("int") || m.message().contains("byte")),
-            "expected range bound type error, got {:?}",
+                .any(|m| m.message().contains("Ord")),
+            "expected Ord requirement diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn range_generic_ord_bound_constructs_range_t() {
+        let src = r#"
+fn span<T: Ord>(T a, T b) -> Range<T> {
+    return a..b;
+}
+fn main() {
+    let r = span(0, 5);
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_ty(int())
+        );
+    }
+
+    #[test]
+    fn range_generic_without_ord_is_diagnostic() {
+        let src = r#"
+fn span<T>(T a, T b) -> Range<T> {
+    return a..b;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("Ord")),
+            "expected Ord bound diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn for_in_range_rejects_non_numeric_ord_element() {
+        // Construction of Range<string> already fails (no Ord). Drive the
+        // for-in diagnostic via a generic Ord type that isn't steppable.
+        let src = r#"
+fn dump<T: Ord>(T a, T b) {
+    for x in a..b { }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("cannot iterate")),
+            "expected non-steppable range for-in diagnostic, got {:?}",
             c.messages()
         );
     }
