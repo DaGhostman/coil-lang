@@ -974,22 +974,6 @@ impl Compiler {
         }
     }
 
-    /// Reorder call-site args into declaration order when any arg is named.
-    ///
-    /// Returns references to the *value* expressions (NamedArg wrappers
-    /// stripped). Positional-only calls keep source order.
-    ///
-    /// For rest functions (`T... xs`), returns only the fixed prefix —
-    /// use [`emit_call_args_with_rest`] for full packing.
-    fn reorder_call_args_for_codegen<'a>(
-        &self,
-        fn_name: &str,
-        args: &'a [Output<'a>],
-    ) -> Vec<&'a Output<'a>> {
-        let (fixed, _rest, _pack) = self.split_call_args_for_rest(fn_name, args);
-        fixed
-    }
-
     /// Split call args into fixed formals + rest elements (P4).
     ///
     /// Returns `(fixed, rest_elems, pack_rest)`. When `pack_rest` is true,
@@ -2683,12 +2667,18 @@ impl Compiler {
         let mut overrides = HashMap::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
             for child in children {
-                if let Expression::Argument(ty, name, _is_rest) = child.1.as_ref()
+                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref()
                     && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
                         ty.1.as_ref()
                     && let Some(concrete) = type_param_tys.get(tp_name)
                 {
-                    overrides.insert(name.to_string(), concrete.clone());
+                    // Rest formals are packed arrays at runtime (`MakeArray`).
+                    let ty = if *is_rest {
+                        crate::typechecking::ty::array(concrete.clone())
+                    } else {
+                        concrete.clone()
+                    };
+                    overrides.insert(name.to_string(), ty);
                 }
             }
         }
@@ -2697,11 +2687,32 @@ impl Compiler {
 
     fn mono_call_offset(&self, fn_name: &str, args: Option<&Vec<Output<'_>>>) -> Option<usize> {
         let args = args?;
-        let ordered = self.reorder_call_args_for_codegen(fn_name, args);
-        let arg_types = ordered
-            .iter()
-            .map(|arg| monomorphize::ground_type_name(&self.checker, arg))
-            .collect::<Option<Vec<_>>>()?;
+        // Keep keying in sync with `monomorphize::candidate_for_call`: one
+        // ground type per formal, with rest contributing its *element* type.
+        let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
+        let mut arg_types = Vec::with_capacity(fixed.len() + usize::from(pack_rest));
+        for arg in &fixed {
+            arg_types.push(monomorphize::ground_type_name(&self.checker, arg)?);
+        }
+        if pack_rest {
+            if rest.is_empty() {
+                // Empty rest: only match when a fixed formal already pinned T.
+                // Without a rest element we can't invent a ground type here;
+                // specializations with empty rest still key the rest slot from
+                // subst — look up by trying each specialization's arg_types
+                // prefix match below via exact equality, so require the rest
+                // element type from the first fixed arg that shares the rest
+                // type param. Fallback: skip mono (shared body).
+                return None;
+            }
+            let elem = monomorphize::ground_type_name(&self.checker, rest[0])?;
+            for arg in rest.iter().skip(1) {
+                if monomorphize::ground_type_name(&self.checker, arg)? != elem {
+                    return None;
+                }
+            }
+            arg_types.push(elem);
+        }
         let spec = self
             .mono_plan
             .specialization_for_call(fn_name, &arg_types)?;

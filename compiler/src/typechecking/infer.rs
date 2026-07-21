@@ -163,6 +163,12 @@ pub struct Checker {
     /// names stay in the flat map (codegen runs after check_program).
     codegen_var_types_scopes: Vec<std::collections::HashMap<String, Option<Ty>>>,
 
+    /// Names bound as parameters (or `self`) in the current function.
+    /// Block overlays restore these on pop even when no outer *block*
+    /// introduced them — without treating flat-map leftovers from other
+    /// functions as restore-worthy (PolyFn `let f = id`).
+    fn_codegen_baselines: Vec<std::collections::HashSet<String>>,
+
     /// Declaration-order parameter names for each function, keyed by the
     /// same name used at call resolution (simple name for free functions,
     /// `Owner::method` for inherent methods). Used to reorder named
@@ -443,6 +449,7 @@ impl Checker {
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
             codegen_var_types_scopes: Vec::new(),
+            fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
             fn_has_rest: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
@@ -858,6 +865,7 @@ impl Checker {
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
         self.codegen_var_types_scopes.clear();
+        self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
         self.fn_has_rest.clear();
         self.call_site_dicts.clear();
@@ -1042,9 +1050,12 @@ impl Checker {
 
     /// Record a binding's type for codegen. Inside a `{ … }` block overlay,
     /// remember the previous flat-map entry so [`pop_block_codegen_scope`]
-    /// can restore shadows — but only when an *outer block in this nesting*
-    /// already introduced the name. Flat-map leftovers from other functions
-    /// must not be restored (that would revive `apply_id`'s `f` over `let f = id`).
+    /// can restore shadows when:
+    /// - an *outer block in this nesting* already introduced the name, or
+    /// - the name is a parameter/`self` in the current function baseline.
+    ///
+    /// Flat-map leftovers from other functions must not be restored (that
+    /// would revive `apply_id`'s `f` over `let f = id` in `main`).
     fn record_codegen_var_type(&mut self, name: String, ty: Ty) {
         if !self.codegen_var_types_scopes.is_empty() {
             let save = {
@@ -1054,7 +1065,11 @@ impl Checker {
                     .rev()
                     .skip(1)
                     .any(|frame| frame.contains_key(&name));
-                if outer_introduced {
+                let in_fn_baseline = self
+                    .fn_codegen_baselines
+                    .last()
+                    .is_some_and(|b| b.contains(&name));
+                if outer_introduced || in_fn_baseline {
                     self.codegen_var_types.get(&name).cloned()
                 } else {
                     None
@@ -7499,16 +7514,21 @@ impl Checker {
             .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
 
         self.push_scope();
+        let mut baseline = std::collections::HashSet::new();
         if let Some(self_ty) = self_ty {
             // Method receiver — side-table for codegen Access/Call.
             self.record_codegen_var_type("self".to_string(), self_ty.clone());
+            baseline.insert("self".to_string());
         }
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
             self.record_codegen_var_type(arg_name.clone(), arg_ty.clone());
+            baseline.insert(arg_name.clone());
         }
+        self.fn_codegen_baselines.push(baseline);
         let _ = self.infer(body);
+        self.fn_codegen_baselines.pop();
         self.pop_scope();
 
         if is_coro {

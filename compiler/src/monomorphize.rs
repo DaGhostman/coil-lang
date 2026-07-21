@@ -70,7 +70,10 @@ impl MonoPlan {
 struct GenericFnSig {
     type_params: Vec<String>,
     type_param_bounds: Vec<Vec<String>>,
+    /// For each formal: which type-parameter index it references (if any).
     param_type_params: Vec<Option<usize>>,
+    /// Parallel to `param_type_params`: true when the formal is `T... name`.
+    param_is_rest: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,10 +144,12 @@ fn signature_from_function(type_params: &[TypeParam<'_>], args: &Output) -> Gene
         .collect::<Vec<_>>();
 
     let mut param_type_params = Vec::new();
+    let mut param_is_rest = Vec::new();
     if let Expression::Fragment(children) = args.1.as_ref() {
         for child in children {
-            if let Expression::Argument(ty, _, _) = child.1.as_ref() {
+            if let Expression::Argument(ty, _, is_rest) = child.1.as_ref() {
                 param_type_params.push(type_param_ref_index(ty, &type_param_names));
+                param_is_rest.push(*is_rest);
             }
         }
     }
@@ -153,6 +158,7 @@ fn signature_from_function(type_params: &[TypeParam<'_>], args: &Output) -> Gene
         type_params: type_param_names,
         type_param_bounds,
         param_type_params,
+        param_is_rest,
     }
 }
 
@@ -221,22 +227,80 @@ fn candidate_for_call(
     }
 
     let args = args.unwrap_or(&[]);
-    if args.len() != sig.param_type_params.len() {
+    // Named call args need the same reorder/pack as codegen; skip for MVP.
+    if args
+        .iter()
+        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)))
+    {
+        return None;
+    }
+
+    let has_rest = sig.param_is_rest.last().copied().unwrap_or(false);
+    let fixed_count = if has_rest {
+        sig.param_type_params.len().saturating_sub(1)
+    } else {
+        sig.param_type_params.len()
+    };
+
+    if !has_rest {
+        if args.len() != sig.param_type_params.len() {
+            return None;
+        }
+    } else if args.len() < fixed_count {
         return None;
     }
 
     let mut subst: Vec<Option<String>> = vec![None; sig.type_params.len()];
-    let mut arg_types = Vec::with_capacity(args.len());
-    for (arg, tp_idx) in args.iter().zip(sig.param_type_params.iter()) {
-        let arg_ty = ground_type_name(checker, arg)?;
+    let mut arg_types = Vec::with_capacity(sig.param_type_params.len());
+
+    let bind = |subst: &mut [Option<String>], tp_idx: Option<usize>, arg_ty: &str| -> Option<()> {
         if let Some(tp_idx) = tp_idx {
-            match &subst[*tp_idx] {
-                Some(existing) if existing != &arg_ty => return None,
+            match &subst[tp_idx] {
+                Some(existing) if existing != arg_ty => return None,
                 Some(_) => {}
-                None => subst[*tp_idx] = Some(arg_ty.clone()),
+                None => subst[tp_idx] = Some(arg_ty.to_string()),
             }
         }
-        arg_types.push(arg_ty);
+        Some(())
+    };
+
+    if !has_rest {
+        for (arg, tp_idx) in args.iter().zip(sig.param_type_params.iter()) {
+            let arg_ty = ground_type_name(checker, arg)?;
+            bind(&mut subst, *tp_idx, &arg_ty)?;
+            arg_types.push(arg_ty);
+        }
+    } else {
+        let (fixed_args, rest_args) = args.split_at(fixed_count);
+        for (arg, tp_idx) in fixed_args
+            .iter()
+            .zip(sig.param_type_params.iter().take(fixed_count))
+        {
+            let arg_ty = ground_type_name(checker, arg)?;
+            bind(&mut subst, *tp_idx, &arg_ty)?;
+            arg_types.push(arg_ty);
+        }
+
+        // One key slot per rest formal: the *element* ground type (not the
+        // packed `[T]` / `[T; N]`), matching `mono_call_offset`.
+        let rest_tp = sig.param_type_params.get(fixed_count).copied().flatten();
+        if rest_args.is_empty() {
+            // Empty rest: T must already be pinned by a fixed formal.
+            let elem = rest_tp.and_then(|i| subst[i].clone())?;
+            arg_types.push(elem);
+        } else {
+            let mut elem_ty: Option<String> = None;
+            for arg in rest_args {
+                let t = ground_type_name(checker, arg)?;
+                match &elem_ty {
+                    None => elem_ty = Some(t.clone()),
+                    Some(prev) if prev != &t => return None,
+                    _ => {}
+                }
+                bind(&mut subst, rest_tp, &t)?;
+            }
+            arg_types.push(elem_ty?);
+        }
     }
 
     let subst = subst.into_iter().collect::<Option<Vec<_>>>()?;
@@ -621,6 +685,20 @@ mod tests {
         assert_eq!(plan.specializations[0].key.subst, vec!["int"]);
         assert_eq!(plan.specializations[0].arg_types, vec!["int", "int"]);
         assert_eq!(plan.retargets.len(), 1);
+    }
+
+    #[test]
+    fn plans_rest_only_num_generic_with_element_arg_type() {
+        // Rest-only formals pack at the call site; the mono key uses the
+        // *element* ground type (one slot per formal), not the packed array.
+        let plan = plan(
+            "fn twice_first<T: Num>(T... xs) -> T { return xs[0] + xs[0]; } \
+             fn main() { print \"%i\", twice_first(21); }",
+        );
+        assert_eq!(plan.specializations.len(), 1);
+        assert_eq!(plan.specializations[0].key.fn_name, "twice_first");
+        assert_eq!(plan.specializations[0].key.subst, vec!["int"]);
+        assert_eq!(plan.specializations[0].arg_types, vec!["int"]);
     }
 
     #[test]

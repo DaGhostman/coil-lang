@@ -1317,6 +1317,35 @@ fn main() {
     assert_eq!(output, "1");
 }
 
+/// Rest-only Num generic must monomorphize (not print a boxed heap pointer).
+#[test]
+fn generic_rest_only_num_call_monomorphizes_and_prints() {
+    let output = run_example_src(
+        r#"
+fn twice_first<T: Num>(T... xs) -> T { return xs[0] + xs[0]; }
+fn main() { print "%i", twice_first(21); }
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+/// Shadowing a function parameter inside a block must restore Access typing.
+#[test]
+fn block_shadow_of_param_restores_access_field_type() {
+    let output = run_example_src(
+        r#"
+enum A { A { z: int, x: int }, }
+enum B { B { y: int }, }
+fn foo(A a) {
+  { let a = B::B { y: 7 }; }
+  print "%i", a.x;
+}
+fn main() { foo(A::A { z: 10, x: 42 }); }
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
 /// Half-open vs inclusive endpoints: `0..1` yields only 0; `0..=1` yields 0,1.
 #[test]
 fn range_half_open_excludes_end_inclusive_includes_end() {
