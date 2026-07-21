@@ -205,15 +205,21 @@ See [Modules reference](modules.md).
 ### Extern (FFI)
 
 ```
-extern_block ::= 'extern' STRING '{' extern_fn* '}'
-extern_fn    ::= 'fn' IDENT arg_list ('->' IDENT)? ';'
+extern_block    ::= 'extern' STRING '{' extern_fn* '}'
+extern_fn       ::= 'fn' IDENT extern_arg_list ('->' type)? ';'
+extern_arg_list ::= '(' (T name (',' T name)* (',' '...')? | '...')? ')'
 ```
+
+Fixed parameters use `T name` (same as ordinary FFI args). A trailing bare
+`...` marks C-style varargs (`printf`-style). Language rest `T... name` is
+rejected inside `extern` — use bare `...` instead.
 
 Example:
 
 ```0s
 extern "c" {
     fn strlen(string s) -> int;
+    fn printf(string fmt, ...) -> int;
 }
 ```
 

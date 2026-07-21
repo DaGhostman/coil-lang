@@ -1062,6 +1062,28 @@ fn main() {
 
 ---
 
+### `examples/ffi_printf.0s`
+
+**Demonstrates:** C-style varargs — bare `...` on an `extern` declaration (`printf`-style). Not language rest `T... xs`.
+
+```0s
+extern "c" {
+    fn printf(string fmt, ...) -> int;
+}
+
+fn main() {
+    printf("hello %i", 42);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/ffi_printf.0s` |
+| **Output** | `hello 42` |
+| **Requires** | Platform C library via `extern "c"` |
+
+---
+
 ### `examples/ffi_sum.0s`
 
 **Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result<_, Error>`; unwrap with `match` (or `?`). Check `e.kind` for typed recovery.
@@ -1460,6 +1482,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `src/foo/sadge.0s` | Modules | (support file) |
 | `src/foo.0s` | Modules | (support file) |
 | `strlen.0s` | FFI | `5` |
+| `ffi_printf.0s` | FFI | `hello 42` |
 | `ffi_sum.0s` | FFI | `42` |
 | `ffi_struct_ret.0s` | FFI | `34` |
 | `ffi_callback_ret.0s` | FFI | `1` |

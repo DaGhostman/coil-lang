@@ -261,6 +261,22 @@ pub struct Checker {
     /// subsequent `invoke(..., id, ...)` can refine its result type.
     ffi_fn_ret_tys: HashMap<String, Ty>,
 
+    /// Whether `let id = declare(..., ret, variadic)` marked the binding as C varargs.
+    ffi_fn_variadic: HashMap<String, bool>,
+
+    /// Fixed-prefix arity (`nfixed`) for variadic `declare` bindings.
+    ffi_fn_nfixed: HashMap<String, usize>,
+
+    /// Extern functions declared with bare `...` (C varargs).
+    extern_variadic: HashSet<String>,
+
+    /// Fixed-prefix arity for [`Self::extern_variadic`] entries.
+    extern_variadic_nfixed: HashMap<String, usize>,
+
+    /// Per-call-site FFI type tags for variadic FFI invokes (keyed by call span).
+    /// Used by codegen because runtime `Value`s are untagged.
+    variadic_call_arg_tags: HashMap<(usize, usize), Vec<(u32, u32)>>,
+
     /// Enclosing function is in Result mode: bare `return` wraps `Ok`,
     /// `raise` produces `Err`. Holds `(Ok_ty, Err_ty)`.
     fn_result_mode: Option<(Ty, Ty)>,
@@ -455,6 +471,11 @@ impl Checker {
             c_structs: Vec::new(),
             callback_sigs: Vec::new(),
             ffi_fn_ret_tys: HashMap::new(),
+            ffi_fn_variadic: HashMap::new(),
+            ffi_fn_nfixed: HashMap::new(),
+            extern_variadic: HashSet::new(),
+            extern_variadic_nfixed: HashMap::new(),
+            variadic_call_arg_tags: HashMap::new(),
             fn_result_mode: None,
             fn_option_mode: None,
             result_mode_fns: HashSet::new(),
@@ -861,6 +882,11 @@ impl Checker {
         self.c_structs.clear();
         self.callback_sigs.clear();
         self.ffi_fn_ret_tys.clear();
+        self.ffi_fn_variadic.clear();
+        self.ffi_fn_nfixed.clear();
+        self.extern_variadic.clear();
+        self.extern_variadic_nfixed.clear();
+        self.variadic_call_arg_tags.clear();
         self.pending_exhaustive.clear();
         self.async_functions.clear();
         self.async_depth = 0;
@@ -1492,17 +1518,25 @@ impl Checker {
                     } else {
                         Vec::new()
                     };
+                    let nfixed = arg_tys.len();
                     let ret_ty = decl
                         .returns
                         .as_ref()
                         .map(|r| self.parse_type_name(r))
                         .unwrap_or_else(unit_ty);
+                    // Register the fixed-prefix function type (extra `...` args
+                    // are accepted at call sites via `extern_variadic`).
                     let fn_ty = arg_tys
                         .iter()
                         .rev()
                         .fold(ret_ty, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)));
                     self.env
                         .insert_top(decl.name.to_string(), Scheme::mono(fn_ty));
+                    if decl.variadic {
+                        self.extern_variadic.insert(decl.name.to_string());
+                        self.extern_variadic_nfixed
+                            .insert(decl.name.to_string(), nfixed);
+                    }
                 }
                 unit_ty()
             }
@@ -2241,6 +2275,17 @@ impl Checker {
                         );
                     }
                 };
+
+                // C-varargs extern: accept `>= nfixed` args; only unify the fixed prefix.
+                if self.extern_variadic.contains(ident.as_str()) {
+                    return self.apply_extern_variadic_call(
+                        &ident,
+                        &fun_ty,
+                        &arg_tys,
+                        args.as_deref(),
+                        range,
+                    );
+                }
 
                 let result = self.apply_function(
                     Some(&ident),
@@ -3924,10 +3969,21 @@ impl Checker {
                                 _ => None,
                             };
                             if let Some(dargs) = declare_args
-                                && dargs.len() == 4
+                                && (dargs.len() == 4 || dargs.len() == 5)
                             {
                                 let ret = self.ty_from_ffi_type_expr(&dargs[3]);
                                 self.ffi_fn_ret_tys.insert(name.to_string(), ret);
+                                let nfixed = match dargs[2].1.as_ref() {
+                                    Expression::Tuple(items) => items.len(),
+                                    _ => 0,
+                                };
+                                let variadic = if dargs.len() == 5 {
+                                    matches!(dargs[4].1.as_ref(), Expression::Bool(true))
+                                } else {
+                                    false
+                                };
+                                self.ffi_fn_variadic.insert(name.to_string(), variadic);
+                                self.ffi_fn_nfixed.insert(name.to_string(), nfixed);
                             }
                             i += 1;
                         }
@@ -4623,6 +4679,141 @@ impl Checker {
             }
         }
         current
+    }
+
+    /// Apply a C-varargs extern call: unify the fixed prefix, accept extra
+    /// FFI-marshallable args, and record per-arg tags for codegen.
+    fn apply_extern_variadic_call(
+        &mut self,
+        name: &str,
+        fun_ty: &Ty,
+        arg_tys: &[Ty],
+        arg_exprs: Option<&[Output]>,
+        range: Range<usize>,
+    ) -> Ty {
+        let nfixed = self
+            .extern_variadic_nfixed
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| Self::fun_arity(fun_ty));
+        if arg_tys.len() < nfixed {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Function `{}` was called with too few arguments \
+                     (variadic; expects at least {}, got {})",
+                    name,
+                    nfixed,
+                    arg_tys.len()
+                ),
+                range,
+                Some("provide the fixed parameters before any `...` arguments".to_string()),
+            );
+        }
+        for (i, ty) in arg_tys.iter().enumerate().skip(nfixed) {
+            if !Self::is_ffi_marshallable_ty(ty) {
+                let span = arg_exprs
+                    .and_then(|a| a.get(i))
+                    .map(|e| e.0.into_range())
+                    .unwrap_or_else(|| range.clone());
+                let mut m = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "variadic FFI argument #{} has non-marshallable type `{}`",
+                        i + 1,
+                        apply_ty_prune(&self.subst, ty)
+                    ),
+                    span.clone(),
+                );
+                m.push(Label::new(
+                    "expected int, float, string, bool, or pointer-like".to_string(),
+                    span,
+                ));
+                self.messages.push(m);
+            }
+        }
+        let fixed = &arg_tys[..nfixed];
+        let fixed_exprs = arg_exprs.map(|a| &a[..nfixed.min(a.len())]);
+        let ret = self.apply_function(Some(name), fun_ty, fixed, fixed_exprs, None, range.clone());
+        let tags: Vec<(u32, u32)> = arg_tys
+            .iter()
+            .map(|ty| Self::ffi_tag_from_ty_static(&apply_ty_prune(&self.subst, ty)))
+            .collect();
+        self.variadic_call_arg_tags
+            .insert((range.start, range.end), tags);
+        ret
+    }
+
+    fn fun_arity(ty: &Ty) -> usize {
+        let mut n = 0;
+        let mut cur = ty;
+        while let Ty::Fun(_, ret) = cur {
+            n += 1;
+            cur = ret.as_ref();
+        }
+        n
+    }
+
+    fn is_ffi_marshallable_ty(ty: &Ty) -> bool {
+        match ty {
+            Ty::Con(n) => matches!(
+                n.to_ascii_lowercase().as_str(),
+                "int"
+                    | "float"
+                    | "string"
+                    | "bool"
+                    | "byte"
+                    | "void"
+                    | "int8"
+                    | "int16"
+                    | "int32"
+                    | "uint8"
+                    | "uint16"
+                    | "uint32"
+                    | "uint64"
+                    | "ptr"
+            ),
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Record { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn ffi_tag_from_ty_static(ty: &Ty) -> (u32, u32) {
+        use common::tag;
+        match ty {
+            Ty::Con(n) => match n.to_ascii_lowercase().as_str() {
+                "float" => (tag::FLOAT, 0),
+                "string" => (tag::STRING, 0),
+                "bool" => (tag::BOOL, 0),
+                "byte" | "uint8" => (tag::UINT8, 0),
+                "int8" => (tag::INT8, 0),
+                "int16" => (tag::INT16, 0),
+                "int32" => (tag::INT32, 0),
+                "uint16" => (tag::UINT16, 0),
+                "uint32" => (tag::UINT32, 0),
+                "uint64" => (tag::UINT64, 0),
+                "ptr" => (tag::PTR, 0),
+                "void" => (tag::VOID, 0),
+                _ => (tag::INT, 0),
+            },
+            Ty::Array { .. } | Ty::Tuple(_) => (tag::PTR, 0),
+            _ => (tag::INT, 0),
+        }
+    }
+
+    /// Whether `name` is an `extern` function declared with C `...`.
+    pub fn is_extern_variadic(&self, name: &str) -> bool {
+        self.extern_variadic.contains(name)
+    }
+
+    /// Whether a `declare` binding was marked variadic.
+    pub fn is_ffi_declare_variadic(&self, binding: &str) -> bool {
+        self.ffi_fn_variadic.get(binding).copied().unwrap_or(false)
+    }
+
+    /// Per-arg FFI tags recorded for a variadic call/invoke at `span`.
+    pub fn variadic_arg_tags_at(&self, span: (usize, usize)) -> Option<&[(u32, u32)]> {
+        self.variadic_call_arg_tags.get(&span).map(|v| v.as_slice())
     }
 
     fn apply_existential_method(
@@ -6532,7 +6723,7 @@ impl Checker {
                 Some("import it with `use ffi::declare;` or `use ffi::*;`".to_string()),
             );
         }
-        if args.len() == 4 {
+        if args.len() == 4 || args.len() == 5 {
             self.infer(&args[0]);
             self.infer(&args[1]);
             match args[2].1.as_ref() {
@@ -6555,13 +6746,23 @@ impl Checker {
                 }
             }
             self.infer_ffi_type_expr(&args[3]);
+            if args.len() == 5 {
+                let flag_ty = self.infer(&args[4]);
+                self.unify(
+                    &flag_ty,
+                    &boolean(),
+                    &args[4].0.into_range(),
+                    "declare variadic flag",
+                );
+            }
         } else {
             for arg in args {
                 self.infer(arg);
             }
             let mut m = Message::error(
                 ErrorCode::DeclareArity,
-                "declare requires 4 arguments (lib, name, args_tuple, ret_type)".to_string(),
+                "declare requires 4 or 5 arguments (lib, name, args_tuple, ret_type[, variadic])"
+                    .to_string(),
                 range.clone(),
             );
             m.push(Label::new(
@@ -6584,18 +6785,46 @@ impl Checker {
             );
         }
         let mut ret_ty = int();
+        let mut variadic = false;
+        let mut nfixed = 0usize;
         if args.len() == 3 {
             self.infer(&args[0]);
             self.infer(&args[1]);
-            if let Expression::Identifier(name) = args[1].1.as_ref()
-                && let Some(ty) = self.ffi_fn_ret_tys.get(*name)
-            {
-                ret_ty = ty.clone();
+            if let Expression::Identifier(name) = args[1].1.as_ref() {
+                if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
+                    ret_ty = ty.clone();
+                }
+                variadic = self.ffi_fn_variadic.get(*name).copied().unwrap_or(false);
+                nfixed = self.ffi_fn_nfixed.get(*name).copied().unwrap_or(0);
             }
             match args[2].1.as_ref() {
                 Expression::Tuple(items) => {
+                    let mut tags = Vec::with_capacity(items.len());
                     for item in items {
-                        self.infer(item);
+                        let ty = self.infer(item);
+                        tags.push(Self::ffi_tag_from_ty_static(&apply_ty_prune(
+                            &self.subst, &ty,
+                        )));
+                    }
+                    if variadic {
+                        if items.len() < nfixed {
+                            let mut m = Message::error(
+                                ErrorCode::InvokeArity,
+                                format!(
+                                    "variadic invoke expects at least {} argument(s), got {}",
+                                    nfixed,
+                                    items.len()
+                                ),
+                                args[2].0.into_range(),
+                            );
+                            m.push(Label::new(
+                                "provide the fixed prefix plus any `...` arguments".to_string(),
+                                args[2].0.into_range(),
+                            ));
+                            self.messages.push(m);
+                        }
+                        self.variadic_call_arg_tags
+                            .insert((range.start, range.end), tags);
                     }
                 }
                 _ => {

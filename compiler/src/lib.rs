@@ -61,6 +61,22 @@ fn ffi_type_tag_from_output(checker: &Checker, expr: &Output) -> Option<(u32, u3
     checker.ffi_type_tag_from_output(expr)
 }
 
+/// Fallback FFI tag from a call-site expression when the typechecker did not
+/// record tags (recovery / missing side-table entry).
+fn ffi_tag_for_expr_fallback(expr: &Output) -> (u32, u32) {
+    use common::tag;
+    match expr.1.as_ref() {
+        Expression::Float(_) => (tag::FLOAT, 0),
+        Expression::String(_) => (tag::STRING, 0),
+        Expression::Bool(_) => (tag::BOOL, 0),
+        Expression::Integer(_) => (tag::INT, 0),
+        Expression::Expr(inner) | Expression::Group(inner) | Expression::Statement(inner) => {
+            ffi_tag_for_expr_fallback(inner)
+        }
+        _ => (tag::INT, 0),
+    }
+}
+
 fn emit_ffi_type_const(bytecode: &mut Vec<Byte>, tag: u32, aux: u32) {
     bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(encode_tag_operand(tag, aux)));
 }
@@ -1342,7 +1358,7 @@ impl Compiler {
     }
 
     fn emit_ffi_declare(&mut self, span: SimpleSpan, args: &[Output]) {
-        if args.len() != 4 {
+        if args.len() != 4 && args.len() != 5 {
             let mut m = Message::error(
                 ErrorCode::DeclareArity,
                 "declare requires arguments as a tuple in position 3 (use (T1, T2, ...) syntax)"
@@ -1351,7 +1367,7 @@ impl Compiler {
             );
             m.push(DiagLabel::new(
                 format!(
-                    "expected 4 arguments (lib, name, args_tuple, ret_type); got {}",
+                    "expected 4 or 5 arguments (lib, name, args_tuple, ret_type[, variadic]); got {}",
                     args.len()
                 ),
                 span.into_range(),
@@ -1365,6 +1381,26 @@ impl Compiler {
         let name = &args[1];
         let args_tuple = &args[2];
         let ret_type = &args[3];
+        let variadic = if args.len() == 5 {
+            match args[4].1.as_ref() {
+                Expression::Bool(b) => *b,
+                _ => {
+                    let mut m = Message::error(
+                        ErrorCode::DeclareArity,
+                        "declare(...) 5th argument (variadic) must be a bool literal".to_string(),
+                        args[4].0.into_range(),
+                    );
+                    m.push(DiagLabel::new(
+                        "use `true` or `false`".to_string(),
+                        args[4].0.into_range(),
+                    ));
+                    self.messages.push(m);
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
         let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
             Expression::Tuple(items) => items.to_vec(),
@@ -1408,7 +1444,10 @@ impl Compiler {
             self.bytecode.extend(ret_bc);
         }
 
-        let operand = arity & 0xFFFF;
+        let mut operand = arity & 0xFFFF;
+        if variadic {
+            operand |= 1 << 16;
+        }
         self.bytecode
             .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
     }
@@ -1436,6 +1475,11 @@ impl Compiler {
         let lib = &args[0];
         let fn_id = &args[1];
         let args_tuple = &args[2];
+
+        let variadic = match fn_id.1.as_ref() {
+            Expression::Identifier(name) => self.checker.is_ffi_declare_variadic(name),
+            _ => false,
+        };
 
         let tuple_elements: Vec<_> = match args_tuple.1.as_ref() {
             Expression::Tuple(items) => items.to_vec(),
@@ -1474,7 +1518,26 @@ impl Compiler {
         self.bytecode
             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity));
 
-        let operand = arity & 0xFFFF;
+        let mut operand = arity & 0xFFFF;
+        if variadic {
+            let tags = self
+                .checker
+                .variadic_arg_tags_at((span.start, span.end))
+                .map(|t| t.to_vec())
+                .unwrap_or_else(|| {
+                    tuple_elements
+                        .iter()
+                        .map(|e| ffi_tag_for_expr_fallback(e))
+                        .collect()
+                });
+            for &(tag, aux) in &tags {
+                emit_ffi_type_const(&mut self.bytecode, tag, aux);
+            }
+            self.bytecode
+                .push(Byte::new(Instruction::MakeTuple).with_operand_u32(tags.len() as u32));
+            operand |= 1 << 16;
+        }
+
         self.bytecode
             .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
     }
@@ -4878,6 +4941,7 @@ impl Compiler {
                         } else {
                             0
                         };
+                        let variadic = self.checker.is_extern_variadic(&n);
                         self.bytecode
                             .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                         self.bytecode
@@ -4890,8 +4954,34 @@ impl Compiler {
                         }
                         self.bytecode
                             .push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+                        let mut operand = arity as u32 & 0xFFFF;
+                        if variadic {
+                            let call_span = (span.start, span.end);
+                            let tags = self
+                                .checker
+                                .variadic_arg_tags_at(call_span)
+                                .map(|t| t.to_vec())
+                                .unwrap_or_else(|| {
+                                    args.as_ref()
+                                        .map(|items| {
+                                            items
+                                                .iter()
+                                                .map(|e| ffi_tag_for_expr_fallback(e))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                });
+                            for &(tag, aux) in &tags {
+                                emit_ffi_type_const(&mut self.bytecode, tag, aux);
+                            }
+                            self.bytecode.push(
+                                Byte::new(Instruction::MakeTuple)
+                                    .with_operand_u32(tags.len() as u32),
+                            );
+                            operand |= 1 << 16;
+                        }
                         self.bytecode
-                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(arity as u32));
+                            .push(Byte::new(Instruction::FfiInvoke).with_operand_u32(operand));
                         self.emit_result_unwrap_or_panic();
                     } else if let Some(&native_id) = self.native.get(&n) {
                         // Same stack order as `emit_io_host_invoke`: id first,
@@ -5945,9 +6035,13 @@ impl Compiler {
                         .and_then(|r| ffi_type_tag_from_output(&self.checker, r))
                         .unwrap_or((tag::VOID, 0));
                     emit_ffi_type_const(&mut self.bytecode, ret_tag, ret_aux);
-                    // Emit DeclareFFI.
+                    // Emit DeclareFFI (bit 16 = C varargs).
+                    let mut operand = arity & 0xFFFF;
+                    if decl.variadic {
+                        operand |= 1 << 16;
+                    }
                     self.bytecode
-                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(arity));
+                        .push(Byte::new(Instruction::DeclareFFI).with_operand_u32(operand));
                     self.emit_result_unwrap_or_panic();
                     // Store the function id.
                     self.bytecode

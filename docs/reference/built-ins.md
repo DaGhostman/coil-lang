@@ -221,16 +221,18 @@ Register a C function signature in a loaded library.
 
 ```0s
 declare(lib, name, (arg_types...), ret_type)
+declare(lib, name, (arg_types...), ret_type, variadic)
 ```
 
 | Argument | Type | Description |
 |----------|------|-------------|
 | `lib` | `int` | Handle from a successful `dload` (`Result::Ok`) |
 | `name` | `string` | Symbol name for `dlsym` |
-| `(arg_types...)` | Tuple of FFI tags | One tag per parameter |
+| `(arg_types...)` | Tuple of FFI tags | Fixed-prefix tags (before C `...` when variadic) |
 | `ret_type` | FFI tag | Return type (`void` allowed) |
+| `variadic` | `bool` (optional) | `true` for C-style varargs (`printf`-style) |
 
-Returns `Result<int, Error>` — `Ok` is the function id; `Err` if the symbol is missing or libffi rejects the signature (`ErrorKind::SymbolNotFound`, `Libffi`, …).
+Returns `Result<int, Error>` — `Ok` is the function id; `Err` if the symbol is missing or libffi rejects the signature (`ErrorKind::SymbolNotFound`, `Libffi`, …). When `variadic` is `true`, later `invoke` calls may pass more arguments than the fixed prefix; the CIF is rebuilt per call with default C promotions on the tail.
 
 ### FFI type tags (`ffi::types`)
 
@@ -269,7 +271,7 @@ invoke(lib, fn_id, (args...))
 |----------|------|-------------|
 | `lib` | `int` | Same library handle |
 | `fn_id` | `int` | Id from a successful `declare` |
-| `(args...)` | Tuple of values | Must match declared arity and types |
+| `(args...)` | Tuple of values | Must match declared arity (or `>=` fixed prefix when `declare` was variadic) |
 
 Returns `Result<T, Error>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = declare(...)?` (or match) so the side table can refine later `invoke` calls.
 
@@ -301,6 +303,7 @@ Not separate builtins — the compiler lowers extern declarations to `dload` / `
 ```0s
 extern "c" {
     fn strlen(string s) -> int;
+    fn printf(string fmt, ...) -> int;   // C varargs — bare `...`
 }
 
 fn main() {

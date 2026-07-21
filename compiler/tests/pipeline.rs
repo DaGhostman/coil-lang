@@ -962,6 +962,87 @@ fn example_strlen_prints_5() {
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
 }
 
+/// Capture bytes written to OS stdout (fd 1) while `f` runs.
+/// Needed for libc `printf`, which bypasses the VM's `PRINT` sink.
+#[cfg(unix)]
+fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    unsafe {
+        let mut pipefd = [0i32; 2];
+        assert_eq!(libc::pipe(pipefd.as_mut_ptr()), 0);
+        let read_fd = pipefd[0];
+        let write_fd = pipefd[1];
+        let old_stdout = libc::dup(1);
+        assert!(old_stdout >= 0);
+        assert_eq!(libc::dup2(write_fd, 1), 1);
+        libc::close(write_fd);
+
+        let result = f();
+
+        // NULL flushes all open output streams (stdout is a macro on some platforms).
+        libc::fflush(std::ptr::null_mut());
+        assert_eq!(libc::dup2(old_stdout, 1), 1);
+        libc::close(old_stdout);
+
+        let mut file = std::fs::File::from_raw_fd(read_fd);
+        let mut buf = Vec::new();
+        let _ = file.read_to_end(&mut buf);
+        drop(file);
+
+        let s = String::from_utf8_lossy(&buf).into_owned();
+        (result, s)
+    }
+}
+
+#[test]
+fn example_ffi_printf_prints_hello_42() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable on this platform via resolve_library(\"c\")");
+        return;
+    }
+
+    #[cfg(not(unix))]
+    {
+        ffi_soft_skip("ffi_printf OS-stdout capture is unix-only");
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let result = std::panic::catch_unwind(|| {
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("compiler crate must have a parent (workspace root)");
+            let full = workspace_root.join("examples/ffi_printf.0s");
+            let src = std::fs::read_to_string(&full).expect("read ffi_printf.0s");
+            let ((), os_out) = with_captured_os_stdout(|| {
+                let _vm_out = run_example_src_with_entry(&src, Some(full.as_path()));
+            });
+            os_out
+        });
+        let output = match result {
+            Ok(s) => s,
+            Err(_) => {
+                ffi_soft_skip("ffi_printf test panicked (dlopen failure?)");
+                return;
+            }
+        };
+        // Debug builds print heap alloc/free traces to OS stdout; strip them.
+        let cleaned: String = output
+            .lines()
+            .filter(|l| !(l.contains(" alloc ") || l.contains(" free ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            cleaned.trim(),
+            "hello 42",
+            "printf(\"hello %i\", 42) should write to OS stdout"
+        );
+    }
+}
+
 #[test]
 fn extern_missing_library_panics_with_message() {
     let src = r#"

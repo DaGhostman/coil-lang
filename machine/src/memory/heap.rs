@@ -823,9 +823,12 @@ pub struct ObjLibrary {
 #[derive(Clone, Debug)]
 pub struct FunctionSig {
     pub name: String,
+    /// Fixed-prefix arity (`nfixed` when [`Self::variadic`]).
     pub arity: usize,
     pub arg_types: Vec<FfiType>,
     pub ret_type: FfiType,
+    /// C-style varargs — CIF rebuilt per invoke with `Cif::new_variadic`.
+    pub variadic: bool,
 }
 
 impl FunctionSig {
@@ -835,6 +838,7 @@ impl FunctionSig {
             arity: sig.arity(),
             arg_types: sig.args.clone(),
             ret_type: sig.ret,
+            variadic: sig.variadic,
         }
     }
 }
@@ -851,6 +855,7 @@ impl RegisteredFunction {
             name: self.sig.name.clone(),
             args: self.sig.arg_types.clone(),
             ret: self.sig.ret_type,
+            variadic: self.sig.variadic,
         }
     }
 }

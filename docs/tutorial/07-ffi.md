@@ -51,17 +51,48 @@ fn main() {
 
 `extern "c"` is the portable libc alias — the resolver maps it to `libc.so.6` (Linux), `libSystem` (macOS), `ucrtbase` (Windows), and so on. On load/declare failure the compiler-emitted unwrap panics with a clear message.
 
+### C varargs (`...`)
+
+Bare trailing `...` on an extern declaration is C-style varargs (not language rest `T... xs`). The CIF is rebuilt per call; the variadic tail uses default argument promotions.
+
+From `examples/ffi_printf.0s`:
+
+```0s
+extern "c" {
+    fn printf(string fmt, ...) -> int;
+}
+
+fn main() {
+    printf("hello %i", 42);   // → hello 42
+}
+```
+
+Userland mirror — optional 5th `bool` on `declare`:
+
+```0s
+use ffi::*;
+use ffi::types::*;
+
+let lib = dload("c")?;
+let id = declare(lib, "printf", (String,), Int, true)?;
+invoke(lib, id, ("hello %i", 42))?;
+```
+
+Arity rule: call/invoke argument count must be `>=` the fixed prefix length.
+
 ### Syntax
 
 ```
 extern_block ::= 'extern' STRING '{' extern_fn* '}'
-extern_fn    ::= 'fn' IDENT '(' arg_list ')' ('->' type_name)? ';'
+extern_fn    ::= 'fn' IDENT '(' extern_arg_list ')' ('->' type_name)? ';'
+extern_arg_list ::= /* fixed `T name` args, optional trailing bare `...` */
 ```
 
 | Part | Meaning |
 |------|---------|
 | `"c"` | Portable libc alias (or any path / soname / basename) |
 | `fn strlen(string s) -> int;` | Signature only — no body, trailing `;` required |
+| `fn printf(string fmt, ...) -> int;` | C varargs — bare `...`, not `T... name` |
 | `strlen("hello")` | Ordinary call site; compiler wires FFI behind the scenes |
 
 ### What the compiler emits
@@ -158,6 +189,7 @@ fn main() {
 |---------|-----------|---------|
 | `dload(path)` | One string argument | `Result<int, Error>` — `Ok` = library handle |
 | `declare(lib, name, args_tuple, ret)` | Four arguments | `Result<int, Error>` — `Ok` = function id |
+| `declare(lib, name, args_tuple, ret, variadic)` | Five arguments | Same; `variadic: bool` marks C `...` |
 | `invoke(lib, fn_id, args_tuple)` | Three arguments | `Result<T, Error>` — `T` from the matching `declare` return tag |
 
 `Error` (from `use ffi::*`) is a record-shaped enum with fields:

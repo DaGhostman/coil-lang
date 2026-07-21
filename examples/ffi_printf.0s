@@ -1,0 +1,12 @@
+// ffi_printf.0s — C-style varargs via bare `...` on an extern declaration.
+// Calls libc `printf` with a format string and one int argument.
+//
+// Expected output: `hello 42`
+
+extern "c" {
+    fn printf(string fmt, ...) -> int;
+}
+
+fn main() {
+    printf("hello %i", 42);
+}
