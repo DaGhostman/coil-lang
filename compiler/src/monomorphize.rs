@@ -588,6 +588,7 @@ where
         | Expression::ExternBlock { .. }
         | Expression::ExternStruct(_)
         | Expression::Forall { .. } => {}
+        Expression::LetDestructure { rhs, .. } => f(rhs),
     }
 }
 

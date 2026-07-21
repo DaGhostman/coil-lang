@@ -3,8 +3,9 @@
 //! Builds a span-annotated `Expression` AST for the compiler pipeline.
 
 use ast::{
-    AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output,
-    Pattern, PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
+    AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, LetFieldPattern,
+    LetPattern, MatchArm, Output, Pattern, PatternField, PatternPayload, RecordFieldDecl,
+    RecordFieldValue, TypeParam, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -1835,7 +1836,7 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("let")
+        let simple = keyword!("let")
             .ignore_then(text::ident())
             .then(op!(":").ignore_then(self.type_annotation()).or_not())
             .then(op!("=").ignore_then(self.expr()).or_not())
@@ -1845,7 +1846,118 @@ impl<'pratt> Pratt<'pratt> {
                     result.push(v);
                 }
                 (e.span(), Box::new(Expression::Fragment(result)))
-            })
+            });
+
+        // `let (a, b) = expr;` / `let { x, y } = expr;` — tried before
+        // the simple `let name` form so `(` / `{` are not misread as
+        // identifiers. Top-level LHS is tuple/record only (not a bare
+        // binding — that stays on the simple path).
+        let destructure = keyword!("let")
+            .ignore_then(self.let_destructure_lhs())
+            .then_ignore(op!("="))
+            .then(self.expr())
+            .map_with(|(pattern, rhs), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::LetDestructure { pattern, rhs }),
+                )
+            });
+
+        choice((destructure, simple))
+    }
+
+    /// Top-level `let` destructure LHS: `(p, …)` or `{ field, … }` only.
+    fn let_destructure_lhs(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        choice((self.let_tuple_pattern(), self.let_record_pattern()))
+    }
+
+    fn let_tuple_pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let inner = self.let_pattern();
+        // Require a comma (or trailing comma) so `(a)` is not a
+        // 1-tuple — same rule as tuple literals.
+        let tuple_multi = inner
+            .clone()
+            .separated_by(op!(','))
+            .at_least(2)
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(op!('('), op!(')'));
+        let tuple_trailing = inner
+            .then_ignore(op!(','))
+            .map(|p| vec![p])
+            .delimited_by(op!('('), op!(')'));
+        choice((tuple_multi, tuple_trailing)).map(LetPattern::Tuple)
+    }
+
+    fn let_record_pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let field = text::ident()
+            .padded()
+            .then(op!(":").ignore_then(self.let_pattern()).or_not())
+            .map(|(name, sub)| {
+                let pattern = sub.unwrap_or(LetPattern::Binding { name });
+                LetFieldPattern { name, pattern }
+            });
+        field
+            .separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("{"), op!("}"))
+            .map(LetPattern::Record)
+    }
+
+    /// Nested irrefutable `let` pattern: `_`, binding, `(p, …)`, `{ field, … }`.
+    fn let_pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        recursive(|pattern_parser| {
+            let record_field = text::ident()
+                .padded()
+                .then(op!(":").ignore_then(pattern_parser.clone()).or_not())
+                .map(|(name, sub)| {
+                    let pattern = sub.unwrap_or(LetPattern::Binding { name });
+                    LetFieldPattern { name, pattern }
+                });
+
+            let record = record_field
+                .separated_by(op!(','))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(op!("{"), op!("}"))
+                .map(LetPattern::Record);
+
+            let tuple_multi = pattern_parser
+                .clone()
+                .separated_by(op!(','))
+                .at_least(2)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(op!('('), op!(')'));
+            let tuple_trailing = pattern_parser
+                .clone()
+                .then_ignore(op!(','))
+                .map(|p| vec![p])
+                .delimited_by(op!('('), op!(')'));
+            let tuple = choice((tuple_multi, tuple_trailing)).map(LetPattern::Tuple);
+
+            choice((
+                just("_").padded().to(LetPattern::Wildcard),
+                tuple,
+                record,
+                text::ident()
+                    .padded()
+                    .map(|name| LetPattern::Binding { name }),
+            ))
+        })
     }
 
     fn constant(
@@ -3372,6 +3484,32 @@ mod tests {
             }
             other => panic!("expected Resume with arg, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn let_tuple_destructure_parses() {
+        let ast = decl_ast!("let (a, b) = (1, 2);");
+        let is_destructure = match &ast {
+            Expression::Statement(s) | Expression::ExprStatement(s) => {
+                matches!(s.1.as_ref(), Expression::LetDestructure { .. })
+            }
+            Expression::LetDestructure { .. } => true,
+            _ => false,
+        };
+        assert!(is_destructure, "expected LetDestructure, got {:?}", ast);
+    }
+
+    #[test]
+    fn let_record_destructure_parses() {
+        let ast = decl_ast!("let { x, y } = { x: 1, y: 2 };");
+        let is_destructure = match &ast {
+            Expression::Statement(s) | Expression::ExprStatement(s) => {
+                matches!(s.1.as_ref(), Expression::LetDestructure { .. })
+            }
+            Expression::LetDestructure { .. } => true,
+            _ => false,
+        };
+        assert!(is_destructure, "expected LetDestructure, got {:?}", ast);
     }
 
     #[test]

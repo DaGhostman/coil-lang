@@ -2577,6 +2577,75 @@ impl Compiler {
         self.context.variables.intern(name) as u32
     }
 
+    /// Bind names from an irrefutable `let` pattern by reading from
+    /// `src_slot` (tuple via `Index`, record via `GetField`).
+    fn emit_let_pattern_binds(
+        &mut self,
+        pattern: &parser::ast::LetPattern<'_>,
+        src_slot: u32,
+        bytecode: &mut Vec<Byte>,
+    ) {
+        use parser::ast::LetPattern;
+        match pattern {
+            LetPattern::Wildcard => {}
+            LetPattern::Binding { name } => {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                let slot = self.context.variables.intern(name.to_string()) as u32;
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            }
+            LetPattern::Tuple(parts) => {
+                for (idx, part) in parts.iter().enumerate() {
+                    match part {
+                        LetPattern::Wildcard => {}
+                        LetPattern::Binding { name } => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            bytecode.push(
+                                Byte::new(Instruction::CONST).with_const_inline(idx as i32),
+                            );
+                            bytecode.push(Byte::new(Instruction::Index));
+                            let slot = self.context.variables.intern(name.to_string()) as u32;
+                            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                        }
+                        nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            bytecode.push(
+                                Byte::new(Instruction::CONST).with_const_inline(idx as i32),
+                            );
+                            bytecode.push(Byte::new(Instruction::Index));
+                            let nested_slot = self.alloc_temp_slot();
+                            bytecode
+                                .push(Byte::new(Instruction::StorePop).with_operand_u32(nested_slot));
+                            self.emit_let_pattern_binds(nested, nested_slot, bytecode);
+                        }
+                    }
+                }
+            }
+            LetPattern::Record(fields) => {
+                for pf in fields {
+                    match &pf.pattern {
+                        LetPattern::Wildcard => {}
+                        LetPattern::Binding { name } => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            Self::emit_raw_string_literal(bytecode, pf.name);
+                            bytecode.push(Byte::new(Instruction::GetField));
+                            let slot = self.context.variables.intern(name.to_string()) as u32;
+                            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                        }
+                        nested @ (LetPattern::Tuple(_) | LetPattern::Record(_)) => {
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src_slot));
+                            Self::emit_raw_string_literal(bytecode, pf.name);
+                            bytecode.push(Byte::new(Instruction::GetField));
+                            let nested_slot = self.alloc_temp_slot();
+                            bytecode
+                                .push(Byte::new(Instruction::StorePop).with_operand_u32(nested_slot));
+                            self.emit_let_pattern_binds(nested, nested_slot, bytecode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// `for x in` over an array already on the operand stack (or just
     /// compiled). Observationally identical to `ArrayIter::next`.
     ///
@@ -3578,6 +3647,14 @@ impl Compiler {
                     self.emit_virtual_test_main();
                 }
             }
+            // --- `let (a, b) = expr` / `let { x, y } = expr` ---
+            Expression::LetDestructure { pattern, rhs } => {
+                self.append_with_existential_pack(&mut bytecode, rhs);
+                let tmp = self.alloc_temp_slot();
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
+                self.emit_let_pattern_binds(pattern, tmp, &mut bytecode);
+            }
+
             // --- Let / const bindings ---
             Expression::Fragment(children) => {
                 // `let x = expr` / `const x = expr` → compile RHS, then

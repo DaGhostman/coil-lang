@@ -679,6 +679,12 @@ fn example_let_reassignment_works() {
     assert_eq!(output, "51020");
 }
 
+#[test]
+fn example_let_destructure_prints_12342() {
+    let output = run_example("examples/let_destructure.0s");
+    assert_eq!(output, "12342");
+}
+
 /// Phase P0: `let x = match { … }` must bind the arm value via
 /// StorePop. Pre-fix Match emitted RETURN at end_label, so the
 /// StorePop was unreachable and prints never ran / saw 0.

@@ -268,6 +268,14 @@ pub enum Expression<'expr> {
     Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
 
+    /// `let (a, b) = expr;` / `let { x, y } = expr;` — irrefutable
+    /// destructuring (Phase P1). Distinct from match [`Pattern`] so
+    /// enum constructors stay match-only.
+    LetDestructure {
+        pattern: LetPattern<'expr>,
+        rhs: Output<'expr>,
+    },
+
     Class {
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
@@ -439,6 +447,27 @@ pub struct MatchArm<'expr> {
     pub body: Output<'expr>,
 }
 
+/// Irrefutable pattern for `let` destructuring (`let (a, b) = …`,
+/// `let { x, y } = …`). Nested tuples/records and `_` wildcards are
+/// allowed; enum constructors are not (use `match`).
+#[derive(Clone, PartialEq, Debug)]
+pub enum LetPattern<'expr> {
+    Wildcard,
+    Binding {
+        name: &'expr str,
+    },
+    Tuple(Vec<LetPattern<'expr>>),
+    Record(Vec<LetFieldPattern<'expr>>),
+}
+
+/// One field in a [`LetPattern::Record`]. Shorthand `x` desugars to
+/// `x: Binding(x)`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LetFieldPattern<'expr> {
+    pub name: &'expr str,
+    pub pattern: LetPattern<'expr>,
+}
+
 /// Match pattern: wildcard, binding, or qualified constructor.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Pattern<'expr> {
@@ -495,6 +524,34 @@ impl<'a> Display for TypeParam<'a> {
             write!(f, "{}: {}", self.name, self.bounds.join(" + "))
         } else {
             write!(f, "{}", self.name)
+        }
+    }
+}
+
+impl<'a> Display for LetPattern<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard => write!(f, "_"),
+            Self::Binding { name } => write!(f, "{}", name),
+            Self::Tuple(parts) => write!(
+                f,
+                "({})",
+                parts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Record(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|pf| match &pf.pattern {
+                        LetPattern::Binding { name } if *name == pf.name => name.to_string(),
+                        _ => format!("{}: {}", pf.name, pf.pattern),
+                    })
+                    .collect();
+                write!(f, "{{ {} }}", parts.join(", "))
+            }
         }
     }
 }
@@ -600,6 +657,9 @@ impl<'a> Display for Expression<'a> {
             Self::Positive(n) => write!(f, "+{}", n.borrow().1),
             Self::Expr(e) => write!(f, "{}", e.1),
             Self::ExprStatement(e) => write!(f, "{};", e.1),
+            Self::LetDestructure { pattern, rhs } => {
+                write!(f, "let {} = {}", pattern, rhs.1)
+            }
             Self::Fragment(list) | Self::Block(list) => write!(
                 f,
                 "{}",

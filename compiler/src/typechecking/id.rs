@@ -72,6 +72,8 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Argument(_, _)
         | Expression::Field(_, _, _) => {}
 
+        Expression::LetDestructure { rhs, .. } => pre_walk(rhs, table),
+
         Expression::TypeApp { args, .. } => {
             for a in args {
                 pre_walk(a, table);

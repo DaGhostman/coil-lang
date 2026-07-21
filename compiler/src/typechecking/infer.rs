@@ -1515,6 +1515,13 @@ impl Checker {
             // ---- Fragments (from `let x = expr`) ----
             Expression::Fragment(children) => self.infer_fragment(children),
 
+            // ---- `let (a, b) = expr` / `let { x, y } = expr` ----
+            Expression::LetDestructure { pattern, rhs } => {
+                let rhs_ty = self.infer(rhs);
+                let _ = self.infer_let_pattern(pattern, &rhs_ty, &rhs.0.into_range());
+                unit_ty()
+            }
+
             // ---- `let` / `const` ----
             Expression::Variable(name, ty_opt) => {
                 let var_ty = match ty_opt {
@@ -7224,7 +7231,8 @@ impl Checker {
             | Expression::Positive(e)
             | Expression::Adjust { target: e, .. }
             | Expression::Defer(e)
-            | Expression::Member(e) => {
+            | Expression::Member(e)
+            | Expression::LetDestructure { rhs: e, .. } => {
                 self.pre_register_enums_walk(e, errors);
             }
 
@@ -8332,6 +8340,146 @@ impl Checker {
                 // tag, the pattern is still of that same type;
                 // exhaustiveness checking will report the
                 // arm as unreachable.)
+                expected_ty.clone()
+            }
+        }
+    }
+
+    /// Bind names from an irrefutable `let` pattern against `expected_ty`
+    /// (the RHS type). Supports nested tuples/records and `_`.
+    fn infer_let_pattern(
+        &mut self,
+        pattern: &parser::ast::LetPattern,
+        expected_ty: &Ty,
+        pattern_range: &Range<usize>,
+    ) -> Ty {
+        use parser::ast::LetPattern;
+        let expected = apply_ty_prune(&self.subst, expected_ty);
+        match pattern {
+            LetPattern::Wildcard => expected,
+            LetPattern::Binding { name } => {
+                self.env
+                    .insert_top(name.to_string(), Scheme::mono(expected.clone()));
+                self.codegen_var_types
+                    .insert(name.to_string(), expected.clone());
+                expected
+            }
+            LetPattern::Tuple(parts) => {
+                let elem_tys = match &expected {
+                    Ty::Tuple(tys) => {
+                        if tys.len() != parts.len() {
+                            return self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "tuple pattern has {} elements, but value has type `{}`",
+                                    parts.len(),
+                                    expected,
+                                ),
+                                pattern_range.clone(),
+                                Some("adjust the pattern or the RHS tuple arity".to_string()),
+                            );
+                        }
+                        tys.clone()
+                    }
+                    Ty::Var(_) => {
+                        let fresh: Vec<Ty> = parts
+                            .iter()
+                            .map(|_| Ty::Var(self.counter.fresh()))
+                            .collect();
+                        let tup = Ty::Tuple(fresh.clone());
+                        self.unify(&expected, &tup, pattern_range, "let tuple destructure");
+                        fresh
+                    }
+                    other => {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "cannot destructure type `{}` with a tuple pattern",
+                                other,
+                            ),
+                            pattern_range.clone(),
+                            Some("RHS must be a tuple".to_string()),
+                        );
+                    }
+                };
+                for (sub, ty) in parts.iter().zip(elem_tys.iter()) {
+                    let _ = self.infer_let_pattern(sub, ty, pattern_range);
+                }
+                expected_ty.clone()
+            }
+            LetPattern::Record(fields) => {
+                let decl_fields = match &expected {
+                    Ty::Record { fields: decl } => decl.clone(),
+                    Ty::Var(_) => {
+                        // Synthesize a record type from the pattern field names.
+                        let mut synth = Vec::with_capacity(fields.len());
+                        let mut seen = std::collections::HashSet::new();
+                        for pf in fields {
+                            if !seen.insert(pf.name) {
+                                return self.error_with_help(
+                                    ErrorCode::DuplicateField,
+                                    format!(
+                                        "Duplicate field `{}` in record pattern",
+                                        pf.name
+                                    ),
+                                    pattern_range.clone(),
+                                    Some("each field must appear exactly once".to_string()),
+                                );
+                            }
+                            synth.push((pf.name.to_string(), Ty::Var(self.counter.fresh())));
+                        }
+                        synth.sort_by(|a, b| a.0.cmp(&b.0));
+                        let rec = Ty::Record {
+                            fields: synth.clone(),
+                        };
+                        self.unify(&expected, &rec, pattern_range, "let record destructure");
+                        synth
+                    }
+                    other => {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "cannot destructure type `{}` with a record pattern",
+                                other,
+                            ),
+                            pattern_range.clone(),
+                            Some("RHS must be a record (dict)".to_string()),
+                        );
+                    }
+                };
+                let mut pattern_site: std::collections::HashMap<&str, &LetPattern> =
+                    std::collections::HashMap::with_capacity(fields.len());
+                for pf in fields {
+                    if pattern_site.insert(pf.name, &pf.pattern).is_some() {
+                        return self.error_with_help(
+                            ErrorCode::DuplicateField,
+                            format!("Duplicate field `{}` in record pattern", pf.name),
+                            pattern_range.clone(),
+                            Some("each field must appear exactly once".to_string()),
+                        );
+                    }
+                }
+                for pf in fields {
+                    let Some((_, fty)) = decl_fields.iter().find(|(n, _)| n == pf.name) else {
+                        return self.error_with_help(
+                            ErrorCode::UnknownField,
+                            format!(
+                                "Cannot find field `{}` on record `{}`",
+                                pf.name, expected,
+                            ),
+                            pattern_range.clone(),
+                            Some(format!(
+                                "the record has fields: {}",
+                                decl_fields
+                                    .iter()
+                                    .map(|(n, _)| format!("`{}`", n))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                        );
+                    };
+                    let _ = self.infer_let_pattern(&pf.pattern, fty, pattern_range);
+                }
                 expected_ty.clone()
             }
         }
