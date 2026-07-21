@@ -111,6 +111,51 @@ fn main() {
 
 ---
 
+### `examples/named_args.0s`
+
+**Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
+
+```0s
+fn greet(string name, int age) {
+    print "%s", name;
+    print "%i", age;
+}
+
+fn main() {
+    greet(name: "Ada", age: 36);
+    greet("Grace", age: 40);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/named_args.0s` |
+| **Output** | `Ada36Grace40` |
+
+---
+
+### `examples/variadic.0s`
+
+**Demonstrates:** Trailing rest parameters (`T... name`) packing into a dynamic array, including an empty rest and named fixed args followed by positional rest.
+
+```0s
+fn sum(int... xs) -> int { /* len + loop */ }
+fn greet(string name, string... extras) -> string { /* concat */ }
+
+fn main() {
+    print "%i", sum(1, 2, 3);           // 6
+    print "%i", sum();                  // 0
+    print "%s", greet(name: "Hi", "!", "?"); // Hi!?
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/variadic.0s` |
+| **Output** | `60Hi!?` |
+
+---
+
 ### `examples/const.0s`
 
 **Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
@@ -1017,6 +1062,28 @@ fn main() {
 
 ---
 
+### `examples/ffi_printf.0s`
+
+**Demonstrates:** C-style varargs — bare `...` on an `extern` declaration (`printf`-style). Not language rest `T... xs`.
+
+```0s
+extern "c" {
+    fn printf(string fmt, ...) -> int;
+}
+
+fn main() {
+    printf("hello %lld", 42);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/ffi_printf.0s` |
+| **Output** | `hello 42` |
+| **Requires** | Platform C library via `extern "c"` |
+
+---
+
 ### `examples/ffi_sum.0s`
 
 **Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result<_, Error>`; unwrap with `match` (or `?`). Check `e.kind` for typed recovery.
@@ -1255,6 +1322,18 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+### `examples/range.0s`
+
+**Demonstrates:** lazy `Range<T: Ord>` (`0..n`, `0..=n`, float bounds),
+first-class range values, empty decreasing ranges.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/range.0s` |
+| **Output** | `01234012356` |
+
+---
+
 ### `examples/for_in_array.0s`
 
 **Demonstrates:** `for x in` over an array (`Item` = element type).
@@ -1355,6 +1434,8 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `string_fmt.0s` | Basics | `hello world42-x` |
 | `show_tuple.0s` | Basics | `(1, 2){ a: 3, b: 4 }` |
 | `let_test.0s` | Basics | `51020` |
+| `named_args.0s` | Basics | `Ada36Grace40` |
+| `variadic.0s` | Basics | `60Hi!?` |
 | `const.0s` | Basics | `42hi` |
 | `for_break.0s` | Basics | `18` |
 | `fizbuz.0s` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
@@ -1401,6 +1482,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `src/foo/sadge.0s` | Modules | (support file) |
 | `src/foo.0s` | Modules | (support file) |
 | `strlen.0s` | FFI | `5` |
+| `ffi_printf.0s` | FFI | `hello 42` |
 | `ffi_sum.0s` | FFI | `42` |
 | `ffi_struct_ret.0s` | FFI | `34` |
 | `ffi_callback_ret.0s` | FFI | `1` |
@@ -1418,6 +1500,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `for_in_tuple.0s` | Collections | `123` |
 | `for_in_dict.0s` | Collections | `12` |
 | `for_in_custom.0s` | Collections / traits | `012` |
+| `range.0s` | Ranges | `012340123561.02.03.0` |
 
 ## Running tests that mirror examples
 

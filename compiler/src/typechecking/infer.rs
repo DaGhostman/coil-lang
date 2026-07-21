@@ -69,6 +69,10 @@ pub enum ForInKind {
     Dict,
     /// Resume/Done loop (completion value excluded from body).
     Coroutine,
+    /// Lazy range counter loop (`0..n` / `0..=n`).
+    /// `float` selects LEF/LEQF/ADDF + step `1.0`; otherwise int/byte
+    /// opcodes (LE/LEQ/ADD + step `1`).
+    Range { inclusive: bool, float: bool },
     /// Dictionary ABI: `into_iter` then `next` → `Option<Item>`.
     Custom {
         into_iter_fqn: String,
@@ -84,9 +88,9 @@ pub struct ForInInfo {
 use super::ty::{ArrayLength, array, array_fixed, tuple as tuple_ty};
 use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
-    list, option_app_ty, option_inner, option_ty, result_app_ty, result_ok_err, result_ty,
-    schemaize_payload, schemaize_ty, string, subst_payload_params, subst_ty_params,
-    unit as unit_ty,
+    list, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, result_app_ty,
+    result_ok_err, result_ty, schemaize_payload, schemaize_ty, string, subst_payload_params,
+    subst_ty_params, unit as unit_ty,
 };
 use super::unify::{UnifyError, unify_with};
 use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};
@@ -152,6 +156,28 @@ pub struct Checker {
 
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
+
+    /// Per-scope save of prior [`codegen_var_types`] entries for names
+    /// overwritten in that scope. On pop, shadowed names are restored so
+    /// Access after a block sees the outer type again. Newly introduced
+    /// names stay in the flat map (codegen runs after check_program).
+    codegen_var_types_scopes: Vec<std::collections::HashMap<String, Option<Ty>>>,
+
+    /// Names bound as parameters (or `self`) in the current function.
+    /// Block overlays restore these on pop even when no outer *block*
+    /// introduced them — without treating flat-map leftovers from other
+    /// functions as restore-worthy (PolyFn `let f = id`).
+    fn_codegen_baselines: Vec<std::collections::HashSet<String>>,
+
+    /// Declaration-order parameter names for each function, keyed by the
+    /// same name used at call resolution (simple name for free functions,
+    /// `Owner::method` for inherent methods). Used to reorder named
+    /// call-site arguments (Phase P2).
+    fn_param_names: std::collections::HashMap<String, Vec<String>>,
+
+    /// Whether the last parameter of `fn_name` is a rest pack (`T... name`).
+    /// When true, call sites pack trailing args into a single `[T]` (P4).
+    fn_has_rest: std::collections::HashMap<String, bool>,
 
     /// Concrete trait dictionaries selected at each generic call site.
     call_site_dicts: HashMap<NodeId, Vec<InstanceDef>>,
@@ -246,6 +272,22 @@ pub struct Checker {
     /// Return type recorded for `let id = declare(..., ret)` bindings so
     /// subsequent `invoke(..., id, ...)` can refine its result type.
     ffi_fn_ret_tys: HashMap<String, Ty>,
+
+    /// Whether `let id = declare(..., ret, variadic)` marked the binding as C varargs.
+    ffi_fn_variadic: HashMap<String, bool>,
+
+    /// Fixed-prefix arity (`nfixed`) for variadic `declare` bindings.
+    ffi_fn_nfixed: HashMap<String, usize>,
+
+    /// Extern functions declared with bare `...` (C varargs).
+    extern_variadic: HashSet<String>,
+
+    /// Fixed-prefix arity for [`Self::extern_variadic`] entries.
+    extern_variadic_nfixed: HashMap<String, usize>,
+
+    /// Per-call-site FFI type tags for variadic FFI invokes (keyed by call span).
+    /// Used by codegen because runtime `Value`s are untagged.
+    variadic_call_arg_tags: HashMap<(usize, usize), Vec<(u32, u32)>>,
 
     /// Enclosing function is in Result mode: bare `return` wraps `Ok`,
     /// `raise` produces `Err`. Holds `(Ok_ty, Err_ty)`.
@@ -406,6 +448,10 @@ impl Checker {
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
+            codegen_var_types_scopes: Vec::new(),
+            fn_codegen_baselines: Vec::new(),
+            fn_param_names: std::collections::HashMap::new(),
+            fn_has_rest: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
             call_site_dicts_by_span: HashMap::new(),
             call_site_forward_dicts: HashMap::new(),
@@ -439,6 +485,11 @@ impl Checker {
             c_structs: Vec::new(),
             callback_sigs: Vec::new(),
             ffi_fn_ret_tys: HashMap::new(),
+            ffi_fn_variadic: HashMap::new(),
+            ffi_fn_nfixed: HashMap::new(),
+            extern_variadic: HashSet::new(),
+            extern_variadic_nfixed: HashMap::new(),
+            variadic_call_arg_tags: HashMap::new(),
             fn_result_mode: None,
             fn_option_mode: None,
             result_mode_fns: HashSet::new(),
@@ -813,6 +864,10 @@ impl Checker {
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
+        self.codegen_var_types_scopes.clear();
+        self.fn_codegen_baselines.clear();
+        self.fn_param_names.clear();
+        self.fn_has_rest.clear();
         self.call_site_dicts.clear();
         self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
@@ -843,6 +898,11 @@ impl Checker {
         self.c_structs.clear();
         self.callback_sigs.clear();
         self.ffi_fn_ret_tys.clear();
+        self.ffi_fn_variadic.clear();
+        self.ffi_fn_nfixed.clear();
+        self.extern_variadic.clear();
+        self.extern_variadic_nfixed.clear();
+        self.variadic_call_arg_tags.clear();
         self.pending_exhaustive.clear();
         self.async_functions.clear();
         self.async_depth = 0;
@@ -962,6 +1022,66 @@ impl Checker {
         } else {
             self.type_aliases.push(HashMap::new());
         }
+    }
+
+    /// Begin a `{ … }` block overlay for codegen var types. Function
+    /// frames must NOT use this — restoring across function `push_scope`
+    /// would revive an earlier function's parameter type over a later
+    /// `let` of the same name (breaks escaped PolyFn typing).
+    fn push_block_codegen_scope(&mut self) {
+        self.codegen_var_types_scopes.push(HashMap::new());
+    }
+
+    fn pop_block_codegen_scope(&mut self) {
+        if let Some(frame) = self.codegen_var_types_scopes.pop() {
+            for (name, prev) in frame {
+                match prev {
+                    Some(ty) => {
+                        self.codegen_var_types.insert(name, ty);
+                    }
+                    None => {
+                        // Binding introduced in this block — keep for
+                        // post-check Access / LoadField.
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a binding's type for codegen. Inside a `{ … }` block overlay,
+    /// remember the previous flat-map entry so [`pop_block_codegen_scope`]
+    /// can restore shadows when:
+    /// - an *outer block in this nesting* already introduced the name, or
+    /// - the name is a parameter/`self` in the current function baseline.
+    ///
+    /// Flat-map leftovers from other functions must not be restored (that
+    /// would revive `apply_id`'s `f` over `let f = id` in `main`).
+    fn record_codegen_var_type(&mut self, name: String, ty: Ty) {
+        if !self.codegen_var_types_scopes.is_empty() {
+            let save = {
+                let scopes = &self.codegen_var_types_scopes;
+                let outer_introduced = scopes
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .any(|frame| frame.contains_key(&name));
+                let in_fn_baseline = self
+                    .fn_codegen_baselines
+                    .last()
+                    .is_some_and(|b| b.contains(&name));
+                if outer_introduced || in_fn_baseline {
+                    self.codegen_var_types.get(&name).cloned()
+                } else {
+                    None
+                }
+            };
+            self.codegen_var_types_scopes
+                .last_mut()
+                .expect("non-empty scopes")
+                .entry(name.clone())
+                .or_insert(save);
+        }
+        self.codegen_var_types.insert(name, ty);
     }
 
     fn register_type_alias(&mut self, name: &str, alias_ty: Ty, range: Range<usize>) {
@@ -1404,6 +1524,8 @@ impl Checker {
             | Expression::Comment(_)
             | Expression::Break
             | Expression::Continue => unit_ty(),
+            // Named call-site arg wrapper — type is the value's type.
+            Expression::NamedArg(_, value) => self.infer(value),
             // `use` — virtual modules first, else disk-module function alias
             Expression::Use {
                 path,
@@ -1462,7 +1584,7 @@ impl Checker {
                         items
                             .iter()
                             .filter_map(|item| {
-                                if let Expression::Argument(ty, _) = item.1.as_ref() {
+                                if let Expression::Argument(ty, _, _) = item.1.as_ref() {
                                     Some(self.parse_type_name(ty))
                                 } else {
                                     None
@@ -1472,17 +1594,25 @@ impl Checker {
                     } else {
                         Vec::new()
                     };
+                    let nfixed = arg_tys.len();
                     let ret_ty = decl
                         .returns
                         .as_ref()
                         .map(|r| self.parse_type_name(r))
                         .unwrap_or_else(unit_ty);
+                    // Register the fixed-prefix function type (extra `...` args
+                    // are accepted at call sites via `extern_variadic`).
                     let fn_ty = arg_tys
                         .iter()
                         .rev()
                         .fold(ret_ty, |acc, p| Ty::Fun(Box::new(p.clone()), Box::new(acc)));
                     self.env
                         .insert_top(decl.name.to_string(), Scheme::mono(fn_ty));
+                    if decl.variadic {
+                        self.extern_variadic.insert(decl.name.to_string());
+                        self.extern_variadic_nfixed
+                            .insert(decl.name.to_string(), nfixed);
+                    }
                 }
                 unit_ty()
             }
@@ -1497,10 +1627,12 @@ impl Checker {
             // own scope.
             Expression::Block(children) => {
                 self.push_scope();
+                self.push_block_codegen_scope();
                 let mut last_ty = unit_ty();
                 for child in children {
                     last_ty = self.infer(child);
                 }
+                self.pop_block_codegen_scope();
                 self.pop_scope();
                 last_ty
             }
@@ -1514,6 +1646,13 @@ impl Checker {
 
             // ---- Fragments (from `let x = expr`) ----
             Expression::Fragment(children) => self.infer_fragment(children),
+
+            // ---- `let (a, b) = expr` / `let { x, y } = expr` ----
+            Expression::LetDestructure { pattern, rhs } => {
+                let rhs_ty = self.infer(rhs);
+                let _ = self.infer_let_pattern(pattern, &rhs_ty, &rhs.0.into_range());
+                unit_ty()
+            }
 
             // ---- `let` / `const` ----
             Expression::Variable(name, ty_opt) => {
@@ -1583,8 +1722,7 @@ impl Checker {
                             if self.env.lookup(var_name).is_some() {
                                 self.env
                                     .insert_top(var_name.to_string(), Scheme::mono(val_ty.clone()));
-                                self.codegen_var_types
-                                    .insert(var_name.to_string(), val_ty.clone());
+                                self.record_codegen_var_type(var_name.to_string(), val_ty.clone());
                             }
                             return val_ty;
                         }
@@ -1601,6 +1739,11 @@ impl Checker {
             }
 
             // ---- Arithmetic / bitwise ----
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+            } => self.infer_range(start, end, *inclusive, range),
             Expression::Add(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "+"),
             Expression::Sub(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "-"),
             Expression::Mul(lhs, rhs) => self.infer_arith(lhs, rhs, id, range, "*"),
@@ -1674,8 +1817,60 @@ impl Checker {
             Expression::Call { name, args } => {
                 // Method call: `recv.method(args)` — Access callee.
                 if let Expression::Access(recv, method) = name.1.as_ref() {
+                    let method_args = args.as_deref().unwrap_or(&[]);
+                    let method_has_named = method_args
+                        .iter()
+                        .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
                     let recv_ty = self.infer(recv);
                     let resolved = apply_ty_prune(&self.subst, &recv_ty);
+
+                    // Named args on methods: only inherent class methods.
+                    if method_has_named {
+                        let class_owner = match &resolved {
+                            Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
+                            Ty::App(head, _) => match head.as_ref() {
+                                Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(owner) = class_owner.as_ref()
+                            && let Some(scheme) = self
+                                .methods
+                                .get(owner)
+                                .and_then(|m| m.get(*method))
+                                .map(|(_, s)| s.clone())
+                        {
+                            let fun_ty = self.instantiate_ty(&scheme);
+                            let fqn = format!("{}::{}", owner, method);
+                            let mut arg_tys = vec![recv_ty];
+                            let (tys, _) =
+                                self.infer_and_reorder_call_args(&fqn, method_args, &range);
+                            arg_tys.extend(tys);
+                            return self.apply_function(
+                                Some(&fqn),
+                                &fun_ty,
+                                &arg_tys,
+                                None,
+                                id,
+                                range,
+                            );
+                        }
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Named arguments are not supported on this call to `{}`",
+                                method
+                            ),
+                            range,
+                            Some(
+                                "named arguments are supported on ordinary functions and inherent methods"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+
                     if let Ty::Existential { class } = &resolved
                         && let Some((owner, method_slot, scheme)) =
                             self.existential_method_candidate(class, method)
@@ -1781,14 +1976,22 @@ impl Checker {
                             .map(|(_, s)| s.clone())
                     {
                         let fun_ty = self.instantiate_ty(&scheme);
+                        let fqn = format!("{}::{}", owner, method);
                         let mut arg_tys = vec![recv_ty];
-                        if let Some(a) = args {
+                        if self.fn_has_rest(&fqn) {
+                            let (tys, _) = self.infer_and_reorder_call_args(
+                                &fqn,
+                                method_args,
+                                &range,
+                            );
+                            arg_tys.extend(tys);
+                        } else if let Some(a) = args {
                             for arg in a {
                                 arg_tys.push(self.infer(arg));
                             }
                         }
                         return self.apply_function(
-                            Some(&format!("{}::{}", owner, method)),
+                            Some(&fqn),
                             &fun_ty,
                             &arg_tys,
                             None,
@@ -1863,14 +2066,43 @@ impl Checker {
                     }
                 };
 
+                let raw_args = args.as_deref().unwrap_or(&[]);
+                let has_named = raw_args
+                    .iter()
+                    .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+
                 if ident == "push" {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            "Named arguments are not supported on `push`".to_string(),
+                            range,
+                            Some("use positional arguments: `push(arr, value)`".to_string()),
+                        );
+                    }
                     return self.infer_array_push(args.as_deref(), range);
                 }
                 if ident == "len" {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            "Named arguments are not supported on `len`".to_string(),
+                            range,
+                            Some("use positional arguments: `len(arr)`".to_string()),
+                        );
+                    }
                     return self.infer_array_len(args.as_deref(), range);
                 }
                 // `assert` from `prelude::test` (auto-imported or via `use`).
                 if let Some(kind) = self.prelude_fn_in_scope(&ident) {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!("Named arguments are not supported on `{}`", ident),
+                            range,
+                            Some("use positional arguments".to_string()),
+                        );
+                    }
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         PreludeFn::Assert => self.infer_assert(arg_slice, range),
@@ -1878,6 +2110,14 @@ impl Checker {
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
                 if let Some(kind) = self.ffi_fn_in_scope(&ident) {
+                    if has_named {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!("Named arguments are not supported on `{}`", ident),
+                            range,
+                            Some("FFI builtins take positional arguments only".to_string()),
+                        );
+                    }
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         FfiBuiltin::Dload => self.infer_ffi_dload(arg_slice, range),
@@ -1895,6 +2135,119 @@ impl Checker {
                             ident
                         )),
                     );
+                }
+
+                // Named call-site args: skip trait UFCS and resolve an ordinary
+                // function (partial application is rejected when any arg is named).
+                if has_named {
+                    let scheme = self.env.lookup(&ident).cloned();
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
+                        match scheme {
+                            Some(s) => {
+                                let (fun_ty, constraints, mapping) =
+                                    self.instantiate_scheme_mapped(&s);
+                                (fun_ty, constraints, mapping, Some(s))
+                            }
+                            None => {
+                                return self.error(
+                                    ErrorCode::UnknownFunction,
+                                    format!("Cannot find function `{}`", ident),
+                                    range,
+                                );
+                            }
+                        };
+                    let (arg_tys, ordered_args) =
+                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                    let result = self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    );
+                    if !fresh_constraints.is_empty() {
+                        self.discharge_constraints(id, &fresh_constraints, &range);
+                        if let Some(scheme) = original_scheme.as_ref() {
+                            self.pin_assoc_after_discharge(
+                                "",
+                                &fresh_constraints,
+                                Some(scheme),
+                                &fresh_mapping,
+                                &range,
+                            );
+                        }
+                    }
+                    // Named calls must fully apply — reject leftover Fun.
+                    let resolved = apply_ty_prune(&self.subst, &result);
+                    if matches!(resolved, Ty::Fun(_, _)) {
+                        let mut msg = Message::error(
+                            ErrorCode::MissingField,
+                            format!(
+                                "Call to `{}` with named arguments is under-applied",
+                                ident
+                            ),
+                            range.clone(),
+                        );
+                        msg.with_help(
+                            "when any argument is named, all remaining parameters must be supplied"
+                                .to_string(),
+                        );
+                        self.messages.push(msg);
+                    }
+                    return result;
+                }
+
+                // Rest-parameter calls pack trailing args; skip UFCS trait
+                // resolution so we don't double-infer (NodeId alignment).
+                if self.fn_has_rest(&ident) {
+                    let scheme = self.env.lookup(&ident).cloned();
+                    let (fun_ty, fresh_constraints, fresh_mapping, original_scheme) =
+                        match scheme {
+                            Some(s) => {
+                                let (fun_ty, constraints, mapping) =
+                                    self.instantiate_scheme_mapped(&s);
+                                (fun_ty, constraints, mapping, Some(s))
+                            }
+                            None => {
+                                return self.error(
+                                    ErrorCode::UnknownFunction,
+                                    format!("Cannot find function `{}`", ident),
+                                    range,
+                                );
+                            }
+                        };
+                    let (call_arg_tys, ordered_args) =
+                        self.infer_and_reorder_call_args(&ident, raw_args, &range);
+                    let result = self.apply_function(
+                        Some(&ident),
+                        &fun_ty,
+                        &call_arg_tys,
+                        if ordered_args.is_empty() {
+                            None
+                        } else {
+                            Some(&ordered_args)
+                        },
+                        id,
+                        range.clone(),
+                    );
+                    if !fresh_constraints.is_empty() {
+                        self.discharge_constraints(id, &fresh_constraints, &range);
+                        if let Some(scheme) = original_scheme.as_ref() {
+                            self.pin_assoc_after_discharge(
+                                "",
+                                &fresh_constraints,
+                                Some(scheme),
+                                &fresh_mapping,
+                                &range,
+                            );
+                        }
+                    }
+                    return result;
                 }
 
                 // Bare/UFCS trait method call: `method(x)`.
@@ -2000,6 +2353,17 @@ impl Checker {
                     }
                 };
 
+                // C-varargs extern: accept `>= nfixed` args; only unify the fixed prefix.
+                if self.extern_variadic.contains(ident.as_str()) {
+                    return self.apply_extern_variadic_call(
+                        &ident,
+                        &fun_ty,
+                        &arg_tys,
+                        args.as_deref(),
+                        range,
+                    );
+                }
+
                 let result = self.apply_function(
                     Some(&ident),
                     &fun_ty,
@@ -2055,8 +2419,7 @@ impl Checker {
                     if let Expression::Identifier(name) = binding.1.as_ref() {
                         self.env
                             .insert_top(name.to_string(), Scheme::mono(elem_ty.clone()));
-                        self.codegen_var_types
-                            .insert(name.to_string(), elem_ty.clone());
+                        self.record_codegen_var_type(name.to_string(), elem_ty.clone());
                     }
                     // Consume the binding node's ID (pre-walk order) now that
                     // the name is in scope.
@@ -2515,7 +2878,14 @@ impl Checker {
                 self.pop_type_params_for_type_parsing(pushed);
                 unit_ty()
             }
-            Expression::Argument(ty, _name) => self.parse_type_name(ty),
+            Expression::Argument(ty, _name, is_rest) => {
+                let elem = self.parse_type_name(ty);
+                if *is_rest {
+                    array(elem)
+                } else {
+                    elem
+                }
+            }
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
             Expression::Access(receiver, field) => {
@@ -3611,8 +3981,7 @@ impl Checker {
                     };
                     self.env
                         .insert_top(name.to_string(), Scheme::mono(var_ty.clone()));
-                    self.codegen_var_types
-                        .insert(name.to_string(), var_ty.clone());
+                    self.record_codegen_var_type(name.to_string(), var_ty.clone());
                     last_ty = unit_ty();
 
                     // Try to consume the next sibling as the initializer.
@@ -3629,8 +3998,7 @@ impl Checker {
                             {
                                 let _ = self.infer(next);
                                 self.env.insert_top(name.to_string(), source_scheme.clone());
-                                self.codegen_var_types
-                                    .insert(name.to_string(), source_scheme.ty.clone());
+                                self.record_codegen_var_type(name.to_string(), source_scheme.ty.clone());
                                 last_ty = source_scheme.ty;
                                 i += 2;
                                 continue;
@@ -3654,7 +4022,7 @@ impl Checker {
                             // so Access codegen sees Record/enum types, not the
                             // pre-unify fresh variable.
                             let pruned = apply_ty_prune(&self.subst, &var_ty);
-                            self.codegen_var_types.insert(name.to_string(), pruned);
+                            self.record_codegen_var_type(name.to_string(), pruned);
                             // `let id = declare(...)` may wrap Declare/Call in
                             // ExprStatement/Statement/`?` — unwrap before matching.
                             let init = unwrap_expr_wrappers(next);
@@ -3675,10 +4043,21 @@ impl Checker {
                                 _ => None,
                             };
                             if let Some(dargs) = declare_args
-                                && dargs.len() == 4
+                                && (dargs.len() == 4 || dargs.len() == 5)
                             {
                                 let ret = self.ty_from_ffi_type_expr(&dargs[3]);
                                 self.ffi_fn_ret_tys.insert(name.to_string(), ret);
+                                let nfixed = match dargs[2].1.as_ref() {
+                                    Expression::Tuple(items) => items.len(),
+                                    _ => 0,
+                                };
+                                let variadic = if dargs.len() == 5 {
+                                    matches!(dargs[4].1.as_ref(), Expression::Bool(true))
+                                } else {
+                                    false
+                                };
+                                self.ffi_fn_variadic.insert(name.to_string(), variadic);
+                                self.ffi_fn_nfixed.insert(name.to_string(), nfixed);
                             }
                             i += 1;
                         }
@@ -3692,7 +4071,7 @@ impl Checker {
                     if let Expression::Identifier(n) = name.1.as_ref() {
                         self.env
                             .insert_top(n.to_string(), Scheme::mono(var_ty.clone()));
-                        self.codegen_var_types.insert(n.to_string(), var_ty.clone());
+                        self.record_codegen_var_type(n.to_string(), var_ty.clone());
                         self.insert_const_binding(n.to_string());
                         if i + 1 < children.len() {
                             let next = &children[i + 1];
@@ -3711,7 +4090,7 @@ impl Checker {
                                     "const binding",
                                 );
                                 let pruned = apply_ty_prune(&self.subst, &var_ty);
-                                self.codegen_var_types.insert(n.to_string(), pruned);
+                                self.record_codegen_var_type(n.to_string(), pruned);
                                 i += 1;
                             }
                         }
@@ -3823,6 +4202,96 @@ impl Checker {
             }
         }
         boolean()
+    }
+
+    /// Lazy `start..end` / `start..=end` — bounds unify to `T` with `T: Ord`.
+    fn infer_range(
+        &mut self,
+        start: &Output,
+        end: &Output,
+        inclusive: bool,
+        range: Range<usize>,
+    ) -> Ty {
+        let st = self.infer(start);
+        let et = self.infer(end);
+        let sp = apply_ty_prune(&self.subst, &st);
+        let ep = apply_ty_prune(&self.subst, &et);
+        // Coerce int literals under a `byte` peer (same as annotated `byte` lets).
+        if Self::is_byte_ty(&sp) && Self::byte_literal_coercion(end).is_ok() {
+            let _ = self.unify(&et, &crate::typechecking::ty::byte(), &end.0.into_range(), "range end");
+        } else if Self::is_byte_ty(&ep) && Self::byte_literal_coercion(start).is_ok() {
+            let _ = self.unify(
+                &st,
+                &crate::typechecking::ty::byte(),
+                &start.0.into_range(),
+                "range start",
+            );
+        }
+        let elem = self.unify(&st, &et, &range, "range bounds");
+        if !self.require_ord_for_range(&elem, &range) {
+            return if inclusive {
+                range_inclusive_ty(Ty::Var(self.counter.fresh()))
+            } else {
+                range_ty(Ty::Var(self.counter.fresh()))
+            };
+        }
+        let elem = apply_ty_prune(&self.subst, &elem);
+        if inclusive {
+            range_inclusive_ty(elem)
+        } else {
+            range_ty(elem)
+        }
+    }
+
+    /// Ensure range element type satisfies `Ord` (instance or active bound).
+    /// Unconstrained free type variables default to `int` (has `Ord`).
+    fn require_ord_for_range(&mut self, elem: &Ty, range: &Range<usize>) -> bool {
+        let pruned = apply_ty_prune(&self.subst, elem);
+        match &pruned {
+            Ty::Var(v) => {
+                if self.user_dict_index(*v, "Ord").is_none() {
+                    self.bind_matching_abstract_constraints(Some(*v), "Ord");
+                }
+                if self.user_dict_index(*v, "Ord").is_some() {
+                    return true;
+                }
+                let in_scope = self
+                    .type_params_in_scope
+                    .iter()
+                    .any(|frame| frame.values().any(|&id| id == *v));
+                if in_scope {
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "range bounds require bound `Ord`".to_string(),
+                        range.clone(),
+                        Some(
+                            "add a `T: Ord` bound, or use a concrete ordered type (`int`, `byte`, `float`)"
+                                .to_string(),
+                        ),
+                    );
+                    return false;
+                }
+                // Free var — pin to int (literals / unconstrained inference).
+                let _ = self.unify(elem, &int(), range, "range element type");
+                true
+            }
+            other => {
+                if self.generics.has_instance("Ord", other) {
+                    true
+                } else {
+                    let _ = self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("range bounds require `T: Ord`, found `{}`", other),
+                        range.clone(),
+                        Some(
+                            "both ends of `a..b` / `a..=b` must share a type that implements `Ord`"
+                                .to_string(),
+                        ),
+                    );
+                    false
+                }
+            }
+        }
     }
 
     fn infer_arith(
@@ -4096,8 +4565,7 @@ impl Checker {
                 if let Expression::Identifier(name) = args[0].1.as_ref() {
                     self.env
                         .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
-                    self.codegen_var_types
-                        .insert((*name).to_string(), dynamic.clone());
+                    self.record_codegen_var_type((*name).to_string(), dynamic.clone());
                 }
                 dynamic
             }
@@ -4110,8 +4578,7 @@ impl Checker {
                 if let Expression::Identifier(name) = args[0].1.as_ref() {
                     self.env
                         .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
-                    self.codegen_var_types
-                        .insert((*name).to_string(), dynamic.clone());
+                    self.record_codegen_var_type((*name).to_string(), dynamic.clone());
                 }
                 dynamic
             }
@@ -4284,6 +4751,141 @@ impl Checker {
             }
         }
         current
+    }
+
+    /// Apply a C-varargs extern call: unify the fixed prefix, accept extra
+    /// FFI-marshallable args, and record per-arg tags for codegen.
+    fn apply_extern_variadic_call(
+        &mut self,
+        name: &str,
+        fun_ty: &Ty,
+        arg_tys: &[Ty],
+        arg_exprs: Option<&[Output]>,
+        range: Range<usize>,
+    ) -> Ty {
+        let nfixed = self
+            .extern_variadic_nfixed
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| Self::fun_arity(fun_ty));
+        if arg_tys.len() < nfixed {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "Function `{}` was called with too few arguments \
+                     (variadic; expects at least {}, got {})",
+                    name,
+                    nfixed,
+                    arg_tys.len()
+                ),
+                range,
+                Some("provide the fixed parameters before any `...` arguments".to_string()),
+            );
+        }
+        for (i, ty) in arg_tys.iter().enumerate().skip(nfixed) {
+            if !Self::is_ffi_marshallable_ty(ty) {
+                let span = arg_exprs
+                    .and_then(|a| a.get(i))
+                    .map(|e| e.0.into_range())
+                    .unwrap_or_else(|| range.clone());
+                let mut m = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "variadic FFI argument #{} has non-marshallable type `{}`",
+                        i + 1,
+                        apply_ty_prune(&self.subst, ty)
+                    ),
+                    span.clone(),
+                );
+                m.push(Label::new(
+                    "expected int, float, string, bool, or pointer-like".to_string(),
+                    span,
+                ));
+                self.messages.push(m);
+            }
+        }
+        let fixed = &arg_tys[..nfixed];
+        let fixed_exprs = arg_exprs.map(|a| &a[..nfixed.min(a.len())]);
+        let ret = self.apply_function(Some(name), fun_ty, fixed, fixed_exprs, None, range.clone());
+        let tags: Vec<(u32, u32)> = arg_tys
+            .iter()
+            .map(|ty| Self::ffi_tag_from_ty_static(&apply_ty_prune(&self.subst, ty)))
+            .collect();
+        self.variadic_call_arg_tags
+            .insert((range.start, range.end), tags);
+        ret
+    }
+
+    fn fun_arity(ty: &Ty) -> usize {
+        let mut n = 0;
+        let mut cur = ty;
+        while let Ty::Fun(_, ret) = cur {
+            n += 1;
+            cur = ret.as_ref();
+        }
+        n
+    }
+
+    fn is_ffi_marshallable_ty(ty: &Ty) -> bool {
+        match ty {
+            Ty::Con(n) => matches!(
+                n.to_ascii_lowercase().as_str(),
+                "int"
+                    | "float"
+                    | "string"
+                    | "bool"
+                    | "byte"
+                    | "void"
+                    | "int8"
+                    | "int16"
+                    | "int32"
+                    | "uint8"
+                    | "uint16"
+                    | "uint32"
+                    | "uint64"
+                    | "ptr"
+            ),
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Record { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn ffi_tag_from_ty_static(ty: &Ty) -> (u32, u32) {
+        use common::tag;
+        match ty {
+            Ty::Con(n) => match n.to_ascii_lowercase().as_str() {
+                "float" => (tag::FLOAT, 0),
+                "string" => (tag::STRING, 0),
+                "bool" => (tag::BOOL, 0),
+                "byte" | "uint8" => (tag::UINT8, 0),
+                "int8" => (tag::INT8, 0),
+                "int16" => (tag::INT16, 0),
+                "int32" => (tag::INT32, 0),
+                "uint16" => (tag::UINT16, 0),
+                "uint32" => (tag::UINT32, 0),
+                "uint64" => (tag::UINT64, 0),
+                "ptr" => (tag::PTR, 0),
+                "void" => (tag::VOID, 0),
+                _ => (tag::INT, 0),
+            },
+            Ty::Array { .. } | Ty::Tuple(_) => (tag::PTR, 0),
+            _ => (tag::INT, 0),
+        }
+    }
+
+    /// Whether `name` is an `extern` function declared with C `...`.
+    pub fn is_extern_variadic(&self, name: &str) -> bool {
+        self.extern_variadic.contains(name)
+    }
+
+    /// Whether a `declare` binding was marked variadic.
+    pub fn is_ffi_declare_variadic(&self, binding: &str) -> bool {
+        self.ffi_fn_variadic.get(binding).copied().unwrap_or(false)
+    }
+
+    /// Per-arg FFI tags recorded for a variadic call/invoke at `span`.
+    pub fn variadic_arg_tags_at(&self, span: (usize, usize)) -> Option<&[(u32, u32)]> {
+        self.variadic_call_arg_tags.get(&span).map(|v| v.as_slice())
     }
 
     fn apply_existential_method(
@@ -6193,7 +6795,7 @@ impl Checker {
                 Some("import it with `use ffi::declare;` or `use ffi::*;`".to_string()),
             );
         }
-        if args.len() == 4 {
+        if args.len() == 4 || args.len() == 5 {
             self.infer(&args[0]);
             self.infer(&args[1]);
             match args[2].1.as_ref() {
@@ -6216,13 +6818,23 @@ impl Checker {
                 }
             }
             self.infer_ffi_type_expr(&args[3]);
+            if args.len() == 5 {
+                let flag_ty = self.infer(&args[4]);
+                self.unify(
+                    &flag_ty,
+                    &boolean(),
+                    &args[4].0.into_range(),
+                    "declare variadic flag",
+                );
+            }
         } else {
             for arg in args {
                 self.infer(arg);
             }
             let mut m = Message::error(
                 ErrorCode::DeclareArity,
-                "declare requires 4 arguments (lib, name, args_tuple, ret_type)".to_string(),
+                "declare requires 4 or 5 arguments (lib, name, args_tuple, ret_type[, variadic])"
+                    .to_string(),
                 range.clone(),
             );
             m.push(Label::new(
@@ -6245,18 +6857,46 @@ impl Checker {
             );
         }
         let mut ret_ty = int();
+        let mut variadic = false;
+        let mut nfixed = 0usize;
         if args.len() == 3 {
             self.infer(&args[0]);
             self.infer(&args[1]);
-            if let Expression::Identifier(name) = args[1].1.as_ref()
-                && let Some(ty) = self.ffi_fn_ret_tys.get(*name)
-            {
-                ret_ty = ty.clone();
+            if let Expression::Identifier(name) = args[1].1.as_ref() {
+                if let Some(ty) = self.ffi_fn_ret_tys.get(*name) {
+                    ret_ty = ty.clone();
+                }
+                variadic = self.ffi_fn_variadic.get(*name).copied().unwrap_or(false);
+                nfixed = self.ffi_fn_nfixed.get(*name).copied().unwrap_or(0);
             }
             match args[2].1.as_ref() {
                 Expression::Tuple(items) => {
+                    let mut tags = Vec::with_capacity(items.len());
                     for item in items {
-                        self.infer(item);
+                        let ty = self.infer(item);
+                        tags.push(Self::ffi_tag_from_ty_static(&apply_ty_prune(
+                            &self.subst, &ty,
+                        )));
+                    }
+                    if variadic {
+                        if items.len() < nfixed {
+                            let mut m = Message::error(
+                                ErrorCode::InvokeArity,
+                                format!(
+                                    "variadic invoke expects at least {} argument(s), got {}",
+                                    nfixed,
+                                    items.len()
+                                ),
+                                args[2].0.into_range(),
+                            );
+                            m.push(Label::new(
+                                "provide the fixed prefix plus any `...` arguments".to_string(),
+                                args[2].0.into_range(),
+                            ));
+                            self.messages.push(m);
+                        }
+                        self.variadic_call_arg_tags
+                            .insert((range.start, range.end), tags);
                     }
                 }
                 _ => {
@@ -6581,6 +7221,15 @@ impl Checker {
                         Some(&owner_ty),
                         *is_coro,
                     );
+                    // Method calls resolve as `Owner::method`; mirror that
+                    // key for named-arg reorder (self is never named).
+                    let fqn = format!("{}::{}", owner, name);
+                    if let Some(names) = self.fn_param_names.get(*name).cloned() {
+                        self.fn_param_names.insert(fqn.clone(), names);
+                    }
+                    if let Some(has) = self.fn_has_rest.get(*name).copied() {
+                        self.fn_has_rest.insert(fqn, has);
+                    }
                     let scheme = if param_vars.is_empty() {
                         Scheme::mono(fun_ty)
                     } else {
@@ -6765,6 +7414,16 @@ impl Checker {
             None
         };
         let arg_tys = self.parse_arg_list(args);
+        // Record declaration-order param names for named call-site args.
+        self.fn_param_names.insert(
+            name.to_string(),
+            arg_tys.iter().map(|(n, _)| n.clone()).collect(),
+        );
+        let has_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
+            if children.last().is_some_and(|c| {
+                matches!(c.1.as_ref(), Expression::Argument(_, _, true))
+            }));
+        self.fn_has_rest.insert(name.to_string(), has_rest);
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
             let send_ty = Ty::Var(self.counter.fresh());
@@ -6855,18 +7514,21 @@ impl Checker {
             .insert_top(name.to_string(), Scheme::mono(Ty::Var(alpha)));
 
         self.push_scope();
+        let mut baseline = std::collections::HashSet::new();
         if let Some(self_ty) = self_ty {
             // Method receiver — side-table for codegen Access/Call.
-            self.codegen_var_types
-                .insert("self".to_string(), self_ty.clone());
+            self.record_codegen_var_type("self".to_string(), self_ty.clone());
+            baseline.insert("self".to_string());
         }
         for (arg_name, arg_ty) in &arg_tys {
             self.env
                 .insert_top(arg_name.clone(), Scheme::mono(arg_ty.clone()));
-            self.codegen_var_types
-                .insert(arg_name.clone(), arg_ty.clone());
+            self.record_codegen_var_type(arg_name.clone(), arg_ty.clone());
+            baseline.insert(arg_name.clone());
         }
+        self.fn_codegen_baselines.push(baseline);
         let _ = self.infer(body);
+        self.fn_codegen_baselines.pop();
         self.pop_scope();
 
         if is_coro {
@@ -6988,17 +7650,343 @@ impl Checker {
     }
 
     /// Parse a function's argument list (a `Fragment` of
-    /// `Argument(ty, name)` nodes).
+    /// `Argument(ty, name, is_rest)` nodes). Rest params become `[T]`.
     fn parse_arg_list(&mut self, args: &Output) -> Vec<(String, Ty)> {
         let mut out = Vec::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
-            for child in children {
-                if let Expression::Argument(ty, name) = child.1.as_ref() {
-                    out.push((name.to_string(), self.parse_type_name(ty)));
+            let n = children.len();
+            for (i, child) in children.iter().enumerate() {
+                if let Expression::Argument(ty, name, is_rest) = child.1.as_ref() {
+                    if *is_rest {
+                        if i + 1 != n {
+                            let mut msg = Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Rest parameter `{}` must be the last parameter",
+                                    name
+                                ),
+                                child.0.into_range(),
+                            );
+                            msg.with_help(
+                                "write fixed parameters first, then `T... name`".to_string(),
+                            );
+                            self.messages.push(msg);
+                        }
+                        let elem = self.parse_type_name(ty);
+                        out.push((name.to_string(), array(elem)));
+                    } else {
+                        out.push((name.to_string(), self.parse_type_name(ty)));
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Declaration-order parameter names for `fn_name`, if recorded.
+    pub fn fn_param_names(&self, fn_name: &str) -> Option<&[String]> {
+        self.fn_param_names.get(fn_name).map(|v| v.as_slice())
+    }
+
+    /// Whether `fn_name` has a trailing rest parameter (`T... name`).
+    pub fn fn_has_rest(&self, fn_name: &str) -> bool {
+        self.fn_has_rest.get(fn_name).copied().unwrap_or(false)
+    }
+
+    /// Infer call arguments, reordering named args and packing rest.
+    ///
+    /// When any argument is [`Expression::NamedArg`], every fixed
+    /// parameter must be supplied (no partial application). Rest
+    /// parameters are positional-only at the call site and pack into
+    /// a single `[T]` (empty when no trailing args). Returns
+    /// `(arg_tys, ordered_value_exprs)` in declaration order; for rest
+    /// functions the last "expr" is a synthetic stand-in when packing
+    /// (callers that need element exprs use codegen's split helper).
+    fn infer_and_reorder_call_args<'a>(
+        &mut self,
+        fn_name: &str,
+        args: &'a [Output<'a>],
+        range: &Range<usize>,
+    ) -> (Vec<Ty>, Vec<Output<'a>>) {
+        let has_named = args
+            .iter()
+            .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
+        let has_rest = self.fn_has_rest.get(fn_name).copied().unwrap_or(false);
+
+        if !has_named && !has_rest {
+            let mut tys = Vec::with_capacity(args.len());
+            let mut exprs = Vec::with_capacity(args.len());
+            for arg in args {
+                tys.push(self.infer(arg));
+                exprs.push(arg.clone());
+            }
+            return (tys, exprs);
+        }
+
+        let Some(param_names) = self.fn_param_names.get(fn_name).cloned() else {
+            if has_named {
+                let mut msg = Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Named arguments are not supported on this call to `{}`",
+                        fn_name
+                    ),
+                    range.clone(),
+                );
+                msg.with_help(
+                    "named arguments require a known function with declared parameter names"
+                        .to_string(),
+                );
+                self.messages.push(msg);
+            }
+            let mut tys = Vec::with_capacity(args.len());
+            let mut exprs = Vec::with_capacity(args.len());
+            for arg in args {
+                tys.push(self.infer(arg));
+                exprs.push(match arg.1.as_ref() {
+                    Expression::NamedArg(_, v) => v.clone(),
+                    _ => arg.clone(),
+                });
+            }
+            return (tys, exprs);
+        };
+
+        let fixed_count = if has_rest {
+            param_names.len().saturating_sub(1)
+        } else {
+            param_names.len()
+        };
+        let rest_name = if has_rest {
+            param_names.get(fixed_count).cloned()
+        } else {
+            None
+        };
+        let fixed_names = &param_names[..fixed_count];
+
+        let mut slots: Vec<Option<(Ty, Output)>> = vec![None; fixed_count];
+        let mut rest_elems: Vec<(Ty, Output)> = Vec::new();
+        let mut next_pos = 0usize;
+        let mut seen_named = false;
+
+        for arg in args {
+            match arg.1.as_ref() {
+                Expression::NamedArg(name, _) => {
+                    if rest_name.as_deref() == Some(*name) {
+                        let mut msg = Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Cannot pass rest parameter `{}` by name in call to `{}`",
+                                name, fn_name
+                            ),
+                            arg.0.into_range(),
+                        );
+                        msg.with_help(
+                            "rest parameters are positional-only; pass trailing values after fixed args"
+                                .to_string(),
+                        );
+                        self.messages.push(msg);
+                        let _ = self.infer(arg);
+                        continue;
+                    }
+                    seen_named = true;
+                    let ty = self.infer(arg);
+                    let value = match arg.1.as_ref() {
+                        Expression::NamedArg(_, v) => v.clone(),
+                        _ => unreachable!(),
+                    };
+                    match fixed_names.iter().position(|p| p == *name) {
+                        Some(idx) => {
+                            if slots[idx].is_some() {
+                                self.messages.push(Message::error(
+                                    ErrorCode::DuplicateField,
+                                    format!(
+                                        "Duplicate named argument `{}` in call to `{}`",
+                                        name, fn_name
+                                    ),
+                                    arg.0.into_range(),
+                                ));
+                            } else {
+                                slots[idx] = Some((ty, value));
+                            }
+                        }
+                        None => {
+                            let mut msg = Message::error(
+                                ErrorCode::UnknownField,
+                                format!(
+                                    "Unknown named argument `{}` in call to `{}`",
+                                    name, fn_name
+                                ),
+                                arg.0.into_range(),
+                            );
+                            if fixed_names.is_empty() {
+                                msg.with_help(format!(
+                                    "`{}` has no named parameters",
+                                    fn_name
+                                ));
+                            } else {
+                                msg.with_help(format!(
+                                    "expected one of: {}",
+                                    fixed_names.join(", ")
+                                ));
+                            }
+                            self.messages.push(msg);
+                        }
+                    }
+                }
+                _ => {
+                    let ty = self.infer(arg);
+                    // Skip fixed slots already filled by name so trailing
+                    // positionals can pack into rest after `f(a: 1, 2, 3)`.
+                    while next_pos < fixed_count && slots[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos < fixed_count {
+                        if seen_named {
+                            let mut msg = Message::error(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "Positional argument after named argument in call to `{}`",
+                                    fn_name
+                                ),
+                                arg.0.into_range(),
+                            );
+                            msg.with_help(
+                                "all positional arguments must come before named arguments"
+                                    .to_string(),
+                            );
+                            self.messages.push(msg);
+                        }
+                        slots[next_pos] = Some((ty, arg.clone()));
+                        next_pos += 1;
+                    } else if has_rest {
+                        // Trailing positionals after fixed (and after named
+                        // fixed args) pack into the rest array.
+                        rest_elems.push((ty, arg.clone()));
+                        next_pos += 1;
+                    } else if seen_named {
+                        let mut msg = Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Positional argument after named argument in call to `{}`",
+                                fn_name
+                            ),
+                            arg.0.into_range(),
+                        );
+                        msg.with_help(
+                            "all positional arguments must come before named arguments"
+                                .to_string(),
+                        );
+                        self.messages.push(msg);
+                    } else {
+                        self.messages.push(Message::error(
+                            ErrorCode::TooManyArguments,
+                            format!(
+                                "Function `{}` was called with too many arguments",
+                                fn_name
+                            ),
+                            arg.0.into_range(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Positional-only under-application of fixed params: do not
+        // synthesize an empty rest pack (preserves partial application).
+        let pack_rest = has_rest
+            && (has_named
+                || next_pos >= fixed_count
+                || args.len() >= fixed_count
+                || fixed_count == 0);
+
+        let mut tys = Vec::with_capacity(fixed_count + usize::from(pack_rest));
+        let mut exprs = Vec::with_capacity(fixed_count + usize::from(pack_rest));
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some((ty, expr)) => {
+                    tys.push(ty);
+                    exprs.push(expr);
+                }
+                None => {
+                    if has_named || pack_rest {
+                        let mut msg = Message::error(
+                            ErrorCode::MissingField,
+                            format!(
+                                "Missing argument `{}` in call to `{}`",
+                                fixed_names[i], fn_name
+                            ),
+                            range.clone(),
+                        );
+                        if has_named {
+                            msg.with_help(
+                                "when any argument is named, all fixed parameters must be supplied"
+                                    .to_string(),
+                            );
+                        }
+                        self.messages.push(msg);
+                        tys.push(Ty::Var(self.counter.fresh()));
+                        if let Some(a) = args.first() {
+                            exprs.push(match a.1.as_ref() {
+                                Expression::NamedArg(_, v) => v.clone(),
+                                _ => a.clone(),
+                            });
+                        }
+                    } else {
+                        // Partial application — stop before first hole.
+                        break;
+                    }
+                }
+            }
+        }
+
+        if pack_rest {
+            let mut elem_ty: Option<Ty> = None;
+            for (t, _) in &rest_elems {
+                let t_pruned = apply_ty_prune(&self.subst, t);
+                match &elem_ty {
+                    None => elem_ty = Some(t_pruned),
+                    Some(prev) => {
+                        let prev_pruned = apply_ty_prune(&self.subst, prev);
+                        if unify_with(&self.subst, &prev_pruned, &t_pruned).is_err() {
+                            let _ = self.error_with_help(
+                                ErrorCode::TypeMismatch,
+                                format!(
+                                    "rest argument type mismatch: expected `{}`, found `{}`",
+                                    prev_pruned, t_pruned
+                                ),
+                                range.clone(),
+                                Some(
+                                    "all trailing rest arguments must share the same element type"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            let element = elem_ty.unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+            let rest_ty = if rest_elems.is_empty() {
+                array(element)
+            } else {
+                array_fixed(element, rest_elems.len())
+            };
+            tys.push(rest_ty);
+            // Stand-in for apply_function's expression hooks (array packing
+            // is a codegen concern). Prefer the first rest elem if any.
+            if let Some((_, e)) = rest_elems.first() {
+                exprs.push(e.clone());
+            } else if let Some(a) = args.first() {
+                exprs.push(match a.1.as_ref() {
+                    Expression::NamedArg(_, v) => v.clone(),
+                    _ => a.clone(),
+                });
+            }
+        }
+
+        if exprs.len() != tys.len() {
+            exprs.clear();
+        }
+        (tys, exprs)
     }
 
     // ============================================================
@@ -7202,7 +8190,7 @@ impl Checker {
             | Expression::Module(_, _)
             | Expression::Variable(_, _)
             | Expression::Constant(_, _)
-            | Expression::Argument(_, _)
+            | Expression::Argument(_, _, _)
             | Expression::Field(_, _, _)
             | Expression::ExternBlock { .. }
             | Expression::ExternStruct(_) => {}
@@ -7224,7 +8212,9 @@ impl Checker {
             | Expression::Positive(e)
             | Expression::Adjust { target: e, .. }
             | Expression::Defer(e)
-            | Expression::Member(e) => {
+            | Expression::Member(e)
+            | Expression::LetDestructure { rhs: e, .. }
+            | Expression::NamedArg(_, e) => {
                 self.pre_register_enums_walk(e, errors);
             }
 
@@ -7271,6 +8261,10 @@ impl Checker {
             | Expression::Coalesce(l, r) => {
                 self.pre_register_enums_walk(l, errors);
                 self.pre_register_enums_walk(r, errors);
+            }
+            Expression::Range { start, end, .. } => {
+                self.pre_register_enums_walk(start, errors);
+                self.pre_register_enums_walk(end, errors);
             }
 
             Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
@@ -8150,8 +9144,7 @@ impl Checker {
                 let pruned = apply_ty_prune(&self.subst, expected_ty);
                 self.env
                     .insert_top(name.to_string(), Scheme::mono(pruned.clone()));
-                self.codegen_var_types
-                    .insert(name.to_string(), pruned.clone());
+                self.record_codegen_var_type(name.to_string(), pruned.clone());
                 pruned
             }
             Pattern::Constructor {
@@ -8332,6 +9325,199 @@ impl Checker {
                 // tag, the pattern is still of that same type;
                 // exhaustiveness checking will report the
                 // arm as unreachable.)
+                expected_ty.clone()
+            }
+        }
+    }
+
+    /// Bind names from an irrefutable `let` pattern against `expected_ty`
+    /// (the RHS type). Supports nested tuples/records and `_`.
+    fn infer_let_pattern(
+        &mut self,
+        pattern: &parser::ast::LetPattern,
+        expected_ty: &Ty,
+        pattern_range: &Range<usize>,
+    ) -> Ty {
+        // Reject `let (x, x) = …` / nested duplicate binders up front.
+        {
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = Self::first_duplicate_let_binder(pattern, &mut seen) {
+                return self.error_with_help(
+                    ErrorCode::VariableRedeclaration,
+                    format!("Duplicate binder `{dup}` in let pattern"),
+                    pattern_range.clone(),
+                    Some("each name may appear at most once in a let pattern".to_string()),
+                );
+            }
+        }
+        self.infer_let_pattern_inner(pattern, expected_ty, pattern_range)
+    }
+
+    fn first_duplicate_let_binder<'a>(
+        pattern: &'a parser::ast::LetPattern<'a>,
+        seen: &mut std::collections::HashSet<&'a str>,
+    ) -> Option<&'a str> {
+        use parser::ast::LetPattern;
+        match pattern {
+            LetPattern::Wildcard => None,
+            LetPattern::Binding { name } => {
+                if !seen.insert(*name) {
+                    Some(*name)
+                } else {
+                    None
+                }
+            }
+            LetPattern::Tuple(parts) => {
+                for p in parts {
+                    if let Some(d) = Self::first_duplicate_let_binder(p, seen) {
+                        return Some(d);
+                    }
+                }
+                None
+            }
+            LetPattern::Record(fields) => {
+                for pf in fields {
+                    if let Some(d) = Self::first_duplicate_let_binder(&pf.pattern, seen) {
+                        return Some(d);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn infer_let_pattern_inner(
+        &mut self,
+        pattern: &parser::ast::LetPattern,
+        expected_ty: &Ty,
+        pattern_range: &Range<usize>,
+    ) -> Ty {
+        use parser::ast::LetPattern;
+        let expected = apply_ty_prune(&self.subst, expected_ty);
+        match pattern {
+            LetPattern::Wildcard => expected,
+            LetPattern::Binding { name } => {
+                self.env
+                    .insert_top(name.to_string(), Scheme::mono(expected.clone()));
+                self.record_codegen_var_type(name.to_string(), expected.clone());
+                expected
+            }
+            LetPattern::Tuple(parts) => {
+                let elem_tys = match &expected {
+                    Ty::Tuple(tys) => {
+                        if tys.len() != parts.len() {
+                            return self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                format!(
+                                    "tuple pattern has {} elements, but value has type `{}`",
+                                    parts.len(),
+                                    expected,
+                                ),
+                                pattern_range.clone(),
+                                Some("adjust the pattern or the RHS tuple arity".to_string()),
+                            );
+                        }
+                        tys.clone()
+                    }
+                    Ty::Var(_) => {
+                        let fresh: Vec<Ty> = parts
+                            .iter()
+                            .map(|_| Ty::Var(self.counter.fresh()))
+                            .collect();
+                        let tup = Ty::Tuple(fresh.clone());
+                        self.unify(&expected, &tup, pattern_range, "let tuple destructure");
+                        fresh
+                    }
+                    other => {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "cannot destructure type `{}` with a tuple pattern",
+                                other,
+                            ),
+                            pattern_range.clone(),
+                            Some("RHS must be a tuple".to_string()),
+                        );
+                    }
+                };
+                for (sub, ty) in parts.iter().zip(elem_tys.iter()) {
+                    let _ = self.infer_let_pattern_inner(sub, ty, pattern_range);
+                }
+                expected_ty.clone()
+            }
+            LetPattern::Record(fields) => {
+                let decl_fields = match &expected {
+                    Ty::Record { fields: decl } => decl.clone(),
+                    Ty::Var(_) => {
+                        // Synthesize a record type from the pattern field names.
+                        let mut synth = Vec::with_capacity(fields.len());
+                        let mut seen = std::collections::HashSet::new();
+                        for pf in fields {
+                            if !seen.insert(pf.name) {
+                                return self.error_with_help(
+                                    ErrorCode::DuplicateField,
+                                    format!(
+                                        "Duplicate field `{}` in record pattern",
+                                        pf.name
+                                    ),
+                                    pattern_range.clone(),
+                                    Some("each field must appear exactly once".to_string()),
+                                );
+                            }
+                            synth.push((pf.name.to_string(), Ty::Var(self.counter.fresh())));
+                        }
+                        synth.sort_by(|a, b| a.0.cmp(&b.0));
+                        let rec = Ty::Record {
+                            fields: synth.clone(),
+                        };
+                        self.unify(&expected, &rec, pattern_range, "let record destructure");
+                        synth
+                    }
+                    other => {
+                        return self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "cannot destructure type `{}` with a record pattern",
+                                other,
+                            ),
+                            pattern_range.clone(),
+                            Some("RHS must be a record (dict)".to_string()),
+                        );
+                    }
+                };
+                let mut pattern_site: std::collections::HashMap<&str, &LetPattern> =
+                    std::collections::HashMap::with_capacity(fields.len());
+                for pf in fields {
+                    if pattern_site.insert(pf.name, &pf.pattern).is_some() {
+                        return self.error_with_help(
+                            ErrorCode::DuplicateField,
+                            format!("Duplicate field `{}` in record pattern", pf.name),
+                            pattern_range.clone(),
+                            Some("each field must appear exactly once".to_string()),
+                        );
+                    }
+                }
+                for pf in fields {
+                    let Some((_, fty)) = decl_fields.iter().find(|(n, _)| n == pf.name) else {
+                        return self.error_with_help(
+                            ErrorCode::UnknownField,
+                            format!(
+                                "Cannot find field `{}` on record `{}`",
+                                pf.name, expected,
+                            ),
+                            pattern_range.clone(),
+                            Some(format!(
+                                "the record has fields: {}",
+                                decl_fields
+                                    .iter()
+                                    .map(|(n, _)| format!("`{}`", n))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                        );
+                    };
+                    let _ = self.infer_let_pattern_inner(&pf.pattern, fty, pattern_range);
+                }
                 expected_ty.clone()
             }
         }
@@ -9217,7 +10403,7 @@ impl Checker {
                     format!("type `{}` is not iterable", te),
                     iterable_range.clone(),
                     Some(
-                        "implement `IntoIterator` / `Iterator`, or use an array, homogeneous tuple/dict, or coroutine"
+                        "implement `IntoIterator` / `Iterator`, or use an array, homogeneous tuple/dict, range, or coroutine"
                             .to_string(),
                     ),
                 );
@@ -9288,10 +10474,57 @@ impl Checker {
                 if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") && args.len() == 2 {
                     return Some((args[0].clone(), ForInKind::Coroutine));
                 }
+                if matches!(head.as_ref(), Ty::Con(n) if n == "Range") && args.len() == 1 {
+                    return self.range_for_in_kind(&args[0], false, range);
+                }
+                if matches!(head.as_ref(), Ty::Con(n) if n == "RangeInclusive") && args.len() == 1
+                {
+                    return self.range_for_in_kind(&args[0], true, range);
+                }
                 None
             }
             _ => None,
         }
+    }
+
+    /// `for` over `Range<T>` / `RangeInclusive<T>` — iteration needs a
+    /// stepped numeric element (`int` / `byte` / `float`). Construction
+    /// only requires `Ord`; non-steppable Ord types get a diagnostic.
+    fn range_for_in_kind(
+        &mut self,
+        elem: &Ty,
+        inclusive: bool,
+        range: &Range<usize>,
+    ) -> Option<(Ty, ForInKind)> {
+        let elem = apply_ty_prune(&self.subst, elem);
+        let float = match &elem {
+            Ty::Con(n) if n == "float" => true,
+            Ty::Con(n) if n == "int" || n == "byte" => false,
+            other => {
+                let _ = self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!("cannot iterate over `Range<{}>`", other),
+                    range.clone(),
+                    Some(
+                        "`for` over a range requires element type `int`, `byte`, or `float` \
+                         (construction only needs `Ord`; stepping needs a numeric successor)"
+                            .to_string(),
+                    ),
+                );
+                // Recovery: int-style opcodes so codegen still emits.
+                return Some((
+                    elem,
+                    ForInKind::Range {
+                        inclusive,
+                        float: false,
+                    },
+                ));
+            }
+        };
+        Some((
+            elem,
+            ForInKind::Range { inclusive, float },
+        ))
     }
 
     /// All types unify to one element type, or diagnose heterogeneity.
@@ -12653,6 +13886,121 @@ fn main() {
     }
 
     #[test]
+    fn range_literal_infers_range_int() {
+        let (c, _) = check("fn main() { let r = 0..10; }");
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_ty(int())
+        );
+    }
+
+    #[test]
+    fn range_inclusive_infers_range_inclusive_int() {
+        let (c, _) = check("fn main() { let r = 0..=10; }");
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_inclusive_ty(int())
+        );
+    }
+
+    #[test]
+    fn for_in_range_binds_element_type() {
+        let src = r#"
+fn main() {
+    for x in 0..5 {
+        let y = x;
+    }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let y_ty = c.codegen_var_type("y").expect("y");
+        assert_eq!(apply_ty_prune(c.subst(), y_ty), int());
+    }
+
+    #[test]
+    fn range_accepts_float_bounds() {
+        let (c, _) = check("fn main() { let r = 1.0..2.0; }");
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_ty(float())
+        );
+    }
+
+    #[test]
+    fn range_rejects_string_bounds_without_ord() {
+        let (c, _) = check(r#"fn main() { let r = "a".."z"; }"#);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("Ord")),
+            "expected Ord requirement diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn range_generic_ord_bound_constructs_range_t() {
+        let src = r#"
+fn span<T: Ord>(T a, T b) -> Range<T> {
+    return a..b;
+}
+fn main() {
+    let r = span(0, 5);
+}
+"#;
+        let (c, _) = check(src);
+        assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
+        let r_ty = c.codegen_var_type("r").expect("r");
+        assert_eq!(
+            apply_ty_prune(c.subst(), r_ty),
+            crate::typechecking::ty::range_ty(int())
+        );
+    }
+
+    #[test]
+    fn range_generic_without_ord_is_diagnostic() {
+        let src = r#"
+fn span<T>(T a, T b) -> Range<T> {
+    return a..b;
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("Ord")),
+            "expected Ord bound diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
+    fn for_in_range_rejects_non_numeric_ord_element() {
+        // Construction of Range<string> already fails (no Ord). Drive the
+        // for-in diagnostic via a generic Ord type that isn't steppable.
+        let src = r#"
+fn dump<T: Ord>(T a, T b) {
+    for x in a..b { }
+}
+"#;
+        let (c, _) = check(src);
+        assert!(
+            c.messages()
+                .iter()
+                .any(|m| m.message().contains("cannot iterate")),
+            "expected non-steppable range for-in diagnostic, got {:?}",
+            c.messages()
+        );
+    }
+
+    #[test]
     fn for_in_hetero_tuple_is_diagnostic() {
         let (c, _) = check("fn main() { for x in (1, \"a\") { } }");
         assert!(
@@ -14008,6 +15356,91 @@ test("bad") {
             msgs.iter().any(|m| m.message().contains("Type mismatch")
                 || m.message().contains("mismatch")),
             "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rest_param_packs_trailing_args_as_array() {
+        let (mut c, _) = check(
+            r#"
+fn sum(int... xs) -> int {
+    return len(xs);
+}
+fn main() {
+    let n = sum(1, 2, 3);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+        assert!(c.fn_has_rest("sum"));
+        assert_eq!(c.fn_param_names("sum"), Some(&["xs".to_string()][..]));
+    }
+
+    #[test]
+    fn rest_param_empty_call_packs_empty_array() {
+        let (mut c, _) = check(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() { let n = sum(); }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rest_param_must_be_last() {
+        let msgs = assert_messages(
+            r#"
+fn bad(int... xs, int y) -> int { return y; }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("must be the last parameter")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rest_param_cannot_be_named_at_call_site() {
+        let msgs = assert_messages(
+            r#"
+fn sum(int... xs) -> int { return len(xs); }
+fn main() { let n = sum(xs: [1, 2]); }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Cannot pass rest parameter")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn named_fixed_then_positional_rest_is_allowed() {
+        let (mut c, _) = check(
+            r#"
+fn f(int a, int... xs) -> int { return a + len(xs); }
+fn main() { let n = f(a: 1, 2, 3); }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }

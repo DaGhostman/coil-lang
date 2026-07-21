@@ -69,8 +69,12 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Module(_, _)
         | Expression::Variable(_, _)
         | Expression::Constant(_, _)
-        | Expression::Argument(_, _)
+        | Expression::Argument(_, _, _)
         | Expression::Field(_, _, _) => {}
+
+        Expression::LetDestructure { rhs, .. } => pre_walk(rhs, table),
+
+        Expression::NamedArg(_, value) => pre_walk(value, table),
 
         Expression::TypeApp { args, .. } => {
             for a in args {
@@ -134,6 +138,10 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Coalesce(l, r) => {
             pre_walk(l, table);
             pre_walk(r, table);
+        }
+        Expression::Range { start, end, .. } => {
+            pre_walk(start, table);
+            pre_walk(end, table);
         }
 
         Expression::Print(fmt, params) | Expression::Format(fmt, params) => {

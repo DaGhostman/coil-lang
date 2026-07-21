@@ -3,8 +3,9 @@
 //! Builds a span-annotated `Expression` AST for the compiler pipeline.
 
 use ast::{
-    AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, MatchArm, Output,
-    Pattern, PatternField, PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
+    AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, LetFieldPattern,
+    LetPattern, MatchArm, Output, Pattern, PatternField, PatternPayload, RecordFieldDecl,
+    RecordFieldValue, TypeParam, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -16,8 +17,8 @@ use chumsky::{
     IterParser, Parser,
     error::Rich,
     extra,
-    pratt::{infix, left, postfix, prefix, right},
-    prelude::{choice, just, none_of, recursive},
+    pratt::{infix, left, none, postfix, prefix, right},
+    prelude::{choice, empty, just, none_of, recursive},
     text,
 };
 use reporting::{ErrorCode, Label, Message};
@@ -31,6 +32,8 @@ enum Precedence {
     Xor,
     And,
     Equal,
+    /// `..` / `..=` — below comparisons, non-associative (Phase P3).
+    Range,
     Compare,
     Binary,
     Term,
@@ -441,6 +444,23 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     },
                 ),
+                // `..=` before `..` so the digraph wins. Non-associative
+                // (reject `a..b..c`). Float `1.0` stays an atom; postfix
+                // `.field` requires an ident after `.`, so `0..10` is fine.
+                infix(
+                    none(Precedence::Range as u16),
+                    choice((op!("..="), op!(".."))),
+                    |lhs, op, rhs, e| {
+                        (
+                            e.span(),
+                            Box::new(Expression::Range {
+                                start: lhs,
+                                end: rhs,
+                                inclusive: op == "..=",
+                            }),
+                        )
+                    },
+                ),
                 infix(
                     right(Precedence::Equal as u16),
                     choice((op!("=="), op!("!="))),
@@ -634,10 +654,22 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        let arg = self
+        // `T... name` (rest) or `T name` (fixed). Rest must be last —
+        // enforced in the typechecker.
+        let rest_arg = self
+            .type_annotation()
+            .then_ignore(just("...").padded())
+            .then(text::ident().padded())
+            .map_with(|(ty, name), e| {
+                (e.span(), Box::new(Expression::Argument(ty, name, true)))
+            });
+        let fixed_arg = self
             .type_annotation()
             .then(text::ident().padded())
-            .map_with(|(ty, name), e| (e.span(), Box::new(Expression::Argument(ty, name))));
+            .map_with(|(ty, name), e| {
+                (e.span(), Box::new(Expression::Argument(ty, name, false)))
+            });
+        let arg = rest_arg.or(fixed_arg);
 
         arg.separated_by(op!(','))
             .allow_trailing()
@@ -1342,6 +1374,87 @@ impl<'pratt> Pratt<'pratt> {
             .labelled("extern struct declaration")
     }
 
+    /// Extern-only parameter list: fixed `T name` args plus optional trailing bare `...`.
+    /// Language rest (`T... name`) is rejected with a clear diagnostic.
+    fn extern_arg_list(
+        &self,
+    ) -> impl Parser<
+        'pratt,
+        &'pratt str,
+        (Output<'pratt>, bool),
+        extra::Err<Rich<'pratt, char>>,
+    > + Clone
+           + 'pratt {
+        #[derive(Clone)]
+        enum ExternArg<'a> {
+            Fixed(Output<'a>),
+            /// Matched `T... name` — rejected after the list is collected.
+            IllegalRest,
+        }
+
+        let illegal_rest = self
+            .type_annotation()
+            .then_ignore(just("...").padded())
+            .then(text::ident().padded())
+            .to(ExternArg::IllegalRest);
+        let fixed_arg = self
+            .type_annotation()
+            .then(text::ident().padded())
+            .map_with(|(ty, name), e| {
+                ExternArg::Fixed((e.span(), Box::new(Expression::Argument(ty, name, false))))
+            });
+        // Prefer illegal-rest so `int... xs` is recognized (then rejected).
+        let arg = illegal_rest.or(fixed_arg);
+
+        let bare_only = just("...")
+            .padded()
+            .map_with(|_, e| {
+                (
+                    (e.span(), Box::new(Expression::Fragment(Vec::new()))),
+                    true,
+                )
+            });
+
+        let fixed_then_ellipsis = arg
+            .separated_by(op!(','))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .then(
+                op!(',')
+                    .ignore_then(just("...").padded())
+                    .or_not()
+                    .map(|o| o.is_some()),
+            )
+            .try_map(|(args, variadic), span| {
+                if args.iter().any(|a| matches!(a, ExternArg::IllegalRest)) {
+                    return Err(Rich::custom(
+                        span,
+                        "use bare `...` for C varargs; `T... name` is only for language rest parameters",
+                    ));
+                }
+                let fixed: Vec<Output<'_>> = args
+                    .into_iter()
+                    .filter_map(|a| match a {
+                        ExternArg::Fixed(o) => Some(o),
+                        ExternArg::IllegalRest => None,
+                    })
+                    .collect();
+                Ok((
+                    (span, Box::new(Expression::Fragment(fixed))),
+                    variadic,
+                ))
+            });
+
+        let empty = empty().map_with(|_, e| {
+            (
+                (e.span(), Box::new(Expression::Fragment(Vec::new()))),
+                false,
+            )
+        });
+
+        choice((bare_only, fixed_then_ellipsis, empty)).delimited_by(op!("("), op!(")"))
+    }
+
     /// `extern "libname" { fn name(args) -> ret; ... }` — declare
     /// external (FFI) functions from a shared library.
     ///
@@ -1364,14 +1477,15 @@ impl<'pratt> Pratt<'pratt> {
         // as long as the final `map_with` produces an `Output`.
         let extern_function_decl = keyword!("fn")
             .then(text::ident().padded())
-            .then(self.arg_list())
+            .then(self.extern_arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             // The trailing `;` is required (no body).
             .then_ignore(op!(";"))
-            .map_with(|(((_, name), args), returns), _e| ExternFunction {
+            .map_with(|(((_, name), (args, variadic)), returns), _e| ExternFunction {
                 name,
                 args,
                 returns,
+                variadic,
             });
 
         // Inline string-literal parser for the library name.
@@ -1835,7 +1949,7 @@ impl<'pratt> Pratt<'pratt> {
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("let")
+        let simple = keyword!("let")
             .ignore_then(text::ident())
             .then(op!(":").ignore_then(self.type_annotation()).or_not())
             .then(op!("=").ignore_then(self.expr()).or_not())
@@ -1845,7 +1959,118 @@ impl<'pratt> Pratt<'pratt> {
                     result.push(v);
                 }
                 (e.span(), Box::new(Expression::Fragment(result)))
-            })
+            });
+
+        // `let (a, b) = expr;` / `let { x, y } = expr;` — tried before
+        // the simple `let name` form so `(` / `{` are not misread as
+        // identifiers. Top-level LHS is tuple/record only (not a bare
+        // binding — that stays on the simple path).
+        let destructure = keyword!("let")
+            .ignore_then(self.let_destructure_lhs())
+            .then_ignore(op!("="))
+            .then(self.expr())
+            .map_with(|(pattern, rhs), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::LetDestructure { pattern, rhs }),
+                )
+            });
+
+        choice((destructure, simple))
+    }
+
+    /// Top-level `let` destructure LHS: `(p, …)` or `{ field, … }` only.
+    fn let_destructure_lhs(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        choice((self.let_tuple_pattern(), self.let_record_pattern()))
+    }
+
+    fn let_tuple_pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let inner = self.let_pattern();
+        // Require a comma (or trailing comma) so `(a)` is not a
+        // 1-tuple — same rule as tuple literals.
+        let tuple_multi = inner
+            .clone()
+            .separated_by(op!(','))
+            .at_least(2)
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(op!('('), op!(')'));
+        let tuple_trailing = inner
+            .then_ignore(op!(','))
+            .map(|p| vec![p])
+            .delimited_by(op!('('), op!(')'));
+        choice((tuple_multi, tuple_trailing)).map(LetPattern::Tuple)
+    }
+
+    fn let_record_pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let field = text::ident()
+            .padded()
+            .then(op!(":").ignore_then(self.let_pattern()).or_not())
+            .map(|(name, sub)| {
+                let pattern = sub.unwrap_or(LetPattern::Binding { name });
+                LetFieldPattern { name, pattern }
+            });
+        field
+            .separated_by(op!(','))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("{"), op!("}"))
+            .map(LetPattern::Record)
+    }
+
+    /// Nested irrefutable `let` pattern: `_`, binding, `(p, …)`, `{ field, … }`.
+    fn let_pattern(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, LetPattern<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        recursive(|pattern_parser| {
+            let record_field = text::ident()
+                .padded()
+                .then(op!(":").ignore_then(pattern_parser.clone()).or_not())
+                .map(|(name, sub)| {
+                    let pattern = sub.unwrap_or(LetPattern::Binding { name });
+                    LetFieldPattern { name, pattern }
+                });
+
+            let record = record_field
+                .separated_by(op!(','))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(op!("{"), op!("}"))
+                .map(LetPattern::Record);
+
+            let tuple_multi = pattern_parser
+                .clone()
+                .separated_by(op!(','))
+                .at_least(2)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(op!('('), op!(')'));
+            let tuple_trailing = pattern_parser
+                .clone()
+                .then_ignore(op!(','))
+                .map(|p| vec![p])
+                .delimited_by(op!('('), op!(')'));
+            let tuple = choice((tuple_multi, tuple_trailing)).map(LetPattern::Tuple);
+
+            choice((
+                just("_").padded().to(LetPattern::Wildcard),
+                tuple,
+                record,
+                text::ident()
+                    .padded()
+                    .map(|name| LetPattern::Binding { name }),
+            ))
+        })
     }
 
     fn constant(
@@ -1877,8 +2102,20 @@ impl<'pratt> Pratt<'pratt> {
         extra::Err<Rich<'pratt, char>>,
     > + Clone
     + 'pratt {
-        expr.clone()
-            .separated_by(op!(','))
+        // Named call-site arg: `ident : expr` → `NamedArg`. Tried before
+        // bare `expr` so `f(a: 1)` does not parse as a labelled type /
+        // weird binary form. Positional `expr` still wins when there is
+        // no colon after the identifier.
+        let named = text::ident()
+            .padded()
+            .then_ignore(op!(":"))
+            .then(expr.clone())
+            .map_with(|(name, value), e| {
+                (e.span(), Box::new(Expression::NamedArg(name, value)))
+            })
+            .labelled("named argument");
+        let arg = named.or(expr.clone());
+        arg.separated_by(op!(','))
             .allow_trailing()
             .collect::<Vec<_>>()
             .or_not()
@@ -3002,6 +3239,54 @@ mod tests {
     }
 
     #[test]
+    fn named_call_args_parse_to_named_arg() {
+        let ast = expr_ast!("f(a: 1, b: 2)");
+        let inner = match ast {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Call { name, args } => {
+                match name.1.as_ref() {
+                    Expression::Identifier(n) => assert_eq!(*n, "f"),
+                    other => panic!("expected Identifier(f), got {:?}", other),
+                }
+                let args = args.expect("call should have args");
+                assert_eq!(args.len(), 2);
+                match args[0].1.as_ref() {
+                    Expression::NamedArg(n, val) => {
+                        assert_eq!(*n, "a");
+                        assert!(
+                            matches!(val.1.as_ref(), Expression::Integer(1)),
+                            "expected Integer(1), got {:?}",
+                            val.1
+                        );
+                    }
+                    other => panic!("expected NamedArg(a, 1), got {:?}", other),
+                }
+                match args[1].1.as_ref() {
+                    Expression::NamedArg(n, val) => {
+                        assert_eq!(*n, "b");
+                        assert!(
+                            matches!(val.1.as_ref(), Expression::Integer(2)),
+                            "expected Integer(2), got {:?}",
+                            val.1
+                        );
+                    }
+                    other => panic!("expected NamedArg(b, 2), got {:?}", other),
+                }
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn named_call_args_display_round_trips() {
+        same!("f(a: 1, b: 2)");
+        same!("greet(\"Ada\", age: 36)");
+    }
+
+    #[test]
     fn postfix_field_access_chains_left_to_right() {
         let ast = expr_ast!("p.x.y");
         let inner = match ast {
@@ -3048,6 +3333,82 @@ mod tests {
             matches!(inner, Expression::Float(_)),
             "expected Float(1.0), got {:?}",
             inner
+        );
+    }
+
+    #[test]
+    fn rest_param_parses_in_arg_list() {
+        let src = "fn sum(int... xs) -> int { return 0; }";
+        let ast = Pratt::default().parse(src).expect("parse");
+        let func = match ast.1.as_ref() {
+            Expression::Program(items) => items[0].1.as_ref(),
+            other => other,
+        };
+        let found = match func {
+            Expression::Function { args, .. } => match args.1.as_ref() {
+                Expression::Fragment(items) => {
+                    matches!(items[0].1.as_ref(), Expression::Argument(_, "xs", true))
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(found, "expected Argument(..., xs, true) in arg list");
+        // Display round-trip for the rest form.
+        assert!(
+            format!("{}", func).contains("int... xs"),
+            "display should show rest syntax, got {}",
+            func
+        );
+    }
+
+    #[test]
+    fn range_half_open_parses() {
+        same!("0..10");
+        let inner = match expr_ast!("0..10") {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Range {
+                inclusive: false, ..
+            } => {}
+            other => panic!("expected half-open Range, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn range_inclusive_parses() {
+        same!("0..=10");
+        let inner = match expr_ast!("0..=10") {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        match inner {
+            Expression::Range {
+                inclusive: true, ..
+            } => {}
+            other => panic!("expected inclusive Range, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn range_does_not_break_float_or_field_access() {
+        let float = match expr_ast!("1.0") {
+            Expression::Expr(e) => e.1.as_ref().clone(),
+            other => other,
+        };
+        assert!(matches!(float, Expression::Float(_)));
+        same!("point.x");
+    }
+
+    #[test]
+    fn range_chain_is_rejected_as_non_associative() {
+        // `..` is non-associative — `a..b..c` must not parse.
+        let result = Pratt::default().parse("1..2..3");
+        assert!(
+            result.is_err(),
+            "expected parse error for chained range 1..2..3, got Ok"
         );
     }
 
@@ -3375,6 +3736,32 @@ mod tests {
     }
 
     #[test]
+    fn let_tuple_destructure_parses() {
+        let ast = decl_ast!("let (a, b) = (1, 2);");
+        let is_destructure = match &ast {
+            Expression::Statement(s) | Expression::ExprStatement(s) => {
+                matches!(s.1.as_ref(), Expression::LetDestructure { .. })
+            }
+            Expression::LetDestructure { .. } => true,
+            _ => false,
+        };
+        assert!(is_destructure, "expected LetDestructure, got {:?}", ast);
+    }
+
+    #[test]
+    fn let_record_destructure_parses() {
+        let ast = decl_ast!("let { x, y } = { x: 1, y: 2 };");
+        let is_destructure = match &ast {
+            Expression::Statement(s) | Expression::ExprStatement(s) => {
+                matches!(s.1.as_ref(), Expression::LetDestructure { .. })
+            }
+            Expression::LetDestructure { .. } => true,
+            _ => false,
+        };
+        assert!(is_destructure, "expected LetDestructure, got {:?}", ast);
+    }
+
+    #[test]
     fn parse_let_binding_yield_round_trips() {
         let ast = decl_ast!("async fn f() { let x = yield 1; }");
         match ast {
@@ -3443,9 +3830,57 @@ mod tests {
                 assert_eq!(f.name, "puts");
                 // Returns: none
                 assert!(f.returns.is_none());
+                assert!(!f.variadic);
             }
             other => panic!("expected ExternBlock, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_extern_block_variadic_ellipsis() {
+        let ast = decl_ast!("extern \"c\" { fn printf(string fmt, ...) -> int; }");
+        match ast {
+            Expression::ExternBlock {
+                library,
+                declarations,
+            } => {
+                assert_eq!(library, "c");
+                assert_eq!(declarations.len(), 1);
+                let f = &declarations[0];
+                assert_eq!(f.name, "printf");
+                assert!(f.variadic);
+                assert!(f.returns.is_some());
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_block_bare_ellipsis_only() {
+        let ast = decl_ast!("extern \"c\" { fn weird(...) -> int; }");
+        match ast {
+            Expression::ExternBlock { declarations, .. } => {
+                assert!(declarations[0].variadic);
+            }
+            other => panic!("expected ExternBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_rejects_language_rest_syntax() {
+        use chumsky::Parser;
+        let src = "extern \"c\" { fn bad(int... xs) -> int; }";
+        let result = Pratt::default().declaration().parse(src);
+        assert!(
+            result.has_errors(),
+            "expected parse error for T... name in extern"
+        );
+        let errs = result.into_errors();
+        let msg = format!("{:?}", errs);
+        assert!(
+            msg.contains("bare `...`") || msg.contains("C varargs"),
+            "unexpected error text: {msg}"
+        );
     }
 
     #[test]
@@ -3460,6 +3895,7 @@ mod tests {
                 assert_eq!(declarations.len(), 2);
                 assert_eq!(declarations[0].name, "puts");
                 assert!(declarations[0].returns.is_none());
+                assert!(!declarations[0].variadic);
                 assert_eq!(declarations[1].name, "strlen");
                 assert!(declarations[1].returns.is_some());
                 assert!(matches!(

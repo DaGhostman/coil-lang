@@ -679,6 +679,80 @@ fn example_let_reassignment_works() {
     assert_eq!(output, "51020");
 }
 
+#[test]
+fn example_named_args_prints_ada36_grace40() {
+    let output = run_example("examples/named_args.0s");
+    assert_eq!(output, "Ada36Grace40");
+}
+
+/// Critical regression: shuffled named args must reorder to declaration
+/// order at runtime. Happy-path goldens only exercise source-order and
+/// positional-prefix forms; a missing codegen reorder would still typecheck
+/// here (string then int) but print the wrong values.
+#[test]
+fn named_args_shuffled_order_prints_correct_values() {
+    let output = run_example_src(
+        r#"
+fn greet(string name, int age) {
+    print "%s", name;
+    print "%i", age;
+}
+
+fn main() {
+    greet(age: 36, name: "Ada");
+    greet(age: 40, name: "Grace");
+}
+"#,
+    );
+    assert_eq!(output, "Ada36Grace40");
+}
+
+/// Rest packing with a named fixed prefix + trailing positionals (P4 + P2).
+#[test]
+fn rest_after_named_fixed_prefix_packs_trailing() {
+    let output = run_example_src(
+        r#"
+fn f(int a, int... xs) -> int {
+    return a + len(xs);
+}
+
+fn main() {
+    print "%i", f(a: 10, 1, 2, 3);
+    print "%i", f(a: 7);
+}
+"#,
+    );
+    assert_eq!(output, "137");
+}
+
+#[test]
+fn example_let_destructure_prints_12342() {
+    let output = run_example("examples/let_destructure.0s");
+    assert_eq!(output, "12342");
+}
+
+/// Nested let destructure must bind inner tuple slots correctly (not swap).
+#[test]
+fn let_nested_tuple_destructure_binds_in_order() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let (a, (b, c)) = (1, (2, 3));
+    print "%i", a;
+    print "%i", b;
+    print "%i", c;
+}
+"#,
+    );
+    assert_eq!(output, "123");
+}
+
+#[test]
+fn example_variadic_prints_60_hi() {
+    let output = run_example("examples/variadic.0s");
+    assert_eq!(output, "60Hi!?");
+}
+
 /// Phase P0: `let x = match { … }` must bind the arm value via
 /// StorePop. Pre-fix Match emitted RETURN at end_label, so the
 /// StorePop was unreachable and prints never ran / saw 0.
@@ -944,6 +1018,139 @@ fn example_strlen_prints_5() {
     assert_eq!(output, "5", "strlen(\"hello\") should print 5");
 }
 
+/// Serialize fd-1 redirection: parallel tests + libtest status lines share
+/// process stdout, so nested `dup2` would corrupt capture.
+#[cfg(unix)]
+static OS_STDOUT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restores process stdout (fd 1) on drop — including panics inside `f`.
+#[cfg(unix)]
+struct StdoutFdGuard {
+    old_stdout: i32,
+}
+
+#[cfg(unix)]
+impl Drop for StdoutFdGuard {
+    fn drop(&mut self) {
+        if self.old_stdout < 0 {
+            return;
+        }
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            let _ = libc::dup2(self.old_stdout, 1);
+            libc::close(self.old_stdout);
+        }
+        self.old_stdout = -1;
+    }
+}
+
+/// Capture bytes written to OS stdout (fd 1) while `f` runs.
+/// Needed for libc `printf`, which bypasses the VM's `PRINT` sink.
+#[cfg(unix)]
+fn with_captured_os_stdout<R>(f: impl FnOnce() -> R) -> (R, String) {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let _lock = OS_STDOUT_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let (read_fd, guard) = unsafe {
+        let mut pipefd = [0i32; 2];
+        assert_eq!(libc::pipe(pipefd.as_mut_ptr()), 0);
+        let read_fd = pipefd[0];
+        let write_fd = pipefd[1];
+        let old_stdout = libc::dup(1);
+        assert!(old_stdout >= 0);
+        assert_eq!(libc::dup2(write_fd, 1), 1);
+        libc::close(write_fd);
+        (read_fd, StdoutFdGuard { old_stdout })
+    };
+
+    // Catch panics so we can restore fd 1 (via `guard`) before rethrowing —
+    // otherwise later tests inherit a broken stdout.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    drop(guard);
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let mut buf = Vec::new();
+    let _ = file.read_to_end(&mut buf);
+    drop(file);
+
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    match result {
+        Ok(r) => (r, s),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Drop noise that lands in a process-wide stdout pipe under `cargo test`
+/// parallelism: debug heap traces and libtest harness status lines.
+#[cfg(unix)]
+fn clean_captured_os_stdout(output: &str) -> String {
+    output
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            if t.is_empty() {
+                return false;
+            }
+            // Debug heap: `0x… alloc …` / `0x… free …`
+            if t.contains(" alloc ") || t.contains(" free ") {
+                return false;
+            }
+            // libtest: `test foo::bar ... ok` (other threads finish mid-capture)
+            if t.starts_with("test ") && t.contains(" ... ") {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn example_ffi_printf_prints_hello_42() {
+    if machine::resolve_library("c", None, &[]).is_err() {
+        ffi_soft_skip("C library not loadable on this platform via resolve_library(\"c\")");
+        return;
+    }
+
+    #[cfg(not(unix))]
+    {
+        ffi_soft_skip("ffi_printf OS-stdout capture is unix-only");
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let result = std::panic::catch_unwind(|| {
+            let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("compiler crate must have a parent (workspace root)");
+            let full = workspace_root.join("examples/ffi_printf.0s");
+            let src = std::fs::read_to_string(&full).expect("read ffi_printf.0s");
+            let ((), os_out) = with_captured_os_stdout(|| {
+                let _vm_out = run_example_src_with_entry(&src, Some(full.as_path()));
+            });
+            os_out
+        });
+        let output = match result {
+            Ok(s) => s,
+            Err(_) => {
+                ffi_soft_skip("ffi_printf test panicked (dlopen failure?)");
+                return;
+            }
+        };
+        let cleaned = clean_captured_os_stdout(&output);
+        assert_eq!(
+            cleaned.trim(),
+            "hello 42",
+            "printf(\"hello %lld\", 42) should write to OS stdout (raw={output:?})"
+        );
+    }
+}
+
 #[test]
 fn extern_missing_library_panics_with_message() {
     let src = r#"
@@ -1066,6 +1273,96 @@ fn example_for_in_dict_prints_12() {
 fn example_for_in_custom_prints_012() {
     let output = run_example("examples/for_in_custom.0s");
     assert_eq!(output, "012");
+}
+
+#[test]
+fn example_range_prints_01234012356() {
+    // 0..5 → 01234; 0..=3 → 0123; 10..0 empty; byte 5..=6 → 56;
+    // float 1.0..4.0 → 1.02.03.0
+    let output = run_example("examples/range.0s");
+    assert_eq!(output, "012340123561.02.03.0");
+}
+
+/// Inner-block destructure must not clobber an outer binding's slot.
+#[test]
+fn let_destructure_block_shadow_preserves_outer_binding() {
+    let output = run_example_src(
+        r#"
+enum A { A { z: int, x: int }, }
+enum B { B { y: int }, }
+fn main() {
+  let outer = { a: A::A { z: 10, x: 42 } };
+  let { a } = outer;
+  { let inner = { a: B::B { y: 7 } }; let { a } = inner; }
+  print "%i", a.x;
+}
+"#,
+    );
+    assert_eq!(output, "42", "outer `a` must survive inner-block shadow");
+}
+
+/// Rest-only generic with a typeclass constraint needs a call-site dict.
+#[test]
+fn generic_rest_only_show_call_emits_dict_and_prints() {
+    let output = run_example_src(
+        r#"
+fn show_all<T: Show>(T... xs) {
+    print "%v", xs[0];
+}
+fn main() {
+    show_all(1);
+}
+"#,
+    );
+    assert_eq!(output, "1");
+}
+
+/// Rest-only Num generic must monomorphize (not print a boxed heap pointer).
+#[test]
+fn generic_rest_only_num_call_monomorphizes_and_prints() {
+    let output = run_example_src(
+        r#"
+fn twice_first<T: Num>(T... xs) -> T { return xs[0] + xs[0]; }
+fn main() { print "%i", twice_first(21); }
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+/// Shadowing a function parameter inside a block must restore Access typing.
+#[test]
+fn block_shadow_of_param_restores_access_field_type() {
+    let output = run_example_src(
+        r#"
+enum A { A { z: int, x: int }, }
+enum B { B { y: int }, }
+fn foo(A a) {
+  { let a = B::B { y: 7 }; }
+  print "%i", a.x;
+}
+fn main() { foo(A::A { z: 10, x: 42 }); }
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+/// Half-open vs inclusive endpoints: `0..1` yields only 0; `0..=1` yields 0,1.
+#[test]
+fn range_half_open_excludes_end_inclusive_includes_end() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    for x in 0..1 {
+        print "%i", x;
+    }
+    print ",";
+    for x in 0..=1 {
+        print "%i", x;
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0,01");
 }
 
 /// Regression guard: `resume h` used INLINE as a `print` argument

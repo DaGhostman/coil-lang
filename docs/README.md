@@ -39,6 +39,9 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 |------|--------|
 | Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
+| Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; no partial named calls) |
+| Rest parameters (`T... xs`) | Supported (trailing only; packs to `[T]`; no call-site `...xs` spread) |
+| Let destructuring (`let (a, b) = …`, `let { x, y } = …`) | Supported (tuple / record; no enum ctor patterns in `let`) |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
 | Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |
@@ -47,11 +50,12 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Generics and traits | Supported: generic functions/enums/aliases/classes, higher-kinded type parameters, associated types/GATs, existentials, coherence checks |
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
-| FFI (`extern` blocks, `dload`/`declare`/`invoke`, struct/callback returns) | Supported (requires libffi) |
+| FFI (`extern` blocks, `dload`/`declare`/`invoke`, C varargs `...`, struct/callback returns) | Supported (requires libffi) |
 | IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
 | Classes (`class` / `impl` / `new`, fields, methods) | Supported |
 | Coroutines (`async`, `yield`, `resume`, `yield from`, `done`) | Supported |
-| `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, coroutines, user `impl`s) |
+| `for x in` (Iterator / IntoIterator) | Supported (arrays, homogeneous tuples/dicts, ranges, coroutines, user `impl`s) |
+| Ranges (`a..b` / `a..=b`) | Supported — lazy `Range<T: Ord>`; `for` steps `int`/`byte`/`float`; no auto array materialize ([syntax](reference/syntax.md#ranges-lazy)) |
 | String concat via `+` | Supported (`string + string` → `string`) |
 | `format` keyword | Supported (returns `string`; same specifiers as `print`) |
 
@@ -155,7 +159,7 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 | Dicts / anonymous records | `examples/dict.0s` |
 | Generics & traits | `examples/generics.0s`, `examples/hkt_bifunctor.0s`, `examples/gat_pointer.0s`, `examples/existential_show.0s` |
 | Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
-| FFI | `examples/strlen.0s`, `examples/ffi_sum.0s` |
+| FFI | `examples/strlen.0s`, `examples/ffi_sum.0s`, `examples/ffi_printf.0s` |
 | IO streams | `examples/io_bytes.0s`, `examples/io_file.0s`, `examples/io_eof.0s`, `examples/io_udp.0s` |
 | Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s`, `examples/for_in_coro.0s` |
 | Full catalog | [examples.md](examples.md) |

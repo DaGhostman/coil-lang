@@ -326,6 +326,16 @@ pub fn byte() -> Ty {
     Ty::Con(BYTE.into())
 }
 
+/// Half-open lazy range type `Range<T>` (Phase P3).
+pub fn range_ty(elem: Ty) -> Ty {
+    Ty::App(Box::new(Ty::Con("Range".into())), vec![elem])
+}
+
+/// Closed lazy range type `RangeInclusive<T>` (Phase P3).
+pub fn range_inclusive_ty(elem: Ty) -> Ty {
+    Ty::App(Box::new(Ty::Con("RangeInclusive".into())), vec![elem])
+}
+
 /// Build the opaque `Stream` type.
 pub fn stream_ty() -> Ty {
     Ty::Con(STREAM.into())

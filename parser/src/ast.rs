@@ -116,8 +116,8 @@ pub enum Expression<'expr> {
     Bool(bool),
     Module(String, Output<'expr>),
 
-    /// Function parameter `(T name)` with a full type annotation.
-    Argument(Output<'expr>, &'expr str),
+    /// Function parameter `T name` or rest `T... name` (`is_rest`).
+    Argument(Output<'expr>, &'expr str, bool),
     Identifier(&'expr str),
     Type(&'expr str),
     /// Generic type application in annotations: `Option<int>`, `Result<int, string>`.
@@ -183,6 +183,13 @@ pub enum Expression<'expr> {
     Geq(Output<'expr>, Output<'expr>),
     Le(Output<'expr>, Output<'expr>),
     Gt(Output<'expr>, Output<'expr>),
+
+    /// Lazy `int`/`byte` range: `start..end` (half-open) or `start..=end` (closed).
+    Range {
+        start: Output<'expr>,
+        end: Output<'expr>,
+        inclusive: bool,
+    },
 
     List(Vec<Output<'expr>>),
     Array(Vec<Output<'expr>>),
@@ -250,6 +257,12 @@ pub enum Expression<'expr> {
         args: Option<Vec<Output<'expr>>>,
     },
 
+    /// Named call-site argument: `name: value` (Phase P2).
+    ///
+    /// Only valid inside [`Call`] argument lists (and other `params()`
+    /// sites that reuse the same parser). Display renders as `name: value`.
+    NamedArg(&'expr str, Output<'expr>),
+
     Break,
     Continue,
     For {
@@ -267,6 +280,14 @@ pub enum Expression<'expr> {
 
     Variable(&'expr str, Option<Output<'expr>>),
     Constant(Output<'expr>, Option<Output<'expr>>),
+
+    /// `let (a, b) = expr;` / `let { x, y } = expr;` — irrefutable
+    /// destructuring (Phase P1). Distinct from match [`Pattern`] so
+    /// enum constructors stay match-only.
+    LetDestructure {
+        pattern: LetPattern<'expr>,
+        rhs: Output<'expr>,
+    },
 
     Class {
         name: &'expr str,
@@ -398,6 +419,8 @@ pub struct ExternFunction<'expr> {
     pub name: &'expr str,
     pub args: Output<'expr>,
     pub returns: Option<Output<'expr>>,
+    /// C-style varargs (`fn printf(string fmt, ...)`) — bare `...`, not language `T... xs`.
+    pub variadic: bool,
 }
 
 /// C-layout struct for FFI: `extern struct Name { field: type, ... }`.
@@ -437,6 +460,27 @@ pub enum EnumConstructPayload<'expr> {
 pub struct MatchArm<'expr> {
     pub pattern: Pattern<'expr>,
     pub body: Output<'expr>,
+}
+
+/// Irrefutable pattern for `let` destructuring (`let (a, b) = …`,
+/// `let { x, y } = …`). Nested tuples/records and `_` wildcards are
+/// allowed; enum constructors are not (use `match`).
+#[derive(Clone, PartialEq, Debug)]
+pub enum LetPattern<'expr> {
+    Wildcard,
+    Binding {
+        name: &'expr str,
+    },
+    Tuple(Vec<LetPattern<'expr>>),
+    Record(Vec<LetFieldPattern<'expr>>),
+}
+
+/// One field in a [`LetPattern::Record`]. Shorthand `x` desugars to
+/// `x: Binding(x)`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LetFieldPattern<'expr> {
+    pub name: &'expr str,
+    pub pattern: LetPattern<'expr>,
 }
 
 /// Match pattern: wildcard, binding, or qualified constructor.
@@ -495,6 +539,34 @@ impl<'a> Display for TypeParam<'a> {
             write!(f, "{}: {}", self.name, self.bounds.join(" + "))
         } else {
             write!(f, "{}", self.name)
+        }
+    }
+}
+
+impl<'a> Display for LetPattern<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard => write!(f, "_"),
+            Self::Binding { name } => write!(f, "{}", name),
+            Self::Tuple(parts) => write!(
+                f,
+                "({})",
+                parts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Record(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|pf| match &pf.pattern {
+                        LetPattern::Binding { name } if *name == pf.name => name.to_string(),
+                        _ => format!("{}: {}", pf.name, pf.pattern),
+                    })
+                    .collect();
+                write!(f, "{{ {} }}", parts.join(", "))
+            }
         }
     }
 }
@@ -569,6 +641,17 @@ impl<'a> Display for Expression<'a> {
             Self::Le(lhs, rhs) => write!(f, "{} < {}", lhs.borrow().1, rhs.borrow().1),
             Self::Eq(lhs, rhs) => write!(f, "{} == {}", lhs.borrow().1, rhs.borrow().1),
             Self::Neq(lhs, rhs) => write!(f, "{} != {}", lhs.borrow().1, rhs.borrow().1),
+            Self::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                if *inclusive {
+                    write!(f, "{}..={}", start.borrow().1, end.borrow().1)
+                } else {
+                    write!(f, "{}..{}", start.borrow().1, end.borrow().1)
+                }
+            }
             Self::CompoundAssign(lhs, op, rhs) => {
                 let sym = match op {
                     AssignOp::Add => "+=",
@@ -600,6 +683,9 @@ impl<'a> Display for Expression<'a> {
             Self::Positive(n) => write!(f, "+{}", n.borrow().1),
             Self::Expr(e) => write!(f, "{}", e.1),
             Self::ExprStatement(e) => write!(f, "{};", e.1),
+            Self::LetDestructure { pattern, rhs } => {
+                write!(f, "let {} = {}", pattern, rhs.1)
+            }
             Self::Fragment(list) | Self::Block(list) => write!(
                 f,
                 "{}",
@@ -728,6 +814,14 @@ impl<'a> Display for Expression<'a> {
                         .collect::<Vec<String>>()
                         .join(", "))
                 )
+            }
+            Self::NamedArg(name, value) => write!(f, "{}: {}", name, value.1),
+            Self::Argument(ty, name, is_rest) => {
+                if *is_rest {
+                    write!(f, "{}... {}", ty.1, name)
+                } else {
+                    write!(f, "{} {}", ty.1, name)
+                }
             }
             Self::Loop {
                 identifier,

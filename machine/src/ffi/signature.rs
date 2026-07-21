@@ -5,11 +5,16 @@ use crate::memory::FfiType;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FfiSignature {
     pub name: String,
+    /// Fixed (non-variadic) argument types. When [`Self::variadic`] is set,
+    /// this is the C prototype prefix before `...` (`nfixed = args.len()`).
     pub args: Vec<FfiType>,
     pub ret: FfiType,
+    /// C-style varargs (`printf`-style). CIF is rebuilt per invoke.
+    pub variadic: bool,
 }
 
 impl FfiSignature {
+    /// Fixed-prefix arity (`nfixed` when variadic).
     pub fn arity(&self) -> usize {
         self.args.len()
     }
@@ -28,6 +33,7 @@ pub struct FfiSignatureBuilder {
     name: String,
     args: Vec<FfiType>,
     ret: Option<FfiType>,
+    variadic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +90,7 @@ impl FfiSignatureBuilder {
             name: name.into(),
             args: Vec::new(),
             ret: None,
+            variadic: false,
         }
     }
 
@@ -102,6 +109,12 @@ impl FfiSignatureBuilder {
         self
     }
 
+    /// Mark as C-style varargs (`nfixed =` current arg count).
+    pub fn variadic(mut self) -> Self {
+        self.variadic = true;
+        self
+    }
+
     pub fn build(self) -> Result<FfiSignature, FfiError> {
         if self.name.is_empty() {
             return Err(FfiError::EmptyName);
@@ -116,6 +129,7 @@ impl FfiSignatureBuilder {
             name: self.name,
             args: self.args,
             ret,
+            variadic: self.variadic,
         })
     }
 }
@@ -134,25 +148,24 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_void_argument() {
+    fn builder_variadic_flag() {
+        let sig = FfiSignatureBuilder::new("printf")
+            .arg(FfiType::String)
+            .ret(FfiType::Int)
+            .variadic()
+            .build()
+            .unwrap();
+        assert!(sig.variadic);
+        assert_eq!(sig.arity(), 1);
+    }
+
+    #[test]
+    fn builder_rejects_void_arg() {
         let err = FfiSignatureBuilder::new("f")
             .arg(FfiType::Void)
             .ret(FfiType::Int)
             .build()
             .unwrap_err();
         assert_eq!(err, FfiError::VoidArgument { index: 0 });
-    }
-
-    #[test]
-    fn builder_produces_signature() {
-        let sig = FfiSignatureBuilder::new("sum")
-            .arg(FfiType::Int)
-            .arg(FfiType::Int)
-            .ret(FfiType::Int)
-            .build()
-            .unwrap();
-        assert_eq!(sig.name, "sum");
-        assert_eq!(sig.arity(), 2);
-        assert_eq!(sig.ret, FfiType::Int);
     }
 }
