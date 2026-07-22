@@ -70,6 +70,9 @@ arg_list      ::= '(' (arg (',' arg)*)? ')'
 arg           ::= type_annotation '...'? IDENT   // trailing `T... name` is rest → `[T]`
 ```
 
+Arity overloads (same name, different arities / rest ranges), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.0s`, `fn_value.0s`, and `lambda.0s`.
+
+
 Call sites may use named arguments (`name: expr`) after any positional
 prefix. Rest parameters are positional-only and pack trailing values
 into one array (including empty). Call-site spread (`f(...xs)`) is not

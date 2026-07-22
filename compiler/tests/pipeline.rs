@@ -2071,3 +2071,28 @@ fn main() {
     // Pre-fix: e.code → LoadField(0) → kind (1), not code (42).
     assert_eq!(output, "421");
 }
+
+
+#[test]
+fn example_overload_prints_15() {
+    let output = run_example("examples/overload.0s");
+    assert_eq!(output, "15");
+}
+
+#[test]
+fn example_fn_value_prints_423() {
+    let output = run_example("examples/fn_value.0s");
+    assert_eq!(output, "423");
+}
+
+#[test]
+fn example_lambda_prints_42() {
+    let output = run_example("examples/lambda.0s");
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn example_method_overload_prints_1116() {
+    let output = run_example("examples/method_overload.0s");
+    assert_eq!(output, "1116");
+}

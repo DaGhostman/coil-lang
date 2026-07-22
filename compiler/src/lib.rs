@@ -1067,6 +1067,7 @@ impl Compiler {
         fn_name: &str,
         args: &'a [Output<'a>],
     ) -> (Vec<&'a Output<'a>>, Vec<&'a Output<'a>>, bool) {
+        let fn_name = strip_overload_key(fn_name);
         let has_named = args
             .iter()
             .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
@@ -4287,7 +4288,12 @@ impl Compiler {
                     .or_default()
                     .push(name.to_string());
                 let (fixed_arity, has_rest) = fn_arity_from_args(args);
-                let table_key = if self.checker.is_overloaded(name) {
+                // Key every member of an overload set (top-level or
+                // `Owner::method`) so CALL sites can resolve via
+                // `selected_overload_at`.
+                let table_key = if self.checker.is_overloaded(name)
+                    || self.checker.is_overloaded(&qualified)
+                {
                     overload_fn_key(&qualified, fixed_arity, has_rest)
                 } else {
                     qualified.clone()
@@ -5095,7 +5101,31 @@ impl Compiler {
                         .get(&owner)
                         .and_then(|m| m.get(*method))
                         .cloned();
-                    if let Some(fqn) = fqn {
+                    if let Some(fqn_base) = fqn {
+                        let nargs = args.as_ref().map(|items| items.len()).unwrap_or(0);
+                        let fqn = if let Some((fa, is_rest)) =
+                            self.checker.selected_overload_at(span.start, span.end)
+                        {
+                            let keyed = overload_fn_key(&fqn_base, fa, is_rest);
+                            if self.functions.contains_key(&keyed) {
+                                keyed
+                            } else {
+                                fqn_base.clone()
+                            }
+                        } else if self.checker.is_overloaded(&fqn_base) {
+                            // Forward call inside an impl that later gained
+                            // more overloads — TC may not have recorded a
+                            // selection (set had size 1 at infer time).
+                            self.checker
+                                .select_overload(&fqn_base, nargs)
+                                .map(|c| {
+                                    overload_fn_key(&fqn_base, c.fixed_arity, c.is_rest)
+                                })
+                                .filter(|k| self.functions.contains_key(k))
+                                .unwrap_or(fqn_base)
+                        } else {
+                            fqn_base
+                        };
                         if let Some(offset) = self.functions.get(&fqn).copied() {
                             // Push receiver first (slot 0), then args
                             // (reordered when any arg is named; rest packed).
@@ -6394,12 +6424,28 @@ impl Compiler {
                 //    name, (arg_tags...), ret) and store fn id.
                 for decl in declarations {
                     let fn_name = decl.name.to_string();
-                    // First-wins on fn-name collisions across
-                    // multiple `extern` blocks.
-                    if self.extern_runtime_functions.contains_key(&fn_name) {
+                    let nfixed = if let Expression::Fragment(items) = decl.args.1.as_ref() {
+                        items
+                            .iter()
+                            .filter(|a| matches!(a.1.as_ref(), Expression::Argument(..)))
+                            .count()
+                    } else {
+                        0
+                    };
+                    // Key fixed-arity overloads; keep bare name for
+                    // single decls and for C-varargs (not overload members).
+                    let table_name = if !decl.variadic
+                        && self.checker.is_overloaded(decl.name)
+                    {
+                        overload_fn_key(&fn_name, nfixed, false)
+                    } else {
+                        fn_name.clone()
+                    };
+                    // First-wins on the same table key across blocks.
+                    if self.extern_runtime_functions.contains_key(&table_name) {
                         continue;
                     }
-                    let fn_id_slot_name = format!("__ext_fn_{}", fn_name);
+                    let fn_id_slot_name = format!("__ext_fn_{}", table_name);
                     let fn_id_slot = self.context.variables.intern(fn_id_slot_name) as u32;
                     // Push the library handle.
                     self.bytecode
@@ -6473,7 +6519,7 @@ impl Compiler {
                     self.bytecode
                         .push(Byte::new(Instruction::StorePop).with_operand_u32(fn_id_slot));
                     self.extern_runtime_functions
-                        .insert(fn_name.clone(), (lib_slot, fn_id_slot));
+                        .insert(table_name, (lib_slot, fn_id_slot));
                 }
             }
             Expression::EnumDecl {
