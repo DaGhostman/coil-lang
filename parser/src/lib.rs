@@ -5439,8 +5439,9 @@ mod tests_lambdas {
             | Expression::ExprStatement(inner)
             | Expression::Group(inner)
             | Expression::Expr(inner)
-            | Expression::Variable(_, Some(inner))
-            | Expression::Return(Some(inner)) => find_lambda(inner.1.as_ref()),
+            | Expression::Return(inner)
+            | Expression::ImplicitReturn(inner) => find_lambda(inner.1.as_ref()),
+            Expression::Variable(_, Some(inner)) => find_lambda(inner.1.as_ref()),
             Expression::Function { body, .. } => find_lambda(body.1.as_ref()),
             _ => None,
         }
