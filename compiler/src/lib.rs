@@ -10915,5 +10915,112 @@ fn main() {
         );
     }
 
+    /// Value-position mono fn → MakeFn; calling through the local → CallIndirect.
+    #[test]
+    fn fn_value_emits_make_fn_then_call_indirect() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    let f = add;
+    print "%i", f(20, 22);
+}
+"#,
+        );
+        let make_fn: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeFn))
+            .collect();
+        assert_eq!(
+            make_fn.len(),
+            1,
+            "expected exactly one MakeFn for `let f = add`; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // n_cap=0, n_filled=0, arity=2, is_rest=false
+        assert_eq!(
+            make_fn[0].operand_u32(),
+            make_fn_operand(0, 0, 2, false),
+            "MakeFn operand should pack arity=2 with no fills/captures"
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "calling through `f` must use CallIndirect; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Positional under-apply must emit MakeFn with n_filled matching argc,
+    /// not a full CALL (which would leave holes unfilled / wrong ABI).
+    #[test]
+    fn partial_application_emits_make_fn_with_fill_count() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    let g = add(1);
+    print "%i", g(2);
+}
+"#,
+        );
+        let make_fn: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeFn))
+            .collect();
+        assert!(
+            !make_fn.is_empty(),
+            "expected MakeFn for partial `add(1)`; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Prefer the partial MakeFn (n_filled=1, arity=2) over any other.
+        assert!(
+            make_fn
+                .iter()
+                .any(|b| b.operand_u32() == make_fn_operand(0, 1, 2, false)),
+            "expected MakeFn(n_cap=0, n_filled=1, arity=2); got operands {:?}",
+            make_fn.iter().map(|b| b.operand_u32()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "completing the partial must CallIndirect; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Explicit-capture lambda must MakeFn with n_cap matching `use (...)`.
+    #[test]
+    fn lambda_emits_make_fn_with_capture_count() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let y = 10;
+    let f = fn (int x) use (y) => x + y;
+    print "%i", f(32);
+}
+"#,
+        );
+        let make_fn: Vec<_> = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MakeFn))
+            .collect();
+        assert!(
+            !make_fn.is_empty(),
+            "expected MakeFn for lambda; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            make_fn
+                .iter()
+                .any(|b| b.operand_u32() == make_fn_operand(1, 0, 1, false)),
+            "expected MakeFn(n_cap=1, n_filled=0, arity=1); got operands {:?}",
+            make_fn.iter().map(|b| b.operand_u32()).collect::<Vec<_>>()
+        );
+    }
+
 
 }

@@ -16326,6 +16326,63 @@ fn main() {}
         let sel = selected.unwrap();
         assert!(sel.is_rest, "should select the rest overload for 5 args");
     }
+
+    /// Bare `let f = overloaded;` without expected type → AmbiguousOverload.
+    #[test]
+    fn ambiguous_overload_in_value_position() {
+        let msgs = assert_messages(
+            r#"
+fn add(int x) -> int { return x; }
+fn add(int x, int y) -> int { return x + y; }
+fn main() { let f = add; }
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.code() == Some(ErrorCode::AmbiguousOverload)),
+            "expected AmbiguousOverload, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Lambda bodies cannot close over outer locals unless listed in `use`.
+    #[test]
+    fn lambda_uncaptured_outer_is_error() {
+        let msgs = assert_messages(
+            r#"
+fn main() {
+    let y = 10;
+    let f = fn (int x) => x + y;
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("cannot capture `y` without `use (y)`")),
+            "expected cannot-capture diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Named under-apply records a partial fill mask (bit 0 for `a:`).
+    #[test]
+    fn named_partial_records_fill_mask() {
+        let (c, _) = check(
+            r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() { let g = add(a: 1); }
+"#,
+        );
+        assert!(
+            !c.partial_fills_by_span.is_empty(),
+            "expected partial_fills_by_span entry for named under-apply"
+        );
+        assert!(
+            c.partial_fills_by_span.values().any(|&mask| mask == 0b01),
+            "expected fill mask 0b01 for `a:`; got {:?}",
+            c.partial_fills_by_span.values().collect::<Vec<_>>()
+        );
+    }
 }
 
 

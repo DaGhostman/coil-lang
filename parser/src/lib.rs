@@ -5421,3 +5421,81 @@ mod tests_generics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_lambdas {
+    use super::*;
+    use ast::Expression;
+
+    fn find_lambda<'a>(expr: &'a Expression<'a>) -> Option<&'a Expression<'a>> {
+        match expr {
+            Expression::Lambda { .. } => Some(expr),
+            Expression::Block(children)
+            | Expression::Program(children)
+            | Expression::Fragment(children) => {
+                children.iter().find_map(|c| find_lambda(c.1.as_ref()))
+            }
+            Expression::Statement(inner)
+            | Expression::ExprStatement(inner)
+            | Expression::Group(inner)
+            | Expression::Expr(inner)
+            | Expression::Variable(_, Some(inner))
+            | Expression::Return(Some(inner)) => find_lambda(inner.1.as_ref()),
+            Expression::Function { body, .. } => find_lambda(body.1.as_ref()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn lambda_short_form_parses_captures_and_arrow_body() {
+        let ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let f = fn (int x) use (y) => x + y;
+}
+"#,
+            )
+            .expect("parse failed");
+        match find_lambda(ast.1.as_ref()) {
+            Some(Expression::Lambda {
+                captures, body, ..
+            }) => {
+                assert_eq!(captures, &["y"]);
+                // Arrow body is an expression tree, not a Block.
+                assert!(
+                    !matches!(body.1.as_ref(), Expression::Block(_)),
+                    "short-form `=>` body should not wrap in Block; got {}",
+                    body.1
+                );
+            }
+            other => panic!("expected Lambda, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lambda_block_body_parses_without_use() {
+        let ast = Pratt::default()
+            .parse(
+                r#"
+fn main() {
+    let f = fn (int x) { return x + 1; };
+}
+"#,
+            )
+            .expect("parse failed");
+        match find_lambda(ast.1.as_ref()) {
+            Some(Expression::Lambda {
+                captures, body, ..
+            }) => {
+                assert!(captures.is_empty(), "expected no captures, got {captures:?}");
+                assert!(
+                    matches!(body.1.as_ref(), Expression::Block(_)),
+                    "brace body should be Block; got {}",
+                    body.1
+                );
+            }
+            other => panic!("expected Lambda, got {:?}", other),
+        }
+    }
+}

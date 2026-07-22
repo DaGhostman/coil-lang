@@ -2096,3 +2096,54 @@ fn example_method_overload_prints_1116() {
     let output = run_example("examples/method_overload.0s");
     assert_eq!(output, "1116");
 }
+
+/// Named under-apply must build a partial whose holes fill in declaration
+/// order at CallIndirect time (not print the named value as the only arg).
+#[test]
+fn named_partial_application_completes_and_prints_3() {
+    let output = run_example_src(
+        r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    let g = add(a: 1);
+    print "%i", g(2);
+}
+"#,
+    );
+    assert_eq!(output, "3");
+}
+
+/// Nested partials (`f(1)` → `p(2)` → `q(3)`) must merge filled masks without
+/// clobbering earlier holes — a common ObjFn regression.
+#[test]
+fn nested_partial_application_prints_6() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int { return a + b + c; }
+fn main() {
+    let p = add3(1);
+    let q = p(2);
+    print "%i", q(3);
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
+/// Fixed-N vs rest-K (N < K) must dispatch by argc: exact fixed wins at N;
+/// rest handles K and above. Typechecker unit tests alone miss wrong CALL targets.
+#[test]
+fn fixed_vs_rest_overload_dispatches_at_runtime() {
+    let output = run_example_src(
+        r#"
+fn f(int x) -> int { return x * 10; }
+fn f(int x, int y, int... xs) -> int { return x + y + len(xs); }
+fn main() {
+    print "%i", f(1);
+    print "%i", f(1, 2);
+    print "%i", f(1, 2, 3, 4);
+}
+"#,
+    );
+    assert_eq!(output, "1035");
+}

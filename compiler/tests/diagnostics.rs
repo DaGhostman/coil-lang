@@ -158,23 +158,101 @@ fn main() {
 }
 
 #[test]
-fn named_call_under_applied_is_rejected() {
-    // Named calls must supply every remaining parameter (no partial
-    // application once any arg is named).
+fn named_under_apply_is_allowed_as_partial() {
+    // Named under-apply produces a residual Fun / partial (no under-applied error).
     let (_ty, msgs) = check(
         r#"
 fn greet(string name, int age) {}
 fn main() {
-    greet(name: "Ada");
+    let partial = greet(name: "Ada");
+}
+"#,
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| m.contains("under-applied") || m.contains("Missing argument `age`")),
+        "named under-apply must not error; got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn ambiguous_overload_in_value_position_is_rejected() {
+    let msgs = check_messages(
+        r#"
+fn add(int x) -> int { return x; }
+fn add(int x, int y) -> int { return x + y; }
+fn main() {
+    let f = add;
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::AmbiguousOverload)),
+        "expected AmbiguousOverload (E0122), got: {:?}",
+        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.message().contains("Ambiguous overload") && m.message().contains("add")),
+        "expected Ambiguous overload message mentioning `add`, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn duplicate_overload_fixed_arity_has_stable_code() {
+    let msgs = check_messages(
+        r#"
+fn f(int x) -> int { return x; }
+fn f(int y) -> int { return y + 1; }
+fn main() { let a = f(1); }
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::DuplicateOverload)),
+        "expected DuplicateOverload (E0121), got: {:?}",
+        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn wrong_arity_on_overloaded_call_has_stable_code() {
+    let msgs = check_messages(
+        r#"
+fn f(int x) -> int { return x; }
+fn f(int x, int y) -> int { return x + y; }
+fn main() { let a = f(1, 2, 3); }
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.code() == Some(ErrorCode::WrongArity)),
+        "expected WrongArity (E0120), got: {:?}",
+        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn lambda_cannot_capture_without_use() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    let y = 10;
+    let f = fn (int x) => x + y;
 }
 "#,
     );
     assert!(
         msgs.iter().any(|m| {
-            m.contains("under-applied") || m.contains("Missing argument `age`")
+            m.message().contains("cannot capture `y` without `use (y)`")
+                || m.message().contains("list `y` in the lambda's `use")
         }),
-        "expected under-applied / missing named-arg diagnostic, got: {:?}",
-        msgs
+        "expected explicit-capture diagnostic for `y`, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
     );
 }
 
