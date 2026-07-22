@@ -176,6 +176,13 @@ pub struct Checker {
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
+    /// Locals whose bound type still had open type-parameter arguments at
+    /// the binding site (e.g. `let f = capture_show(0)` → `t29 -> int`).
+    /// Codegen uses this to `BoxValue` CallIndirect args even after the
+    /// running subst later grounds those vars (so `codegen_var_type` alone
+    /// is insufficient at emit time).
+    polyfn_bindings: std::collections::HashSet<String>,
+
     /// Per-scope save of prior [`codegen_var_types`] entries for names
     /// overwritten in that scope. On pop, shadowed names are restored so
     /// Access after a block sees the outer type again. Newly introduced
@@ -503,6 +510,7 @@ impl Checker {
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
+            polyfn_bindings: std::collections::HashSet::new(),
             codegen_var_types_scopes: Vec::new(),
             fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
@@ -925,6 +933,7 @@ impl Checker {
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
+        self.polyfn_bindings.clear();
         self.codegen_var_types_scopes.clear();
         self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
@@ -1122,7 +1131,33 @@ impl Checker {
     ///
     /// Flat-map leftovers from other functions must not be restored (that
     /// would revive `apply_id`'s `f` over `let f = id` in `main`).
+    /// True when any parameter position in a (possibly quantified) function
+    /// type is still an open type variable — the runtime value is a PolyFn
+    /// that expects boxed args.
+    fn fn_args_contain_type_param(ty: &Ty) -> bool {
+        match ty {
+            Ty::Forall { body, .. } => Self::fn_args_contain_type_param(body),
+            Ty::Fun(arg, ret) => {
+                matches!(arg.as_ref(), Ty::Var(_)) || Self::fn_args_contain_type_param(ret)
+            }
+            _ => false,
+        }
+    }
+
+    fn maybe_record_polyfn_binding(&mut self, name: &str, ty: &Ty) {
+        if matches!(ty, Ty::Forall { .. }) || Self::fn_args_contain_type_param(ty) {
+            self.polyfn_bindings.insert(name.to_string());
+        }
+    }
+
+    /// Whether `name` was bound to a PolyFn-shaped value (open type-param args
+    /// or `forall`) at its let/const site. Used by CallIndirect boxing.
+    pub fn is_polyfn_binding(&self, name: &str) -> bool {
+        self.polyfn_bindings.contains(name)
+    }
+
     fn record_codegen_var_type(&mut self, name: String, ty: Ty) {
+        self.maybe_record_polyfn_binding(&name, &ty);
         if !self.codegen_var_types_scopes.is_empty() {
             let save = {
                 let scopes = &self.codegen_var_types_scopes;
@@ -1576,14 +1611,18 @@ impl Checker {
                     // If exactly one candidate matches current_expected, pick it.
                     let expected = self.current_expected.clone();
                     let matching: Vec<&OverloadCandidate> = if let Some(ref exp) = expected {
+                        // Prune so a solved `Ty::Var` expected type doesn't look
+                        // open; unify under `self.subst` (not empty) so existing
+                        // bindings are visible without mutating the running subst.
+                        let exp = apply_ty_prune(&self.subst, exp);
                         candidates
                             .iter()
                             .filter(|c| {
-                                // Instantiate the candidate's scheme and try to
-                                // unify against expected. Use a fresh subst so
-                                // we don't pollute the running subst.
                                 let (fun_ty, _, _) = self.instantiate_scheme_mapped(&c.scheme);
-                                crate::typechecking::unify::unify(&fun_ty, exp).is_ok()
+                                crate::typechecking::unify::unify_with(
+                                    &self.subst, &fun_ty, &exp,
+                                )
+                                .is_ok()
                             })
                             .collect()
                     } else {
@@ -1626,9 +1665,36 @@ impl Checker {
                             )),
                         );
                     }
-                    // matching.len() == 0 but is_overloaded — fall through to
-                    // the normal env lookup (will return a Var or the last
-                    // inserted scheme, which may unify later).
+                    // matching.len() == 0 with an expected type — no candidate
+                    // unifies. Emit a dedicated diagnostic rather than falling
+                    // through to the last-registered scheme (wrong codegen key /
+                    // confusing TypeMismatch downstream).
+                    let arities: Vec<String> = candidates
+                        .iter()
+                        .map(|c| {
+                            if c.is_rest {
+                                format!("{}+ args (rest)", c.fixed_arity)
+                            } else {
+                                format!("{} args", c.fixed_arity)
+                            }
+                        })
+                        .collect();
+                    let expected_pretty = expected
+                        .as_ref()
+                        .map(|e| apply_ty_prune(&self.subst, e).to_string())
+                        .unwrap_or_else(|| "?".into());
+                    return self.error_with_help(
+                        ErrorCode::TypeMismatch,
+                        format!(
+                            "No overload of `{}` matches expected type `{}`",
+                            name, expected_pretty
+                        ),
+                        range,
+                        Some(format!(
+                            "available overloads: {}",
+                            arities.join(", ")
+                        )),
+                    );
                 }
 
                 let scheme = self.env.lookup(name).cloned();
@@ -8316,9 +8382,9 @@ impl Checker {
 
     /// Infer call arguments, reordering named args and packing rest.
     ///
-    /// When any argument is [`Expression::NamedArg`], every fixed
-    /// parameter must be supplied (no partial application). Rest
-    /// parameters are positional-only at the call site and pack into
+    /// Named arguments may under-apply: omitted fixed parameters become
+    /// holes and the call type is a residual `Fun` (partial application).
+    /// Rest parameters are positional-only at the call site and pack into
     /// a single `[T]` (empty when no trailing args). Returns
     /// `(arg_tys, ordered_value_exprs)` in declaration order; for rest
     /// functions the last "expr" is a synthetic stand-in when packing
@@ -8522,6 +8588,19 @@ impl Checker {
 
         let mut tys = Vec::with_capacity(fixed_count + usize::from(pack_rest));
         let mut exprs = Vec::with_capacity(fixed_count + usize::from(pack_rest));
+        // `filled_mask` is a u32 on the VM stack (MakeFn / CallIndirect); cap
+        // fixed arity so bit shifts never wrap.
+        if fixed_count > 32 {
+            let msg = Message::error(
+                ErrorCode::WrongArity,
+                format!(
+                    "Function `{}` has {} fixed parameters; at most 32 are supported for partial application",
+                    fn_name, fixed_count
+                ),
+                range.clone(),
+            );
+            self.messages.push(msg);
+        }
         let mut fill_mask: u32 = 0;
         let mut filled_slots: Vec<(usize, Ty)> = Vec::new();
         let mut saw_hole = false;
@@ -8531,7 +8610,9 @@ impl Checker {
                     filled_slots.push((i, ty.clone()));
                     tys.push(ty);
                     exprs.push(expr);
-                    fill_mask |= 1u32 << i;
+                    if i < 32 {
+                        fill_mask |= 1u32 << i;
+                    }
                 }
                 None => {
                     saw_hole = true;

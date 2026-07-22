@@ -2613,6 +2613,19 @@ impl Compiler {
             .any(|bound| free.contains(bound) && top_level_vars.contains(bound))
     }
 
+    /// Whether CallIndirect args through `local` must be `BoxValue`'d.
+    ///
+    /// Bare `let f = show` sets [`Self::polyfn_sources`]. Locals assigned from a
+    /// *call* that returns a PolyFn (`let f = capture_show(0)`) are recorded in
+    /// the typechecker's [`Checker::is_polyfn_binding`] set at the binding site
+    /// (while arg types are still open). Mono `ObjFn` / partial / lambda locals
+    /// have concrete `Fun` args and must not box.
+    fn local_call_needs_arg_boxing(&self, local: &str) -> bool {
+        self.polyfn_sources.contains_key(local)
+            || self.polyfn_vars.contains(local)
+            || self.checker.is_polyfn_binding(local)
+    }
+
     /// Whether a CallIndirect through a local needs a post-call `UnboxValue`.
     ///
     /// Direct `polyfn_sources` mappings consult the original generic scheme.
@@ -4232,6 +4245,9 @@ impl Compiler {
                         if let Some(source) = polyfn_source {
                             self.polyfn_vars.insert(name.clone());
                             self.polyfn_sources.insert(name.clone(), source);
+                        } else if self.checker.is_polyfn_binding(&name) {
+                            // Returned/captured PolyFn (`let f = capture_show(0)`).
+                            self.polyfn_vars.insert(name.clone());
                         }
                         // Compile the RHS BEFORE interning the binding name.
                         // Match payload slots use `variables.len()` as the first
@@ -5500,12 +5516,14 @@ impl Compiler {
                             args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
                         let mut arg_tys = Vec::new();
                         let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
+                        // Box for PolyFn locals — including those assigned from a
+                        // call that returns a captured PolyFn (no polyfn_sources
+                        // entry). Mono ObjFn / partials / lambdas stay unboxed.
+                        let needs_arg_box = self.local_call_needs_arg_boxing(&identifier);
                         if let Some(arg_list) = args {
                             for arg in arg_list {
                                 self.append_with_existential_pack(&mut bytecode, arg);
-                                // Box concrete args only when delegating through a
-                                // PolyFn — ObjFn / mono partials take raw values.
-                                if polyfn_source.is_some() {
+                                if needs_arg_box {
                                     if let Some(arg_ty) = self.codegen_expr_ty(arg) {
                                         Self::emit_box_if_needed(&mut bytecode, &arg_ty);
                                         arg_tys.push(arg_ty);
