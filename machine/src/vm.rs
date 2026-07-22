@@ -17,7 +17,7 @@ use common::{
 
 use crate::{
     CStructLayout, CoroState, Frame, Heap, Member, ObjArray, ObjBoxed, ObjCoroutine, ObjEnum,
-    ObjInstance, ObjPolyFn, ObjString, ObjTuple, Object, RefCoroutine, Stack,
+    ObjInstance, ObjFn, ObjPolyFn, ObjString, ObjTuple, Object, RefCoroutine, Stack,
 };
 use common::ValueTag;
 
@@ -442,6 +442,12 @@ impl<const S: usize> Machine<S> {
             }
             Object::Tuple(gc) => {
                 for v in &gc.as_ref().elements {
+                    Self::mark_value_if_heap(heap, *v, gray);
+                }
+            }
+            Object::Fn(gc) => {
+                let f = gc.as_ref();
+                for v in f.captures.iter().chain(f.captured_args.iter()) {
                     Self::mark_value_if_heap(heap, *v, gray);
                 }
             }
@@ -1028,7 +1034,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::DictEntries as u8);
+            promise!(*bc as u8 <= Instruction::MakeFn as u8);
 
             match bc {
                 Instruction::POP => {
@@ -2225,6 +2231,134 @@ impl<const S: usize> Machine<S> {
                     let value_arity = (packed & 0xFFFF) as usize;
                     let app_dict_arity = ((packed >> 16) & 0xFFFF) as usize;
                     let raw = self.stack.pop();
+
+                    // First-class ObjFn: merge new args into holes / captures.
+                    let fn_obj = {
+                        let addr = raw.raw() as u64;
+                        if !raw.raw().is_null() && self.heap.contains_addr(raw.raw()) {
+                            self.heap.find_object_by_addr(addr).and_then(|o| match o {
+                                Object::Fn(gc) => Some(gc),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(gc) = fn_obj {
+                        // Pop application dictionaries first (unused for ObjFn).
+                        for _ in 0..app_dict_arity {
+                            let _ = self.stack.pop();
+                        }
+                        let mut new_args = Vec::with_capacity(value_arity);
+                        for _ in 0..value_arity {
+                            new_args.push(self.stack.pop());
+                        }
+                        new_args.reverse();
+
+                        let base = gc.as_ref();
+                        let arity = base.arity as usize;
+                        let is_rest = base.is_rest;
+                        let mut filled_mask = base.filled_mask;
+                        let captures = base.captures.clone();
+                        let entry = base.entry;
+
+                        // Expand existing filled values into per-slot slots
+                        // (decl order), then fill the next unfilled holes
+                        // positionally from `new_args`.
+                        let mut slot_vals: Vec<Option<Value>> = vec![None; arity];
+                        {
+                            let mut old_i = 0usize;
+                            for slot in 0..arity {
+                                if filled_mask & (1u32 << slot) != 0 {
+                                    if old_i < base.captured_args.len() {
+                                        slot_vals[slot] = Some(base.captured_args[old_i]);
+                                        old_i += 1;
+                                    }
+                                }
+                            }
+                        }
+                        let mut arg_i = 0usize;
+                        for slot in 0..arity {
+                            if filled_mask & (1u32 << slot) != 0 {
+                                continue;
+                            }
+                            if arg_i >= new_args.len() {
+                                break;
+                            }
+                            slot_vals[slot] = Some(new_args[arg_i]);
+                            filled_mask |= 1u32 << slot;
+                            arg_i += 1;
+                        }
+
+                        let mut captured_args: Vec<Value> = Vec::with_capacity(arity);
+                        for slot in 0..arity {
+                            if filled_mask & (1u32 << slot) != 0 {
+                                if let Some(v) = slot_vals[slot] {
+                                    captured_args.push(v);
+                                }
+                            }
+                        }
+
+                        let fixed_filled = filled_mask.count_ones() as usize;
+                        let remaining_new = &new_args[arg_i..];
+
+                        if fixed_filled < arity {
+                            // Still a partial — push updated ObjFn.
+                            let partial = ObjFn {
+                                entry,
+                                arity: base.arity,
+                                is_rest,
+                                filled_mask,
+                                captured_args,
+                                captures,
+                            };
+                            let (object, _) = self.heap.alloc(partial, Object::Fn);
+                            self.alloc_counter += 1;
+                            if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                                Self::gc_collect(
+                                    &mut self.heap,
+                                    &self.stack,
+                                    &self.resume_stack,
+                                    &mut self.alloc_counter,
+                                );
+                            }
+                            self.stack.push(Value::from(object.addr()));
+                            continue;
+                        }
+
+                        // Fixed slots complete. Rest extras → MakeArray
+                        // (including empty rest when `is_rest` and no extras).
+                        let mut call_args = captured_args;
+                        if is_rest {
+                            let arr = crate::memory::ObjArray {
+                                elements: remaining_new.to_vec(),
+                            };
+                            let (object, _) = self.heap.alloc(arr, Object::Array);
+                            self.alloc_counter += 1;
+                            call_args.push(Value::from(object.addr()));
+                        } else if !remaining_new.is_empty() {
+                            // Too many args for a fixed fn — drop extras defensively.
+                        }
+
+                        // Frame: [captures..., params...]
+                        for c in &captures {
+                            self.stack.push(*c);
+                        }
+                        for a in &call_args {
+                            self.stack.push(*a);
+                        }
+                        let frame_arity = captures.len() + call_args.len();
+                        let return_ip = ip;
+                        let callee_sp = self.stack.tell() - frame_arity;
+                        self.frames.get_mut().seek(return_ip);
+                        self.frames
+                            .setup_current_and_advance(|frame| frame.set(callee_sp));
+                        sp = callee_sp;
+                        ip = entry as usize;
+                        continue;
+                    }
+
                     let (target, captured) = {
                         let addr = raw.raw() as u64;
                         if !raw.raw().is_null() && self.heap.contains_addr(raw.raw()) {
@@ -2256,10 +2390,6 @@ impl<const S: usize> Machine<S> {
                     };
 
                     let merged_dicts: Vec<Value> = if captured.is_empty() {
-                        // Unconstrained / delayed-evidence PolyFn, or a plain
-                        // code-offset call: application dicts are the full set.
-                        // Plain calls pack app_dict_arity=0 and put every argument
-                        // in value_arity (legacy), so this stays a no-op.
                         app_dicts
                     } else {
                         let mut app_i = 0usize;
@@ -2268,8 +2398,6 @@ impl<const S: usize> Machine<S> {
                             match slot {
                                 Some(m) => {
                                     merged.push(member_value(m));
-                                    // Skip a duplicate app-site dict for this
-                                    // already-captured constraint, if present.
                                     if app_i < app_dicts.len() {
                                         app_i += 1;
                                     }
@@ -2292,9 +2420,6 @@ impl<const S: usize> Machine<S> {
                         self.stack.push(dict);
                     }
 
-                    // Legacy plain calls pack the full argument count in the low
-                    // 16 bits with app_dict_arity=0 and no captures, so
-                    // `value_arity + 0` preserves the previous operand meaning.
                     let arity = value_arity + dict_arity;
 
                     let return_ip = ip;
@@ -2304,6 +2429,52 @@ impl<const S: usize> Machine<S> {
                         .setup_current_and_advance(|frame| frame.set(callee_sp));
                     sp = callee_sp;
                     ip = target;
+                }
+                Instruction::MakeFn => {
+                    // Stack (bottom → TOS):
+                    //   [captures..., filled_param_values..., filled_mask, entry]
+                    // Operand packing:
+                    //   [7:0]=n_captures [15:8]=n_filled [23:16]=arity [24]=is_rest
+                    let op = opcode.operand_u32();
+                    let n_captures = (op & 0xFF) as usize;
+                    let n_filled = ((op >> 8) & 0xFF) as usize;
+                    let arity = ((op >> 16) & 0xFF) as u32;
+                    let is_rest = (op & (1 << 24)) != 0;
+
+                    let entry = self.stack.pop().as_int() as u32;
+                    let filled_mask = self.stack.pop().as_int() as u32;
+
+                    let mut filled_vals = Vec::with_capacity(n_filled);
+                    for _ in 0..n_filled {
+                        filled_vals.push(self.stack.pop());
+                    }
+                    filled_vals.reverse();
+
+                    let mut captures = Vec::with_capacity(n_captures);
+                    for _ in 0..n_captures {
+                        captures.push(self.stack.pop());
+                    }
+                    captures.reverse();
+
+                    let pfn = ObjFn {
+                        entry,
+                        arity,
+                        is_rest,
+                        filled_mask,
+                        captured_args: filled_vals,
+                        captures,
+                    };
+                    let (object, _) = self.heap.alloc(pfn, Object::Fn);
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(object.addr()));
                 }
                 Instruction::BoxValue => {
                     let tag = (opcode.operand_u32() & 0xFFFF) as u16;
@@ -4451,5 +4622,112 @@ mod tests {
         vm.run(&[const_int(9), load_field(0), Byte::new(Instruction::HALT)]);
         assert_eq!(vm.tell(), 1);
         assert_eq!(vm.pop(), Value::default());
+    }
+
+    /// MakeFn packing: [7:0]=n_cap [15:8]=n_filled [23:16]=arity [24]=is_rest
+    fn make_fn_op(n_cap: u32, n_filled: u32, arity: u32, is_rest: bool) -> u32 {
+        n_cap | (n_filled << 8) | (arity << 16) | if is_rest { 1 << 24 } else { 0 }
+    }
+
+    #[test]
+    fn make_fn_then_call_indirect_invokes_entry() {
+        // MakeFn → StorePop 0; push args; LOAD 0; CallIndirect
+        let body_entry = 9u32;
+        let code = vec![
+            const_int(0),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(0, 0, 2, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(10),
+            const_int(20),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(2),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ];
+        assert!(matches!(code[body_entry as usize].bytecode(), Instruction::LOAD));
+        let mut vm = Machine::<16>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 30);
+    }
+
+    #[test]
+    fn make_fn_partial_then_complete_via_call_indirect() {
+        let body_entry = 9u32;
+        let code = vec![
+            const_int(7),
+            const_int(0b001),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(0, 1, 2, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(3),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ];
+        let mut vm = Machine::<16>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 10);
+    }
+
+    #[test]
+    fn make_fn_with_captures_injects_leading_locals() {
+        let body_entry = 9u32;
+        let code = vec![
+            const_int(10),
+            const_int(0),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(1, 0, 1, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(5),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ];
+        let mut vm = Machine::<16>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 15);
+    }
+
+    #[test]
+    fn call_indirect_nested_partial_fills_remaining_holes() {
+        let body_entry = 14u32;
+        let code = [
+            const_int(0),
+            const_int(body_entry as i64),
+            Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_op(0, 0, 3, false)),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(1),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(1),
+            Byte::new(Instruction::StorePop).with_operand_u32(0),
+            const_int(2),
+            const_int(3),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CallIndirect).with_operand_u32(2),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::POP),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::LOAD).with_operand_u32(2),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::RETURN),
+        ];
+        assert!(matches!(code[body_entry as usize].bytecode(), Instruction::LOAD));
+        let mut vm = Machine::<32>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 6);
     }
 }

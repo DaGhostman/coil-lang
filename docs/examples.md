@@ -1511,3 +1511,44 @@ cargo test -p compiler --test pipeline
 ```
 
 This is useful to verify expected output without invoking the full CLI archive path.
+
+---
+
+## Arity overloads, fn values, and lambdas
+
+### `examples/overload.0s`
+
+**Demonstrates:** Compile-time arity overloads — same name, different arities.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/overload.0s` |
+| **Output** | `15` |
+
+### `examples/fn_value.0s`
+
+**Demonstrates:** First-class monomorphic functions (`let f = add`) and positional partial application (`let g = add(1)`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/fn_value.0s` |
+| **Output** | `423` |
+
+### `examples/lambda.0s`
+
+**Demonstrates:** Explicit-capture lambdas — `fn (int x) use (y) => x + y`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/lambda.0s` |
+| **Output** | `42` |
+
+### `examples/method_overload.0s`
+
+**Demonstrates:** `impl` method arity overloads (`bump()` vs `bump(int)`).
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/method_overload.0s` |
+| **Output** | `1116` |
+

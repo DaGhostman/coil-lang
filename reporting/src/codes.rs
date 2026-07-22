@@ -35,6 +35,12 @@ pub enum ErrorCode {
     InvalidOptionalAccess,
     ConflictingErrorType,
     GenericTypeError,
+    /// No overload of a function accepts the given argument count.
+    WrongArity,
+    /// Two overloads of the same function have conflicting arities.
+    DuplicateOverload,
+    /// A function name used in value position is ambiguous among overloads.
+    AmbiguousOverload,
 
     // --- Enums / match / constructs (E02xx) ---
     DuplicateEnum,
@@ -97,6 +103,9 @@ impl ErrorCode {
             Self::InvalidOptionalAccess => "E0116",
             Self::ConflictingErrorType => "E0117",
             Self::GenericTypeError => "E0119",
+            Self::WrongArity => "E0120",
+            Self::DuplicateOverload => "E0121",
+            Self::AmbiguousOverload => "E0122",
             Self::DuplicateEnum => "E0200",
             Self::DuplicateConstructor => "E0201",
             Self::UnknownEnum => "E0202",
@@ -155,6 +164,9 @@ impl ErrorCode {
             Self::InvalidOptionalAccess => "invalid optional access",
             Self::ConflictingErrorType => "conflicting error types",
             Self::GenericTypeError => "type error",
+            Self::WrongArity => "no matching overload for argument count",
+            Self::DuplicateOverload => "duplicate overload: conflicting arities",
+            Self::AmbiguousOverload => "ambiguous overload in value position",
             Self::DuplicateEnum => "duplicate enum",
             Self::DuplicateConstructor => "duplicate constructor",
             Self::UnknownEnum => "unknown enum",
@@ -221,6 +233,9 @@ mod tests {
             | InvalidOptionalAccess
             | ConflictingErrorType
             | GenericTypeError
+            | WrongArity
+            | DuplicateOverload
+            | AmbiguousOverload
             | DuplicateEnum
             | DuplicateConstructor
             | UnknownEnum
@@ -270,6 +285,9 @@ mod tests {
             InvalidOptionalAccess,
             ConflictingErrorType,
             GenericTypeError,
+            WrongArity,
+            DuplicateOverload,
+            AmbiguousOverload,
             DuplicateEnum,
             DuplicateConstructor,
             UnknownEnum,

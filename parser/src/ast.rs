@@ -392,6 +392,18 @@ pub enum Expression<'expr> {
         type_params: Vec<TypeParam<'expr>>,
         ty: Box<Output<'expr>>,
     },
+
+    /// Anonymous function: `fn (T x) use (y) => expr` or `fn (T x) { block }`.
+    ///
+    /// - `args` — a `Fragment` of `Argument` nodes (same layout as `Function`).
+    /// - `captures` — variable names from the optional `use (a, b)` capture list.
+    /// - `body` — the function body: either a short expression (after `=>`) or
+    ///   a `Block`.
+    Lambda {
+        args: Output<'expr>,
+        captures: Vec<&'expr str>,
+        body: Output<'expr>,
+    },
 }
 
 /// Payload shape for an `enum` variant declaration.
@@ -682,6 +694,8 @@ impl<'a> Display for Expression<'a> {
             Self::Negate(n) => write!(f, "-{}", n.borrow().1),
             Self::Positive(n) => write!(f, "+{}", n.borrow().1),
             Self::Expr(e) => write!(f, "{}", e.1),
+            Self::Return(e) => write!(f, "return {}", e.1),
+            Self::ImplicitReturn(e) => write!(f, "{}", e.1),
             Self::ExprStatement(e) => write!(f, "{};", e.1),
             Self::LetDestructure { pattern, rhs } => {
                 write!(f, "let {} = {}", pattern, rhs.1)
@@ -1122,6 +1136,29 @@ impl<'a> Display for Expression<'a> {
                     }
                 } else {
                     write!(f, "impl {} {{ {} }}", class, ms.join(" "))
+                }
+            }
+            Self::Lambda {
+                args,
+                captures,
+                body,
+            } => {
+                // Prefer comma-separated params for round-trip with `arg_list`.
+                let params = match args.1.as_ref() {
+                    Self::Fragment(items) => items
+                        .iter()
+                        .map(|a| a.1.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    other => other.to_string(),
+                };
+                write!(f, "fn ({})", params)?;
+                if !captures.is_empty() {
+                    write!(f, " use ({})", captures.join(", "))?;
+                }
+                match body.1.as_ref() {
+                    Self::Block(_) => write!(f, " {{\n{}}}", body.1),
+                    _ => write!(f, " => {}", body.1),
                 }
             }
             e => write!(f, "<unhandled: {:?}>", e),

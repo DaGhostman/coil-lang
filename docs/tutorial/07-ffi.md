@@ -357,7 +357,7 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 | Failed `declare` | `Result::Err` (missing symbol, libffi error) |
 | `extern` failure | Compiler unwraps Results and panics with a clear message |
 | No automatic `out.c0s` invalidation for new `.so` | Rebuild C libraries separately; bytecode does not embed shared-library contents |
-| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **23**); stale `.c0s` files are rejected after compiler upgrades |
+| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **24**); stale `.c0s` files are rejected after compiler upgrades |
 
 ---
 

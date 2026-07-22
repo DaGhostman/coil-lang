@@ -451,6 +451,35 @@ fn polyfn_captured_dict_survives_return() {
     assert_eq!(run_example_src(src), "42");
 }
 
+/// Inner-block PolyFn let must not poison an outer same-named ObjFn local.
+#[test]
+fn polyfn_block_shadow_does_not_box_outer_mono_fn() {
+    let src = r#"
+        trait Describable<T> {
+            fn describe_val(T x) -> int;
+        }
+        impl Describable<int> {
+            fn describe_val(int x) -> int { return x + 1; }
+        }
+        fn show<T: Describable>(T x) -> int {
+            return describe_val(x);
+        }
+        fn capture_show<T: Describable>(T _w) {
+            return show;
+        }
+        fn add(int a, int b) -> int { return a + b; }
+        fn main() {
+            let f = add;
+            {
+                let f = capture_show(0);
+                print "%i", f(41);
+            }
+            print "%i", f(1, 2);
+        }
+    "#;
+    assert_eq!(run_example_src(src), "423");
+}
+
 /// Phase 4: multiparam `Convert<A,B>` capture works after return with no app dict.
 /// Both type args are witnessed at the capture call so the dict is concrete.
 #[test]
@@ -2070,4 +2099,80 @@ fn main() {
     );
     // Pre-fix: e.code → LoadField(0) → kind (1), not code (42).
     assert_eq!(output, "421");
+}
+
+
+#[test]
+fn example_overload_prints_15() {
+    let output = run_example("examples/overload.0s");
+    assert_eq!(output, "15");
+}
+
+#[test]
+fn example_fn_value_prints_423() {
+    let output = run_example("examples/fn_value.0s");
+    assert_eq!(output, "423");
+}
+
+#[test]
+fn example_lambda_prints_42() {
+    let output = run_example("examples/lambda.0s");
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn example_method_overload_prints_1116() {
+    let output = run_example("examples/method_overload.0s");
+    assert_eq!(output, "1116");
+}
+
+/// Named under-apply must build a partial whose holes fill in declaration
+/// order at CallIndirect time (not print the named value as the only arg).
+#[test]
+fn named_partial_application_completes_and_prints_3() {
+    let output = run_example_src(
+        r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    let g = add(a: 1);
+    print "%i", g(2);
+}
+"#,
+    );
+    assert_eq!(output, "3");
+}
+
+/// Nested partials (`f(1)` → `p(2)` → `q(3)`) must merge filled masks without
+/// clobbering earlier holes — a common ObjFn regression.
+#[test]
+fn nested_partial_application_prints_6() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int { return a + b + c; }
+fn main() {
+    let p = add3(1);
+    let q = p(2);
+    print "%i", q(3);
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
+/// Fixed-N vs rest-K (N < K) must dispatch by argc: exact fixed wins at N;
+/// rest handles K and above. Typechecker unit tests alone miss wrong CALL targets.
+#[test]
+fn fixed_vs_rest_overload_dispatches_at_runtime() {
+    let output = run_example_src(
+        r#"
+fn f(int x) -> int { return x * 10; }
+fn f(int x, int y, int... xs) -> int { return x + y + len(xs); }
+fn main() {
+    print "%i", f(1);
+    print "%i", f(1, 2);
+    print "%i", f(1, 2, 3, 4);
+}
+"#,
+    );
+    assert_eq!(output, "1035");
 }

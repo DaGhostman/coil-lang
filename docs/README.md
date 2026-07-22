@@ -28,7 +28,7 @@ See [Getting Started](getting-started.md) for prerequisites, project layout, and
 1. **Parse** — the Pratt parser reads `.0s` source into an AST.
 2. **Typecheck** — Algorithm W (Hindley–Milner) infers types and reports source-anchored diagnostics.
 3. **Codegen** — the compiler emits stack bytecode, then runs a peephole fusion pass.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **15**) and written to `out.c0s` on first run.
+4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **24**) and written to `out.c0s` on first run.
 5. **Execute** — the VM loads the archive and runs `main`.
 
 Re-run the same binary without deleting `out.c0s` to reuse the cached compile. Delete `out.c0s` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source.
@@ -39,7 +39,8 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 |------|--------|
 | Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
-| Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; no partial named calls) |
+| Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; named holes on partials allowed) |
+| Arity overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.0s`, `fn_value.0s`, `lambda.0s`) |
 | Rest parameters (`T... xs`) | Supported (trailing only; packs to `[T]`; no call-site `...xs` spread) |
 | Let destructuring (`let (a, b) = …`, `let { x, y } = …`) | Supported (tuple / record; no enum ctor patterns in `let`) |
 | `break` / `continue` | Supported |
