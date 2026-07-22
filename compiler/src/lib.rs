@@ -512,8 +512,16 @@ fn strip_overload_key(name: &str) -> &str {
 }
 
 /// `MakeFn` operand: `[7:0]=n_cap [15:8]=n_filled [23:16]=arity [24]=is_rest`.
+///
+/// `n_cap` and `n_filled` are packed into 8-bit fields (max 255). Callers with
+/// larger values must not reach here — partial-application arity is already
+/// capped at 32 for `filled_mask`.
 fn make_fn_operand(n_cap: u32, n_filled: u32, arity: u32, is_rest: bool) -> u32 {
-    n_cap | (n_filled << 8) | (arity << 16) | if is_rest { 1 << 24 } else { 0 }
+    debug_assert!(
+        n_cap <= 0xFF && n_filled <= 0xFF,
+        "MakeFn n_cap/n_filled overflow 8-bit fields: n_cap={n_cap} n_filled={n_filled}"
+    );
+    (n_cap & 0xFF) | ((n_filled & 0xFF) << 8) | (arity << 16) | if is_rest { 1 << 24 } else { 0 }
 }
 
 /// Fixed-arity / rest flag from a function's `Argument` fragment.
@@ -2616,14 +2624,15 @@ impl Compiler {
     /// Whether CallIndirect args through `local` must be `BoxValue`'d.
     ///
     /// Bare `let f = show` sets [`Self::polyfn_sources`]. Locals assigned from a
-    /// *call* that returns a PolyFn (`let f = capture_show(0)`) are recorded in
-    /// the typechecker's [`Checker::is_polyfn_binding`] set at the binding site
-    /// (while arg types are still open). Mono `ObjFn` / partial / lambda locals
-    /// have concrete `Fun` args and must not box.
+    /// *call* that returns a PolyFn (`let f = capture_show(0)`) are seeded into
+    /// [`Self::polyfn_vars`] from the binder's span in
+    /// [`Checker::is_polyfn_binding_at`] when the let is emitted. Both sets are
+    /// snapshotted around `{ … }` blocks so an inner PolyFn cannot poison an
+    /// outer same-named ObjFn. Mono partials / lambdas stay unboxed.
     fn local_call_needs_arg_boxing(&self, local: &str) -> bool {
-        self.polyfn_sources.contains_key(local)
-            || self.polyfn_vars.contains(local)
-            || self.checker.is_polyfn_binding(local)
+        // Only the codegen-scoped sets — never a flat name table (that would
+        // leak across `{ … }` block shadows).
+        self.polyfn_sources.contains_key(local) || self.polyfn_vars.contains(local)
     }
 
     /// Whether a CallIndirect through a local needs a post-call `UnboxValue`.
@@ -4226,6 +4235,7 @@ impl Compiler {
                         _ => None,
                     };
                     if let Some((name, is_const)) = binding {
+                        let binder_span = (children[0].0.start, children[0].0.end);
                         // Check if the RHS is a bare identifier that names a generic fn.
                         // If so, track this variable as holding an ObjPolyFn.
                         let polyfn_source = match unwrapped_identifier(&children[1]) {
@@ -4245,7 +4255,10 @@ impl Compiler {
                         if let Some(source) = polyfn_source {
                             self.polyfn_vars.insert(name.clone());
                             self.polyfn_sources.insert(name.clone(), source);
-                        } else if self.checker.is_polyfn_binding(&name) {
+                        } else if self
+                            .checker
+                            .is_polyfn_binding_at(binder_span.0, binder_span.1)
+                        {
                             // Returned/captured PolyFn (`let f = capture_show(0)`).
                             self.polyfn_vars.insert(name.clone());
                         }
@@ -4272,6 +4285,12 @@ impl Compiler {
                 }
             }
             Expression::Block(children) => {
+                // Isolate PolyFn tracking the same way function bodies do:
+                // keep outer entries visible inside the block, then restore
+                // so an inner `let f = capture_show(0)` cannot poison an
+                // outer same-named ObjFn / mono local after the block.
+                let saved_polyfn_vars = self.polyfn_vars.clone();
+                let saved_polyfn_sources = self.polyfn_sources.clone();
                 let ctx = self.context.child();
                 self.context = ctx;
                 // Append each child to self.bytecode (Print/control-flow emit in-place).
@@ -4281,6 +4300,8 @@ impl Compiler {
                 }
 
                 self.context = *self.context.get_prev().clone().unwrap();
+                self.polyfn_vars = saved_polyfn_vars;
+                self.polyfn_sources = saved_polyfn_sources;
             }
             Expression::Function {
                 name,

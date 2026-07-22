@@ -176,12 +176,12 @@ pub struct Checker {
     /// Variable types for codegen when infer cache is misaligned in function bodies.
     codegen_var_types: std::collections::HashMap<String, Ty>,
 
-    /// Locals whose bound type still had open type-parameter arguments at
-    /// the binding site (e.g. `let f = capture_show(0)` → `t29 -> int`).
-    /// Codegen uses this to `BoxValue` CallIndirect args even after the
-    /// running subst later grounds those vars (so `codegen_var_type` alone
-    /// is insufficient at emit time).
-    polyfn_bindings: std::collections::HashSet<String>,
+    /// Let/const binding spans whose bound type had open type-parameter
+    /// arguments (or was `forall`) at the binding site. Keyed by the
+    /// `Variable`/`Constant` span — not the binder name — so an inner
+    /// `{ let f = capture_show(0); }` cannot poison an outer `f`.
+    /// Codegen seeds `polyfn_vars` from this when emitting the matching let.
+    polyfn_binding_spans: std::collections::HashSet<(usize, usize)>,
 
     /// Per-scope save of prior [`codegen_var_types`] entries for names
     /// overwritten in that scope. On pop, shadowed names are restored so
@@ -510,7 +510,7 @@ impl Checker {
             cache: std::collections::HashMap::new(),
             codegen_types_by_span: HashMap::new(),
             codegen_var_types: std::collections::HashMap::new(),
-            polyfn_bindings: std::collections::HashSet::new(),
+            polyfn_binding_spans: std::collections::HashSet::new(),
             codegen_var_types_scopes: Vec::new(),
             fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
@@ -933,7 +933,7 @@ impl Checker {
         self.cache.clear();
         self.codegen_types_by_span.clear();
         self.codegen_var_types.clear();
-        self.polyfn_bindings.clear();
+        self.polyfn_binding_spans.clear();
         self.codegen_var_types_scopes.clear();
         self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
@@ -1131,33 +1131,7 @@ impl Checker {
     ///
     /// Flat-map leftovers from other functions must not be restored (that
     /// would revive `apply_id`'s `f` over `let f = id` in `main`).
-    /// True when any parameter position in a (possibly quantified) function
-    /// type is still an open type variable — the runtime value is a PolyFn
-    /// that expects boxed args.
-    fn fn_args_contain_type_param(ty: &Ty) -> bool {
-        match ty {
-            Ty::Forall { body, .. } => Self::fn_args_contain_type_param(body),
-            Ty::Fun(arg, ret) => {
-                matches!(arg.as_ref(), Ty::Var(_)) || Self::fn_args_contain_type_param(ret)
-            }
-            _ => false,
-        }
-    }
-
-    fn maybe_record_polyfn_binding(&mut self, name: &str, ty: &Ty) {
-        if matches!(ty, Ty::Forall { .. }) || Self::fn_args_contain_type_param(ty) {
-            self.polyfn_bindings.insert(name.to_string());
-        }
-    }
-
-    /// Whether `name` was bound to a PolyFn-shaped value (open type-param args
-    /// or `forall`) at its let/const site. Used by CallIndirect boxing.
-    pub fn is_polyfn_binding(&self, name: &str) -> bool {
-        self.polyfn_bindings.contains(name)
-    }
-
     fn record_codegen_var_type(&mut self, name: String, ty: Ty) {
-        self.maybe_record_polyfn_binding(&name, &ty);
         if !self.codegen_var_types_scopes.is_empty() {
             let save = {
                 let scopes = &self.codegen_var_types_scopes;
@@ -1183,6 +1157,51 @@ impl Checker {
                 .or_insert(save);
         }
         self.codegen_var_types.insert(name, ty);
+    }
+
+    /// Whether any type-parameter hole appears in `ty` (including nested
+    /// tuple / array / record / app argument positions).
+    fn ty_contains_open_var(ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(_) => true,
+            Ty::Forall { body, .. } => Self::ty_contains_open_var(body),
+            Ty::Fun(arg, ret) => {
+                Self::ty_contains_open_var(arg) || Self::ty_contains_open_var(ret)
+            }
+            Ty::App(ctor, args) => {
+                Self::ty_contains_open_var(ctor) || args.iter().any(Self::ty_contains_open_var)
+            }
+            Ty::List(inner) | Ty::Array { element: inner, .. } => Self::ty_contains_open_var(inner),
+            Ty::Tuple(elems) => elems.iter().any(Self::ty_contains_open_var),
+            Ty::Record { fields } => fields.iter().any(|(_, t)| Self::ty_contains_open_var(t)),
+            Ty::Constructor { owner, .. } => Self::ty_contains_open_var(owner),
+            Ty::Con(_) | Ty::Sum { .. } | Ty::Existential { .. } => false,
+        }
+    }
+
+    /// True when any parameter position in a (possibly quantified) function
+    /// type still contains an open type variable — the runtime value is a
+    /// PolyFn that expects boxed args.
+    fn fn_args_contain_type_param(ty: &Ty) -> bool {
+        match ty {
+            Ty::Forall { body, .. } => Self::fn_args_contain_type_param(body),
+            Ty::Fun(arg, ret) => {
+                Self::ty_contains_open_var(arg) || Self::fn_args_contain_type_param(ret)
+            }
+            _ => false,
+        }
+    }
+
+    fn maybe_record_polyfn_binding(&mut self, span: (usize, usize), ty: &Ty) {
+        if matches!(ty, Ty::Forall { .. }) || Self::fn_args_contain_type_param(ty) {
+            self.polyfn_binding_spans.insert(span);
+        }
+    }
+
+    /// Whether the let/const binder at `span` was PolyFn-shaped. Used by
+    /// codegen to seed per-scope `polyfn_vars` (not consulted at call sites).
+    pub fn is_polyfn_binding_at(&self, start: usize, end: usize) -> bool {
+        self.polyfn_binding_spans.contains(&(start, end))
     }
 
     fn register_type_alias(&mut self, name: &str, alias_ty: Ty, range: Range<usize>) {
@@ -4483,6 +4502,10 @@ impl Checker {
                                 let _ = self.infer(next);
                                 self.env.insert_top(name.to_string(), source_scheme.clone());
                                 self.record_codegen_var_type(name.to_string(), source_scheme.ty.clone());
+                                self.maybe_record_polyfn_binding(
+                                    (child.0.start, child.0.end),
+                                    &source_scheme.ty,
+                                );
                                 last_ty = source_scheme.ty;
                                 i += 2;
                                 continue;
@@ -4506,7 +4529,8 @@ impl Checker {
                             // so Access codegen sees Record/enum types, not the
                             // pre-unify fresh variable.
                             let pruned = apply_ty_prune(&self.subst, &var_ty);
-                            self.record_codegen_var_type(name.to_string(), pruned);
+                            self.record_codegen_var_type(name.to_string(), pruned.clone());
+                            self.maybe_record_polyfn_binding((child.0.start, child.0.end), &pruned);
                             // `let id = declare(...)` may wrap Declare/Call in
                             // ExprStatement/Statement/`?` — unwrap before matching.
                             let init = unwrap_expr_wrappers(next);
@@ -4574,7 +4598,11 @@ impl Checker {
                                     "const binding",
                                 );
                                 let pruned = apply_ty_prune(&self.subst, &var_ty);
-                                self.record_codegen_var_type(n.to_string(), pruned);
+                                self.record_codegen_var_type(n.to_string(), pruned.clone());
+                                self.maybe_record_polyfn_binding(
+                                    (child.0.start, child.0.end),
+                                    &pruned,
+                                );
                                 i += 1;
                             }
                         }
@@ -8586,10 +8614,9 @@ impl Checker {
                 || args.len() >= fixed_count
                 || fixed_count == 0);
 
-        let mut tys = Vec::with_capacity(fixed_count + usize::from(pack_rest));
-        let mut exprs = Vec::with_capacity(fixed_count + usize::from(pack_rest));
         // `filled_mask` is a u32 on the VM stack (MakeFn / CallIndirect); cap
-        // fixed arity so bit shifts never wrap.
+        // fixed arity so bit shifts never wrap. Abort early — continuing would
+        // emit a truncated mask and mis-bind partials.
         if fixed_count > 32 {
             let msg = Message::error(
                 ErrorCode::WrongArity,
@@ -8600,7 +8627,19 @@ impl Checker {
                 range.clone(),
             );
             self.messages.push(msg);
+            let mut tys = Vec::with_capacity(args.len());
+            let mut exprs = Vec::with_capacity(args.len());
+            for arg in args {
+                tys.push(Ty::Var(self.counter.fresh()));
+                exprs.push(match arg.1.as_ref() {
+                    Expression::NamedArg(_, v) => v.clone(),
+                    _ => arg.clone(),
+                });
+            }
+            return (tys, exprs);
         }
+        let mut tys = Vec::with_capacity(fixed_count + usize::from(pack_rest));
+        let mut exprs = Vec::with_capacity(fixed_count + usize::from(pack_rest));
         let mut fill_mask: u32 = 0;
         let mut filled_slots: Vec<(usize, Ty)> = Vec::new();
         let mut saw_hole = false;
@@ -8610,9 +8649,7 @@ impl Checker {
                     filled_slots.push((i, ty.clone()));
                     tys.push(ty);
                     exprs.push(expr);
-                    if i < 32 {
-                        fill_mask |= 1u32 << i;
-                    }
+                    fill_mask |= 1u32 << i;
                 }
                 None => {
                     saw_hole = true;

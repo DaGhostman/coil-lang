@@ -451,6 +451,35 @@ fn polyfn_captured_dict_survives_return() {
     assert_eq!(run_example_src(src), "42");
 }
 
+/// Inner-block PolyFn let must not poison an outer same-named ObjFn local.
+#[test]
+fn polyfn_block_shadow_does_not_box_outer_mono_fn() {
+    let src = r#"
+        trait Describable<T> {
+            fn describe_val(T x) -> int;
+        }
+        impl Describable<int> {
+            fn describe_val(int x) -> int { return x + 1; }
+        }
+        fn show<T: Describable>(T x) -> int {
+            return describe_val(x);
+        }
+        fn capture_show<T: Describable>(T _w) {
+            return show;
+        }
+        fn add(int a, int b) -> int { return a + b; }
+        fn main() {
+            let f = add;
+            {
+                let f = capture_show(0);
+                print "%i", f(41);
+            }
+            print "%i", f(1, 2);
+        }
+    "#;
+    assert_eq!(run_example_src(src), "423");
+}
+
 /// Phase 4: multiparam `Convert<A,B>` capture works after return with no app dict.
 /// Both type args are witnessed at the capture call so the dict is concrete.
 #[test]
