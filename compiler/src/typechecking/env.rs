@@ -96,6 +96,28 @@ impl Env {
         self.frames.pop()
     }
 
+    /// Replace all frames with a single empty frame; return the previous stack.
+    /// Used by lambdas so only explicit `use` captures + params are visible.
+    pub fn take_and_isolate(&mut self) -> Vec<Frame> {
+        std::mem::replace(&mut self.frames, vec![Frame::new()])
+    }
+
+    /// Restore a frame stack previously returned by [`take_and_isolate`].
+    pub fn restore_frames(&mut self, frames: Vec<Frame>) {
+        self.frames = frames;
+    }
+
+    /// Collect every binding name visible in this env (all frames).
+    pub fn all_names(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for frame in &self.frames {
+            for (n, _) in &frame.bindings {
+                names.insert(n.clone());
+            }
+        }
+        names
+    }
+
     /// Number of frames currently on the stack.
     pub fn depth(&self) -> usize {
         self.frames.len()

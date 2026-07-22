@@ -375,6 +375,22 @@ pub struct Checker {
     /// whether the candidate should be added to `overload_sets`.
     registering_overloadable_fn: bool,
 
+    /// When inside a lambda body: names that exist in the outer env but were
+    /// not listed in `use (…)`. Looking them up yields a capture diagnostic
+    /// instead of a generic "Cannot find value".
+    lambda_uncaptured_outer: Option<std::collections::HashSet<String>>,
+
+    /// Call sites that under-applied a fixed-arity (or rest) function and
+    /// produced a residual `Fun` / partial. Value is the bitmask of filled
+    /// fixed-parameter slots (bit i ⇒ param i bound). Used by codegen for
+    /// `MakeFn` partials (positional and named holes).
+    pub partial_fills_by_span: std::collections::HashMap<(usize, usize), u32>,
+
+    /// Per-slot types for [`partial_fills_by_span`] entries (slot index, ty).
+    /// Needed when named holes are non-prefix (`add(b: 2)`) so typing does
+    /// not feed args into `apply_function` in the wrong order.
+    partial_filled_tys_by_span: std::collections::HashMap<(usize, usize), Vec<(usize, Ty)>>,
+
     /// Projections encountered while building a scheme. Each is quantified
     /// alongside the method/function binders and later pinned from the selected
     /// instance.
@@ -546,6 +562,9 @@ impl Checker {
             fn_dict_arity: HashMap::new(),
             current_typeclass: None,
             registering_overloadable_fn: false,
+            lambda_uncaptured_outer: None,
+            partial_fills_by_span: std::collections::HashMap::new(),
+            partial_filled_tys_by_span: std::collections::HashMap::new(),
             current_assoc_projections: None,
             open_assoc_projections: HashMap::new(),
         };
@@ -912,6 +931,9 @@ impl Checker {
         self.fn_has_rest.clear();
         self.overload_sets.clear();
         self.selected_overloads_by_span.clear();
+        self.partial_fills_by_span.clear();
+        self.partial_filled_tys_by_span.clear();
+        self.lambda_uncaptured_outer = None;
         self.call_site_dicts.clear();
         self.call_site_dicts_by_span.clear();
         self.call_site_forward_dicts.clear();
@@ -1612,11 +1634,28 @@ impl Checker {
                 let scheme = self.env.lookup(name).cloned();
                 match scheme {
                     Some(s) => self.instantiate_ty(&s),
-                    None => self.error(
-                        ErrorCode::UnknownValue,
-                        format!("Cannot find value `{}` in this scope", name),
-                        range,
-                    ),
+                    None => {
+                        if self
+                            .lambda_uncaptured_outer
+                            .as_ref()
+                            .is_some_and(|s| s.contains(*name))
+                        {
+                            return self.error_with_help(
+                                ErrorCode::UnknownValue,
+                                format!("cannot capture `{}` without `use ({})`", name, name),
+                                range,
+                                Some(format!(
+                                    "list `{}` in the lambda's `use (…)` capture list",
+                                    name
+                                )),
+                            );
+                        }
+                        self.error(
+                            ErrorCode::UnknownValue,
+                            format!("Cannot find value `{}` in this scope", name),
+                            range,
+                        )
+                    }
                 }
             }
 
@@ -2353,18 +2392,47 @@ impl Checker {
                         };
                     let (arg_tys, ordered_args) =
                         self.infer_and_reorder_call_args(&ident, raw_args, &range);
-                    let result = self.apply_function(
-                        Some(&ident),
-                        &fun_ty,
-                        &arg_tys,
-                        if ordered_args.is_empty() {
-                            None
+                    let result = if let Some(filled) = self
+                        .partial_filled_tys_by_span
+                        .get(&(range.start, range.end))
+                        .cloned()
+                    {
+                        let mask = self
+                            .partial_fills_by_span
+                            .get(&(range.start, range.end))
+                            .copied()
+                            .unwrap_or(0);
+                        let n = mask.count_ones();
+                        if !Self::is_prefix_fill_mask(mask, n) {
+                            self.apply_partial_with_mask(&fun_ty, &filled, &range)
                         } else {
-                            Some(&ordered_args)
-                        },
-                        id,
-                        range.clone(),
-                    );
+                            self.apply_function(
+                                Some(&ident),
+                                &fun_ty,
+                                &arg_tys,
+                                if ordered_args.is_empty() {
+                                    None
+                                } else {
+                                    Some(&ordered_args)
+                                },
+                                id,
+                                range.clone(),
+                            )
+                        }
+                    } else {
+                        self.apply_function(
+                            Some(&ident),
+                            &fun_ty,
+                            &arg_tys,
+                            if ordered_args.is_empty() {
+                                None
+                            } else {
+                                Some(&ordered_args)
+                            },
+                            id,
+                            range.clone(),
+                        )
+                    };
                     if !fresh_constraints.is_empty() {
                         self.discharge_constraints(id, &fresh_constraints, &range);
                         if let Some(scheme) = original_scheme.as_ref() {
@@ -3039,6 +3107,67 @@ impl Checker {
                 );
                 self.registering_overloadable_fn = prev_overloadable;
                 unit_ty()
+            }
+
+            // ---- Anonymous lambdas ----
+            Expression::Lambda {
+                args,
+                captures,
+                body,
+            } => {
+                // Resolve capture types from the outer env before isolating.
+                let mut cap_bindings: Vec<(String, Ty)> = Vec::new();
+                for cap in captures {
+                    match self.env.lookup(cap).cloned() {
+                        Some(scheme) => {
+                            let ty = self.instantiate_ty(&scheme);
+                            cap_bindings.push((cap.to_string(), ty));
+                        }
+                        None => {
+                            return self.error(
+                                ErrorCode::UnknownValue,
+                                format!("Cannot find value `{}` in this scope", cap),
+                                range,
+                            );
+                        }
+                    }
+                }
+                let arg_tys = self.parse_arg_list(args);
+                let mut uncaptured = self.env.all_names();
+                for (n, _) in &cap_bindings {
+                    uncaptured.remove(n);
+                }
+                for (n, _) in &arg_tys {
+                    uncaptured.remove(n);
+                }
+
+                let saved_frames = self.env.take_and_isolate();
+                let prev_uncaptured = self.lambda_uncaptured_outer.replace(uncaptured);
+                for (n, ty) in &cap_bindings {
+                    self.env
+                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.record_codegen_var_type(n.clone(), ty.clone());
+                }
+                for (n, ty) in &arg_tys {
+                    self.env
+                        .insert_top(n.clone(), Scheme::mono(ty.clone()));
+                    self.record_codegen_var_type(n.clone(), ty.clone());
+                }
+
+                let ret_slot = Ty::Var(self.counter.fresh());
+                let prev_ret = self.current_return_ty.replace(ret_slot.clone());
+                let body_ty = self.infer(body);
+                self.unify(&ret_slot, &body_ty, &range, "lambda body");
+                self.current_return_ty = prev_ret;
+                self.lambda_uncaptured_outer = prev_uncaptured;
+                self.env.restore_frames(saved_frames);
+
+                let ret = apply_ty_prune(&self.subst, &ret_slot);
+                let mut fun_ty = ret;
+                for (_, arg_ty) in arg_tys.iter().rev() {
+                    fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+                }
+                fun_ty
             }
 
             // ---- `test("…") { … }` harness cases ----
@@ -4939,6 +5068,55 @@ impl Checker {
             }
         }
         current
+    }
+
+    /// Apply a partially-filled call where named holes may skip parameters.
+    ///
+    /// `filled` is `(slot_index, arg_ty)` for each provided argument. Unfilled
+    /// slots become residual `Fun` parameters (in declaration order).
+    fn apply_partial_with_mask(
+        &mut self,
+        fun_ty: &Ty,
+        filled: &[(usize, Ty)],
+        range: &Range<usize>,
+    ) -> Ty {
+        let mut params: Vec<Ty> = Vec::new();
+        let mut current = fun_ty.clone();
+        loop {
+            let pruned = apply_ty_prune(&self.subst, &current);
+            match pruned {
+                Ty::Forall { .. } => {
+                    let (body, _) = self.instantiate_forall_ty(&pruned);
+                    current = body;
+                }
+                Ty::Fun(param, ret) => {
+                    params.push(*param);
+                    current = *ret;
+                }
+                other => {
+                    current = other;
+                    break;
+                }
+            }
+        }
+        let mut residual: Vec<Ty> = Vec::new();
+        for (i, param) in params.iter().enumerate() {
+            if let Some((_, arg_ty)) = filled.iter().find(|(s, _)| *s == i) {
+                self.unify(param, arg_ty, range, "function argument");
+            } else {
+                residual.push(param.clone());
+            }
+        }
+        let mut out = current;
+        for p in residual.into_iter().rev() {
+            out = Ty::Fun(Box::new(p), Box::new(out));
+        }
+        out
+    }
+
+    /// True when `mask` fills exactly the first `n` bits (positional prefix).
+    fn is_prefix_fill_mask(mask: u32, n_filled: u32) -> bool {
+        n_filled > 0 && mask == (1u32 << n_filled).wrapping_sub(1)
     }
 
     /// Apply a C-varargs extern call: unify the fixed prefix, accept extra
@@ -8010,6 +8188,11 @@ impl Checker {
         self.selected_overloads_by_span.get(&(start, end)).copied()
     }
 
+    /// Fill bitmask for a partial-application call site, if any.
+    pub fn partial_fill_at(&self, start: usize, end: usize) -> Option<u32> {
+        self.partial_fills_by_span.get(&(start, end)).copied()
+    }
+
     /// Infer call arguments, reordering named args and packing rest.
     ///
     /// When any argument is [`Expression::NamedArg`], every fixed
@@ -8218,15 +8401,21 @@ impl Checker {
 
         let mut tys = Vec::with_capacity(fixed_count + usize::from(pack_rest));
         let mut exprs = Vec::with_capacity(fixed_count + usize::from(pack_rest));
+        let mut fill_mask: u32 = 0;
+        let mut filled_slots: Vec<(usize, Ty)> = Vec::new();
+        let mut saw_hole = false;
         for (i, slot) in slots.into_iter().enumerate() {
             match slot {
                 Some((ty, expr)) => {
+                    filled_slots.push((i, ty.clone()));
                     tys.push(ty);
                     exprs.push(expr);
+                    fill_mask |= 1u32 << i;
                 }
                 None => {
-                    if has_named || pack_rest {
-                        let mut msg = Message::error(
+                    saw_hole = true;
+                    if pack_rest && !has_named {
+                        let msg = Message::error(
                             ErrorCode::MissingField,
                             format!(
                                 "Missing argument `{}` in call to `{}`",
@@ -8234,12 +8423,6 @@ impl Checker {
                             ),
                             range.clone(),
                         );
-                        if has_named {
-                            msg.with_help(
-                                "when any argument is named, all fixed parameters must be supplied"
-                                    .to_string(),
-                            );
-                        }
                         self.messages.push(msg);
                         tys.push(Ty::Var(self.counter.fresh()));
                         if let Some(a) = args.first() {
@@ -8248,13 +8431,25 @@ impl Checker {
                                 _ => a.clone(),
                             });
                         }
+                    } else if has_named {
+                        // Named under-apply: leave a hole (partial).
                     } else {
-                        // Partial application — stop before first hole.
+                        // Positional-only partial — stop before first hole.
                         break;
                     }
                 }
             }
         }
+
+        // Record fill mask whenever the call under-applied fixed params.
+        let fixed_filled = fill_mask.count_ones() as usize;
+        if fixed_filled < fixed_count && (has_named || !pack_rest) {
+            self.partial_fills_by_span
+                .insert((range.start, range.end), fill_mask);
+            self.partial_filled_tys_by_span
+                .insert((range.start, range.end), filled_slots);
+        }
+        let _ = saw_hole; // used for clarity in the None branch
 
         if pack_rest {
             let mut elem_ty: Option<Ty> = None;
@@ -8688,6 +8883,10 @@ impl Checker {
             }
 
             Expression::Function { args, body, .. } => {
+                self.pre_register_enums_walk(args, errors);
+                self.pre_register_enums_walk(body, errors);
+            }
+            Expression::Lambda { args, body, .. } => {
                 self.pre_register_enums_walk(args, errors);
                 self.pre_register_enums_walk(body, errors);
             }

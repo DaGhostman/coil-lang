@@ -494,6 +494,49 @@ fn next_available_slot(match_bindings: &HashMap<usize, HashMap<String, u32>>, ba
     max_slot + 1
 }
 
+/// Bytecode table key for an arity overload: `name#2` or `name#rest1`.
+fn overload_fn_key(name: &str, fixed_arity: usize, is_rest: bool) -> String {
+    if is_rest {
+        format!("{name}#rest{fixed_arity}")
+    } else {
+        format!("{name}#{fixed_arity}")
+    }
+}
+
+/// Strip `#N` / `#restN` suffix from an overload table key.
+fn strip_overload_key(name: &str) -> &str {
+    match name.rfind('#') {
+        Some(i) => &name[..i],
+        None => name,
+    }
+}
+
+/// `MakeFn` operand: `[7:0]=n_cap [15:8]=n_filled [23:16]=arity [24]=is_rest`.
+fn make_fn_operand(n_cap: u32, n_filled: u32, arity: u32, is_rest: bool) -> u32 {
+    n_cap | (n_filled << 8) | (arity << 16) | if is_rest { 1 << 24 } else { 0 }
+}
+
+/// Fixed-arity / rest flag from a function's `Argument` fragment.
+fn fn_arity_from_args(args: &Output<'_>) -> (usize, bool) {
+    match args.1.as_ref() {
+        Expression::Fragment(children) => {
+            let has_rest = children.last().is_some_and(|c| {
+                matches!(c.1.as_ref(), Expression::Argument(_, _, true))
+            });
+            let n = children
+                .iter()
+                .filter(|c| matches!(c.1.as_ref(), Expression::Argument(..)))
+                .count();
+            if has_rest {
+                (n.saturating_sub(1), true)
+            } else {
+                (n, false)
+            }
+        }
+        _ => (0, false),
+    }
+}
+
 #[derive(Default, Clone)]
 struct Context {
     current: Option<String>,
@@ -4243,8 +4286,13 @@ impl Compiler {
                     .entry(self.namespace.clone())
                     .or_default()
                     .push(name.to_string());
-                self.functions
-                    .insert(qualified.clone(), self.bytecode.len());
+                let (fixed_arity, has_rest) = fn_arity_from_args(args);
+                let table_key = if self.checker.is_overloaded(name) {
+                    overload_fn_key(&qualified, fixed_arity, has_rest)
+                } else {
+                    qualified.clone()
+                };
+                self.functions.insert(table_key, self.bytecode.len());
                 if *is_coro {
                     self.coroutine_fns.insert(qualified.clone());
                 }
@@ -4317,6 +4365,92 @@ impl Compiler {
                     args,
                     body,
                     name,
+                );
+            }
+            Expression::Lambda {
+                args,
+                captures,
+                body,
+            } => {
+                // Layout in self.bytecode:
+                //   JMP after_body
+                //   entry: <captures slots 0..n> <params> <body> RETURN
+                //   after_body: LOAD captures...; CONST 0; CodePtr entry; MakeFn
+                use crate::block_builder::{BlockBuilder, JumpKind};
+                let mut bb = BlockBuilder::new();
+                let after = bb.fresh_label();
+                bb.emit_jump_to(after, JumpKind::Unconditional, &mut self.bytecode);
+                let entry = self.bytecode.len() as u32;
+
+                let prev_fn_vars = std::mem::take(&mut self.context.variables);
+                for cap in captures {
+                    self.context.variables.intern((*cap).to_string());
+                }
+                let mut a = self.do_compile(args);
+                self.bytecode.append(&mut a);
+                let (arity, is_rest) = fn_arity_from_args(args);
+                let mut b = self.do_compile(body);
+                self.bytecode.append(&mut b);
+                // Expression-bodied lambdas (`=> x + y` / `{ …; last }`) leave
+                // the result on the stack — emit a bare RETURN. Pushing
+                // `CONST 0; RETURN` (named-fn fall-through) would discard that
+                // value; peephole then fuses it to `ConstReturnImm` and every
+                // call returns 0.
+                if !matches!(
+                    self.bytecode.last().map(|b| b.bytecode()),
+                    Some(Instruction::RETURN)
+                ) {
+                    let body_empty = matches!(
+                        body.1.as_ref(),
+                        Expression::Block(items) if items.is_empty()
+                    );
+                    if body_empty {
+                        self.bytecode.push(Byte::new_with_value(
+                            Instruction::CONST,
+                            Value::default().raw() as _,
+                        ));
+                    }
+                    self.bytecode.push(Byte::new(Instruction::RETURN));
+                }
+                self.context.variables = prev_fn_vars;
+
+                bb.bind_label(
+                    after,
+                    self.bytecode.len() as u32,
+                    &mut self.bytecode,
+                    &mut self.constants,
+                );
+                let _ = bb.finalize();
+
+                for cap in captures {
+                    if let Some(slot) = self.lookup_slot(cap) {
+                        self.bytecode
+                            .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                    } else {
+                        let mut message = Message::error(
+                            ErrorCode::UnknownValue,
+                            format!("Cannot find capture `{}`", cap),
+                            span.into_range(),
+                        );
+                        message.push(DiagLabel::new(
+                            format!("`{}` must be in scope at the lambda", cap),
+                            span.into_range(),
+                        ));
+                        self.messages.push(message);
+                    }
+                }
+                self.bytecode
+                    .push(Byte::new(Instruction::CONST).with_const_inline(0));
+                self.bytecode.push(
+                    Byte::new(Instruction::CodePtr).with_operand_u32(entry),
+                );
+                self.bytecode.push(
+                    Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
+                        captures.len() as u32,
+                        0,
+                        arity as u32,
+                        is_rest,
+                    )),
                 );
             }
             Expression::Expr(child) | Expression::Statement(child) => {
@@ -5068,10 +5202,37 @@ impl Compiler {
                         n
                     } else if !self.namespace.is_empty() {
                         let qualified = format!("{}::{}", self.namespace, n);
-                        if self.functions.contains_key(&qualified) {
+                        if self.functions.contains_key(&qualified)
+                            || self
+                                .checker
+                                .selected_overload_at(span.start, span.end)
+                                .is_some()
+                        {
                             qualified
                         } else {
                             n
+                        }
+                    } else {
+                        n
+                    };
+
+                    // Arity-overload table key (when the typechecker selected one).
+                    let n = if let Some((fa, is_rest)) = self
+                        .checker
+                        .selected_overload_at(span.start, span.end)
+                    {
+                        let keyed = overload_fn_key(&n, fa, is_rest);
+                        if self.functions.contains_key(&keyed) {
+                            keyed
+                        } else {
+                            // Try bare-name key when FQN wasn't used at registration.
+                            let simple = n.rsplit("::").next().unwrap_or(&n);
+                            let keyed_simple = overload_fn_key(simple, fa, is_rest);
+                            if self.functions.contains_key(&keyed_simple) {
+                                keyed_simple
+                            } else {
+                                n
+                            }
                         }
                     } else {
                         n
@@ -5150,12 +5311,67 @@ impl Compiler {
                     } else if let Some(offset) = self.functions.get(&n).copied() {
                         let mono_offset = self.mono_call_offset(&n, args.as_ref());
                         let target_offset = mono_offset.unwrap_or(offset);
-                        // If the callee is a generic function, box each concrete arg
-                        // at the call boundary (concrete→generic).
-                        let is_generic = self.checker.is_generic_fn(&n) && mono_offset.is_none();
+                        let lookup_name = strip_overload_key(&n).to_string();
+                        let is_generic =
+                            self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
                         let arg_slice = args.as_deref().unwrap_or(&[]);
+
+                        // Partial application → MakeFn (not CALL).
+                        let (fa, is_rest) = self
+                            .checker
+                            .selected_overload_at(span.start, span.end)
+                            .or_else(|| {
+                                let names = self.checker.fn_param_names(&lookup_name)?;
+                                let rest = self.checker.fn_has_rest(&lookup_name);
+                                let fixed = if rest {
+                                    names.len().saturating_sub(1)
+                                } else {
+                                    names.len()
+                                };
+                                Some((fixed, rest))
+                            })
+                            .unwrap_or((0, false));
+                        let fill_mask = self.checker.partial_fill_at(span.start, span.end).or_else(
+                            || {
+                                let argc = arg_slice.len();
+                                if !is_rest && fa > 0 && argc < fa {
+                                    Some((1u32 << argc).wrapping_sub(1))
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+                        if let Some(mask) = fill_mask {
+                            // Emit filled values in declaration order (already
+                            // the order of `arg_slice` after named reorder at TC).
+                            for arg in arg_slice {
+                                let value = match arg.1.as_ref() {
+                                    Expression::NamedArg(_, v) => v,
+                                    _ => arg,
+                                };
+                                bytecode.append(&mut self.do_compile(value));
+                            }
+                            let n_filled = mask.count_ones();
+                            bytecode.push(
+                                Byte::new(Instruction::CONST).with_const_inline(mask as i32),
+                            );
+                            bytecode.push(
+                                Byte::new(Instruction::CodePtr)
+                                    .with_operand_u32(target_offset as u32),
+                            );
+                            bytecode.push(
+                                Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
+                                    0,
+                                    n_filled,
+                                    fa as u32,
+                                    is_rest,
+                                )),
+                            );
+                            return bytecode;
+                        }
+
                         let value_arity = self.emit_call_args_with_rest(
-                            &n,
+                            &lookup_name,
                             arg_slice,
                             &mut bytecode,
                             is_generic,
@@ -5171,7 +5387,7 @@ impl Compiler {
                         // this path.
                         let dict_count = if is_generic {
                             let (fixed, rest, pack_rest) =
-                                self.split_call_args_for_rest(&n, arg_slice);
+                                self.split_call_args_for_rest(&lookup_name, arg_slice);
                             let mut call_arg_tys: Vec<crate::typechecking::Ty> = fixed
                                 .iter()
                                 .map(|arg| {
@@ -5208,7 +5424,7 @@ impl Compiler {
                             forwarded
                                 + Self::emit_call_site_dicts(
                                     &mut bytecode,
-                                    &n,
+                                    &lookup_name,
                                     &call_arg_tys,
                                     call_ret_ty.as_ref(),
                                     &self.checker,
@@ -5219,9 +5435,11 @@ impl Compiler {
                         };
 
                         let arity = value_arity + dict_count as u32;
-                        if is_instance_method_fqn(&self.checker, &n) {
+                        if is_instance_method_fqn(&self.checker, &lookup_name) {
                             Self::emit_call_indirect(&mut bytecode, target_offset as u32, arity);
-                        } else if self.coroutine_fns.contains(&n) {
+                        } else if self.coroutine_fns.contains(&lookup_name)
+                            || self.coroutine_fns.contains(&n)
+                        {
                             bytecode.push(
                                 Byte::new(Instruction::MakeCoro)
                                     .with_call_packed(arity, target_offset as u32),
@@ -5238,7 +5456,7 @@ impl Compiler {
                         // (`id<T>(T) -> T`). Nested params (`F<A> -> A`) are
                         // not boxed at construction, so unboxing would zero
                         // a valid immediate (Phase 5 HKT / Container::first).
-                        if is_generic && self.generic_return_is_boxed(&n) {
+                        if is_generic && self.generic_return_is_boxed(&lookup_name) {
                             if let Some(call_ty) = self.codegen_expr_ty(ast) {
                                 Self::emit_unbox_if_needed(&mut bytecode, &call_ty);
                             }
@@ -5251,18 +5469,21 @@ impl Compiler {
                         let value_arity =
                             args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
                         let mut arg_tys = Vec::new();
+                        let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
                         if let Some(arg_list) = args {
                             for arg in arg_list {
                                 self.append_with_existential_pack(&mut bytecode, arg);
-                                // Box concrete args when delegating through a polyfn.
-                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                    arg_tys.push(arg_ty);
+                                // Box concrete args only when delegating through a
+                                // PolyFn — ObjFn / mono partials take raw values.
+                                if polyfn_source.is_some() {
+                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                        arg_tys.push(arg_ty);
+                                    }
                                 }
                             }
                         }
                         let mut dict_count = 0u32;
-                        let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
                         if let Some(source) = polyfn_source.as_ref() {
                             if let Some(indices) = self_id
                                 .and_then(|id| self.checker.forwarded_dicts_at(id))
@@ -5487,16 +5708,72 @@ impl Compiler {
                             self.messages.push(message);
                         }
                     } else {
-                        let mut message = Message::error(
-                            ErrorCode::UnknownValue,
-                            "Unknown variable".to_string(),
-                            span.into_range(),
-                        );
-                        message.push(DiagLabel::new(
-                            format!("Unknown variable '{}'", n),
-                            span.into_range(),
-                        ));
-                        self.messages.push(message);
+                        // Monomorphic function in value position → MakeFn.
+                        let (fa, is_rest, entry_key) = if let Some((fa, is_rest)) =
+                            self.checker.selected_overload_at(span.start, span.end)
+                        {
+                            let keyed = overload_fn_key(&resolved_n, fa, is_rest);
+                            (fa, is_rest, keyed)
+                        } else if self.checker.is_overloaded(&resolved_n) {
+                            // Ambiguous — typechecker should have diagnosed.
+                            let mut message = Message::error(
+                                ErrorCode::UnknownValue,
+                                "Ambiguous overload in value position".to_string(),
+                                span.into_range(),
+                            );
+                            message.push(DiagLabel::new(
+                                format!("Cannot reify overloaded `{}` without a type annotation", n),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
+                            return bytecode;
+                        } else {
+                            let rest = self.checker.fn_has_rest(&resolved_n);
+                            let fa = self
+                                .checker
+                                .fn_param_names(&resolved_n)
+                                .map(|names| {
+                                    if rest {
+                                        names.len().saturating_sub(1)
+                                    } else {
+                                        names.len()
+                                    }
+                                })
+                                .unwrap_or(0);
+                            (fa, rest, resolved_n.clone())
+                        };
+                        if let Some(&entry_offset) = self
+                            .functions
+                            .get(&entry_key)
+                            .or_else(|| self.functions.get(&resolved_n))
+                        {
+                            bytecode.push(
+                                Byte::new(Instruction::CONST).with_const_inline(0),
+                            );
+                            bytecode.push(
+                                Byte::new(Instruction::CodePtr)
+                                    .with_operand_u32(entry_offset as u32),
+                            );
+                            bytecode.push(
+                                Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
+                                    0,
+                                    0,
+                                    fa as u32,
+                                    is_rest,
+                                )),
+                            );
+                        } else {
+                            let mut message = Message::error(
+                                ErrorCode::UnknownValue,
+                                "Unknown variable".to_string(),
+                                span.into_range(),
+                            );
+                            message.push(DiagLabel::new(
+                                format!("Unknown variable '{}'", n),
+                                span.into_range(),
+                            ));
+                            self.messages.push(message);
+                        }
                     }
                 }
             }
@@ -10591,5 +10868,6 @@ fn main() {
             "expected ≥3 StorePop (tmp + a + b); got {store_pop_count}"
         );
     }
+
 
 }

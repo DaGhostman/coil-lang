@@ -628,6 +628,10 @@ where
             }
             f(body);
         }
+        Expression::Lambda { args, body, .. } => {
+            f(args);
+            f(body);
+        }
         Expression::TestCase { name, body } => {
             f(name);
             f(body);

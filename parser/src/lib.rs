@@ -377,6 +377,8 @@ impl<'pratt> Pratt<'pratt> {
                         )
                     })
                     .labelled("new"),
+                // Anonymous `fn (…)` before `ident` so `fn` stays a keyword.
+                self.lambda_atom(expr.clone()),
                 self.ident(),
             ));
 
@@ -676,6 +678,67 @@ impl<'pratt> Pratt<'pratt> {
             .collect::<Vec<_>>()
             .map_with(output!(Fragment))
             .delimited_by(op!("("), op!(")"))
+    }
+
+    /// Anonymous lambda: `fn (T x) use (y) => expr` or `fn (T x) { expr; … }`.
+    ///
+    /// Distinct from named `fn name(…)` declarations (`func`): this form has
+    /// no name between `fn` and `(`. Optional `use (id, …)` after the param
+    /// list lists explicit captures (same `use` keyword as module imports;
+    /// disambiguated by position after `fn (…)`).
+    ///
+    /// Long-form bodies are a brace-delimited sequence of expressions (not
+    /// full `statement()`s) so this atom can live inside `expr()` without
+    /// re-entering `statement()` → `expr()` during parser construction.
+    fn lambda_atom<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let captures = keyword!("use")
+            .ignore_then(
+                text::ident()
+                    .padded()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!("("), op!(")")),
+            )
+            .or_not()
+            .map(|opt| opt.unwrap_or_default());
+
+        let short_body = op!("=>").ignore_then(expr.clone());
+        // Brace body built from the same recursive `expr` — do NOT call
+        // `self.statement()` here (that would re-enter `expr()` while the
+        // outer `recursive(|expr| …)` is still being constructed → stack
+        // overflow at parser build / first parse).
+        let long_body = expr
+            .clone()
+            .then_ignore(op!(';').or_not())
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(op!("{"), op!("}"))
+            .map_with(|children, e| (e.span(), Box::new(Expression::Block(children))));
+
+        keyword!("fn")
+            .ignore_then(self.arg_list())
+            .then(captures)
+            .then(choice((short_body, long_body)))
+            .map_with(|((args, captures), body), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Lambda {
+                        args,
+                        captures,
+                        body,
+                    }),
+                )
+            })
+            .labelled("lambda")
     }
 
     /// Parse one `where` constraint: `Convert<A, B>` or unary `Num<T>`.
