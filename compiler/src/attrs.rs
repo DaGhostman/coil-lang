@@ -261,7 +261,8 @@ fn validate_attr_protocol(args: &Output, span: SimpleSpan) -> Result<(), Message
         ));
     }
     let last_rest = params.last().map(|(_, _, r)| *r).unwrap_or(false);
-    if !last_rest {
+    let last_name = params.last().map(|(_, n, _)| *n).unwrap_or("");
+    if !last_rest || last_name != "args" {
         return Err(Message::error(
             ErrorCode::GenericTypeError,
             "Attribute declaration must end with a bare `...args` tuple-rest parameter".to_string(),
@@ -328,10 +329,21 @@ fn resolve_attr_extras<'a>(
             }
         }
         AttrArgs::Positional(lits) => {
+            if lits.len() > extra_params.len() {
+                messages.push(Message::error(
+                    ErrorCode::GenericTypeError,
+                    format!(
+                        "Too many positional arguments for `#[{}(...)]` (expected {}, got {})",
+                        attr.name,
+                        extra_params.len(),
+                        lits.len()
+                    ),
+                    span.into_range(),
+                ));
+                return None;
+            }
             for (i, lit) in lits.iter().enumerate() {
-                if i < extra_params.len() {
-                    values[i] = Some(attr_literal_expr(span, lit));
-                }
+                values[i] = Some(attr_literal_expr(span, lit));
             }
         }
         AttrArgs::String(s) => {
@@ -1499,23 +1511,17 @@ fn expand_function_user_attrs<'a>(
                 args,
             );
         } else {
-            let params = fn_param_nodes(args);
-            let param_idents: Vec<Output<'a>> = params
-                .iter()
-                .filter(|(_, _, rest)| !*rest)
-                .map(|(_, name, _)| ident(span, name))
-                .collect();
             let inner = at(
                 span,
                 Expression::Lambda {
                     args: args.clone(),
-                    captures: vec![],
+                    captures: collect_lambda_captures(&orig_for_fallback, args),
                     body: orig_for_fallback.clone(),
                 },
             );
             let mut call_args = vec![inner];
             call_args.extend(extras);
-            call_args.extend(param_idents.iter().cloned());
+            call_args.extend(forward_call_args(span, args));
             wrapped = at(
                 span,
                 Expression::Call {

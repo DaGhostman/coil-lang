@@ -7758,7 +7758,7 @@ impl Compiler {
         // ID pre-walk / typecheck (see `attrs::expand_program`).
         let expand = attrs::expand_program(ast);
         self.messages.extend(expand.messages);
-        self.decorated_class_ctors = expand.decorated_class_ctors;
+        self.decorated_class_ctors.extend(expand.decorated_class_ctors);
         let _program_ty = self.checker.check_program(ast);
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the

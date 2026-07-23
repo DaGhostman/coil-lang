@@ -1403,14 +1403,24 @@ fn main() {}
 
 #[test]
 fn ffi_combined_with_test_reports_diagnostic() {
-    let msgs = compile_messages(
-        r#"
+    let mut ast = Pratt::default()
+        .parse(
+            r#"
 #[ffi(lib = "c")]
 #[test]
 fn strlen(string s) -> int;
 fn main() {}
 "#,
-    );
+        )
+        .expect("parse failed");
+    let mut c = compiler::Compiler::default();
+    c.set_include_tests(true);
+    let _ = c.compile("", &mut ast);
+    let msgs: Vec<String> = c
+        .get_messages()
+        .iter()
+        .map(|m| m.message().to_string())
+        .collect();
     assert!(
         msgs.iter()
             .any(|m| m.contains("`#[ffi]` cannot be combined with `#[test]`")),

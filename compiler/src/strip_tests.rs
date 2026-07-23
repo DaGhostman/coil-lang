@@ -15,9 +15,7 @@ pub fn strip_test_declarations(ast: &mut Output<'_>) {
 fn is_test_top_level_decl(node: &Output<'_>) -> bool {
     match node.1.as_ref() {
         Expression::TestCase { .. } => true,
-        Expression::Function { attrs, body, .. } => {
-            body.is_some() && attrs.iter().any(|a| a.name == "test")
-        }
+        Expression::Function { attrs, .. } => attrs.iter().any(|a| a.name == "test"),
         _ => false,
     }
 }
@@ -78,5 +76,24 @@ fn main() { }
             })
             .collect();
         assert_eq!(names, ["log", "keep_me", "main"]);
+    }
+
+    #[test]
+    fn strip_removes_signature_only_test_functions() {
+        let mut ast = Pratt::default()
+            .parse(
+                r#"
+#[test]
+fn sig_only();
+fn main() { }
+"#,
+            )
+            .expect("parse");
+        strip_test_declarations(&mut ast);
+        let Expression::Program(children) = ast.1.as_ref() else {
+            panic!("expected program");
+        };
+        assert_eq!(children.len(), 1);
+        assert!(matches!(children[0].1.as_ref(), Expression::Function { name, .. } if *name == "main"));
     }
 }
