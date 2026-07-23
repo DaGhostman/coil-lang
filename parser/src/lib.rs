@@ -4431,10 +4431,16 @@ mod tests {
             .expect("parse append assignment");
         fn find_append(e: &Expression<'_>) -> bool {
             match e {
-                Expression::Assignment(lhs, _) => matches!(lhs.1.as_ref(), Expression::Index(_, None)),
-                Expression::Fragment(items) | Expression::Block(items) => {
-                    items.iter().any(|i| find_append(i.1.as_ref()))
+                Expression::Assignment(lhs, _) => {
+                    let mut cur = lhs.1.as_ref();
+                    while let Expression::Expr(inner) = cur {
+                        cur = inner.1.as_ref();
+                    }
+                    matches!(cur, Expression::Index(_, None))
                 }
+                Expression::Program(items)
+                | Expression::Fragment(items)
+                | Expression::Block(items) => items.iter().any(|i| find_append(i.1.as_ref())),
                 Expression::Expr(inner)
                 | Expression::Group(inner)
                 | Expression::Statement(inner)
@@ -4451,19 +4457,28 @@ mod tests {
 
     #[test]
     fn parse_readonly_array_literal() {
-        let src = "readonly [1, 2, 3]";
+        let src = "readonly [1, 2, 3];";
         let ast = Pratt::default()
             .parse(src)
             .expect("parse readonly array");
         fn find_readonly_array(e: &Expression<'_>) -> bool {
             match e {
-                Expression::Readonly(inner) => matches!(inner.1.as_ref(), Expression::Array(_)),
-                Expression::Fragment(items) | Expression::Block(items) => {
+                Expression::Readonly(inner) => {
+                    let mut cur = inner.1.as_ref();
+                    while let Expression::Expr(inner) = cur {
+                        cur = inner.1.as_ref();
+                    }
+                    matches!(cur, Expression::Array(_))
+                }
+                Expression::Program(items)
+                | Expression::Fragment(items)
+                | Expression::Block(items) => {
                     items.iter().any(|i| find_readonly_array(i.1.as_ref()))
                 }
-                Expression::Expr(inner) | Expression::Group(inner) => {
-                    find_readonly_array(inner.1.as_ref())
-                }
+                Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::Statement(inner)
+                | Expression::ExprStatement(inner) => find_readonly_array(inner.1.as_ref()),
                 _ => false,
             }
         }
@@ -4476,21 +4491,28 @@ mod tests {
 
     #[test]
     fn parse_readonly_new_and_new_readonly_instantiate() {
-        for src in ["readonly new Point(1, 2)", "new readonly Point(1, 2)"] {
+        for src in ["readonly new Point(1, 2);", "new readonly Point(1, 2);"] {
             let ast = Pratt::default()
                 .parse(src)
                 .unwrap_or_else(|e| panic!("parse `{src}` failed: {e:?}"));
             fn find_readonly_new(e: &Expression<'_>) -> bool {
                 match e {
                     Expression::Readonly(inner) => {
-                        matches!(inner.1.as_ref(), Expression::Instantiate(_, _))
+                        let mut cur = inner.1.as_ref();
+                        while let Expression::Expr(inner) = cur {
+                            cur = inner.1.as_ref();
+                        }
+                        matches!(cur, Expression::Instantiate(_, _))
                     }
-                    Expression::Fragment(items) | Expression::Block(items) => {
+                    Expression::Program(items)
+                    | Expression::Fragment(items)
+                    | Expression::Block(items) => {
                         items.iter().any(|i| find_readonly_new(i.1.as_ref()))
                     }
-                    Expression::Expr(inner) | Expression::Group(inner) => {
-                        find_readonly_new(inner.1.as_ref())
-                    }
+                    Expression::Expr(inner)
+                    | Expression::Group(inner)
+                    | Expression::Statement(inner)
+                    | Expression::ExprStatement(inner) => find_readonly_new(inner.1.as_ref()),
                     _ => false,
                 }
             }
