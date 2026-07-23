@@ -29,6 +29,7 @@ struct CliArgs {
     command: Command,
     log_json: bool,
     log_lsp: bool,
+    include_tests: bool,
 }
 
 fn print_help() {
@@ -48,6 +49,7 @@ fn print_help() {
          \n\
          Options:\n\
          \x20 -o, --output <path>  Output archive for `compile` (default: out.c0s)\n\
+         \x20 --include-tests      Compile harness tests into the archive (default: omit)\n\
          \x20 --fail-fast          With `test`, stop after the first failed case\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
          \x20 --log-lsp            Emit LSP Diagnostic NDJSON on stdout\n\
@@ -61,6 +63,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut log_json = false;
     let mut log_lsp = false;
     let mut fail_fast = false;
+    let mut include_tests = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
 
@@ -71,6 +74,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             "--log-json" => log_json = true,
             "--log-lsp" => log_lsp = true,
             "--fail-fast" => fail_fast = true,
+            "--include-tests" => include_tests = true,
             "-h" | "--help" => {
                 print_help();
                 exit(0);
@@ -89,7 +93,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, -o/--output, or a command/file)");
+                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, -o/--output, or a command/file)");
             }
             _ => positionals.push(arg.clone()),
         }
@@ -102,6 +106,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile`");
             }
+            if include_tests {
+                return Err("--include-tests is only valid with `compile` or the default run mode");
+            }
             Command::Test {
                 path: None,
                 fail_fast,
@@ -110,6 +117,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         [cmd, path] if cmd == "test" => {
             if output.is_some() {
                 return Err("-o/--output is only valid with `compile`");
+            }
+            if include_tests {
+                return Err("--include-tests is only valid with `compile` or the default run mode");
             }
             if path == "compile" || path == "run" || path == "test" {
                 return Err("test path must be a directory");
@@ -162,6 +172,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         command,
         log_json,
         log_lsp,
+        include_tests,
     })
 }
 
@@ -444,6 +455,7 @@ fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<
         } else {
             Pipeline::with_reporter(config.clone(), writer_for(format))
         };
+        pipeline.set_include_tests(true);
 
         // catch_unwind isolates a compiler ICE from aborting the whole
         // harness under panic=unwind. Release builds use panic=abort, so
@@ -610,6 +622,9 @@ fn main() {
         command => {
             let format = config.format;
             let mut pipeline = Pipeline::with_reporter(config, writer_for(format));
+            if cli.include_tests {
+                pipeline.set_include_tests(true);
+            }
             match command {
                 Command::BuildAndRun { filename } => cmd_build_and_run(&mut pipeline, &filename),
                 Command::Compile { filename, output } => {
@@ -745,6 +760,7 @@ mod tests {
         assert!(parse_args(&args(&["run", "a.c0s", "-o", "x"])).is_err());
         assert!(parse_args(&args(&["test", "-o", "x"])).is_err());
         assert!(parse_args(&args(&["examples/fib.0s", "-o", "x"])).is_err());
+        assert!(parse_args(&args(&["test", "--include-tests"])).is_err());
     }
 
     #[test]
@@ -793,6 +809,10 @@ mod tests {
         // Mutual exclusion is enforced later by ReportConfig::from_cli_flags.
         let cli = parse_args(&args(&["--log-json", "--log-lsp", "test"])).unwrap();
         assert!(cli.log_json && cli.log_lsp);
+
+        let cli = parse_args(&args(&["--include-tests", "examples/fib.0s"])).unwrap();
+        assert!(cli.include_tests);
+        assert!(matches!(cli.command, Command::BuildAndRun { .. }));
     }
 
     fn unique_tmp(label: &str) -> PathBuf {
@@ -1002,6 +1022,7 @@ test("still runs") {
 }
 "#;
         let mut pipeline = Pipeline::new();
+        pipeline.set_include_tests(true);
         let (bytecode, constants) = pipeline
             .compile_src(src)
             .expect("multi-case harness source should compile");

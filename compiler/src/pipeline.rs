@@ -69,6 +69,8 @@ pub struct Pipeline {
     /// Parsed-source cache: avoids re-reading files between discovery and compile.
     source_interner: common::Interner<PathBuf>,
     source_cache: Vec<Option<String>>,
+    /// When true, harness tests are compiled into the program (see `--include-tests`).
+    include_tests: bool,
     compiler: Compiler,
     /// Owned diagnostic sink (pretty / SARIF / LSP).
     sink: Box<dyn DiagnosticSink>,
@@ -422,6 +424,7 @@ impl Pipeline {
             entry_file: None,
             source_interner: common::Interner::default(),
             source_cache: Vec::new(),
+            include_tests: false,
             compiler: Compiler::default(),
             sink: create_sink(&config, SourceMap::new(), writer),
             messages_emitted: 0,
@@ -1063,6 +1066,17 @@ impl Pipeline {
     /// Harness test cases from the last compile (`description`, bytecode offset).
     pub fn test_cases(&self) -> &[(String, u32)] {
         self.compiler.test_cases()
+    }
+
+    /// When true, `test("…")` blocks and `#[test]` functions are compiled and
+    /// registered for the harness. Default is false (production builds).
+    pub fn set_include_tests(&mut self, include: bool) {
+        self.include_tests = include;
+        self.compiler.set_include_tests(include);
+    }
+
+    pub fn include_tests(&self) -> bool {
+        self.include_tests
     }
 
     /// Borrow host-registered native function metadata.

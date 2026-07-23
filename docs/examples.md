@@ -491,20 +491,23 @@ fn sum_tree(Tree t) -> int {
 
 ### `examples/derive_show_eq.0s`
 
-**Demonstrates:** Header `derive Show, Eq, Ord` on enums and classes — structural `%v`, `==`, and `<` without hand-written `impl`s.
+**Demonstrates:** `#[derive(Show, Eq, Ord)]` on enums and classes — structural `%v`, `==`, and `<` without hand-written `impl`s.
 
 ```0s
-enum Color derive Show, Eq, Ord {
+#[derive(Show, Eq, Ord)]
+enum Color {
     Red,
     Blue,
 }
 
-enum Point derive Show, Eq {
+#[derive(Show, Eq)]
+enum Point {
     Origin,
     Point { x: int, y: int },
 }
 
-class Cell derive Show, Eq {
+#[derive(Show, Eq)]
+class Cell {
     value: int,
 }
 ```
@@ -513,6 +516,71 @@ class Cell derive Show, Eq {
 |---|---|
 | **Run** | `cargo run -- examples/derive_show_eq.0s` |
 | **Output** | `Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false` |
+
+---
+
+### `examples/attr_ffi.0s`
+
+**Demonstrates:** `#[ffi(lib = "c")]` attribute sugar for a single libc binding (equivalent to an `extern` block entry).
+
+```0s
+#[ffi(lib = "c")]
+fn strlen(string s) -> int;
+
+fn main() {
+    let n = strlen("hello");
+    print "%i", n;
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/attr_ffi.0s` |
+| **Output** | `5` |
+| **Requires** | Platform C library via `lib = "c"` |
+
+---
+
+### `examples/spread.0s`
+
+**Demonstrates:** Call-site spread for tuples and arrays.
+
+```0s
+fn pair_sum(int a, int b) -> int { return a + b; }
+fn triple_sum(int a, int b, int c) -> int { return a + b + c; }
+
+fn main() {
+    print "%i", pair_sum(...(1, 2));
+    print "%i", triple_sum(...[10, 20, 30]);
+}
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/spread.0s` |
+| **Output** | `360` |
+
+---
+
+### `examples/attr_decorator.0s`
+
+**Demonstrates:** User-defined `attr` decorators with argument forwarding and stacked wrappers.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/attr_decorator.0s` |
+| **Output** | `enterdo_thinghi42` |
+
+---
+
+### `examples/attr_class.0s`
+
+**Demonstrates:** Class-level `#[attr(...)]` wrapping `new Point(...)` construction.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/attr_class.0s` |
+| **Output** | `Point ctor512` |
 
 ---
 

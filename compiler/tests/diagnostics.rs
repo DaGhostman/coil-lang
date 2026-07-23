@@ -1175,7 +1175,7 @@ fn compile_messages(src: &str) -> Vec<String> {
 
 #[test]
 fn derive_unknown_trait_reports_diagnostic() {
-    let msgs = compile_messages("enum Color derive Clone { Red } fn main() {}");
+    let msgs = compile_messages("#[derive(Clone)] enum Color { Red } fn main() {}");
     assert!(
         msgs.iter()
             .any(|m| m.contains("Cannot derive unknown or non-derivable trait `Clone`")),
@@ -1186,7 +1186,7 @@ fn derive_unknown_trait_reports_diagnostic() {
 
 #[test]
 fn derive_non_derivable_trait_reports_diagnostic() {
-    let msgs = compile_messages("enum Color derive Num { Red } fn main() {}");
+    let msgs = compile_messages("#[derive(Num)] enum Color { Red } fn main() {}");
     assert!(
         msgs.iter()
             .any(|m| m.contains("Cannot derive unknown or non-derivable trait `Num`")),
@@ -1197,7 +1197,7 @@ fn derive_non_derivable_trait_reports_diagnostic() {
 
 #[test]
 fn derive_generic_enum_reports_diagnostic() {
-    let msgs = compile_messages("enum Box<T> derive Show { Box(T) } fn main() {}");
+    let msgs = compile_messages("#[derive(Show)] enum Box<T> { Box(T) } fn main() {}");
     assert!(
         msgs.iter().any(|m| {
             m.contains("Cannot derive traits for generic enum `Box`")
@@ -1210,13 +1210,221 @@ fn derive_generic_enum_reports_diagnostic() {
 
 #[test]
 fn derive_generic_class_reports_diagnostic() {
-    let msgs = compile_messages("class Cell<T> derive Eq { value: T } fn main() {}");
+    let msgs = compile_messages("#[derive(Eq)] class Cell<T> { value: T } fn main() {}");
     assert!(
         msgs.iter().any(|m| {
             m.contains("Cannot derive traits for generic class `Cell`")
                 && m.contains("write an explicit `impl`")
         }),
         "expected generic-class derive diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn unknown_attribute_reports_diagnostic() {
+    let msgs = compile_messages("#[bench] fn foo() { } fn main() {}");
+    assert!(
+        msgs.iter().any(|m| m.contains("Unknown attribute `bench`")),
+        "expected unknown attribute diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn ffi_attr_with_body_reports_diagnostic() {
+    let msgs = compile_messages(
+        "#[ffi(lib = \"c\")] fn strlen(string s) -> int { return 0; } fn main() {}",
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("requires a signature-only function")),
+        "expected ffi-with-body diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn signature_only_without_ffi_reports_diagnostic() {
+    let msgs = compile_messages("fn foo() -> int; fn main() {}");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Signature-only function requires `#[ffi(...)]`")),
+        "expected signature-only diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn test_attr_on_enum_reports_diagnostic() {
+    let msgs = compile_messages("#[test] enum E { A } fn main() {}");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Attribute `test` is not valid on enum")),
+        "expected test-on-enum diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn user_attr_on_ffi_fn_reports_diagnostic() {
+    let msgs = compile_messages(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    return target(...args);
+}
+#[log(message = "x")]
+#[ffi(lib = "c")]
+fn strlen(string s) -> int;
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("User-defined attribute `log` cannot be applied to FFI functions")
+        }),
+        "expected user-attr-on-ffi diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn spread_non_aggregate_reports_diagnostic() {
+    let msgs = check_messages(
+        r#"
+fn f(int x) -> int { return x; }
+fn main() {
+    let n = 5;
+    f(...n);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.message().contains("cannot spread")),
+        "expected cannot-spread diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn attr_missing_trailing_rest_reports_diagnostic() {
+    let msgs = compile_messages(
+        r#"
+attr bad<T>(fn(...args) -> T target, string message) -> T {
+    return target(...args);
+}
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("bare `...args`")),
+        "expected missing tuple-rest diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn spread_dynamic_array_reports_diagnostic() {
+    let msgs = check_messages(
+        r#"
+fn f(int x) -> int { return x; }
+fn main() {
+    let a: [int] = [1, 2, 3];
+    f(...a);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.message().contains("cannot spread dynamic-length array")),
+        "expected dynamic-array spread diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn attr_missing_extra_argument_reports_diagnostic() {
+    let msgs = compile_messages(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    return target(...args);
+}
+#[log]
+fn do_thing() -> int { return 1; }
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Missing argument `message` for `#[log(...)]`")),
+        "expected missing attr-extra diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn attr_unknown_key_reports_diagnostic() {
+    let msgs = compile_messages(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    return target(...args);
+}
+#[log(foo = "x")]
+fn do_thing() -> int { return 1; }
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("Unknown key `foo` in `#[log(...)]`")),
+        "expected unknown attr-key diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn attr_too_few_params_reports_diagnostic() {
+    let msgs = compile_messages(
+        r#"
+attr bad<T>(fn(...args) -> T target) -> T {
+    return target(...args);
+}
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.contains("Attribute declaration requires at least `target` and trailing `...args`")
+        }),
+        "expected attr-too-few-params diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn ffi_combined_with_test_reports_diagnostic() {
+    let mut ast = Pratt::default()
+        .parse(
+            r#"
+#[ffi(lib = "c")]
+#[test]
+fn strlen(string s) -> int;
+fn main() {}
+"#,
+        )
+        .expect("parse failed");
+    let mut c = compiler::Compiler::default();
+    c.set_include_tests(true);
+    let _ = c.compile("", &mut ast);
+    let msgs: Vec<String> = c
+        .get_messages()
+        .iter()
+        .map(|m| m.message().to_string())
+        .collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`#[ffi]` cannot be combined with `#[test]`")),
+        "expected ffi+test combination diagnostic, got: {:?}",
         msgs
     );
 }

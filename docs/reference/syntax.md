@@ -15,6 +15,60 @@ Programs are sequences of **declarations** and **statements**. Most top-level it
 
 ---
 
+## Attributes
+
+Rust-style attributes attach metadata to top-level `fn`, `enum`, and `class` declarations (and to methods inside `impl` blocks):
+
+```
+attr_list   ::= ('#[' attribute ']')*
+attribute   ::= ident
+              | ident '(' ident (',' ident)* ')'
+              | ident '(' kv (',' kv)* ')'
+              | ident '(' literal (',' (literal | kv))* ')'
+              | ident '(' string ')'
+kv          ::= ident '=' (string | int | float | 'true' | 'false')
+literal     ::= string | int | float | 'true' | 'false'
+```
+
+Examples:
+
+```0s
+#[derive(Show, Eq, Ord)]
+enum Color { Red, Blue }
+
+#[test]
+fn add_works() {
+    assert(1 + 1 == 2)?;
+}
+
+#[ffi(lib = "c", name = "strlen")]
+fn strlen(string s) -> int;
+
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    print "%s", message;
+    return target(...args);
+}
+
+#[log(message = "enter")]
+fn do_work(int x) -> int { return x; }
+
+#[log(message = "Point ctor")]
+class Point { x: int, y: int }
+```
+
+| Attribute | Target | Semantics |
+|-----------|--------|-----------|
+| `#[derive(Trait, …)]` | `enum` / `class` | Synthesizes builtin trait instances (`Show`, `Eq`, `Ord`) |
+| `#[test]` / `#[test("desc")]` | `fn` with body | Registers a `zero-script test` harness case (Result mode) |
+| `#[ffi(lib = "…", name = "…", variadic = true)]` | signature-only `fn …;` | Desugars to compile-time `extern` lowering |
+| User `attr` names | `fn`, methods, `class` | Expands to a wrapper that receives the decoratee callable, attribute extras, and forwarded call arguments (`...args`); class attrs wrap the constructor |
+
+User-defined attributes must end with a bare tuple-rest parameter `...args` and call `target(...args)` to forward runtime arguments. Stacking order is Python-style: the first listed attribute is outermost. User attrs cannot be applied to FFI bindings.
+
+Multiple attributes stack (e.g. `#[derive(Show)] #[derive(Eq)]`). Unknown attribute names are rejected at compile time.
+
+---
+
 ## Lexical structure
 
 | Element | Rules |
@@ -46,6 +100,7 @@ Top-level forms (order in parser `choice`):
 declaration ::= class_decl
               | impl_decl
               | function_decl
+              | attr_decl
               | type_alias
               | use_stmt
               | mod_stmt
@@ -58,8 +113,8 @@ declaration ::= class_decl
 ### Functions
 
 ```
-function_decl ::= 'async'? 'fn' IDENT type_param_list? arg_list
-                  ('->' type_annotation)? where_clause? block
+function_decl ::= attr_list? 'async'? 'fn' IDENT type_param_list? arg_list
+                  ('->' type_annotation)? where_clause? (block | ';')
 type_param_list ::= '<' type_param (',' type_param)* '>'
 type_param      ::= IDENT (':' (kind | class_bound ('+' class_bound)*))?
 kind            ::= '*' | 'Constraint' | kind '->' kind | '(' kind ')'
@@ -67,7 +122,18 @@ class_bound     ::= IDENT
 where_clause    ::= 'where' where_constraint (',' where_constraint)*
 where_constraint ::= IDENT '<' type_annotation (',' type_annotation)* '>'
 arg_list      ::= '(' (arg (',' arg)*)? ')'
-arg           ::= type_annotation '...'? IDENT   // trailing `T... name` is rest → `[T]`
+arg           ::= type_annotation '...'? IDENT   // `T... name` → `[T]`; bare `... name` → tuple pack
+```
+
+### Attribute declarations
+
+```
+attr_decl   ::= 'attr' IDENT type_param_list? '(' attr_param (',' attr_param)* ')'
+                ('->' type_annotation)? where_clause? block
+attr_param  ::= type_fn_sig IDENT          // first param: `fn(...args) -> T target`
+              | type_annotation IDENT      // middle extras: `string message`, …
+              | '...' IDENT                // trailing tuple-rest: forwarded call args
+type_fn_sig ::= 'fn' '(' '...' IDENT ')' '->' type_annotation
 ```
 
 Arity overloads (same name, different arities / rest ranges), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.0s`, `fn_value.0s`, and `lambda.0s`.
@@ -75,10 +141,32 @@ Arity overloads (same name, different arities / rest ranges), first-class monomo
 
 Call sites may use named arguments (`name: expr`) after any positional
 prefix. Rest parameters are positional-only and pack trailing values
-into one array (including empty). Call-site spread (`f(...xs)`) is not
-supported yet.
+into one array (`T... xs` → `[T]`) or tuple (`... xs` → `(T1, …, Tn)`).
+Call-site spread forwards packed values as separate arguments:
+
+```
+call        ::= callee '(' (call_arg (',' call_arg)*)? ')'
+call_arg    ::= expr | '...' expr
+```
+
+| Spread operand type | Semantics |
+|---------------------|-----------|
+| Tuple `(T1, …, Tn)` | Each element becomes one argument |
+| Fixed array `[T; N]` | Each element becomes one argument |
+| Dynamic `[T]` | Compile error (use tuple or `[T; N]`) |
+| Other | Compile error |
 
 Examples:
+
+```0s
+fn triple(int a, int b, int c) -> int { return a + b + c; }
+triple(...(1, 2, 3));          // tuple spread
+triple(...[10, 20, 30]);       // array spread
+
+attr wrap<T>(fn(...args) -> T target, ...args) -> T {
+    return target(...args);
+}
+```
 
 ```0s
 fn add(int a, int b) -> int { return a + b; }
@@ -88,6 +176,10 @@ fn greet() { print "hi"; }
 fn sum(int... xs) -> int { return len(xs); }
 sum(1, 2, 3);   // xs == [1, 2, 3]
 sum();          // xs == []
+
+// Signature-only FFI declaration (requires #[ffi(...)]):
+#[ffi(lib = "c")]
+fn strlen(string s) -> int;
 ```
 
 ### Traits and impl
@@ -172,19 +264,19 @@ record_payload  ::= '{' field_decl (',' field_decl)* '}'
 field_decl      ::= IDENT ':' type
 ```
 
-Grammar (with optional derive):
+Grammar (with optional derive attribute):
 
 ```
-enum_decl ::= 'enum' IDENT type_param_list? derive_clause? '{' variant (',' variant)* ','? '}'
-derive_clause ::= 'derive' IDENT (',' IDENT)*
+enum_decl ::= attr_list? 'enum' IDENT type_param_list? '{' variant (',' variant)* ','? '}'
 ```
 
-Examples:
+Example:
 
 ```0s
 enum Tree { Leaf, Node(int, Tree, Tree) }
 enum Point { Origin, Point { x: int, y: int } }
-enum Color derive Show, Eq, Ord { Red, Blue }
+#[derive(Show, Eq, Ord)]
+enum Color { Red, Blue }
 ```
 
 ### Type aliases
@@ -228,12 +320,18 @@ extern "c" {
 
 `extern "c"` is the portable libc alias. See [FFI tutorial](../tutorial/07-ffi.md).
 
+Equivalent attribute form for a single function:
+
+```0s
+#[ffi(lib = "c")]
+fn strlen(string s) -> int;
+```
+
 ### Classes and impl
 
 ```
-class_decl ::= 'class' IDENT type_param_list? derive_clause? '{' field_decl (',' field_decl)* ','? '}'
+class_decl ::= attr_list? 'class' IDENT type_param_list? '{' field_decl (',' field_decl)* ','? '}'
 field_decl ::= 'pub'? IDENT ':' type
-derive_clause ::= 'derive' IDENT (',' IDENT)*
 
 impl_decl  ::= 'impl' IDENT type_param_list? '{' method_decl* '}'
 method_decl ::= 'pub'? function_decl
@@ -242,7 +340,7 @@ method_decl ::= 'pub'? function_decl
 `type_param_list` is the same form as on functions (`<T>`, `<T: Num>`, …).
 An inherent `impl Cell<T>` shares those parameters with the class so methods
 can mention `T` and type `self` as `Cell<T>`.
-See [Trait derive](types.md#trait-derive) for the `derive` clause.
+See [Trait derive](types.md#trait-derive) for `#[derive(...)]`.
 
 Example:
 
@@ -253,7 +351,8 @@ impl Foo {
     fn name_len() -> int { return 0; }
 }
 
-class Cell derive Show, Eq { value: int }
+#[derive(Show, Eq)]
+class Cell { value: int }
 
 class Cell<T> { value: T }
 impl Cell<T> {
@@ -480,7 +579,6 @@ These appear in planning docs but are **not** parsed from source today:
 | Feature | Status |
 |---------|--------|
 | `case` as alias for `match` | Not registered |
-| Call-site spread (`f(...xs)`) | **Deferred** — [`FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md`](../../FEATURE_PLAN_PARAMS_DESTRUCTURE_RANGES.md) |
 
 ### Ranges (lazy)
 

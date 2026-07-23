@@ -51,6 +51,24 @@ fn main() {
 
 `extern "c"` is the portable libc alias — the resolver maps it to `libc.so.6` (Linux), `libSystem` (macOS), `ucrtbase` (Windows), and so on. On load/declare failure the compiler-emitted unwrap panics with a clear message.
 
+### Attribute sugar: `#[ffi]`
+
+A single libc function can be declared without an `extern` block:
+
+```0s
+#[ffi(lib = "c")]
+fn strlen(string s) -> int;
+
+fn main() {
+    let n = strlen("hello");
+    print "%i", n;
+}
+```
+
+Optional `name = "symbol"` overrides the C symbol when it differs from the zero-script identifier; optional `variadic = true` marks C varargs. See `examples/attr_ffi.0s`.
+
+---
+
 ### C varargs (`...`)
 
 Bare trailing `...` on an extern declaration is C-style varargs (not language rest `T... xs`). The CIF is rebuilt per call; the variadic tail uses default argument promotions.

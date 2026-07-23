@@ -41,7 +41,9 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; named holes on partials allowed) |
 | Arity overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.0s`, `fn_value.0s`, `lambda.0s`) |
-| Rest parameters (`T... xs`) | Supported (trailing only; packs to `[T]`; no call-site `...xs` spread) |
+| Rest parameters (`T... xs` / tuple `... xs`) | Supported (trailing only; `T...` packs to `[T]`, bare `...` packs to a tuple) |
+| Call-site spread (`f(...pack)`) | Supported (tuple and array operands) |
+| User-defined `attr` decorators | Supported (`attr` decl + `#[name(...)]` on `fn`, methods, class constructors) |
 | Let destructuring (`let (a, b) = …`, `let { x, y } = …`) | Supported (tuple / record; no enum ctor patterns in `let`) |
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |

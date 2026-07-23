@@ -107,6 +107,37 @@ pub enum Visibility {
     Public,
 }
 
+/// One `#[name]` / `#[name(args)]` attribute on a declaration.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Attribute<'expr> {
+    pub name: &'expr str,
+    pub args: AttrArgs<'expr>,
+}
+
+/// Argument shapes for attributes.
+#[derive(Clone, PartialEq, Debug)]
+pub enum AttrArgs<'expr> {
+    /// `#[test]` — no parentheses.
+    Empty,
+    /// `#[derive(Show, Eq)]` — comma-separated identifiers.
+    Idents(Vec<&'expr str>),
+    /// `#[ffi(lib = "c", name = "sym")]` — key/value pairs.
+    KeyValues(Vec<(&'expr str, AttrLit<'expr>)>),
+    /// `#[log("msg")]` / `#[retry(3, times = 2)]` — positional literals.
+    Positional(Vec<AttrLit<'expr>>),
+    /// `#[test("description")]` — single string literal.
+    String(&'expr str),
+}
+
+/// Literal values in attribute key/value pairs.
+#[derive(Clone, PartialEq, Debug)]
+pub enum AttrLit<'expr> {
+    String(&'expr str),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum Expression<'expr> {
     Noop(Output<'expr>),
@@ -116,8 +147,28 @@ pub enum Expression<'expr> {
     Bool(bool),
     Module(String, Output<'expr>),
 
-    /// Function parameter `T name` or rest `T... name` (`is_rest`).
-    Argument(Output<'expr>, &'expr str, bool),
+    /// Function parameter `T name`, homogeneous rest `T... name`, or tuple
+    /// rest `... name` (`ty` is `None` for bare tuple rest).
+    Argument(Option<Output<'expr>>, &'expr str, bool),
+
+    /// Call-site spread: `f(...expr)`.
+    Spread(Output<'expr>),
+
+    /// Function type in annotations: `fn(T x, ...args) -> R`.
+    TypeFnSig {
+        params: Output<'expr>,
+        ret: Output<'expr>,
+    },
+
+    /// User-defined attribute declaration.
+    AttrDecl {
+        name: &'expr str,
+        type_params: Vec<TypeParam<'expr>>,
+        args: Output<'expr>,
+        returns: Option<Output<'expr>>,
+        where_constraints: Vec<WhereConstraint<'expr>>,
+        body: Output<'expr>,
+    },
     Identifier(&'expr str),
     Type(&'expr str),
     /// Generic type application in annotations: `Option<int>`, `Result<int, string>`.
@@ -238,6 +289,7 @@ pub enum Expression<'expr> {
     },
 
     Function {
+        attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         is_coro: bool,
         type_params: Vec<TypeParam<'expr>>,
@@ -245,7 +297,8 @@ pub enum Expression<'expr> {
         returns: Option<Output<'expr>>,
         /// Constraints from a trailing `where` clause (after returns).
         where_constraints: Vec<WhereConstraint<'expr>>,
-        body: Output<'expr>,
+        /// `None` = signature-only (`fn f(...) -> T;`); `Some` = block body.
+        body: Option<Output<'expr>>,
     },
 
     Branch(Option<Output<'expr>>, Output<'expr>),
@@ -290,10 +343,9 @@ pub enum Expression<'expr> {
     },
 
     Class {
+        attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
-        /// Traits requested via `class Name derive Show, Eq { … }`.
-        derives: Vec<&'expr str>,
         fields: Vec<Output<'expr>>,
     },
     Implementation {
@@ -328,10 +380,9 @@ pub enum Expression<'expr> {
 
     /// Top-level `enum` declaration.
     EnumDecl {
+        attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         type_params: Vec<TypeParam<'expr>>,
-        /// Traits requested via `enum Name derive Show, Eq { … }`.
-        derives: Vec<&'expr str>,
         variants: Vec<Output<'expr>>,
     },
 
@@ -429,6 +480,8 @@ pub struct RecordFieldDecl<'expr> {
 #[derive(Clone, PartialEq, Debug)]
 pub struct ExternFunction<'expr> {
     pub name: &'expr str,
+    /// Optional C symbol when it differs from the Zero Script name (`#[ffi(name = "sym")]`).
+    pub symbol: Option<&'expr str>,
     pub args: Output<'expr>,
     pub returns: Option<Output<'expr>>,
     /// C-style varargs (`fn printf(string fmt, ...)`) — bare `...`, not language `T... xs`.
@@ -522,12 +575,71 @@ pub enum PatternPayload<'expr> {
     Record(Vec<PatternField<'expr>>),
 }
 
-/// Format a derive clause as ` derive Show, Eq` (leading space), or empty.
-fn fmt_derives(derives: &[&str]) -> String {
-    if derives.is_empty() {
+fn fmt_attrs(attrs: &[Attribute<'_>]) -> String {
+    if attrs.is_empty() {
         return String::new();
     }
-    format!(" derive {}", derives.join(", "))
+    let mut out = String::new();
+    for attr in attrs {
+        out.push_str(&format!("{}\n", attr));
+    }
+    out
+}
+
+fn fmt_attr_lit<'a>(lit: &AttrLit<'a>) -> String {
+    match lit {
+        AttrLit::String(s) => format!("\"{}\"", s),
+        AttrLit::Int(i) => i.to_string(),
+        AttrLit::Float(v) => v.to_string(),
+        AttrLit::Bool(b) => b.to_string(),
+    }
+}
+
+impl<'a> Display for Attribute<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#[{}", self.name)?;
+        match &self.args {
+            AttrArgs::Empty => {}
+            AttrArgs::Idents(idents) => {
+                write!(f, "({})", idents.join(", "))?;
+            }
+            AttrArgs::KeyValues(kvs) => {
+                let parts: Vec<String> = kvs
+                    .iter()
+                    .map(|(k, v)| match v {
+                        AttrLit::String(s) => format!("{} = \"{}\"", k, s),
+                        AttrLit::Int(i) => format!("{} = {}", k, i),
+                        AttrLit::Float(v) => format!("{} = {}", k, v),
+                        AttrLit::Bool(b) => format!("{} = {}", k, b),
+                    })
+                    .collect();
+                write!(f, "({})", parts.join(", "))?;
+            }
+            AttrArgs::Positional(lits) => {
+                let parts: Vec<String> = lits.iter().map(fmt_attr_lit).collect();
+                write!(f, "({})", parts.join(", "))?;
+            }
+            AttrArgs::String(s) => write!(f, "(\"{}\")", s)?,
+        }
+        write!(f, "]")
+    }
+}
+
+/// Description for `#[test]` / `#[test("desc")]` on a function declaration.
+pub fn attr_test_desc<'expr>(attrs: &[Attribute<'expr>], fn_name: &str) -> Option<String> {
+    let attr = attrs.iter().find(|a| a.name == "test")?;
+    let desc = match &attr.args {
+        AttrArgs::String(s) => (*s).to_string(),
+        AttrArgs::Positional(lits) if lits.len() == 1 => match &lits[0] {
+            AttrLit::String(s) => (*s).to_string(),
+            AttrLit::Int(n) => n.to_string(),
+            AttrLit::Float(f) => f.to_string(),
+            AttrLit::Bool(b) => b.to_string(),
+        },
+        AttrArgs::Empty => fn_name.to_string(),
+        _ => fn_name.to_string(),
+    };
+    Some(desc)
 }
 
 /// Format a `Vec<TypeParam>` as `<T, U: Num + Eq, F: * -> *>`.
@@ -777,6 +889,7 @@ impl<'a> Display for Expression<'a> {
                 )
             }
             Self::Function {
+                attrs,
                 name,
                 is_coro,
                 type_params,
@@ -807,11 +920,19 @@ impl<'a> Display for Expression<'a> {
                             .join(", ")
                     )
                 };
-                write!(
-                    f,
-                    "{}fn {}{}({}){}{} {{\n{}}}",
-                    async_kw, name, tp, args.1, ret_str, where_str, body.1
-                )
+                let attr_prefix = fmt_attrs(attrs);
+                match body {
+                    Some(b) => write!(
+                        f,
+                        "{}{}fn {}{}({}){}{} {{\n{}}}",
+                        attr_prefix, async_kw, name, tp, args.1, ret_str, where_str, b.1
+                    ),
+                    None => write!(
+                        f,
+                        "{}{}fn {}{}({}){}{};",
+                        attr_prefix, async_kw, name, tp, args.1, ret_str, where_str
+                    ),
+                }
             }
             Self::Defer(b) => write!(f, "defer {}", b.1),
             Self::TestCase { name, body } => {
@@ -832,10 +953,52 @@ impl<'a> Display for Expression<'a> {
             Self::NamedArg(name, value) => write!(f, "{}: {}", name, value.1),
             Self::Argument(ty, name, is_rest) => {
                 if *is_rest {
-                    write!(f, "{}... {}", ty.1, name)
+                    match ty {
+                        None => write!(f, "... {}", name),
+                        Some(t) => write!(f, "{}... {}", t.1, name),
+                    }
                 } else {
-                    write!(f, "{} {}", ty.1, name)
+                    write!(f, "{} {}", ty.as_ref().expect("fixed param").1, name)
                 }
+            }
+            Self::Spread(inner) => write!(f, "...{}", inner.1),
+            Self::TypeFnSig { params, ret } => write!(f, "fn{} -> {}", params.1, ret.1),
+            Self::AttrDecl {
+                name,
+                type_params,
+                args,
+                returns,
+                where_constraints,
+                body,
+            } => {
+                write!(f, "attr {}", name)?;
+                if !type_params.is_empty() {
+                    write!(
+                        f,
+                        "<{}>",
+                        type_params
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
+                }
+                write!(f, "{}", args.1)?;
+                if let Some(ret) = returns {
+                    write!(f, " -> {}", ret.1)?;
+                }
+                if !where_constraints.is_empty() {
+                    write!(
+                        f,
+                        " where {}",
+                        where_constraints
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
+                }
+                write!(f, " {}", body.1)
             }
             Self::Loop {
                 identifier,
@@ -892,9 +1055,9 @@ impl<'a> Display for Expression<'a> {
                 write!(f, "{{ {} }}", parts.join(", "))
             }
             Self::EnumDecl {
+                attrs,
                 name,
                 type_params,
-                derives,
                 variants,
             } => {
                 let tp = if type_params.is_empty() {
@@ -902,7 +1065,7 @@ impl<'a> Display for Expression<'a> {
                 } else {
                     fmt_type_params(type_params)
                 };
-                let der = fmt_derives(derives);
+                let attr_prefix = fmt_attrs(attrs);
                 let vs = variants
                     .iter()
                     .map(|v| match v.1.as_ref() {
@@ -935,7 +1098,7 @@ impl<'a> Display for Expression<'a> {
                     })
                     .collect::<Vec<String>>()
                     .join(", ");
-                write!(f, "enum {}{}{} {{ {} }}", name, tp, der, vs)
+                write!(f, "{}enum {}{} {{ {} }}", attr_prefix, name, tp, vs)
             }
             Self::EnumVariant { name, payload } => match payload {
                 EnumVariantPayload::Unit => write!(f, "{}", name),
@@ -1047,9 +1210,9 @@ impl<'a> Display for Expression<'a> {
                 ty,
             } => write!(f, "type {}{} = {};", name, fmt_type_params(type_params), ty.1),
             Self::Class {
+                attrs,
                 name,
                 type_params,
-                derives,
                 fields,
             } => {
                 let tp = if type_params.is_empty() {
@@ -1057,9 +1220,9 @@ impl<'a> Display for Expression<'a> {
                 } else {
                     fmt_type_params(type_params)
                 };
-                let der = fmt_derives(derives);
+                let attr_prefix = fmt_attrs(attrs);
                 let fs: Vec<String> = fields.iter().map(|f| f.1.to_string()).collect();
-                write!(f, "class {}{}{} {{ {} }}", name, tp, der, fs.join(", "))
+                write!(f, "{}class {}{} {{ {} }}", attr_prefix, name, tp, fs.join(", "))
             }
             Self::Implementation {
                 what,

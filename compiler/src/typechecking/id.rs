@@ -69,8 +69,33 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Module(_, _)
         | Expression::Variable(_, _)
         | Expression::Constant(_, _)
-        | Expression::Argument(_, _, _)
         | Expression::Field(_, _, _) => {}
+
+        Expression::Argument(ty, _, _) => {
+            if let Some(t) = ty {
+                pre_walk(t, table);
+            }
+        }
+
+        Expression::Spread(inner) => pre_walk(inner, table),
+
+        Expression::TypeFnSig { params, ret } => {
+            pre_walk(params, table);
+            pre_walk(ret, table);
+        }
+
+        Expression::AttrDecl {
+            args,
+            returns,
+            body,
+            ..
+        } => {
+            pre_walk(args, table);
+            if let Some(ret) = returns {
+                pre_walk(ret, table);
+            }
+            pre_walk(body, table);
+        }
 
         Expression::LetDestructure { rhs, .. } => pre_walk(rhs, table),
 
@@ -209,7 +234,9 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
 
         Expression::Function { args, body, .. } => {
             pre_walk(args, table);
-            pre_walk(body, table);
+            if let Some(body) = body {
+                pre_walk(body, table);
+            }
         }
         Expression::Lambda { args, body, .. } => {
             pre_walk(args, table);
