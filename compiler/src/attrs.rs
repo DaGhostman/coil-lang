@@ -9,8 +9,9 @@ use std::collections::{HashMap, HashSet};
 use parser::{
     SimpleSpan,
     ast::{
-        AttrArgs, AttrLit, Attribute, EnumVariantPayload, ExternFunction, Expression, MatchArm,
-        Output, Pattern, PatternField, PatternPayload, Visibility,
+        AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload, ExternFunction,
+        ExternStructDecl, Expression, MatchArm, Output, Pattern, PatternField, PatternPayload,
+        RecordFieldDecl, RecordFieldValue, Visibility,
     },
 };
 use reporting::{ErrorCode, Message};
@@ -402,6 +403,84 @@ fn is_target_args_spread(args: &Option<Vec<Output<'_>>>) -> bool {
     })
 }
 
+fn rewrite_outputs<'a>(
+    items: &[Output<'a>],
+    target: &Output<'a>,
+    subs: &HashMap<&str, Output<'a>>,
+    forward_idents: &[Output<'a>],
+) -> Vec<Output<'a>> {
+    items
+        .iter()
+        .map(|e| rewrite_expr_inline(e, target, subs, forward_idents))
+        .collect()
+}
+
+fn rewrite_construct_payload<'a>(
+    fields: &EnumConstructPayload<'a>,
+    target: &Output<'a>,
+    subs: &HashMap<&str, Output<'a>>,
+    forward_idents: &[Output<'a>],
+) -> EnumConstructPayload<'a> {
+    match fields {
+        EnumConstructPayload::Unit => EnumConstructPayload::Unit,
+        EnumConstructPayload::Tuple(items) => {
+            EnumConstructPayload::Tuple(rewrite_outputs(items, target, subs, forward_idents))
+        }
+        EnumConstructPayload::Record(records) => EnumConstructPayload::Record(
+            records
+                .iter()
+                .map(|f| RecordFieldValue {
+                    name: f.name,
+                    value: rewrite_expr_inline(&f.value, target, subs, forward_idents),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn rewrite_enum_variant_payload<'a>(
+    payload: &EnumVariantPayload<'a>,
+    target: &Output<'a>,
+    subs: &HashMap<&str, Output<'a>>,
+    forward_idents: &[Output<'a>],
+) -> EnumVariantPayload<'a> {
+    match payload {
+        EnumVariantPayload::Unit => EnumVariantPayload::Unit,
+        EnumVariantPayload::Tuple(items) => {
+            EnumVariantPayload::Tuple(rewrite_outputs(items, target, subs, forward_idents))
+        }
+        EnumVariantPayload::Record(fields) => EnumVariantPayload::Record(
+            fields
+                .iter()
+                .map(|f| RecordFieldDecl {
+                    name: f.name,
+                    value: rewrite_expr_inline(&f.value, target, subs, forward_idents),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn rewrite_extern_function<'a>(
+    decl: &ExternFunction<'a>,
+    target: &Output<'a>,
+    subs: &HashMap<&str, Output<'a>>,
+    forward_idents: &[Output<'a>],
+) -> ExternFunction<'a> {
+    ExternFunction {
+        name: decl.name,
+        symbol: decl.symbol,
+        args: rewrite_expr_inline(&decl.args, target, subs, forward_idents),
+        returns: decl
+            .returns
+            .as_ref()
+            .map(|r| rewrite_expr_inline(r, target, subs, forward_idents)),
+        variadic: decl.variadic,
+    }
+}
+
+/// Recursively rewrite every sub-expression in `expr`, beta-reducing
+/// `target(...args)` calls to the inlined decoratee body.
 fn rewrite_expr_inline<'a>(
     expr: &Output<'a>,
     target: &Output<'a>,
@@ -409,6 +488,7 @@ fn rewrite_expr_inline<'a>(
     forward_idents: &[Output<'a>],
 ) -> Output<'a> {
     let span = expr.0;
+    let rw = |e: &Output<'a>| rewrite_expr_inline(e, target, subs, forward_idents);
     match expr.1.as_ref() {
         Expression::Call { name, args } => {
             if let Expression::Identifier(callee) = name.1.as_ref()
@@ -419,18 +499,11 @@ fn rewrite_expr_inline<'a>(
                 // expanded entry function — beta-reduce the call.
                 return target.clone();
             }
-            let new_name = rewrite_expr_inline(name, target, subs, forward_idents);
-            let new_args = args.as_ref().map(|items| {
-                items
-                    .iter()
-                    .map(|a| rewrite_expr_inline(a, target, subs, forward_idents))
-                    .collect()
-            });
             at(
                 span,
                 Expression::Call {
-                    name: new_name,
-                    args: new_args,
+                    name: rw(name),
+                    args: args.as_ref().map(|items| rewrite_outputs(items, target, subs, forward_idents)),
                 },
             )
         }
@@ -438,98 +511,135 @@ fn rewrite_expr_inline<'a>(
             .get(*name)
             .cloned()
             .unwrap_or_else(|| expr.clone()),
-        Expression::Return(inner) => at(
+
+        // Literals and leaves with no nested expressions.
+        Expression::Integer(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Bool(_)
+        | Expression::Type(_)
+        | Expression::Comment(_)
+        | Expression::Default(_)
+        | Expression::Break
+        | Expression::Continue
+        | Expression::Use { .. }
+        | Expression::AssocTypeDecl { .. } => expr.clone(),
+
+        Expression::Noop(inner)
+        | Expression::Spread(inner)
+        | Expression::Return(inner)
+        | Expression::ImplicitReturn(inner)
+        | Expression::Raise(inner)
+        | Expression::Panic(inner)
+        | Expression::Yield(inner)
+        | Expression::YieldFrom(inner)
+        | Expression::Try(inner)
+        | Expression::Negate(inner)
+        | Expression::Not(inner)
+        | Expression::LogicalNot(inner)
+        | Expression::Positive(inner)
+        | Expression::Defer(inner)
+        | Expression::Dload(inner)
+        | Expression::Done(inner)
+        | Expression::Expr(inner)
+        | Expression::Group(inner)
+        | Expression::Member(inner) => at(span, clone_unary(expr.1.as_ref(), rw(inner))),
+
+        Expression::Resume(handle, send) => at(
             span,
-            Expression::Return(rewrite_expr_inline(inner, target, subs, forward_idents)),
+            Expression::Resume(
+                rw(handle),
+                send.as_ref().map(|s| rw(s)),
+            ),
         ),
-        Expression::ImplicitReturn(inner) => at(
+        Expression::OptionalAccess(receiver, field) => {
+            at(span, Expression::OptionalAccess(rw(receiver), *field))
+        }
+        Expression::CompoundAssign(lhs, op, rhs) => at(
             span,
-            Expression::ImplicitReturn(rewrite_expr_inline(inner, target, subs, forward_idents)),
+            Expression::CompoundAssign(rw(lhs), *op, rw(rhs)),
         ),
-        Expression::Print(fmt, params) => {
-            let params = params.as_ref().map(|items| {
-                items
-                    .iter()
-                    .map(|p| rewrite_expr_inline(p, target, subs, forward_idents))
-                    .collect()
-            });
-            at(span, Expression::Print(fmt.clone(), params))
-        }
-        Expression::Format(fmt, params) => {
-            let params = params.as_ref().map(|items| {
-                items
-                    .iter()
-                    .map(|p| rewrite_expr_inline(p, target, subs, forward_idents))
-                    .collect()
-            });
-            at(span, Expression::Format(fmt.clone(), params))
-        }
-        Expression::Block(items) => {
-            let items = items
-                .iter()
-                .map(|s| rewrite_stmt_inline(s, target, subs, forward_idents))
-                .collect();
-            at(span, Expression::Block(items))
-        }
-        Expression::Expr(inner) => at(
+        Expression::Adjust {
+            op,
+            prefix,
+            target: adj_target,
+        } => at(
             span,
-            Expression::Expr(rewrite_expr_inline(inner, target, subs, forward_idents)),
+            Expression::Adjust {
+                op: *op,
+                prefix: *prefix,
+                target: rw(adj_target),
+            },
         ),
-        Expression::Statement(_inner) => rewrite_stmt_inline(expr, target, subs, forward_idents),
-        Expression::ExprStatement(inner) => at(
+        Expression::Add(l, r)
+        | Expression::Sub(l, r)
+        | Expression::Mul(l, r)
+        | Expression::Div(l, r)
+        | Expression::Mod(l, r)
+        | Expression::Pow(l, r)
+        | Expression::Shl(l, r)
+        | Expression::Shr(l, r)
+        | Expression::Xor(l, r)
+        | Expression::And(l, r)
+        | Expression::BitAnd(l, r)
+        | Expression::Or(l, r)
+        | Expression::BitOr(l, r)
+        | Expression::Eq(l, r)
+        | Expression::Neq(l, r)
+        | Expression::Leq(l, r)
+        | Expression::Geq(l, r)
+        | Expression::Le(l, r)
+        | Expression::Gt(l, r)
+        | Expression::Coalesce(l, r) => at(span, clone_binary(expr.1.as_ref(), rw(l), rw(r))),
+        Expression::Range {
+            start,
+            end,
+            inclusive,
+        } => at(
             span,
-            Expression::ExprStatement(rewrite_expr_inline(inner, target, subs, forward_idents)),
+            Expression::Range {
+                start: rw(start),
+                end: rw(end),
+                inclusive: *inclusive,
+            },
         ),
-        Expression::Fragment(children) => {
-            let children = children
-                .iter()
-                .map(|c| rewrite_expr_inline(c, target, subs, forward_idents))
-                .collect();
-            at(span, Expression::Fragment(children))
+        Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
+            let params = params
+                .as_ref()
+                .map(|items| rewrite_outputs(items, target, subs, forward_idents));
+            match expr.1.as_ref() {
+                Expression::Print(..) => at(span, Expression::Print(rw(fmt), params)),
+                Expression::Format(..) => at(span, Expression::Format(rw(fmt), params)),
+                _ => unreachable!(),
+            }
         }
+        Expression::Assignment(lhs, rhs) => at(span, Expression::Assignment(rw(lhs), rw(rhs))),
+        Expression::Access(receiver, field) => at(span, Expression::Access(rw(receiver), *field)),
+        Expression::Index(receiver, index) => {
+            at(span, Expression::Index(rw(receiver), rw(index)))
+        }
+        Expression::NamedArg(name, value) => at(span, Expression::NamedArg(*name, rw(value))),
+        Expression::Branch(cond, body) => at(
+            span,
+            Expression::Branch(cond.as_ref().map(|c| rw(c)), rw(body)),
+        ),
         Expression::If(branches) => {
-            let branches = branches
-                .iter()
-                .map(|branch| match branch.1.as_ref() {
-                    Expression::Branch(cond, body) => at(
-                        branch.0,
-                        Expression::Branch(
-                            cond.as_ref().map(|c| {
-                                rewrite_expr_inline(c, target, subs, forward_idents)
-                            }),
-                            rewrite_expr_inline(body, target, subs, forward_idents),
-                        ),
-                    ),
-                    _ => rewrite_expr_inline(branch, target, subs, forward_idents),
-                })
-                .collect();
+            let branches = branches.iter().map(|branch| rw(branch)).collect();
             at(span, Expression::If(branches))
         }
         Expression::Match { scrutinee, arms } => {
-            let scrutinee = rewrite_expr_inline(scrutinee, target, subs, forward_idents);
             let arms = arms
                 .iter()
                 .map(|arm| MatchArm {
                     pattern: arm.pattern.clone(),
-                    body: rewrite_expr_inline(&arm.body, target, subs, forward_idents),
+                    body: rw(&arm.body),
                 })
                 .collect();
-            at(span, Expression::Match { scrutinee, arms })
+            at(span, Expression::Match {
+                scrutinee: rw(scrutinee),
+                arms,
+            })
         }
-        Expression::Loop {
-            identifier,
-            iterable,
-            body,
-        } => at(
-            span,
-            Expression::Loop {
-                identifier: identifier
-                    .as_ref()
-                    .map(|id| rewrite_expr_inline(id, target, subs, forward_idents)),
-                iterable: rewrite_expr_inline(iterable, target, subs, forward_idents),
-                body: rewrite_expr_inline(body, target, subs, forward_idents),
-            },
-        ),
         Expression::For {
             init,
             cond,
@@ -538,17 +648,372 @@ fn rewrite_expr_inline<'a>(
         } => at(
             span,
             Expression::For {
-                init: init
-                    .as_ref()
-                    .map(|e| rewrite_expr_inline(e, target, subs, forward_idents)),
-                cond: rewrite_expr_inline(cond, target, subs, forward_idents),
-                step: step
-                    .as_ref()
-                    .map(|e| rewrite_expr_inline(e, target, subs, forward_idents)),
-                body: rewrite_expr_inline(body, target, subs, forward_idents),
+                init: init.as_ref().map(|e| rw(e)),
+                cond: rw(cond),
+                step: step.as_ref().map(|e| rw(e)),
+                body: rw(body),
             },
         ),
-        _ => expr.clone(),
+        Expression::Loop {
+            identifier,
+            iterable,
+            body,
+        } => at(
+            span,
+            Expression::Loop {
+                identifier: identifier.as_ref().map(|id| rw(id)),
+                iterable: rw(iterable),
+                body: rw(body),
+            },
+        ),
+        Expression::List(items)
+        | Expression::Array(items)
+        | Expression::Tuple(items)
+        | Expression::Fragment(items)
+        | Expression::Declare(items)
+        | Expression::Invoke(items) => {
+            at(span, clone_expr_list(expr.1.as_ref(), rewrite_outputs(items, target, subs, forward_idents)))
+        }
+        Expression::Block(items) => {
+            let items = items
+                .iter()
+                .map(|s| rewrite_stmt_inline(s, target, subs, forward_idents))
+                .collect();
+            at(span, Expression::Block(items))
+        }
+        Expression::Program(items) => {
+            at(span, Expression::Program(rewrite_outputs(items, target, subs, forward_idents)))
+        }
+        Expression::Dict(fields) => {
+            let fields = fields
+                .iter()
+                .map(|f| RecordFieldValue {
+                    name: f.name,
+                    value: rw(&f.value),
+                })
+                .collect();
+            at(span, Expression::Dict(fields))
+        }
+        Expression::Construct {
+            enum_name,
+            variant_name,
+            fields,
+        } => at(
+            span,
+            Expression::Construct {
+                enum_name: *enum_name,
+                variant_name: *variant_name,
+                fields: rewrite_construct_payload(fields, target, subs, forward_idents),
+            },
+        ),
+        Expression::Variable(name, init) => at(
+            span,
+            Expression::Variable(*name, init.as_ref().map(|e| rw(e))),
+        ),
+        Expression::Constant(ty, init) => at(
+            span,
+            Expression::Constant(rw(ty), init.as_ref().map(|e| rw(e))),
+        ),
+        Expression::LetDestructure { pattern, rhs } => at(
+            span,
+            Expression::LetDestructure {
+                pattern: pattern.clone(),
+                rhs: rw(rhs),
+            },
+        ),
+        Expression::Argument(ty, name, rest) => at(
+            span,
+            Expression::Argument(ty.as_ref().map(|t| rw(t)), *name, *rest),
+        ),
+        Expression::TypeFnSig { params, ret } => at(
+            span,
+            Expression::TypeFnSig {
+                params: rw(params),
+                ret: rw(ret),
+            },
+        ),
+        Expression::TypeApp { name, args } => at(
+            span,
+            Expression::TypeApp {
+                name: *name,
+                args: rewrite_outputs(args, target, subs, forward_idents),
+            },
+        ),
+        Expression::TypeProjection { owner, name, args } => at(
+            span,
+            Expression::TypeProjection {
+                owner: *owner,
+                name: *name,
+                args: rewrite_outputs(args, target, subs, forward_idents),
+            },
+        ),
+        Expression::TypeFun(arg, ret) => at(span, Expression::TypeFun(rw(arg), rw(ret))),
+        Expression::Forall { params, ty } => at(
+            span,
+            Expression::Forall {
+                params: params.clone(),
+                ty: Box::new(rw(ty)),
+            },
+        ),
+        Expression::TypeAlias {
+            name,
+            type_params,
+            ty,
+        } => at(
+            span,
+            Expression::TypeAlias {
+                name: *name,
+                type_params: type_params.clone(),
+                ty: Box::new(rw(ty)),
+            },
+        ),
+        Expression::AssocTypeDef {
+            name,
+            type_params,
+            ty,
+        } => at(
+            span,
+            Expression::AssocTypeDef {
+                name: *name,
+                type_params: type_params.clone(),
+                ty: Box::new(rw(ty)),
+            },
+        ),
+        Expression::AttrDecl {
+            name,
+            type_params,
+            args,
+            returns,
+            where_constraints,
+            body,
+        } => at(
+            span,
+            Expression::AttrDecl {
+                name: *name,
+                type_params: type_params.clone(),
+                args: rw(args),
+                returns: returns.as_ref().map(|r| rw(r)),
+                where_constraints: where_constraints.clone(),
+                body: rw(body),
+            },
+        ),
+        Expression::Function {
+            attrs,
+            name,
+            is_coro,
+            type_params,
+            args,
+            returns,
+            where_constraints,
+            body,
+        } => at(
+            span,
+            Expression::Function {
+                attrs: attrs.clone(),
+                name: *name,
+                is_coro: *is_coro,
+                type_params: type_params.clone(),
+                args: rw(args),
+                returns: returns.as_ref().map(|r| rw(r)),
+                where_constraints: where_constraints.clone(),
+                body: body.as_ref().map(|b| rw(b)),
+            },
+        ),
+        Expression::Lambda {
+            args,
+            captures,
+            body,
+        } => at(
+            span,
+            Expression::Lambda {
+                args: rw(args),
+                captures: captures.clone(),
+                body: rw(body),
+            },
+        ),
+        Expression::Instantiate(receiver, type_args) => at(
+            span,
+            Expression::Instantiate(
+                rw(receiver),
+                type_args
+                    .as_ref()
+                    .map(|items| rewrite_outputs(items, target, subs, forward_idents)),
+            ),
+        ),
+        Expression::TestCase { name, body } => at(
+            span,
+            Expression::TestCase {
+                name: rw(name),
+                body: rw(body),
+            },
+        ),
+        Expression::Module(path, child) => at(span, Expression::Module(path.clone(), rw(child))),
+        Expression::Field(vis, ty, name) => {
+            at(span, Expression::Field(*vis, rw(ty), rw(name)))
+        }
+        Expression::Method(vis, method) => at(span, Expression::Method(*vis, rw(method))),
+        Expression::Class {
+            attrs,
+            name,
+            type_params,
+            fields,
+        } => at(
+            span,
+            Expression::Class {
+                attrs: attrs.clone(),
+                name: *name,
+                type_params: type_params.clone(),
+                fields: rewrite_outputs(fields, target, subs, forward_idents),
+            },
+        ),
+        Expression::Implementation {
+            what,
+            owner,
+            type_params,
+            methods,
+        } => at(
+            span,
+            Expression::Implementation {
+                what: *what,
+                owner: *owner,
+                type_params: type_params.clone(),
+                methods: rewrite_outputs(methods, target, subs, forward_idents),
+            },
+        ),
+        Expression::EnumDecl {
+            attrs,
+            name,
+            type_params,
+            variants,
+        } => at(
+            span,
+            Expression::EnumDecl {
+                attrs: attrs.clone(),
+                name: *name,
+                type_params: type_params.clone(),
+                variants: rewrite_outputs(variants, target, subs, forward_idents),
+            },
+        ),
+        Expression::EnumVariant { name, payload } => at(
+            span,
+            Expression::EnumVariant {
+                name: *name,
+                payload: rewrite_enum_variant_payload(payload, target, subs, forward_idents),
+            },
+        ),
+        Expression::ExternStruct(decl) => at(
+            span,
+            Expression::ExternStruct(ExternStructDecl {
+                name: decl.name,
+                fields: decl
+                    .fields
+                    .iter()
+                    .map(|(fname, ty)| (fname.clone(), rw(ty)))
+                    .collect(),
+            }),
+        ),
+        Expression::ExternBlock {
+            library,
+            declarations,
+        } => at(
+            span,
+            Expression::ExternBlock {
+                library: library.clone(),
+                declarations: declarations
+                    .iter()
+                    .map(|d| rewrite_extern_function(d, target, subs, forward_idents))
+                    .collect(),
+            },
+        ),
+        Expression::TypeClass {
+            name,
+            type_params,
+            methods,
+        } => at(
+            span,
+            Expression::TypeClass {
+                name: *name,
+                type_params: type_params.clone(),
+                methods: rewrite_outputs(methods, target, subs, forward_idents),
+            },
+        ),
+        Expression::TypeClassImpl {
+            class,
+            args,
+            methods,
+        } => at(
+            span,
+            Expression::TypeClassImpl {
+                class: *class,
+                args: rewrite_outputs(args, target, subs, forward_idents),
+                methods: rewrite_outputs(methods, target, subs, forward_idents),
+            },
+        ),
+        Expression::Statement(_inner) => rewrite_stmt_inline(expr, target, subs, forward_idents),
+        Expression::ExprStatement(inner) => at(span, Expression::ExprStatement(rw(inner))),
+    }
+}
+
+fn clone_unary<'a>(kind: &Expression<'a>, inner: Output<'a>) -> Expression<'a> {
+    match kind {
+        Expression::Noop(_) => Expression::Noop(inner),
+        Expression::Spread(_) => Expression::Spread(inner),
+        Expression::Return(_) => Expression::Return(inner),
+        Expression::ImplicitReturn(_) => Expression::ImplicitReturn(inner),
+        Expression::Raise(_) => Expression::Raise(inner),
+        Expression::Panic(_) => Expression::Panic(inner),
+        Expression::Yield(_) => Expression::Yield(inner),
+        Expression::YieldFrom(_) => Expression::YieldFrom(inner),
+        Expression::Try(_) => Expression::Try(inner),
+        Expression::Negate(_) => Expression::Negate(inner),
+        Expression::Not(_) => Expression::Not(inner),
+        Expression::LogicalNot(_) => Expression::LogicalNot(inner),
+        Expression::Positive(_) => Expression::Positive(inner),
+        Expression::Defer(_) => Expression::Defer(inner),
+        Expression::Dload(_) => Expression::Dload(inner),
+        Expression::Done(_) => Expression::Done(inner),
+        Expression::Expr(_) => Expression::Expr(inner),
+        Expression::Group(_) => Expression::Group(inner),
+        Expression::Member(_) => Expression::Member(inner),
+        other => panic!("clone_unary: unexpected {:?}", other),
+    }
+}
+
+fn clone_binary<'a>(kind: &Expression<'a>, left: Output<'a>, right: Output<'a>) -> Expression<'a> {
+    match kind {
+        Expression::Add(_, _) => Expression::Add(left, right),
+        Expression::Sub(_, _) => Expression::Sub(left, right),
+        Expression::Mul(_, _) => Expression::Mul(left, right),
+        Expression::Div(_, _) => Expression::Div(left, right),
+        Expression::Mod(_, _) => Expression::Mod(left, right),
+        Expression::Pow(_, _) => Expression::Pow(left, right),
+        Expression::Shl(_, _) => Expression::Shl(left, right),
+        Expression::Shr(_, _) => Expression::Shr(left, right),
+        Expression::Xor(_, _) => Expression::Xor(left, right),
+        Expression::And(_, _) => Expression::And(left, right),
+        Expression::BitAnd(_, _) => Expression::BitAnd(left, right),
+        Expression::Or(_, _) => Expression::Or(left, right),
+        Expression::BitOr(_, _) => Expression::BitOr(left, right),
+        Expression::Eq(_, _) => Expression::Eq(left, right),
+        Expression::Neq(_, _) => Expression::Neq(left, right),
+        Expression::Leq(_, _) => Expression::Leq(left, right),
+        Expression::Geq(_, _) => Expression::Geq(left, right),
+        Expression::Le(_, _) => Expression::Le(left, right),
+        Expression::Gt(_, _) => Expression::Gt(left, right),
+        Expression::Coalesce(_, _) => Expression::Coalesce(left, right),
+        other => panic!("clone_binary: unexpected {:?}", other),
+    }
+}
+
+fn clone_expr_list<'a>(kind: &Expression<'a>, items: Vec<Output<'a>>) -> Expression<'a> {
+    match kind {
+        Expression::List(_) => Expression::List(items),
+        Expression::Array(_) => Expression::Array(items),
+        Expression::Tuple(_) => Expression::Tuple(items),
+        Expression::Fragment(_) => Expression::Fragment(items),
+        Expression::Declare(_) => Expression::Declare(items),
+        Expression::Invoke(_) => Expression::Invoke(items),
+        other => panic!("clone_expr_list: unexpected {:?}", other),
     }
 }
 

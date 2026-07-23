@@ -2494,3 +2494,56 @@ fn main() {
     );
     assert_eq!(output, "OI1");
 }
+
+#[test]
+fn attr_inlining_rewrites_target_in_all_expression_contexts() {
+    let output = run_example_src(
+        r#"
+attr wrap_if<T>(fn(...args) -> T target, ...args) -> T {
+    if true {
+        return target(...args);
+    }
+    return 0;
+}
+
+attr wrap_for<T>(fn(...args) -> T target, ...args) -> T {
+    for (let i = 0; i < 1; i = i + 1) {
+        return target(...args);
+    }
+    return 0;
+}
+
+attr wrap_while<T>(fn(...args) -> T target, ...args) -> T {
+    while (true) {
+        return target(...args);
+    }
+    return 0;
+}
+
+attr wrap_print<T>(fn(...args) -> T target, ...args) -> T {
+    print "%s", "x";
+    return target(...args);
+}
+
+#[wrap_if]
+fn a() -> int { return 10; }
+
+#[wrap_for]
+fn b() -> int { return 20; }
+
+#[wrap_while]
+fn c() -> int { return 30; }
+
+#[wrap_print]
+fn d() -> int { return 40; }
+
+fn main() {
+    print "%i", a();
+    print "%i", b();
+    print "%i", c();
+    print "%i", d();
+}
+"#,
+    );
+    assert_eq!(output, "102030x40");
+}
