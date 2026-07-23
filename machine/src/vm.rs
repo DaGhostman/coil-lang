@@ -2504,6 +2504,11 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::LoadStatic => {
                     let slot = opcode.operand_u32() as usize;
+                    debug_assert!(
+                        slot < self.statics.len(),
+                        "LoadStatic slot {slot} out of bounds (len {})",
+                        self.statics.len()
+                    );
                     let val = self
                         .statics
                         .get(slot)
@@ -2513,6 +2518,11 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::StoreStatic => {
                     let slot = opcode.operand_u32() as usize;
+                    debug_assert!(
+                        slot < self.statics.len(),
+                        "StoreStatic slot {slot} out of bounds (len {})",
+                        self.statics.len()
+                    );
                     let val = self.stack.pop();
                     if let Some(s) = self.statics.get_mut(slot) {
                         *s = val;
@@ -4813,8 +4823,9 @@ mod tests {
         assert_eq!(vm.pop().as_int(), 42);
     }
 
-    /// Out-of-range StoreStatic is a defensive no-op (does not panic).
+    /// Out-of-range StoreStatic is a defensive no-op in release (debug_assert in dev).
     #[test]
+    #[cfg(not(debug_assertions))]
     fn store_static_out_of_range_is_noop() {
         let code = [
             Byte::new(Instruction::CONST).with_operand_u32(7),
@@ -4825,5 +4836,18 @@ mod tests {
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 1);
         assert_eq!(vm.pop().as_int(), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "StoreStatic slot 99 out of bounds")]
+    fn store_static_out_of_range_debug_asserts() {
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(7),
+            Byte::new(Instruction::StoreStatic).with_operand_u32(99),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 1);
     }
 }

@@ -3352,13 +3352,21 @@ impl Checker {
                 attrs,
                 name,
                 is_coro,
-                is_static: _,
+                is_static,
                 type_params,
                 args,
                 returns,
                 where_constraints,
                 body,
             } => {
+                if *is_static {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "`static fn` is only allowed inside an `impl` block".to_string(),
+                        range,
+                        Some("declare static methods as `impl Class { static fn ... }`".to_string()),
+                    );
+                }
                 if *name == "main" {
                     self.main_decl_span = Some(range.clone());
                 }
@@ -4468,7 +4476,7 @@ impl Checker {
                 } else {
                     apply_ty_prune(&self.subst, &init_ty)
                 };
-                self.register_static_slot(fqn, *is_const, slot_ty.clone());
+                self.register_static_slot(fqn, *is_const, slot_ty.clone(), range.clone());
                 self.env
                     .insert_top(name.to_string(), Scheme::mono(slot_ty.clone()));
                 self.record_codegen_var_type(name.to_string(), slot_ty.clone());
@@ -5075,7 +5083,7 @@ impl Checker {
                 if self.static_slots.contains_key(&module_fqn) {
                     if self.is_static_const_fqn(&module_fqn) {
                         let mut msg = Message::error(
-                            ErrorCode::FormatSpecifierMismatch,
+                            ErrorCode::InvalidAssignment,
                             format!("Cannot assign to constant `{}`", ident),
                             range,
                         );
@@ -7897,7 +7905,12 @@ impl Checker {
                         continue;
                     }
                     let fqn = format!("{}::{}", name, fname_str);
-                    self.register_static_slot(fqn, false, ty.clone());
+                    self.register_static_slot(
+                        fqn,
+                        false,
+                        ty.clone(),
+                        field.0.into_range(),
+                    );
                     if let Some(init_expr) = init {
                         let init_ty = self.infer(init_expr);
                         self.coerce_or_unify(
@@ -11656,9 +11669,25 @@ impl Checker {
         }
     }
 
-    fn register_static_slot(&mut self, fqn: String, is_const: bool, ty: Ty) -> u32 {
-        if let Some((id, _)) = self.static_slots.get(&fqn) {
-            return *id;
+    fn register_static_slot(
+        &mut self,
+        fqn: String,
+        is_const: bool,
+        ty: Ty,
+        range: Range<usize>,
+    ) -> u32 {
+        if self.static_slots.contains_key(&fqn) {
+            let id = self.static_slots.get(&fqn).map(|(id, _)| *id).unwrap_or(0);
+            let _ = self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("Duplicate static slot `{}`", fqn),
+                range,
+                Some(
+                    "each `static let` / `static const` / class `static` field must have a unique name"
+                        .to_string(),
+                ),
+            );
+            return id;
         }
         let id = self.next_static_slot;
         self.next_static_slot += 1;

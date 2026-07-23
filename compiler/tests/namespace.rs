@@ -418,6 +418,24 @@ roots = ["./src"]
     assert_eq!(output, "7");
 }
 
+#[test]
+fn cross_module_static_slot_init_and_mutation() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        ("src/counter.0s", "static let n = 0;\n"),
+        (
+            "src/main.0s",
+            "mod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    print \"%i\", counter::n;\n}\n",
+        ),
+    ];
+    let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.0s");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "5");
+}
+
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CwdLockGuard(std::sync::MutexGuard<'static, ()>);
