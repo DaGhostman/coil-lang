@@ -1,4 +1,4 @@
-// Array literals, index, mutation, push, len, for-in.
+// Array literals, index, mutation, append (`arr[] =`), len, for-in.
 test("literal index") {
     let a = [10, 20, 30];
     assert(a[0] == 10)?;
@@ -24,20 +24,20 @@ test("len of literal") {
     assert(len(a) == 4)?;
 }
 
-test("push grows array") {
+test("append grows array") {
     let a = [1];
-    push(a, 2);
-    push(a, 3);
+    a[] = 2;
+    a[] = 3;
     assert(len(a) == 3)?;
     assert(a[0] == 1)?;
     assert(a[1] == 2)?;
     assert(a[2] == 3)?;
 }
 
-test("empty then push") {
+test("empty then append") {
     let a = [0];
     a[0] = 7;
-    push(a, 8);
+    a[] = 8;
     assert(len(a) == 2)?;
     assert(a[1] == 8)?;
 }

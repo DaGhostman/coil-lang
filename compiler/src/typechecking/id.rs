@@ -69,7 +69,8 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         | Expression::Module(_, _)
         | Expression::Variable(_, _)
         | Expression::Constant(_, _)
-        | Expression::Field(_, _, _) => {}
+        | Expression::Field { .. }
+        | Expression::QualifiedAccess { .. } => {}
 
         Expression::Argument(ty, _, _) => {
             if let Some(t) = ty {
@@ -209,7 +210,16 @@ fn pre_walk_children(node: &Output, table: &mut IdTable) {
         }
         Expression::Index(target, index) => {
             pre_walk(target, table);
-            pre_walk(index, table);
+            if let Some(index) = index {
+                pre_walk(index, table);
+            }
+        }
+        Expression::Readonly(inner) => pre_walk(inner, table),
+        Expression::StaticDecl { ty, init, .. } => {
+            if let Some(ty) = ty {
+                pre_walk(ty, table);
+            }
+            pre_walk(init, table);
         }
         Expression::Dict(fields) => {
             for f in fields {

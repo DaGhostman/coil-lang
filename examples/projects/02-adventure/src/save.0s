@@ -26,7 +26,7 @@ fn encode_save(int room, int has_key) -> [byte] {
         hi = z;
     }
     let payload: [byte] = [hi];
-    push(payload, lo);
+    payload[] = lo;
     return payload;
 }
 

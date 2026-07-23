@@ -225,6 +225,41 @@ print "%i", x + y;   // 15 — x's slot is preserved
 
 **Reassignment** (`x = expr;`) uses the same slot-write path: the old value is replaced.
 
+### `const` bindings
+
+`const` forbids **rebinding** the name — the slot cannot be reassigned with `x = …`:
+
+```0s
+const VERSION = "1.0";
+// VERSION = "2.0";   // error: cannot assign to const binding
+```
+
+`const` is **shallow**: if the initializer is heap-mutable (`[T]`, a class instance, or a dict), the compiler emits a warning that interior mutation (fields, indices, `arr[] =`) still succeeds. Scalars, strings, tuples, and enums without interior paths do not warn.
+
+### Module `static` slots
+
+Top-level singletons use `static let` (mutable) or `static const` (immutable binding):
+
+```0s
+static let hits = 0;
+static const VERSION = "1.0";
+```
+
+Initializers run once in the program prologue (before `main`), in module dependency order. Other modules import the item name via `use` like ordinary functions.
+
+Class statics use `ClassName::field` / `ClassName::method(...)` — see [Types — Static slots](../reference/types.md#static-slots) and `examples/static_singleton.0s`.
+
+### `readonly` values
+
+`readonly` seals a value against **external** mutation while still allowing methods to mutate via `self`:
+
+```0s
+let xs = readonly [1, 2, 3];
+let p = readonly new Point(1, 2);
+```
+
+Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[] = …`) is rejected. See `examples/readonly_seal.0s` and [Types — Readonly](../reference/types.md#readonly-types).
+
 **Reading** a variable emits a load from that slot. The typechecker ensures you only assign types compatible with the binding's declared or inferred type.
 
 Implications for you as a programmer:

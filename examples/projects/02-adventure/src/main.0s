@@ -170,7 +170,7 @@ fn main() {
                     }
                     if b != nl {
                         if b != cr {
-                            push(line, b);
+                            line[] = b;
                         }
                     }
                 }
@@ -180,7 +180,7 @@ fn main() {
                 let out: [byte] = [line[1]];
                 let j = 2;
                 while j < len(line) {
-                    push(out, line[j]);
+                    out[] = line[j];
                     j = j + 1;
                 }
                 running = handle_line(p, out, save_path);

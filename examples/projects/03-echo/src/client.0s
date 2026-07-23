@@ -6,7 +6,7 @@ fn request_body() -> [byte] {
     let a: byte = 65;
     let b: byte = 66;
     let body: [byte] = [a];
-    push(body, b);
+    body[] = b;
     return body;
 }
 

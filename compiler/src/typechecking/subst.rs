@@ -175,6 +175,7 @@ pub fn apply_ty(subst: &Subst, ty: &Ty) -> Ty {
                 body: Box::new(apply_ty(&inner, body)),
             }
         }
+        Ty::Readonly(inner) => Ty::Readonly(Box::new(apply_ty(subst, inner))),
     }
 }
 

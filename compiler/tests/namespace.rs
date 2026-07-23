@@ -90,7 +90,7 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
 
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
 
     let bytes = Rc::try_unwrap(buf)
@@ -363,7 +363,7 @@ roots = ["./src"]
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
     let output = String::from_utf8(
         Rc::try_unwrap(buf)

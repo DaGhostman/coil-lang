@@ -10,7 +10,9 @@ All reserved words in the zero-script parser. Keywords cannot be used as identif
 |---------|----------|-------------------|-----------|
 | `fn` | Declaration | Function definition | [Syntax — Functions](syntax.md#functions) |
 | `let` | Statement | Mutable local binding | [Syntax — Statements](syntax.md#statements) |
-| `const` | Statement | Immutable local binding | [Syntax — Statements](syntax.md#statements) |
+| `const` | Statement | Immutable local binding (shallow: heap interiors may still mutate) | [Syntax — Statements](syntax.md#statements) |
+| `static` | Declaration | Module or class singleton slot | [Types — Statics](types.md#static-slots) |
+| `readonly` | Expression | Seal value against external mutation | [Types — Readonly](types.md#readonly-types) |
 | `if` | Statement | Conditional | [Syntax — Statements](syntax.md#statements) |
 | `else` | Statement | Alternative branch | [Syntax — Statements](syntax.md#statements) |
 | `while` | Statement | Loop while condition true | [Syntax — Statements](syntax.md#statements) |

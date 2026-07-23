@@ -53,6 +53,8 @@ pub enum Ty {
     Record {
         fields: Vec<(String, Ty)>,
     },
+    /// `readonly T` — sealed against external mutation (typechecker only in v1).
+    Readonly(Box<Ty>),
     Existential {
         class: String,
     },
@@ -474,6 +476,34 @@ pub fn tuple(tys: Vec<Ty>) -> Ty {
     Ty::Tuple(tys)
 }
 
+/// Build the `readonly T` wrapper type.
+pub fn readonly_ty(ty: Ty) -> Ty {
+    Ty::Readonly(Box::new(ty))
+}
+
+/// Peel `readonly` qualifiers for read/mutation checks.
+pub fn strip_readonly<'a>(ty: &'a Ty) -> &'a Ty {
+    match ty {
+        Ty::Readonly(inner) => strip_readonly(inner),
+        other => other,
+    }
+}
+
+/// Whether a `const` binding should emit a shallow-immutability warning.
+pub fn is_shallow_const_mutable(ty: &Ty) -> bool {
+    match strip_readonly(ty) {
+        Ty::Array { .. } | Ty::Record { .. } => true,
+        Ty::Con(name) => name != "int"
+            && name != "float"
+            && name != "string"
+            && name != "bool"
+            && name != "byte"
+            && name != "unit",
+        Ty::App(_, _) => true,
+        _ => false,
+    }
+}
+
 /// Build the `[T]` (dynamic-length) array type.
 pub fn array(element: Ty) -> Ty {
     Ty::Array {
@@ -545,6 +575,7 @@ pub fn subst_ty_params(ty: &Ty, params: &std::collections::HashMap<String, Ty>) 
             constraints: constraints.clone(),
             body: Box::new(subst_ty_params(body, params)),
         },
+        Ty::Readonly(inner) => Ty::Readonly(Box::new(subst_ty_params(inner, params))),
     }
 }
 
@@ -617,6 +648,7 @@ pub fn schemaize_ty(ty: &Ty, var_to_name: &std::collections::HashMap<TyVarId, St
             constraints: constraints.clone(),
             body: Box::new(schemaize_ty(body, var_to_name)),
         },
+        Ty::Readonly(inner) => Ty::Readonly(Box::new(schemaize_ty(inner, var_to_name))),
     }
 }
 
@@ -706,6 +738,7 @@ fn go(ty: &Ty, acc: &mut HashSet<TyVarId>) {
             let bound: HashSet<_> = bounds.iter().copied().collect();
             acc.retain(|v| !bound.contains(v));
         }
+        Ty::Readonly(inner) => go(inner, acc),
     }
 }
 

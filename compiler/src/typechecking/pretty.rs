@@ -107,6 +107,7 @@ impl fmt::Display for Ty {
                 }
                 write!(f, " }}")
             }
+            Ty::Readonly(inner) => write!(f, "readonly {}", inner),
             Ty::Existential { class } => write!(f, "{}", class),
             Ty::Forall {
                 bounds,

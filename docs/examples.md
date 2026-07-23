@@ -716,13 +716,13 @@ Tuples, arrays, dicts, and `type` aliases.
 
 ### `examples/array_grow.0s`
 
-**Demonstrates:** Growing arrays with `push`, reading the runtime length with `len`, and indexing appended elements.
+**Demonstrates:** Growing arrays with `arr[] =`, reading the runtime length with `len`, and indexing appended elements.
 
 ```0s
 fn main() {
     let a = [1, 2];
-    push(a, 3);
-    push(a, 4);
+    a[] = 3;
+    a[] = 4;
     print "%i", len(a);
     print "%i", a[0];
     print "%i", a[3];
@@ -1527,6 +1527,8 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `io_nested_host.0s` | IO | `3` |
 | `io_nested_write.0s` | IO | `2` |
 | `array_grow.0s` | Collections | `414` |
+| `static_singleton.0s` | Statics | `121` |
+| `readonly_seal.0s` | Readonly | `322` |
 | `dict.0s` | Collections | `4210042` |
 | `aliases.0s` | Types | `347` |
 | `generic_alias.0s` | Types | `7` |

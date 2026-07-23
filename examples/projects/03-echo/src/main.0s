@@ -52,8 +52,8 @@ fn run_echo() {
     read_exact(server, s2)?;
 
     let inbound: [byte] = [s0[0]];
-    push(inbound, s1[0]);
-    push(inbound, s2[0]);
+    inbound[] = s1[0];
+    inbound[] = s2[0];
     let reply = echo_reply(inbound);
     write_all(server, reply)?;
 
@@ -69,8 +69,8 @@ fn run_echo() {
     close(listener)?;
 
     let back: [byte] = [c0[0]];
-    push(back, c1[0]);
-    push(back, c2[0]);
+    back[] = c1[0];
+    back[] = c2[0];
     if payload_eq(back, body) == 1 {
         return "ok";
     }

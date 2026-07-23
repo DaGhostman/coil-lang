@@ -443,6 +443,10 @@ pub fn unify_with(subst: &Subst, t1: &Ty, t2: &Ty) -> Result<Subst, UnifyError> 
             Ok(current)
         }
 
+        (Ty::Readonly(a), Ty::Readonly(b)) => unify_with(subst, a.as_ref(), b.as_ref()),
+        (Ty::Readonly(a), b) => unify_with(subst, a.as_ref(), &b),
+        (a, Ty::Readonly(b)) => unify_with(subst, &a, b.as_ref()),
+
         // Anything else: the constructors are incompatible.
         (left, right) => Err(UnifyError::Mismatch { left, right }),
     }

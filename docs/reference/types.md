@@ -149,11 +149,11 @@ fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 
 ### Growing arrays
 
-Use `push(arr, value)` to append in place. The value must match the array's element type. The call returns the same array as a dynamic `[T]`, and `len(arr)` returns its current runtime length as `int`.
+Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed, and `len(arr)` returns its current runtime length as `int`.
 
 ```0s
 let xs = [1, 2];   // starts as [int; 2]
-push(xs, 3);       // xs is treated as dynamic [int] afterwards
+xs[] = 3;          // xs is treated as dynamic [int] afterwards
 print "%i", len(xs);
 ```
 
@@ -185,6 +185,75 @@ let n = d.x;              // field access
 Structural `Show` covers tuples and anonymous records automatically. Non-generic
 enums and classes can also opt in with `#[derive(Show)]` (see
 [Trait derive](#trait-derive)); otherwise write an explicit `impl Show for T`.
+
+---
+
+## Static slots
+
+Module-level and class-level singletons share one global slot table for the process.
+
+```0s
+static let hits = 0;
+static const VERSION = "1.0";
+
+class Counter {
+    static count: int = 0,
+    value: int,
+}
+
+impl Counter {
+    static fn fresh() -> Counter {
+        Counter::count = Counter::count + 1;
+        return new Counter(0);
+    }
+}
+```
+
+| Form | Access | Mutation |
+|------|--------|----------|
+| `static let x = …` | bare `x` in defining module | Reassignable |
+| `static const X = …` | bare `X` | Immutable after init |
+| `Class::field` | `Counter::count` | `static let`-style unless `static const` |
+| `static fn` | `Class::method()` | No `self`; not callable on instances |
+
+Initializers run once in the program prologue (declaration order). Other modules import statics via `use` like ordinary items.
+
+Class `static` fields require an initializer. `static` and `const` field modifiers are mutually exclusive on class fields.
+
+---
+
+## Readonly types
+
+`readonly` seals a value against **external** mutation. Methods may still mutate via `self`.
+
+```0s
+let xs = readonly [1, 2, 3];
+let p = new readonly Point(1, 2);
+// sugar: readonly new Point(1, 2)
+```
+
+| Operation | `readonly T` handle | Inside `impl` via `self` |
+|-----------|-------------------|---------------------------|
+| Read fields / index | Allowed | Allowed |
+| `p.field = …` / `xs[] = …` | Error | Allowed for class fields |
+| Rebind variable | Allowed (`let a = readonly [1]; a = readonly [2];`) | — |
+
+Type pretty-print: `readonly T`. Arrays and dicts have no method exception — external `StoreIndex` / field writes are rejected.
+
+---
+
+## Class `const` fields
+
+```0s
+class Point {
+    const x: int,
+    const y: int,
+}
+```
+
+Const fields may be set only in `new` (constructor). Any later `p.x = …` or `self.x = …` is a type error — stricter than `readonly`, which allows method bodies to mutate via `self`.
+
+Local `const` bindings are shallow: the compiler warns when the initializer type is heap-mutable (`[T]`, class instances, dicts) because interior mutation through fields or `arr[] =` still succeeds.
 
 ---
 

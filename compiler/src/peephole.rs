@@ -135,6 +135,102 @@ fn patch_targets(byte: &mut Byte, fusion_sites: &[FusionSite], pool: &mut [u64])
     }
 }
 
+/// Shift absolute jump/call targets at or after `threshold` forward by `delta`.
+///
+/// Used when bytecode is inserted (e.g. static initializer prologue) so
+/// `CALL`/`JMP` operands emitted before the splice still reach the right
+/// instruction.
+pub fn bump_targets_at_or_after(
+    bytecode: &mut [Byte],
+    pool: &mut [u64],
+    threshold: usize,
+    delta: usize,
+) {
+    if delta == 0 {
+        return;
+    }
+    for byte in bytecode.iter_mut() {
+        bump_target_in_byte(byte, pool, threshold, delta);
+    }
+}
+
+/// Like [`bump_targets_at_or_after`], but skips the instruction at `skip_index`
+/// (used when a freshly inserted `JMP` already has a pre-adjusted target).
+pub fn bump_targets_at_or_after_skip_byte(
+    bytecode: &mut [Byte],
+    pool: &mut [u64],
+    skip_index: usize,
+    threshold: usize,
+    delta: usize,
+) {
+    if delta == 0 {
+        return;
+    }
+    for (i, byte) in bytecode.iter_mut().enumerate() {
+        if i == skip_index {
+            continue;
+        }
+        bump_target_in_byte(byte, pool, threshold, delta);
+    }
+}
+
+fn bump_target_in_byte(byte: &mut Byte, pool: &mut [u64], threshold: usize, delta: usize) {
+    let bump = |t: usize| -> usize {
+        if t >= threshold {
+            t + delta
+        } else {
+            t
+        }
+    };
+    match byte.bytecode() {
+        Instruction::JMP | Instruction::JMPT | Instruction::JMPF => {
+            if byte.operand_u32() != u32::MAX {
+                let t = bump(byte.operand_u32() as usize);
+                *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
+            }
+        }
+        Instruction::CALL | Instruction::MakeCoro => {
+            let (arity, target) = byte.call_parts();
+            let t = bump(target);
+            *byte = Byte::new(*byte.bytecode()).with_call_packed(arity as u32, t as u32);
+        }
+        Instruction::CmpJmpf => {
+            let (op, target) = byte.cmp_jmpf_parts();
+            let t = bump(target);
+            if t <= u16::MAX as usize {
+                *byte = Byte::new(Instruction::CmpJmpf).with_cmp_jmpf(op, t as u16);
+            }
+        }
+        Instruction::BinSlotImmJmpf => {
+            let (op, slot, pool_idx) = byte.bin_slot_imm_jmpf_parts();
+            if pool_idx < pool.len() {
+                let packed = pool[pool_idx];
+                let imm = packed as u32;
+                let target = bump((packed >> 32) as usize);
+                pool[pool_idx] = ((target as u64) << 32) | (imm as u64);
+            }
+            let _ = (op, slot);
+        }
+        Instruction::LogNotJmpf => {
+            let t = bump(byte.log_not_jmpf_target());
+            if t <= u16::MAX as usize {
+                *byte = Byte::new(Instruction::LogNotJmpf).with_log_not_jmpf(t as u16);
+            }
+        }
+        Instruction::JumpIfMatch => {
+            let idx = (byte.operand_u32() & 0xFFFF) as usize;
+            if idx < pool.len() {
+                pool[idx] = bump(pool[idx] as usize) as u64;
+            }
+        }
+        Instruction::CodePtr | Instruction::MakePolyFn => {
+            let t = bump(byte.operand_u32() as usize);
+            *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
+        }
+        _ => {}
+    }
+}
+
 /// True for integer binary ops that `BinSlotImm` can carry
 /// (arithmetic + comparisons on a local and an inline immediate).
 fn is_int_bin_op(i: Instruction) -> bool {
@@ -755,6 +851,18 @@ mod tests {
         assert_eq!(bc.len(), 3, "CodePtr; CONST; ADD must not fold");
         assert_eq!(*bc[0].bytecode(), Instruction::CodePtr);
         assert_eq!(bc[0].operand_u32(), 1);
+    }
+
+    #[test]
+    fn bump_targets_at_or_after_shifts_call_operand() {
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::CALL).with_call_packed(1, 5),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut pool = Vec::<u64>::new();
+        bump_targets_at_or_after(&mut bc, &mut pool, 3, 2);
+        assert_eq!(bc[1].call_parts().1, 7);
     }
 
     #[test]

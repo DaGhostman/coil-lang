@@ -157,6 +157,8 @@ pub struct Machine<const S: usize> {
     pending_ffi: Option<PendingFfiInvoke>,
     /// Set when a language-level `panic` aborts the VM.
     panicked: bool,
+    /// Global static slots (`LoadStatic` / `StoreStatic`).
+    statics: Vec<Value>,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -184,6 +186,7 @@ impl<const S: usize> Default for Machine<S> {
             nested_return: None,
             pending_ffi: None,
             panicked: false,
+            statics: Vec::new(),
         }
     }
 }
@@ -839,14 +842,15 @@ impl<const S: usize> Machine<S> {
     }
 
     pub fn run(&mut self, code: &[Byte]) {
-        self.run_with_pool(code, &[]);
+        self.run_with_pool(code, &[], 0);
     }
 
     /// Run bytecode with an optional constant pool for wide immediates.
-    pub fn run_with_pool(&mut self, code: &[Byte], constants: &[u64]) {
+    pub fn run_with_pool(&mut self, code: &[Byte], constants: &[u64], static_slots: u32) {
         if code.is_empty() {
             return;
         }
+        self.statics = vec![Value::default(); static_slots as usize];
         self.program_code = unsafe {
             std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
         };
@@ -996,9 +1000,9 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Run compiler-produced bytecode (archived layout, no `.c0s` round-trip).
-    pub fn run_raw(&mut self, code: &[RawByte], constants: &[u64]) {
+    pub fn run_raw(&mut self, code: &[RawByte], constants: &[u64], static_slots: u32) {
         let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
-        self.run_with_pool(code, constants);
+        self.run_with_pool(code, constants, static_slots);
     }
 
     #[inline(always)]
@@ -1034,7 +1038,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::MakeFn as u8);
+            promise!(*bc as u8 <= Instruction::StoreStatic as u8);
 
             match bc {
                 Instruction::POP => {
@@ -2498,6 +2502,22 @@ impl<const S: usize> Machine<S> {
                     }
                     self.stack.push(Value::from(object.addr()));
                 }
+                Instruction::LoadStatic => {
+                    let slot = opcode.operand_u32() as usize;
+                    let val = self
+                        .statics
+                        .get(slot)
+                        .copied()
+                        .unwrap_or_default();
+                    self.stack.push(val);
+                }
+                Instruction::StoreStatic => {
+                    let slot = opcode.operand_u32() as usize;
+                    let val = self.stack.pop();
+                    if let Some(s) = self.statics.get_mut(slot) {
+                        *s = val;
+                    }
+                }
                 Instruction::BoxValue => {
                     let tag = (opcode.operand_u32() & 0xFFFF) as u16;
                     let v = self.stack.pop();
@@ -3074,6 +3094,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &constants,
+            0,
         );
         // After the jump, the payload (42) was pushed. Top of
         // stack is 42.
@@ -3121,6 +3142,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[],
+            0,
         );
         // After fall-through, we pushed 99. Stack: [enum_ptr, 99].
         let v = vm.pop();
@@ -3275,6 +3297,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &pool,
+            0,
         );
         assert_eq!(vm.pop().as_float(), 3.5);
     }
@@ -4348,6 +4371,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &pool,
+            0,
         );
         // 1.5 + 2.5 = 4.0
         assert_eq!(vm.pop().as_float(), 4.0);
@@ -4489,6 +4513,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &pool,
+            0,
         );
         let s = vm.pop();
         let text = Machine::<64>::object_string_value(&vm.heap, &s);
@@ -4565,6 +4590,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[0u64],
+            0,
         );
         assert_eq!(vm.pop().as_int(), 7);
         assert_eq!(vm.pop().as_int(), 42);
@@ -4580,6 +4606,7 @@ mod tests {
                 Byte::new(Instruction::HALT),
             ],
             &[0u64],
+            0,
         );
         assert_eq!(vm.pop().as_int(), 3);
     }
@@ -4751,5 +4778,24 @@ mod tests {
         let mut vm = Machine::<32>::default();
         vm.run(&code);
         assert_eq!(vm.pop().as_int(), 6);
+    }
+
+    /// Regression: two `LoadStatic; CONST 1; ADD; StoreStatic` sequences in one
+    /// function must not underflow the stack in release builds.
+    #[test]
+    fn dual_static_assign_sequence_does_not_underflow_stack() {
+        let code = [
+            Byte::new(Instruction::LoadStatic).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::StoreStatic).with_operand_u32(0),
+            Byte::new(Instruction::LoadStatic).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::StoreStatic).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<256>::default();
+        vm.run_with_pool(&code, &[], 2);
     }
 }

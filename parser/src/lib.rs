@@ -4,7 +4,7 @@
 
 use ast::{
     AdjustOp, AssignOp, AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload,
-    Expression, LetFieldPattern, LetPattern, MatchArm, Output, Pattern, PatternField,
+    Expression, FieldModifier, LetFieldPattern, LetPattern, MatchArm, Output, Pattern, PatternField,
     PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
 };
 use std::{
@@ -371,15 +371,16 @@ impl<'pratt> Pratt<'pratt> {
                 // `self.call(...)` (which expects a leading
                 // ident) AND before `self.ident()`.
                 self.tuple_atom(expr.clone()),
-                // `[a, b, c]` — array atom.
-                self.array_atom(expr.clone()),
+                // `[a, b, c]` — array atom (optionally `readonly […]`).
+                self.readonly_array_atom(expr.clone()),
                 self.dict_atom(expr.clone()),
                 // `EnumName::Variant(args)` — qualified constructor
-                // application. MUST be tried before `self.call(...)`
-                // because both start with `ident`: the backtracking
-                // inside `choice` will try the next alternative if
-                // the `::` after the first ident is missing.
+                // application. MUST be tried before `qualified_access`
+                // so multi-segment paths (`ffi::types::Int`) and enum
+                // unit/tuple/record shapes win over static field access.
                 self.construct(expr.clone()),
+                self.qualified_access(),
+                self.readonly_instantiate(expr.clone()),
                 self.instantiate(expr.clone()),
                 // float comes before int so that `1.0` is parsed as a
                 // float, not an `int` `1` followed by a stray `.0`.
@@ -635,7 +636,12 @@ impl<'pratt> Pratt<'pratt> {
                 ),
                 postfix(
                     Precedence::Primary as u16,
-                    expr.clone().delimited_by(op!('['), op!(']')),
+                    choice((
+                        expr.clone()
+                            .map(Some)
+                            .delimited_by(op!('['), op!(']')),
+                        op!('[').ignore_then(op!(']')).to(None),
+                    )),
                     |lhs, index, e| (e.span(), Box::new(Expression::Index(lhs, index))),
                 ),
                 postfix(
@@ -832,41 +838,38 @@ impl<'pratt> Pratt<'pratt> {
             .map(|opt| opt.unwrap_or_default())
     }
 
-    /// Parses the function *signature* (`async? fn Name<T>(args) -> ret where …`)
-    /// without consuming the body block.  Used by `typeclass_decl` to parse
-    /// sig-only methods that end in `;`.
-    ///
-    /// Returns
-    /// `((((((is_coro, _), name), type_params), args), returns), where_constraints)`.
+    /// Parses the function *signature* (`async? static? fn Name<T>(args) -> ret where …`)
+    /// without consuming the body block.
     fn func_sig(
         &self,
-    ) -> impl Parser<
-        'pratt,
-        &'pratt str,
-        (
-            (
-                (
-                    (
-                        ((Option<&'pratt str>, &'pratt str), &'pratt str),
-                        Vec<TypeParam<'pratt>>,
-                    ),
-                    Output<'pratt>,
-                ),
-                Option<Output<'pratt>>,
-            ),
-            Vec<ast::WhereConstraint<'pratt>>,
-        ),
-        extra::Err<Rich<'pratt, char>>,
-    > + Clone
-           + 'pratt {
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
         keyword!("async")
             .or_not()
+            .then(keyword!("static").or_not())
             .then(keyword!("fn"))
             .then(text::ident().padded())
             .then(self.type_param_list())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             .then(self.where_clause())
+            .map_with(|(((((((is_coro, is_static), _), name), type_params), args), returns), where_constraints), e| {
+                let empty_block = (e.span(), Box::new(Expression::Block(vec![])));
+                (
+                    e.span(),
+                    Box::new(Expression::Function {
+                        attrs: vec![],
+                        name,
+                        is_coro: is_coro.is_some(),
+                        is_static: is_static.is_some(),
+                        type_params,
+                        args,
+                        returns,
+                        where_constraints,
+                        body: Some(empty_block),
+                    }),
+                )
+            })
     }
 
     /// `attr Name<T>(target, extras..., ...args) -> R { body }`
@@ -909,6 +912,7 @@ impl<'pratt> Pratt<'pratt> {
     {
         self.attr_list()
             .then(keyword!("async").or_not())
+            .then(keyword!("static").or_not())
             .then(keyword!("fn"))
             .then(text::ident().padded())
             .then(self.type_param_list())
@@ -919,23 +923,24 @@ impl<'pratt> Pratt<'pratt> {
                 self.block(stmt).map(Some),
                 op!(";").to(None),
             )))
-            .map_with(
-                |((((((((attrs, is_coro), _), name), type_params), args), returns), where_constraints), body), e| {
-                    (
-                        e.span(),
-                        Box::new(Expression::Function {
-                            attrs,
-                            name,
-                            is_coro: is_coro.is_some(),
-                            type_params,
-                            args,
-                            returns,
-                            where_constraints,
-                            body,
-                        }),
-                    )
-                },
-            )
+            .map_with(|full, e| {
+                let (((((((((attrs, is_coro), is_static), _), name), type_params), args), returns), where_constraints), body) =
+                    full;
+                (
+                    e.span(),
+                    Box::new(Expression::Function {
+                        attrs,
+                        name,
+                        is_coro: is_coro.is_some(),
+                        is_static: is_static.is_some(),
+                        type_params,
+                        args,
+                        returns,
+                        where_constraints,
+                        body,
+                    }),
+                )
+            })
     }
 
     fn yield_expr_<
@@ -1305,6 +1310,7 @@ impl<'pratt> Pratt<'pratt> {
         //    `impl_block` failing (after consuming `impl Name`) causes `choice` to
         //    retry with `typeclass_impl_block`.
         choice((
+            self.static_decl(),
             self.class(),
             self.typeclass_decl(stmt.clone()),
             self.trait_impl_for_block(stmt.clone()),
@@ -1769,32 +1775,151 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// `[pub] name: Type` — a class field declaration.
-    ///
-    /// The field type is parsed via `type_annotation()` so it can accept
-    /// generic types (`name: Option<int>`), arrays (`name: [int]`), tuples,
-    /// and `forall` annotations.
+    /// `[pub] [static|const] name: Type [= expr]` — class field declaration.
     fn field_decl(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         keyword!("pub")
             .or_not()
+            .then(
+                choice((
+                    just("static").padded().to(FieldModifier::Static),
+                    keyword!("const").to(FieldModifier::Const),
+                ))
+                .or_not(),
+            )
             .then(text::ident())
             .then_ignore(op!(":"))
             .then(self.type_annotation())
-            .map_with(|((vis, name), ty), e| {
+            .then(op!("=").ignore_then(self.expr()).or_not())
+            .map_with(|((((vis, modifier), name), ty), init), e| {
                 let visibility = if vis.is_some() {
                     Visibility::Public
                 } else {
                     Visibility::Private
                 };
+                let modifier = modifier.unwrap_or(FieldModifier::Instance);
                 let name_output: Output = (e.span(), Box::new(Expression::Identifier(name)));
                 (
                     e.span(),
-                    Box::new(Expression::Field(visibility, name_output, ty)),
+                    Box::new(Expression::Field {
+                        visibility,
+                        modifier,
+                        name: name_output,
+                        ty,
+                        init,
+                    }),
                 )
             })
+    }
+
+    /// Top-level `static let` / `static const` singleton binding.
+    fn static_decl(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        just("static")
+            .padded()
+            .ignore_then(choice((
+                keyword!("const").to(true),
+                just("let").padded().to(false),
+            )))
+            .then(text::ident().padded())
+            .then(op!(":").ignore_then(self.type_annotation()).or_not())
+            .then_ignore(op!("="))
+            .then(self.expr())
+            .then_ignore(op!(";"))
+            .map_with(|(((is_const, name), ty), init), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::StaticDecl {
+                        is_const,
+                        name,
+                        ty,
+                        init,
+                    }),
+                )
+            })
+            .labelled("static declaration")
+    }
+
+    /// `ClassName::member` — static field access (not enum constructor).
+    fn qualified_access(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        text::ident()
+            .then_ignore(just("::").padded())
+            .then(text::ident())
+            .then_ignore(choice((op!("("), op!("{"))).not())
+            .map_with(|(owner, member), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::QualifiedAccess { owner, member }),
+                )
+            })
+            .labelled("qualified access")
+    }
+
+    /// `readonly [a, b, …]` array literal.
+    fn readonly_array_atom<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        choice((
+            keyword!("readonly")
+                .ignore_then(self.array_atom(expr.clone()))
+                .map_with(|inner, e| (e.span(), Box::new(Expression::Readonly(inner)))),
+            self.array_atom(expr),
+        ))
+    }
+
+    /// `new readonly Class(args)` or `readonly new Class(args)`.
+    fn readonly_instantiate<
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    >(
+        &self,
+        expr: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        let new_then_class = keyword!("new")
+            .ignore_then(text::ident())
+            .then(self.params(expr.clone()));
+        let readonly_new = keyword!("readonly")
+            .ignore_then(new_then_class.clone())
+            .map_with(|(class, args), e| {
+                let class_output = (e.span(), Box::new(Expression::Identifier(class)));
+                (
+                    e.span(),
+                    Box::new(Expression::Readonly((
+                        e.span(),
+                        Box::new(Expression::Instantiate(class_output, args)),
+                    ))),
+                )
+            });
+        let new_readonly = keyword!("new")
+            .ignore_then(keyword!("readonly"))
+            .ignore_then(text::ident())
+            .then(self.params(expr))
+            .map_with(|(class, args), e| {
+                let class_output = (e.span(), Box::new(Expression::Identifier(class)));
+                (
+                    e.span(),
+                    Box::new(Expression::Readonly((
+                        e.span(),
+                        Box::new(Expression::Instantiate(class_output, args)),
+                    ))),
+                )
+            });
+        choice((readonly_new, new_readonly))
     }
 
     /// `trait Name<T, U: Bound> { type Elem; fn sig(…) -> ret; fn default(…) { body } }`
@@ -1814,27 +1939,7 @@ impl<'pratt> Pratt<'pratt> {
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         // A method that ends in `;` is signature-only: emit an empty Block.
-        let sig_only = self
-            .func_sig()
-            .then_ignore(op!(";"))
-            .map_with(
-                |((((((is_coro, _), name), type_params), args), returns), where_constraints), e| {
-                    let empty_block = (e.span(), Box::new(Expression::Block(vec![])));
-                    (
-                        e.span(),
-                        Box::new(Expression::Function {
-                            attrs: vec![],
-                            name,
-                            is_coro: is_coro.is_some(),
-                            type_params,
-                            args,
-                            returns,
-                            where_constraints,
-                            body: Some(empty_block),
-                        }),
-                    )
-                },
-            );
+        let sig_only = self.func_sig().then_ignore(op!(";"));
 
         // A method with a full block body (the default implementation).
         let default_method = self.func(stmt);
@@ -4257,6 +4362,46 @@ mod tests {
             find_construct(ast.1.as_ref()).expect("expected Construct(ffi::types::Int)");
         assert_eq!(enum_name, "ffi::types");
         assert_eq!(variant, "Int");
+    }
+
+    #[test]
+    fn parse_static_let_declaration() {
+        let src = "static let hits = 0;";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::StaticDecl {
+                    is_const,
+                    name,
+                    init,
+                    ..
+                } => {
+                    assert!(!*is_const);
+                    assert_eq!(*name, "hits");
+                    let init_expr = match init.1.as_ref() {
+                        Expression::Expr(inner) => inner.1.as_ref(),
+                        other => other,
+                    };
+                    match init_expr {
+                        Expression::Integer(n) => assert_eq!(*n, 0),
+                        other => panic!("expected Integer(0) init, got {:?}", other),
+                    }
+                }
+                other => panic!("expected StaticDecl, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_static_singleton_example_file() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/static_singleton.0s"
+        ))
+        .expect("read example");
+        let result = Pratt::default().parse(&src);
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
     }
 
     #[test]

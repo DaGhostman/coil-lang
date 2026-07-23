@@ -342,6 +342,7 @@ pub(crate) fn substitute_vars(ty: &Ty, mapping: &HashMap<TyVarId, TyVarId>) -> T
                 body: Box::new(substitute_vars(body, &inner)),
             }
         }
+        Ty::Readonly(inner) => Ty::Readonly(Box::new(substitute_vars(inner, mapping))),
     }
 }
 

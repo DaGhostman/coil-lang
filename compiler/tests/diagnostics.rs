@@ -1607,6 +1607,19 @@ fn record_pattern_shape_mismatch_errors() {
 }
 
 #[test]
+fn shallow_const_on_array_emits_warning() {
+    let msgs = check_messages(r#"fn main() { const a = [1, 2, 3]; }"#);
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("binding `a` is constant")
+                && m.message().contains("still mutable")
+        }),
+        "expected shallow-const warning, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn const_reassignment_errors() {
     let (_ty, msgs) = check(
         r#"

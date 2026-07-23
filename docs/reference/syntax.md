@@ -398,6 +398,7 @@ statement ::= while_stmt
 |-----------|--------|
 | `let` | `let IDENT (':' type_annotation)? ('=' expr)? ';'` |
 | `const` | `const IDENT (':' type_annotation)? '=' expr ';'` |
+| `static` | `static let IDENT …` / `static const IDENT …` (top-level only) |
 | Expression | `expr ';'` |
 | `print` | `print STRING (',' expr)* ';'` |
 | `return` | `return expr ';'` |
@@ -413,6 +414,27 @@ statement ::= while_stmt
 ### `let` desugaring
 
 `let x: int = 5;` produces a variable declaration fragment followed by initializer expression. Type-only `let x: int;` is allowed.
+
+`static let` / `static const` are top-level declarations only; initializers run in the program prologue before `main`.
+
+### Array append (`arr[] =`)
+
+Empty index `arr[]` is valid **only** as an assignment target and appends to a dynamic array:
+
+```0s
+arr[] = value;
+```
+
+Using `arr[]` as an rvalue is a compile error. See [Built-ins — Array append](built-ins.md#array-append-arr--and-len).
+
+### `readonly` expressions
+
+Prefix `readonly` on array literals or `new` seals the value against external mutation:
+
+```0s
+let xs = readonly [1, 2, 3];
+let p = readonly new Point(1, 2);
+```
 
 ---
 
