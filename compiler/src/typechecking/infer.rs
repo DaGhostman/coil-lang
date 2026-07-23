@@ -3564,16 +3564,22 @@ impl Checker {
                 }
             }
             Expression::Instantiate(class_expr, args) => {
-                let class_ty = self.infer(class_expr);
-                let resolved = apply_ty_prune(&self.subst, &class_ty);
-                let class_name = match &resolved {
-                    Ty::Con(n) => n.clone(),
-                    _ => {
-                        return self.error(
-                            ErrorCode::NotAFunction,
-                            "Cannot instantiate non-class type".to_string(),
-                            range,
-                        );
+                let class_name = if let Expression::Identifier(name) = class_expr.1.as_ref()
+                    && self.classes.contains_key(*name)
+                {
+                    (*name).to_string()
+                } else {
+                    let class_ty = self.infer(class_expr);
+                    let resolved = apply_ty_prune(&self.subst, &class_ty);
+                    match &resolved {
+                        Ty::Con(n) => n.clone(),
+                        _ => {
+                            return self.error(
+                                ErrorCode::NotAFunction,
+                                "Cannot instantiate non-class type".to_string(),
+                                range,
+                            );
+                        }
                     }
                 };
                 if let Some(fields) = self.classes.get(&class_name).cloned() {

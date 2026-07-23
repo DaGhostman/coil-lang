@@ -2331,12 +2331,34 @@ impl<const S: usize> Machine<S> {
                         // (including empty rest when `is_rest` and no extras).
                         let mut call_args = captured_args;
                         if is_rest {
-                            let arr = crate::memory::ObjArray {
-                                elements: remaining_new.to_vec(),
+                            let rest_val = if remaining_new.len() == 1 {
+                                let v = remaining_new[0];
+                                let addr = v.raw() as u64;
+                                if !v.raw().is_null()
+                                    && self.heap.contains_addr(v.raw())
+                                    && matches!(
+                                        Self::find_object_by_addr(&self.heap, addr),
+                                        Some(Object::Array(_))
+                                    )
+                                {
+                                    v
+                                } else {
+                                    let arr = crate::memory::ObjArray {
+                                        elements: remaining_new.to_vec(),
+                                    };
+                                    let (object, _) = self.heap.alloc(arr, Object::Array);
+                                    self.alloc_counter += 1;
+                                    Value::from(object.addr())
+                                }
+                            } else {
+                                let arr = crate::memory::ObjArray {
+                                    elements: remaining_new.to_vec(),
+                                };
+                                let (object, _) = self.heap.alloc(arr, Object::Array);
+                                self.alloc_counter += 1;
+                                Value::from(object.addr())
                             };
-                            let (object, _) = self.heap.alloc(arr, Object::Array);
-                            self.alloc_counter += 1;
-                            call_args.push(Value::from(object.addr()));
+                            call_args.push(rest_val);
                         } else if !remaining_new.is_empty() {
                             // Too many args for a fixed fn — drop extras defensively.
                         }

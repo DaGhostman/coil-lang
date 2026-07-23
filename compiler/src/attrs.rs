@@ -10,7 +10,7 @@ use parser::{
     SimpleSpan,
     ast::{
         AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload, ExternFunction,
-        ExternStructDecl, Expression, MatchArm, Output, Pattern, PatternField, PatternPayload,
+        ExternStructDecl, Expression, LetPattern, MatchArm, Output, Pattern, PatternField, PatternPayload,
         RecordFieldDecl, RecordFieldValue, Visibility,
     },
 };
@@ -403,15 +403,419 @@ fn is_target_args_spread(args: &Option<Vec<Output<'_>>>) -> bool {
     })
 }
 
+fn decoratee_param_names<'a>(decoratee_args: &Output<'a>) -> HashSet<&'static str> {
+    fn_param_nodes(decoratee_args)
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .collect()
+}
+
+/// Free identifiers in `expr` that must be captured by a lambda wrapping
+/// `decoratee_args` parameters (e.g. implicit `self` on methods).
+fn collect_lambda_captures<'a>(expr: &Output<'a>, decoratee_args: &Output<'a>) -> Vec<&'static str> {
+    let mut bound = decoratee_param_names(decoratee_args);
+    let mut free = HashSet::new();
+    collect_free_idents(expr, &mut bound, &mut free);
+    let mut names: Vec<&'static str> = free.into_iter().map(|n| leak(n)).collect();
+    names.sort_unstable();
+    names
+}
+
+fn should_capture_ident(name: &str) -> bool {
+    if name == "self" {
+        return true;
+    }
+    // Type / module names (Constructors, `Point`, …) are not closure captures.
+    name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+}
+
+fn collect_free_idents<'a>(
+    expr: &Output<'a>,
+    bound: &mut HashSet<&'static str>,
+    free: &mut HashSet<String>,
+) {
+    match expr.1.as_ref() {
+        Expression::Identifier(name) => {
+            if !bound.contains(*name) && should_capture_ident(name) {
+                free.insert((*name).to_string());
+            }
+        }
+        Expression::Lambda { args, captures, body } => {
+            let mut inner_bound = bound.clone();
+            for cap in captures {
+                inner_bound.insert(leak((*cap).to_string()));
+            }
+            if let Expression::Fragment(children) = args.1.as_ref() {
+                for child in children {
+                    if let Expression::Argument(_, name, _) = child.1.as_ref() {
+                        inner_bound.insert(leak((*name).to_string()));
+                    }
+                }
+            }
+            collect_free_idents(body, &mut inner_bound, free);
+        }
+        Expression::Function { args, body, .. } => {
+            let mut inner_bound = bound.clone();
+            for (_, name, _) in fn_param_nodes(args) {
+                inner_bound.insert(name);
+            }
+            if let Some(b) = body {
+                collect_free_idents(b, &mut inner_bound, free);
+            }
+        }
+        Expression::LetDestructure { pattern, rhs } => {
+            collect_free_idents(rhs, bound, free);
+            bind_let_pattern_names(pattern, bound);
+        }
+        Expression::Variable(name, init) => {
+            if let Some(rhs) = init {
+                collect_free_idents(rhs, bound, free);
+            }
+            bound.insert(leak((*name).to_string()));
+        }
+        Expression::Constant(_, init) => {
+            if let Some(rhs) = init {
+                collect_free_idents(rhs, bound, free);
+            }
+        }
+        Expression::Call { name, args } => {
+            // Callee identifiers (`len`, `print`, …) are not capture candidates.
+            if !matches!(name.1.as_ref(), Expression::Identifier(_)) {
+                collect_free_idents(name, bound, free);
+            }
+            if let Some(items) = args {
+                for a in items {
+                    collect_free_idents(a, bound, free);
+                }
+            }
+        }
+        Expression::Block(items) | Expression::Fragment(items) | Expression::Program(items) => {
+            for item in items {
+                collect_free_idents(item, bound, free);
+            }
+        }
+        Expression::If(branches) => {
+            for branch in branches {
+                collect_free_idents(branch, bound, free);
+            }
+        }
+        Expression::Match { scrutinee, arms } => {
+            collect_free_idents(scrutinee, bound, free);
+            for arm in arms {
+                collect_free_idents(&arm.body, bound, free);
+            }
+        }
+        Expression::For { init, cond, step, body } => {
+            if let Some(i) = init {
+                collect_free_idents(i, bound, free);
+            }
+            collect_free_idents(cond, bound, free);
+            if let Some(s) = step {
+                collect_free_idents(s, bound, free);
+            }
+            collect_free_idents(body, bound, free);
+        }
+        Expression::Loop { identifier, iterable, body } => {
+            if let Some(id) = identifier {
+                collect_free_idents(id, bound, free);
+            }
+            collect_free_idents(iterable, bound, free);
+            collect_free_idents(body, bound, free);
+        }
+        Expression::Return(inner)
+        | Expression::ImplicitReturn(inner)
+        | Expression::Raise(inner)
+        | Expression::Panic(inner)
+        | Expression::Yield(inner)
+        | Expression::YieldFrom(inner)
+        | Expression::Try(inner)
+        | Expression::Negate(inner)
+        | Expression::Not(inner)
+        | Expression::LogicalNot(inner)
+        | Expression::Positive(inner)
+        | Expression::Defer(inner)
+        | Expression::Dload(inner)
+        | Expression::Done(inner)
+        | Expression::Expr(inner)
+        | Expression::Group(inner)
+        | Expression::Spread(inner)
+        | Expression::Noop(inner)
+        | Expression::Member(inner) => collect_free_idents(inner, bound, free),
+        Expression::Resume(handle, send) => {
+            collect_free_idents(handle, bound, free);
+            if let Some(s) = send {
+                collect_free_idents(s, bound, free);
+            }
+        }
+        Expression::OptionalAccess(receiver, _) => collect_free_idents(receiver, bound, free),
+        Expression::Access(receiver, _) => collect_free_idents(receiver, bound, free),
+        Expression::Index(receiver, index) => {
+            collect_free_idents(receiver, bound, free);
+            collect_free_idents(index, bound, free);
+        }
+        Expression::Assignment(lhs, rhs)
+        | Expression::Coalesce(lhs, rhs)
+        | Expression::Add(lhs, rhs)
+        | Expression::Sub(lhs, rhs)
+        | Expression::Mul(lhs, rhs)
+        | Expression::Div(lhs, rhs)
+        | Expression::Mod(lhs, rhs)
+        | Expression::Pow(lhs, rhs)
+        | Expression::Shl(lhs, rhs)
+        | Expression::Shr(lhs, rhs)
+        | Expression::Xor(lhs, rhs)
+        | Expression::And(lhs, rhs)
+        | Expression::BitAnd(lhs, rhs)
+        | Expression::Or(lhs, rhs)
+        | Expression::BitOr(lhs, rhs)
+        | Expression::Eq(lhs, rhs)
+        | Expression::Neq(lhs, rhs)
+        | Expression::Leq(lhs, rhs)
+        | Expression::Geq(lhs, rhs)
+        | Expression::Le(lhs, rhs)
+        | Expression::Gt(lhs, rhs) => {
+            collect_free_idents(lhs, bound, free);
+            collect_free_idents(rhs, bound, free);
+        }
+        Expression::CompoundAssign(lhs, _, rhs) => {
+            collect_free_idents(lhs, bound, free);
+            collect_free_idents(rhs, bound, free);
+        }
+        Expression::Adjust { target: t, .. } => collect_free_idents(t, bound, free),
+        Expression::Range { start, end, .. } => {
+            collect_free_idents(start, bound, free);
+            collect_free_idents(end, bound, free);
+        }
+        Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
+            collect_free_idents(fmt, bound, free);
+            if let Some(items) = params {
+                for p in items {
+                    collect_free_idents(p, bound, free);
+                }
+            }
+        }
+        Expression::Branch(cond, body) => {
+            if let Some(c) = cond {
+                collect_free_idents(c, bound, free);
+            }
+            collect_free_idents(body, bound, free);
+        }
+        Expression::List(items)
+        | Expression::Array(items)
+        | Expression::Tuple(items)
+        | Expression::Declare(items)
+        | Expression::Invoke(items) => {
+            for item in items {
+                collect_free_idents(item, bound, free);
+            }
+        }
+        Expression::Dict(fields) => {
+            for f in fields {
+                collect_free_idents(&f.value, bound, free);
+            }
+        }
+        Expression::Construct { fields, .. } => match fields {
+            EnumConstructPayload::Unit => {}
+            EnumConstructPayload::Tuple(items) => {
+                for item in items {
+                    collect_free_idents(item, bound, free);
+                }
+            }
+            EnumConstructPayload::Record(records) => {
+                for f in records {
+                    collect_free_idents(&f.value, bound, free);
+                }
+            }
+        },
+        Expression::NamedArg(_, value) => collect_free_idents(value, bound, free),
+        Expression::ExprStatement(inner) | Expression::Statement(inner) => {
+            collect_free_idents(inner, bound, free);
+        }
+        Expression::Instantiate(receiver, type_args) => {
+            if !matches!(receiver.1.as_ref(), Expression::Identifier(_)) {
+                collect_free_idents(receiver, bound, free);
+            }
+            if let Some(items) = type_args {
+                for t in items {
+                    collect_free_idents(t, bound, free);
+                }
+            }
+        }
+        Expression::TestCase { name, body } => {
+            collect_free_idents(name, bound, free);
+            collect_free_idents(body, bound, free);
+        }
+        Expression::TypeApp { args, .. } | Expression::TypeProjection { args, .. } => {
+            for a in args {
+                collect_free_idents(a, bound, free);
+            }
+        }
+        Expression::TypeFun(lhs, rhs)
+        | Expression::TypeFnSig { params: lhs, ret: rhs } => {
+            collect_free_idents(lhs, bound, free);
+            collect_free_idents(rhs, bound, free);
+        }
+        Expression::Argument(ty, _, _) => {
+            if let Some(t) = ty {
+                collect_free_idents(t, bound, free);
+            }
+        }
+        Expression::AttrDecl { args, returns, body, .. } => {
+            collect_free_idents(args, bound, free);
+            if let Some(r) = returns {
+                collect_free_idents(r, bound, free);
+            }
+            collect_free_idents(body, bound, free);
+        }
+        Expression::TypeAlias { ty, .. } | Expression::AssocTypeDef { ty, .. } => {
+            collect_free_idents(ty, bound, free);
+        }
+        Expression::Forall { ty, .. } => collect_free_idents(ty, bound, free),
+        Expression::Module(_, child) => collect_free_idents(child, bound, free),
+        Expression::Field(_, ty, name) => {
+            collect_free_idents(ty, bound, free);
+            collect_free_idents(name, bound, free);
+        }
+        Expression::Method(_, method) => collect_free_idents(method, bound, free),
+        Expression::Class { fields, .. } => {
+            for item in fields {
+                collect_free_idents(item, bound, free);
+            }
+        }
+        Expression::Implementation { methods, .. }
+        | Expression::TypeClass { methods, .. } => {
+            for m in methods {
+                collect_free_idents(m, bound, free);
+            }
+        }
+        Expression::EnumDecl { variants, .. } => {
+            for v in variants {
+                collect_free_idents(v, bound, free);
+            }
+        }
+        Expression::TypeClassImpl { args, methods, .. } => {
+            for a in args {
+                collect_free_idents(a, bound, free);
+            }
+            for m in methods {
+                collect_free_idents(m, bound, free);
+            }
+        }
+        Expression::EnumVariant { payload, .. } => match payload {
+            EnumVariantPayload::Unit => {}
+            EnumVariantPayload::Tuple(items) => {
+                for item in items {
+                    collect_free_idents(item, bound, free);
+                }
+            }
+            EnumVariantPayload::Record(fields) => {
+                for f in fields {
+                    collect_free_idents(&f.value, bound, free);
+                }
+            }
+        },
+        Expression::ExternStruct(decl) => {
+            for (_, ty) in &decl.fields {
+                collect_free_idents(ty, bound, free);
+            }
+        }
+        Expression::ExternBlock { declarations, .. } => {
+            for d in declarations {
+                collect_free_idents(&d.args, bound, free);
+                if let Some(r) = &d.returns {
+                    collect_free_idents(r, bound, free);
+                }
+            }
+        }
+        Expression::Integer(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Bool(_)
+        | Expression::Type(_)
+        | Expression::Comment(_)
+        | Expression::Default(_)
+        | Expression::Break
+        | Expression::Continue
+        | Expression::Use { .. }
+        | Expression::AssocTypeDecl { .. } => {}
+    }
+}
+
+fn bind_let_pattern_names<'a>(pattern: &LetPattern<'a>, bound: &mut HashSet<&'static str>) {
+    match pattern {
+        LetPattern::Wildcard => {}
+        LetPattern::Binding { name } => {
+            bound.insert(leak((*name).to_string()));
+        }
+        LetPattern::Tuple(items) => {
+            for p in items {
+                bind_let_pattern_names(p, bound);
+            }
+        }
+        LetPattern::Record(fields) => {
+            for f in fields {
+                bind_let_pattern_names(&f.pattern, bound);
+            }
+        }
+    }
+}
+
+/// Build call arguments for invoking the decoratee lambda from the enclosing
+/// function's parameter names (mirrors the non-inline `Lambda` + `Call` path).
+fn forward_call_args<'a>(span: SimpleSpan, decoratee_args: &Output<'a>) -> Vec<Output<'a>> {
+    fn_param_nodes(decoratee_args)
+        .into_iter()
+        .map(|(ty, name, is_rest)| {
+            if is_rest {
+                if ty.is_none() {
+                    // Tuple rest `...xs` — spread the heterogeneous pack.
+                    at(span, Expression::Spread(ident(span, name)))
+                } else {
+                    // Homogeneous `T... xs` — pass the `[T]` pack as one argument.
+                    ident(span, name)
+                }
+            } else {
+                ident(span, name)
+            }
+        })
+        .collect()
+}
+
+/// Lower `target(...args)` to an anonymous-function call so `return` inside
+/// the decoratee body exits the lambda frame and produces a value at the
+/// call site (expression-safe, early-return-safe).
+fn make_target_invoke<'a>(
+    span: SimpleSpan,
+    target: &Output<'a>,
+    decoratee_args: &Output<'a>,
+) -> Output<'a> {
+    let captures = collect_lambda_captures(target, decoratee_args);
+    let lambda = at(
+        span,
+        Expression::Lambda {
+            args: decoratee_args.clone(),
+            captures,
+            body: target.clone(),
+        },
+    );
+    at(
+        span,
+        Expression::Call {
+            name: lambda,
+            args: Some(forward_call_args(span, decoratee_args)),
+        },
+    )
+}
+
 fn rewrite_outputs<'a>(
     items: &[Output<'a>],
     target: &Output<'a>,
     subs: &HashMap<&str, Output<'a>>,
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> Vec<Output<'a>> {
     items
         .iter()
-        .map(|e| rewrite_expr_inline(e, target, subs, forward_idents))
+        .map(|e| rewrite_expr_inline(e, target, subs, decoratee_args))
         .collect()
 }
 
@@ -419,19 +823,19 @@ fn rewrite_construct_payload<'a>(
     fields: &EnumConstructPayload<'a>,
     target: &Output<'a>,
     subs: &HashMap<&str, Output<'a>>,
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> EnumConstructPayload<'a> {
     match fields {
         EnumConstructPayload::Unit => EnumConstructPayload::Unit,
         EnumConstructPayload::Tuple(items) => {
-            EnumConstructPayload::Tuple(rewrite_outputs(items, target, subs, forward_idents))
+            EnumConstructPayload::Tuple(rewrite_outputs(items, target, subs, decoratee_args))
         }
         EnumConstructPayload::Record(records) => EnumConstructPayload::Record(
             records
                 .iter()
                 .map(|f| RecordFieldValue {
                     name: f.name,
-                    value: rewrite_expr_inline(&f.value, target, subs, forward_idents),
+                    value: rewrite_expr_inline(&f.value, target, subs, decoratee_args),
                 })
                 .collect(),
         ),
@@ -442,19 +846,19 @@ fn rewrite_enum_variant_payload<'a>(
     payload: &EnumVariantPayload<'a>,
     target: &Output<'a>,
     subs: &HashMap<&str, Output<'a>>,
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> EnumVariantPayload<'a> {
     match payload {
         EnumVariantPayload::Unit => EnumVariantPayload::Unit,
         EnumVariantPayload::Tuple(items) => {
-            EnumVariantPayload::Tuple(rewrite_outputs(items, target, subs, forward_idents))
+            EnumVariantPayload::Tuple(rewrite_outputs(items, target, subs, decoratee_args))
         }
         EnumVariantPayload::Record(fields) => EnumVariantPayload::Record(
             fields
                 .iter()
                 .map(|f| RecordFieldDecl {
                     name: f.name,
-                    value: rewrite_expr_inline(&f.value, target, subs, forward_idents),
+                    value: rewrite_expr_inline(&f.value, target, subs, decoratee_args),
                 })
                 .collect(),
         ),
@@ -465,45 +869,43 @@ fn rewrite_extern_function<'a>(
     decl: &ExternFunction<'a>,
     target: &Output<'a>,
     subs: &HashMap<&str, Output<'a>>,
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> ExternFunction<'a> {
     ExternFunction {
         name: decl.name,
         symbol: decl.symbol,
-        args: rewrite_expr_inline(&decl.args, target, subs, forward_idents),
+        args: rewrite_expr_inline(&decl.args, target, subs, decoratee_args),
         returns: decl
             .returns
             .as_ref()
-            .map(|r| rewrite_expr_inline(r, target, subs, forward_idents)),
+            .map(|r| rewrite_expr_inline(r, target, subs, decoratee_args)),
         variadic: decl.variadic,
     }
 }
 
-/// Recursively rewrite every sub-expression in `expr`, beta-reducing
-/// `target(...args)` calls to the inlined decoratee body.
+/// Recursively rewrite every sub-expression in `expr`, lowering
+/// `target(...args)` to a lambda call over the decoratee body.
 fn rewrite_expr_inline<'a>(
     expr: &Output<'a>,
     target: &Output<'a>,
     subs: &HashMap<&str, Output<'a>>,
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> Output<'a> {
     let span = expr.0;
-    let rw = |e: &Output<'a>| rewrite_expr_inline(e, target, subs, forward_idents);
+    let rw = |e: &Output<'a>| rewrite_expr_inline(e, target, subs, decoratee_args);
     match expr.1.as_ref() {
         Expression::Call { name, args } => {
             if let Expression::Identifier(callee) = name.1.as_ref()
                 && *callee == "target"
                 && is_target_args_spread(args)
             {
-                // Decoratee parameters are already in scope on the
-                // expanded entry function — beta-reduce the call.
-                return target.clone();
+                return make_target_invoke(span, target, decoratee_args);
             }
             at(
                 span,
                 Expression::Call {
                     name: rw(name),
-                    args: args.as_ref().map(|items| rewrite_outputs(items, target, subs, forward_idents)),
+                    args: args.as_ref().map(|items| rewrite_outputs(items, target, subs, decoratee_args)),
                 },
             )
         }
@@ -606,7 +1008,7 @@ fn rewrite_expr_inline<'a>(
         Expression::Print(fmt, params) | Expression::Format(fmt, params) => {
             let params = params
                 .as_ref()
-                .map(|items| rewrite_outputs(items, target, subs, forward_idents));
+                .map(|items| rewrite_outputs(items, target, subs, decoratee_args));
             match expr.1.as_ref() {
                 Expression::Print(..) => at(span, Expression::Print(rw(fmt), params)),
                 Expression::Format(..) => at(span, Expression::Format(rw(fmt), params)),
@@ -672,17 +1074,17 @@ fn rewrite_expr_inline<'a>(
         | Expression::Fragment(items)
         | Expression::Declare(items)
         | Expression::Invoke(items) => {
-            at(span, clone_expr_list(expr.1.as_ref(), rewrite_outputs(items, target, subs, forward_idents)))
+            at(span, clone_expr_list(expr.1.as_ref(), rewrite_outputs(items, target, subs, decoratee_args)))
         }
         Expression::Block(items) => {
             let items = items
                 .iter()
-                .map(|s| rewrite_stmt_inline(s, target, subs, forward_idents))
+                .map(|s| rewrite_stmt_inline(s, target, subs, decoratee_args))
                 .collect();
             at(span, Expression::Block(items))
         }
         Expression::Program(items) => {
-            at(span, Expression::Program(rewrite_outputs(items, target, subs, forward_idents)))
+            at(span, Expression::Program(rewrite_outputs(items, target, subs, decoratee_args)))
         }
         Expression::Dict(fields) => {
             let fields = fields
@@ -703,7 +1105,7 @@ fn rewrite_expr_inline<'a>(
             Expression::Construct {
                 enum_name: *enum_name,
                 variant_name: *variant_name,
-                fields: rewrite_construct_payload(fields, target, subs, forward_idents),
+                fields: rewrite_construct_payload(fields, target, subs, decoratee_args),
             },
         ),
         Expression::Variable(name, init) => at(
@@ -736,7 +1138,7 @@ fn rewrite_expr_inline<'a>(
             span,
             Expression::TypeApp {
                 name: *name,
-                args: rewrite_outputs(args, target, subs, forward_idents),
+                args: rewrite_outputs(args, target, subs, decoratee_args),
             },
         ),
         Expression::TypeProjection { owner, name, args } => at(
@@ -744,7 +1146,7 @@ fn rewrite_expr_inline<'a>(
             Expression::TypeProjection {
                 owner: *owner,
                 name: *name,
-                args: rewrite_outputs(args, target, subs, forward_idents),
+                args: rewrite_outputs(args, target, subs, decoratee_args),
             },
         ),
         Expression::TypeFun(arg, ret) => at(span, Expression::TypeFun(rw(arg), rw(ret))),
@@ -837,7 +1239,7 @@ fn rewrite_expr_inline<'a>(
                 rw(receiver),
                 type_args
                     .as_ref()
-                    .map(|items| rewrite_outputs(items, target, subs, forward_idents)),
+                    .map(|items| rewrite_outputs(items, target, subs, decoratee_args)),
             ),
         ),
         Expression::TestCase { name, body } => at(
@@ -863,7 +1265,7 @@ fn rewrite_expr_inline<'a>(
                 attrs: attrs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
-                fields: rewrite_outputs(fields, target, subs, forward_idents),
+                fields: rewrite_outputs(fields, target, subs, decoratee_args),
             },
         ),
         Expression::Implementation {
@@ -877,7 +1279,7 @@ fn rewrite_expr_inline<'a>(
                 what: *what,
                 owner: *owner,
                 type_params: type_params.clone(),
-                methods: rewrite_outputs(methods, target, subs, forward_idents),
+                methods: rewrite_outputs(methods, target, subs, decoratee_args),
             },
         ),
         Expression::EnumDecl {
@@ -891,14 +1293,14 @@ fn rewrite_expr_inline<'a>(
                 attrs: attrs.clone(),
                 name: *name,
                 type_params: type_params.clone(),
-                variants: rewrite_outputs(variants, target, subs, forward_idents),
+                variants: rewrite_outputs(variants, target, subs, decoratee_args),
             },
         ),
         Expression::EnumVariant { name, payload } => at(
             span,
             Expression::EnumVariant {
                 name: *name,
-                payload: rewrite_enum_variant_payload(payload, target, subs, forward_idents),
+                payload: rewrite_enum_variant_payload(payload, target, subs, decoratee_args),
             },
         ),
         Expression::ExternStruct(decl) => at(
@@ -921,7 +1323,7 @@ fn rewrite_expr_inline<'a>(
                 library: library.clone(),
                 declarations: declarations
                     .iter()
-                    .map(|d| rewrite_extern_function(d, target, subs, forward_idents))
+                    .map(|d| rewrite_extern_function(d, target, subs, decoratee_args))
                     .collect(),
             },
         ),
@@ -934,7 +1336,7 @@ fn rewrite_expr_inline<'a>(
             Expression::TypeClass {
                 name: *name,
                 type_params: type_params.clone(),
-                methods: rewrite_outputs(methods, target, subs, forward_idents),
+                methods: rewrite_outputs(methods, target, subs, decoratee_args),
             },
         ),
         Expression::TypeClassImpl {
@@ -945,11 +1347,11 @@ fn rewrite_expr_inline<'a>(
             span,
             Expression::TypeClassImpl {
                 class: *class,
-                args: rewrite_outputs(args, target, subs, forward_idents),
-                methods: rewrite_outputs(methods, target, subs, forward_idents),
+                args: rewrite_outputs(args, target, subs, decoratee_args),
+                methods: rewrite_outputs(methods, target, subs, decoratee_args),
             },
         ),
-        Expression::Statement(_inner) => rewrite_stmt_inline(expr, target, subs, forward_idents),
+        Expression::Statement(_inner) => rewrite_stmt_inline(expr, target, subs, decoratee_args),
         Expression::ExprStatement(inner) => at(span, Expression::ExprStatement(rw(inner))),
     }
 }
@@ -1021,16 +1423,16 @@ fn rewrite_stmt_inline<'a>(
     stmt: &Output<'a>,
     target: &Output<'a>,
     subs: &HashMap<&str, Output<'a>>,
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> Output<'a> {
     if let Expression::Statement(inner) = stmt.1.as_ref() {
         let span = stmt.0;
         at(
             span,
-            Expression::Statement(rewrite_expr_inline(inner, target, subs, forward_idents)),
+            Expression::Statement(rewrite_expr_inline(inner, target, subs, decoratee_args)),
         )
     } else {
-        rewrite_expr_inline(stmt, target, subs, forward_idents)
+        rewrite_expr_inline(stmt, target, subs, decoratee_args)
     }
 }
 
@@ -1039,13 +1441,13 @@ fn inline_attr_body<'a>(
     target: Output<'a>,
     extras: &[Output<'a>],
     extra_param_names: &[String],
-    forward_idents: &[Output<'a>],
+    decoratee_args: &Output<'a>,
 ) -> Output<'a> {
     let mut subs = HashMap::new();
     for (name, expr) in extra_param_names.iter().zip(extras.iter()) {
         subs.insert(name.as_str(), expr.clone());
     }
-    rewrite_expr_inline(attr_body, &target, &subs, forward_idents)
+    rewrite_expr_inline(attr_body, &target, &subs, decoratee_args)
 }
 
 fn expand_function_user_attrs<'a>(
@@ -1094,7 +1496,7 @@ fn expand_function_user_attrs<'a>(
                 wrapped,
                 &extras,
                 &extra_names,
-                &[],
+                args,
             );
         } else {
             let params = fn_param_nodes(args);

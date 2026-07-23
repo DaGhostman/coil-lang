@@ -4608,8 +4608,9 @@ impl Compiler {
 
                 for cap in captures {
                     if let Some(slot) = self.lookup_slot(cap) {
-                        self.bytecode
-                            .push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
+                        bytecode.push(
+                            Byte::new(Instruction::LOAD).with_operand_u32(slot),
+                        );
                     } else {
                         let mut message = Message::error(
                             ErrorCode::UnknownValue,
@@ -4623,19 +4624,11 @@ impl Compiler {
                         self.messages.push(message);
                     }
                 }
-                self.bytecode
-                    .push(Byte::new(Instruction::CONST).with_const_inline(0));
-                self.bytecode.push(
-                    Byte::new(Instruction::CodePtr).with_operand_u32(entry),
-                );
-                self.bytecode.push(
-                    Byte::new(Instruction::MakeFn).with_operand_u32(make_fn_operand(
-                        captures.len() as u32,
-                        0,
-                        arity as u32,
-                        is_rest,
-                    )),
-                );
+                bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+                bytecode.push(Byte::new(Instruction::CodePtr).with_operand_u32(entry));
+                bytecode.push(Byte::new(Instruction::MakeFn).with_operand_u32(
+                    make_fn_operand(captures.len() as u32, 0, arity as u32, is_rest),
+                ));
             }
             Expression::Expr(child) | Expression::Statement(child) => {
                 bytecode.append(&mut self.do_compile(child))
