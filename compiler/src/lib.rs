@@ -1,9 +1,10 @@
 mod block_builder;
-mod derive;
+mod attrs;
 mod manifest;
 mod monomorphize;
 mod peephole;
 mod pipeline;
+mod strip_tests;
 mod typechecking;
 
 use std::{
@@ -617,6 +618,12 @@ pub struct Compiler {
     /// Active loop patchers. Break/continue emit through the innermost builder.
     loop_bbs: Vec<BlockBuilder>,
 
+    /// Class name → decorated constructor function name (from attr expansion).
+    decorated_class_ctors: HashMap<String, String>,
+
+    /// Name of the function currently being codegen'd (for ctor/Instantiate routing).
+    active_fn_name: Option<String>,
+
     /// True while compiling an `impl` method — Function resets locals
     /// and reserves slot 0 for `self`.
     compiling_method: bool,
@@ -631,6 +638,11 @@ pub struct Compiler {
 
     /// True when a user-written `fn main` was emitted this compile.
     user_main_defined: bool,
+
+    /// When false (default), harness `test("…")` blocks and `#[test]` functions
+    /// are stripped before typecheck/codegen. Set true for `zero-script test`
+    /// or `compile --include-tests`.
+    include_tests: bool,
 
     /// Local variable names that hold an `ObjPolyFn` heap pointer
     /// (i.e. `let f = some_generic_fn;`). When these are invoked via
@@ -682,10 +694,13 @@ impl Default for Compiler {
             temp_counter: 0,
             loop_stack: Vec::new(),
             loop_bbs: Vec::new(),
+            decorated_class_ctors: HashMap::new(),
+            active_fn_name: None,
             compiling_method: false,
             compiling_result_mode: false,
             test_cases: Vec::new(),
             user_main_defined: false,
+            include_tests: false,
             polyfn_vars: HashSet::new(),
             polyfn_sources: HashMap::new(),
             mono_plan: MonoPlan::default(),
@@ -703,6 +718,15 @@ impl Compiler {
     /// Harness test cases emitted this compile: `(description, fn offset)`.
     pub fn test_cases(&self) -> &[(String, u32)] {
         &self.test_cases
+    }
+
+    /// Include harness `test("…")` / `#[test]` declarations in the compile unit.
+    pub fn set_include_tests(&mut self, include: bool) {
+        self.include_tests = include;
+    }
+
+    pub fn include_tests(&self) -> bool {
+        self.include_tests
     }
 
     pub fn intern_constant(&mut self, value: u64) -> u32 {
@@ -1066,6 +1090,88 @@ impl Compiler {
         }
     }
 
+    /// Flatten `...expr` spread nodes for codegen using inferred types.
+    fn flatten_call_args_for_emit<'a>(&self, args: &[Output<'a>]) -> Vec<Output<'a>> {
+        use crate::typechecking::subst::apply_ty_prune;
+        use crate::typechecking::ty::{ArrayLength, Ty};
+        let mut out = Vec::new();
+        for arg in args {
+            if let Expression::Spread(inner) = arg.1.as_ref() {
+                if let Expression::Array(items) = inner.1.as_ref() {
+                    for i in 0..items.len() {
+                        let span = inner.0;
+                        out.push((
+                            span,
+                            Box::new(Expression::Index(
+                                inner.clone(),
+                                (span, Box::new(Expression::Integer(i as i64))),
+                            )),
+                        ));
+                    }
+                    continue;
+                }
+                if let Expression::Tuple(items) = inner.1.as_ref() {
+                    for i in 0..items.len() {
+                        let span = inner.0;
+                        out.push((
+                            span,
+                            Box::new(Expression::Index(
+                                inner.clone(),
+                                (span, Box::new(Expression::Integer(i as i64))),
+                            )),
+                        ));
+                    }
+                    continue;
+                }
+                let ty = self
+                    .codegen_expr_ty(inner)
+                    .or_else(|| {
+                        self.checker
+                            .lookup_for_codegen_span(inner.0.start, inner.0.end)
+                            .map(|t| apply_ty_prune(self.checker.subst(), &t))
+                    });
+                let Some(ty) = ty else {
+                    out.push(arg.clone());
+                    continue;
+                };
+                let resolved = apply_ty_prune(self.checker.subst(), &ty);
+                match resolved {
+                    Ty::Tuple(elems) => {
+                        for i in 0..elems.len() {
+                            let span = inner.0;
+                            out.push((
+                                span,
+                                Box::new(Expression::Index(
+                                    inner.clone(),
+                                    (span, Box::new(Expression::Integer(i as i64))),
+                                )),
+                            ));
+                        }
+                    }
+                    Ty::Array {
+                        length: ArrayLength::Static(n),
+                        ..
+                    } => {
+                        for i in 0..n {
+                            let span = inner.0;
+                            out.push((
+                                span,
+                                Box::new(Expression::Index(
+                                    inner.clone(),
+                                    (span, Box::new(Expression::Integer(i as i64))),
+                                )),
+                            ));
+                        }
+                    }
+                    _ => out.push(arg.clone()),
+                }
+            } else {
+                out.push(arg.clone());
+            }
+        }
+        out
+    }
+
     /// Split call args into fixed formals + rest elements (P4).
     ///
     /// Returns `(fixed, rest_elems, pack_rest)`. When `pack_rest` is true,
@@ -1073,22 +1179,19 @@ impl Compiler {
     fn split_call_args_for_rest<'a>(
         &self,
         fn_name: &str,
-        args: &'a [Output<'a>],
-    ) -> (Vec<&'a Output<'a>>, Vec<&'a Output<'a>>, bool) {
+        args: &[Output<'a>],
+    ) -> (Vec<Output<'a>>, Vec<Output<'a>>, bool) {
+        let args = self.flatten_call_args_for_emit(args);
         let fn_name = strip_overload_key(fn_name);
         let has_named = args
             .iter()
             .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
         let has_rest = self.checker.fn_has_rest(fn_name);
         if !has_named && !has_rest {
-            return (args.iter().collect(), Vec::new(), false);
+            return (args, Vec::new(), false);
         }
         let Some(param_names) = self.checker.fn_param_names(fn_name) else {
-            return (
-                args.iter().map(Self::call_arg_value).collect(),
-                Vec::new(),
-                false,
-            );
+            return (args, Vec::new(), false);
         };
         let fixed_count = if has_rest {
             param_names.len().saturating_sub(1)
@@ -1100,24 +1203,21 @@ impl Compiler {
         } else {
             None
         };
-        let mut slots: Vec<Option<&'a Output<'a>>> = vec![None; fixed_count];
+        let mut slots: Vec<Option<Output<'a>>> = vec![None; fixed_count];
         let mut rest = Vec::new();
         let mut next_pos = 0usize;
-        for arg in args {
+        for arg in &args {
             match arg.1.as_ref() {
                 Expression::NamedArg(name, value) => {
-                    // Typechecker rejects naming the rest param; recover by
-                    // packing the value into the rest array so CALL arity
-                    // stays aligned with the callee.
                     if rest_name == Some(*name) {
-                        rest.push(value);
+                        rest.push(value.clone());
                         continue;
                     }
                     if let Some(idx) = param_names[..fixed_count]
                         .iter()
                         .position(|p| p == *name)
                     {
-                        slots[idx] = Some(value);
+                        slots[idx] = Some(value.clone());
                     }
                 }
                 _ => {
@@ -1125,10 +1225,10 @@ impl Compiler {
                         next_pos += 1;
                     }
                     if next_pos < fixed_count {
-                        slots[next_pos] = Some(arg);
+                        slots[next_pos] = Some(arg.clone());
                         next_pos += 1;
                     } else if has_rest {
-                        rest.push(arg);
+                        rest.push(arg.clone());
                         next_pos += 1;
                     } else {
                         next_pos += 1;
@@ -1149,6 +1249,22 @@ impl Compiler {
         }
     }
 
+    fn call_arg_value_owned<'a>(arg: &'a Output<'a>) -> Output<'a> {
+        match arg.1.as_ref() {
+            Expression::NamedArg(_, v) => v.clone(),
+            _ => arg.clone(),
+        }
+    }
+
+    /// Consume pre-walk IDs for `Spread` nodes (flattened at call sites).
+    fn consume_spread_emit_ids(&mut self, args: &[Output<'_>]) {
+        for arg in args {
+            if matches!(arg.1.as_ref(), Expression::Spread(_)) {
+                let _ = self.next_emit_id();
+            }
+        }
+    }
+
     /// Emit value args for a call, packing rest into `MakeArray` when needed.
     /// Returns the CALL arity (fixed + 1 if rest packed).
     fn emit_call_args_with_rest(
@@ -1158,6 +1274,7 @@ impl Compiler {
         bytecode: &mut Vec<Byte>,
         box_generic: bool,
     ) -> u32 {
+        self.consume_spread_emit_ids(args);
         let (fixed, rest, pack_rest) = self.split_call_args_for_rest(fn_name, args);
 
         for arg in &fixed {
@@ -1177,9 +1294,15 @@ impl Compiler {
                     }
                 }
             }
-            bytecode.push(
-                Byte::new(Instruction::MakeArray).with_operand_u32(rest.len() as u32),
-            );
+            if self.checker.fn_tuple_rest(fn_name) {
+                bytecode.push(
+                    Byte::new(Instruction::MakeTuple).with_operand_u32(rest.len() as u32),
+                );
+            } else {
+                bytecode.push(
+                    Byte::new(Instruction::MakeArray).with_operand_u32(rest.len() as u32),
+                );
+            }
             return (fixed.len() + 1) as u32;
         }
         fixed.len() as u32
@@ -2494,6 +2617,10 @@ impl Compiler {
             self.bytecode.append(&mut bc);
             return;
         };
+        let Some(body) = body else {
+            self.consume_function_signature_output(method);
+            return;
+        };
 
         self.functions
             .insert(qualified.clone(), self.bytecode.len());
@@ -2680,9 +2807,12 @@ impl Compiler {
         qualified: &str,
         type_params: &[parser::ast::TypeParam<'compiler>],
         args: &Output<'compiler>,
-        body: &Output<'compiler>,
+        body: Option<&Output<'compiler>>,
         source_name: &str,
     ) {
+        let Some(body) = body else {
+            return;
+        };
         if type_params.is_empty() || self.mono_plan.is_empty() {
             return;
         }
@@ -2773,6 +2903,7 @@ impl Compiler {
         if let Expression::Fragment(children) = args.1.as_ref() {
             for child in children {
                 if let Expression::Argument(ty, name, is_rest) = child.1.as_ref()
+                    && let Some(ty) = ty
                     && let Expression::Type(tp_name) | Expression::Identifier(tp_name) =
                         ty.1.as_ref()
                     && let Some(concrete) = type_param_tys.get(tp_name)
@@ -2810,7 +2941,7 @@ impl Compiler {
                 // type param. Fallback: skip mono (shared body).
                 return None;
             }
-            let elem = monomorphize::ground_type_name(&self.checker, rest[0])?;
+            let elem = monomorphize::ground_type_name(&self.checker, &rest[0])?;
             for arg in rest.iter().skip(1) {
                 if monomorphize::ground_type_name(&self.checker, arg)? != elem {
                     return None;
@@ -2829,8 +2960,10 @@ impl Compiler {
         if let Expression::Function { args, body, .. } = method.1.as_ref() {
             let mut args_bc = self.do_compile(args);
             self.bytecode.append(&mut args_bc);
-            let mut body_bc = self.do_compile(body);
-            self.bytecode.append(&mut body_bc);
+            if let Some(body) = body {
+                let mut body_bc = self.do_compile(body);
+                self.bytecode.append(&mut body_bc);
+            }
         } else {
             let mut bc = self.do_compile(method);
             self.bytecode.append(&mut bc);
@@ -2979,7 +3112,7 @@ impl Compiler {
 
     /// Synthesize the packed rest-array type for a call's trailing args
     /// (`[T]` / `[T; N]`), mirroring typechecker `infer_and_reorder_call_args`.
-    fn synthesize_rest_array_ty(&self, rest: &[&Output<'_>]) -> crate::typechecking::Ty {
+    fn synthesize_rest_array_ty(&self, rest: &[Output<'_>]) -> crate::typechecking::Ty {
         use crate::typechecking::ty::{array, array_fixed};
         let mut elem: Option<crate::typechecking::Ty> = None;
         for arg in rest {
@@ -4304,6 +4437,7 @@ impl Compiler {
                 self.polyfn_sources = saved_polyfn_sources;
             }
             Expression::Function {
+                attrs,
                 name,
                 is_coro,
                 type_params,
@@ -4312,6 +4446,9 @@ impl Compiler {
                 where_constraints: _,
                 body,
             } => {
+                let Some(body) = body else {
+                    return vec![];
+                };
                 let qualified = if self.namespace.is_empty() {
                     name.to_string()
                 } else {
@@ -4325,9 +4462,6 @@ impl Compiler {
                     .or_default()
                     .push(name.to_string());
                 let (fixed_arity, has_rest) = fn_arity_from_args(args);
-                // Key every member of an overload set (top-level or
-                // `Owner::method`) so CALL sites can resolve via
-                // `selected_overload_at`.
                 let table_key = if self.checker.is_overloaded(name)
                     || self.checker.is_overloaded(&qualified)
                 {
@@ -4335,7 +4469,11 @@ impl Compiler {
                 } else {
                     qualified.clone()
                 };
-                self.functions.insert(table_key, self.bytecode.len());
+                let fn_offset = self.bytecode.len() as u32;
+                self.functions.insert(table_key, fn_offset as usize);
+                if let Some(desc) = parser::ast::attr_test_desc(attrs, name) {
+                    self.test_cases.push((desc, fn_offset));
+                }
                 if *is_coro {
                     self.coroutine_fns.insert(qualified.clone());
                 }
@@ -4375,7 +4513,10 @@ impl Compiler {
 
                 self.bytecode.append(&mut a);
 
+                let prev_active = self.active_fn_name.take();
+                self.active_fn_name = Some(name.to_string());
                 let mut c = self.do_compile(body);
+                self.active_fn_name = prev_active;
                 self.bytecode.append(&mut c);
 
                 self.context.defers.iter().for_each(|offset| {
@@ -4406,7 +4547,7 @@ impl Compiler {
                     &qualified,
                     type_params,
                     args,
-                    body,
+                    Some(body),
                     name,
                 );
             }
@@ -4738,6 +4879,30 @@ impl Compiler {
             }
             Expression::Instantiate(class, args) => {
                 let name = self.resolve_variable_checked(class);
+                let ctor_name = self
+                    .decorated_class_ctors
+                    .get(&name)
+                    .filter(|ctor| self.active_fn_name.as_deref() != Some(ctor.as_str()))
+                    .cloned();
+                if let Some(ctor) = ctor_name {
+                    let arg_slice = args.as_deref().unwrap_or(&[]);
+                    if let Some(offset) = self.functions.get(ctor.as_str()).copied() {
+                        let arity =
+                            self.emit_call_args_with_rest(&ctor, arg_slice, &mut bytecode, false);
+                        bytecode.push(
+                            Byte::new(Instruction::CALL)
+                                .with_call_packed(arity, offset as u32),
+                        );
+                    } else {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!(
+                                "Decorated constructor `{ctor}` for class `{name}` was not found"
+                            ),
+                            class.0.into_range(),
+                        ));
+                    }
+                } else {
                 let fields = self.context.classes.get(&name).cloned().unwrap_or_default();
                 bytecode.push(Byte::new(Instruction::INIT).with_operand_u32(fields.len() as u32));
                 // SetField stack order is value, target, name (same as
@@ -4756,6 +4921,7 @@ impl Compiler {
                     }
                 }
                 bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_inst));
+                }
             }
             Expression::Adjust { op, prefix, target } => {
                 self.emit_adjust(&mut bytecode, target, *op, *prefix);
@@ -5206,6 +5372,20 @@ impl Compiler {
                         self.messages.push(message);
                     }
                 } else {
+                    if matches!(name.1.as_ref(), Expression::Lambda { .. }) {
+                        let arg_slice = args.as_deref().unwrap_or(&[]);
+                        self.consume_spread_emit_ids(arg_slice);
+                        let flat_args = self.flatten_call_args_for_emit(arg_slice);
+                        for arg in &flat_args {
+                            bytecode.append(&mut self.do_compile(arg));
+                        }
+                        bytecode.append(&mut self.do_compile(name));
+                        bytecode.push(
+                            Byte::new(Instruction::CallIndirect)
+                                .with_operand_u32(flat_args.len() as u32),
+                        );
+                        return bytecode;
+                    }
                     if let Expression::Identifier(raw) = name.1.as_ref() {
                         if *raw == "push" {
                             let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
@@ -5382,6 +5562,8 @@ impl Compiler {
                         let is_generic =
                             self.checker.is_generic_fn(&lookup_name) && mono_offset.is_none();
                         let arg_slice = args.as_deref().unwrap_or(&[]);
+                        self.consume_spread_emit_ids(arg_slice);
+                        let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
 
                         // Partial application → MakeFn (not CALL).
                         let (fa, is_rest) = self
@@ -5400,7 +5582,8 @@ impl Compiler {
                             .unwrap_or((0, false));
                         let fill_mask = self.checker.partial_fill_at(span.start, span.end).or_else(
                             || {
-                                let argc = arg_slice.len();
+                                // Spread args count as their expanded arity, not one slot.
+                                let argc = flat_arg_slice.len();
                                 if !is_rest && fa > 0 && argc < fa {
                                     Some((1u32 << argc).wrapping_sub(1))
                                 } else {
@@ -5410,8 +5593,8 @@ impl Compiler {
                         );
                         if let Some(mask) = fill_mask {
                             // Emit filled values in declaration order (already
-                            // the order of `arg_slice` after named reorder at TC).
-                            for arg in arg_slice {
+                            // the order of `flat_arg_slice` after named reorder at TC).
+                            for arg in &flat_arg_slice {
                                 let value = match arg.1.as_ref() {
                                     Expression::NamedArg(_, v) => v,
                                     _ => arg,
@@ -5533,22 +5716,22 @@ impl Compiler {
                         // (`let f = show` / `return show`), rank-n parameter, or
                         // a PolyFn returned from another call. Emit args, optional
                         // application dictionaries, then CallIndirect.
-                        let value_arity =
-                            args.as_ref().map(|items| items.len()).unwrap_or(0) as u32;
+                        let arg_slice = args.as_deref().unwrap_or(&[]);
+                        self.consume_spread_emit_ids(arg_slice);
+                        let flat_args = self.flatten_call_args_for_emit(arg_slice);
+                        let value_arity = flat_args.len() as u32;
                         let mut arg_tys = Vec::new();
                         let polyfn_source = self.polyfn_sources.get(&identifier).cloned();
                         // Box for PolyFn locals — including those assigned from a
                         // call that returns a captured PolyFn (no polyfn_sources
                         // entry). Mono ObjFn / partials / lambdas stay unboxed.
                         let needs_arg_box = self.local_call_needs_arg_boxing(&identifier);
-                        if let Some(arg_list) = args {
-                            for arg in arg_list {
-                                self.append_with_existential_pack(&mut bytecode, arg);
-                                if needs_arg_box {
-                                    if let Some(arg_ty) = self.codegen_expr_ty(arg) {
-                                        Self::emit_box_if_needed(&mut bytecode, &arg_ty);
-                                        arg_tys.push(arg_ty);
-                                    }
+                        for arg in &flat_args {
+                            self.append_with_existential_pack(&mut bytecode, arg);
+                            if needs_arg_box {
+                                if let Some(arg_ty) = self.codegen_expr_ty(arg) {
+                                    Self::emit_box_if_needed(&mut bytecode, &arg_ty);
+                                    arg_tys.push(arg_ty);
                                 }
                             }
                         }
@@ -5612,12 +5795,13 @@ impl Compiler {
             }
             Expression::Argument(ty, n, _is_rest) => {
                 let _ = self.context.variables.intern(n.to_string());
-                if matches!(ty.1.as_ref(), Expression::Forall { .. }) {
+                if ty.as_ref().is_some_and(|t| matches!(t.1.as_ref(), Expression::Forall { .. })) {
                     self.polyfn_vars.insert(n.to_string());
                 }
                 // bytecode.push(Byte::new(Instruction::LOAD)
             }
-            Expression::Type(_) | Expression::TypeFun(_, _) | Expression::Forall { .. } => {
+            Expression::Type(_) | Expression::TypeFun(_, _) | Expression::TypeFnSig { .. }
+            | Expression::Forall { .. } => {
                 // Type names appear as metadata inside enum
                 // declarations (e.g. `Some(int)` wraps `int` as
                 // an `Expression::Type`). The typechecker has
@@ -5640,7 +5824,9 @@ impl Compiler {
                             body,
                             ..
                         } => {
-                            let has_default = !matches!(body.1.as_ref(), Expression::Block(items) if items.is_empty());
+                            let has_default = body.as_ref().is_some_and(|b| {
+                                !matches!(b.1.as_ref(), Expression::Block(items) if items.is_empty())
+                            });
                             if has_default {
                                 let fqn =
                                     crate::typechecking::generics::Generics::default_method_fqn(
@@ -6491,15 +6677,18 @@ impl Compiler {
                         .push(Byte::new(Instruction::LOAD).with_operand_u32(lib_slot));
                     // Push the function name (string literal).
                     let span: SimpleSpan = (0..0).into();
+                    let sym = decl.symbol.unwrap_or(decl.name);
                     let name_expr: parser::ast::Output =
-                        (span, Box::new(parser::ast::Expression::String(decl.name)));
+                        (span, Box::new(parser::ast::Expression::String(sym)));
                     let mut name_bc = self.do_compile(&name_expr);
                     self.bytecode.append(&mut name_bc);
                     // Push each arg type as a CONST tag.
                     let mut arg_type_tags: Vec<u32> = Vec::new();
                     if let Expression::Fragment(items) = decl.args.1.as_ref() {
                         for arg in items {
-                            if let Expression::Argument(type_expr, _param_name, _) = arg.1.as_ref() {
+                            if let Expression::Argument(type_expr, _param_name, _) = arg.1.as_ref()
+                                && let Some(type_expr) = type_expr
+                            {
                                 if let Some((tag, aux)) =
                                     ffi_type_tag_from_output(&self.checker, type_expr)
                                 {
@@ -7522,6 +7711,10 @@ impl Compiler {
                     let _ = self.do_compile(arg);
                 }
             }
+            Expression::Spread(_) => {
+                // Call sites flatten spread before emission; this arm keeps
+                // ID alignment if a spread node is reached defensively.
+            }
 
             _expr => {
                 let mut message = Message::error(
@@ -7564,11 +7757,15 @@ impl Compiler {
         self.mono_codegen_var_types.clear();
         self.test_cases.clear();
         self.user_main_defined = false;
+        if !self.include_tests {
+            strip_tests::strip_test_declarations(ast);
+        }
         self.checker.set_current_module(module);
         // Expand `derive` clauses to synthetic `impl` AST before the
         // ID pre-walk / typecheck (see `derive::expand_program`).
-        let derive_msgs = derive::expand_program(ast);
-        self.messages.extend(derive_msgs);
+        let expand = attrs::expand_program(ast);
+        self.messages.extend(expand.messages);
+        self.decorated_class_ctors = expand.decorated_class_ctors;
         let _program_ty = self.checker.check_program(ast);
         self.emit_builtin_dict_thunks();
         // Builtin dictionary thunks are emitted immediately after the
@@ -7678,6 +7875,7 @@ test("two") { assert(true)?; }
             )
             .expect("parse failed");
         let mut compiler = Compiler::default();
+        compiler.set_include_tests(true);
         let bc = compiler.compile("", &mut ast);
 
         assert_eq!(compiler.test_cases().len(), 2);

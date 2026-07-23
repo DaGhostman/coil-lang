@@ -1,11 +1,13 @@
-// derive Ord / Eq / Show on enums.
-enum Color derive Ord, Eq {
+// #[derive] Ord / Eq / Show on enums.
+#[derive(Ord, Eq)]
+enum Color {
     Red,
     Blue,
     Green,
 }
 
-enum Flag derive Eq {
+#[derive(Eq)]
+enum Flag {
     Off,
     On,
 }

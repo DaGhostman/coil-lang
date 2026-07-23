@@ -125,7 +125,9 @@ fn collect_generic_functions(
                     sigs.insert(format!("{module}::{name}"), sig);
                 }
             }
-            collect_generic_functions(module, body, sigs);
+            if let Some(body) = body {
+                collect_generic_functions(module, body, sigs);
+            }
         }
         _ => walk_children(node, &mut |child| {
             collect_generic_functions(module, child, sigs)
@@ -148,7 +150,7 @@ fn signature_from_function(type_params: &[TypeParam<'_>], args: &Output) -> Gene
     if let Expression::Fragment(children) = args.1.as_ref() {
         for child in children {
             if let Expression::Argument(ty, _, is_rest) = child.1.as_ref() {
-                param_type_params.push(type_param_ref_index(ty, &type_param_names));
+                param_type_params.push(ty.as_ref().and_then(|t| type_param_ref_index(t, &type_param_names)));
                 param_is_rest.push(*is_rest);
             }
         }
@@ -626,7 +628,9 @@ where
             if let Some(returns) = returns {
                 f(returns);
             }
-            f(body);
+            if let Some(body) = body {
+                f(body);
+            }
         }
         Expression::Lambda { args, body, .. } => {
             f(args);
@@ -723,6 +727,18 @@ where
         | Expression::Forall { .. } => {}
         Expression::LetDestructure { rhs, .. } => f(rhs),
         Expression::NamedArg(_, value) => f(value),
+        Expression::Spread(inner) => f(inner),
+        Expression::TypeFnSig { params, ret } => {
+            f(params);
+            f(ret);
+        }
+        Expression::AttrDecl { args, returns, body, .. } => {
+            f(args);
+            if let Some(returns) = returns {
+                f(returns);
+            }
+            f(body);
+        }
     }
 }
 

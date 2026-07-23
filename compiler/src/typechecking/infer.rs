@@ -205,6 +205,20 @@ pub struct Checker {
     /// When true, call sites pack trailing args into a single `[T]` (P4).
     fn_has_rest: std::collections::HashMap<String, bool>,
 
+    /// When the last parameter is bare `... name`, trailing args pack into a
+    /// heterogeneous tuple instead of `[T]`.
+    fn_tuple_rest: std::collections::HashMap<String, bool>,
+
+    /// Shared tuple-pack type for the current function's bare `...args` param
+    /// and any `fn(...args) -> R` parameter types in its signature.
+    current_tuple_pack: Option<Ty>,
+
+    /// `callee(...pack)` spread calls keyed by call span → unpacked arity.
+    spread_call_arity: HashMap<(usize, usize), usize>,
+
+    /// Tuple bases expanded by [`flatten_spread_call_args`] (by span).
+    spread_expanded_bases: std::collections::HashSet<(usize, usize)>,
+
     /// All overload candidates for each function name.
     ///
     /// Populated at the end of each `infer_function` call.  When a name has
@@ -515,6 +529,10 @@ impl Checker {
             fn_codegen_baselines: Vec::new(),
             fn_param_names: std::collections::HashMap::new(),
             fn_has_rest: std::collections::HashMap::new(),
+            fn_tuple_rest: std::collections::HashMap::new(),
+            current_tuple_pack: None,
+            spread_call_arity: HashMap::new(),
+            spread_expanded_bases: std::collections::HashSet::new(),
             overload_sets: std::collections::HashMap::new(),
             selected_overloads_by_span: std::collections::HashMap::new(),
             call_site_dicts: HashMap::new(),
@@ -938,6 +956,10 @@ impl Checker {
         self.fn_codegen_baselines.clear();
         self.fn_param_names.clear();
         self.fn_has_rest.clear();
+        self.fn_tuple_rest.clear();
+        self.current_tuple_pack = None;
+        self.spread_call_arity.clear();
+        self.spread_expanded_bases.clear();
         self.overload_sets.clear();
         self.selected_overloads_by_span.clear();
         self.partial_fills_by_span.clear();
@@ -1819,7 +1841,7 @@ impl Checker {
                             .iter()
                             .filter_map(|item| {
                                 if let Expression::Argument(ty, _, _) = item.1.as_ref() {
-                                    Some(self.parse_type_name(ty))
+                                    ty.as_ref().map(|t| self.parse_type_name(t))
                                 } else {
                                     None
                                 }
@@ -2076,6 +2098,25 @@ impl Checker {
                 pruned
             }
             Expression::Call { name, args } => {
+                if let Expression::Identifier(callee) = name.1.as_ref() {
+                    if let Some(arg_list) = args.as_deref() {
+                        if arg_list.len() == 1 {
+                            if let Expression::Spread(pack) = arg_list[0].1.as_ref() {
+                                if self.next_id_idx < self.ids.ids().len() {
+                                    self.next_id_idx += 1;
+                                }
+                                if let Some(ty) = self.try_infer_spread_call_target(
+                                    callee,
+                                    pack,
+                                    &range,
+                                    id,
+                                ) {
+                                    return ty;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Method call: `recv.method(args)` — Access callee.
                 if let Expression::Access(recv, method) = name.1.as_ref() {
                     let method_args = args.as_deref().unwrap_or(&[]);
@@ -2390,6 +2431,27 @@ impl Checker {
                     );
                 }
 
+                // First-class callee (`lambda(...)`, nested fn value, etc.).
+                if !matches!(
+                    name.1.as_ref(),
+                    Expression::Identifier(_) | Expression::Access(_, _)
+                ) {
+                    let callee_ty = self.infer(name);
+                    let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
+                    let arg_tys: Vec<Ty> = flat_args
+                        .iter()
+                        .map(|arg| self.infer_call_arg(arg))
+                        .collect();
+                    return self.apply_function(
+                        None,
+                        &callee_ty,
+                        &arg_tys,
+                        args.as_deref(),
+                        id,
+                        range,
+                    );
+                }
+
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
                     _ => {
@@ -2688,10 +2750,8 @@ impl Checker {
                 // Bare/UFCS trait method call: `method(x)`.
                 // Resolve it before ordinary environment lookup because class
                 // methods are selected by the active bound, not by a global FQN.
-                let arg_tys: Vec<Ty> = match args {
-                    Some(a) => a.iter().map(|arg| self.infer(arg)).collect(),
-                    None => Vec::new(),
-                };
+                let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
+                let arg_tys: Vec<Ty> = flat_args.iter().map(|arg| self.infer_call_arg(arg)).collect();
                 if let Some(Ty::Existential { class }) =
                     arg_tys.first().map(|ty| apply_ty_prune(&self.subst, ty))
                     && let Some((owner, method_slot, scheme)) =
@@ -2803,7 +2863,11 @@ impl Checker {
                     Some(&ident),
                     &fun_ty,
                     &arg_tys,
-                    args.as_deref(),
+                    if flat_args.is_empty() {
+                        None
+                    } else {
+                        Some(&flat_args)
+                    },
                     id,
                     range.clone(),
                 );
@@ -3263,6 +3327,7 @@ impl Checker {
 
             // ---- Function declarations ----
             Expression::Function {
+                attrs,
                 name,
                 is_coro,
                 type_params,
@@ -3274,23 +3339,36 @@ impl Checker {
                 if *name == "main" {
                     self.main_decl_span = Some(range.clone());
                 }
-                // A genuine top-level user function is overloadable.
-                // Trait prototype bodies are re-walked here via `self.infer(m)`
-                // from inside the trait handler (where `current_typeclass` is
-                // set), so we suppress overload registration in that context.
                 let prev_overloadable = self.registering_overloadable_fn;
                 self.registering_overloadable_fn = self.current_typeclass.is_none();
+
+                let test_desc = parser::ast::attr_test_desc(attrs, name);
+                let prev_test_result_mode = if let Some(desc) = &test_desc {
+                    self.test_case_names.push(desc.clone());
+                    let prev = self.fn_result_mode.take();
+                    self.fn_result_mode = Some((unit_ty(), string()));
+                    prev
+                } else {
+                    None
+                };
+
                 self.infer_function(
                     name,
                     type_params,
                     args,
                     returns.as_ref(),
                     where_constraints,
-                    body,
+                    body.as_ref(),
                     &range,
                     None,
                     *is_coro,
                 );
+
+                if test_desc.is_some() {
+                    self.result_mode_fns.insert(name.to_string());
+                    self.fn_result_mode = prev_test_result_mode;
+                }
+
                 self.registering_overloadable_fn = prev_overloadable;
                 unit_ty()
             }
@@ -3382,13 +3460,25 @@ impl Checker {
                 unit_ty()
             }
             Expression::Argument(ty, _name, is_rest) => {
-                let elem = self.parse_type_name(ty);
                 if *is_rest {
-                    array(elem)
+                    match ty {
+                        None => Ty::Var(self.counter.fresh()),
+                        Some(t) => array(self.parse_type_name(t)),
+                    }
                 } else {
-                    elem
+                    self.parse_type_name(ty.as_ref().expect("fixed param type"))
                 }
             }
+            Expression::Spread(inner) => {
+                let _ = self.infer(inner);
+                self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    "spread expression is only valid in call argument lists".to_string(),
+                    range,
+                    None,
+                )
+            }
+            Expression::AttrDecl { .. } => unit_ty(),
             Expression::Method(_vis, body) => self.infer(body),
             Expression::Member(_) => unit_ty(),
             Expression::Access(receiver, field) => {
@@ -3682,8 +3772,9 @@ impl Checker {
                         Expression::Function {
                             name: mname, body, ..
                         } => {
-                            let has_default =
-                                !matches!(body.1.as_ref(), Expression::Block(v) if v.is_empty());
+                            let has_default = body.as_ref().is_some_and(|b| {
+                                !matches!(b.1.as_ref(), Expression::Block(v) if v.is_empty())
+                            });
                             Some(TypeClassMethodDef {
                                 name: mname.to_string(),
                                 has_default,
@@ -4144,7 +4235,7 @@ impl Checker {
                                     margs,
                                     returns.as_ref(),
                                     where_cs,
-                                    body,
+                                    body.as_ref(),
                                     &m.0.into_range(),
                                     None,
                                     is_coro,
@@ -6832,6 +6923,9 @@ impl Checker {
                 Box::new(self.parse_type_name(arg)),
                 Box::new(self.parse_type_name(ret)),
             ),
+            Expression::TypeFnSig { params, ret } => {
+                self.parse_fn_sig_type(params, ret)
+            }
             Expression::Forall { params, ty } => {
                 self.forall_type(params, |checker| checker.parse_type_name(ty))
             }
@@ -7777,7 +7871,7 @@ impl Checker {
                         args,
                         returns.as_ref(),
                         where_constraints,
-                        func_body,
+                        func_body.as_ref(),
                         &method.0.into_range(),
                         Some(&owner_ty),
                         *is_coro,
@@ -7790,6 +7884,9 @@ impl Checker {
                     }
                     if let Some(has) = self.fn_has_rest.get(*name).copied() {
                         self.fn_has_rest.insert(fqn.clone(), has);
+                    }
+                    if let Some(tuple) = self.fn_tuple_rest.get(*name).copied() {
+                        self.fn_tuple_rest.insert(fqn.clone(), tuple);
                     }
                     let scheme = if param_vars.is_empty() {
                         Scheme::mono(fun_ty.clone())
@@ -7942,11 +8039,19 @@ impl Checker {
         args: &Output,
         returns: Option<&Output>,
         where_constraints: &[parser::ast::WhereConstraint],
-        body: &Output,
+        body: Option<&Output>,
         range: &Range<usize>,
         self_ty: Option<&Ty>,
         is_coro: bool,
     ) -> Ty {
+        let Some(body) = body else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "Function declaration must have a body".into(),
+                range.clone(),
+                Some("add a block `{ … }` or use `#[ffi(...)]` for foreign declarations".into()),
+            );
+        };
         // Set up type parameter environment.
         let is_generic = !type_params.is_empty();
         let mut param_vars: Vec<TyVarId> = Vec::new();
@@ -7997,7 +8102,9 @@ impl Checker {
         } else {
             None
         };
+        self.current_tuple_pack = Self::tuple_pack_ty_for_args(args, &mut self.counter);
         let arg_tys = self.parse_arg_list(args);
+        self.current_tuple_pack = None;
         // Record declaration-order param names for named call-site args.
         self.fn_param_names.insert(
             name.to_string(),
@@ -8007,7 +8114,12 @@ impl Checker {
             if children.last().is_some_and(|c| {
                 matches!(c.1.as_ref(), Expression::Argument(_, _, true))
             }));
+        let has_tuple_rest = matches!(args.1.as_ref(), Expression::Fragment(children)
+            if children.last().is_some_and(|c| {
+                matches!(c.1.as_ref(), Expression::Argument(None, _, true))
+            }));
         self.fn_has_rest.insert(name.to_string(), has_rest);
+        self.fn_tuple_rest.insert(name.to_string(), has_tuple_rest);
         let (ret_ty, yield_slot, send_slot) = if is_coro {
             let yield_ty = Ty::Var(self.counter.fresh());
             let send_ty = Ty::Var(self.counter.fresh());
@@ -8324,8 +8436,96 @@ impl Checker {
         }
     }
 
+    /// Parse `fn(T x, ...args) -> R` function types.
+    fn parse_fn_sig_type(&mut self, params: &Output, ret: &Output) -> Ty {
+        // Sole bare `...args` in a fn type: opaque callable unified at spread calls.
+        if let Expression::Fragment(children) = params.1.as_ref() {
+            if children.len() == 1 {
+                if let Expression::Argument(None, _, true) = children[0].1.as_ref() {
+                    return Ty::Var(self.counter.fresh());
+                }
+            }
+        }
+        let param_tys = self.parse_arg_list(params);
+        let ret_ty = self.parse_type_name(ret);
+        let mut fun_ty = ret_ty;
+        for (_, arg_ty) in param_tys.iter().rev() {
+            fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
+        }
+        fun_ty
+    }
+
+    fn tuple_pack_ty_for_args(args: &Output, counter: &mut TyVarCounter) -> Option<Ty> {
+        if let Expression::Fragment(children) = args.1.as_ref() {
+            if children.last().is_some_and(|c| {
+                matches!(c.1.as_ref(), Expression::Argument(None, _, true))
+            }) {
+                return Some(Ty::Var(counter.fresh()));
+            }
+        }
+        None
+    }
+
+    fn try_infer_spread_call_target(
+        &mut self,
+        callee: &str,
+        pack: &Output,
+        range: &Range<usize>,
+        id: Option<NodeId>,
+    ) -> Option<Ty> {
+        let scheme = self.env.lookup(callee)?.clone();
+        let (fun_ty, fresh_constraints, fresh_mapping) =
+            self.instantiate_scheme_mapped(&scheme);
+        let pack_ty = self.infer(pack);
+        let resolved_pack = apply_ty_prune(&self.subst, &pack_ty);
+        let elems = match resolved_pack {
+            Ty::Tuple(elems) => elems,
+            Ty::Var(_) => {
+                let ret = self
+                    .current_return_ty
+                    .clone()
+                    .map(|t| apply_ty_prune(&self.subst, &t))
+                    .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                if let Some(call_id) = id {
+                    self.cache.insert(call_id, ret.clone());
+                }
+                return Some(ret);
+            }
+            _ => return None,
+        };
+        let mut fun = apply_ty_prune(&self.subst, &fun_ty);
+        for elem in &elems {
+            let Ty::Fun(arg, ret) = fun else {
+                return None;
+            };
+            self.unify(&arg, elem, range, "spread call argument");
+            fun = apply_ty_prune(&self.subst, &*ret);
+        }
+        self.spread_call_arity
+            .insert((range.start, range.end), elems.len());
+        if let Some(call_id) = id {
+            self.cache.insert(call_id, fun.clone());
+        }
+        if !fresh_constraints.is_empty() {
+            self.discharge_constraints(id, &fresh_constraints, range);
+            self.pin_assoc_after_discharge(
+                "",
+                &fresh_constraints,
+                Some(&scheme),
+                &fresh_mapping,
+                range,
+            );
+        }
+        Some(fun)
+    }
+
+    pub fn spread_call_arity_at(&self, start: usize, end: usize) -> Option<usize> {
+        self.spread_call_arity.get(&(start, end)).copied()
+    }
+
     /// Parse a function's argument list (a `Fragment` of
-    /// `Argument(ty, name, is_rest)` nodes). Rest params become `[T]`.
+    /// `Argument(ty, name, is_rest)` nodes). Rest params become `[T]` or a
+    /// heterogeneous tuple for bare `... name`.
     fn parse_arg_list(&mut self, args: &Output) -> Vec<(String, Ty)> {
         let mut out = Vec::new();
         if let Expression::Fragment(children) = args.1.as_ref() {
@@ -8343,14 +8543,26 @@ impl Checker {
                                 child.0.into_range(),
                             );
                             msg.with_help(
-                                "write fixed parameters first, then `T... name`".to_string(),
+                                "write fixed parameters first, then `T... name` or `... name`"
+                                    .to_string(),
                             );
                             self.messages.push(msg);
                         }
-                        let elem = self.parse_type_name(ty);
-                        out.push((name.to_string(), array(elem)));
+                        if ty.is_none() {
+                            let pack = self
+                                .current_tuple_pack
+                                .clone()
+                                .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                            out.push((name.to_string(), pack));
+                        } else {
+                            let elem = self.parse_type_name(ty.as_ref().expect("typed rest"));
+                            out.push((name.to_string(), array(elem)));
+                        }
                     } else {
-                        out.push((name.to_string(), self.parse_type_name(ty)));
+                        out.push((
+                            name.to_string(),
+                            self.parse_type_name(ty.as_ref().expect("fixed param type")),
+                        ));
                     }
                 }
             }
@@ -8363,9 +8575,14 @@ impl Checker {
         self.fn_param_names.get(fn_name).map(|v| v.as_slice())
     }
 
-    /// Whether `fn_name` has a trailing rest parameter (`T... name`).
+    /// Whether `fn_name` has a trailing rest parameter (`T... name` or `... name`).
     pub fn fn_has_rest(&self, fn_name: &str) -> bool {
         self.fn_has_rest.get(fn_name).copied().unwrap_or(false)
+    }
+
+    /// Whether `fn_name`'s trailing rest is a heterogeneous tuple pack (`... name`).
+    pub fn fn_tuple_rest(&self, fn_name: &str) -> bool {
+        self.fn_tuple_rest.get(fn_name).copied().unwrap_or(false)
     }
 
     /// All registered overload candidates for `fn_name`, if any.
@@ -8408,6 +8625,123 @@ impl Checker {
         self.partial_fills_by_span.get(&(start, end)).copied()
     }
 
+    /// Expand `...expr` spread nodes in a call argument list using inferred
+    /// tuple/array types. Returns a flat argument list for arity checking.
+    pub fn flatten_spread_call_args<'a>(&mut self, args: &[Output<'a>]) -> Vec<Output<'a>> {
+        let mut out = Vec::new();
+        for arg in args {
+            if let Expression::Spread(inner) = arg.1.as_ref() {
+                // Consume the `Spread` node's pre-walk ID (call sites flatten
+                // instead of inferring `Expression::Spread` directly).
+                if self.next_id_idx < self.ids.ids().len() {
+                    self.next_id_idx += 1;
+                }
+                let ty = self.infer(inner);
+                let resolved = apply_ty_prune(&self.subst, &ty);
+                match resolved {
+                    Ty::Tuple(elems) => {
+                        self.spread_expanded_bases
+                            .insert((inner.0.start, inner.0.end));
+                        for i in 0..elems.len() {
+                            out.push(self.synthetic_index(inner, i as i64));
+                        }
+                    }
+                    Ty::Array { element: _, length } => {
+                        if let ArrayLength::Static(n) = length {
+                            self.spread_expanded_bases
+                                .insert((inner.0.start, inner.0.end));
+                            for i in 0..n {
+                                out.push(self.synthetic_index(inner, i as i64));
+                            }
+                        } else {
+                            let _ = self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                "cannot spread dynamic-length array".to_string(),
+                                arg.0.into_range(),
+                                Some(
+                                    "use a tuple or a fixed-length array `[T; N]` at the spread site"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                    _ => {
+                        let _ = self.error_with_help(
+                            ErrorCode::GenericTypeError,
+                            format!("cannot spread value of type `{}`", resolved),
+                            arg.0.into_range(),
+                            Some("spread requires a tuple or array value".to_string()),
+                        );
+                    }
+                }
+            } else {
+                out.push(arg.clone());
+            }
+        }
+        out
+    }
+
+    fn synthetic_index<'a>(&mut self, base: &Output<'a>, idx: i64) -> Output<'a> {
+        let span = base.0;
+        (
+            span,
+            Box::new(Expression::Index(
+                base.clone(),
+                (span, Box::new(Expression::Integer(idx))),
+            )),
+        )
+    }
+
+    fn infer_spread_index_elem(&mut self, target: &Output, index_expr: &Output) -> Ty {
+        let target_ty = self
+            .codegen_types_by_span
+            .get(&(target.0.start, target.0.end))
+            .cloned()
+            .unwrap_or_else(|| self.infer_inner(target, None));
+        let resolved = apply_ty_prune(&self.subst, &target_ty);
+        let idx = match index_expr.1.as_ref() {
+            Expression::Integer(i) => *i,
+            _ => {
+                return self.error(
+                    ErrorCode::GenericTypeError,
+                    "spread-expanded index must be a literal".to_string(),
+                    index_expr.0.into_range(),
+                );
+            }
+        };
+        match resolved {
+            Ty::Tuple(elems) => elems
+                .get(idx as usize)
+                .cloned()
+                .unwrap_or_else(|| Ty::Var(self.counter.fresh())),
+            Ty::Array { element, length: ArrayLength::Static(n) } => {
+                if (idx as usize) < n {
+                    element.as_ref().clone()
+                } else {
+                    Ty::Var(self.counter.fresh())
+                }
+            }
+            _ => Ty::Var(self.counter.fresh()),
+        }
+    }
+
+    /// Infer a call argument, skipping ID consumption for spread-expanded indices.
+    fn infer_call_arg(&mut self, arg: &Output) -> Ty {
+        if let Expression::Index(target, index_expr) = arg.1.as_ref() {
+            if self
+                .spread_expanded_bases
+                .contains(&(target.0.start, target.0.end))
+            {
+                let ty = self.infer_spread_index_elem(target, index_expr);
+                self.codegen_types_by_span
+                    .entry((arg.0.start, arg.0.end))
+                    .or_insert_with(|| ty.clone());
+                return ty;
+            }
+        }
+        self.infer(arg)
+    }
+
     /// Infer call arguments, reordering named args and packing rest.
     ///
     /// Named arguments may under-apply: omitted fixed parameters become
@@ -8423,6 +8757,8 @@ impl Checker {
         args: &'a [Output<'a>],
         range: &Range<usize>,
     ) -> (Vec<Ty>, Vec<Output<'a>>) {
+        let flat_args: Vec<Output<'a>> = self.flatten_spread_call_args(args);
+        let args = flat_args.as_slice();
         let has_named = args
             .iter()
             .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
@@ -8432,7 +8768,7 @@ impl Checker {
             let mut tys = Vec::with_capacity(args.len());
             let mut exprs = Vec::with_capacity(args.len());
             for arg in args {
-                tys.push(self.infer(arg));
+                tys.push(self.infer_call_arg(arg));
                 exprs.push(arg.clone());
             }
             return (tys, exprs);
@@ -8457,7 +8793,7 @@ impl Checker {
             let mut tys = Vec::with_capacity(args.len());
             let mut exprs = Vec::with_capacity(args.len());
             for arg in args {
-                tys.push(self.infer(arg));
+                tys.push(self.infer_call_arg(arg));
                 exprs.push(match arg.1.as_ref() {
                     Expression::NamedArg(_, v) => v.clone(),
                     _ => arg.clone(),
@@ -8691,6 +9027,19 @@ impl Checker {
         let _ = saw_hole; // used for clarity in the None branch
 
         if pack_rest {
+            let tuple_rest = self.fn_tuple_rest.get(fn_name).copied().unwrap_or(false);
+            if tuple_rest {
+                let elem_tys: Vec<Ty> = rest_elems
+                    .iter()
+                    .map(|(t, _)| apply_ty_prune(&self.subst, t))
+                    .collect();
+                let rest_ty = if elem_tys.is_empty() {
+                    tuple_ty(vec![])
+                } else {
+                    tuple_ty(elem_tys)
+                };
+                tys.push(rest_ty);
+            } else {
             let mut elem_ty: Option<Ty> = None;
             for (t, _) in &rest_elems {
                 let t_pruned = apply_ty_prune(&self.subst, t);
@@ -8722,6 +9071,7 @@ impl Checker {
                 array_fixed(element, rest_elems.len())
             };
             tys.push(rest_ty);
+            }
             // Stand-in for apply_function's expression hooks (array packing
             // is a codegen concern). Prefer the first rest elem if any.
             if let Some((_, e)) = rest_elems.first() {
@@ -9123,7 +9473,9 @@ impl Checker {
 
             Expression::Function { args, body, .. } => {
                 self.pre_register_enums_walk(args, errors);
-                self.pre_register_enums_walk(body, errors);
+                if let Some(body) = body {
+                    self.pre_register_enums_walk(body, errors);
+                }
             }
             Expression::Lambda { args, body, .. } => {
                 self.pre_register_enums_walk(args, errors);
@@ -9233,6 +9585,18 @@ impl Checker {
                 }
             }
             Expression::AssocTypeDef { ty, .. } => self.pre_register_enums_walk(ty, errors),
+            Expression::Spread(inner) => self.pre_register_enums_walk(inner, errors),
+            Expression::TypeFnSig { params, ret } => {
+                self.pre_register_enums_walk(params, errors);
+                self.pre_register_enums_walk(ret, errors);
+            }
+            Expression::AttrDecl { args, returns, body, .. } => {
+                self.pre_register_enums_walk(args, errors);
+                if let Some(returns) = returns {
+                    self.pre_register_enums_walk(returns, errors);
+                }
+                self.pre_register_enums_walk(body, errors);
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 // Exercised by `zero-script test`.
-enum Color derive Ord {
+#[derive(Ord)]
+enum Color {
     Red,
     Blue,
 }

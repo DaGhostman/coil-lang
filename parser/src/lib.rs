@@ -3,9 +3,9 @@
 //! Builds a span-annotated `Expression` AST for the compiler pipeline.
 
 use ast::{
-    AdjustOp, AssignOp, EnumConstructPayload, EnumVariantPayload, Expression, LetFieldPattern,
-    LetPattern, MatchArm, Output, Pattern, PatternField, PatternPayload, RecordFieldDecl,
-    RecordFieldValue, TypeParam, Visibility,
+    AdjustOp, AssignOp, AttrArgs, AttrLit, Attribute, EnumConstructPayload, EnumVariantPayload,
+    Expression, LetFieldPattern, LetPattern, MatchArm, Output, Pattern, PatternField,
+    PatternPayload, RecordFieldDecl, RecordFieldValue, TypeParam, Visibility,
 };
 use std::{
     marker::PhantomData,
@@ -129,117 +129,146 @@ impl<'pratt> Pratt<'pratt> {
         text::ident().padded().map_with(output!(Identifier))
     }
 
-    /// Type annotation: bare identifiers, `[T]`, `[T; N]`, or `(T1, T2, ...)`.
+    /// Type atoms and function types without nested `fn(...)` signatures in
+    /// parameter positions (used by `arg_list` to avoid parser recursion).
+    fn type_annotation_no_fn(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        use chumsky::Parser;
+        recursive(|type_ann| {
+            self.type_annotation_atoms(type_ann.clone())
+                .then(op!("->").ignore_then(type_ann.clone()).or_not())
+                .map_with(|(lhs, rhs), e| match rhs {
+                    Some(rhs) => (e.span(), Box::new(Expression::TypeFun(lhs, rhs))),
+                    None => lhs,
+                })
+        })
+    }
+
+    /// Shared type-atom parser: arrays, tuples, `forall`, projections, names.
+    fn type_annotation_atoms<T>(
+        &self,
+        type_ann: T,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    where
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
+    {
+        use chumsky::Parser;
+        let array_type = text::ident()
+            .padded()
+            .map_with(output!(Type))
+            .then(
+                op!(";")
+                    .ignore_then(
+                        text::int(10)
+                            .to_slice()
+                            .from_str::<i64>()
+                            .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0)),
+                    )
+                    .or_not(),
+            )
+            .delimited_by(op!('['), op!(']'))
+            .map_with(|(elem, n_opt), e| match n_opt {
+                Some(n) => (
+                    e.span(),
+                    Box::new(Expression::Array(vec![
+                        elem,
+                        (e.span(), Box::new(Expression::Integer(n))),
+                    ])),
+                ),
+                None => (e.span(), Box::new(Expression::Array(vec![elem]))),
+            });
+        let tuple_type = self.tuple_atom(type_ann.clone());
+        let named_type = text::ident()
+            .padded()
+            .then(
+                type_ann
+                    .clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('<'), op!('>'))
+                    .or_not(),
+            )
+            .map_with(|(name, args_opt), e| match args_opt {
+                Some(args) => (e.span(), Box::new(Expression::TypeApp { name, args })),
+                None => (e.span(), Box::new(Expression::Type(name))),
+            });
+        let projection_type = text::ident()
+            .padded()
+            .then_ignore(op!("::"))
+            .then(text::ident().padded())
+            .then(
+                type_ann
+                    .clone()
+                    .separated_by(op!(','))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(op!('<'), op!('>'))
+                    .or_not(),
+            )
+            .map_with(|((owner, name), args_opt), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::TypeProjection {
+                        owner,
+                        name,
+                        args: args_opt.unwrap_or_default(),
+                    }),
+                )
+            });
+        let forall_type = keyword!("forall")
+            .ignore_then(
+                self.single_type_param()
+                    .separated_by(op!(","))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(op!("."))
+            .then(type_ann.clone())
+            .map_with(|(params, ty), e| {
+                (
+                    e.span(),
+                    Box::new(Expression::Forall {
+                        params,
+                        ty: Box::new(ty),
+                    }),
+                )
+            });
+        choice((
+            array_type,
+            tuple_type,
+            forall_type,
+            projection_type,
+            named_type,
+        ))
+    }
+
+    /// Type annotation: bare identifiers, `[T]`, `[T; N]`, `(T1, T2, ...)`, or
+    /// `fn(T x, ...args) -> R`.
     fn type_annotation(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
         use chumsky::Parser;
         recursive(|type_ann| {
-            // `[T]` or `[T; N]` — array form. `T` is the
-            // element type; `N` (optional) is a non-negative
-            // integer for static-length arrays.
-            // Element names inside `[T]` stay simple idents (matches
-            // the pre-generic array annotation shape).
-            let array_type = text::ident()
-                .padded()
-                .map_with(output!(Type))
-                .then(
-                    op!(";")
-                        .ignore_then(
-                            text::int(10)
-                                .to_slice()
-                                .from_str::<i64>()
-                                .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0)),
-                        )
-                        .or_not(),
-                )
-                .delimited_by(op!('['), op!(']'))
-                .map_with(|(elem, n_opt), e| match n_opt {
-                    // Preserve the element type so `[byte; 4]` / `[int; 5]`
-                    // both round-trip through the typechecker.
-                    Some(n) => (
-                        e.span(),
-                        Box::new(Expression::Array(vec![
-                            elem,
-                            (e.span(), Box::new(Expression::Integer(n))),
-                        ])),
-                    ),
-                    None => (e.span(), Box::new(Expression::Array(vec![elem]))),
-                });
-            // `(T1, T2, ...)` — tuple form.
-            let tuple_type = self.tuple_atom(type_ann.clone());
-            // `Name` or `Name<T, U>` — bare type / generic application.
-            let named_type = text::ident()
-                .padded()
-                .then(
-                    type_ann
-                        .clone()
-                        .separated_by(op!(','))
-                        .allow_trailing()
-                        .collect::<Vec<_>>()
-                        .delimited_by(op!('<'), op!('>'))
-                        .or_not(),
-                )
-                .map_with(|(name, args_opt), e| match args_opt {
-                    Some(args) => (e.span(), Box::new(Expression::TypeApp { name, args })),
-                    None => (e.span(), Box::new(Expression::Type(name))),
-                });
-            // `Owner::Assoc` / `Owner::Assoc<T>` — associated-type projection.
-            // Tried before bare `named_type` so `Collect::Elem` is not
-            // left as `Type("Collect")` followed by a parse failure on `::`.
-            let projection_type = text::ident()
-                .padded()
-                .then_ignore(op!("::"))
-                .then(text::ident().padded())
-                .then(
-                    type_ann
-                        .clone()
-                        .separated_by(op!(','))
-                        .allow_trailing()
-                        .collect::<Vec<_>>()
-                        .delimited_by(op!('<'), op!('>'))
-                        .or_not(),
-                )
-                .map_with(|((owner, name), args_opt), e| {
+            let base_atom = self.type_annotation_atoms(type_ann.clone());
+            let fn_sig_type = keyword!("fn")
+                .ignore_then(self.arg_list_typed(base_atom.clone()))
+                .then(op!("->").ignore_then(type_ann.clone()))
+                .map_with(|(params, ret), e| {
                     (
                         e.span(),
-                        Box::new(Expression::TypeProjection {
-                            owner,
-                            name,
-                            args: args_opt.unwrap_or_default(),
-                        }),
-                    )
-                });
-            // `forall T. ty` / `forall T: Num + Eq, U. ty` — universally
-            // quantified type annotation. Tried BEFORE `named_type` so
-            // that `forall` is not parsed as an identifier.
-            let forall_type = keyword!("forall")
-                .ignore_then(
-                    self.single_type_param()
-                        .separated_by(op!(","))
-                        .at_least(1)
-                        .collect::<Vec<_>>(),
-                )
-                .then_ignore(op!("."))
-                .then(type_ann.clone())
-                .map_with(|(params, ty), e| {
-                    (
-                        e.span(),
-                        Box::new(Expression::Forall {
+                        Box::new(Expression::TypeFnSig {
                             params,
-                            ty: Box::new(ty),
+                            ret,
                         }),
                     )
                 });
-            let atom = choice((
-                array_type,
-                tuple_type,
-                forall_type,
-                projection_type,
-                named_type,
-            ));
-            atom.clone()
+            choice((fn_sig_type, base_atom))
                 .then(op!("->").ignore_then(type_ann.clone()).or_not())
                 .map_with(|(lhs, rhs), e| match rhs {
                     Some(rhs) => (e.span(), Box::new(Expression::TypeFun(lhs, rhs))),
@@ -652,32 +681,54 @@ impl<'pratt> Pratt<'pratt> {
             .delimited_by(op!('{'), op!('}'))
     }
 
-    fn arg_list(
+    fn arg_list_typed<T>(
         &self,
+        ty_parser: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    where
+        T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
+            + Clone
+            + 'pratt,
     {
-        // `T... name` (rest) or `T name` (fixed). Rest must be last —
-        // enforced in the typechecker.
-        let rest_arg = self
-            .type_annotation()
+        // `... name` (tuple rest), `T... name` (homogeneous rest), or `T name` (fixed).
+        let tuple_rest_arg = op!("...")
+            .ignore_then(text::ident().padded())
+            .map_with(|name, e| {
+                (e.span(), Box::new(Expression::Argument(None, name, true)))
+            });
+        let rest_arg = ty_parser
+            .clone()
             .then_ignore(just("...").padded())
             .then(text::ident().padded())
             .map_with(|(ty, name), e| {
-                (e.span(), Box::new(Expression::Argument(ty, name, true)))
+                (
+                    e.span(),
+                    Box::new(Expression::Argument(Some(ty), name, true)),
+                )
             });
-        let fixed_arg = self
-            .type_annotation()
+        let fixed_arg = ty_parser
+            .clone()
             .then(text::ident().padded())
             .map_with(|(ty, name), e| {
-                (e.span(), Box::new(Expression::Argument(ty, name, false)))
+                (
+                    e.span(),
+                    Box::new(Expression::Argument(Some(ty), name, false)),
+                )
             });
-        let arg = rest_arg.or(fixed_arg);
+        let arg = tuple_rest_arg.or(rest_arg).or(fixed_arg);
 
         arg.separated_by(op!(','))
             .allow_trailing()
             .collect::<Vec<_>>()
             .map_with(output!(Fragment))
             .delimited_by(op!("("), op!(")"))
+    }
+
+    fn arg_list(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        self.arg_list_typed(self.type_annotation_no_fn())
     }
 
     /// Anonymous lambda: `fn (T x) use (y) => expr` or `fn (T x) { expr; … }`.
@@ -818,6 +869,35 @@ impl<'pratt> Pratt<'pratt> {
             .then(self.where_clause())
     }
 
+    /// `attr Name<T>(target, extras..., ...args) -> R { body }`
+    fn attr_decl(
+        &self,
+    ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    {
+        keyword!("attr")
+            .ignore_then(text::ident().padded())
+            .then(self.type_param_list())
+            .then(self.arg_list_typed(self.type_annotation()))
+            .then(op!("->").ignore_then(self.type_annotation()).or_not())
+            .then(self.where_clause())
+            .then(self.block(self.statement()))
+            .map_with(
+                |(((((name, type_params), args), returns), where_constraints), body), e| {
+                    (
+                        e.span(),
+                        Box::new(Expression::AttrDecl {
+                            name,
+                            type_params,
+                            args,
+                            returns,
+                            where_constraints,
+                            body,
+                        }),
+                    )
+                },
+            )
+    }
+
     fn func<
         T: Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>>
             + Clone
@@ -827,21 +907,24 @@ impl<'pratt> Pratt<'pratt> {
         stmt: T,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("async")
-            .or_not()
+        self.attr_list()
+            .then(keyword!("async").or_not())
             .then(keyword!("fn"))
             .then(text::ident().padded())
             .then(self.type_param_list())
             .then(self.arg_list())
             .then(op!("->").ignore_then(self.type_annotation()).or_not())
             .then(self.where_clause())
-            .then(self.block(stmt))
+            .then(choice((
+                self.block(stmt).map(Some),
+                op!(";").to(None),
+            )))
             .map_with(
-                |(((((((is_coro, _), name), type_params), args), returns), where_constraints), body),
-                 e| {
+                |((((((((attrs, is_coro), _), name), type_params), args), returns), where_constraints), body), e| {
                     (
                         e.span(),
                         Box::new(Expression::Function {
+                            attrs,
                             name,
                             is_coro: is_coro.is_some(),
                             type_params,
@@ -1228,6 +1311,7 @@ impl<'pratt> Pratt<'pratt> {
             self.impl_block(stmt.clone()),
             self.typeclass_impl_block(stmt.clone()),
             self.test_case(stmt.clone()),
+            self.attr_decl(),
             self.func(stmt.clone()),
             self.type_alias(),
             self.use_(),
@@ -1464,7 +1548,10 @@ impl<'pratt> Pratt<'pratt> {
             .type_annotation()
             .then(text::ident().padded())
             .map_with(|(ty, name), e| {
-                ExternArg::Fixed((e.span(), Box::new(Expression::Argument(ty, name, false))))
+                ExternArg::Fixed((
+                    e.span(),
+                    Box::new(Expression::Argument(Some(ty), name, false)),
+                ))
             });
         // Prefer illegal-rest so `int... xs` is recognized (then rejected).
         let arg = illegal_rest.or(fixed_arg);
@@ -1546,6 +1633,7 @@ impl<'pratt> Pratt<'pratt> {
             .then_ignore(op!(";"))
             .map_with(|(((_, name), (args, variadic)), returns), _e| ExternFunction {
                 name,
+                symbol: None,
                 args,
                 returns,
                 variadic,
@@ -1580,34 +1668,87 @@ impl<'pratt> Pratt<'pratt> {
             })
     }
 
-    /// Optional `derive Trait (, Trait)*` clause on enum/class headers.
-    fn derive_clause(
+    /// Zero or more `#[attr]` / `#[attr(args)]` prefixes on a declaration.
+    fn attr_list(
         &self,
-    ) -> impl Parser<'pratt, &'pratt str, Vec<&'pratt str>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
+    ) -> impl Parser<'pratt, &'pratt str, Vec<Attribute<'pratt>>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("derive")
-            .ignore_then(
-                text::ident()
-                    .padded()
-                    .separated_by(op!(','))
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
-            )
-            .or_not()
-            .map(|opt| opt.unwrap_or_default())
+        let attr_float = text::int(10)
+            .then(just('.').then(text::int(10)))
+            .to_slice()
+            .from_str::<f64>()
+            .validate(|v: Result<f64, _>, _, _| v.unwrap_or(0.0))
+            .map(AttrLit::Float);
+
+        let attr_lit = choice((
+            just('"')
+                .ignore_then(none_of('"').repeated().to_slice())
+                .then_ignore(just('"'))
+                .map(AttrLit::String),
+            text::int(10)
+                .to_slice()
+                .from_str::<i64>()
+                .validate(|v: Result<i64, _>, _, _| v.unwrap_or(0))
+                .map(AttrLit::Int),
+            attr_float,
+            keyword!("true").to(AttrLit::Bool(true)),
+            keyword!("false").to(AttrLit::Bool(false)),
+        ));
+
+        let attr_kv = text::ident()
+            .then_ignore(op!("="))
+            .then(attr_lit.clone());
+
+        let attr_args = choice((
+            attr_kv
+                .padded()
+                .separated_by(op!(','))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .map(AttrArgs::KeyValues),
+            just('"')
+                .ignore_then(none_of('"').repeated().to_slice())
+                .then_ignore(just('"'))
+                .map(AttrArgs::String),
+            attr_lit
+                .padded()
+                .separated_by(op!(','))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .map(AttrArgs::Positional),
+            text::ident()
+                .padded()
+                .separated_by(op!(','))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .map(AttrArgs::Idents),
+        ))
+        .delimited_by(op!("("), op!(")"));
+
+        let attribute = text::ident()
+            .then(attr_args.or_not())
+            .map(|(name, args)| Attribute {
+                name,
+                args: args.unwrap_or(AttrArgs::Empty),
+            });
+
+        op!("#")
+            .ignore_then(attribute.delimited_by(op!("["), op!("]")))
+            .repeated()
+            .collect::<Vec<_>>()
     }
 
-    /// `class Name [derive T, …] { [pub] field: Type, ... }`
+    /// `class Name { [pub] field: Type, ... }`
     ///
     /// Fields are private by default; `pub` makes them public.
     fn class(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("class")
-            .ignore_then(text::ident().padded())
+        self.attr_list()
+            .then(keyword!("class"))
+            .then(text::ident().padded())
             .then(self.type_param_list())
-            .then(self.derive_clause())
             .then(
                 self.field_decl()
                     .separated_by(op!(','))
@@ -1615,13 +1756,13 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!("{"), op!("}")),
             )
-            .map_with(|(((name, type_params), derives), fields), e| {
+            .map_with(|((((attrs, _), name), type_params), fields), e| {
                 (
                     e.span(),
                     Box::new(Expression::Class {
+                        attrs,
                         name,
                         type_params,
-                        derives,
                         fields,
                     }),
                 )
@@ -1682,13 +1823,14 @@ impl<'pratt> Pratt<'pratt> {
                     (
                         e.span(),
                         Box::new(Expression::Function {
+                            attrs: vec![],
                             name,
                             is_coro: is_coro.is_some(),
                             type_params,
                             args,
                             returns,
                             where_constraints,
-                            body: empty_block,
+                            body: Some(empty_block),
                         }),
                     )
                 },
@@ -2177,7 +2319,10 @@ impl<'pratt> Pratt<'pratt> {
                 (e.span(), Box::new(Expression::NamedArg(name, value)))
             })
             .labelled("named argument");
-        let arg = named.or(expr.clone());
+        let spread = op!("...")
+            .ignore_then(expr.clone())
+            .map_with(|inner, e| (e.span(), Box::new(Expression::Spread(inner))));
+        let arg = spread.or(named).or(expr.clone());
         arg.separated_by(op!(','))
             .allow_trailing()
             .collect::<Vec<_>>()
@@ -2532,15 +2677,15 @@ impl<'pratt> Pratt<'pratt> {
     /// before `variable()` so a leading `enum` keyword isn't
     /// mis-parsed as `let`.
     ///
-    /// Optional derive clause: `enum Name derive Show, Eq { … }`.
+    /// Optional derive attribute: `#[derive(Show, Eq)] enum Name { … }`.
     fn enum_decl(
         &self,
     ) -> impl Parser<'pratt, &'pratt str, Output<'pratt>, extra::Err<Rich<'pratt, char>>> + Clone + 'pratt
     {
-        keyword!("enum")
-            .ignore_then(text::ident().padded())
+        self.attr_list()
+            .then(keyword!("enum"))
+            .then(text::ident().padded())
             .then(self.type_param_list())
-            .then(self.derive_clause())
             .then(
                 self.enum_variant()
                     .separated_by(op!(','))
@@ -2548,13 +2693,13 @@ impl<'pratt> Pratt<'pratt> {
                     .collect::<Vec<_>>()
                     .delimited_by(op!('{'), op!('}')),
             )
-            .map_with(|(((name, type_params), derives), variants), e| {
+            .map_with(|((((attrs, _), name), type_params), variants), e| {
                 (
                     e.span(),
                     Box::new(Expression::EnumDecl {
+                        attrs,
                         name,
                         type_params,
-                        derives,
                         variants,
                     }),
                 )
@@ -3547,7 +3692,7 @@ mod tests {
             .clone();
         // Top: Function { ..., body: Block([...]) }
         let fn_body = match ast {
-            Expression::Function { body, .. } => body,
+            Expression::Function { body, .. } => body.expect("function should have a body"),
             other => panic!("expected Function decl, got {:?}", other),
         };
         let stmts = match fn_body.1.as_ref() {
@@ -3732,7 +3877,7 @@ mod tests {
             }
         }
         match expr.as_ref() {
-            Expression::Function { body, .. } => match body.1.as_ref() {
+            Expression::Function { body, .. } => match body.as_ref().expect("function body").1.as_ref() {
                 Expression::Block(stmts) => match stmts[0].1.as_ref() {
                     Expression::Statement(stmt) => match stmt.1.as_ref() {
                         // `yield` is preferred over `expr_statement`, so the
@@ -3828,7 +3973,7 @@ mod tests {
     fn parse_let_binding_yield_round_trips() {
         let ast = decl_ast!("async fn f() { let x = yield 1; }");
         match ast {
-            Expression::Function { body, .. } => match body.1.as_ref() {
+            Expression::Function { body, .. } => match body.as_ref().expect("function body").1.as_ref() {
                 Expression::Block(stmts) => match stmts[0].1.as_ref() {
                     Expression::Statement(stmt) => match stmt.1.as_ref() {
                         Expression::Fragment(children) => {
@@ -4691,7 +4836,10 @@ mod tests_generics {
                 match methods[0].1.as_ref() {
                     Expression::Function { name: mname, body, .. } => {
                         assert_eq!(*mname, "eq");
-                        assert!(matches!(body.1.as_ref(), Expression::Block(stmts) if stmts.is_empty()));
+                        assert!(matches!(
+                            body.as_ref().expect("method body").1.as_ref(),
+                            Expression::Block(stmts) if stmts.is_empty()
+                        ));
                     }
                     other => panic!("expected Function, got {:?}", other),
                 }
@@ -4713,7 +4861,10 @@ mod tests_generics {
                     Expression::Function { name: mname, body, .. } => {
                         assert_eq!(*mname, "add");
                         // Block is non-empty (contains the return statement).
-                        assert!(matches!(body.1.as_ref(), Expression::Block(stmts) if !stmts.is_empty()));
+                        assert!(matches!(
+                            body.as_ref().expect("method body").1.as_ref(),
+                            Expression::Block(stmts) if !stmts.is_empty()
+                        ));
                     }
                     other => panic!("expected Function, got {:?}", other),
                 }
@@ -5162,47 +5313,178 @@ mod tests_generics {
         assert_eq!(s, "impl Cell<T> {  }");
     }
 
-    /// `enum Point derive Show, Eq { … }` parses derive traits onto EnumDecl.
+    /// `#[derive(Show, Eq)]` on enums parses attribute traits.
     #[test]
-    fn enum_derive_clause_parses_traits() {
-        match decl_ast!("enum Point derive Show, Eq { Origin, Point { x: int, y: int } }") {
-            Expression::EnumDecl {
-                name, derives, ..
-            } => {
+    fn enum_derive_attr_parses_traits() {
+        match decl_ast!("#[derive(Show, Eq)] enum Point { Origin, Point { x: int, y: int } }") {
+            Expression::EnumDecl { name, attrs, .. } => {
                 assert_eq!(name, "Point");
-                assert_eq!(derives, vec!["Show", "Eq"]);
+                assert_eq!(attrs.len(), 1);
+                assert_eq!(attrs[0].name, "derive");
+                assert!(matches!(
+                    &attrs[0].args,
+                    ast::AttrArgs::Idents(v) if v == &["Show", "Eq"]
+                ));
             }
             other => panic!("expected EnumDecl, got {:?}", other),
         }
     }
 
-    /// Derive clause Display round-trips on enums.
+    /// Derive attribute Display round-trips on enums.
     #[test]
-    fn enum_derive_clause_display_round_trips() {
-        let s = stmt!("enum Point derive Show, Eq { Origin }");
-        assert_eq!(s, "enum Point derive Show, Eq { Origin }");
+    fn enum_derive_attr_display_round_trips() {
+        let s = stmt!("#[derive(Show, Eq)] enum Point { Origin }");
+        assert_eq!(s, "#[derive(Show, Eq)]\nenum Point { Origin }");
     }
 
-    /// `class Cell derive Show { … }` parses derive traits onto Class.
+    /// `#[derive(Show, Eq)]` on classes parses attribute traits.
     #[test]
-    fn class_derive_clause_parses_traits() {
-        match decl_ast!("class Cell derive Show, Eq { value: int }") {
-            Expression::Class {
-                name, derives, ..
-            } => {
+    fn class_derive_attr_parses_traits() {
+        match decl_ast!("#[derive(Show, Eq)] class Cell { value: int }") {
+            Expression::Class { name, attrs, .. } => {
                 assert_eq!(name, "Cell");
-                assert_eq!(derives, vec!["Show", "Eq"]);
+                assert_eq!(attrs.len(), 1);
+                assert!(matches!(
+                    &attrs[0].args,
+                    ast::AttrArgs::Idents(v) if v == &["Show", "Eq"]
+                ));
             }
             other => panic!("expected Class, got {:?}", other),
         }
     }
 
-    /// Enum without derive still has an empty derives list.
+    /// Enum without attributes has an empty attrs list.
     #[test]
-    fn enum_without_derive_has_empty_list() {
+    fn enum_without_attrs_has_empty_list() {
         match decl_ast!("enum Point { Origin }") {
-            Expression::EnumDecl { derives, .. } => assert!(derives.is_empty()),
+            Expression::EnumDecl { attrs, .. } => assert!(attrs.is_empty()),
             other => panic!("expected EnumDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ffi_attr_signature_only_fn_parses() {
+        match decl_ast!("#[ffi(lib = \"c\", name = \"strlen\")] fn strlen(string s) -> int;") {
+            Expression::Function {
+                attrs,
+                name,
+                body,
+                ..
+            } => {
+                assert_eq!(name, "strlen");
+                assert!(body.is_none());
+                assert_eq!(attrs.len(), 1);
+                assert_eq!(attrs[0].name, "ffi");
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_attr_on_fn_parses() {
+        match decl_ast!("#[test(\"desc\")] fn foo() { return; }") {
+            Expression::Function { attrs, name, body, .. } => {
+                assert_eq!(name, "foo");
+                assert!(body.is_some());
+                assert_eq!(attrs.len(), 1);
+                assert!(matches!(&attrs[0].args, ast::AttrArgs::String("desc")));
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn attr_body_target_call_is_spread() {
+        match decl_ast!(
+            "attr log<T>(fn(...args) -> T target, string message, ...args) -> T { return target(...args); }"
+        ) {
+            Expression::AttrDecl { body, .. } => match body.1.as_ref() {
+                Expression::Block(stmts) => {
+                    let ret = &stmts[0];
+                    let call = match ret.1.as_ref() {
+                        Expression::Statement(inner) => match inner.1.as_ref() {
+                            Expression::Return(inner) => match inner.1.as_ref() {
+                                Expression::Call { .. } => inner,
+                                Expression::Expr(call) => call,
+                                other => panic!("expected Call in return, got {:?}", other),
+                            },
+                            Expression::Expr(call) => call,
+                            other => panic!("expected Return/Expr, got {:?}", other),
+                        },
+                        other => panic!("expected Statement, got {:?}", other),
+                    };
+                    match call.1.as_ref() {
+                        Expression::Call { name, args } => {
+                            assert!(matches!(name.1.as_ref(), Expression::Identifier("target")));
+                            let args = args.as_ref().expect("args");
+                            assert_eq!(args.len(), 1);
+                            assert!(matches!(
+                                args[0].1.as_ref(),
+                                Expression::Spread(inner)
+                                    if matches!(inner.1.as_ref(), Expression::Identifier("args"))
+                            ));
+                        }
+                        other => panic!("expected Call, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Block body, got {:?}", other),
+            },
+            other => panic!("expected AttrDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn attr_decl_parses() {
+        match decl_ast!(
+            "attr log<T>(fn(...args) -> T target, string message, ...args) -> T { return target(...args); }"
+        ) {
+            Expression::AttrDecl { name, .. } => assert_eq!(name, "log"),
+            other => panic!("expected AttrDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn call_site_spread_parses() {
+        match decl_ast!("fn main() { pair_sum(...(1, 2)); }") {
+            Expression::Function { body: Some(body), .. } => match body.1.as_ref() {
+                Expression::Block(items) => {
+                    let call = match items[0].1.as_ref() {
+                        Expression::Statement(inner) => match inner.1.as_ref() {
+                            Expression::ExprStatement(call) => call,
+                            Expression::Expr(call) => call,
+                            other => panic!("expected expr statement, got {:?}", other),
+                        },
+                        Expression::ExprStatement(call) => call,
+                        other => panic!("expected Statement, got {:?}", other),
+                    };
+                    let call = match call.1.as_ref() {
+                        Expression::Call { .. } => call,
+                        Expression::Expr(inner) => inner,
+                        other => panic!("expected Call, got {:?}", other),
+                    };
+                    match call.1.as_ref() {
+                        Expression::Call { args: Some(args), .. } => {
+                            assert_eq!(args.len(), 1);
+                            assert!(matches!(args[0].1.as_ref(), Expression::Spread(_)));
+                        }
+                        other => panic!("expected Call, got {:?}", other),
+                    }
+                }
+                other => panic!("expected Block, got {:?}", other),
+            },
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stacked_attrs_parse() {
+        match decl_ast!("#[derive(Show)] #[test] fn foo() { return; }") {
+            Expression::Function { attrs, .. } => {
+                assert_eq!(attrs.len(), 2);
+                assert_eq!(attrs[0].name, "derive");
+                assert_eq!(attrs[1].name, "test");
+            }
+            other => panic!("expected Function, got {:?}", other),
         }
     }
 
@@ -5332,9 +5614,9 @@ mod tests_generics {
                     }
                 }
                 assert!(
-                    has_return_negate(body.1.as_ref()),
+                    has_return_negate(body.as_ref().expect("function body").1.as_ref()),
                     "expected Return(Negate(...)); got {}",
-                    body.1
+                    body.as_ref().expect("function body").1
                 );
             }
             other => panic!("expected Function, got {:?}", other),
@@ -5371,9 +5653,9 @@ mod tests_generics {
                     }
                 }
                 assert!(
-                    has_return_sub(body.1.as_ref()),
+                    has_return_sub(body.as_ref().expect("function body").1.as_ref()),
                     "expected Return(Sub(...)); got {}",
-                    body.1
+                    body.as_ref().expect("function body").1
                 );
             }
             other => panic!("expected Function, got {:?}", other),
@@ -5412,9 +5694,9 @@ mod tests_generics {
                     }
                 }
                 assert!(
-                    has_yield_negate(body.1.as_ref()),
+                    has_yield_negate(body.as_ref().expect("function body").1.as_ref()),
                     "expected Yield(Negate(...)); got {}",
-                    body.1
+                    body.as_ref().expect("function body").1
                 );
             }
             other => panic!("expected Function, got {:?}", other),
@@ -5442,7 +5724,10 @@ mod tests_lambdas {
             | Expression::Return(inner)
             | Expression::ImplicitReturn(inner) => find_lambda(inner.1.as_ref()),
             Expression::Variable(_, Some(inner)) => find_lambda(inner.1.as_ref()),
-            Expression::Function { body, .. } => find_lambda(body.1.as_ref()),
+            Expression::Function { body, .. } => body
+                .as_ref()
+                .map(|b| find_lambda(b.1.as_ref()))
+                .unwrap_or(None),
             _ => None,
         }
     }

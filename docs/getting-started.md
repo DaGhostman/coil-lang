@@ -100,7 +100,7 @@ Layout under `./tests`:
 
 | Path | Meaning |
 |------|---------|
-| `tests/**/*.0s` (except below) | Must compile; each `test("…")` case must return `Ok` |
+| `tests/**/*.0s` (except below) | Must compile; each `test("…")` or `#[test]` case must return `Ok` |
 | `tests/compile_fail/**/*.0s` | Must **fail** to compile (negative syntax / type tests) |
 | `tests/positive/`, `tests/negative_runtime/` | Organized positive and soft-failure runtime suites |
 
@@ -111,12 +111,20 @@ test("addition works") {
     assert(1 + 1 == 2)?;
 }
 
-test("subtraction works") {
-    assert(5 - 3 == 2, "arith")?;
+#[test]
+fn multiply_works() {
+    assert(3 * 4 == 12)?;
 }
 ```
 
-Each `test("…") { … }` body runs in Result mode. A failed `assert`/`?` or a language `panic` fails that case; by default the harness continues to the next case (each case runs in an isolated VM so a panic does not skip later cases). Failures print `> Test "<description>" failed`. Files without `test(...)` cases still use a single `fn main()` as one opaque case. Files under `compile_fail/` pass only when compilation returns a clean diagnostic rejection (`Err`); a compiler panic does not count (and aborts under release `panic = "abort"`). Diagnostics for those files are silenced so the summary stays readable.
+Each `test("…") { … }` or `#[test]` function body runs in Result mode. A failed `assert`/`?` or a language `panic` fails that case; by default the harness continues to the next case (each case runs in an isolated VM so a panic does not skip later cases). Failures print `> Test "<description>" failed`. Files without `test(...)` cases still use a single `fn main()` as one opaque case. Files under `compile_fail/` pass only when compilation returns a clean diagnostic rejection (`Err`); a compiler panic does not count (and aborts under release `panic = "abort"`). Diagnostics for those files are silenced so the summary stays readable.
+
+**Production builds** (`cargo run -- file.0s`, `zero-script compile`) **omit** harness declarations by default — `test("…")` blocks and `#[test]` functions are stripped before codegen so they are not shipped in `out.c0s`. Use `--include-tests` to embed them (useful when you want to run the harness against a pre-built archive on another machine):
+
+```bash
+zero-script --include-tests compile myapp.0s -o myapp.c0s
+zero-script test ./tests          # always includes harness tests
+```
 
 ### Recompiling after changes
 

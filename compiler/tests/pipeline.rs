@@ -36,6 +36,20 @@ fn run_example_src(src: &str) -> String {
     run_example_src_with_entry(src, None)
 }
 
+fn compile_src_with_tests(src: &str) -> (Pipeline, Vec<common::Byte>, Vec<u64>) {
+    let mut pipeline = Pipeline::new();
+    pipeline.set_include_tests(true);
+    let (bytecode, constants) = pipeline
+        .compile_src(src)
+        .expect("source with tests should compile");
+    (pipeline, bytecode, constants)
+}
+
+fn run_harness_src(src: &str) -> String {
+    let (pipeline, bytecode, constants) = compile_src_with_tests(src);
+    run_bytecode(bytecode, constants, &pipeline, None)
+}
+
 fn run_example_src_with_entry(src: &str, entry: Option<&std::path::Path>) -> String {
     let mut pipeline = Pipeline::new();
     let (bytecode, constants) = pipeline
@@ -1607,7 +1621,8 @@ fn example_derive_show_eq_prints_expected() {
 #[test]
 fn derive_ord_unit_variants_compare_by_declaration_order() {
     let src = r#"
-enum Color derive Ord {
+#[derive(Ord)]
+enum Color {
     Red,
     Blue,
 }
@@ -1635,7 +1650,8 @@ fn main() {
 #[test]
 fn derive_ord_record_payload_lexicographic_compare() {
     let src = r#"
-enum Pair derive Ord {
+#[derive(Ord)]
+enum Pair {
     Pair { x: int, y: int },
 }
 
@@ -1652,6 +1668,88 @@ fn main() {
 "#;
     let output = run_example_src(src);
     assert_eq!(output, "true,true,false,true,false");
+}
+
+#[test]
+fn example_attr_ffi_strlen_prints_5() {
+    let output = run_example("examples/attr_ffi.0s");
+    assert_eq!(output, "5");
+}
+
+#[test]
+fn example_spread_prints_3_and_60() {
+    let output = run_example("examples/spread.0s");
+    assert_eq!(output, "360");
+}
+
+#[test]
+fn example_attr_decorator_forwards_args_and_stacks_attrs() {
+    let output = run_example("examples/attr_decorator.0s");
+    assert_eq!(output, "enterdo_thinghi42");
+}
+
+#[test]
+fn example_attr_class_decorates_constructor() {
+    let output = run_example("examples/attr_class.0s");
+    assert_eq!(output, "Point ctor512");
+}
+
+#[test]
+fn attr_method_forwards_self() {
+    let src = r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    print "%s", message;
+    return target(...args);
+}
+
+class Counter {
+    n: int,
+}
+
+impl Counter {
+    #[log(message = "bump")]
+    fn bump() -> int {
+        return self.n;
+    }
+}
+
+fn main() {
+    let c = new Counter(7);
+    print "%i", c.bump();
+}
+"#;
+    let output = run_example_src(src);
+    assert_eq!(output, "bump7");
+}
+
+#[test]
+fn attr_test_fn_discovered_by_harness() {
+    let mut pipeline = Pipeline::new();
+    pipeline.set_include_tests(true);
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests/positive/attr_test.0s"),
+    )
+    .expect("read attr_test.0s");
+    let (bytecode, constants) = pipeline.compile_src(&src).expect("compile attr_test.0s");
+    let cases = pipeline.test_cases().to_vec();
+    assert_eq!(
+        cases.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["addition works", "multiply_works"]
+    );
+
+    for (_name, offset) in &cases {
+        let mut machine = Machine::<128>::default();
+        pipeline.wire_host_natives(&mut machine);
+        machine.load_program(&bytecode, &constants);
+        let ret = machine.call_function(*offset, &[]);
+        assert!(
+            !machine.panicked() && machine.result_is_ok(ret),
+            "#[test] case should pass"
+        );
+    }
 }
 
 #[test]
@@ -1733,7 +1831,7 @@ fn example_io_nested_write_prints_2() {
 /// Standalone virtual `main` for a green `test("…")` suite exits cleanly.
 #[test]
 fn harness_virtual_main_passes_when_all_asserts_ok() {
-    let output = run_example_src(
+    let output = run_harness_src(
         r#"
 test("ok") {
     assert(true)?;
@@ -1747,6 +1845,7 @@ test("ok") {
 #[test]
 fn harness_virtual_main_prints_failure_and_panics() {
     let mut pipeline = Pipeline::new();
+    pipeline.set_include_tests(true);
     let (bytecode, constants) = pipeline
         .compile_src(
             r#"
@@ -1782,6 +1881,7 @@ test("broken") {
 #[test]
 fn harness_isolated_call_function_continues_after_soft_fail() {
     let mut pipeline = Pipeline::new();
+    pipeline.set_include_tests(true);
     let (bytecode, constants) = pipeline
         .compile_src(
             r#"
@@ -1815,6 +1915,7 @@ test("c") { assert(1 + 1 == 2)?; }
 #[test]
 fn harness_isolated_call_function_continues_after_hard_panic() {
     let mut pipeline = Pipeline::new();
+    pipeline.set_include_tests(true);
     let (bytecode, constants) = pipeline
         .compile_src(
             r#"
@@ -2175,4 +2276,140 @@ fn main() {
 "#,
     );
     assert_eq!(output, "1035");
+}
+
+// ── Harness stripping + cross-feature integration ─────────────────────────────
+
+#[test]
+fn production_compile_strips_harness_declarations() {
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = pipeline
+        .compile_src(
+            r#"
+#[test]
+fn hidden() { assert(false)?; }
+test("also hidden") { assert(false)?; }
+fn main() { print "ok"; }
+"#,
+        )
+        .expect("compile");
+    assert!(
+        pipeline.test_cases().is_empty(),
+        "production compile must not register harness cases"
+    );
+    let output = run_bytecode(bytecode, constants, &pipeline, None);
+    assert_eq!(output, "ok");
+}
+
+#[test]
+fn include_tests_flag_embeds_harness_metadata() {
+    let (pipeline, _bc, _constants) = compile_src_with_tests(
+        r#"
+#[test("via attr")]
+fn from_attr() { assert(true)?; }
+test("via block") { assert(true)?; }
+"#,
+    );
+    assert_eq!(pipeline.test_cases().len(), 2);
+    assert_eq!(pipeline.test_cases()[0].0, "via attr");
+    assert_eq!(pipeline.test_cases()[1].0, "via block");
+}
+
+#[test]
+fn attr_decorator_with_overloaded_functions_forwards_each_arity() {
+    let output = run_example_src(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    print "%s", message;
+    return target(...args);
+}
+
+#[log(message = "nullary")]
+fn do_thing() -> int { return 0; }
+
+#[log(message = "unary")]
+fn do_thing(int x) -> int { return x; }
+
+fn main() {
+    print "%i", do_thing();
+    print "%i", do_thing(42);
+}
+"#,
+    );
+    assert_eq!(output, "nullary0unary42");
+}
+
+#[test]
+fn spread_with_partial_application_forwards_remaining_args() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int { return a + b + c; }
+fn main() {
+    let p = add3(1);
+    print "%i", p(...(2, 3));
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
+#[test]
+fn named_call_args_on_overloaded_functions_dispatch_correctly() {
+    let output = run_example_src(
+        r#"
+fn greet(string name) -> string { return name; }
+fn greet(string name, int age) -> string { return format "%s:%i", name, age; }
+fn main() {
+    print "%s", greet(name: "Ada");
+    print "%s", greet(name: "Grace", age: 40);
+}
+"#,
+    );
+    assert_eq!(output, "AdaGrace:40");
+}
+
+#[test]
+fn attr_on_async_fn_rejected_at_compile_time() {
+    let mut pipeline = Pipeline::new();
+    let result = pipeline.compile_src(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    return target(...args);
+}
+#[log(message = "coro")]
+async fn counter() {
+    yield 1;
+}
+fn main() {
+    let h = counter();
+    print "%i", resume h;
+}
+"#,
+    );
+    assert!(
+        result.is_err(),
+        "decorating async fn with user attrs is not supported yet"
+    );
+}
+
+#[test]
+fn rest_overload_with_attr_logging_forwards_pack() {
+    let output = run_example_src(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    print "%s", message;
+    return target(...args);
+}
+
+#[log(message = "sum")]
+fn total(int... xs) -> int {
+    return len(xs);
+}
+
+fn main() {
+    print "%i", total(1, 2, 3);
+}
+"#,
+    );
+    assert_eq!(output, "sum3");
 }
