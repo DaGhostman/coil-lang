@@ -192,9 +192,50 @@ fn example_static_singleton_prints_121() {
 }
 
 #[test]
+fn example_static_minimal_prints_11() {
+    let output = run_example("examples/static_minimal.0s");
+    assert_eq!(output, "11");
+}
+
+#[test]
 fn example_readonly_seal_prints_322() {
     let output = run_example("examples/readonly_seal.0s");
     assert_eq!(output, "322");
+}
+
+/// `static const` is readable via LoadStatic; only reassignment is rejected.
+#[test]
+fn static_const_reads_via_load_static() {
+    let output = run_example_src(
+        r#"
+static const VERSION = 42;
+
+fn main() {
+    print "%i", VERSION;
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+/// Class `const` fields are readable after construction (mutation is blocked separately).
+#[test]
+fn const_class_field_reads_after_construction() {
+    let output = run_example_src(
+        r#"
+class Point {
+    const x: int,
+    y: int,
+}
+
+fn main() {
+    let p = new Point(7, 9);
+    print "%i", p.x;
+    print "%i", p.y;
+}
+"#,
+    );
+    assert_eq!(output, "79");
 }
 
 #[test]

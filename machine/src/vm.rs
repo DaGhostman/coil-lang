@@ -4798,4 +4798,32 @@ mod tests {
         let mut vm = Machine::<256>::default();
         vm.run_with_pool(&code, &[], 2);
     }
+
+    /// StoreStatic must write the popped value so a later LoadStatic observes it.
+    #[test]
+    fn load_store_static_round_trips_value() {
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(42),
+            Byte::new(Instruction::StoreStatic).with_operand_u32(0),
+            Byte::new(Instruction::LoadStatic).with_operand_u32(0),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 1);
+        assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// Out-of-range StoreStatic is a defensive no-op (does not panic).
+    #[test]
+    fn store_static_out_of_range_is_noop() {
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(7),
+            Byte::new(Instruction::StoreStatic).with_operand_u32(99),
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 1);
+        assert_eq!(vm.pop().as_int(), 1);
+    }
 }

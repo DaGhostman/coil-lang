@@ -866,6 +866,35 @@ mod tests {
     }
 
     #[test]
+    fn bump_targets_at_or_after_shifts_jmp_operand() {
+        let mut bc = vec![
+            Byte::new(Instruction::JMP).with_operand_u32(4),
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut pool = Vec::<u64>::new();
+        bump_targets_at_or_after(&mut bc, &mut pool, 3, 5);
+        assert_eq!(bc[0].operand_u32(), 9);
+        // Target below threshold must stay put.
+        let mut bc2 = vec![Byte::new(Instruction::JMP).with_operand_u32(1)];
+        bump_targets_at_or_after(&mut bc2, &mut pool, 3, 5);
+        assert_eq!(bc2[0].operand_u32(), 1);
+    }
+
+    #[test]
+    fn bump_targets_skip_byte_leaves_skipped_jmp_unchanged() {
+        let mut bc = vec![
+            Byte::new(Instruction::JMP).with_operand_u32(10), // freshly inserted; already adjusted
+            Byte::new(Instruction::CALL).with_call_packed(0, 10),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut pool = Vec::<u64>::new();
+        bump_targets_at_or_after_skip_byte(&mut bc, &mut pool, 0, 5, 3);
+        assert_eq!(bc[0].operand_u32(), 10, "skipped JMP must keep pre-adjusted target");
+        assert_eq!(bc[1].call_parts().1, 13, "non-skipped CALL must bump");
+    }
+
+    #[test]
     fn code_ptr_return_does_not_fuse_to_const_return() {
         let mut bc = vec![
             Byte::new(Instruction::CodePtr).with_operand_u32(7),

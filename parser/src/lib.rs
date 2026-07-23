@@ -4394,6 +4394,115 @@ mod tests {
     }
 
     #[test]
+    fn parse_static_const_declaration() {
+        let src = r#"static const VERSION = "1.0";"#;
+        let result = Pratt::default().declaration().parse(src).into_result();
+        match result {
+            Ok((_span, expr)) => match expr.as_ref() {
+                Expression::StaticDecl {
+                    is_const,
+                    name,
+                    init,
+                    ..
+                } => {
+                    assert!(*is_const);
+                    assert_eq!(*name, "VERSION");
+                    let init_expr = match init.1.as_ref() {
+                        Expression::Expr(inner) => inner.1.as_ref(),
+                        other => other,
+                    };
+                    assert!(
+                        matches!(init_expr, Expression::String("1.0")),
+                        "expected string init, got {:?}",
+                        init_expr
+                    );
+                }
+                other => panic!("expected StaticDecl, got {:?}", other),
+            },
+            Err(e) => panic!("parse failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn parse_array_append_assignment() {
+        let src = "a[] = 3;";
+        let ast = Pratt::default()
+            .parse(src)
+            .expect("parse append assignment");
+        fn find_append(e: &Expression<'_>) -> bool {
+            match e {
+                Expression::Assignment(lhs, _) => matches!(lhs.1.as_ref(), Expression::Index(_, None)),
+                Expression::Fragment(items) | Expression::Block(items) => {
+                    items.iter().any(|i| find_append(i.1.as_ref()))
+                }
+                Expression::Expr(inner)
+                | Expression::Group(inner)
+                | Expression::Statement(inner)
+                | Expression::ExprStatement(inner) => find_append(inner.1.as_ref()),
+                _ => false,
+            }
+        }
+        assert!(
+            find_append(ast.1.as_ref()),
+            "expected Assignment(Index(_, None), …) for `a[] = 3`, got {:?}",
+            ast.1
+        );
+    }
+
+    #[test]
+    fn parse_readonly_array_literal() {
+        let src = "readonly [1, 2, 3]";
+        let ast = Pratt::default()
+            .parse(src)
+            .expect("parse readonly array");
+        fn find_readonly_array(e: &Expression<'_>) -> bool {
+            match e {
+                Expression::Readonly(inner) => matches!(inner.1.as_ref(), Expression::Array(_)),
+                Expression::Fragment(items) | Expression::Block(items) => {
+                    items.iter().any(|i| find_readonly_array(i.1.as_ref()))
+                }
+                Expression::Expr(inner) | Expression::Group(inner) => {
+                    find_readonly_array(inner.1.as_ref())
+                }
+                _ => false,
+            }
+        }
+        assert!(
+            find_readonly_array(ast.1.as_ref()),
+            "expected Readonly(Array), got {:?}",
+            ast.1
+        );
+    }
+
+    #[test]
+    fn parse_readonly_new_and_new_readonly_instantiate() {
+        for src in ["readonly new Point(1, 2)", "new readonly Point(1, 2)"] {
+            let ast = Pratt::default()
+                .parse(src)
+                .unwrap_or_else(|e| panic!("parse `{src}` failed: {e:?}"));
+            fn find_readonly_new(e: &Expression<'_>) -> bool {
+                match e {
+                    Expression::Readonly(inner) => {
+                        matches!(inner.1.as_ref(), Expression::Instantiate(_, _))
+                    }
+                    Expression::Fragment(items) | Expression::Block(items) => {
+                        items.iter().any(|i| find_readonly_new(i.1.as_ref()))
+                    }
+                    Expression::Expr(inner) | Expression::Group(inner) => {
+                        find_readonly_new(inner.1.as_ref())
+                    }
+                    _ => false,
+                }
+            }
+            assert!(
+                find_readonly_new(ast.1.as_ref()),
+                "expected Readonly(Instantiate) for `{src}`, got {:?}",
+                ast.1
+            );
+        }
+    }
+
+    #[test]
     fn parse_static_singleton_example_file() {
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
