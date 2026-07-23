@@ -2413,3 +2413,84 @@ fn main() {
     );
     assert_eq!(output, "sum3");
 }
+
+/// Prefix args + spread pack must flatten in source order. A buggy flatten that
+/// drops the prefix or reverses pack elements would still typecheck for
+/// `add3(int,int,int)` but print the wrong sum.
+#[test]
+fn spread_mixed_prefix_and_pack_prints_6() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int { return a + b + c; }
+fn main() {
+    print "%i", add3(1, ...(2, 3));
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
+/// Let-bound packs exercise the typed-lookup codegen path (not the literal
+/// Tuple/Array shortcuts). Wrong Index expansion would silently mis-bind.
+#[test]
+fn spread_let_bound_tuple_prints_6() {
+    let output = run_example_src(
+        r#"
+fn add3(int a, int b, int c) -> int { return a + b + c; }
+fn main() {
+    let pack = (1, 2, 3);
+    print "%i", add3(...pack);
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
+/// Positional attr extras (`#[log("enter")]`) must bind to the first extra
+/// parameter the same way named extras do.
+#[test]
+fn attr_positional_extra_forwards_literal() {
+    let output = run_example_src(
+        r#"
+attr log<T>(fn(...args) -> T target, string message, ...args) -> T {
+    print "%s", message;
+    return target(...args);
+}
+
+#[log("enter")]
+fn do_thing(int x) -> int { return x; }
+
+fn main() {
+    print "%i", do_thing(7);
+}
+"#,
+    );
+    assert_eq!(output, "enter7");
+}
+
+/// Stacking is Python-style: first listed attr is outermost. Reversing the
+/// expand loop would swap the print order without failing typecheck.
+#[test]
+fn stacked_attrs_apply_outer_first() {
+    let output = run_example_src(
+        r#"
+attr outer<T>(fn(...args) -> T target, ...args) -> T {
+    print "O";
+    return target(...args);
+}
+attr inner<T>(fn(...args) -> T target, ...args) -> T {
+    print "I";
+    return target(...args);
+}
+
+#[outer]
+#[inner]
+fn f() -> int { return 1; }
+
+fn main() {
+    print "%i", f();
+}
+"#,
+    );
+    assert_eq!(output, "OI1");
+}
