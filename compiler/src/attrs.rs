@@ -311,7 +311,7 @@ fn resolve_attr_extras<'a>(
     extra_params: &[(&'static str, Option<Output>)],
     span: SimpleSpan,
     messages: &mut Vec<Message>,
-) -> Vec<Output<'a>> {
+) -> Option<Vec<Output<'a>>> {
     let mut values: Vec<Option<Output<'a>>> = vec![None; extra_params.len()];
     match &attr.args {
         AttrArgs::KeyValues(kvs) => {
@@ -348,20 +348,25 @@ fn resolve_attr_extras<'a>(
         AttrArgs::Empty => {}
     }
     let mut out = Vec::new();
+    let mut missing = false;
     for (i, (name, _)) in extra_params.iter().enumerate() {
         match values[i].take() {
             Some(v) => out.push(v),
             None => {
+                missing = true;
                 messages.push(Message::error(
                     ErrorCode::GenericTypeError,
                     format!("Missing argument `{}` for `#[{}(...)]`", name, attr.name),
                     span.into_range(),
                 ));
-                out.push(at(span, Expression::Integer(0)));
             }
         }
     }
-    out
+    if missing {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn collect_attr_function_bodies<'a>(decls: &[Output<'a>]) -> HashMap<String, Output<'a>> {
@@ -482,6 +487,67 @@ fn rewrite_expr_inline<'a>(
                 .collect();
             at(span, Expression::Fragment(children))
         }
+        Expression::If(branches) => {
+            let branches = branches
+                .iter()
+                .map(|branch| match branch.1.as_ref() {
+                    Expression::Branch(cond, body) => at(
+                        branch.0,
+                        Expression::Branch(
+                            cond.as_ref().map(|c| {
+                                rewrite_expr_inline(c, target, subs, forward_idents)
+                            }),
+                            rewrite_expr_inline(body, target, subs, forward_idents),
+                        ),
+                    ),
+                    _ => rewrite_expr_inline(branch, target, subs, forward_idents),
+                })
+                .collect();
+            at(span, Expression::If(branches))
+        }
+        Expression::Match { scrutinee, arms } => {
+            let scrutinee = rewrite_expr_inline(scrutinee, target, subs, forward_idents);
+            let arms = arms
+                .iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern.clone(),
+                    body: rewrite_expr_inline(&arm.body, target, subs, forward_idents),
+                })
+                .collect();
+            at(span, Expression::Match { scrutinee, arms })
+        }
+        Expression::Loop {
+            identifier,
+            iterable,
+            body,
+        } => at(
+            span,
+            Expression::Loop {
+                identifier: identifier
+                    .as_ref()
+                    .map(|id| rewrite_expr_inline(id, target, subs, forward_idents)),
+                iterable: rewrite_expr_inline(iterable, target, subs, forward_idents),
+                body: rewrite_expr_inline(body, target, subs, forward_idents),
+            },
+        ),
+        Expression::For {
+            init,
+            cond,
+            step,
+            body,
+        } => at(
+            span,
+            Expression::For {
+                init: init
+                    .as_ref()
+                    .map(|e| rewrite_expr_inline(e, target, subs, forward_idents)),
+                cond: rewrite_expr_inline(cond, target, subs, forward_idents),
+                step: step
+                    .as_ref()
+                    .map(|e| rewrite_expr_inline(e, target, subs, forward_idents)),
+                body: rewrite_expr_inline(body, target, subs, forward_idents),
+            },
+        ),
         _ => expr.clone(),
     }
 }
@@ -550,11 +616,13 @@ fn expand_function_user_attrs<'a>(
                     .collect()
             })
             .unwrap_or_default();
-        let extras = resolve_attr_extras(attr, &extra_params, span, messages);
         let extra_names = attr_extra_names
             .get(attr.name)
             .cloned()
             .unwrap_or_default();
+        let Some(extras) = resolve_attr_extras(attr, &extra_params, span, messages) else {
+            continue;
+        };
         if let Some(attr_body) = find_attr_function_body(attr_bodies, attr.name) {
             wrapped = inline_attr_body(
                 &attr_body,
@@ -693,16 +761,25 @@ fn expand_decls<'a>(
             let is_ffi_sig = body.is_none();
             validate_attrs(attrs, "function", user_attrs, &mut messages, span, is_ffi_sig);
             if body.is_some() {
-                expand_function_user_attrs(
-                    attr_bodies,
-                    attrs,
-                    args,
-                    body,
-                    user_attrs,
-                    attr_extra_names,
-                    span,
-                    &mut messages,
-                );
+                if *is_coro && !user_attrs_on(attrs, user_attrs).is_empty() {
+                    messages.push(Message::error(
+                        ErrorCode::GenericTypeError,
+                        "user-defined attributes are not supported on `async fn`".to_string(),
+                        span.into_range(),
+                    ));
+                    strip_user_attrs(attrs, user_attrs);
+                } else {
+                    expand_function_user_attrs(
+                        attr_bodies,
+                        attrs,
+                        args,
+                        body,
+                        user_attrs,
+                        attr_extra_names,
+                        span,
+                        &mut messages,
+                    );
+                }
             }
             if is_ffi_sig {
                 if let Some(ffi) = parse_ffi_attr(attrs, &mut messages, span) {

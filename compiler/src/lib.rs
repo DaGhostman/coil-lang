@@ -7762,7 +7762,7 @@ impl Compiler {
         }
         self.checker.set_current_module(module);
         // Expand `derive` clauses to synthetic `impl` AST before the
-        // ID pre-walk / typecheck (see `derive::expand_program`).
+        // ID pre-walk / typecheck (see `attrs::expand_program`).
         let expand = attrs::expand_program(ast);
         self.messages.extend(expand.messages);
         self.decorated_class_ctors = expand.decorated_class_ctors;

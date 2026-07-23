@@ -153,7 +153,7 @@ call_arg    ::= expr | '...' expr
 |---------------------|-----------|
 | Tuple `(T1, …, Tn)` | Each element becomes one argument |
 | Fixed array `[T; N]` | Each element becomes one argument |
-| Dynamic `[T]` | Each element becomes one argument (runtime length) |
+| Dynamic `[T]` | Compile error (use tuple or `[T; N]`) |
 | Other | Compile error |
 
 Examples:
