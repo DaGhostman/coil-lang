@@ -1,6 +1,6 @@
 # Tutorial: Aggregates
 
-zero-script gives you four ways to group data: **tuples**, **arrays**, **dicts** (anonymous records), and **enum record variants**. This chapter covers the first three plus **type aliases**, which make complex aggregate types easier to read.
+coil gives you four ways to group data: **tuples**, **arrays**, **dicts** (anonymous records), and **enum record variants**. This chapter covers the first three plus **type aliases**, which make complex aggregate types easier to read.
 
 ---
 
@@ -8,7 +8,7 @@ zero-script gives you four ways to group data: **tuples**, **arrays**, **dicts**
 
 A **tuple** is a fixed-size, heterogeneous product type. Each element can have a different type.
 
-```0s
+```coil
 let pair = (42, "hello");
 let triple = (1, 2, 3);
 ```
@@ -31,7 +31,7 @@ This matters for arithmetic: `(1 + 2) * 3` evaluates to `9`, not a tuple multipl
 
 Annotate tuple types with parentheses and commas:
 
-```0s
+```coil
 fn swap((int, string) pair) -> (string, int) {
     return (pair[1], pair[0]);
 }
@@ -45,7 +45,7 @@ Index tuples with integer literals: `t[0]`, `t[1]`, and so on.
 
 When the index is a **compile-time constant**, the typechecker verifies it is in bounds:
 
-```0s
+```coil
 let t = (10, 20);
 print "%i", t[0];   // OK — index 0
 print "%i", t[5];   // compile error: tuple index 5 out of bounds for tuple of length 2
@@ -61,14 +61,14 @@ An **array** is a homogeneous collection — every element has the same type.
 
 ### Array literals
 
-```0s
+```coil
 let nums = [1, 2, 3];
 let empty: [int] = [];
 ```
 
 All elements in a literal must share one type. Mixing types is a compile error:
 
-```0s
+```coil
 let bad = [1, "x"];   // error: array element type mismatch
 ```
 
@@ -81,7 +81,7 @@ let bad = [1, "x"];   // error: array element type mismatch
 
 Examples:
 
-```0s
+```coil
 fn sum_fixed([int; 3] arr) -> int {
     return arr[0] + arr[1] + arr[2];
 }
@@ -100,12 +100,12 @@ Indexing uses the same `arr[i]` syntax as tuples.
 **Fixed-length arrays** (`[T; N]`):
 
 - A **literal index** that is out of bounds is a **compile error**:
-  ```0s
+  ```coil
   let arr = [0, 1, 2];   // type [int; 3]
   let _ = arr[3];        // error: array index 3 out of bounds for array of length 3
   ```
 - A **variable index** is allowed — the compiler cannot prove bounds at compile time:
-  ```0s
+  ```coil
   let i = 1;
   let _ = arr[i];        // OK
   ```
@@ -118,7 +118,7 @@ Indexing uses the same `arr[i]` syntax as tuples.
 
 `arr[] = value` appends in place (empty index is only legal on the left of `=`). `len(arr)` returns the current runtime length.
 
-```0s
+```coil
 fn main() {
     let a = [1, 2];
     a[] = 3;
@@ -136,7 +136,7 @@ The appended value must match the element type. After append, a fixed literal ar
 
 A **dict** (anonymous record) is written with curly braces and named fields:
 
-```0s
+```coil
 let d = { foo: 42, bar: 100 };
 print "%i", d.foo;   // 42
 print "%i", d.bar;   // 100
@@ -146,7 +146,7 @@ print "%i", d.bar;   // 100
 
 Dicts are **structurally typed**. Two literals with the same field names and compatible types are the same type, even if they were written in different places:
 
-```0s
+```coil
 let a = { x: 1, y: 2 };
 let b = { y: 3, x: 4 };   // field order does not matter
 // a and b both have type { x: int, y: int }
@@ -158,14 +158,14 @@ There is no separate type name to declare — the shape `{ foo: int, bar: int }`
 
 Use dot notation: `d.foo`. The compiler resolves the field at compile time. Accessing a field that does not exist on the record's type is an error:
 
-```0s
+```coil
 let d = { foo: 42 };
 print "%i", d.bar;   // error: Cannot find field `bar` on record `{ foo: int }`
 ```
 
 Duplicate field names in one literal are also rejected:
 
-```0s
+```coil
 let bad = { foo: 1, foo: 2 };   // error: Duplicate field `foo`
 ```
 
@@ -179,7 +179,7 @@ Enum variants can also use record-shaped payloads (`Point { x: int, y: int }`), 
 
 Give a readable name to any type with `type Name = T;`:
 
-```0s
+```coil
 type Point = (int, int);
 
 fn distance(Point p) -> int {
@@ -203,7 +203,7 @@ Scoping rules:
 - Aliases are lexical: a block or function may define an alias that shadows an outer alias.
 - Declaring `type X = T;` twice in the same scope is a typechecking diagnostic.
 
-See `examples/aliases.0s` for a complete runnable example.
+See `examples/aliases.hy` for a complete runnable example.
 
 ---
 
@@ -231,15 +231,15 @@ See `examples/aliases.0s` for a complete runnable example.
 
 | File | Demonstrates |
 |------|--------------|
-| `examples/array_grow.0s` | Growing arrays with `arr[] =` and `len` |
-| `examples/dict.0s` | Dict literals and field access |
-| `examples/aliases.0s` | Type aliases with tuples |
-| `examples/record.0s` | Enum record variants (contrast with dicts) |
+| `examples/array_grow.hy` | Growing arrays with `arr[] =` and `len` |
+| `examples/dict.hy` | Dict literals and field access |
+| `examples/aliases.hy` | Type aliases with tuples |
+| `examples/record.hy` | Enum record variants (contrast with dicts) |
 
 Run any example from the project root:
 
 ```bash
-cargo run -- examples/dict.0s
+cargo run -- examples/dict.hy
 ```
 
 ---

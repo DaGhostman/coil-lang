@@ -1,6 +1,6 @@
 # Modules reference
 
-This document specifies the syntax and semantics of zero-script's module system: `use` imports, `mod` forward declarations, namespace rules, and path resolution.
+This document specifies the syntax and semantics of coil's module system: `use` imports, `mod` forward declarations, namespace rules, and path resolution.
 
 ---
 
@@ -44,7 +44,7 @@ A `mod` declaration loads a module file but does not bind any names in the curre
 
 ## Virtual modules (compiler builtins)
 
-Some `use` paths resolve to **compiler-owned virtual modules**, not `.0s` files on disk. The pipeline skips disk discovery for these paths.
+Some `use` paths resolve to **compiler-owned virtual modules**, not `.hy` files on disk. The pipeline skips disk discovery for these paths.
 
 | Module | Exports | Auto-imported? |
 |--------|---------|----------------|
@@ -61,7 +61,7 @@ Some `use` paths resolve to **compiler-owned virtual modules**, not `.0s` files 
 
 Short prelude names are bound in scope so `Option::Some` and `T: Eq` work without imports. To redefine a prelude name:
 
-```0s
+```coil
 use prelude::ops::Eq as PreludeEq; // frees short `Eq`
 trait Eq<T> { /* your trait */ }   // now allowed
 // Builtin still reachable as `prelude::ops::Eq` or `PreludeEq`
@@ -69,7 +69,7 @@ trait Eq<T> { /* your trait */ }   // now allowed
 
 Without the `as` rebind, `trait Eq` / `enum Option` is a conflict diagnostic.
 
-`zero.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops` + `prelude::test`.
+`coil.toml` `preludes = […]` customization is **not** implemented yet — the compiler always injects `prelude` + `prelude::ops` + `prelude::test`.
 
 ---
 
@@ -81,8 +81,8 @@ Given a concrete import `use a::b::c;`:
 1. Split the path into segments. All segments except the last form the **directory path**; the last segment is the **item name**.
    - Path: `["a", "b"]`
    - Item name: `"c"`
-2. For each search root in `[module].roots` (from `zero.toml`, in declaration order):
-   - Build candidate: `<project_root>/<root>/a/b/c.0s`
+2. For each search root in `[module].roots` (from `coil.toml`, in declaration order):
+   - Build candidate: `<project_root>/<root>/a/b/c.hy`
    - If the file exists, **stop** — this is the resolved module file.
 3. If no root contains the file, emit a module-not-found diagnostic.
 
@@ -92,22 +92,22 @@ Given a glob import `use a::b::*;`:
    - For `use foo::*`: path = `["foo"]`, stem = `"foo"`
    - For `use a::b::*`: path = `["a"]`, stem = `"b"` (the last non-glob segment names the file)
 2. Pop the last segment from the path to get the directory prefix.
-3. Resolve `<project_root>/<root>/<path>/<stem>.0s` using the same root search order.
-4. Example: `use foo::*` → `<root>/foo.0s`
+3. Resolve `<project_root>/<root>/<path>/<stem>.hy` using the same root search order.
+4. Example: `use foo::*` → `<root>/foo.hy`
 
 Given a `mod foo;` declaration:
 
-1. For each search root, check `<project_root>/<root>/foo.0s`.
+1. For each search root, check `<project_root>/<root>/foo.hy`.
 2. First existing file wins.
 
 ### Resolution examples
 
 | Statement | Resolved file (root = `src/`) |
 |-----------|-------------------------------|
-| `use foo::sadge;` | `src/foo/sadge.0s` |
-| `use lib::io::read;` | `src/lib/io/read.0s` |
-| `use foo::*;` | `src/foo.0s` |
-| `mod foo;` | `src/foo.0s` |
+| `use foo::sadge;` | `src/foo/sadge.hy` |
+| `use lib::io::read;` | `src/lib/io/read.hy` |
+| `use foo::*;` | `src/foo.hy` |
+| `mod foo;` | `src/foo.hy` |
 
 With multiple roots `["./src", "./vendor"]`, the compiler checks `./src/...` first, then `./vendor/...`. The first match wins.
 
@@ -121,16 +121,16 @@ For a resolved file path, the namespace is:
 
 1. Find the **first** search root that contains the file.
 2. Take the path relative to that root.
-3. Strip the `.0s` extension.
+3. Strip the `.hy` extension.
 4. Replace path separators with `::`.
 
 Examples (root = `src/`):
 
 | Absolute path | Relative path | Namespace |
 |---------------|---------------|-----------|
-| `src/foo.0s` | `foo.0s` | `foo` |
-| `src/foo/sadge.0s` | `foo/sadge.0s` | `foo::sadge` |
-| `src/lib/io/read.0s` | `lib/io/read.0s` | `lib::io::read` |
+| `src/foo.hy` | `foo.hy` | `foo` |
+| `src/foo/sadge.hy` | `foo/sadge.hy` | `foo::sadge` |
+| `src/lib/io/read.hy` | `lib/io/read.hy` | `lib::io::read` |
 
 If a file is outside all search roots, the namespace falls back to the file's bare stem.
 
@@ -150,7 +150,7 @@ If the namespace is empty, the FQN is just `<function_name>`.
 
 For a concrete import `use a::b::c;`:
 
-- Expected file: `<root>/a/b/c.0s`
+- Expected file: `<root>/a/b/c.hy`
 - File namespace: `a::b::c`
 - Expected function name inside the file: `c`
 - FQN: `a::b::c::c`
@@ -163,12 +163,12 @@ The last path segment names both the file and the function inside it.
 
 `use foo::*;`:
 
-1. **Discovery:** loads and compiles `foo.0s` (same as a non-glob reference to that file).
+1. **Discovery:** loads and compiles `foo.hy` (same as a non-glob reference to that file).
 2. **Scope:** after the dependency files compile, every top-level function whose FQN starts with `foo::` and has no further `::` segments is imported into the current scope by its bare name.
 
-Example — `src/foo.0s`:
+Example — `src/foo.hy`:
 
-```0s
+```coil
 fn sadge() { print "%i", 100; }
 fn greet() { print "%i", 200; }
 ```
@@ -177,7 +177,7 @@ After `use foo::*;` in another file, both `sadge()` and `greet()` are callable d
 
 ### Glob limitations
 
-- **File-scoped only.** `use foo::*` imports from `foo.0s`. It does **not** import items from `foo/bar.0s` or other files in a `foo/` directory.
+- **File-scoped only.** `use foo::*` imports from `foo.hy`. It does **not** import items from `foo/bar.hy` or other files in a `foo/` directory.
 - **Top-level items only.** Nested items (if added in future versions) are not glob-imported.
 - **No aliasing.** `use foo::* as bar;` is not valid syntax.
 - **Compile order matters.** Glob expansion reads the function registry after dependency files compile. The imported file must compile before the consumer.
@@ -199,7 +199,7 @@ Without `as`, the local name defaults to the last path segment (`name`).
 
 Examples:
 
-```0s
+```coil
 use foo::sadge;           // local: sadge  → FQN foo::sadge::sadge
 use foo::sadge as f;      // local: f      → FQN foo::sadge::sadge
 use lib::io::read as rd;  // local: rd     → FQN lib::io::read::read
@@ -230,7 +230,7 @@ The pipeline runs in two passes:
 
 ---
 
-## Interaction with `zero.toml`
+## Interaction with `coil.toml`
 
 Module resolution depends on `[module].roots` from the project manifest. See [Project configuration](project-config.md) for manifest format and default behavior.
 

@@ -1,0 +1,18 @@
+// examples/generic_class.hy — generic class + impl end-to-end.
+//
+// Output: 42
+
+class Cell<T> {
+    value: T
+}
+
+impl Cell<T> {
+    fn get() -> T {
+        return self.value;
+    }
+}
+
+fn main() {
+    let c = new Cell(42);
+    print "%i", c.get();
+}

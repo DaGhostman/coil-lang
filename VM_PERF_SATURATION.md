@@ -8,16 +8,16 @@
 
 | Workload | Class | Exercises | Golden output |
 |----------|-------|-----------|---------------|
-| `examples/fib_bench.0s` | CPU / calls | recursion, `BinReturn`, `BinSlotSlot` | `2178309` |
-| `examples/perf/numeric.0s` | CPU / loop | `BinSlotImmJmpf`, `BinSlotImm`, `StorePop` | `1999000` |
-| `examples/perf/operators_loop.0s` | CPU / ops | `Pow`, `BITAND`, `BITOR`, `LogNotJmpf` | `149912` |
-| `examples/perf/array_mut.0s` | heap / agg | `StoreIndex`, compound update | `2000` |
-| `examples/perf/dict_hot.0s` | heap / records | `GetField`, `SetField` | `6000` |
-| `examples/perf/coro_ping.0s` | coroutines | `MakeCoro`, `ResumeCoro`, `YieldCoro` | `124750` |
-| `examples/perf/match_sum.0s` | match (bytecode only) | `MakeEnum`, `JumpIfMatch` | *(runtime golden deferred — see below)* |
-| `examples/operators.0s` | smoke | operator surface | `801125428falsetrue3` |
+| `examples/fib_bench.hy` | CPU / calls | recursion, `BinReturn`, `BinSlotSlot` | `2178309` |
+| `examples/perf/numeric.hy` | CPU / loop | `BinSlotImmJmpf`, `BinSlotImm`, `StorePop` | `1999000` |
+| `examples/perf/operators_loop.hy` | CPU / ops | `Pow`, `BITAND`, `BITOR`, `LogNotJmpf` | `149912` |
+| `examples/perf/array_mut.hy` | heap / agg | `StoreIndex`, compound update | `2000` |
+| `examples/perf/dict_hot.hy` | heap / records | `GetField`, `SetField` | `6000` |
+| `examples/perf/coro_ping.hy` | coroutines | `MakeCoro`, `ResumeCoro`, `YieldCoro` | `124750` |
+| `examples/perf/match_sum.hy` | match (bytecode only) | `MakeEnum`, `JumpIfMatch` | *(runtime golden deferred — see below)* |
+| `examples/operators.hy` | smoke | operator surface | `801125428falsetrue3` |
 
-Run the full harness (64MB limit, fresh `out.c0s` per example):
+Run the full harness (64MB limit, fresh `out.hyc` per example):
 
 ```bash
 ./scripts/vm_bench.sh
@@ -34,8 +34,8 @@ Dispatch-count regressions live in `compiler/tests/perf_metrics.rs` (requires
 
 | Superinstruction | Convoy | Measured benefit |
 |------------------|--------|------------------|
-| `BinSlotImmJmpf` | `LOAD; CONST; <cmp>; JMPF` | Removes 3 dispatches per loop test on `numeric.0s` |
-| `LogNotJmpf` | `LogNot; JMPF` | Fuses control flow in `operators_loop.0s` |
+| `BinSlotImmJmpf` | `LOAD; CONST; <cmp>; JMPF` | Removes 3 dispatches per loop test on `numeric.hy` |
+| `LogNotJmpf` | `LogNot; JMPF` | Fuses control flow in `operators_loop.hy` |
 | `Pow` / `BITAND` / `BITOR` in `BinSlot*` / `BinReturn` | `LOAD; LOAD; <op>` | Enables fusion for operator-heavy loops |
 
 Peephole also extends `is_bin_op` / `is_int_bin_op` for `Pow`, `BITAND`, `BITOR`.
@@ -77,7 +77,7 @@ Peephole also extends `is_bin_op` / `is_int_bin_op` for `Pow`, `BITAND`, `BITOR`
 cargo test --workspace
 cargo test -p compiler --test perf_metrics
 cargo test -p compiler --test pipeline example_perf
-cargo build --release && rm -f out.c0s && poop -d 6000 ./target/release/zero-script examples/fib_bench.0s
+cargo build --release && rm -f out.hyc && poop -d 6000 ./target/release/coil examples/fib_bench.hy
 ```
 
 All workspace tests should pass; fib dispatch stays below 18M (`perf_fib_dispatch_regression`).

@@ -1,4 +1,4 @@
-//! Hindley–Milner type inference for zero-script.
+//! Hindley–Milner type inference for coil.
 //!
 //! Runs after parsing and before bytecode emission. Exposes [`Checker`]
 //! for inference, native registration, and span-indexed type lookup.

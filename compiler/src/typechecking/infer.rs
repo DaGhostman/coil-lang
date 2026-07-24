@@ -1,4 +1,4 @@
-//! Hindley–Milner inference (Algorithm W) over the zero-script AST.
+//! Hindley–Milner inference (Algorithm W) over the coil AST.
 //!
 //! [`Checker`] owns the substitution, accumulates diagnostics with error
 //! recovery, and caches inferred types keyed by pre-walk [`NodeId`]s.
@@ -15312,7 +15312,7 @@ fn main() { let h = ping(); resume h with "hello"; }"#;
 
     #[test]
     fn coro_send_example_typechecks() {
-        let src = include_str!("../../../examples/coro_send.0s");
+        let src = include_str!("../../../examples/coro_send.hy");
         let (c, _) = check(src);
         assert!(c.messages().is_empty(), "unexpected: {:?}", c.messages());
     }

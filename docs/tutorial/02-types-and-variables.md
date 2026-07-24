@@ -1,6 +1,6 @@
 # Chapter 2 — Types and Variables
 
-Chapter 1 showed how to write programs; this chapter explains how zero-script **reasons about** those programs. Every expression has a type. The compiler checks types before your program runs, catching mistakes like passing a string where an integer is expected or calling an unknown function.
+Chapter 1 showed how to write programs; this chapter explains how coil **reasons about** those programs. Every expression has a type. The compiler checks types before your program runs, catching mistakes like passing a string where an integer is expected or calling an unknown function.
 
 ---
 
@@ -10,15 +10,15 @@ Types can appear in three main places.
 
 ### On `let` bindings
 
-```0s
+```coil
 let x: int = 5;
-let name: string = "zero-script";
+let name: string = "coil";
 let flag: bool = false;
 ```
 
 When you omit the annotation, the compiler infers the type from the initializer:
 
-```0s
+```coil
 let x = 5;        // inferred as int
 let pi = 3.14;    // inferred as float
 ```
@@ -27,7 +27,7 @@ Explicit annotations are useful when the initializer is ambiguous, when you want
 
 ### On function parameters
 
-```0s
+```coil
 fn distance(int x, int y) -> int {
     return x + y;
 }
@@ -37,7 +37,7 @@ Each parameter requires a type name before the parameter name: `Type param`.
 
 ### On return types
 
-```0s
+```coil
 fn add(int a, int b) -> int {
     return a + b;
 }
@@ -49,9 +49,9 @@ fn greet() {
 
 The `-> RetType` clause is optional. Functions with no meaningful return value may omit it (they effectively return unit).
 
-From `examples/aliases.0s`, annotations on both parameter and `let`:
+From `examples/aliases.hy`, annotations on both parameter and `let`:
 
-```0s
+```coil
 type Point = (int, int);
 
 fn distance(Point p) -> int {
@@ -70,7 +70,7 @@ fn main() {
 
 ## Primitive types
 
-zero-script provides five primitive type names used in everyday programs:
+coil provides five primitive type names used in everyday programs:
 
 | Type     | Literal examples   | Notes                                      |
 |----------|--------------------|--------------------------------------------|
@@ -85,25 +85,25 @@ Built-in primitive names are matched **case-insensitively** at typecheck time: `
 
 `void` appears primarily in foreign-function signatures:
 
-```0s
+```coil
 fn main() -> void {
     print "Hello, World!";
 }
 ```
 
-For ordinary zero-script functions, omit the return type instead of writing `-> void`.
+For ordinary coil functions, omit the return type instead of writing `-> void`.
 
 ---
 
 ## Type inference (Hindley–Milner)
 
-zero-script uses a **Hindley–Milner** (Algorithm W) typechecker. You do not need to annotate every name — the compiler deduces types by analyzing how values flow through your program.
+coil uses a **Hindley–Milner** (Algorithm W) typechecker. You do not need to annotate every name — the compiler deduces types by analyzing how values flow through your program.
 
 ### What inference handles well
 
 **Literals** — each literal form maps to a fixed primitive type:
 
-```0s
+```coil
 let n = 42;           // int
 let pi = 3.14;        // float
 let msg = "hi";       // string
@@ -114,7 +114,7 @@ let ok = true;        // bool
 
 **Function calls** — the checker verifies arity and unifies argument types with parameter types:
 
-```0s
+```coil
 fn add(int a, int b) -> int { return a + b; }
 
 fn main() {
@@ -145,7 +145,7 @@ The typechecker emits diagnostics anchored to your source. Common messages:
 
 You referenced a name that was never bound, or it is out of scope (e.g. a `let` inside an inner block):
 
-```0s
+```coil
 fn main() {
     print "%i", x;   // error: x not declared
 }
@@ -157,7 +157,7 @@ fn main() {
 
 No function with that name is visible (typo, wrong module import, or missing declaration):
 
-```0s
+```coil
 fn main() {
     bar(1);   // error if bar is not declared
 }
@@ -169,7 +169,7 @@ fn main() {
 
 Two types that must be the same were incompatible:
 
-```0s
+```coil
 let x: int = "hello";   // error
 return "text";          // inside fn f() -> int { ... }
 ```
@@ -180,7 +180,7 @@ return "text";          // inside fn f() -> int { ... }
 
 `print` and `format` validate each `%` specifier against the corresponding argument:
 
-```0s
+```coil
 print "%i", "hello";   // %i requires int
 print "%s", 42;        // %s requires string
 print "%f", 1;         // %f requires float — use 1.0
@@ -193,7 +193,7 @@ print "%z", 1;         // %z requires bool
 
 Assignment (`x = expr;`) requires an existing binding from `let`:
 
-```0s
+```coil
 fn main() {
     x = 10;   // error: x was never declared with let
 }
@@ -217,7 +217,7 @@ At run time, a `let x = expr;` binding:
 
 This matters when you bind several variables in sequence:
 
-```0s
+```coil
 let x = 5;
 let y = 10;
 print "%i", x + y;   // 15 — x's slot is preserved
@@ -229,7 +229,7 @@ print "%i", x + y;   // 15 — x's slot is preserved
 
 `const` forbids **rebinding** the name — the slot cannot be reassigned with `x = …`:
 
-```0s
+```coil
 const VERSION = "1.0";
 // VERSION = "2.0";   // error: cannot assign to const binding
 ```
@@ -240,25 +240,25 @@ const VERSION = "1.0";
 
 Top-level singletons use `static let` (mutable) or `static const` (immutable binding):
 
-```0s
+```coil
 static let hits = 0;
 static const VERSION = "1.0";
 ```
 
 Initializers run once in the program prologue (before `main`), in module dependency order. Other modules import the item name via `use` like ordinary functions.
 
-Class statics use `ClassName::field` / `ClassName::method(...)` — see [Types — Static slots](../reference/types.md#static-slots) and `examples/static_singleton.0s`.
+Class statics use `ClassName::field` / `ClassName::method(...)` — see [Types — Static slots](../reference/types.md#static-slots) and `examples/static_singleton.hy`.
 
 ### `readonly` values
 
 `readonly` seals a value against **external** mutation while still allowing methods to mutate via `self`:
 
-```0s
+```coil
 let xs = readonly [1, 2, 3];
 let p = readonly new Point(1, 2);
 ```
 
-Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[] = …`) is rejected. See `examples/readonly_seal.0s` and [Types — Readonly](../reference/types.md#readonly-types).
+Rebinding the variable is allowed; writing through an external handle (`p.x = …`, `xs[] = …`) is rejected. See `examples/readonly_seal.hy` and [Types — Readonly](../reference/types.md#readonly-types).
 
 **Reading** a variable emits a load from that slot. The typechecker ensures you only assign types compatible with the binding's declared or inferred type.
 
@@ -272,9 +272,9 @@ Implications for you as a programmer:
 
 ## Classes (brief overview)
 
-zero-script supports class declarations and `impl` blocks for methods. From `examples/classes.0s`:
+coil supports class declarations and `impl` blocks for methods. From `examples/classes.hy`:
 
-```0s
+```coil
 class Foo {
     name: String,
 }
@@ -299,7 +299,7 @@ Key points today:
 
 Field access and mutation on classes are still limited compared to record-shaped enums and dict literals. Prefer enums with record payloads or `{ key: value }` records for data-oriented code until the classes tutorial is expanded.
 
-**Coming soon:** dedicated coverage of classes, `impl`, and instance field access — see `examples/classes.0s` for the current syntax snapshot.
+**Coming soon:** dedicated coverage of classes, `impl`, and instance field access — see `examples/classes.hy` for the current syntax snapshot.
 
 ---
 
@@ -307,7 +307,7 @@ Field access and mutation on classes are still limited compared to record-shaped
 
 Give a readable name to an existing type:
 
-```0s
+```coil
 type Point = (int, int);
 
 fn length(Point p) -> int {
@@ -323,7 +323,7 @@ Rules of thumb:
 - The right-hand side can be any type annotation form: primitives, tuples, arrays, fixed arrays, or class names.
 - Inner blocks may shadow outer aliases; duplicate aliases in the same scope are rejected.
 
-Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — Aggregates](../tutorial/05-aggregates.md). See `examples/aliases.0s` for a runnable example.
+Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — Aggregates](../tutorial/05-aggregates.md). See `examples/aliases.hy` for a runnable example.
 
 ---
 
@@ -331,7 +331,7 @@ Full treatment of aliases alongside tuples and arrays appears in [Chapter 5 — 
 
 A small program that combines annotations, inference, and checked output:
 
-```0s
+```coil
 fn clamp(int lo, int hi, int v) -> int {
     if v < lo {
         return lo;
@@ -355,7 +355,7 @@ If you change `clamp` to return `"100"` (string), the checker reports a `Type mi
 
 ## Exercises
 
-1. Add explicit types to every binding in `examples/let_test.0s` without changing behavior.
+1. Add explicit types to every binding in `examples/let_test.hy` without changing behavior.
 
 2. Write a function `max(int a, int b) -> int` and a `main` that prints the result. Remove the return type and confirm inference still accepts the program.
 
@@ -366,7 +366,7 @@ If you change `clamp` to return `"100"` (string), the checker reports a `Type mi
 
 4. Declare `type UserId = int;` and write `fn fetch(UserId id) -> int` that returns `id * 2`. Call it from `main`.
 
-5. Read `examples/classes.0s` and explain (in comments or a note) which operations are type-checked but not yet fully supported at run time.
+5. Read `examples/classes.hy` and explain (in comments or a note) which operations are type-checked but not yet fully supported at run time.
 
 ---
 
@@ -375,6 +375,6 @@ If you change `clamp` to return `"100"` (string), the checker reports a `Type mi
 - [Chapter 1 — Basics](01-basics.md) — syntax, control flow, and `print`
 - [Chapter 5 — Aggregates](../tutorial/05-aggregates.md) — tuples, arrays, records, and aliases in depth
 - [Operator reference](../reference/operators.md) — operators and operand types
-- `examples/let_test.0s` — binding and reassignment
-- `examples/aliases.0s` — type alias end-to-end
-- `examples/classes.0s` — class syntax snapshot
+- `examples/let_test.hy` — binding and reassignment
+- `examples/aliases.hy` — type alias end-to-end
+- `examples/classes.hy` — class syntax snapshot

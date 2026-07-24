@@ -2,9 +2,9 @@
 
 ## What it shows
 
-Playable text adventure over **stdin/stdout**: rooms/items (`world.0s`),
-byte-line command parse (`commands.0s`), save encode/decode (`save.0s`),
-REPL + file/stdin IO in `main.0s`. Multiple `use …::*` imports resolve on
+Playable text adventure over **stdin/stdout**: rooms/items (`world.hy`),
+byte-line command parse (`commands.hy`), save encode/decode (`save.hy`),
+REPL + file/stdin IO in `main.hy`. Multiple `use …::*` imports resolve on
 the **entry** file.
 
 ## Play (interactive)
@@ -35,22 +35,22 @@ Expected gist: Hall → Library (take key) → inventory → Hall → Garden →
 
 ```bash
 ./examples/projects/run-tests.sh
-# or: cd examples/projects/02-adventure && …/zero-script test
+# or: cd examples/projects/02-adventure && …/coil test
 ```
 
 ## Layout
 
 | File | Role |
 |------|------|
-| `src/world.0s` | Player, rooms, move, key |
-| `src/commands.0s` | `Cmd` + `parse_line` / `bytes_eq` |
-| `src/save.0s` | Pure 2-byte encode/decode (`SaveData`) |
-| `src/main.0s` | REPL + stdin/`open`/`write_all`/`read_to_end` |
+| `src/world.hy` | Player, rooms, move, key |
+| `src/commands.hy` | `Cmd` + `parse_line` / `bytes_eq` |
+| `src/save.hy` | Pure 2-byte encode/decode (`SaveData`) |
+| `src/main.hy` | REPL + stdin/`open`/`write_all`/`read_to_end` |
 
 ## Ergonomics / gaps noticed
 
 1. **IO HostInvoke from a dependency module is broken** — `open`/`write_all`
-   must live in the entry file (hence thin `save.0s` + IO wrappers in `main`).
+   must live in the entry file (hence thin `save.hy` + IO wrappers in `main`).
 2. No `read_line` builtin — batch `read_to_end` + `\n` split (Ctrl+D / pipe).
 3. No `\n` string escapes; prompts use spaces.
 4. Commands compared as `[byte]` (not `from_bytes`).

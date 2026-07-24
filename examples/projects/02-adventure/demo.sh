@@ -8,16 +8,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-BIN="${BIN:-$CARGO_TARGET_DIR/release/zero-script}"
+BIN="${BIN:-$CARGO_TARGET_DIR/release/coil}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-10}"
-ENTRY="$HERE/src/main.0s"
+ENTRY="$HERE/src/main.hy"
 
 if [[ ! -x "$BIN" ]]; then
-  echo "Building release zero-script…"
+  echo "Building release coil…"
   cargo build --release --manifest-path "$ROOT/Cargo.toml"
 fi
 
-rm -f "$ROOT/out.c0s" "$HERE/out.c0s"
+rm -f "$ROOT/out.hyc" "$HERE/out.hyc"
 
 case "${1:-}" in
   --help | -h)

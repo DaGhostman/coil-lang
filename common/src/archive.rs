@@ -60,7 +60,7 @@ mod tests {
                 Byte::new(Instruction::CONST).with_const_inline(7),
                 Byte::new(Instruction::HALT),
             ],
-            source_files: vec!["main.0s".into()],
+            source_files: vec!["main.hy".into()],
             debug_locs: vec![
                 DebugLoc {
                     file: 0,

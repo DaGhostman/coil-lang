@@ -1,4 +1,4 @@
-//! libffi closures for C → zero-script callbacks.
+//! libffi closures for C → coil callbacks.
 
 use std::ffi::c_void;
 
@@ -31,7 +31,7 @@ pub struct VmCallbackState {
     pub call_fn: VmCallFn,
 }
 
-/// Trampoline for `extern "C" fn(int64) -> int64` callbacks into zero-script.
+/// Trampoline for `extern "C" fn(int64) -> int64` callbacks into coil.
 unsafe extern "C" fn vm_int_to_int_trampoline(
     _cif: &low::ffi_cif,
     result: &mut i64,
@@ -69,7 +69,7 @@ pub fn callback_cif(
     .map(|p| p.cif)
 }
 
-/// Create an owned closure for a zero-script `fn(int) -> int` at `fn_offset`.
+/// Create an owned closure for a coil `fn(int) -> int` at `fn_offset`.
 pub fn make_int_callback(
     vm: *mut c_void,
     fn_offset: u32,

@@ -12,7 +12,7 @@
 /// `int sum(int a, int b)` — return the sum of two integers.
 ///
 /// Symbol name: `sum` (the function's identifier as it
-/// appears in userland). The zero-script FFI declaration
+/// appears in userland). The coil FFI declaration
 /// matches by name:
 ///
 /// ```0s
@@ -66,7 +66,7 @@ static int64_t doubler(int64_t x) {
     return x * 2;
 }
 
-/// Return a C function pointer (opaque Ptr / Callback to zero-script).
+/// Return a C function pointer (opaque Ptr / Callback to coil).
 int64_fn_int64 get_doubler(void) {
     return &doubler;
 }

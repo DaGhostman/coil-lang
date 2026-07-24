@@ -1,0 +1,12 @@
+// Exercised by `coil test` — success-path assert / Result edges.
+test("assert arithmetic") {
+    assert(true)?;
+    assert(1 + 1 == 2, "arithmetic")?;
+}
+
+test("match on assert Ok") {
+    print "%s", match assert(true) {
+        Result::Ok(_) => "ok",
+        Result::Err(_) => "bad",
+    };
+}

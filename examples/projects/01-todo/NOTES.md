@@ -16,7 +16,7 @@ and a sibling module imported via `use board::*;`.
 
 ```bash
 ./examples/projects/run-tests.sh
-# or: cd examples/projects/01-todo && …/zero-script test
+# or: cd examples/projects/01-todo && …/coil test
 ```
 
 ## Ergonomics / gaps noticed
@@ -27,5 +27,5 @@ and a sibling module imported via `use board::*;`.
    status is stored as `int` instead.
 3. **Empty `[Task] = []` is unreliable** — boards use a sentinel task at index 0.
 4. **No `\n` string escapes** — demo separates fields with `" | "`.
-5. **`zero-script test` only scans `./tests` relative to CWD** — must `cd` into
+5. **`coil test` only scans `./tests` relative to CWD** — must `cd` into
    the project (no `--project` flag yet).

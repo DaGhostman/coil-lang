@@ -1,4 +1,4 @@
-# Debug line table (`.c0s`)
+# Debug line table (`.hyc`)
 
 Compiled programs carry a **debug line table** inside the versioned
 `ArchivedProgram` envelope. This is separate from the in-memory
@@ -21,7 +21,7 @@ The table is updated when the peephole pass fuses instructions
 
 ## Archive version
 
-`ARCHIVE_VERSION` is **26**. Older `.c0s` files without `source_files` /
+`ARCHIVE_VERSION` is **26**. Older `.hyc` files without `source_files` /
 `debug_locs` are rejected at load time.
 
 ## Runtime `panic` output

@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn file_round_trip_read_to_end() {
-        let path = std::env::temp_dir().join("zero_script_io_unit_roundtrip.bin");
+        let path = std::env::temp_dir().join("coil_io_unit_roundtrip.bin");
         let mut heap = Heap::default();
         let data = make_byte_array(&mut heap, b"Hi");
         let w = stream_open(&mut heap, path.to_str().unwrap(), "w").expect("open w");
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn empty_file_read_returns_eof_none() {
-        let path = std::env::temp_dir().join("zero_script_io_unit_eof.bin");
+        let path = std::env::temp_dir().join("coil_io_unit_eof.bin");
         {
             let _f = std::fs::File::create(&path).unwrap();
         }
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn close_then_read_is_already_closed() {
-        let path = std::env::temp_dir().join("zero_script_io_unit_closed.bin");
+        let path = std::env::temp_dir().join("coil_io_unit_closed.bin");
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(b"x").unwrap();

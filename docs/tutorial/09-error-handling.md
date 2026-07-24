@@ -1,6 +1,6 @@
 # Error handling: Result, Option, raise, ?, ??, ?.
 
-zero-script ships compiler-built-in **`Option`** and **`Result`** sum types, plus operators that desugar to ordinary `match` / `return` (no new VM opcodes).
+coil ships compiler-built-in **`Option`** and **`Result`** sum types, plus operators that desugar to ordinary `match` / `return` (no new VM opcodes).
 
 This chapter builds on [Enums and Match](03-enums-and-match.md).
 
@@ -17,7 +17,7 @@ You do **not** declare these yourself — they live in the virtual `prelude` mod
 
 Construct and match them like any other enum:
 
-```0s
+```coil
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -36,7 +36,7 @@ Annotations may use type applications: `Option<int>`, `Result<int, string>`.
 
 A function enters **result mode** when it uses `raise`, uses `?` on a `Result`, or is annotated `-> Result<...>`. In result mode, ordinary `return v` (and success paths) are wrapped as `Result::Ok(v)` by codegen.
 
-```0s
+```coil
 fn parse_pos(int n, int is_neg) {
     if is_neg == 1 {
         raise "neg";
@@ -61,7 +61,7 @@ Postfix `x?` unwraps success and propagates failure:
 | `Option<T>` | `Option<T>` | `T` |
 | neither | any | **hard type error** (E0114) |
 
-```0s
+```coil
 fn double_pos(int n, int is_neg) {
     let v = parse_pos(n, is_neg)?;
     return v * 2;
@@ -81,7 +81,7 @@ Do **not** mix Option-`?` and Result-`?` in the same function without a clear ma
 | `Option<T>` | `Some` payload | `b` (must unify with `T`) |
 | `Result<T, E>` | `Ok` payload | `b` — **`Err` is discarded** |
 
-```0s
+```coil
 let a = Option::None ?? "bar";       // "bar"
 let b = Result::Err("boom") ?? 7;    // 7 — error swallowed
 ```
@@ -97,7 +97,7 @@ Prefer `?` or `match` when failure must be observed. Coalesce on a non-Option/no
 - `None` → `None`
 - `Some(x)` → `Some(x.field)`
 
-```0s
+```coil
 let some = Option::Some({ v: 42 });
 let none = Option::None;
 print "%i,", show(some?.v);   // Some(42) → unwrap in helper
@@ -114,13 +114,13 @@ print "%i", none?.v ?? 0;     // None → 0
 
 `panic msg` aborts immediately with `panic: <msg>` (CLI exit code 1). Prefer `assert` when failure should be recoverable.
 
-See [Built-ins — assert / panic](../reference/built-ins.md#assert-preludetest) and `examples/assert.0s` / `examples/panic.0s`.
+See [Built-ins — assert / panic](../reference/built-ins.md#assert-preludetest) and `examples/assert.hy` / `examples/panic.hy`.
 
 ---
 
 ## Worked example
 
-See `examples/raise_try.0s` (output `10,neg`), `examples/coalesce.0s` (`bar,hi,7,9`), and `examples/optional_chain.0s` (`42,0`).
+See `examples/raise_try.hy` (output `10,neg`), `examples/coalesce.hy` (`bar,hi,7,9`), and `examples/optional_chain.hy` (`42,0`).
 
 ---
 

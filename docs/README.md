@@ -1,12 +1,12 @@
-# zero-script
+# coil
 
-**zero-script** is a statically typed scripting language with Hindley–Milner type inference. Programs are compiled to bytecode and executed on a custom virtual machine. Source files use the `.0s` extension; compiled archives are stored as `.c0s` files.
+**coil** is a statically typed scripting language with Hindley–Milner type inference. Programs are compiled to bytecode and executed on a custom virtual machine. Source files use the `.hy` extension (short for **henry**, the SI unit of inductance — the measure of a coil); compiled archives are stored as `.hyc` files.
 
 The language targets embeddable scripting: you get real type checking and inference without a heavyweight build pipeline, plus optional FFI for calling into C libraries or host-provided Rust closures.
 
 ## Quick start
 
-```0s
+```coil
 fn main() {
     print "Hello, world!";
 }
@@ -16,7 +16,7 @@ Run any program from the repository root:
 
 ```bash
 cargo build --workspace
-cargo run -- examples/print_literal.0s
+cargo run -- examples/print_literal.hy
 ```
 
 Expected output: `hello`
@@ -25,13 +25,13 @@ See [Getting Started](getting-started.md) for prerequisites, project layout, and
 
 ## How programs run
 
-1. **Parse** — the Pratt parser reads `.0s` source into an AST.
+1. **Parse** — the Pratt parser reads `.hy` source into an AST.
 2. **Typecheck** — Algorithm W (Hindley–Milner) infers types and reports source-anchored diagnostics.
 3. **Codegen** — the compiler emits stack bytecode, then runs a peephole fusion pass.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **26**) and written to `out.c0s` on first run. See [Debug line table](reference/debug-info.md).
+4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **26**) and written to `out.hyc` on first run. See [Debug line table](reference/debug-info.md).
 5. **Execute** — the VM loads the archive and runs `main`.
 
-Re-run the same binary without deleting `out.c0s` to reuse the cached compile. Delete `out.c0s` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source.
+Re-run the same binary without deleting `out.hyc` to reuse the cached compile. Delete `out.hyc` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source.
 
 ## Language at a glance
 
@@ -40,7 +40,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Primitives | `int`, `float`, `string`, `bool`, `byte` |
 | Functions, `let` / `const`, `if`/`else`, `while` / `for` | Supported |
 | Named call-site arguments (`f(name: v)`) | Supported (positional prefix then named; named holes on partials allowed) |
-| Arity overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.0s`, `fn_value.0s`, `lambda.0s`) |
+| Arity overloads / first-class fn values / lambdas (`use`) | Supported (`examples/overload.hy`, `fn_value.hy`, `lambda.hy`) |
 | Rest parameters (`T... xs` / tuple `... xs`) | Supported (trailing only; `T...` packs to `[T]`, bare `...` packs to a tuple) |
 | Call-site spread (`f(...pack)`) | Supported (tuple and array operands) |
 | User-defined `attr` decorators | Supported (`attr` decl + `#[name(...)]` on `fn`, methods, class constructors) |
@@ -51,7 +51,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | Tuples, arrays (`arr[] =` / `len`), dicts (anonymous records) | Supported |
 | Type aliases (`type Name = T;`, lexically scoped) | Supported |
 | Generics and traits | Supported: generic functions/enums/aliases/classes, higher-kinded type parameters, associated types/GATs, existentials, coherence checks |
-| Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |
+| Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `coil.toml`) |
 | Field access (`p.x`, chained `p.x.y`) | Supported |
 | FFI (`extern` blocks, `dload`/`declare`/`invoke`, C varargs `...`, struct/callback returns) | Supported (requires libffi) |
 | IO streams (`use io::*;`, `[byte]`, files, sync adapters, TCP, UDP) | Supported (non-blocking L0; no HTTP in VM) |
@@ -66,7 +66,7 @@ Browse runnable demos in [Examples](examples.md). Multi-file showcase apps (todo
 
 ## Documentation
 
-### New to zero-script?
+### New to coil?
 
 Work through the tutorial in order. Each chapter builds on the previous one.
 
@@ -77,13 +77,13 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [03 — Enums & Match](tutorial/03-enums-and-match.md) | Sum types and pattern matching |
 | [04 — Records & Fields](tutorial/04-records-and-fields.md) | Record variants, field access, nested patterns |
 | [05 — Aggregates](tutorial/05-aggregates.md) | Tuples, arrays, dicts, type aliases |
-| [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `zero.toml` |
+| [06 — Modules](tutorial/06-modules.md) | `use`, `mod`, `coil.toml` |
 | [07 — FFI](tutorial/07-ffi.md) | `extern` blocks and dynamic loading |
 | [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
 | [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 | [10 — IO streams](tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
 
-Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.0s`.
+Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.hy`.
 
 Start here: [Getting Started](getting-started.md)
 
@@ -99,7 +99,7 @@ Look up syntax and semantics when you already know what you need.
 | [Keywords](reference/keywords.md) | Reserved words and constructs |
 | [Built-ins](reference/built-ins.md) | `print`, `format`, FFI builtins, natives |
 | [Modules](reference/modules.md) | Namespace rules, `use` resolution |
-| [Project config](reference/project-config.md) | `zero.toml` manifest format |
+| [Project config](reference/project-config.md) | `coil.toml` manifest format |
 | [Error codes](reference/error-codes.md) | Stable `E####` diagnostic codes, SARIF / LSP flags |
 
 ### Examples catalog
@@ -112,16 +112,16 @@ Look up syntax and semantics when you already know what you need.
 ## Repository layout
 
 ```
-zero-script/
+coil/
 ├── common/          # Shared types: opcodes, values, archive format
 ├── parser/          # Pratt parser and AST
 ├── compiler/        # HM typechecker, codegen, pipeline, peephole
 ├── machine/         # VM, heap/GC, FFI (libffi)
-├── examples/        # Runnable .0s demos (see examples.md)
+├── examples/        # Runnable .hy demos (see examples.md)
 │   └── projects/    # Showcase multi-file apps + co-located tests
 ├── docs/            # This documentation
 ├── src/main.rs      # CLI: default build+run, compile, run, test
-└── zero.toml.example  # Example project manifest
+└── coil.toml.example  # Example project manifest
 ```
 
 ## Building and running
@@ -130,26 +130,26 @@ zero-script/
 # Build everything
 cargo build --workspace
 
-# Default: compile to out.c0s (cached) and run
-cargo run -- examples/fib.0s
+# Default: compile to out.hyc (cached) and run
+cargo run -- examples/fib.hy
 
 # Compile only / run archive / project tests
-cargo run -- compile examples/fib.0s -o fib.c0s
-cargo run -- run fib.c0s
-cargo run -- test   # every .0s under ./tests
+cargo run -- compile examples/fib.hy -o fib.hyc
+cargo run -- run fib.hyc
+cargo run -- test   # every .hy under ./tests
 
 # Release build
 cargo build --release --workspace
-cargo run --release -- examples/fib.0s
+cargo run --release -- examples/fib.hy
 ```
 
 | Command | Role |
 |---------|------|
-| *(no subcommand)* `<file.0s>` | Compile → `out.c0s` (cached) → run |
-| `compile <file.0s> [-o path]` | Compile entry file to a `.c0s` archive |
-| `run <file.c0s>` | Execute a compiled archive |
-| `package <file.0s> [-o path] [--check-native]` | Single executable for this OS/arch (embedded `.c0s`) |
-| `test [path] [--fail-fast]` | Compile+run all `[path]/**/*.0s` (default `./tests`); continue after failures unless `--fail-fast` |
+| *(no subcommand)* `<file.hy>` | Compile → `out.hyc` (cached) → run |
+| `compile <file.hy> [-o path]` | Compile entry file to a `.hyc` archive |
+| `run <file.hyc>` | Execute a compiled archive |
+| `package <file.hy> [-o path] [--check-native]` | Single executable for this OS/arch (embedded `.hyc`) |
+| `test [path] [--fail-fast]` | Compile+run all `[path]/**/*.hy` (default `./tests`); continue after failures unless `--fail-fast` |
 
 For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](getting-started.md).
 
@@ -157,13 +157,13 @@ For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `
 
 | Goal | Start with |
 |------|------------|
-| First program | [getting-started.md](getting-started.md) → `examples/fib.0s` |
-| Enums & pattern matching | `examples/option.0s`, `examples/result.0s` |
-| Record-shaped variants | `examples/record.0s`, `examples/mixed.0s` |
-| Dicts / anonymous records | `examples/dict.0s` |
-| Generics & traits | `examples/generics.0s`, `examples/hkt_bifunctor.0s`, `examples/gat_pointer.0s`, `examples/existential_show.0s` |
-| Modules | `examples/modules.0s` (see [examples.md](examples.md) for setup) |
-| FFI | `examples/strlen.0s`, `examples/ffi_sum.0s`, `examples/ffi_printf.0s` |
-| IO streams | `examples/io_bytes.0s`, `examples/io_file.0s`, `examples/io_eof.0s`, `examples/io_udp.0s` |
-| Coroutines | `examples/coro.0s`, `examples/coro_gen.0s`, `examples/coro_send.0s`, `examples/for_in_coro.0s` |
+| First program | [getting-started.md](getting-started.md) → `examples/fib.hy` |
+| Enums & pattern matching | `examples/option.hy`, `examples/result.hy` |
+| Record-shaped variants | `examples/record.hy`, `examples/mixed.hy` |
+| Dicts / anonymous records | `examples/dict.hy` |
+| Generics & traits | `examples/generics.hy`, `examples/hkt_bifunctor.hy`, `examples/gat_pointer.hy`, `examples/existential_show.hy` |
+| Modules | `examples/modules.hy` (see [examples.md](examples.md) for setup) |
+| FFI | `examples/strlen.hy`, `examples/ffi_sum.hy`, `examples/ffi_printf.hy` |
+| IO streams | `examples/io_bytes.hy`, `examples/io_file.hy`, `examples/io_eof.hy`, `examples/io_udp.hy` |
+| Coroutines | `examples/coro.hy`, `examples/coro_gen.hy`, `examples/coro_send.hy`, `examples/for_in_coro.hy` |
 | Full catalog | [examples.md](examples.md) |

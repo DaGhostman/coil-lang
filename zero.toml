@@ -1,9 +1,0 @@
-# Project manifest for the zero-script workspace / examples.
-# Roots include `examples/src` so `cargo run -- examples/modules.0s`
-# can resolve `use foo::sadge;`.
-
-[module]
-roots = ["./src", "./examples/src"]
-
-[ffi]
-search_paths = ["./examples"]

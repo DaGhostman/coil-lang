@@ -1,6 +1,6 @@
 # Types reference
 
-zero-script uses **Hindley–Milner (Algorithm W)** type inference with optional annotations. Types are checked once per program before codegen; the compiler caches `(NodeId → Ty)` for opcode selection (e.g. `ADD` vs `ADDF`).
+coil uses **Hindley–Milner (Algorithm W)** type inference with optional annotations. Types are checked once per program before codegen; the compiler caches `(NodeId → Ty)` for opcode selection (e.g. `ADD` vs `ADDF`).
 
 ---
 
@@ -52,7 +52,7 @@ Payload types are inferred at use sites (`Option::Some(1)` → `Option` of `int`
 
 Curried internally: `int -> int -> int` means `(int, int) -> int`.
 
-```0s
+```coil
 fn add(int a, int b) -> int { return a + b; }
 // add : int -> int -> int
 ```
@@ -63,7 +63,7 @@ fn add(int a, int b) -> int { return a + b; }
 
 Declared with `enum Name { variants }`:
 
-```0s
+```coil
 enum Tree {
     Leaf,
     Node(int, Tree, Tree),
@@ -86,7 +86,7 @@ Ty::Sum {
 
 User enums may take type parameters. Annotations and construct/match use the same `Ty::App` machinery as builtin `Option` / `Result`:
 
-```0s
+```coil
 enum Box<T> {
     Empty,
     Full(T),
@@ -122,7 +122,7 @@ Applying a variant yields a constructor type carrying tag and arity, unified aga
 
 Heterogeneous fixed-length products:
 
-```0s
+```coil
 let t = (1, "hi", true);   // (int, string, bool)
 fn pair(int a, string b) -> (int, string) { return (a, b); }
 ```
@@ -142,7 +142,7 @@ Homogeneous collections with optional static length:
 | `[T]` | `Dynamic` | Function param — length unknown at compile time |
 | `[T; N]` | `Static(N)` | Literal `[1, 2, 3]` infers `[int; 3]` |
 
-```0s
+```coil
 let xs = [1, 2, 3];        // [int; 3]
 fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 ```
@@ -151,7 +151,7 @@ fn sum([int] arr) -> int { /* ... */ }  // dynamic length param
 
 Use `arr[] = value` to append in place. The value must match the array's element type. The binding is promoted to dynamic `[T]` when needed, and `len(arr)` returns its current runtime length as `int`.
 
-```0s
+```coil
 let xs = [1, 2];   // starts as [int; 2]
 xs[] = 3;          // xs is treated as dynamic [int] afterwards
 print "%i", len(xs);
@@ -172,7 +172,7 @@ print "%i", len(xs);
 
 Anonymous structurally typed records:
 
-```0s
+```coil
 let d = { x: 1, y: 2 };   // { x: int, y: int }
 let n = d.x;              // field access
 ```
@@ -192,7 +192,7 @@ enums and classes can also opt in with `#[derive(Show)]` (see
 
 Module-level and class-level singletons share one global slot table for the process.
 
-```0s
+```coil
 static let hits = 0;
 static const VERSION = "1.0";
 
@@ -226,7 +226,7 @@ Class `static` fields require an initializer. `static` and `const` field modifie
 
 `readonly` seals a value against **external** mutation. Methods may still mutate via `self`.
 
-```0s
+```coil
 let xs = readonly [1, 2, 3];
 let p = new readonly Point(1, 2);
 // sugar: readonly new Point(1, 2)
@@ -244,7 +244,7 @@ Type pretty-print: `readonly T`. Arrays and dicts have no method exception — e
 
 ## Class `const` fields
 
-```0s
+```coil
 class Point {
     const x: int,
     const y: int,
@@ -261,7 +261,7 @@ Local `const` bindings are shallow: the compiler warns when the initializer type
 
 Substituted at typecheck time; zero runtime cost. Parametric aliases expand when applied:
 
-```0s
+```coil
 type UserId = int;
 type IntPair = (int, int);
 type Pair<T> = (T, T);
@@ -355,7 +355,7 @@ Static(N) ~ Static(M)    ✓ (element types must unify; N and M need not match f
 
 When no binding-yield or send sites exist, `S` defaults to `unit` and diagnostics print `coroutine<Y>`.
 
-```0s
+```coil
 async fn counter() -> coroutine<int> {
     yield 0;
     yield 1;
@@ -376,7 +376,7 @@ inside an `async fn` therefore unifies `expr`'s type against the SAME
 `Y` as every `yield` in that body — not `unit` — so the returned value
 is not discarded:
 
-```0s
+```coil
 async fn counter() {
     yield 1;
     yield 2;
@@ -404,7 +404,7 @@ a stale value.
 
 Generic functions use an optional type-parameter list and trait bounds on parameters:
 
-```0s
+```coil
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 
 fn main() {
@@ -415,7 +415,7 @@ fn main() {
 
 Multi-parameter traits use a trailing `where` clause:
 
-```0s
+```coil
 trait Convert<A, B> { fn cast(A x) -> B; }
 impl Convert<int, int> { fn cast(int x) -> int { return x; } }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
@@ -440,7 +440,7 @@ Kinds classify type-level parameters:
 Constraint-kind parameters let a generic abstract over the class predicate
 itself:
 
-```0s
+```coil
 fn choose<c: * -> Constraint, T: c>(T a, T b) -> int {
     if lt_val(a, b) { return 0; } // selects c = Ordered
     if eq_val(a, b) { return 42; } // Equal method via Ordered superclass
@@ -490,7 +490,7 @@ then each superclass’s methods in declaration order (transitively). An
 `impl Ordered<int>` therefore requires an existing `Equal<int>` instance — its
 methods fill the trailing dict slots.
 
-```0s
+```coil
 trait Describable<T> { fn describe_val(T x) -> int; }
 impl Describable<int> { fn describe_val(int x) -> int { return x + 1; } }
 fn show<T: Describable>(T x) -> int { return x.describe_val(); }
@@ -501,7 +501,7 @@ fn show<T: Describable>(T x) -> int { return x.describe_val(); }
 
 A unary trait name in a value type position denotes an existential value:
 
-```0s
+```coil
 fn print_any(Show x) {
     print "%s", show(x);
 }
@@ -533,7 +533,7 @@ Rules:
 
 Bound methods support both equivalent forms:
 
-```0s
+```coil
 x.describe_val(); // method sugar
 describe_val(x);  // bare / UFCS form
 ```
@@ -565,7 +565,7 @@ The compiler pre-registers these traits and instances for `int`, `float`, and (w
 `Into` is multi-parameter: `impl Into<T> for S` stores instance args
 `[S, T]`. Prefer method form with an expected type —
 `let y: T = x.into();` — so the target pins constraint discharge. Open
-`where Into<A, B>` helpers also work. See `examples/into.0s`.
+`where Into<A, B>` helpers also work. See `examples/into.hy`.
 
 On open/generic operands, operators require the matching op trait (or the
 `Num` / `Ord` convenience supertrait). Concrete `int`/`float` arithmetic and
@@ -577,7 +577,7 @@ comparisons still use hardwired opcodes. String concatenation
 Non-generic `enum` and `class` declarations may include `#[derive(...)]`
 attributes that synthesize structural instances of builtin traits:
 
-```0s
+```coil
 #[derive(Show, Eq)]
 enum Point {
     Origin,
@@ -604,7 +604,7 @@ Rules:
 - Combining `#[derive(Show)]` with a hand-written `impl Show for T` hits the usual overlap diagnostic.
 - Empty `#[derive()]` with no traits is a parse error.
 
-See `examples/derive_show_eq.0s`.
+See `examples/derive_show_eq.hy`.
 
 ### User-defined traits (sketch)
 
@@ -613,7 +613,7 @@ Declare a trait and provide instances for concrete types. Prefer the
 For multi-parameter traits, `impl Trait<A, B> for T` prepends `T` as the first
 type argument (Self slot), so it is equivalent to `impl Trait<T, A, B>`.
 
-```0s
+```coil
 trait Measurable<T> {
     fn size(T x) -> int;
 }
@@ -655,7 +655,7 @@ A trait may declare associated types; each impl must define them. Associated
 types may be nullary (`type Elem;`) or generic (`type Ref<T>;`, also called a
 generic associated type / GAT):
 
-```0s
+```coil
 trait Collect<C> {
     type Elem;
     fn head(C xs) -> Elem;
@@ -688,7 +688,7 @@ impl Collect<Option<int>> {
   projections such as `P::Ref<Option>` to pass a constructor-kinded argument,
   while `P::Ref<int>` is rejected.
 
-```0s
+```coil
 trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
@@ -705,14 +705,14 @@ fn get<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A> {
 ```
 
 Associated types are erased at runtime (no dictionary slot); they exist only
-in the typechecker. See `examples/assoc_type.0s` and
-`examples/gat_pointer.0s`.
+in the typechecker. See `examples/assoc_type.hy` and
+`examples/gat_pointer.hy`.
 
 ### Superclasses and implied bounds
 
 Unary trait parameter bounds declare superclasses:
 
-```0s
+```coil
 trait Equal<T> { fn eq_val(T a, T b) -> bool; }
 trait Ordered<T: Equal> { fn lt_val(T a, T b) -> bool; }
 
@@ -733,14 +733,14 @@ fn cmp_eq<T: Ordered>(T a, T b) -> bool {
 
 Builtin `Ord` / `Eq` are independent (no superclass link) so existing builtin
 dict layouts stay unchanged. Prefer a custom `Ordered` / `Equal` pair when you
-need superclass semantics. See `examples/superclass_ord.0s`.
+need superclass semantics. See `examples/superclass_ord.hy`.
 
 ### First-class generic functions
 
 A generic function can escape into a local `PolyFn` value and be instantiated
 more than once:
 
-```0s
+```coil
 fn id<T>(T x) -> T { return x; }
 let f = id;
 let n = f(42);
@@ -760,7 +760,7 @@ passed to a compatible `forall T. T -> T` parameter uses the same path.
 
 Type annotations may use prenex / higher-rank quantification:
 
-```0s
+```coil
 fn app(forall T. T -> T f, int x) -> int {
     return f(x);
 }
@@ -772,12 +772,12 @@ binder (rigid variables) and rejects escaping skolems. A polymorphic
 generic function identifier (e.g. `id`) is compatible with a matching
 `forall` parameter type.
 
-See `examples/generics.0s`, `examples/trait_dict.0s`,
-`examples/existential_show.0s`, `examples/hkt_container.0s`,
-`examples/hkt_bifunctor.0s`, `examples/multiparam.0s`,
-`examples/constraint_kind.0s`, `examples/superclass_ord.0s`,
-`examples/assoc_type.0s`, `examples/gat_pointer.0s`, and
-`examples/polyfn.0s` for runnable demos.
+See `examples/generics.hy`, `examples/trait_dict.hy`,
+`examples/existential_show.hy`, `examples/hkt_container.hy`,
+`examples/hkt_bifunctor.hy`, `examples/multiparam.hy`,
+`examples/constraint_kind.hy`, `examples/superclass_ord.hy`,
+`examples/assoc_type.hy`, `examples/gat_pointer.hy`, and
+`examples/polyfn.hy` for runnable demos.
 
 ### Boxing and unboxing at generic boundaries
 
@@ -785,7 +785,7 @@ When a concrete value crosses into a generic function body, the compiler wraps i
 
 This means **most generic calls to primitive-returning functions are transparent** — the caller receives a plain `int`, `float`, `bool`, or `string`, not a boxed wrapper:
 
-```0s
+```coil
 fn id<T>(T x) -> T { return x; }
 
 fn main() {
@@ -798,7 +798,7 @@ fn main() {
 
 Concrete format specifiers (`%i`, `%f`, `%s`, `%z`, …) require a resolved concrete type. An open type parameter is a type error; use `%v`, which requires `T: Show` and lowers through the `show` method to a string before formatting:
 
-```0s
+```coil
 fn show_it<T: Show>(T x) {
     print "%v", x;   // ok — dictionary Show
 }
@@ -811,7 +811,7 @@ fn main() {
 }
 ```
 
-Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. User types can `impl Show<MyType>`. See `examples/generic_print.0s`.
+Builtin `Show` instances cover `int`, `float`, `string`, `bool`, and `unit`. User types can `impl Show<MyType>`. See `examples/generic_print.hy`.
 
 ---
 

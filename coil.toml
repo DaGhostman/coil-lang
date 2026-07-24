@@ -1,0 +1,9 @@
+# Project manifest for the coil workspace / examples.
+# Roots include `examples/src` so `cargo run -- examples/modules.hy`
+# can resolve `use foo::sadge;`.
+
+[module]
+roots = ["./src", "./examples/src"]
+
+[ffi]
+search_paths = ["./examples"]

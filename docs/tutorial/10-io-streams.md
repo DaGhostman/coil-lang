@@ -1,9 +1,9 @@
 # 10 — IO streams
 
-zero-script exposes non-blocking file, stdio, and TCP IO through the virtual
+coil exposes non-blocking file, stdio, and TCP IO through the virtual
 **`io`** module. Import it explicitly (like `ffi`):
 
-```0s
+```coil
 use io::*;
 ```
 
@@ -18,7 +18,7 @@ Buffers use the **`byte`** primitive and **`[byte]`** arrays.
 | `byte` | Integer in `0..=255`. Literals coerce when annotated / expected. |
 | `[byte]` | Homogeneous byte buffer for `read` / `write`. |
 
-```0s
+```coil
 fn main() {
     let b: byte = 255;
     let arr: [byte] = [1, 2, 3];
@@ -37,7 +37,7 @@ fn main() {
 | `from_bytes` | `[byte] → Result<string, IoError>` | UTF-8 decode; invalid sequences → `InvalidInput` |
 | `to_bytes` | `string → [byte]` | UTF-8 encode (always succeeds) |
 
-```0s
+```coil
 use io::*;
 
 fn main() {
@@ -49,7 +49,7 @@ fn main() {
 }
 ```
 
-See `examples/io_text.0s`.
+See `examples/io_text.hy`.
 
 ---
 
@@ -74,7 +74,7 @@ See `examples/io_text.0s`.
 TCP and UDP live in nested virtual modules — import them explicitly
 (like `ffi::types`):
 
-```0s
+```coil
 use io::*;
 use io::net::tcp::*;
 use io::net::udp::*;
@@ -96,7 +96,7 @@ you need peer addresses:
 | `recv_from(s, buf)` | `→ Result<(int, string, int), IoError>` | `(nbytes, peer_host, peer_port)` |
 | `recv_from_wait(s, buf)` | same | Blocks in the host via `poll` |
 
-```0s
+```coil
 use io::*;
 use io::net::udp::*;
 
@@ -112,7 +112,7 @@ fn main() {
 }
 ```
 
-See `examples/io_udp.0s`.
+See `examples/io_udp.hy`.
 
 ---
 
@@ -129,7 +129,7 @@ See `examples/io_udp.0s`.
 
 ## File round-trip
 
-```0s
+```coil
 use io::*;
 
 fn main() {
@@ -146,7 +146,7 @@ fn main() {
 }
 ```
 
-See `examples/io_file.0s` and `examples/io_eof.0s`.
+See `examples/io_file.hy` and `examples/io_eof.hy`.
 
 ---
 

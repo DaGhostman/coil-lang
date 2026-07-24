@@ -1,4 +1,4 @@
-//! Stack VM, managed heap, and FFI runtime for zero-script bytecode.
+//! Stack VM, managed heap, and FFI runtime for coil bytecode.
 
 mod ffi;
 pub mod io;

@@ -1,12 +1,12 @@
 # 08 — Coroutines
 
-zero-script supports **stackful coroutines** via `async fn`, `yield`, `resume`, and (Phase 2) bidirectional send/receive and `yield from` delegation.
+coil supports **stackful coroutines** via `async fn`, `yield`, `resume`, and (Phase 2) bidirectional send/receive and `yield from` delegation.
 
 ## Creating a coroutine
 
 An `async fn` returns a **handle** with type `coroutine<Y>` when it only yields values out, or `coroutine<Y, S>` when it also receives values on resume (`S` defaults to `unit` when unused).
 
-```0s
+```coil
 async fn counter() {
     yield 0;
     yield 1;
@@ -26,7 +26,7 @@ Calling an async function emits `MakeCoro` — it allocates a suspended coroutin
 
 `resume h` continues the coroutine until the next `yield` or `return`. The yielded (or returned) value becomes the result of the `resume` expression — `resume` has a single static result type covering both.
 
-```0s
+```coil
 async fn two_step() {
     yield 10;
     yield 20;
@@ -48,7 +48,7 @@ Resuming an already-**done** coroutine always returns `0` (`Value::default()`) �
 
 Use `done(h)` to ask whether a handle has completed (returns `bool`):
 
-```0s
+```coil
 let h = two_step();
 print "%z", done(h); // false
 resume h;
@@ -59,7 +59,7 @@ print "%z", done(h); // true
 
 `resume h` can be used inline anywhere an expression is expected, including directly as a `print` argument:
 
-```0s
+```coil
 print "%i,", resume h;
 ```
 
@@ -67,21 +67,21 @@ print "%i,", resume h;
 
 Resume with a value:
 
-```0s
+```coil
 resume h with expr
 ```
 
 Receive at a yield site:
 
-```0s
+```coil
 let msg = yield "ready";
 ```
 
 The send type `S` in `coroutine<Y, S>` is inferred from binding-yield patterns and `resume h with v` sites.
 
-Example (`examples/coro_send.0s`):
+Example (`examples/coro_send.hy`):
 
-```0s
+```coil
 async fn ping() {
     let msg = yield "ready";
     print "%s", msg;
@@ -100,7 +100,7 @@ Output: `hello`
 
 Delegate to another coroutine; values and sends propagate through the delegate chain.
 
-```0s
+```coil
 async fn inner() {
     yield 0;
     yield 1;
@@ -119,13 +119,13 @@ fn main() {
 }
 ```
 
-Output: `01` (from `examples/coro_yield_from.0s`).
+Output: `01` (from `examples/coro_yield_from.hy`).
 
 ## Interleaving
 
 Two handles are independent — resuming one does not advance the other, even when both handles come from the same (possibly parameterized) `async fn`:
 
-```0s
+```coil
 async fn counter(int base) {
     yield base;
     yield base + 1;
@@ -143,7 +143,7 @@ fn main() {
 }
 ```
 
-See `examples/coro_interleave.0s` for a longer alternating-`resume` example.
+See `examples/coro_interleave.hy` for a longer alternating-`resume` example.
 
 ## Iterating with `for x in`
 
@@ -154,7 +154,7 @@ Coroutines participate: the loop resumes until `done`, binding each
 (`return` / fall-off) does **not** enter the body (Python/JS-like).
 `break` / `continue` work as usual.
 
-```0s
+```coil
 async fn counter() {
     yield 0;
     yield 1;
@@ -169,9 +169,9 @@ fn main() {
 }
 ```
 
-See `examples/for_in_coro.0s`. The same `for x in` form also iterates
+See `examples/for_in_coro.hy`. The same `for x in` form also iterates
 arrays, homogeneous tuples/dicts, and user `impl IntoIterator` types
-(see `examples/for_in_array.0s`, `for_in_dict.0s`, `for_in_custom.0s`).
+(see `examples/for_in_array.hy`, `for_in_dict.hy`, `for_in_custom.hy`).
 
 ## Recompiling
 
@@ -179,8 +179,8 @@ Coroutines and iterators added VM opcodes; delete stale archives after
 upgrading:
 
 ```bash
-rm -f out.c0s
-cargo run -- examples/coro_send.0s
+rm -f out.hyc
+cargo run -- examples/coro_send.hy
 ```
 
 Bump `ARCHIVE_VERSION` whenever bytecode changes incompatibly (see

@@ -135,7 +135,7 @@ pub struct Machine<const S: usize> {
     resume_stack: Vec<ResumeCtx>,
     /// Directory of the entry script (for relative `dload` paths).
     base_dir: Option<PathBuf>,
-    /// Extra search paths from `zero.toml` `[ffi]`.
+    /// Extra search paths from `coil.toml` `[ffi]`.
     ffi_search_paths: Vec<PathBuf>,
     /// Registered C struct layouts for pass-by-value FFI.
     struct_layouts: Vec<CStructLayout>,
@@ -988,7 +988,7 @@ impl<const S: usize> Machine<S> {
         self.push_result_err(kind, err.to_string());
     }
 
-    /// Call a zero-script function at `offset` reentrantly (for FFI callbacks).
+    /// Call a coil function at `offset` reentrantly (for FFI callbacks).
     pub fn call_function(&mut self, offset: u32, args: &[Value]) -> Value {
         let saved_sp = self.stack.tell();
         for a in args {
@@ -1043,7 +1043,7 @@ impl<const S: usize> Machine<S> {
         }
     }
 
-    /// Run compiler-produced bytecode (archived layout, no `.c0s` round-trip).
+    /// Run compiler-produced bytecode (archived layout, no `.hyc` round-trip).
     pub fn run_raw(&mut self, code: &[RawByte], constants: &[u64], static_slots: u32) {
         let code: &[Byte] = unsafe { std::slice::from_raw_parts(code.as_ptr().cast(), code.len()) };
         self.run_with_pool(code, constants, static_slots);
@@ -3983,7 +3983,7 @@ mod tests {
         assert_eq!(out.as_int(), 42);
     }
 
-    /// `load_program` is the public entry used by `zero-script test` —
+    /// `load_program` is the public entry used by `coil test` —
     /// without it, harness cases cannot `call_function` against compiled
     /// bytecode.
     #[test]
@@ -4119,7 +4119,7 @@ mod tests {
         );
     }
 
-    /// C → zero-script callback via `apply_cb` in libsum.so.
+    /// C → coil callback via `apply_cb` in libsum.so.
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn vm_callback_apply_cb_doubles() {

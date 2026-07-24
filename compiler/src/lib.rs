@@ -647,7 +647,7 @@ pub struct Compiler {
     user_main_defined: bool,
 
     /// When false (default), harness `test("…")` blocks and `#[test]` functions
-    /// are stripped before typecheck/codegen. Set true for `zero-script test`
+    /// are stripped before typecheck/codegen. Set true for `coil test`
     /// or `compile --include-tests`.
     include_tests: bool,
 
@@ -4335,7 +4335,7 @@ impl Compiler {
     }
 
     /// Emit a synthetic `main` that runs every harness test case in one VM
-    /// (standalone `cargo run -- tests/foo.0s`). Prints
+    /// (standalone `cargo run -- tests/foo.hy`). Prints
     /// `> Test "<name>" failed` on soft failures and panics with
     /// `"tests failed"` if any case failed.
     fn emit_virtual_test_main(&mut self) {
@@ -8205,7 +8205,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("examples/static_singleton.0s");
+            .join("examples/static_singleton.hy");
         let mut pipeline = crate::Pipeline::new();
         let (bytecode, constants) = pipeline
             .compile_src_from_file(path.to_str().unwrap())
@@ -8232,7 +8232,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("examples/static_minimal.0s");
+            .join("examples/static_minimal.hy");
         let mut pipeline = crate::Pipeline::new();
         let (bytecode, constants) = pipeline
             .compile_src_from_file(path.to_str().unwrap())
@@ -8742,7 +8742,7 @@ test("two") { assert(true)?; }
     #[test]
     fn compile_module_diff_matches_compile_tail_for_fib() {
         use common::Instruction;
-        let src = include_str!("../../examples/fib.0s");
+        let src = include_str!("../../examples/fib.hy");
         let mut ast = Pratt::default().parse(src).expect("parse fib");
 
         // `compile_module` emits unfused absolute-offset bytecode;
@@ -8801,7 +8801,7 @@ test("two") { assert(true)?; }
     #[test]
     fn fib_compiles_with_fused_superinstructions() {
         use common::Instruction;
-        let src = include_str!("../../examples/fib.0s");
+        let src = include_str!("../../examples/fib.hy");
         let (bc, _) = compile_src(src);
         // fib's body fuses: `n <= 2` may become `BinSlotImmJmpf` or
         // `BinSlotImm`, `return 1` into `ConstReturnImm`, and the
@@ -9715,7 +9715,7 @@ fn main() {
     // level. The end-to-end runtime behavior is verified separately
     // by the `example_match_with_two_ok_arms_dispatches_correctly`
     // test in `compiler/tests/pipeline.rs` (which compiles and runs
-    // `examples/result.0s` after it's extended to two `Result::Ok`
+    // `examples/result.hy` after it's extended to two `Result::Ok`
     // arms).
 
     /// Codegen test 16 : Case 4 — a multi-arm match
@@ -11212,7 +11212,7 @@ fn main() { \
     /// not `CONST`. Peephole fusion adjusts `CodePtr` in `finalize_bytecode`
     /// but never rewrites `CONST`, so a stale offset would make the FFI
     /// trampoline jump to the wrong IP (regression: prints `0` instead of
-    /// `42` for `examples/ffi_callback.0s`).
+    /// `42` for `examples/ffi_callback.hy`).
     #[test]
     fn invoke_callback_fn_arg_emits_relocatable_code_ptr() {
         use common::Instruction;

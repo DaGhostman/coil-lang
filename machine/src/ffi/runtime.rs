@@ -54,7 +54,7 @@ pub fn probe_system_libffi() -> Result<(), String> {
     ))
 }
 
-/// Verify that each named library can be resolved (for `zero-script package --check-native`).
+/// Verify that each named library can be resolved (for `coil package --check-native`).
 pub fn check_native_libraries(
     names: &[String],
     base_dir: Option<&Path>,

@@ -2,7 +2,7 @@
 
 Built-in facilities provided by the language runtime and compiler — not ordinary user-defined functions in a standard library.
 
-zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/O modules, etc.). What exists today is I/O, FFI, and host-embedder hooks.
+coil does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/O modules, etc.). What exists today is I/O, FFI, and host-embedder hooks.
 
 ---
 
@@ -23,7 +23,7 @@ zero-script does **not** yet ship a general-purpose stdlib (no `map`, `filter`, 
 | `panic` | Keyword | Abort with a string message (exit code 1) |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
-Compiler builtins live in **virtual modules** (not `.0s` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*;`. FFI and **`io`** are **not** auto-imported — write `use ffi::*;` / `use io::*;` before using those APIs.
+Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*;`. FFI and **`io`** are **not** auto-imported — write `use ffi::*;` / `use io::*;` before using those APIs.
 
 ---
 
@@ -83,7 +83,7 @@ The typechecker validates specifiers against arguments when the format string is
 
 ### Examples
 
-```0s
+```coil
 print "plain text";
 print "%i", 42;
 print "%s %z", "ok", true;
@@ -103,7 +103,7 @@ See [Tutorial 01](../tutorial/01-basics.md) for introductory usage.
 
 Append with empty index assignment; query length with `len`.
 
-```0s
+```coil
 arr[] = value   // append (assignment target only)
 len(arr)
 ```
@@ -115,7 +115,7 @@ len(arr)
 
 Empty `arr[]` is only valid as an assignment target — using it as an rvalue is a compile error.
 
-```0s
+```coil
 let a = [1, 2];
 a[] = 3;
 print "%i", len(a); // 3
@@ -134,7 +134,7 @@ format_expr ::= 'format' STRING (',' expr)*
 
 `format` uses the same specifier rules as `print`, but returns the formatted `string` instead of writing to stdout.
 
-```0s
+```coil
 let s = format "%i-%s", 42, "x";
 print "%s", s; // 42-x
 ```
@@ -145,7 +145,7 @@ print "%s", s; // 42-x
 
 Runtime FFI callables are exports of the virtual `ffi` module. They are **not** keywords and are **not** in scope until you import them:
 
-```0s
+```coil
 use ffi::*;
 use ffi::types::*;
 ```
@@ -156,7 +156,7 @@ Or import individually: `use ffi::dload;`, `use ffi::declare;`, `use ffi::invoke
 
 Load a native shared library at runtime.
 
-```0s
+```coil
 dload(path_expr)
 ```
 
@@ -166,7 +166,7 @@ dload(path_expr)
 
 Returns `Result<int, Error>` — `Ok` is the library handle (heap object address). Failure is `Err(Error)`, never `-1`.
 
-```0s
+```coil
 use ffi::*;
 let lib = match dload("sum") {
     Result::Ok(h) => h,
@@ -190,7 +190,7 @@ Test whether a coroutine handle has finished.
 
 ### Syntax
 
-```0s
+```coil
 done(handle_expr)
 ```
 
@@ -204,7 +204,7 @@ done(handle_expr)
 
 ### Example
 
-```0s
+```coil
 let h = counter();
 print "%z", done(h); // false
 resume h;
@@ -218,7 +218,7 @@ print "%z", done(h); // true
 
 Register a C function signature in a loaded library.
 
-```0s
+```coil
 declare(lib, name, (arg_types...), ret_type)
 declare(lib, name, (arg_types...), ret_type, variadic)
 ```
@@ -237,7 +237,7 @@ Returns `Result<int, Error>` — `Ok` is the function id; `Err` if the symbol is
 
 Tag constructors live in the virtual `ffi::types` module. After `use ffi::types::*;`, write bare `Int`, `Ptr`, `Callback`, …:
 
-```0s
+```coil
 use ffi::*;
 use ffi::types::*;
 
@@ -262,7 +262,7 @@ declare(lib, "h", (ffi::types::Ptr,), Int); // qualified path needs no glob
 
 Call a function registered with `declare`.
 
-```0s
+```coil
 invoke(lib, fn_id, (args...))
 ```
 
@@ -274,7 +274,7 @@ invoke(lib, fn_id, (args...))
 
 Returns `Result<T, Error>` where `T` is the type recorded from the matching `declare(..., ret)` (`unit` for `void`). Bind `let id = declare(...)?` (or match) so the side table can refine later `invoke` calls.
 
-```0s
+```coil
 let n = match invoke(lib, sum_id, (40, 2)) {
     Result::Ok(v) => v,
     Result::Err(e) => panic e.message,
@@ -299,7 +299,7 @@ Match on `e.kind` for recovery; use `e.message` for logging / `panic`.
 
 Not separate builtins — the compiler lowers extern declarations to `dload` / `declare` / `invoke` sequences. User code calls look like normal functions:
 
-```0s
+```coil
 extern "c" {
     fn strlen(string s) -> int;
     fn printf(string fmt, ...) -> int;   // C varargs — bare `...`
@@ -318,7 +318,7 @@ fn main() {
 
 Non-blocking file / stdio / TCP / UDP streams. **Not** auto-imported:
 
-```0s
+```coil
 use io::*;
 ```
 
@@ -336,15 +336,15 @@ use io::*;
 
 Buffers are **`[byte]`**. Use `from_bytes` / `to_bytes` for text. `print` still uses the `PRINT` opcode (not `stdout`). No HTTP in the VM — userland only later.
 
-See [Tutorial 10 — IO streams](../tutorial/10-io-streams.md) and `examples/io_*.0s`.
+See [Tutorial 10 — IO streams](../tutorial/10-io-streams.md) and `examples/io_*.hy`.
 
 ---
 
 ## Iterator / IntoIterator
 
-Prelude traits (virtual module — not `.0s` sources) power `for x in expr`:
+Prelude traits (virtual module — not `.hy` sources) power `for x in expr`:
 
-```0s
+```coil
 trait Iterator<I> {
     type Item;
     fn next(I it) -> Option<Item>;
@@ -369,7 +369,7 @@ required) covers:
 | `coroutine<Y, S>` | `Y` | Resume/Done; completion value excluded from the body |
 
 Users write ordinary `impl IntoIterator` / `impl Iterator` for custom types
-(see `examples/for_in_custom.0s`). Methods are callable as UFCS
+(see `examples/for_in_custom.hy`). Methods are callable as UFCS
 (`into_iter(x)`, `next(it)`).
 
 ---
@@ -440,7 +440,7 @@ vm.run_raw(&bytecode);
 
 | Approach | Use when |
 |----------|----------|
-| Host natives | Embedding zero-script in a Rust app; hot callbacks; sandboxed API surface |
+| Host natives | Embedding coil in a Rust app; hot callbacks; sandboxed API surface |
 | `extern` / `dload` | Calling existing C libraries; plugins as `.so` files |
 
 ---
@@ -458,7 +458,7 @@ Auto-imported from the virtual `prelude::test` module. Returns a `Result` — it
 
 `cond` must be `bool`; `msg` must be `string`. Propagate with `?` in a result-mode function, or `match` the value:
 
-```0s
+```coil
 fn must_be_pos(int n) {
     assert(n > 0, "expected positive")?;
     return n;
@@ -467,27 +467,27 @@ fn must_be_pos(int n) {
 
 Rebind the short name with `use prelude::test::assert as check;` if you need `assert` free for something else.
 
-See `examples/assert.0s`.
+See `examples/assert.hy`.
 
 ---
 
 ## `test("…") { … }` (harness cases)
 
-Top-level declaration used by `zero-script test`. The name must be a **string literal**. The body is typechecked in Result mode (`Result<(), string>`), so `assert(...)?` and `raise` work as in a result-mode function.
+Top-level declaration used by `coil test`. The name must be a **string literal**. The body is typechecked in Result mode (`Result<(), string>`), so `assert(...)?` and `raise` work as in a result-mode function.
 
-```0s
+```coil
 test("addition works") {
     assert(1 + 1 == 2)?;
 }
 ```
 
-Do **not** also define `fn main` in a file that uses `test(...)` cases — the compiler injects a virtual `main` for standalone runs. The `zero-script test` CLI runs each case in an isolated VM (so a `panic` in one case does not skip later cases) and prints `> Test "<description>" failed` on failure. Pass `--fail-fast` to stop after the first failed case.
+Do **not** also define `fn main` in a file that uses `test(...)` cases — the compiler injects a virtual `main` for standalone runs. The `coil test` CLI runs each case in an isolated VM (so a `panic` in one case does not skip later cases) and prints `> Test "<description>" failed` on failure. Pass `--fail-fast` to stop after the first failed case.
 
 ### `#[test]` on functions
 
 The same harness semantics apply when tests are declared as attributed functions:
 
-```0s
+```coil
 #[test("addition works")]
 fn add_works() {
     assert(1 + 1 == 2)?;
@@ -501,22 +501,22 @@ fn multiply_works() {
 
 The optional string argument is the case description; when omitted, the function name is used. `#[test]` functions and `test("…") { … }` blocks may coexist in one file.
 
-**Production compiles** (`compile`, default `cargo run`) strip harness declarations unless you pass `--include-tests`. The `zero-script test` command always compiles them.
+**Production compiles** (`compile`, default `cargo run`) strip harness declarations unless you pass `--include-tests`. The `coil test` command always compiles them.
 
 ---
 
 ## `panic`
 
-Keyword that aborts the program with a string message. Writes `panic: <msg>` and stops the VM; the CLI exits with code `1`. Under `zero-script test`, a language panic fails the current case only (the next case still runs unless `--fail-fast` is set).
+Keyword that aborts the program with a string message. Writes `panic: <msg>` and stops the VM; the CLI exits with code `1`. Under `coil test`, a language panic fails the current case only (the next case still runs unless `--fail-fast` is set).
 
-```0s
+```coil
 panic "unreachable";
 panic format "bad index %i", i;
 ```
 
 Unlike `raise`, `panic` is not recoverable with `?` / `match`. Prefer `assert` + `?` when callers should handle failure.
 
-See `examples/panic.0s`.
+See `examples/panic.hy`.
 
 ---
 

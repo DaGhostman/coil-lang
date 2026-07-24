@@ -1,0 +1,190 @@
+// 02-adventure — text adventure over stdin/stdout.
+//
+// Modules: world (rooms/player), commands (byte parse), save (encode/decode).
+// File IO and stdin live here (entry file) — see NOTES.md.
+// Input: `read_to_end` once, then split on `\n` (batch / Ctrl+D on a TTY).
+//
+//   rm -f out.hyc
+//   printf 'look\ngo north\ntake key\ninventory\ngo south\ngo east\nlook\nquit\n' | \
+//     timeout 10s ./target/release/coil examples/projects/02-adventure/src/main.hy
+
+use io::*;
+use world::*;
+use commands::*;
+use save::*;
+
+fn save_player(string path, int room, int has_key) {
+    let payload = encode_save(room, has_key);
+    let s = open(path, "w")?;
+    write_all(s, payload)?;
+    close(s)?;
+    return 0;
+}
+
+fn load_player(string path) {
+    let s = open(path, "r")?;
+    let got = read_to_end(s)?;
+    close(s)?;
+    return decode_save(got);
+}
+
+fn print_look(Player p) {
+    let room = player_room(p);
+    print "You are in the ";
+    print "%s", room_title(room);
+    print ". Exits: ";
+    print "%s", room_exits(room);
+    print ". ";
+    if key_here(p) == 1 {
+        print "A brass key glints on a shelf. ";
+    }
+    if player_has_key(p) == 1 {
+        if room == 2 {
+            print "The garden gate unlocks - you win! ";
+        }
+    }
+}
+
+fn print_help() {
+    print "Commands: look, go north/south/east/west, take [key], inventory, save, load, help, quit";
+}
+
+fn handle_line(Player p, [byte] line, string save_path) -> int {
+    if len(line) == 0 {
+        return 1;
+    }
+    let c = parse_line(line);
+    let k = cmd_kind(c);
+
+    if k == 0 {
+        print_look(p);
+        print " ";
+    }
+    if k == 1 {
+        let d = cmd_dir(c);
+        if move_ok(p, d) == 1 {
+            try_move(p, d);
+            print "OK. ";
+            print_look(p);
+            print " ";
+        } else {
+            print "You cannot go that way. ";
+        }
+    }
+    if k == 2 {
+        if key_here(p) == 1 {
+            try_take_key(p);
+            print "Taken: brass key. ";
+        } else {
+            print "Nothing to take. ";
+        }
+    }
+    if k == 3 {
+        if player_has_key(p) == 1 {
+            print "Inventory: brass key. ";
+        } else {
+            print "Inventory: (empty). ";
+        }
+    }
+    if k == 4 {
+        let r = save_player(save_path, player_room(p), player_has_key(p));
+        print "%s", match r {
+            Result::Ok(_) => "Saved. ",
+            Result::Err(_) => "Save failed. ",
+        };
+    }
+    if k == 5 {
+        let r = load_player(save_path);
+        let ok = match r {
+            Result::Ok(_) => 1,
+            Result::Err(_) => 0,
+        };
+        if ok == 1 {
+            let data = match r {
+                Result::Ok(d) => d,
+                Result::Err(_) => new SaveData(0, 0),
+            };
+            p.room = data.room;
+            p.has_key = data.has_key;
+            print "Loaded. ";
+            print_look(p);
+            print " ";
+        } else {
+            print "Load failed. ";
+        }
+    }
+    if k == 6 {
+        print_help();
+        print " ";
+    }
+    if k == 7 {
+        print "Bye.";
+        return 0;
+    }
+    if k == 8 {
+        print "Unknown command. Type help. ";
+    }
+    return 1;
+}
+
+fn main() {
+    print "=== Tiny Adventure === ";
+    print "Type help for commands (end input with Ctrl+D / EOF). ";
+    print_help();
+    print " ";
+
+    let p = new_player();
+    print_look(p);
+    print " ";
+
+    let save_path = "/tmp/coil_adventure_save.dat";
+    let z: byte = 0;
+    let nl: byte = 10;
+    let cr: byte = 13;
+
+    let input = stdin();
+    let raw = match read_to_end(input) {
+        Result::Ok(b) => b,
+        Result::Err(_) => [z],
+    };
+
+    let i = 0;
+    let running = 1;
+    while running == 1 {
+        if i >= len(raw) {
+            print "Bye.";
+            running = 0;
+        }
+        if running == 1 {
+            let line: [byte] = [z];
+            let collecting = 1;
+            while collecting == 1 {
+                if i >= len(raw) {
+                    collecting = 0;
+                }
+                if collecting == 1 {
+                    let b = raw[i];
+                    i = i + 1;
+                    if b == nl {
+                        collecting = 0;
+                    }
+                    if b != nl {
+                        if b != cr {
+                            line[] = b;
+                        }
+                    }
+                }
+            }
+            print "> ";
+            if len(line) > 1 {
+                let out: [byte] = [line[1]];
+                let j = 2;
+                while j < len(line) {
+                    out[] = line[j];
+                    j = j + 1;
+                }
+                running = handle_line(p, out, save_path);
+            }
+        }
+    }
+}

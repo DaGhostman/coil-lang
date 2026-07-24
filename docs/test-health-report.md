@@ -15,17 +15,17 @@ broken, what looked flaky, incomplete implementations, and fixes applied.
 
 | Path | Issue | Fix |
 |------|-------|-----|
-| `examples/fib.0s` used `fib(32)` | Millions of recursive calls; debug heap alloc traces made `example_fib_still_works` and shared suite wall time drag | Smoke example is now `fib(10)` → `55`; bench lives in `examples/fib_bench.0s` (`fib(32)` → `2178309`) for `poop` / `vm_bench.sh` / `perf_fib_dispatch_regression` |
+| `examples/fib.hy` used `fib(32)` | Millions of recursive calls; debug heap alloc traces made `example_fib_still_works` and shared suite wall time drag | Smoke example is now `fib(10)` → `55`; bench lives in `examples/fib_bench.hy` (`fib(32)` → `2178309`) for `poop` / `vm_bench.sh` / `perf_fib_dispatch_regression` |
 
 ## Flaky tests
 
 | Test | Symptom | Root cause | Fix |
 |------|---------|------------|-----|
-| `example_derive_show_eq_prints_expected` / `tests/derive_ord.0s` | `Color::Red < Color::Blue` intermittently `false` (ASLR-dependent) | Concrete `<`/`>`/`<=`/`>=` codegen looked up empty `Ord` (no methods) and fell back to hardwired `LE`/`GT`/… which compare **heap pointer addresses** | Emit via `Lt`/`Gt`/`Le`/`Ge` in `emit_concrete_operator_call` (`compiler/src/lib.rs`). Regression: `derive_ord_unit_variants_compare_by_declaration_order` (8× stable). |
+| `example_derive_show_eq_prints_expected` / `tests/derive_ord.hy` | `Color::Red < Color::Blue` intermittently `false` (ASLR-dependent) | Concrete `<`/`>`/`<=`/`>=` codegen looked up empty `Ord` (no methods) and fell back to hardwired `LE`/`GT`/… which compare **heap pointer addresses** | Emit via `Lt`/`Gt`/`Le`/`Ge` in `emit_concrete_operator_call` (`compiler/src/lib.rs`). Regression: `derive_ord_unit_variants_compare_by_declaration_order` (8× stable). |
 
 Namespace suite (`compiler/tests/namespace.rs`) passed repeatedly under `--test-threads=16`. Residual risks (not failing today):
 
-- Process-wide `CWD_LOCK` + `chdir` for `zero.toml` discovery
+- Process-wide `CWD_LOCK` + `chdir` for `coil.toml` discovery
 - Shared `examples/libsum.so` build among FFI tests (must not truncate with `File::create`)
 
 ## Incomplete / false-green patterns
@@ -34,7 +34,7 @@ Namespace suite (`compiler/tests/namespace.rs`) passed repeatedly under `--test-
 |---------|------|------------|
 | FFI tests `eprintln!("skipping…"); return;` when `cc` / `.so` / `libc` missing | CI can go green without exercising FFI | Soft-skip **panics when `CI` is set**; GitHub Actions installs `libffi-dev` + `build-essential` |
 | No `.github/workflows` before this work | Regressions like #15 Ord derive landed unnoticed | Added `.github/workflows/ci.yml` |
-| CLI `out.c0s` cache | Stale bytecode on manual runs (not pipeline goldens) | Documented; CI does not rely on the cache for goldens |
+| CLI `out.hyc` cache | Stale bytecode on manual runs (not pipeline goldens) | Documented; CI does not rely on the cache for goldens |
 
 ## Coverage (post edge-case expansion)
 
@@ -70,11 +70,11 @@ Target band was 60–80% average; suites now sit at the high end / slightly abov
 ## Coverage follow-ups applied
 
 - In-tree `proptest` property tests (parser no-panic; small-program compile no-panic)
-- Extra `./tests/*.0s` exercised by `zero-script test` (derive Ord, assert edges)
+- Extra `./tests/*.hy` exercised by `coil test` (derive Ord, assert edges)
 - GitHub Actions: `cargo test --workspace` + `cargo run -- test`
 
 ## Out of scope (still known)
 
-- Documented `examples/strlen.0s` CLI segfault path (pipeline golden passes)
+- Documented `examples/strlen.hy` CLI segfault path (pipeline golden passes)
 - Commented-out allocator unit tests in `machine/src/memory/allocator.rs`
 - Overnight `cargo-fuzz` / libFuzzer corpus

@@ -42,7 +42,7 @@ SARIF `ruleId`, and LSP `code`). Codes are grouped by family:
 | `E0400`–`E0405` | Aggregate / FFI family | Index OOB, array element mismatch, `declare`/`invoke` arity, … |
 | `E0800`–`E0801` | Codegen family | Unknown expression / codegen error |
 | `E0900` | `IoError` | I/O failure |
-| `E0901` | `ArchiveVersionMismatch` | Stale `.c0s` archive |
+| `E0901` | `ArchiveVersionMismatch` | Stale `.hyc` archive |
 | `E0902` | `InvalidCliFlags` | Conflicting or unknown CLI flags |
 | `E0903` | `MissingInputFile` | No input file given |
 

@@ -1,4 +1,4 @@
-//! Diagnostic reporting for zero-script.
+//! Diagnostic reporting for coil.
 //!
 //! Owns producer [`Message`]s (with stable [`ErrorCode`]s) and sink-facing
 //! [`Diagnostic`]s. Render via [`DiagnosticSink`]: pretty ariadne,

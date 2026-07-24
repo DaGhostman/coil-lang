@@ -1,0 +1,7 @@
+// examples/bench.hy — minimal smoke-test (not a real benchmark)
+fn main() {
+    let a = 5;
+    let b = 7;
+    let c = a + b;
+    print "%i\n", c;
+}

@@ -1,8 +1,8 @@
-//! Project manifest (`zero.toml`) parsing and module path resolution.
+//! Project manifest (`coil.toml`) parsing and module path resolution.
 //!
-//! A `zero.toml` at the project root declares search roots for `use`
+//! A `coil.toml` at the project root declares search roots for `use`
 //! resolution and an optional entry point. The pipeline maps `a::b::c`
-//! paths to `<root>/a/b/c.0s` files on disk.
+//! paths to `<root>/a/b/c.hy` files on disk.
 //!
 //! ## Format
 //!
@@ -12,7 +12,7 @@
 //!
 //! [entry]
 //! # Optional. Default = the file passed to the compiler.
-//! file = "./src/main.0s"
+//! file = "./src/main.hy"
 //! ```
 //!
 //! The parser is intentionally minimal (no nested tables,
@@ -37,15 +37,15 @@
 //! `["./src", "./vendor"]`, we search each root in order
 //! and return the first file that exists:
 //!
-//! 1. `./src/a/b/c.0s`
-//! 2. `./vendor/a/b/c.0s`
+//! 1. `./src/a/b/c.hy`
+//! 2. `./vendor/a/b/c.hy`
 //!
 //! The first match wins. If no root contains the file, the
 //! pipeline emits a "module not found" diagnostic.
 
 use std::path::{Path, PathBuf};
 
-/// Errors that can occur while loading a `zero.toml` manifest.
+/// Errors that can occur while loading a `coil.toml` manifest.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)] // some variants are reserved for future strict-mode validation
 pub enum ManifestError {
@@ -85,7 +85,7 @@ impl std::error::Error for ManifestError {}
 pub struct Manifest {
     /// Search roots for module discovery. Each path is
     /// resolved relative to the project root (the directory
-    /// containing `zero.toml`).
+    /// containing `coil.toml`).
     pub roots: Vec<PathBuf>,
     /// Optional explicit entry point. When `None`, the
     /// compiler falls back to the file passed on the CLI.
@@ -95,7 +95,7 @@ pub struct Manifest {
 }
 
 impl Default for Manifest {
-    /// Default manifest when no `zero.toml` is present:
+    /// Default manifest when no `coil.toml` is present:
     /// a single search root at `src/`, no explicit entry
     /// point.
     fn default() -> Self {
@@ -108,17 +108,17 @@ impl Default for Manifest {
 }
 
 impl Manifest {
-    /// Load a manifest from a project root. If `zero.toml`
+    /// Load a manifest from a project root. If `coil.toml`
     /// exists, parse it. If not, return the default manifest
     /// (just `src/`).
     ///
     /// `project_root` is the directory containing the
-    /// `zero.toml` file. Search roots in the manifest are
+    /// `coil.toml` file. Search roots in the manifest are
     /// stored as relative paths; callers should re-root them
     /// when actually searching (see
     /// [`Manifest::resolve_module`]).
     pub fn load(project_root: &Path) -> Result<Self, ManifestError> {
-        let manifest_path = project_root.join("zero.toml");
+        let manifest_path = project_root.join("coil.toml");
         match std::fs::read_to_string(&manifest_path) {
             Ok(contents) => Self::parse(&contents),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -242,16 +242,16 @@ impl Manifest {
     ///
     /// The file containing the module is the LAST
     /// segment of the dotted path (as a file stem). For
-    /// `use foo::sadge;`, the file is `foo.0s` (NOT
-    /// `foo/sadge.0s`). For `use lib::io::read;`, the
-    /// file is `io.0s` inside `lib/` (so the full path
-    /// is `<root>/lib/io.0s`).
+    /// `use foo::sadge;`, the file is `foo.hy` (NOT
+    /// `foo/sadge.hy`). For `use lib::io::read;`, the
+    /// file is `io.hy` inside `lib/` (so the full path
+    /// is `<root>/lib/io.hy`).
     ///
     /// The fully qualified name of the imported item is
     /// `<file's path>::<name>` — the file's directory
     /// path is the namespace, and the function name is
-    /// the LAST segment. So `sadge` in `foo.0s` has
-    /// FQN `foo::sadge`, and `read` in `lib/io.0s` has
+    /// the LAST segment. So `sadge` in `foo.hy` has
+    /// FQN `foo::sadge`, and `read` in `lib/io.hy` has
     /// FQN `lib::io::read`.
     pub fn resolve_use(&self, project_root: &Path, path: &[String], name: &str) -> Option<PathBuf> {
         for root in &self.roots {
@@ -259,12 +259,12 @@ impl Manifest {
             for segment in path {
                 candidate.push(segment);
             }
-            // The file is `name.0s` inside the directory
+            // The file is `name.hy` inside the directory
             // `<root>/<path joined>`. So for `use
-            // foo::sadge;`, file = `<root>/foo/sadge.0s`.
+            // foo::sadge;`, file = `<root>/foo/sadge.hy`.
             // For `use lib::io::read;`, file =
-            // `<root>/lib/io/read.0s`.
-            candidate.push(format!("{}.0s", name));
+            // `<root>/lib/io/read.hy`.
+            candidate.push(format!("{}.hy", name));
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -273,11 +273,11 @@ impl Manifest {
     }
 
     /// Resolve a `mod foo;` forward declaration to an
-    /// absolute file path. Looks for `<root>/foo.0s` in
+    /// absolute file path. Looks for `<root>/foo.hy` in
     /// each search root.
     pub fn resolve_mod(&self, project_root: &Path, name: &str) -> Option<PathBuf> {
         for root in &self.roots {
-            let candidate = project_root.join(root).join(format!("{}.0s", name));
+            let candidate = project_root.join(root).join(format!("{}.hy", name));
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -292,7 +292,7 @@ impl Manifest {
     /// path separators replaced with `::`.
     ///
     /// For example, given roots `["./src", "./builtins"]` and
-    /// file `./builtins/core/ffi/dload.0s`, the namespace is
+    /// file `./builtins/core/ffi/dload.hy`, the namespace is
     /// `core::ffi::dload`.
     ///
     /// Returns `None` if the file is not inside any search
@@ -369,8 +369,8 @@ fn parse_string_array(value: &str) -> Option<Vec<String>> {
 /// Convert a relative file path to a namespace string. Strips
 /// the file extension and replaces path separators with `::`.
 ///
-/// `"core/ffi/dload.0s"` → `"core::ffi::dload"`
-/// `"foo.0s"` → `"foo"`
+/// `"core/ffi/dload.hy"` → `"core::ffi::dload"`
+/// `"foo.hy"` → `"foo"`
 fn path_to_namespace(rel: &Path) -> String {
     // Strip the file extension.
     let stem = rel.with_extension("");
@@ -411,12 +411,12 @@ mod tests {
     #[test]
     fn parse_full_manifest() {
         let src = r#"
-            # zero-script project manifest
+            # coil project manifest
             [module]
             roots = ["./src", "./vendor", "./builtins"]
 
             [entry]
-            file = "./src/main.0s"
+            file = "./src/main.hy"
         "#;
         let m = Manifest::parse(src).unwrap();
         assert_eq!(
@@ -427,7 +427,7 @@ mod tests {
                 PathBuf::from("./builtins"),
             ]
         );
-        assert_eq!(m.entry, Some(PathBuf::from("./src/main.0s")));
+        assert_eq!(m.entry, Some(PathBuf::from("./src/main.hy")));
     }
 
     #[test]
@@ -440,10 +440,10 @@ mod tests {
     #[test]
     fn parse_missing_module_section_uses_default() {
         // No `[module]` section: fall back to default roots.
-        let src = "[entry]\nfile = \"main.0s\"\n";
+        let src = "[entry]\nfile = \"main.hy\"\n";
         let m = Manifest::parse(src).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("src")]);
-        assert_eq!(m.entry, Some(PathBuf::from("main.0s")));
+        assert_eq!(m.entry, Some(PathBuf::from("main.hy")));
     }
 
     #[test]
@@ -471,32 +471,32 @@ mod tests {
 
     #[test]
     fn path_to_namespace_strips_extension_and_uses_double_colon() {
-        assert_eq!(path_to_namespace(Path::new("foo.0s")), "foo");
+        assert_eq!(path_to_namespace(Path::new("foo.hy")), "foo");
         assert_eq!(
-            path_to_namespace(Path::new("core/ffi/dload.0s")),
+            path_to_namespace(Path::new("core/ffi/dload.hy")),
             "core::ffi::dload"
         );
-        assert_eq!(path_to_namespace(Path::new("a/b/c.0s")), "a::b::c");
+        assert_eq!(path_to_namespace(Path::new("a/b/c.hy")), "a::b::c");
     }
 
     #[test]
     fn resolve_use_finds_file_in_first_root() {
         // Build a temporary project layout:
-        //   <tmp>/src/foo/sadge.0s
+        //   <tmp>/src/foo/sadge.hy
         // `use foo::sadge;` should resolve to that file.
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_1");
+        let tmp = std::env::temp_dir().join("coil_manifest_test_1");
         let src = tmp.join("src").join("foo");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("sadge.0s"), "// empty\n").unwrap();
+        std::fs::write(src.join("sadge.hy"), "// empty\n").unwrap();
 
         let m = Manifest::default(); // roots = ["src"]
         let resolved = m.resolve_use(&tmp, &["foo".into()], "sadge");
         assert!(
             resolved.is_some(),
-            "expected to find sadge.0s in <tmp>/src/foo/"
+            "expected to find sadge.hy in <tmp>/src/foo/"
         );
         let resolved = resolved.unwrap();
-        assert!(resolved.ends_with("src/foo/sadge.0s"));
+        assert!(resolved.ends_with("src/foo/sadge.hy"));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
@@ -504,10 +504,10 @@ mod tests {
 
     #[test]
     fn resolve_use_falls_back_to_second_root() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_2");
+        let tmp = std::env::temp_dir().join("coil_manifest_test_2");
         let vendor = tmp.join("vendor").join("lib_x");
         std::fs::create_dir_all(&vendor).unwrap();
-        std::fs::write(vendor.join("foo.0s"), "// empty\n").unwrap();
+        std::fs::write(vendor.join("foo.hy"), "// empty\n").unwrap();
 
         let m = Manifest {
             roots: vec![PathBuf::from("src"), PathBuf::from("vendor")],
@@ -517,17 +517,17 @@ mod tests {
         let resolved = m.resolve_use(&tmp, &["lib_x".into()], "foo");
         assert!(
             resolved.is_some(),
-            "expected to find foo.0s in vendor/lib_x/"
+            "expected to find foo.hy in vendor/lib_x/"
         );
         let resolved = resolved.unwrap();
-        assert!(resolved.ends_with("vendor/lib_x/foo.0s"));
+        assert!(resolved.ends_with("vendor/lib_x/foo.hy"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_use_returns_none_when_missing() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_3");
+        let tmp = std::env::temp_dir().join("coil_manifest_test_3");
         std::fs::create_dir_all(&tmp).unwrap();
 
         let m = Manifest::default();
@@ -539,25 +539,25 @@ mod tests {
 
     #[test]
     fn resolve_mod_finds_top_level_file() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_resolve_mod");
+        let tmp = std::env::temp_dir().join("coil_manifest_test_resolve_mod");
         let src = tmp.join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("foo.0s"), "// empty\n").unwrap();
+        std::fs::write(src.join("foo.hy"), "// empty\n").unwrap();
 
         let m = Manifest::default();
         let resolved = m.resolve_mod(&tmp, "foo");
         assert!(resolved.is_some());
-        assert!(resolved.unwrap().ends_with("src/foo.0s"));
+        assert!(resolved.unwrap().ends_with("src/foo.hy"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn namespace_of_returns_path_relative_to_root() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_4");
+        let tmp = std::env::temp_dir().join("coil_manifest_test_4");
         let builtins = tmp.join("builtins").join("core").join("ffi");
         std::fs::create_dir_all(&builtins).unwrap();
-        let file = builtins.join("dload.0s");
+        let file = builtins.join("dload.hy");
         std::fs::write(&file, "// empty\n").unwrap();
 
         let m = Manifest {
@@ -573,10 +573,10 @@ mod tests {
 
     #[test]
     fn namespace_of_returns_none_for_file_outside_all_roots() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_5");
+        let tmp = std::env::temp_dir().join("coil_manifest_test_5");
         let outside = tmp.join("totally").join("elsewhere");
         std::fs::create_dir_all(&outside).unwrap();
-        let file = outside.join("x.0s");
+        let file = outside.join("x.hy");
         std::fs::write(&file, "// empty\n").unwrap();
 
         let m = Manifest {
@@ -591,10 +591,10 @@ mod tests {
     }
 
     #[test]
-    fn load_falls_back_to_default_when_zero_toml_absent() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_6");
+    fn load_falls_back_to_default_when_coil_toml_absent() {
+        let tmp = std::env::temp_dir().join("coil_manifest_test_6");
         std::fs::create_dir_all(&tmp).unwrap();
-        // Don't create zero.toml.
+        // Don't create coil.toml.
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("src")]);
         assert_eq!(m.entry, None);
@@ -602,10 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn load_reads_existing_zero_toml() {
-        let tmp = std::env::temp_dir().join("zero_script_manifest_test_7");
+    fn load_reads_existing_coil_toml() {
+        let tmp = std::env::temp_dir().join("coil_manifest_test_7");
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("zero.toml"), "[module]\nroots = [\"./vendor\"]\n").unwrap();
+        std::fs::write(tmp.join("coil.toml"), "[module]\nroots = [\"./vendor\"]\n").unwrap();
 
         let m = Manifest::load(&tmp).unwrap();
         assert_eq!(m.roots, vec![PathBuf::from("./vendor")]);

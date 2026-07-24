@@ -1,6 +1,6 @@
 //! Compiler-provided virtual modules (`prelude`, `ffi`, …).
 //!
-//! These are not `.0s` files on disk. `use` resolves against this
+//! These are not `.hy` files on disk. `use` resolves against this
 //! registry before falling back to [`crate::manifest::Manifest`] path
 //! discovery, and every file gets an implicit prelude import.
 

@@ -41,7 +41,7 @@ jobs:
       - name: Workspace tests
         run: cargo test --workspace
 
-      - name: Language harness (`zero-script test`)
+      - name: Language harness (`coil test`)
         run: |
           cargo build -q
-          ./target/debug/zero-script test
+          ./target/debug/coil test

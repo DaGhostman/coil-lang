@@ -3,12 +3,12 @@
 Every runnable (or intentionally non-runnable) program under `examples/`. Run from the **repository root** unless noted otherwise:
 
 ```bash
-cargo run -- examples/<file>.0s
+cargo run -- examples/<file>.hy
 ```
 
-Delete `out.c0s` after editing source to force recompilation.
+Delete `out.hyc` after editing source to force recompilation.
 
-> **Note:** The CLI uses multi-file discovery (`Pipeline::compile_src_from_file`) when a `zero.toml` is present, so `use` / `mod` examples such as `modules.0s` work from `cargo run`. FFI examples need **libffi** and sometimes a built shared library (`libsum.so` / `libsum.dylib` / `sum.dll`).
+> **Note:** The CLI uses multi-file discovery (`Pipeline::compile_src_from_file`) when a `coil.toml` is present, so `use` / `mod` examples such as `modules.hy` work from `cargo run`. FFI examples need **libffi** and sometimes a built shared library (`libsum.so` / `libsum.dylib` / `sum.dll`).
 
 ---
 
@@ -16,11 +16,11 @@ Delete `out.c0s` after editing source to force recompilation.
 
 Core syntax: functions, `let`, arithmetic, control flow, and I/O.
 
-### `examples/print_literal.0s`
+### `examples/print_literal.hy`
 
 **Demonstrates:** Literal string output with `print`.
 
-```0s
+```coil
 fn main() {
     print "hello";
 }
@@ -28,16 +28,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/print_literal.0s` |
+| **Run** | `cargo run -- examples/print_literal.hy` |
 | **Output** | `hello` |
 
 ---
 
-### `examples/format_literal.0s`
+### `examples/format_literal.hy`
 
 **Demonstrates:** Formatted output — `print "%i", expr` pushes the value then formats it.
 
-```0s
+```coil
 fn main() {
     print "%i", 42;
 }
@@ -45,16 +45,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/format_literal.0s` |
+| **Run** | `cargo run -- examples/format_literal.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/string_fmt.0s`
+### `examples/string_fmt.hy`
 
 **Demonstrates:** String concatenation with `+` and the `format` expression returning a string.
 
-```0s
+```coil
 fn main() {
     let a = "hello";
     let b = "world";
@@ -66,16 +66,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/string_fmt.0s` |
+| **Run** | `cargo run -- examples/string_fmt.hy` |
 | **Output** | `hello world42-x` |
 
 ---
 
-### `examples/show_tuple.0s`
+### `examples/show_tuple.hy`
 
 **Demonstrates:** `%v` structural Show for tuples and anonymous records.
 
-```0s
+```coil
 fn main() {
     print "%v", (1, 2);
     print "%v", { a: 3, b: 4 };
@@ -84,16 +84,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/show_tuple.0s` |
+| **Run** | `cargo run -- examples/show_tuple.hy` |
 | **Output** | `(1, 2){ a: 3, b: 4 }` |
 
 ---
 
-### `examples/let_test.0s`
+### `examples/let_test.hy`
 
 **Demonstrates:** `let` bindings, reading locals, and reassignment (`x = 20;`).
 
-```0s
+```coil
 fn main() {
     let x = 5;
     print "%i", x;
@@ -106,16 +106,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/let_test.0s` |
+| **Run** | `cargo run -- examples/let_test.hy` |
 | **Output** | `51020` |
 
 ---
 
-### `examples/named_args.0s`
+### `examples/named_args.hy`
 
 **Demonstrates:** Named call-site arguments (`name: value`), including a positional prefix followed by named args.
 
-```0s
+```coil
 fn greet(string name, int age) {
     print "%s", name;
     print "%i", age;
@@ -129,16 +129,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/named_args.0s` |
+| **Run** | `cargo run -- examples/named_args.hy` |
 | **Output** | `Ada36Grace40` |
 
 ---
 
-### `examples/variadic.0s`
+### `examples/variadic.hy`
 
 **Demonstrates:** Trailing rest parameters (`T... name`) packing into a dynamic array, including an empty rest and named fixed args followed by positional rest.
 
-```0s
+```coil
 fn sum(int... xs) -> int { /* len + loop */ }
 fn greet(string name, string... extras) -> string { /* concat */ }
 
@@ -151,16 +151,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/variadic.0s` |
+| **Run** | `cargo run -- examples/variadic.hy` |
 | **Output** | `60Hi!?` |
 
 ---
 
-### `examples/const.0s`
+### `examples/const.hy`
 
 **Demonstrates:** Immutable `const` bindings (reassignment is rejected by the typechecker).
 
-```0s
+```coil
 fn main() {
     const answer = 42;
     print "%i", answer;
@@ -171,16 +171,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/const.0s` |
+| **Run** | `cargo run -- examples/const.hy` |
 | **Output** | `42hi` |
 
 ---
 
-### `examples/for_break.0s`
+### `examples/for_break.hy`
 
 **Demonstrates:** C-style `for` with `continue` and `break` (sum `0+1+2+4+5+6` = `18`).
 
-```0s
+```coil
 fn main() {
     let sum = 0;
     for (let i = 0; i < 10; i = i + 1) {
@@ -194,16 +194,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/for_break.0s` |
+| **Run** | `cargo run -- examples/for_break.hy` |
 | **Output** | `18` |
 
 ---
 
-### `examples/fizbuz.0s`
+### `examples/fizbuz.hy`
 
 **Demonstrates:** `if` conditions, modulo, and independent `print` calls (FizzBuzz-style, without newlines between numbers).
 
-```0s
+```coil
 fn fizbuz(int n) {
     if (n % 3) == 0 {
         print "FIZ";
@@ -222,16 +222,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/fizbuz.0s` |
+| **Run** | `cargo run -- examples/fizbuz.hy` |
 | **Output** | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
 
 ---
 
-### `examples/fib.0s`
+### `examples/fib.hy`
 
 **Demonstrates:** Recursive functions, `if`, and integer arithmetic (smoke / docs).
 
-```0s
+```coil
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -246,31 +246,31 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/fib.0s` |
+| **Run** | `cargo run -- examples/fib.hy` |
 | **Output** | `55` |
 
 For the release CPU / dispatch regression (`fib(32)` → `2178309`), use
-`examples/fib_bench.0s` instead.
+`examples/fib_bench.hy` instead.
 
 ---
 
-### `examples/fib_bench.0s`
+### `examples/fib_bench.hy`
 
-**Demonstrates:** Same recursive Fibonacci as `fib.0s`, but with `fib(32)` for
+**Demonstrates:** Same recursive Fibonacci as `fib.hy`, but with `fib(32)` for
 release `poop` / `perf_metrics` regression measurement.
 
 | | |
 |---|---|
-| **Run** | `cargo run --release -- examples/fib_bench.0s` |
+| **Run** | `cargo run --release -- examples/fib_bench.hy` |
 | **Output** | `2178309` |
 
 ---
 
-### `examples/bench.0s`
+### `examples/bench.hy`
 
 **Demonstrates:** Minimal `let` + arithmetic smoke test (not a performance benchmark).
 
-```0s
+```coil
 fn main() {
     let a = 5;
     let b = 7;
@@ -281,16 +281,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/bench.0s` |
+| **Run** | `cargo run -- examples/bench.hy` |
 | **Output** | `12` followed by a newline |
 
 ---
 
-### `examples/call_test.0s`
+### `examples/call_test.hy`
 
 **Demonstrates:** Calling a function for side effect; expression statement discards the return value.
 
-```0s
+```coil
 fn add(int a, int b) -> int {
     return a + b;
 }
@@ -303,16 +303,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/call_test.0s` |
+| **Run** | `cargo run -- examples/call_test.hy` |
 | **Output** | `done` |
 
 ---
 
-### `examples/gc.0s`
+### `examples/gc.hy`
 
 **Demonstrates:** String parameter passing and `print "%s"` (also exercises heap allocation / GC paths when many strings are allocated).
 
-```0s
+```coil
 fn sadge(string n) {
     print "%s", n;
 }
@@ -324,7 +324,7 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/gc.0s` |
+| **Run** | `cargo run -- examples/gc.hy` |
 | **Output** | `Hello` |
 
 ---
@@ -333,11 +333,11 @@ fn main() {
 
 Sum types with unit, tuple, and record-shaped payloads.
 
-### `examples/option.0s`
+### `examples/option.hy`
 
 **Demonstrates:** Built-in `Option`, constructor calls, and `match` with a binding arm.
 
-```0s
+```coil
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -352,16 +352,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/option.0s` |
+| **Run** | `cargo run -- examples/option.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/result.0s`
+### `examples/result.hy`
 
 **Demonstrates:** Built-in `Result` wrapping `Option`, multiple `match` arms sharing an outer tag with different inner patterns, and inner-pattern dispatch at runtime.
 
-```0s
+```coil
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -379,38 +379,38 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/result.0s` |
+| **Run** | `cargo run -- examples/result.hy` |
 | **Output** | `420-1` |
 
 ---
 
-### `examples/assert.0s`
+### `examples/assert.hy`
 
 **Demonstrates:** `prelude::test::assert` returning `Result<(), string>`, with `?` propagation and matched error messages.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/assert.0s` |
+| **Run** | `cargo run -- examples/assert.hy` |
 | **Output** | `ok,assertion failed,custom` |
 
 ---
 
-### `examples/panic.0s`
+### `examples/panic.hy`
 
 **Demonstrates:** `panic "…"` abort (writes `panic: boom`, process exits 1).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/panic.0s` |
+| **Run** | `cargo run -- examples/panic.hy` |
 | **Output** | `panic: boom` (stderr/stdout; non-zero exit) |
 
 ---
 
-### `examples/raise_try.0s`
+### `examples/raise_try.hy`
 
 **Demonstrates:** `raise`, postfix `?`, and inferred `Result` return (implicit `Ok` wrapping).
 
-```0s
+```coil
 fn parse_pos(int n, int is_neg) {
     if is_neg == 1 {
         raise "neg";
@@ -426,38 +426,38 @@ fn double_pos(int n, int is_neg) {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/raise_try.0s` |
+| **Run** | `cargo run -- examples/raise_try.hy` |
 | **Output** | `10,neg` |
 
 ---
 
-### `examples/coalesce.0s`
+### `examples/coalesce.hy`
 
 **Demonstrates:** `??` on `Option` and `Result` (`Err` is swallowed on Result).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/coalesce.0s` |
+| **Run** | `cargo run -- examples/coalesce.hy` |
 | **Output** | `bar,hi,7,9` |
 
 ---
 
-### `examples/optional_chain.0s`
+### `examples/optional_chain.hy`
 
 **Demonstrates:** `?.` optional field access on `Option` plus `??` fallback.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/optional_chain.0s` |
+| **Run** | `cargo run -- examples/optional_chain.hy` |
 | **Output** | `42,0` |
 
 ---
 
-### `examples/tree.0s`
+### `examples/tree.hy`
 
 **Demonstrates:** Recursive enum (`Tree::Node` contains child `Tree` values); isorecursive typing and recursive `match`.
 
-```0s
+```coil
 enum Tree {
     Leaf,
     Node(int, Tree, Tree),
@@ -473,27 +473,27 @@ fn sum_tree(Tree t) -> int {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/tree.0s` |
+| **Run** | `cargo run -- examples/tree.hy` |
 | **Output** | `6` |
 
 ---
 
-### `examples/record.0s`
+### `examples/record.hy`
 
 **Demonstrates:** Record-shaped enum variant (`Point { x: int, y: int }`), pattern destructuring in `match`, and field access (`p.x`, `p.y`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/record.0s` |
+| **Run** | `cargo run -- examples/record.hy` |
 | **Output** | `169512` (distance² = 169, then x = 5, y = 12) |
 
 ---
 
-### `examples/derive_show_eq.0s`
+### `examples/derive_show_eq.hy`
 
 **Demonstrates:** `#[derive(Show, Eq, Ord)]` on enums and classes — structural `%v`, `==`, and `<` without hand-written `impl`s.
 
-```0s
+```coil
 #[derive(Show, Eq, Ord)]
 enum Color {
     Red,
@@ -514,16 +514,16 @@ class Cell {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/derive_show_eq.0s` |
+| **Run** | `cargo run -- examples/derive_show_eq.hy` |
 | **Output** | `Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false` |
 
 ---
 
-### `examples/attr_ffi.0s`
+### `examples/attr_ffi.hy`
 
 **Demonstrates:** `#[ffi(lib = "c")]` attribute sugar for a single libc binding (equivalent to an `extern` block entry).
 
-```0s
+```coil
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
 
@@ -535,17 +535,17 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/attr_ffi.0s` |
+| **Run** | `cargo run -- examples/attr_ffi.hy` |
 | **Output** | `5` |
 | **Requires** | Platform C library via `lib = "c"` |
 
 ---
 
-### `examples/spread.0s`
+### `examples/spread.hy`
 
 **Demonstrates:** Call-site spread for tuples and arrays.
 
-```0s
+```coil
 fn pair_sum(int a, int b) -> int { return a + b; }
 fn triple_sum(int a, int b, int c) -> int { return a + b + c; }
 
@@ -557,38 +557,38 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/spread.0s` |
+| **Run** | `cargo run -- examples/spread.hy` |
 | **Output** | `360` |
 
 ---
 
-### `examples/attr_decorator.0s`
+### `examples/attr_decorator.hy`
 
 **Demonstrates:** User-defined `attr` decorators with argument forwarding and stacked wrappers.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/attr_decorator.0s` |
+| **Run** | `cargo run -- examples/attr_decorator.hy` |
 | **Output** | `enterdo_thinghi42` |
 
 ---
 
-### `examples/attr_class.0s`
+### `examples/attr_class.hy`
 
 **Demonstrates:** Class-level `#[attr(...)]` wrapping `new Point(...)` construction.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/attr_class.0s` |
+| **Run** | `cargo run -- examples/attr_class.hy` |
 | **Output** | `Point ctor512` |
 
 ---
 
-### `examples/mixed.0s`
+### `examples/mixed.hy`
 
 **Demonstrates:** One enum mixing **unit**, **tuple**, and **record** variant shapes; `match` arms bind payload values per shape.
 
-```0s
+```coil
 enum Shape {
     Empty,
     CircleR(int),
@@ -599,27 +599,27 @@ enum Shape {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/mixed.0s` |
+| **Run** | `cargo run -- examples/mixed.hy` |
 | **Output** | `025122` (areas: 0, 25, 12, 2) |
 
 ---
 
-### `examples/nested_records.0s`
+### `examples/nested_records.hy`
 
 **Demonstrates:** Nested record patterns in `match` (`Wrap::W { inner: Inner::I { v }, name } => v`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/nested_records.0s` |
+| **Run** | `cargo run -- examples/nested_records.hy` |
 | **Output** | `99` |
 
 ---
 
-### `examples/chained.0s`
+### `examples/chained.hy`
 
 **Demonstrates:** Chained field access across nested record enums (`o.x.v` where `x` is itself a record type).
 
-```0s
+```coil
 enum Outer {
     Outer { x: Inner, y: int },
 }
@@ -631,7 +631,7 @@ fn read_x_v(Outer o) -> int {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/chained.0s` |
+| **Run** | `cargo run -- examples/chained.hy` |
 | **Output** | `427` (42 and 7 concatenated in one print stream) |
 
 ---
@@ -640,62 +640,62 @@ fn read_x_v(Outer o) -> int {
 
 Virtual `io` module (`use io::*;`), `byte` / `[byte]` buffers, files, EOF, text helpers, UDP.
 
-### `examples/io_bytes.0s`
+### `examples/io_bytes.hy`
 
 **Demonstrates:** `byte` annotation, `[byte]` literal coercion, `len` / index.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_bytes.0s` |
+| **Run** | `cargo run -- examples/io_bytes.hy` |
 | **Output** | `25532` |
 
-### `examples/io_file.0s`
+### `examples/io_file.hy`
 
 **Demonstrates:** `open` / `write_all` / `read_to_end` / `close` round-trip; `Result` + `?`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_file.0s` |
+| **Run** | `cargo run -- examples/io_file.hy` |
 | **Output** | `2` |
 
-### `examples/io_eof.0s`
+### `examples/io_eof.hy`
 
 **Demonstrates:** Non-blocking `read` on an empty file returns `Ok(None)` (EOF).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_eof.0s` |
+| **Run** | `cargo run -- examples/io_eof.hy` |
 | **Output** | `eof` |
 
-### `examples/io_text.0s`
+### `examples/io_text.hy`
 
 **Demonstrates:** `from_bytes` (`[byte]` → UTF-8 `string`) and `to_bytes` (`string` → `[byte]`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_text.0s` |
+| **Run** | `cargo run -- examples/io_text.hy` |
 | **Output** | `hello2` |
 
-### `examples/io_udp.0s`
+### `examples/io_udp.hy`
 
 **Demonstrates:** `use io::net::udp::*;` — `bind` / `local_port` / `send_to` / `recv_from_wait` localhost echo.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_udp.0s` |
+| **Run** | `cargo run -- examples/io_udp.hy` |
 | **Output** | `2` |
 
-### `examples/io_nested_host.0s`
+### `examples/io_nested_host.hy`
 
 **Demonstrates:** Nested IO HostInvoke — `read_to_end(open(...)?)` must leave the
 stream (not the outer native id) on the stack for `MakeTuple`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_nested_host.0s` |
+| **Run** | `cargo run -- examples/io_nested_host.hy` |
 | **Output** | `3` |
 
-### `examples/io_nested_write.0s`
+### `examples/io_nested_write.hy`
 
 **Demonstrates:** Nested IO HostInvoke with outer arity > 1 —
 `write_all(open(...)?, buf)` must pack the stream (not the outer native id)
@@ -703,7 +703,7 @@ into `MakeTuple`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/io_nested_write.0s` |
+| **Run** | `cargo run -- examples/io_nested_write.hy` |
 | **Output** | `2` |
 
 See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
@@ -714,11 +714,11 @@ See [Tutorial 10 — IO streams](tutorial/10-io-streams.md).
 
 Tuples, arrays, dicts, and `type` aliases.
 
-### `examples/array_grow.0s`
+### `examples/array_grow.hy`
 
 **Demonstrates:** Growing arrays with `arr[] =`, reading the runtime length with `len`, and indexing appended elements.
 
-```0s
+```coil
 fn main() {
     let a = [1, 2];
     a[] = 3;
@@ -731,16 +731,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/array_grow.0s` |
+| **Run** | `cargo run -- examples/array_grow.hy` |
 | **Output** | `414` |
 
 ---
 
-### `examples/dict.0s`
+### `examples/dict.hy`
 
 **Demonstrates:** Anonymous structurally typed records (`{ foo: 42, bar: 100 }`) and field read via `d.foo`.
 
-```0s
+```coil
 fn main() {
     let d = { foo: 42, bar: 100 };
     print "%i", d.foo;
@@ -751,16 +751,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/dict.0s` |
+| **Run** | `cargo run -- examples/dict.hy` |
 | **Output** | `4210042` |
 
 ---
 
-### `examples/aliases.0s`
+### `examples/aliases.hy`
 
 **Demonstrates:** `type Point = (int, int);`, tuple indexing `p[0]`, and alias substitution at typecheck time (zero runtime cost).
 
-```0s
+```coil
 type Point = (int, int);
 
 fn main() {
@@ -773,16 +773,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/aliases.0s` |
+| **Run** | `cargo run -- examples/aliases.hy` |
 | **Output** | `347` |
 
 ---
 
-### `examples/generic_alias.0s`
+### `examples/generic_alias.hy`
 
 **Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
 
-```0s
+```coil
 type Pair<T> = (T, T);
 
 fn main() {
@@ -793,16 +793,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/generic_alias.0s` |
+| **Run** | `cargo run -- examples/generic_alias.hy` |
 | **Output** | `7` |
 
 ---
 
-### `examples/generic_enum.0s`
+### `examples/generic_enum.hy`
 
 **Demonstrates:** User generic enums — `enum Box<T> { Empty, Full(T) }` with construct/match typed as `Box<int>` (same machinery as builtin `Option` / `Result`).
 
-```0s
+```coil
 enum Box<T> {
     Empty,
     Full(T),
@@ -822,16 +822,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/generic_enum.0s` |
+| **Run** | `cargo run -- examples/generic_enum.hy` |
 | **Output** | `7` |
 
 ---
 
-### `examples/generics.0s`
+### `examples/generics.hy`
 
 **Demonstrates:** Generic functions with a `Num` trait bound — one `add<T: Num>` body used at `int` and `float` call sites.
 
-```0s
+```coil
 fn add<T: Num>(T a, T b) -> T {
     return a + b;
 }
@@ -845,30 +845,30 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/generics.0s` |
+| **Run** | `cargo run -- examples/generics.hy` |
 | **Output** | `7424.0427` |
 
 ---
 
-### `examples/generic_print.0s`
+### `examples/generic_print.hy`
 
 **Demonstrates:** Format `%v` via the `Show` trait — builtin instances for
 primitives, a user `impl Show<Point>`, and `format "%v"` parity with `print`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/generic_print.0s` |
+| **Run** | `cargo run -- examples/generic_print.hy` |
 | **Output** | `42hi1.5true(3,4)99` |
 
 ---
 
-### `examples/existential_show.0s`
+### `examples/existential_show.hy`
 
 **Demonstrates:** Bare-class existential `Show` in a parameter type. The call
 `print_any(42)` packs the concrete value with its `Show<int>` dictionary, and
 `show(x)` dispatches through that stored dictionary.
 
-```0s
+```coil
 fn print_any(Show x) {
     print "%s", show(x);
 }
@@ -880,12 +880,12 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/existential_show.0s` |
+| **Run** | `cargo run -- examples/existential_show.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/hkt_container.0s`
+### `examples/hkt_container.hy`
 
 **Demonstrates:** Unary higher-kinded traits (`Container<F: * -> *>`) with
 an `impl Container<Option>`, a polymorphic instance method `first<A>`, and a
@@ -893,12 +893,12 @@ generic caller `get<F: Container, A>(F<A>) -> A`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/hkt_container.0s` |
+| **Run** | `cargo run -- examples/hkt_container.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/hkt_bifunctor.0s`
+### `examples/hkt_bifunctor.hy`
 
 **Demonstrates:** Binary higher-kinded traits
 (`Bifunctor<F: * -> * -> *>`) with an `impl Bifunctor<Result>` and a
@@ -907,60 +907,60 @@ generic caller whose parameter has both an explicit kind and bound:
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/hkt_bifunctor.0s` |
+| **Run** | `cargo run -- examples/hkt_bifunctor.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/multiparam.0s`
+### `examples/multiparam.hy`
 
 **Demonstrates:** Multi-parameter trait `Convert<A, B>` with a `where`
 clause on a generic function (`fn apply_cast<A, B>(A x) -> B where Convert<A, B>`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/multiparam.0s` |
+| **Run** | `cargo run -- examples/multiparam.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/into.0s`
+### `examples/into.hy`
 
 **Demonstrates:** Prelude conversion trait `Into` —
 `impl Into<Fahrenheit> for Celsius` and `let f: Fahrenheit = c.into();`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/into.0s` |
+| **Run** | `cargo run -- examples/into.hy` |
 | **Output** | `32` |
 
 ---
 
-### `examples/trait_dict.0s`
+### `examples/trait_dict.hy`
 
 **Demonstrates:** User trait dictionaries, method sugar, and dictionary
 forwarding through a nested generic call.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/trait_dict.0s` |
+| **Run** | `cargo run -- examples/trait_dict.hy` |
 | **Output** | `4242` |
 
 ---
 
-### `examples/trait_default.0s`
+### `examples/trait_default.hy`
 
 **Demonstrates:** An omitted default method calling a sibling implementation
 through the same dictionary.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/trait_default.0s` |
+| **Run** | `cargo run -- examples/trait_default.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/superclass_ord.0s`
+### `examples/superclass_ord.hy`
 
 **Demonstrates:** Typeclass superclass / implied bounds —
 `trait Ordered<T: Equal>` stores `Equal` as a superclass; `fn cmp_eq<T: Ordered>`
@@ -969,12 +969,12 @@ is subclass methods then superclass methods.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/superclass_ord.0s` |
+| **Run** | `cargo run -- examples/superclass_ord.hy` |
 | **Output** | `truetruefalse` |
 
 ---
 
-### `examples/constraint_kind.0s`
+### `examples/constraint_kind.hy`
 
 **Demonstrates:** Constraint-kind parameters
 (`fn choose<c: * -> Constraint, T: c>(...)`). The body first selects
@@ -983,12 +983,12 @@ is subclass methods then superclass methods.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/constraint_kind.0s` |
+| **Run** | `cargo run -- examples/constraint_kind.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/assoc_type.0s`
+### `examples/assoc_type.hy`
 
 **Demonstrates:** Associated types — `type Elem;` in a trait,
 `type Elem = int;` in the impl, bare `Elem` as a method return type,
@@ -997,18 +997,18 @@ call that pins the projection to `int`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/assoc_type.0s` |
+| **Run** | `cargo run -- examples/assoc_type.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/gat_pointer.0s`
+### `examples/gat_pointer.hy`
 
 **Demonstrates:** Generic associated types — `type Ref<T>;` in a
 trait, `type Ref<T> = T;` in the impl, and an applied projection
 `P::Ref<A>` pinned by the selected `Pointer<Option>` instance.
 
-```0s
+```coil
 trait Pointer<P: * -> *> {
     type Ref<T>;
     fn deref<T>(P<T> ptr) -> Ref<T>;
@@ -1026,12 +1026,12 @@ fn get<P: * -> *, Pointer, A>(P<A> ptr) -> P::Ref<A> {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/gat_pointer.0s` |
+| **Run** | `cargo run -- examples/gat_pointer.hy` |
 | **Output** | `42` |
 
 ---
 
-### `examples/polyfn.0s`
+### `examples/polyfn.hy`
 
 **Demonstrates:** First-class generic functions, multi-instantiation,
 constrained apply-site dictionaries, rank-n `forall` parameters, and
@@ -1040,7 +1040,7 @@ captured dictionary evidence that survives returning a PolyFn
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/polyfn.0s` |
+| **Run** | `cargo run -- examples/polyfn.hy` |
 | **Output** | `424.0424242` |
 
 ---
@@ -1049,11 +1049,11 @@ captured dictionary evidence that survives returning a PolyFn
 
 Multi-file projects using `use` and `mod`. Support files live under `examples/src/`.
 
-### `examples/modules.0s`
+### `examples/modules.hy`
 
 **Demonstrates:** `use foo::sadge;` importing a function from another file; hex formatting.
 
-```0s
+```coil
 use foo::sadge;
 
 fn main() {
@@ -1064,34 +1064,34 @@ fn main() {
 
 | | |
 |---|---|
-| **Companion** | `examples/src/foo/sadge.0s` — defines `fn sadge()` printing `420` as hex |
+| **Companion** | `examples/src/foo/sadge.hy` — defines `fn sadge()` printing `420` as hex |
 | **Expected output** | `1a4` (newline) then `45` — i.e. `1a4\n45` |
 
-**Setup:** The module resolver looks for `src/foo/sadge.0s` relative to the project root (default manifest roots). The examples layout places files at `examples/src/foo/sadge.0s`, so for a working demo you need either:
+**Setup:** The module resolver looks for `src/foo/sadge.hy` relative to the project root (default manifest roots). The examples layout places files at `examples/src/foo/sadge.hy`, so for a working demo you need either:
 
-- A `zero.toml` at the repo root with `roots = ["./examples/src"]`, **and**
+- A `coil.toml` at the repo root with `roots = ["./examples/src"]`, **and**
 - Multi-file compilation (`compile_src_from_file`) — the stock `cargo run` path currently compiles one file in memory and does **not** resolve `use` across files.
 
 See [reference/modules.md](reference/modules.md) and [reference/project-config.md](reference/project-config.md) for full module workflow. Namespace integration tests live in `compiler/tests/namespace.rs`.
 
 ---
 
-### `examples/src/foo/sadge.0s`
+### `examples/src/foo/sadge.hy`
 
 **Demonstrates:** Module support file; namespace `foo::sadge`, function FQN `foo::sadge::sadge`.
 
 | | |
 |---|---|
-| **Run alone** | `cargo run -- examples/src/foo/sadge.0s` (if given its own `main` — this file only defines `sadge`, not `main`) |
-| **Role** | Imported by `modules.0s` |
+| **Run alone** | `cargo run -- examples/src/foo/sadge.hy` (if given its own `main` — this file only defines `sadge`, not `main`) |
+| **Role** | Imported by `modules.hy` |
 
 ---
 
-### `examples/src/foo.0s`
+### `examples/src/foo.hy`
 
-**Demonstrates:** Alternate / legacy module layout (single `foo.0s` with a top-level `sadge`).
+**Demonstrates:** Alternate / legacy module layout (single `foo.hy` with a top-level `sadge`).
 
-```0s
+```coil
 fn sadge() {
     print "%x\n", 420;
 }
@@ -1099,19 +1099,19 @@ fn sadge() {
 
 | | |
 |---|---|
-| **Note** | Used in namespace tests; not the file resolved by `use foo::sadge` (that resolves to `src/foo/sadge.0s`) |
+| **Note** | Used in namespace tests; not the file resolved by `use foo::sadge` (that resolves to `src/foo/sadge.hy`) |
 
 ---
 
 ## FFI (foreign function interface)
 
-Calling C from zero-script. Requires **libffi**.
+Calling C from coil. Requires **libffi**.
 
-### `examples/strlen.0s`
+### `examples/strlen.hy`
 
 **Demonstrates:** Compile-time `extern` block — no manual `dload`/`declare` in source. The compiler emits library load and symbol registration bytecode (unwraps `Result`, panics on failure).
 
-```0s
+```coil
 extern "c" {
     fn strlen(string s) -> int;
 }
@@ -1124,17 +1124,17 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/strlen.0s` |
+| **Run** | `cargo run -- examples/strlen.hy` |
 | **Output** | `5` |
 | **Requires** | Platform C library via `extern "c"` (`libc.so.6` / `libSystem` / `ucrtbase`, …) |
 
 ---
 
-### `examples/ffi_printf.0s`
+### `examples/ffi_printf.hy`
 
 **Demonstrates:** C-style varargs — bare `...` on an `extern` declaration (`printf`-style). Not language rest `T... xs`.
 
-```0s
+```coil
 extern "c" {
     fn printf(string fmt, ...) -> int;
 }
@@ -1146,17 +1146,17 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/ffi_printf.0s` |
+| **Run** | `cargo run -- examples/ffi_printf.hy` |
 | **Output** | `hello 42` |
 | **Requires** | Platform C library via `extern "c"` |
 
 ---
 
-### `examples/ffi_sum.0s`
+### `examples/ffi_sum.hy`
 
 **Demonstrates:** Userland FFI — `dload` / `declare` / `invoke` each return `Result<_, Error>`; unwrap with `match` (or `?`). Check `e.kind` for typed recovery.
 
-```0s
+```coil
 use ffi::*;
 use ffi::types::*;
 
@@ -1188,7 +1188,7 @@ fn main() {
 
 ### `examples/sum.c`
 
-**Demonstrates:** C companion source for `ffi_sum.0s`, `ffi_struct_ret.0s`, and `ffi_callback_ret.0s` (not a zero-script file).
+**Demonstrates:** C companion source for `ffi_sum.hy`, `ffi_struct_ret.hy`, and `ffi_callback_ret.hy` (not a coil file).
 
 ```c
 int sum(int a, int b) { return a + b; }
@@ -1203,29 +1203,29 @@ int sum(int a, int b) { return a + b; }
 
 ---
 
-### `examples/ffi_struct_ret.0s`
+### `examples/ffi_struct_ret.hy`
 
 **Demonstrates:** `extern struct` return from C unpacked into a record (`p.x` / `p.y`).
 
 | | |
 |---|---|
-| **Run** | Build the platform `libsum` artifact, then `cargo run -- examples/ffi_struct_ret.0s` |
+| **Run** | Build the platform `libsum` artifact, then `cargo run -- examples/ffi_struct_ret.hy` |
 | **Output** | `34` |
 
 ---
 
-### `examples/ffi_callback_ret.0s`
+### `examples/ffi_callback_ret.hy`
 
 **Demonstrates:** Opaque function-pointer return (`Ptr` from `ffi::types`); prints `1` if non-null.
 
 | | |
 |---|---|
-| **Run** | Build the platform `libsum` artifact, then `cargo run -- examples/ffi_callback_ret.0s` |
+| **Run** | Build the platform `libsum` artifact, then `cargo run -- examples/ffi_callback_ret.hy` |
 | **Output** | `1` |
 
 ---
 
-### `examples/ffi_callback.0s` / `examples/ffi_array.0s`
+### `examples/ffi_callback.hy` / `examples/ffi_array.hy`
 
 **Demonstrates:** Callback trampolines and pointer/array FFI shapes (see source). Require the platform `libsum` shared library / libffi.
 
@@ -1233,11 +1233,11 @@ int sum(int a, int b) { return a + b; }
 
 ## Classes
 
-### `examples/classes.0s`
+### `examples/classes.hy`
 
 **Demonstrates:** Positional ctor args, field read/write, and method calls (`self`).
 
-```0s
+```coil
 class Point {
     x: int,
     y: int,
@@ -1265,16 +1265,16 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/classes.0s` |
+| **Run** | `cargo run -- examples/classes.hy` |
 | **Output** | `7458` |
 
-### `examples/generic_class.0s`
+### `examples/generic_class.hy`
 
 **Demonstrates:** Generic class declaration (`class Cell<T>`), inherent
 `impl Cell<T>`, constructor type inference (`new Cell(42)` → `Cell<int>`),
 and a method that returns the type parameter.
 
-```0s
+```coil
 class Cell<T> {
     value: T
 }
@@ -1293,7 +1293,7 @@ fn main() {
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/generic_class.0s` |
+| **Run** | `cargo run -- examples/generic_class.hy` |
 | **Output** | `42` |
 
 ---
@@ -1302,146 +1302,146 @@ fn main() {
 
 Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/receive and `yield from`. See [Tutorial: Coroutines](tutorial/08-coroutines.md).
 
-### `examples/coro.0s`
+### `examples/coro.hy`
 
 **Demonstrates:** Basic suspend/resume with prints between yields.
 
 | | |
 |---|---|
-| **Run** | `rm -f out.c0s && cargo run -- examples/coro.0s` |
+| **Run** | `rm -f out.hyc && cargo run -- examples/coro.hy` |
 | **Output** | Suspended/resumed trace (see source) |
 
 ---
 
-### `examples/operators.0s`
+### `examples/operators.hy`
 
 **Demonstrates:** Compound assignment, prefix/postfix increment, array and dict mutation, power, logical/bitwise operators.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/operators.0s` |
+| **Run** | `cargo run -- examples/operators.hy` |
 | **Output** | `801125428falsetrue3` |
 
 ---
 
-### `examples/coro_gen.0s`
+### `examples/coro_gen.hy`
 
 **Demonstrates:** Generator-style counter (`yield 0`, `yield 1`, `yield 2`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/coro_gen.0s` |
+| **Run** | `cargo run -- examples/coro_gen.hy` |
 | **Output** | `012` |
 
 ---
 
-### `examples/coro_send.0s`
+### `examples/coro_send.hy`
 
 **Demonstrates:** Binding yield + `resume h with v` (ping-pong send).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/coro_send.0s` |
+| **Run** | `cargo run -- examples/coro_send.hy` |
 | **Output** | `hello` |
 
 ---
 
-### `examples/coro_yield_from.0s`
+### `examples/coro_yield_from.hy`
 
 **Demonstrates:** `yield from` delegation.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/coro_yield_from.0s` |
+| **Run** | `cargo run -- examples/coro_yield_from.hy` |
 | **Output** | `012` |
 
 ---
 
-### `examples/coro_interleave.0s`
+### `examples/coro_interleave.hy`
 
 **Demonstrates:** Two independent handles from the same parameterized `async fn`, resumed in arbitrary order, with `resume` used inline as a `print` argument.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/coro_interleave.0s` |
+| **Run** | `cargo run -- examples/coro_interleave.hy` |
 | **Output** | `10,100,101,11,12,102` |
 
 ---
 
-### `examples/coro_done.0s`
+### `examples/coro_done.hy`
 
 **Demonstrates:** `done(h)` builtin — `false` while suspended, `true` after completion.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/coro_done.0s` |
+| **Run** | `cargo run -- examples/coro_done.hy` |
 | **Output** | `falsefalsetrue` |
 
 ---
 
-### `examples/for_in_coro.0s`
+### `examples/for_in_coro.hy`
 
 **Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/for_in_coro.0s` |
+| **Run** | `cargo run -- examples/for_in_coro.hy` |
 | **Output** | `01210` |
 
 ---
 
-### `examples/range.0s`
+### `examples/range.hy`
 
 **Demonstrates:** lazy `Range<T: Ord>` (`0..n`, `0..=n`, float bounds),
 first-class range values, empty decreasing ranges.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/range.0s` |
+| **Run** | `cargo run -- examples/range.hy` |
 | **Output** | `01234012356` |
 
 ---
 
-### `examples/for_in_array.0s`
+### `examples/for_in_array.hy`
 
 **Demonstrates:** `for x in` over an array (`Item` = element type).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/for_in_array.0s` |
+| **Run** | `cargo run -- examples/for_in_array.hy` |
 | **Output** | `123` |
 
 ---
 
-### `examples/for_in_tuple.0s`
+### `examples/for_in_tuple.hy`
 
 **Demonstrates:** homogeneous tuple for-in (`Item` = element type).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/for_in_tuple.0s` |
+| **Run** | `cargo run -- examples/for_in_tuple.hy` |
 | **Output** | `123` |
 
 ---
 
-### `examples/for_in_dict.0s`
+### `examples/for_in_dict.hy`
 
 **Demonstrates:** homogeneous dict for-in as `(string, V)` pairs (`p[1]` prints values).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/for_in_dict.0s` |
+| **Run** | `cargo run -- examples/for_in_dict.hy` |
 | **Output** | `12` |
 
 ---
 
-### `examples/for_in_custom.0s`
+### `examples/for_in_custom.hy`
 
 **Demonstrates:** user `impl IntoIterator` + `impl Iterator` on a class.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/for_in_custom.0s` |
+| **Run** | `cargo run -- examples/for_in_custom.hy` |
 | **Output** | `012` |
 
 ---
@@ -1449,7 +1449,7 @@ first-class range values, empty decreasing ranges.
 ## Showcase projects
 
 Larger multi-file apps live under [`examples/projects/`](../examples/projects/README.md).
-Each project has its own `zero.toml`, co-located `tests/`, and `NOTES.md`.
+Each project has its own `coil.toml`, co-located `tests/`, and `NOTES.md`.
 
 | Project | Focus | How to run |
 |---------|--------|------------|
@@ -1488,7 +1488,7 @@ CI / non-interactive (always under `timeout`; canned input in `transcript.txt`):
 ./examples/projects/run-tests.sh
 ```
 
-Or `cd` into a project and run `zero-script test` (harness is CWD-`./tests` only).
+Or `cd` into a project and run `coil test` (harness is CWD-`./tests` only).
 See [`examples/projects/README.md`](../examples/projects/README.md).
 
 ---
@@ -1497,80 +1497,80 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 
 | File | Category | Output (if known) |
 |------|----------|-------------------|
-| `print_literal.0s` | Basics | `hello` |
-| `format_literal.0s` | Basics | `42` |
-| `string_fmt.0s` | Basics | `hello world42-x` |
-| `show_tuple.0s` | Basics | `(1, 2){ a: 3, b: 4 }` |
-| `let_test.0s` | Basics | `51020` |
-| `named_args.0s` | Basics | `Ada36Grace40` |
-| `variadic.0s` | Basics | `60Hi!?` |
-| `const.0s` | Basics | `42hi` |
-| `for_break.0s` | Basics | `18` |
-| `fizbuz.0s` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
-| `fib.0s` | Basics | `55` |
-| `fib_bench.0s` | Perf | `2178309` |
-| `bench.0s` | Basics | `12\n` |
-| `call_test.0s` | Basics | `done` |
-| `gc.0s` | Basics | `Hello` |
-| `option.0s` | Enums | `42` |
-| `result.0s` | Enums | `420-1` |
-| `tree.0s` | Enums | `6` |
-| `record.0s` | Enums / records | `169512` |
-| `mixed.0s` | Enums | `025122` |
-| `nested_records.0s` | Enums | `99` |
-| `chained.0s` | Enums / fields | `427` |
-| `io_bytes.0s` | IO | `25532` |
-| `io_file.0s` | IO | `2` |
-| `io_eof.0s` | IO | `eof` |
-| `io_text.0s` | IO | `hello2` |
-| `io_udp.0s` | IO | `2` |
-| `io_nested_host.0s` | IO | `3` |
-| `io_nested_write.0s` | IO | `2` |
-| `array_grow.0s` | Collections | `414` |
-| `static_singleton.0s` | Statics | `121` |
-| `readonly_seal.0s` | Readonly | `322` |
-| `dict.0s` | Collections | `4210042` |
-| `aliases.0s` | Types | `347` |
-| `generic_alias.0s` | Types | `7` |
-| `generic_enum.0s` | Enums / types | `7` |
-| `generics.0s` | Types | `7424.0427` |
-| `generic_print.0s` | Types | `42hi1.5true(3,4)99` |
-| `existential_show.0s` | Types | `42` |
-| `hkt_container.0s` | Types | `42` |
-| `hkt_bifunctor.0s` | Types | `42` |
-| `multiparam.0s` | Types | `42` |
-| `into.0s` | Types | `32` |
-| `trait_dict.0s` | Types | `4242` |
-| `trait_default.0s` | Types | `42` |
-| `superclass_ord.0s` | Types | `truetruefalse` |
-| `constraint_kind.0s` | Types | `42` |
-| `assoc_type.0s` | Types | `42` |
-| `gat_pointer.0s` | Types | `42` |
-| `polyfn.0s` | Types | `424.0424242` |
-| `operators.0s` | Operators | `801125428falsetrue3` |
-| `modules.0s` | Modules | `1a4\n45` |
-| `src/foo/sadge.0s` | Modules | (support file) |
-| `src/foo.0s` | Modules | (support file) |
-| `strlen.0s` | FFI | `5` |
-| `ffi_printf.0s` | FFI | `hello 42` |
-| `ffi_sum.0s` | FFI | `42` |
-| `ffi_struct_ret.0s` | FFI | `34` |
-| `ffi_callback_ret.0s` | FFI | `1` |
-| `sum.c` | FFI | (C source, not `.0s`) |
-| `classes.0s` | Classes | `7458` |
-| `generic_class.0s` | Classes | `42` |
-| `coro.0s` | Coroutines | (see source) |
-| `coro_gen.0s` | Coroutines | `012` |
-| `coro_send.0s` | Coroutines | `hello` |
-| `coro_yield_from.0s` | Coroutines | `012` |
-| `coro_interleave.0s` | Coroutines | `10,100,101,11,12,102` |
-| `coro_done.0s` | Coroutines | `falsefalsetrue` |
-| `for_in_coro.0s` | Coroutines | `01210` |
-| `for_in_array.0s` | Collections | `123` |
-| `for_in_tuple.0s` | Collections | `123` |
-| `for_in_dict.0s` | Collections | `12` |
-| `for_in_custom.0s` | Collections / traits | `012` |
-| `range.0s` | Ranges | `012340123561.02.03.0` |
+| `print_literal.hy` | Basics | `hello` |
+| `format_literal.hy` | Basics | `42` |
+| `string_fmt.hy` | Basics | `hello world42-x` |
+| `show_tuple.hy` | Basics | `(1, 2){ a: 3, b: 4 }` |
+| `let_test.hy` | Basics | `51020` |
+| `named_args.hy` | Basics | `Ada36Grace40` |
+| `variadic.hy` | Basics | `60Hi!?` |
+| `const.hy` | Basics | `42hi` |
+| `for_break.hy` | Basics | `18` |
+| `fizbuz.hy` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
+| `fib.hy` | Basics | `55` |
+| `fib_bench.hy` | Perf | `2178309` |
+| `bench.hy` | Basics | `12\n` |
+| `call_test.hy` | Basics | `done` |
+| `gc.hy` | Basics | `Hello` |
+| `option.hy` | Enums | `42` |
+| `result.hy` | Enums | `420-1` |
+| `tree.hy` | Enums | `6` |
+| `record.hy` | Enums / records | `169512` |
+| `mixed.hy` | Enums | `025122` |
+| `nested_records.hy` | Enums | `99` |
+| `chained.hy` | Enums / fields | `427` |
+| `io_bytes.hy` | IO | `25532` |
+| `io_file.hy` | IO | `2` |
+| `io_eof.hy` | IO | `eof` |
+| `io_text.hy` | IO | `hello2` |
+| `io_udp.hy` | IO | `2` |
+| `io_nested_host.hy` | IO | `3` |
+| `io_nested_write.hy` | IO | `2` |
+| `array_grow.hy` | Collections | `414` |
+| `static_singleton.hy` | Statics | `121` |
+| `readonly_seal.hy` | Readonly | `322` |
+| `dict.hy` | Collections | `4210042` |
+| `aliases.hy` | Types | `347` |
+| `generic_alias.hy` | Types | `7` |
+| `generic_enum.hy` | Enums / types | `7` |
+| `generics.hy` | Types | `7424.0427` |
+| `generic_print.hy` | Types | `42hi1.5true(3,4)99` |
+| `existential_show.hy` | Types | `42` |
+| `hkt_container.hy` | Types | `42` |
+| `hkt_bifunctor.hy` | Types | `42` |
+| `multiparam.hy` | Types | `42` |
+| `into.hy` | Types | `32` |
+| `trait_dict.hy` | Types | `4242` |
+| `trait_default.hy` | Types | `42` |
+| `superclass_ord.hy` | Types | `truetruefalse` |
+| `constraint_kind.hy` | Types | `42` |
+| `assoc_type.hy` | Types | `42` |
+| `gat_pointer.hy` | Types | `42` |
+| `polyfn.hy` | Types | `424.0424242` |
+| `operators.hy` | Operators | `801125428falsetrue3` |
+| `modules.hy` | Modules | `1a4\n45` |
+| `src/foo/sadge.hy` | Modules | (support file) |
+| `src/foo.hy` | Modules | (support file) |
+| `strlen.hy` | FFI | `5` |
+| `ffi_printf.hy` | FFI | `hello 42` |
+| `ffi_sum.hy` | FFI | `42` |
+| `ffi_struct_ret.hy` | FFI | `34` |
+| `ffi_callback_ret.hy` | FFI | `1` |
+| `sum.c` | FFI | (C source, not `.hy`) |
+| `classes.hy` | Classes | `7458` |
+| `generic_class.hy` | Classes | `42` |
+| `coro.hy` | Coroutines | (see source) |
+| `coro_gen.hy` | Coroutines | `012` |
+| `coro_send.hy` | Coroutines | `hello` |
+| `coro_yield_from.hy` | Coroutines | `012` |
+| `coro_interleave.hy` | Coroutines | `10,100,101,11,12,102` |
+| `coro_done.hy` | Coroutines | `falsefalsetrue` |
+| `for_in_coro.hy` | Coroutines | `01210` |
+| `for_in_array.hy` | Collections | `123` |
+| `for_in_tuple.hy` | Collections | `123` |
+| `for_in_dict.hy` | Collections | `12` |
+| `for_in_custom.hy` | Collections / traits | `012` |
+| `range.hy` | Ranges | `012340123561.02.03.0` |
 
 ## Running tests that mirror examples
 
@@ -1586,39 +1586,39 @@ This is useful to verify expected output without invoking the full CLI archive p
 
 ## Arity overloads, fn values, and lambdas
 
-### `examples/overload.0s`
+### `examples/overload.hy`
 
 **Demonstrates:** Compile-time arity overloads — same name, different arities.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/overload.0s` |
+| **Run** | `cargo run -- examples/overload.hy` |
 | **Output** | `15` |
 
-### `examples/fn_value.0s`
+### `examples/fn_value.hy`
 
 **Demonstrates:** First-class monomorphic functions (`let f = add`) and positional partial application (`let g = add(1)`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/fn_value.0s` |
+| **Run** | `cargo run -- examples/fn_value.hy` |
 | **Output** | `423` |
 
-### `examples/lambda.0s`
+### `examples/lambda.hy`
 
 **Demonstrates:** Explicit-capture lambdas — `fn (int x) use (y) => x + y`.
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/lambda.0s` |
+| **Run** | `cargo run -- examples/lambda.hy` |
 | **Output** | `42` |
 
-### `examples/method_overload.0s`
+### `examples/method_overload.hy`
 
 **Demonstrates:** `impl` method arity overloads (`bump()` vs `bump(int)`).
 
 | | |
 |---|---|
-| **Run** | `cargo run -- examples/method_overload.0s` |
+| **Run** | `cargo run -- examples/method_overload.hy` |
 | **Output** | `1116` |
 

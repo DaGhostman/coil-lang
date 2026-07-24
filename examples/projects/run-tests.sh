@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run co-located `zero-script test` suites for each showcase project.
+# Run co-located `coil test` suites for each showcase project.
 # Harness only scans ./tests relative to CWD — hence the per-project cd.
 set -euo pipefail
 
@@ -7,19 +7,19 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 
-BIN="${BIN:-$CARGO_TARGET_DIR/release/zero-script}"
+BIN="${BIN:-$CARGO_TARGET_DIR/release/coil}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 PROJECTS="$ROOT/examples/projects"
 
 if [[ ! -x "$BIN" ]]; then
-  echo "Building release zero-script…"
+  echo "Building release coil…"
   cargo build --release --manifest-path "$ROOT/Cargo.toml"
 fi
 
 failed=0
 for proj in 01-todo 02-adventure 03-echo; do
   echo "=== $proj tests ==="
-  rm -f "$PROJECTS/$proj/out.c0s" "$ROOT/out.c0s"
+  rm -f "$PROJECTS/$proj/out.hyc" "$ROOT/out.hyc"
   if (
     cd "$PROJECTS/$proj"
     timeout "${TIMEOUT_SECS}s" "$BIN" test

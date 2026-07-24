@@ -1,23 +1,23 @@
-# Project configuration (`zero.toml`)
+# Project configuration (`coil.toml`)
 
-The **`zero.toml`** file at a project's root tells the compiler where to find module files and optionally which file is the entry point.
+The **`coil.toml`** file at a project's root tells the compiler where to find module files and optionally which file is the entry point.
 
 ---
 
 ## File location
 
-Place `zero.toml` in the **project root** — the directory the compiler treats as the working directory when resolving relative paths.
+Place `coil.toml` in the **project root** — the directory the compiler treats as the working directory when resolving relative paths.
 
 ```
 my-project/
-├── zero.toml
+├── coil.toml
 └── src/
-    ├── main.0s
+    ├── main.hy
     └── foo/
-        └── bar.0s
+        └── bar.hy
 ```
 
-If `zero.toml` is absent, the compiler uses built-in defaults (see [Default behavior](#default-behavior-without-zerotoml)).
+If `coil.toml` is absent, the compiler uses built-in defaults (see [Default behavior](#default-behavior-without-coiltoml)).
 
 ---
 
@@ -51,7 +51,7 @@ Example:
 roots = ["./src", "./vendor", "./builtins"]
 ```
 
-Each path in `roots` is a **search root**. When resolving `use foo::bar;`, the compiler looks for `<root>/foo/bar.0s` under each root **in order**. The first existing file wins.
+Each path in `roots` is a **search root**. When resolving `use foo::bar;`, the compiler looks for `<root>/foo/bar.hy` under each root **in order**. The first existing file wins.
 
 If the `[module]` section is omitted entirely, roots default to `["src"]`.
 
@@ -67,7 +67,7 @@ Example:
 
 ```toml
 [entry]
-file = "./src/main.0s"
+file = "./src/main.hy"
 ```
 
 When set, the compiler uses this file as the program entry point (jumps to `main` in that file).
@@ -75,29 +75,29 @@ When set, the compiler uses this file as the program entry point (jumps to `main
 When omitted, the entry file is whatever you pass on the command line:
 
 ```bash
-cargo run -- examples/modules.0s
+cargo run -- examples/modules.hy
 ```
 
 ---
 
 ## Complete example
 
-From `zero.toml.example`:
+From `coil.toml.example`:
 
 ```toml
-# zero-script project manifest
+# coil project manifest
 
 [module]
 # Search roots for `use` resolution. Each path is relative to
-# the directory containing this zero.toml file. The compiler
+# the directory containing this coil.toml file. The compiler
 # searches the roots in order; the first file that exists wins.
 roots = ["./src", "./vendor", "./builtins"]
 
-# Default when no zero.toml exists: roots = ["src"]
+# Default when no coil.toml exists: roots = ["src"]
 
 [entry]
 # Optional entry point. If omitted, use the file from the CLI.
-# file = "./src/main.0s"
+# file = "./src/main.hy"
 ```
 
 ---
@@ -116,19 +116,19 @@ Given a `use a::b::c;` statement and roots `["./src", "./vendor", "./builtins"]`
 For root `./src`:
 
 ```
-./src/a/b/c.0s   → exists? use this file
+./src/a/b/c.hy   → exists? use this file
 ```
 
 If not found, try `./vendor`:
 
 ```
-./vendor/a/b/c.0s
+./vendor/a/b/c.hy
 ```
 
 Then `./builtins`:
 
 ```
-./builtins/a/b/c.0s
+./builtins/a/b/c.hy
 ```
 
 ### Step 3 — First match wins
@@ -137,10 +137,10 @@ Stop at the first path that exists on disk. That file is loaded and compiled.
 
 ### Step 4 — Compute namespace
 
-Strip the matching root prefix, remove `.0s`, replace `/` with `::`:
+Strip the matching root prefix, remove `.hy`, replace `/` with `::`:
 
 ```
-./src/a/b/c.0s  →  namespace "a::b::c"
+./src/a/b/c.hy  →  namespace "a::b::c"
 ```
 
 ### Glob imports
@@ -149,14 +149,14 @@ For `use foo::*;`:
 
 1. The module stem is the last non-`*` segment: `"foo"`.
 2. Directory prefix is all preceding segments (empty for `use foo::*`).
-3. Resolve `<root>/foo.0s` (not a subdirectory).
-4. Namespace of `foo.0s` is `foo`.
+3. Resolve `<root>/foo.hy` (not a subdirectory).
+4. Namespace of `foo.hy` is `foo`.
 
 ### `mod` declarations
 
 For `mod foo;`:
 
-1. Search each root for `<root>/foo.0s`.
+1. Search each root for `<root>/foo.hy`.
 2. First existing file wins.
 3. Namespace is `foo`.
 
@@ -170,22 +170,22 @@ For `mod foo;`:
 
 ---
 
-## Default behavior without `zero.toml`
+## Default behavior without `coil.toml` {#default-behavior-without-coiltoml}
 
-When no `zero.toml` exists in the project root (or the file cannot be read):
+When no `coil.toml` exists in the project root (or the file cannot be read):
 
 | Setting | Default |
 |---------|---------|
 | `[module].roots` | `["src"]` |
 | `[entry].file` | None — use CLI argument |
 
-This means a minimal project with only `src/main.0s` and `src/foo/bar.0s` works without any manifest, as long as you run the compiler from the project root:
+This means a minimal project with only `src/main.hy` and `src/foo/bar.hy` works without any manifest, as long as you run the compiler from the project root:
 
 ```bash
-cargo run -- src/main.0s
+cargo run -- src/main.hy
 ```
 
-The namespace test suite confirms that `use foo::greet;` resolves to `src/foo/greet.0s` with no manifest present.
+The namespace test suite confirms that `use foo::greet;` resolves to `src/foo/greet.hy` with no manifest present.
 
 ---
 
@@ -198,15 +198,15 @@ Use multiple roots to vendored or built-in libraries:
 roots = ["./src", "./vendor", "./builtins"]
 ```
 
-Resolution order means **your source tree takes precedence**. If both `src/foo/greet.0s` and `vendor/foo/greet.0s` exist, the `src/` copy is used.
+Resolution order means **your source tree takes precedence**. If both `src/foo/greet.hy` and `vendor/foo/greet.hy` exist, the `src/` copy is used.
 
 Typical layout:
 
 ```
 project/
-├── zero.toml
+├── coil.toml
 ├── src/           # application code (first priority)
-├── vendor/        # third-party zero-script modules
+├── vendor/        # third-party coil modules
 └── builtins/      # compiler-shipped helpers (e.g. FFI wrappers)
 ```
 
@@ -224,11 +224,11 @@ strict   = true           # reject undefined names at typecheck (not yet impleme
 
 These are recognized in planning documents but **ignored or rejected** by the current parser. Do not rely on them.
 
-Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual modules owned by the compiler — they are **not** configured via `zero.toml` today. Every file always gets the implicit prelude; FFI still requires an explicit `use`.
+Compiler builtins (`prelude`, `prelude::ops`, `ffi`, `ffi::types`) are virtual modules owned by the compiler — they are **not** configured via `coil.toml` today. Every file always gets the implicit prelude; FFI still requires an explicit `use`.
 
 ---
 
 ## Related documentation
 
 - [Modules reference](modules.md) — `use` / `mod` syntax, FQN rules, glob semantics
-- [Tutorial: Modules](../tutorial/06-modules.md) — walkthrough with `examples/modules.0s`
+- [Tutorial: Modules](../tutorial/06-modules.md) — walkthrough with `examples/modules.hy`

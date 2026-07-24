@@ -1,4 +1,4 @@
-//! Shared types for the zero-script compiler and VM.
+//! Shared types for the coil compiler and VM.
 
 mod archive;
 mod package;

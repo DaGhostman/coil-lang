@@ -1,6 +1,6 @@
 # 07 — Foreign Function Interface (FFI)
 
-zero-script can call code outside the VM in two ways:
+coil can call code outside the VM in two ways:
 
 1. **Compile-time `extern` blocks** — declare C functions in source; the compiler emits `dload`, `declare`, and `invoke` bytecode for you.
 2. **Runtime `dload` / `declare` / `invoke`** — load a shared library and call functions entirely from script, with no recompile.
@@ -23,20 +23,20 @@ Build the workspace, then run FFI examples:
 
 ```bash
 cargo build --workspace
-cargo run -- examples/strlen.0s
+cargo run -- examples/strlen.hy
 ```
 
 ---
 
 ## Path 1: Compile-time `extern` blocks
 
-An `extern` block names a shared library and lists function signatures. Calls to those functions look like ordinary zero-script calls.
+An `extern` block names a shared library and lists function signatures. Calls to those functions look like ordinary coil calls.
 
 ### Example: `strlen` from libc
 
-From `examples/strlen.0s`:
+From `examples/strlen.hy`:
 
-```0s
+```coil
 extern "c" {
     fn strlen(string s) -> int;
 }
@@ -55,7 +55,7 @@ fn main() {
 
 A single libc function can be declared without an `extern` block:
 
-```0s
+```coil
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
 
@@ -65,7 +65,7 @@ fn main() {
 }
 ```
 
-Optional `name = "symbol"` overrides the C symbol when it differs from the zero-script identifier; optional `variadic = true` marks C varargs. See `examples/attr_ffi.0s`.
+Optional `name = "symbol"` overrides the C symbol when it differs from the coil identifier; optional `variadic = true` marks C varargs. See `examples/attr_ffi.hy`.
 
 ---
 
@@ -73,9 +73,9 @@ Optional `name = "symbol"` overrides the C symbol when it differs from the zero-
 
 Bare trailing `...` on an extern declaration is C-style varargs (not language rest `T... xs`). The CIF is rebuilt per call; the variadic tail uses default argument promotions.
 
-From `examples/ffi_printf.0s`:
+From `examples/ffi_printf.hy`:
 
-```0s
+```coil
 extern "c" {
     fn printf(string fmt, ...) -> int;
 }
@@ -88,7 +88,7 @@ fn main() {
 
 Userland mirror — optional 5th `bool` on `declare`:
 
-```0s
+```coil
 use ffi::*;
 use ffi::types::*;
 
@@ -136,7 +136,7 @@ In runtime `declare`, import tag constructors from the virtual `ffi::types` modu
 | `void` / `Void` | Return-only |
 | `bool`, `int8`…`uint64`, `ptr` | Sized integers, bool, raw pointer |
 | `[int]` / `(int, float)` | Lowered to `Ptr` (array/tuple buffer) |
-| `Callback` | C function pointer → zero-script function |
+| `Callback` | C function pointer → coil function |
 | `extern struct Point { x: int32, y: int32 };` | Pass-by-value C struct |
 
 Qualified paths like `ffi::types::Int` also work without a glob import. Functions with no `-> ret` in `extern` blocks default to **`void`**, not `int`.
@@ -149,7 +149,7 @@ Use this when you want to load libraries dynamically, pick symbols at runtime, o
 
 These names are exports of the virtual `ffi` module — **import them** before use:
 
-```0s
+```coil
 use ffi::*;
 use ffi::types::*;
 ```
@@ -175,9 +175,9 @@ cc -dynamiclib -o examples/libsum.dylib examples/sum.c
 clang -shared -o examples/sum.dll examples/sum.c
 ```
 
-**zero-script** (`examples/ffi_sum.0s`):
+**coil** (`examples/ffi_sum.hy`):
 
-```0s
+```coil
 use ffi::*;
 use ffi::types::*;
 
@@ -198,7 +198,7 @@ fn main() {
 }
 ```
 
-`dload("sum")` resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` and `[ffi] search_paths` in `zero.toml`. Tag constructors (`Int`, `Ptr`, …) come from `ffi::types` — you do not declare them in source.
+`dload("sum")` resolves to `libsum.so` / `libsum.dylib` / `sum.dll` via `platform_lib_names` and `[ffi] search_paths` in `coil.toml`. Tag constructors (`Int`, `Ptr`, …) come from `ffi::types` — you do not declare them in source.
 
 **Expected output:** `42`
 
@@ -220,7 +220,7 @@ fn main() {
 
 `ErrorKind` variants: `LibraryNotFound`, `SymbolNotFound`, `ArityMismatch`, `Libffi`, `InvalidSignature`, `InvalidHandle`, `Unsupported`, `Other`.
 
-```0s
+```coil
 match dload("missing") {
     Result::Ok(h) => h,
     Result::Err(e) => match e.kind {
@@ -235,7 +235,7 @@ match dload("missing") {
 
 Argument types and call arguments are **single tuple expressions**, not flat comma lists.
 
-```0s
+```coil
 // Correct
 declare(lib, "sum", (Int, Int), Int);
 invoke(lib, id, (40, 2));
@@ -300,7 +300,7 @@ The `extern` block string and the `dload` path use the same resolver (`base_dir`
 ### C function guidelines
 
 - Export plain C functions (`int sum(int a, int b)`), not C++ mangled names, unless you `extern "C"`.
-- Match zero-script FFI types to C types the libffi layer expects (`int` → 64-bit integer in the ABI mapping).
+- Match coil FFI types to C types the libffi layer expects (`int` → 64-bit integer in the ABI mapping).
 - Keep symbols unique within the loaded library — lookup is by name via `dlsym`.
 
 ---
@@ -311,12 +311,12 @@ Strings cross the FFI boundary as **NUL-terminated C strings**:
 
 | Direction | Behavior |
 |-----------|----------|
-| **zero-script → C** | Heap `ObjString` is passed as `const char *` pointing at UTF-8 bytes (with NUL terminator managed by the VM). |
-| **C → zero-script** | Return value is read as `char *`, **copied immediately** into a new heap `ObjString`, then returned to script. The VM does not take ownership of the C pointer. |
+| **coil → C** | Heap `ObjString` is passed as `const char *` pointing at UTF-8 bytes (with NUL terminator managed by the VM). |
+| **C → coil** | Return value is read as `char *`, **copied immediately** into a new heap `ObjString`, then returned to script. The VM does not take ownership of the C pointer. |
 
 Implications:
 
-- C functions must not retain pointers to zero-script string buffers after the call returns unless you copy them in C.
+- C functions must not retain pointers to coil string buffers after the call returns unless you copy them in C.
 - C functions returning `char *` should return memory valid for the duration of the copy (static buffers, heap you still own, etc.). Do not return stack pointers.
 - A null C string pointer becomes an empty string value.
 
@@ -327,7 +327,7 @@ Implications:
 All dynamic calls go through **libffi**:
 
 - `DeclareFFI` prepares a libffi call interface (`ffi_cif`) at declare time.
-- `FfiInvoke` marshals zero-script values into libffi arguments and invokes the function pointer.
+- `FfiInvoke` marshals coil values into libffi arguments and invokes the function pointer.
 
 If libffi rejects a signature combination, `declare` returns `Result::Err`. Build failures mentioning `libffi` mean the development headers are missing — install the platform package from [Prerequisites](#prerequisites).
 
@@ -374,8 +374,8 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 | Failed `dload` | `Result::Err(string)` — match or `?`; never `-1` |
 | Failed `declare` | `Result::Err` (missing symbol, libffi error) |
 | `extern` failure | Compiler unwraps Results and panics with a clear message |
-| No automatic `out.c0s` invalidation for new `.so` | Rebuild C libraries separately; bytecode does not embed shared-library contents |
-| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **24**); stale `.c0s` files are rejected after compiler upgrades |
+| No automatic `out.hyc` invalidation for new `.so` | Rebuild C libraries separately; bytecode does not embed shared-library contents |
+| Archive version | FFI opcode / tag layout is part of `ARCHIVE_VERSION` (currently **24**); stale `.hyc` files are rejected after compiler upgrades |
 
 ---
 
@@ -391,8 +391,8 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 ## Exercises
 
-1. Run `examples/strlen.0s` and confirm output `5`. Change the string and predict the new length.
-2. Build the platform `libsum` artifact from `examples/sum.c` and run `examples/ffi_sum.0s`.
+1. Run `examples/strlen.hy` and confirm output `5`. Change the string and predict the new length.
+2. Build the platform `libsum` artifact from `examples/sum.c` and run `examples/ffi_sum.hy`.
 3. Add a C function `int triple(int x) { return x * 3; }`, export it from the same library, and call it via `declare`/`invoke` (unwrap the `Result`s).
 4. Try an incorrect signature (e.g. declare `sum` with one `int` argument) and observe `Result::Err`.
 
@@ -402,4 +402,4 @@ This produces `HostInvoke` bytecode from `Compiler::register()`. See [Built-ins 
 
 - [Built-ins reference](../reference/built-ins.md) — full `print` / FFI builtin details
 - [Types reference](../reference/types.md) — what can and cannot cross the FFI boundary
-- [Getting Started](../getting-started.md) — build and cache (`out.c0s`) workflow
+- [Getting Started](../getting-started.md) — build and cache (`out.hyc`) workflow

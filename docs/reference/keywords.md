@@ -1,6 +1,6 @@
 # Keywords reference
 
-All reserved words in the zero-script parser. Keywords cannot be used as identifiers.
+All reserved words in the coil parser. Keywords cannot be used as identifiers.
 
 ---
 

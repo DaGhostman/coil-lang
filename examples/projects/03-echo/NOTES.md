@@ -3,8 +3,8 @@
 ## What it shows
 
 Single-process TCP echo: `io::net::tcp` listen/connect/accept_wait, length-prefixed
-framing (`protocol.0s`), pure server/client helpers, and a coroutine that
-supplies payload bytes. Stream IO stays in `main.0s`.
+framing (`protocol.hy`), pure server/client helpers, and a coroutine that
+supplies payload bytes. Stream IO stays in `main.hy`.
 
 ## Run
 
@@ -19,24 +19,24 @@ Always under `timeout` (the script wraps it).
 
 ```bash
 ./examples/projects/run-tests.sh
-# or: cd examples/projects/03-echo && …/zero-script test
+# or: cd examples/projects/03-echo && …/coil test
 ```
 
 ## Layout
 
 | File | Role |
 |------|------|
-| `src/protocol.0s` | `encode_frame` / `frame_len` / `payload_eq` (sibling calls) |
-| `src/server.0s` | Pure echo policy (`echo_reply`) |
-| `src/client.0s` | Pure request body + fixed port |
-| `src/main.0s` | listen → connect → accept → exchange (all Stream IO) |
+| `src/protocol.hy` | `encode_frame` / `frame_len` / `payload_eq` (sibling calls) |
+| `src/server.hy` | Pure echo policy (`echo_reply`) |
+| `src/client.hy` | Pure request body + fixed port |
+| `src/main.hy` | listen → connect → accept → exchange (all Stream IO) |
 
 ## Ergonomics / gaps noticed
 
 1. **IO HostInvoke from a dependency module is broken** — TCP helpers that
    call `listen`/`write_all`/… must live in the entry file.
 2. **`use sibling::*` inside a non-entry module** may not resolve free-fn
-   calls (`payload_eq` from `server.0s` failed) — keep dep modules self-contained
+   calls (`payload_eq` from `server.hy` failed) — keep dep modules self-contained
    or call shared helpers only from the entry.
 3. TCP has **no `local_port`** — fixed port `41235`.
 4. Preferred order: `listen` → `connect` → `accept_wait`.

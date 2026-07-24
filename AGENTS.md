@@ -1,9 +1,9 @@
-# zero-script — AGENTS
+# coil — AGENTS
 
 ## Learned User Preferences
 
 - Run tests with a 64MB memory limit to catch leaks; exceeding it likely indicates a memory leak.
-- Use `poop` for CPU performance benchmarks: `cargo build --release && poop -d 6000 "./target/release/zero-script examples/fib_bench.0s" && rm out.c0s`.
+- Use `poop` for CPU performance benchmarks: `cargo build --release && poop -d 6000 "./target/release/coil examples/fib_bench.hy" && rm out.hyc`.
 - Use parallel sub-agents scoped to disjoint files or modules for large tasks (docs, comment cleanup, exploration).
 - Draft implementation plans before large language-feature work; do not edit attached plan files during implementation.
 - New language features require full HM typechecker integration and updated user-facing docs in `docs/`.
@@ -14,19 +14,19 @@
 
 ## Learned Workspace Facts
 
-- zero-script is a statically typed language with HM inference, compiled to stack bytecode and run on a custom VM; sources use `.0s`, build with `cargo build --workspace`, run with `cargo run -- examples/foo.0s`.
+- coil is a statically typed language with HM inference, compiled to stack bytecode and run on a custom VM; sources use `.hy`, build with `cargo build --workspace`, run with `cargo run -- examples/foo.hy`.
 - User-facing documentation lives in `docs/` (tutorial chapters, reference pages, examples catalog).
 - Single-pass stack codegen in `compiler/src/lib.rs` is the only compilation path; register-VM migration was removed.
 - Coroutines (Phase 1–2): `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` via `MakeCoro`/`ResumeCoro`/`YieldCoro`/`YieldFromCoro`; `coroutine<Y, S>` types; resume-after-done returns `Value::default()`.
 - Compiler builtins live in virtual modules: `prelude` / `prelude::ops` (auto-imported every file) and `ffi` / `ffi::types` / `io` (explicit `use` required). `dload`/`declare`/`invoke` are ordinary identifiers via `use ffi::*`; tags are `ffi::types::{Int,Ptr,…}` (no global `FFIType` name). They return `prelude::Result` (`dload`/`declare` → `Result<int, Error>`; `invoke` → `Result<T, Error>`). `ffi::Error` has `kind: ErrorKind` + `message: string`; match `e.kind` for recovery.
 - Virtual `io` module: opaque `Stream`, `IoError`, `Read`/`Write`, free fns `stdin`/`stdout`/`stderr`/`open`/`read`/`write`/`close` plus sync adapters `read_exact`/`read_to_end`/`write_all`, text helpers `from_bytes`/`to_bytes` (UTF-8 `[byte]` ↔ `string`). Networking is nested: `io::net::tcp::{connect,listen,accept,accept_wait}` and `io::net::udp::{bind,connect,send_to,recv_from,recv_from_wait,local_port}` (`recv_from` → `(nbytes, host, port)`). Host registry keys stay uniquely prefixed (`tcp_connect`, `udp_bind`, …). L0 is non-blocking (`WouldBlock` / `Ok(None)` EOF); buffers are `[byte]`. Host natives via `HostInvoke` — no new opcodes / no `ARCHIVE_VERSION` bump for IO.
 - `byte` is `Ty::Con("byte")` (0..=255 immediate); integer literals coerce under expected `byte` / `[byte]`. Array type annotations `[T]` / `[T; N]` preserve the element type in the parser AST.
-- FFI uses compile-time `extern` blocks (no `use ffi` needed) and runtime `dload`/`declare`/`invoke` with libffi; `resolve_library` resolves paths via entry-script `base_dir`, `zero.toml` `[ffi] search_paths`, and system search (`extern "c"` / `dload("sum")` are cross-platform); supports Ptr (arrays/tuples), C structs, and callbacks via `FfiSignatureBuilder`.
-- `ARCHIVE_VERSION` is 26; bump on incompatible bytecode, tag, or opcode changes. Static slots use `LoadStatic`/`StoreStatic`; `static_slot_count` is stored in the archive envelope. `.c0s` archives also carry `source_files` + `debug_locs` (one `DebugLoc` per bytecode slot); peephole fusion must call `shrink_debug_locs` alongside `fuse_bytecode`.
-- `prelude::test::assert` is an auto-imported virtual builtin returning `Result<(), string>`; `panic` is a keyword that aborts the VM (CLI/`zero-script test` treat it as failure).
-- `examples/fib.0s` is the smoke Fibonacci (`fib(10)` → `55`); `examples/fib_bench.0s` (`fib(32)` → `2178309`) is the primary performance regression benchmark.
-- CLI caches compiled bytecode in `out.c0s`; delete it before re-running examples to avoid stale output.
-- `zero-script test [path] [--fail-fast]` discovers `**/*.0s` under an optional directory (default `./tests`). Top-level `test("desc") { … }` cases (string literal name, Result-mode body) replace per-file `main`; the harness runs each case in an isolated VM. Legacy files with only `fn main()` still count as one case.
+- FFI uses compile-time `extern` blocks (no `use ffi` needed) and runtime `dload`/`declare`/`invoke` with libffi; `resolve_library` resolves paths via entry-script `base_dir`, `coil.toml` `[ffi] search_paths`, and system search (`extern "c"` / `dload("sum")` are cross-platform); supports Ptr (arrays/tuples), C structs, and callbacks via `FfiSignatureBuilder`.
+- `ARCHIVE_VERSION` is 26; bump on incompatible bytecode, tag, or opcode changes. Static slots use `LoadStatic`/`StoreStatic`; `static_slot_count` is stored in the archive envelope. `.hyc` archives also carry `source_files` + `debug_locs` (one `DebugLoc` per bytecode slot); peephole fusion must call `shrink_debug_locs` alongside `fuse_bytecode`.
+- `prelude::test::assert` is an auto-imported virtual builtin returning `Result<(), string>`; `panic` is a keyword that aborts the VM (CLI/`coil test` treat it as failure).
+- `examples/fib.hy` is the smoke Fibonacci (`fib(10)` → `55`); `examples/fib_bench.hy` (`fib(32)` → `2178309`) is the primary performance regression benchmark.
+- CLI caches compiled bytecode in `out.hyc`; delete it before re-running examples to avoid stale output.
+- `coil test [path] [--fail-fast]` discovers `**/*.hy` under an optional directory (default `./tests`). Top-level `test("desc") { … }` cases (string literal name, Result-mode body) replace per-file `main`; the harness runs each case in an isolated VM. Legacy files with only `fn main()` still count as one case.
 
 ## PHASE 14 - HINDLEY–MILNER TYPECHECKER (COMPLETED)
 
@@ -142,7 +142,7 @@ pub use typechecking::{Checker, Ty};
 - `compiler/src/typechecking/pretty.rs` (~130 LOC)
 - `compiler/tests/diagnostics.rs` (15 tests)
 - `HM_TYPECHECKER_PLAN.md`
-- `examples/fib.0s` (tweaked from `fib(7)` to `fib(32)`; expects
+- `examples/fib.hy` (tweaked from `fib(7)` to `fib(32)`; expects
   the 32nd Fibonacci number, `2178309`)
 
 **Removed:**
@@ -272,7 +272,7 @@ Wired sum types and pattern matching end-to-end: appended three new
 VM opcodes (`MakeEnum`, `JumpIfMatch`, `Unpack`), implemented their
 runtime semantics, replaced the 15A codegen stubs with a real
 threaded-code match emitter, and verified end-to-end with
-`examples/option.0s` (which prints `42`).
+`examples/option.hy` (which prints `42`).
 
 ### New opcodes (appended, not inserted)
 
@@ -322,7 +322,7 @@ a second pass after the arm-body offsets are known.
    the end of the `Instruction` enum to preserve every existing
    `#[repr(u8)]` discriminant. Inserting before `SET` would shift
    every later opcode's numeric value and silently corrupt every
-   `.0s` archive ever compiled.
+   `.hy` archive ever compiled.
 2. **Stack discipline: reverse-emit, no-reverse-pop.** Codegen emits
    payload args in reverse declaration order so the stack top holds
    `args[0]`. `MakeEnum` pops arity values top-first — first pop is
@@ -404,9 +404,9 @@ Codegen tests (`compiler/src/lib.rs::tests`):
 
 ### End-to-end smoke test
 
-`examples/option.0s` compiles and runs correctly, printing `42`:
+`examples/option.hy` compiles and runs correctly, printing `42`:
 
-```0s
+```coil
 enum Option {
     None,
     Some(int),
@@ -432,7 +432,7 @@ fn main() {
 | `machine/src/vm.rs` | +343 LOC (net) | Dispatch arms + 6 tests + restoration of commented tests |
 | `machine/src/memory/heap.rs` | +36 LOC | `head_for_lookup` + `contains_addr` helpers |
 | `compiler/src/lib.rs` | +484 LOC (net) | Real codegen for `EnumDecl`/`Variant`/`Construct`/`Match`/`Type` + `Print`/`Format` refactor + `emit_pattern_binding` + 3 codegen tests |
-| `examples/option.0s` | new | End-to-end smoke test |
+| `examples/option.hy` | new | End-to-end smoke test |
 | `AGENTS.md` | this section | Documentation |
 
 ### Build status (15C)
@@ -519,18 +519,18 @@ proportionally to allocations. The companion
 "root" enum, then 200 unrelated enums, and verifies the
 root survives the cycles.
 
-### 15D.2/15D.3 — `examples/result.0s` and `examples/tree.0s`
+### 15D.2/15D.3 — `examples/result.hy` and `examples/tree.hy`
 
 Two new examples demonstrate the 15A/15B/15C features
 end-to-end:
 
-- `examples/result.0s` — `Result<Option<int>>` with a
+- `examples/result.hy` — `Result<Option<int>>` with a
   nested match (`Result::Ok(Option::Some(v)) => v`,
   `Result::Err(_) => -1`). Currently the example only
   includes one `Result::Ok` arm because the existing
   match-codegen cannot dispatch on inner patterns
   (see "Known limitations" below).
-- `examples/tree.0s` — a recursive `Tree` enum
+- `examples/tree.hy` — a recursive `Tree` enum
   (`Tree::Leaf | Tree::Node(int, Tree, Tree)`) with
   `sum_tree` walking the tree recursively. This
   exercises the isorecursive encoding (Phase 15A
@@ -539,7 +539,7 @@ end-to-end:
   required the `Con(name)` opaque-reference treatment
   in `Ty::Sum` (see `HM_TYPECHECKER_PLAN.md`).
 
-The pre-existing `examples/option.0s` and `examples/fib.0s`
+The pre-existing `examples/option.hy` and `examples/fib.hy`
 continue to work unchanged.
 
 ### 15D.4 — Golden pipeline tests
@@ -549,11 +549,11 @@ example in-memory and runs the resulting bytecode through
 a `Machine` that captures stdout, asserting the exact
 output. Four tests:
 
-- `example_option_prints_42` — `option.0s` → `"42"`
-- `example_result_prints_42_and_neg1` — `result.0s`
+- `example_option_prints_42` — `option.hy` → `"42"`
+- `example_result_prints_42_and_neg1` — `result.hy`
   → `"42-1"`
-- `example_tree_prints_6` — `tree.0s` → `"6"`
-- `example_fib_still_works` — `fib.0s` → `"13"` (regression)
+- `example_tree_prints_6` — `tree.hy` → `"6"`
+- `example_fib_still_works` — `fib.hy` → `"13"` (regression)
 
 Supporting changes:
 
@@ -561,7 +561,7 @@ Supporting changes:
   Result<Vec<Byte>, ()>` — new helper. Compiles a source
   string in-memory, patches the prologue's `JMP` to
   jump to `main`, and returns the resulting bytecode.
-  No `.c0s` file round-trip needed. Used by the tests
+  No `.hyc` file round-trip needed. Used by the tests
   so the test process is the only thing that touches
   the filesystem.
 - `Machine::with_output(&mut self, W: Write + 'static)` —
@@ -697,7 +697,7 @@ This section.
   to a second `JUMP_IF_MATCH` for the inner
   tag (or to add a separate "tag-of-payload"
   test after the outer matches). The current
-  workaround in `examples/result.0s` is to have
+  workaround in `examples/result.hy` is to have
   only one `Result::Ok` arm.
 - **`UNPACK` push order.** Phase 15D changed
   `STORE` to a no-op, which is a load-bearing
@@ -737,8 +737,8 @@ This section.
 | `compiler/tests/pipeline.rs` | new (~109 LOC) | 4 golden end-to-end tests |
 | `compiler/Cargo.toml` | +3 LOC | Add `machine` as dev-dependency |
 | `common/src/opcode.rs` | +19 LOC | 16-bit `JUMP_IF_MATCH` ceiling documentation |
-| `examples/result.0s` | new (~37 LOC) | Nested match example |
-| `examples/tree.0s` | new (~17 LOC) | Recursive enum example |
+| `examples/result.hy` | new (~37 LOC) | Nested match example |
+| `examples/tree.hy` | new (~17 LOC) | Recursive enum example |
 | `AGENTS.md` | this section (+341 net) | Documentation |
 
 ### Build status (15D)
@@ -796,7 +796,7 @@ infinite-looped on any `if` whose body contained a
 directly to `self.bytecode` rather than to a local
 `Vec<Byte>`). The VM was jumping backward into the
 condition on every iteration, never exiting the
-`if`. The pre-existing `examples/fizbuz.0s`
+`if`. The pre-existing `examples/fizbuz.hy`
 regression test — `cargo test fizbuz_runs_to_completion`
 — crashed with severe memory pressure before this fix.
 
@@ -1068,12 +1068,12 @@ parser warnings. No new compiler or machine warnings.
 - `cargo test -p compiler --test pipeline fizbuz_runs_to_completion`
   passes. The pre-16.5 infinite-loop regression is still fixed.
 - `cargo test -p compiler --test pipeline` (6 golden tests) all pass.
-- `cargo run -- examples/fizbuz.0s` terminates with
+- `cargo run -- examples/fizbuz.hy` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
-- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
-- `cargo run -- examples/option.0s` prints `42`.
-- `cargo run -- examples/result.0s` prints `42-1`.
-- `cargo run -- examples/tree.0s` prints `6`.
+- `cargo run -- examples/fib.hy` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
+- `cargo run -- examples/option.hy` prints `42`.
+- `cargo run -- examples/result.hy` prints `42-1`.
+- `cargo run -- examples/tree.hy` prints `6`.
 
 ### Anything 16.7+ needs to know
 
@@ -1098,7 +1098,7 @@ parser warnings. No new compiler or machine warnings.
 - The `Expression::Default` AST variant is still
   reachable from real source as of 15D's `Default`
   codegen arm in `do_compile`.
-- `examples/fizbuz.0s` had its `fizbuz(2)` through `fizbuz(15)`
+- `examples/fizbuz.hy` had its `fizbuz(2)` through `fizbuz(15)`
   lines uncommented in a prior (uncommitted-from-AGENTS) edit;
   that change was pre-existing before Phase 16.6 and is unrelated
   to this work.
@@ -1329,12 +1329,12 @@ No new compiler or machine warnings.
 - `cargo test -p compiler --test pipeline fizbuz_runs_to_completion`
   passes. The pre-16.5 infinite-loop regression is still fixed.
 - `cargo test -p compiler --test pipeline` (6 golden tests) all pass.
-- `cargo run -- examples/fizbuz.0s` terminates with
+- `cargo run -- examples/fizbuz.hy` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
-- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
-- `cargo run -- examples/option.0s` prints `42`.
-- `cargo run -- examples/result.0s` prints `42-1`.
-- `cargo run -- examples/tree.0s` prints `6`.
+- `cargo run -- examples/fib.hy` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
+- `cargo run -- examples/option.hy` prints `42`.
+- `cargo run -- examples/result.hy` prints `42-1`.
+- `cargo run -- examples/tree.hy` prints `6`.
 
 ### Anything 17B+ needs to know
 
@@ -1444,7 +1444,7 @@ field access). The VM already implements the runtime semantics
 |------|-----------|---------|
 | `compiler/src/lib.rs` | +130 LOC | `Expression::Access` codegen arm, `enum_name_for_receiver` + `receiver_type` helpers, `extract_enum_name` free fn, 2 new codegen tests |
 | `compiler/src/typechecking/infer.rs` | +110 LOC | `codegen_var_types` side-table field, `new()`/`check_program` clearing, `infer_function` + `infer_fragment` population, `field_index_for` + `codegen_var_type` + `infer_for_codegen` accessors |
-| `examples/record.0s` | rewrote | Added `x_coord` + `y_coord` functions that read fields via `p.x` / `p.y`. Output extended from `"169"` to `"169512"`. |
+| `examples/record.hy` | rewrote | Added `x_coord` + `y_coord` functions that read fields via `p.x` / `p.y`. Output extended from `"169"` to `"169512"`. |
 | `compiler/tests/pipeline.rs` | 1 line | Updated `example_record_prints_169` → `example_record_prints_169_5_12` with new expected output. |
 
 ### Test counts (18D-codegen final)
@@ -1474,11 +1474,11 @@ The +2 is the two new codegen tests in `compiler/src/lib.rs::tests`:
 
 ### End-to-end smoke test
 
-`examples/record.0s` compiles and runs correctly, printing
+`examples/record.hy` compiles and runs correctly, printing
 `169512` (5²+12² from pattern destructuring, then `p.x` = 5
 and `p.y` = 12 from field access):
 
-```0s
+```coil
 enum Point {
     Origin,
     Point { x: int, y: int },
@@ -1515,14 +1515,14 @@ parser warnings. No new compiler or machine warnings.
 
 - `cargo test -p compiler --test pipeline` (9 golden tests) all
   pass, including `example_record_prints_169_5_12`.
-- `cargo run -- examples/record.0s` terminates with
+- `cargo run -- examples/record.hy` terminates with
   `169512`.
-- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
-- `cargo run -- examples/option.0s` prints `42`.
-- `cargo run -- examples/result.0s` prints `420-1`.
-- `cargo run -- examples/tree.0s` prints `6`.
-- `cargo run -- examples/mixed.0s` prints `025122`.
-- `cargo run -- examples/fizbuz.0s` terminates with
+- `cargo run -- examples/fib.hy` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
+- `cargo run -- examples/option.hy` prints `42`.
+- `cargo run -- examples/result.hy` prints `420-1`.
+- `cargo run -- examples/tree.hy` prints `6`.
+- `cargo run -- examples/mixed.hy` prints `025122`.
+- `cargo run -- examples/fizbuz.hy` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
 
 ### Anything 19+ needs to know
@@ -1565,7 +1565,7 @@ parser warnings. No new compiler or machine warnings.
   matching the regular `JMP`, with the tag in a separate
   scratch word. No current test program approaches the
   65,535 limit.
-- `examples/fizbuz.0s` had its `fizbuz(2)` through `fizbuz(15)`
+- `examples/fizbuz.hy` had its `fizbuz(2)` through `fizbuz(15)`
   lines uncommented in a prior (uncommitted-from-AGENTS) edit;
   that change was pre-existing before Phase 16.6 and is
   unrelated to this work.
@@ -1621,13 +1621,13 @@ original 17B design is sketched at the end of that document).
   `Point::Origin()`).
 - **Mixed-shape enums:** a single enum can have variants
   of all three shapes (Unit, Tuple, Record). See
-  `examples/mixed.0s` for the canonical demonstration.
+  `examples/mixed.hy` for the canonical demonstration.
 
 ### Examples added
 
-- `examples/record.0s` — distance-squared from origin
+- `examples/record.hy` — distance-squared from origin
   (5² + 12² = 169). Uses a Unit variant + a Record variant.
-- `examples/mixed.0s` — tag-of-shape dispatch on a
+- `examples/mixed.hy` — tag-of-shape dispatch on a
   Unit + Tuple + Record enum with **binding bodies**
   (each arm uses its own payload values). Outputs
   `0`, `25`, `12`, `2`.
@@ -1777,8 +1777,8 @@ The +72 delta from 17A's 289 is broken down as:
 | `compiler/src/typechecking/env.rs` | +9 LOC | Walk `EnumVariantPayloadTy` in env's substitute_vars |
 | `compiler/src/typechecking/id.rs` | +14 LOC | Pre-walk for `EnumVariant`/`Construct`/`PatternPayload` |
 | `compiler/src/lib.rs` | +76 LOC (was); +~140 LOC in cleanup | Codegen for `Construct` (record reorder via `payload_tys_for`); codegen for `Match` outer-arm binding (Record walks decl_order); +match-end `RETURN` to avoid function codegen's auto-default clobbering; 17B-cleanup: `match_bindings: Option<HashMap<String, u32>>` per-arm map + `lookup_slot` helper for the multi-variant binding body fix; +6 record codegen tests |
-| `examples/record.0s` | new (~22 LOC) | Record-shape end-to-end smoke test |
-| `examples/mixed.0s` | new (~22 LOC); 17B-cleanup: corrected to use shape-correct patterns (Issue 1) | Mixed-shape enum end-to-end smoke test, with binding bodies across all three shapes |
+| `examples/record.hy` | new (~22 LOC) | Record-shape end-to-end smoke test |
+| `examples/mixed.hy` | new (~22 LOC); 17B-cleanup: corrected to use shape-correct patterns (Issue 1) | Mixed-shape enum end-to-end smoke test, with binding bodies across all three shapes |
 | `AGENTS.md` | this section (+192 net for original; +~120 in cleanup) | Documentation |
 
 ### Known limitations (forwarded to 17C+)
@@ -1807,15 +1807,15 @@ machine warnings.
 ### Critical regression check
 
 - `cargo test --workspace` — all 361 tests pass.
-- `cargo run -- examples/fib.0s` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
-- `cargo run -- examples/option.0s` prints `42`.
-- `cargo run -- examples/result.0s` prints `42-1`.
-- `cargo run -- examples/tree.0s` prints `6`.
-- `cargo run -- examples/record.0s` prints `169`.
-- `cargo run -- examples/mixed.0s` prints `025122`
+- `cargo run -- examples/fib.hy` terminates with `2178309` (the user updated `fib(7)` to `fib(32)`; the test pipeline expects the new output).
+- `cargo run -- examples/option.hy` prints `42`.
+- `cargo run -- examples/result.hy` prints `42-1`.
+- `cargo run -- examples/tree.hy` prints `6`.
+- `cargo run -- examples/record.hy` prints `169`.
+- `cargo run -- examples/mixed.hy` prints `025122`
   (binding-body dispatch — the 17B-cleanup fix
   makes this produce correct output).
-- `cargo run -- examples/fizbuz.0s` terminates with
+- `cargo run -- examples/fizbuz.hy` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
 
 ### Anything 17C+ needs to know
@@ -1908,7 +1908,7 @@ clobber the OUTER record's position-2 field. Programs
 with multi-field nested records interleaved with
 non-nested OUTER fields would need a scratch-area
 scheme (deferred to 19+). All test programs and
-`examples/nested_records.0s` satisfy this constraint.
+`examples/nested_records.hy` satisfy this constraint.
 
 ### Decisions locked in (during implementation)
 
@@ -2005,15 +2005,15 @@ Codegen tests in `compiler/src/lib.rs::tests`:
 Pipeline golden test in `compiler/tests/pipeline.rs`:
 
 5. `example_nested_records_prints_99` —
-   compiles `examples/nested_records.0s`, runs it on a
+   compiles `examples/nested_records.hy`, runs it on a
    `Machine`, asserts stdout is `"99"`.
 
 ### End-to-end smoke test
 
-`examples/nested_records.0s` compiles and runs
+`examples/nested_records.hy` compiles and runs
 correctly, printing `99`:
 
-```0s
+```coil
 enum Inner {
     I { v: int },
 }
@@ -2042,7 +2042,7 @@ fn main() {
 | `machine/src/vm.rs` | +83 LOC (net) | Dispatch arm for `UnpackAt` (slot-based UNPACK for nested records) |
 | `compiler/src/lib.rs` | +275 LOC (net) | Convert `emit_pattern_binding` to free function with `&Checker` param + new `parent_decl_order`/`is_outer` params + Record arm rewrite (uses `UnpackAt` at recursion level) + 4 new codegen tests + `emit_inner_test` Record arm rewrite |
 | `compiler/tests/pipeline.rs` | +25 LOC (net) | New `example_nested_records_prints_99` golden test |
-| `examples/nested_records.0s` | new (~26 LOC) | End-to-end smoke test |
+| `examples/nested_records.hy` | new (~26 LOC) | End-to-end smoke test |
 | `AGENTS.md` | this section (+200 net) | Documentation |
 
 ### Build status (18B)
@@ -2056,7 +2056,7 @@ machine warnings.
 ### Critical regression check
 
 - `cargo test --workspace` — all 406 tests pass.
-- `cargo run -- examples/nested_records.0s` —
+- `cargo run -- examples/nested_records.hy` —
   prints `99`.
 - All existing examples (`fib`, `option`, `result`,
   `tree`, `mixed`, `record`, `chained`, `fizbuz`)
@@ -2200,7 +2200,7 @@ identical bytecode to the pre-18A codegen.
 
 ### Examples updated
 
-- `examples/result.0s` extended with two `Result::Ok`
+- `examples/result.hy` extended with two `Result::Ok`
   arms (`Some(v)` vs `None`) plus a wildcard `Err(_)`
   arm. Output extended from `42-1` to `420-1` (the
   `None` arm now prints `0` at runtime).
@@ -2236,7 +2236,7 @@ The 5 codegen tests in `compiler/src/lib.rs::tests`:
 
 Plus 1 pipeline golden test:
 - `example_match_with_two_ok_arms_dispatches_correctly`
-  — compiles and runs `examples/result.0s` to verify
+  — compiles and runs `examples/result.hy` to verify
   the runtime dispatch of `Some(42) → 42`, `None → 0`,
   and `Err → -1`.
 
@@ -2252,7 +2252,7 @@ And 1 typechecker test:
 |------|-----------|---------|
 | `compiler/src/lib.rs` | +1064 LOC (forward pass + helpers + tests) | `group_arms_by_outer_tag`, `arm_has_runtime_test`, `emit_inner_test`, `next_available_slot`, per-arm `match_bindings` map, 5 new codegen tests |
 | `compiler/src/typechecking/infer.rs` | +124 LOC | `InnerCoverage { Any, Tag(u32) }`, `ArmCoverage.inner`, `inner_coverage` helper, exhaustiveness check rewrite, 1 new test |
-| `examples/result.0s` | extended | Second `Result::Ok(Option::None)` arm + `print` in `main` |
+| `examples/result.hy` | extended | Second `Result::Ok(Option::None)` arm + `print` in `main` |
 | `compiler/tests/pipeline.rs` | +110 LOC | `example_match_with_two_ok_arms_dispatches_correctly` + uses `compile_test` for existing `example_result_prints_42_and_neg1` (typechecker was previously flagging the second `Result::Ok` arm) |
 
 ### Build status (18A)
@@ -2265,7 +2265,7 @@ machine warnings.
 
 - `cargo test --workspace` — all 357 tests pass at this
   milestone.
-- `cargo run -- examples/result.0s` prints `420-1` after
+- `cargo run -- examples/result.hy` prints `420-1` after
   the follow-up commit that exercises the `None` arm at
   runtime.
 - All existing examples (`fib`, `option`, `tree`, `fizbuz`)
@@ -2286,7 +2286,7 @@ machine warnings.
   emission. Any future change to `emit_pattern_binding`
   must preserve `consume_values` propagation through
   recursion.
-- `examples/result.0s` exercises the inner-pattern
+- `examples/result.hy` exercises the inner-pattern
   dispatch at runtime via `compile_test` (not
   `compile_src`) because the typechecker still flags
   the second `Result::Ok` arm as unreachable at the
@@ -2304,7 +2304,7 @@ widened the `Byte` struct to carry a full u64 `value`
 field (the operand stays u32; `value` can carry wider
 targets and floats). Phase 18C finishes the widening and
 also introduces a versioned bytecode archive so stale
-`.c0s` files can be rejected at load time.
+`.hyc` files can be rejected at load time.
 
 The `JUMP_IF_MATCH` operand layout is now:
 - `operands[31:16]` = expected tag (16 bits)
@@ -2370,7 +2370,7 @@ version doesn't match.
    ```
    The version is checked at load time. Bumping
    `ARCHIVE_VERSION` invalidates every previously
-   compiled `.c0s` file, which is the right behavior
+   compiled `.hyc` file, which is the right behavior
    when the bytecode format changes incompatibly.
 5. **`ArchivedArchivedProgram` is the rkyv type name.**
    rkyv's `Archive` derive generates a separate archived
@@ -2393,14 +2393,14 @@ version doesn't match.
    `Pipeline::run` is silent on the version check
    itself, deferring to the runner to print the user-
    facing message).
-8. **`src/main.rs` rebuilds on missing `out.c0s`.** The
+8. **`src/main.rs` rebuilds on missing `out.hyc`.** The
    pre-18C main always compiled; 18C re-enables the
-   `if !std::fs::exists("out.c0s") { compile }` check so
+   `if !std::fs::exists("out.hyc") { compile }` check so
    re-running after source edits picks up the new
    compile. When the file exists, it's read as a bare
    `ArchivedVec<ArchivedByte>` (the old format) — this
    is a deliberate short-circuit: existing cached
-   `.c0s` files keep working without recompilation.
+   `.hyc` files keep working without recompilation.
 
 ### New file: `common/src/archive.rs`
 
@@ -2429,8 +2429,8 @@ pub struct ArchivedProgram {
   bytecode, not a runtime panic. (No test program
   approaches the limit, but the architecture now
   supports it.)
-- **Stale `.c0s` files are rejected at load time.** A
-  `.c0s` compiled with `ARCHIVE_VERSION = 0` (pre-18C)
+- **Stale `.hyc` files are rejected at load time.** A
+  `.hyc` compiled with `ARCHIVE_VERSION = 0` (pre-18C)
   loads as `Err(())` when `ARCHIVE_VERSION = 1`. The
   runner prints the version-mismatch message and the
   user recompiles from source.
@@ -2439,8 +2439,8 @@ pub struct ArchivedProgram {
   in-memory `Vec<Byte>` is wrapped internally.
 - **`src/main.rs` caches the compile.** Re-running the
   binary on an unchanged source reuses the cached
-  `out.c0s` (saves the compile step). When the source
-  changes, the user deletes `out.c0s` to force a
+  `out.hyc` (saves the compile step). When the source
+  changes, the user deletes `out.hyc` to force a
   recompile (or the runner could add an mtime check —
   deferred to a future phase).
 
@@ -2473,7 +2473,7 @@ target is silently truncated back to `u16`.
 | `common/src/lib.rs` | +2 LOC | `mod archive; pub use archive::*` |
 | `compiler/src/block_builder.rs` | +24 LOC (net) | `make_jump_placeholder` uses `with_value_u32` for `JumpIfMatch`; `patch_jump_operand` writes the wide target (no more `u16::try_from` panic); test uses target=100_000 |
 | `compiler/src/pipeline.rs` | +30 LOC (net) | `Pipeline::compile` wraps in `ArchivedProgram`; `Pipeline::run` checks version + deserializes archived `Vec<Byte>` |
-| `src/main.rs` | +5/-5 LOC (net 0) | Re-enables `if !std::fs::exists("out.c0s")` rebuild check |
+| `src/main.rs` | +5/-5 LOC (net 0) | Re-enables `if !std::fs::exists("out.hyc")` rebuild check |
 | `machine/src/vm.rs` | +14 LOC | New `jump_if_match_wide_target_round_trips` test |
 | `machine/Cargo.toml` | (unchanged) | `rkyv` already a dep for `run_raw` |
 
@@ -2486,12 +2486,12 @@ machine warnings.
 ### Critical regression check
 
 - `cargo test --workspace` — all 358 tests pass.
-- `cargo run -- examples/fib.0s` prints `13`.
-- `cargo run -- examples/option.0s` prints `42`.
-- `cargo run -- examples/result.0s` prints `420-1`.
-- `cargo run -- examples/record.0s` prints `169512`.
-- `cargo run -- examples/mixed.0s` prints `025122`.
-- `cargo run -- examples/tree.0s` prints `6`.
+- `cargo run -- examples/fib.hy` prints `13`.
+- `cargo run -- examples/option.hy` prints `42`.
+- `cargo run -- examples/result.hy` prints `420-1`.
+- `cargo run -- examples/record.hy` prints `169512`.
+- `cargo run -- examples/mixed.hy` prints `025122`.
+- `cargo run -- examples/tree.hy` prints `6`.
 
 ### Anything 18D+ needs to know
 
@@ -2499,7 +2499,7 @@ machine warnings.
   change.** Any future change to the `Byte` struct
   layout (operand encoding, value field width) or to
   any opcode's operand semantics MUST bump
-  `ARCHIVE_VERSION` to invalidate stale `.c0s` files.
+  `ARCHIVE_VERSION` to invalidate stale `.hyc` files.
   Otherwise `Pipeline::run` will silently accept the
   stale format and the VM will execute garbage.
 - **`ArchivedProgram` is the wrapper for ALL future
@@ -2591,7 +2591,7 @@ what makes `let x = 5; let y = 10;` work — the second
    of the `Instruction` enum to preserve `#[repr(u8)]`
    discriminant stability. Inserting before `SET` would
    shift every later opcode's numeric value and
-   silently corrupt every `.c0s` archive ever compiled.
+   silently corrupt every `.hyc` archive ever compiled.
 2. **`STORE` is reserved for match-arm bindings.** The
    pre-18E codegen sometimes emitted `STORE` for let
    bindings (via the `Expression::Assignment` path);
@@ -2661,9 +2661,9 @@ what makes `let x = 5; let y = 10;` work — the second
 
 ### Examples added
 
-- `examples/let_test.0s` — let-bound variable binding
+- `examples/let_test.hy` — let-bound variable binding
   and re-assignment:
-  ```0s
+  ```coil
   fn main() {
       let x = 5;
       print "%i", x;        // "5"
@@ -2721,7 +2721,7 @@ The 3 pipeline golden tests in
 1. `let_binding_emits_store_pop_in_bytecode` — codegen-
    side byte-shape guard for the let-binding codegen.
 2. `example_let_reassignment_works` — end-to-end
-   `examples/let_test.0s` → `"51020"`.
+   `examples/let_test.hy` → `"51020"`.
 3. `example_let_chained_bindings_works` — chained let
    bindings (`let x = 5; let y = x + 1; print y;`)
    exercise the cursor-preservation behavior end-to-end.
@@ -2736,7 +2736,7 @@ The 3 pipeline golden tests in
 | `machine/src/vm.rs` | +120 LOC (net) | Dispatch arm for `StorePop` (cursor preservation) + 4 new tests |
 | `compiler/src/lib.rs` | +180 LOC (net) | `Expression::Fragment` special-case + `Expression::Assignment` rewrite + `Expression::Block` rewrite + 3 new codegen tests |
 | `compiler/tests/pipeline.rs` | +110 LOC (net) | 3 new pipeline golden tests |
-| `examples/let_test.0s` | new (~24 LOC) | End-to-end smoke test |
+| `examples/let_test.hy` | new (~24 LOC) | End-to-end smoke test |
 
 ### Build status (18E)
 
@@ -2748,12 +2748,12 @@ machine warnings.
 
 - `cargo test --workspace` — all 391 tests pass at
   this milestone.
-- `cargo run -- examples/let_test.0s` prints `51020`.
-- `cargo run -- examples/fib.0s` prints `13`.
-- `cargo run -- examples/result.0s` prints `420-1`.
-- `cargo run -- examples/record.0s` prints `169512`.
-- `cargo run -- examples/chained.0s` prints `427`.
-- `cargo run -- examples/fizbuz.0s` terminates with
+- `cargo run -- examples/let_test.hy` prints `51020`.
+- `cargo run -- examples/fib.hy` prints `13`.
+- `cargo run -- examples/result.hy` prints `420-1`.
+- `cargo run -- examples/record.hy` prints `169512`.
+- `cargo run -- examples/chained.hy` prints `427`.
+- `cargo run -- examples/fizbuz.hy` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
 
 ### Anything 18F+ needs to know
@@ -2902,10 +2902,10 @@ isn't registered.
 
 ### New example
 
-`examples/chained.0s` — chained field access with two
+`examples/chained.hy` — chained field access with two
 enums:
 
-```0s
+```coil
 enum Inner {
     Inner { v: int },
 }
@@ -2986,7 +2986,7 @@ The +1 pipeline golden test in
 `compiler/tests/pipeline.rs`:
 
 - `example_chained_prints_42_7` — end-to-end
-  `examples/chained.0s` → `"427"`.
+  `examples/chained.hy` → `"427"`.
 
 The +4 parser tests in `parser/src/lib.rs::tests`:
 
@@ -3026,7 +3026,7 @@ that re-enablement).
 | `parser/src/lib.rs` | +119 LOC | Postfix `.ident` operator in Primary precedence + 4 new parser tests |
 | `compiler/src/typechecking/infer.rs` | +163 LOC (net) | `Checker::field_type_for` helper + 6 new typechecker tests |
 | `compiler/src/lib.rs` | +45 LOC | `receiver_type` extended to handle `Access(inner, field)` case (recursion + `field_type_for`) + 3 new codegen tests |
-| `examples/chained.0s` | new (~37 LOC) | End-to-end smoke test |
+| `examples/chained.hy` | new (~37 LOC) | End-to-end smoke test |
 
 ### Build status (19)
 
@@ -3038,15 +3038,15 @@ machine warnings.
 
 - `cargo test --workspace` — all 401 tests pass at
   this milestone.
-- `cargo run -- examples/chained.0s` prints `427`.
-- `cargo run -- examples/record.0s` prints `169512`.
-- `cargo run -- examples/result.0s` prints `420-1`.
-- `cargo run -- examples/fib.0s` prints `13`.
-- `cargo run -- examples/option.0s` prints `42`.
-- `cargo run -- examples/tree.0s` prints `6`.
-- `cargo run -- examples/mixed.0s` prints `025122`.
-- `cargo run -- examples/let_test.0s` prints `51020`.
-- `cargo run -- examples/fizbuz.0s` terminates with
+- `cargo run -- examples/chained.hy` prints `427`.
+- `cargo run -- examples/record.hy` prints `169512`.
+- `cargo run -- examples/result.hy` prints `420-1`.
+- `cargo run -- examples/fib.hy` prints `13`.
+- `cargo run -- examples/option.hy` prints `42`.
+- `cargo run -- examples/tree.hy` prints `6`.
+- `cargo run -- examples/mixed.hy` prints `025122`.
+- `cargo run -- examples/let_test.hy` prints `51020`.
+- `cargo run -- examples/fizbuz.hy` terminates with
   `FIZBUZFIZFIZBUZFIZFIZBUZ`.
 
 ### Side fix: `Machine::run_raw` restored
@@ -3319,7 +3319,7 @@ The Phase 24 typechecker added 12 unit tests
 `parenthesised_*`).
 
 **Phase 27 work completed as a Phase 24 side-effect.**
-The pre-existing `examples/mixed.0s` pipeline test was
+The pre-existing `examples/mixed.hy` pipeline test was
 crashing with heap addresses leaking into printed
 output (expected `025122`, got `025124...`). The root
 cause was the same parser bug Phase 24 fixed for
@@ -3447,7 +3447,7 @@ existing class-allocation logic.
 - `machine/src/vm.rs` — `STRING` opcode routes through
   `heap.intern`; three new dispatch arms (`MakeDict`,
   `GetField`, `SetField`).
-- `examples/dict.0s` — new example (`4210042`).
+- `examples/dict.hy` — new example (`4210042`).
 - `compiler/tests/pipeline.rs` — new golden test
   `example_dict_prints_42_100_42`.
 
@@ -3483,7 +3483,7 @@ must be an `Expression::Tuple`. Same for `Invoke`.
 
 ### Decisions locked in
 
-1. **Breaking change.** Migrated `examples/ffi_sum.0s`
+1. **Breaking change.** Migrated `examples/ffi_sum.hy`
    to the new form. No shim — the legacy flat form
    emits a clear diagnostic at the call site.
 2. **Runtime uses `Object::Tuple` for the args bundle.**
@@ -3512,7 +3512,7 @@ must be an `Expression::Tuple`. Same for `Invoke`.
   args-tuple via `find_object_by_addr` returning
   `ObjTuple.elements`; `FfiInvoke` does the same for
   the runtime arg tuple.
-- `examples/ffi_sum.0s` — migrated.
+- `examples/ffi_sum.hy` — migrated.
 
 ### Tests (26)
 
@@ -3575,7 +3575,7 @@ case-insensitive primitive lookup.
   register the alias.
 - `compiler/src/lib.rs` — codegen treats `Expression::TypeAlias` as a no-op (`Block`
   recursion to consume IDs).
-- `examples/aliases.0s` — new example (`347`).
+- `examples/aliases.hy` — new example (`347`).
 - `compiler/tests/pipeline.rs` — new golden test
   `example_aliases_prints_3_4_7`.
 
@@ -3642,62 +3642,62 @@ compiler or machine warnings.
 
 ### Summary
 
-Added a project-level module system to zero-script.
+Added a project-level module system to coil.
 The `use foo::bar;` and `use foo::bar as baz;` and
-`use foo::*;` forms now resolve to actual `.0s` files
-on disk, discovered through a `zero.toml` manifest at
+`use foo::*;` forms now resolve to actual `.hy` files
+on disk, discovered through a `coil.toml` manifest at
 the project root. The `mod foo;` forward declaration
 triggers the same discovery.
 
 The user-facing API:
 - **`use foo::bar;`** — imports `bar` (a function in
-  `src/foo.0s`) into the current scope. `bar()` calls
+  `src/foo.hy`) into the current scope. `bar()` calls
   resolve to the fully qualified name `foo::bar`.
 - **`use foo::bar as baz;`** — same as above, but
   `baz` is the local name.
 - **`use foo::*;`** — glob: brings every top-level
-  item from `foo.0s` into scope (e.g., `sadge` and
+  item from `foo.hy` into scope (e.g., `sadge` and
   `greet` if both are top-level functions in
-  `foo.0s`).
+  `foo.hy`).
 - **`mod foo;`** — forward declaration: triggers the
-  pipeline to load `foo.0s` if not already loaded.
-- **`zero.toml`** — project manifest at the project
+  pipeline to load `foo.hy` if not already loaded.
+- **`coil.toml`** — project manifest at the project
   root. Declares search roots for `use` resolution
   and an optional entry-point file.
 
 ### File → namespace convention
 
-A file at `<root>/<path>.0s` has namespace
+A file at `<root>/<path>.hy` has namespace
 `<path::as::double_colons>`. The entry file (passed
 to the compiler) is special: it lives in the
 top-level namespace (no prefix), regardless of its
 path on disk.
 
 Examples:
-- `src/foo.0s` → namespace `foo`. Top-level
+- `src/foo.hy` → namespace `foo`. Top-level
   function `sadge` has FQN `foo::sadge`.
-- `src/lib/io.0s` → namespace `lib::io`. Top-level
+- `src/lib/io.hy` → namespace `lib::io`. Top-level
   function `read` has FQN `lib::io::read`.
-- `src/main.0s` (the entry file) → namespace `""`.
+- `src/main.hy` (the entry file) → namespace `""`.
   Top-level function `main` has FQN `main`.
 
 ### `use` resolution convention
 
 `use <a>::<b>::<c>;` looks for the file
-`<root>/<a>/<b>/<c>.0s`. The item imported is
+`<root>/<a>/<b>/<c>.hy`. The item imported is
 `c` (the LAST segment). So `use foo::sadge;` looks
-for `<root>/foo/sadge.0s` and imports `sadge` (a
+for `<root>/foo/sadge.hy` and imports `sadge` (a
 top-level function in that file).
 
 For globs (`use foo::*;`): the file is
-`<root>/foo.0s` (the LAST segment is dropped
+`<root>/foo.hy` (the LAST segment is dropped
 because the glob marker isn't an item name). The
 glob brings every top-level item from that file
 into scope.
 
 ### File additions
 
-**`compiler/src/manifest.rs`** (~580 LOC) — `zero.toml`
+**`compiler/src/manifest.rs`** (~580 LOC) — `coil.toml`
 parser and `Manifest` struct. The manifest declares
 search roots; module paths in `use` statements are
 resolved by searching each root in order.
@@ -3705,7 +3705,7 @@ resolved by searching each root in order.
 **`compiler/tests/namespace.rs`** (~290 LOC) — 7
 golden end-to-end tests for the new namespace system.
 
-**`zero.toml.example`** (~80 LOC) — example manifest
+**`coil.toml.example`** (~80 LOC) — example manifest
 documenting the format.
 
 ### File modifications
@@ -3770,7 +3770,7 @@ documenting the format.
    is processed with `pop_back` (LIFO), so
    dependencies are compiled BEFORE their
    consumers. This guarantees that when
-   `main.0s`'s `sadge()` call is compiled, the
+   `main.hy`'s `sadge()` call is compiled, the
    function `foo::sadge::sadge` is already in
    `self.functions`.
 5. **The entry file is special.** It uses namespace
@@ -3781,19 +3781,19 @@ documenting the format.
    before changing cwd in the test harness.**
    Cargo's parallel test runner would otherwise
    have multiple threads fighting over the cwd and
-   reading the wrong `zero.toml`. A longer-term fix
+   reading the wrong `coil.toml`. A longer-term fix
    would thread-local the cwd or pass the manifest
    path explicitly to the pipeline.
-7. **`use foo::*;` resolves the file as `foo.0s`**
+7. **`use foo::*;` resolves the file as `foo.hy`**
    (the last segment is dropped from the path
    because the glob marker isn't an item name). This
    matches the existing convention: `use foo::bar;`
-   looks for `foo.0s` (with `bar` as the function
+   looks for `foo.hy` (with `bar` as the function
    name in that file), so `use foo::*;` looks for
-   the same `foo.0s` and brings all its top-level
+   the same `foo.hy` and brings all its top-level
    items into scope.
 8. **`mod foo;` is a no-op at codegen time** — it
-   only triggers the pipeline to load `foo.0s`. The
+   only triggers the pipeline to load `foo.hy`. The
    pipeline's `enqueue_uses` walker handles the load.
 9. **Namespace is a code-only concept at the FQN
    level.** Functions in different files but with
@@ -3824,15 +3824,15 @@ documenting the format.
 
 | File | Net change | Purpose |
 |---|---|---|
-| `compiler/src/manifest.rs` | +580 LOC (new) | `zero.toml` parser + path resolution |
+| `compiler/src/manifest.rs` | +580 LOC (new) | `coil.toml` parser + path resolution |
 | `compiler/src/pipeline.rs` | +280 / -80 LOC | Manifest-driven multi-file pipeline |
 | `compiler/src/lib.rs` | +180 / -50 LOC | `Use`/`Module` codegen, glob expansion, `compile_module` |
 | `compiler/src/typechecking/infer.rs` | +30 LOC | `Use` arm populates env |
 | `parser/src/lib.rs` | +280 / -10 LOC | `use_` and `mod_` parsers |
 | `compiler/tests/namespace.rs` | +290 LOC (new) | 7 end-to-end namespace tests |
-| `zero.toml.example` | +80 LOC (new) | Example manifest |
-| `examples/modules.0s` | rewrote | Use the new namespace form |
-| `examples/src/foo/sadge.0s` | new | The file that `examples/modules.0s` uses |
+| `coil.toml.example` | +80 LOC (new) | Example manifest |
+| `examples/modules.hy` | rewrote | Use the new namespace form |
+| `examples/src/foo/sadge.hy` | new | The file that `examples/modules.hy` uses |
 
 ### Build status (29A)
 
@@ -3849,15 +3849,15 @@ machine warnings.
   `NATIVE` operand (for library-isolated natives),
   bump `ARCHIVE_VERSION` to 2.
 - **The `use` resolution is path-based, not name-based.**
-  `use foo::sadge;` looks for the file `foo.0s` (with
+  `use foo::sadge;` looks for the file `foo.hy` (with
   `sadge` as the function name inside). It does NOT
-  search for a file named `foo.0s` with `sadge` as the
+  search for a file named `foo.hy` with `sadge` as the
   function inside (which would be a Rust-style
   module::item separation). This convention is
   consistent across the whole stack but may surprise
   Rust users.
 - **Glob imports are file-scoped, not directory-scoped.**
-  `use foo::*;` brings items from `foo.0s` (a single
+  `use foo::*;` brings items from `foo.hy` (a single
   file) into scope. It does NOT transitively reach
   into files in the `foo/` subdirectory. To reach
   those, the user must write a separate
@@ -3970,7 +3970,7 @@ unfused (poor perf ROI).
    because inline `CONST` cannot represent them (the pool flag
    owns the high bit).
 6. **`ARCHIVE_VERSION` is bumped on any fusion change** (now `7`)
-   so stale `.c0s` archives are rejected at load time.
+   so stale `.hyc` archives are rejected at load time.
 
 ### Tests
 
@@ -4056,10 +4056,10 @@ Display: `resume h with v` (not `resume h(v)`).
 
 | File | Output |
 |------|--------|
-| `examples/coro_send.0s` | `hello` |
-| `examples/coro_yield_from.0s` | `012` |
-| `examples/coro_gen.0s` | `012` |
-| `examples/coro_interleave.0s` | `10,100,101,11,12,102` |
+| `examples/coro_send.hy` | `hello` |
+| `examples/coro_yield_from.hy` | `012` |
+| `examples/coro_gen.hy` | `012` |
+| `examples/coro_interleave.hy` | `10,100,101,11,12,102` |
 
 ### Known limitations
 
@@ -4146,7 +4146,7 @@ unaffected).
   interleaved in any order, with `resume` used inline. Verified
   with 3+ interleaved handles and resumes past completion (Done
   → `0`) in both directions.
-- `examples/coro_gen.0s` and `examples/coro_interleave.0s`
+- `examples/coro_gen.hy` and `examples/coro_interleave.hy`
   rewritten to use the previously-broken inline-`resume`-in-
   `print` pattern directly (no more defensive `let`-binding or
   separate-per-counter workarounds).
@@ -4157,11 +4157,11 @@ unaffected).
 |------|---------|
 | `compiler/src/lib.rs` | One-line `ExprStatement` fix + 2 new codegen regression tests (`bare_yield_statement_does_not_emit_trailing_pop`, `bare_yield_from_statement_does_not_emit_trailing_pop`) |
 | `compiler/tests/pipeline.rs` | 2 new golden regression tests (`inline_resume_in_print_does_not_corrupt_stack`, `parameterized_interleaved_coroutines_inline_resume_stay_independent`) |
-| `examples/coro_gen.0s` | Rewritten to use inline `print "%i", resume h;` |
-| `examples/coro_interleave.0s` | Rewritten to use a single parameterized `async fn counter(int base)` with two interleaved handles + inline resume (output unchanged: `10,100,101,11,12,102`) |
+| `examples/coro_gen.hy` | Rewritten to use inline `print "%i", resume h;` |
+| `examples/coro_interleave.hy` | Rewritten to use a single parameterized `async fn counter(int base)` with two interleaved handles + inline resume (output unchanged: `10,100,101,11,12,102`) |
 | `docs/tutorial/08-coroutines.md` | Removed the stale "bind before print" tip; interleaving section now shows a real parameterized example |
 | `docs/reference/types.md` | Removed the stale "Coroutine args + interleave" limitation row; added the (separate, pre-existing) `async fn` return-type limitation discovered while investigating |
-| `docs/examples.md` | Updated `coro_interleave.0s` description |
+| `docs/examples.md` | Updated `coro_interleave.hy` description |
 
 ### Test counts (CORO-2.1 final)
 
@@ -4215,7 +4215,7 @@ pipeline, up from 380 + 23).
 | `compiler/src/typechecking/infer.rs`, `pretty.rs` | `coroutine<Y, S>` |
 | `docs/tutorial/08-coroutines.md` | New tutorial |
 | `docs/*` | Reference + examples catalog |
-| `examples/coro_*.0s` | New/updated demos |
+| `examples/coro_*.hy` | New/updated demos |
 
 ## PHASE CORO-2.2 — TYPED `return` INSIDE COROUTINES + DONE-RESUME SENTINEL (COMPLETED)
 
@@ -4294,7 +4294,7 @@ so there's no code path that could accidentally resurrect it.
 
 ### What works now
 
-```0s
+```coil
 async fn counter() {
     yield 1;
     yield 2;
@@ -4409,10 +4409,10 @@ records gotchas.
   `compiler` integration suites `tests/pipeline.rs` and
   `tests/perf_metrics.rs` each take ~25-30s (they compile+run every
   example / benchmark), so the full run takes a couple of minutes.
-- **Run a program:** `cargo run -- examples/<name>.0s`. The CLI caches
-  compiled bytecode in `out.c0s` in the CWD; **delete `out.c0s` before
+- **Run a program:** `cargo run -- examples/<name>.hy`. The CLI caches
+  compiled bytecode in `out.hyc` in the CWD; **delete `out.hyc` before
   re-running a different source or after editing** (e.g.
-  `rm -f out.c0s`), otherwise you execute stale bytecode.
+  `rm -f out.hyc`), otherwise you execute stale bytecode.
 
 ### Dev-build stdout noise
 
@@ -4420,14 +4420,14 @@ records gotchas.
   traces to STDOUT** (guarded by `#[cfg(debug_assertions)]` in
   `machine/src/memory/heap.rs`). These interleave with real program
   output. For clean output when demonstrating a program, build/run with
-  `--release` (`./target/release/zero-script examples/<name>.0s`).
+  `--release` (`./target/release/coil examples/<name>.hy`).
 
 ### FFI
 
 - `libffi` (system `libffi-dev`) is required for the FFI paths and is
   preinstalled in this environment; the FFI unit tests (`machine`) and
   pipeline golden tests (`strlen`, `ffi_sum`) pass. The standalone
-  `examples/strlen.0s` CLI run may **segfault** — that is a pre-existing
+  `examples/strlen.hy` CLI run may **segfault** — that is a pre-existing
   runtime issue in the example path, not an environment/setup problem
   (the equivalent FFI logic passes in the test suite).
 
@@ -4463,13 +4463,13 @@ FFI returns, multi-file CLI), then shipped P2 scripting ergonomics
 - Typechecker + codegen for positional ctor args, field
   `GetField`/`SetField`, and method `CALL` with `self` at slot 0.
 - Parser: `impl` methods via `.repeated()` (no commas required).
-- `examples/classes.0s` → `7458`.
+- `examples/classes.hy` → `7458`.
 
 ### Phase 3 — Coroutines
 
 - Builtin `done(h)` → `bool` via `DoneCoro`.
 - `async fn -> T` unifies declared `T` with yield/return slot `Y`.
-- `examples/coro_done.0s` → `falsefalsetrue`.
+- `examples/coro_done.hy` → `falsefalsetrue`.
 
 ### Phase 4 — FFI returns + invoke typing
 
@@ -4478,37 +4478,37 @@ FFI returns, multi-file CLI), then shipped P2 scripting ergonomics
 - `invoke` result type comes from `declare`'s recorded `ret` (side
   table; unwrap `ExprStatement`/`Statement` wrappers on `let id =
   declare(...)`).
-- Examples: `ffi_struct_ret.0s` (`34`), `ffi_callback_ret.0s` (`1`).
+- Examples: `ffi_struct_ret.hy` (`34`), `ffi_callback_ret.hy` (`1`).
 
 ### Phase 5 — Multi-file CLI
 
 - `src/main.rs` uses `Pipeline::compile_src_from_file`.
 - Recompile on missing/corrupt archive, version mismatch, or newer
-  entry mtime. `find_project_root` walks up for `zero.toml`.
-- Workspace `zero.toml` roots include `./examples/src` for modules.
+  entry mtime. `find_project_root` walks up for `coil.toml`.
+- Workspace `coil.toml` roots include `./examples/src` for modules.
 
 ### Phase 6 — Loops
 
 - `break` / `continue` via `loop_stack` + `BlockBuilder`.
 - C-style `for (init; cond; step)` desugars to `while` with continue
-  targeting the step. `examples/for_break.0s` → `18`.
+  targeting the step. `examples/for_break.hy` → `18`.
 
 ### Phase 7 — Strings + `format`
 
 - `string + string` → `FORMAT "%s%s"`.
 - User-facing `format` keyword leaves a string on the stack (no
-  `PRINT`). `examples/string_fmt.0s` → `hello world42-x`.
+  `PRINT`). `examples/string_fmt.hy` → `hello world42-x`.
 - FORMAT arg pop order fixed to source order.
 
 ### Phase 8 — `const`
 
 - Parser `const name = expr;` → `Expression::Constant`.
-- `examples/const.0s` → `42hi`.
+- `examples/const.hy` → `42hi`.
 
 ### Phase 9 — Growing arrays
 
 - Opcodes `ArrayPush` / `ArrayLen`; builtins `push` / `len`.
-- `examples/array_grow.0s` → `414`. Bumped `ARCHIVE_VERSION` to **15**.
+- `examples/array_grow.hy` → `414`. Bumped `ARCHIVE_VERSION` to **15**.
 
 ### Phase 10 — Scoped type aliases
 
@@ -4524,8 +4524,8 @@ FFI returns, multi-file CLI), then shipped P2 scripting ergonomics
 ### Critical regressions
 
 - `cargo test --workspace`
-- `cargo run -- examples/fib.0s` → `2178309`
-- `cargo run -- examples/modules.0s` / `classes.0s` / `for_break.0s`
+- `cargo run -- examples/fib.hy` → `2178309`
+- `cargo run -- examples/modules.hy` / `classes.hy` / `for_break.hy`
 - Pipeline goldens: fizbuz, coroutines, FFI, dict, arrays
 
 ### Release-build note (post-landing fix)

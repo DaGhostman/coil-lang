@@ -37,7 +37,7 @@ impl LspSink {
         self.sources
             .path(file)
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "untitled:zero-script".to_string())
+            .unwrap_or_else(|| "untitled:coil".to_string())
     }
 
     fn byte_to_position(text: &str, byte: usize) -> LspPosition {
@@ -90,7 +90,7 @@ impl DiagnosticSink for LspSink {
             )
         } else {
             (
-                Some("untitled:zero-script".to_string()),
+                Some("untitled:coil".to_string()),
                 LspRange {
                     start: LspPosition {
                         line: 0,
@@ -121,7 +121,7 @@ impl DiagnosticSink for LspSink {
             range,
             severity,
             code: diag.code.map(|c| LspCode::String(c.as_str().to_string())),
-            source: Some("zero-script".to_string()),
+            source: Some("coil".to_string()),
             message: diag.message,
             related_information: if related_information.is_empty() {
                 None
@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn lsp_ndjson_spanned_and_spanless() {
         let mut sources = SourceMap::new();
-        let file = sources.insert("test.0s", "let x = 1;\n");
+        let file = sources.insert("test.hy", "let x = 1;\n");
         let shared = SharedBuf::new();
         let mut sink = LspSink::new(sources, Box::new(shared.clone()));
 
@@ -270,14 +270,14 @@ mod tests {
         let first: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["severity"], 1);
         assert_eq!(first["code"], "E0102");
-        assert_eq!(first["source"], "zero-script");
+        assert_eq!(first["source"], "coil");
         assert_eq!(first["range"]["start"]["character"], 4);
         assert_eq!(first["relatedInformation"][0]["message"], "here");
         assert_eq!(first["data"]["help"], "expected int");
 
         let second: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["code"], "E0903");
-        assert_eq!(second["uri"], "untitled:zero-script");
+        assert_eq!(second["uri"], "untitled:coil");
     }
 
     #[test]

@@ -36,15 +36,15 @@ fn build_project(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = std::env::temp_dir().join(format!(
-        "zero_script_ns_test_{}_{}_{}",
+        "coil_ns_test_{}_{}_{}",
         test_name, pid, nanos
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp project dir");
 
     // Write the manifest.
-    let manifest_path = tmp.join("zero.toml");
-    std::fs::write(&manifest_path, manifest).expect("write zero.toml");
+    let manifest_path = tmp.join("coil.toml");
+    std::fs::write(&manifest_path, manifest).expect("write coil.toml");
 
     // Write the source files.
     for (rel, content) in files {
@@ -130,10 +130,10 @@ fn use_single_segment_resolves_in_src_root() {
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/main.0s", "use foo::sadge;\nfn main() { sadge(); }\n"),
-        ("src/foo/sadge.0s", "fn sadge() { print \"%x\\n\", 420; }\n"),
+        ("src/main.hy", "use foo::sadge;\nfn main() { sadge(); }\n"),
+        ("src/foo/sadge.hy", "fn sadge() { print \"%x\\n\", 420; }\n"),
     ];
-    let (root, entry) = build_project("use_single_segment", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("use_single_segment", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "1a4\n");
 }
@@ -145,10 +145,10 @@ fn use_with_alias_renames_imported_item() {
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/main.0s", "use foo::sadge as f;\nfn main() { f(); }\n"),
-        ("src/foo/sadge.0s", "fn sadge() { print \"%i\", 99; }\n"),
+        ("src/main.hy", "use foo::sadge as f;\nfn main() { f(); }\n"),
+        ("src/foo/sadge.hy", "fn sadge() { print \"%i\", 99; }\n"),
     ];
-    let (root, entry) = build_project("use_with_alias", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("use_with_alias", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "99");
 }
@@ -160,10 +160,10 @@ fn use_multi_segment_path_walks_into_nested_directory() {
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/main.0s", "use lib::io::read;\nfn main() { read(); }\n"),
-        ("src/lib/io/read.0s", "fn read() { print \"%i\", 7; }\n"),
+        ("src/main.hy", "use lib::io::read;\nfn main() { read(); }\n"),
+        ("src/lib/io/read.hy", "fn read() { print \"%i\", 7; }\n"),
     ];
-    let (root, entry) = build_project("use_multi_segment", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("use_multi_segment", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "7");
 }
@@ -175,17 +175,17 @@ fn multiple_roots_search_in_order() {
 roots = ["./src", "./vendor"]
 "#;
     let files = &[
-        ("src/main.0s", "use foo::greet;\nfn main() { greet(); }\n"),
+        ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
         (
-            "src/foo/greet.0s",
+            "src/foo/greet.hy",
             "fn greet() { print \"%s\", \"from-src\"; }\n",
         ),
         (
-            "vendor/foo/greet.0s",
+            "vendor/foo/greet.hy",
             "fn greet() { print \"%s\", \"from-vendor\"; }\n",
         ),
     ];
-    let (root, entry) = build_project("multiple_roots", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("multiple_roots", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "from-src");
 }
@@ -193,10 +193,10 @@ roots = ["./src", "./vendor"]
 #[test]
 fn no_manifest_uses_default_src_root() {
     let files = &[
-        ("src/main.0s", "use foo::greet;\nfn main() { greet(); }\n"),
-        ("src/foo/greet.0s", "fn greet() { print \"%i\", 42; }\n"),
+        ("src/main.hy", "use foo::greet;\nfn main() { greet(); }\n"),
+        ("src/foo/greet.hy", "fn greet() { print \"%i\", 42; }\n"),
     ];
-    let tmp = std::env::temp_dir().join("zero_script_ns_test_no_manifest");
+    let tmp = std::env::temp_dir().join("coil_ns_test_no_manifest");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("create temp dir");
     for (rel, content) in files {
@@ -206,7 +206,7 @@ fn no_manifest_uses_default_src_root() {
         }
         std::fs::write(&full, content).expect("write source file");
     }
-    let entry_full = tmp.join("src/main.0s");
+    let entry_full = tmp.join("src/main.hy");
     let output = run_project(&tmp, &entry_full);
     assert_eq!(output, "42");
 }
@@ -219,16 +219,16 @@ roots = ["./src"]
 "#;
     let files = &[
         (
-            "src/main.0s",
+            "src/main.hy",
             "use foo::*;\nfn main() { sadge(); greet(); }\n",
         ),
         (
-            "src/foo.0s",
+            "src/foo.hy",
             "fn sadge() { print \"%i\", 100; }\n\
              fn greet() { print \"%i\", 200; }\n",
         ),
     ];
-    let (root, entry) = build_project("use_glob", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("use_glob", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "100200");
 }
@@ -240,11 +240,11 @@ fn use_glob_does_not_reach_subdirectory_files() {
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/main.0s", "use foo::*;\nfn main() { top_only(); }\n"),
-        ("src/foo.0s", "fn top_only() { print \"%s\", \"ok\"; }\n"),
-        ("src/foo/bar.0s", "fn bar() { print \"%s\", \"BAD\"; }\n"),
+        ("src/main.hy", "use foo::*;\nfn main() { top_only(); }\n"),
+        ("src/foo.hy", "fn top_only() { print \"%s\", \"ok\"; }\n"),
+        ("src/foo/bar.hy", "fn bar() { print \"%s\", \"BAD\"; }\n"),
     ];
-    let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("use_glob_subdir", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "ok");
 }
@@ -257,17 +257,17 @@ roots = ["./src"]
 "#;
     let files = &[
         (
-            "src/main.0s",
+            "src/main.hy",
             "use iface::*;\n\
              impl Foreign<int> { fn id(int x) -> int { return x; } }\n\
              fn main() { }\n",
         ),
         (
-            "src/iface.0s",
+            "src/iface.hy",
             "trait Foreign<T> { fn id(T x) -> int; }\n",
         ),
     ];
-    let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("orphan_instance_modules", manifest, files, "src/main.hy");
     let msgs = compile_project_errors(&root, &entry);
     assert!(
         msgs.iter()
@@ -291,7 +291,7 @@ roots = ["./src"]
     // modules do not rewrite bare recursive calls to the FQN today.
     let files = &[
         (
-            "src/main.0s",
+            "src/main.hy",
             "use util::inc;\n\
              fn id<T>(T x) -> T { return x; }\n\
              fn fib(int n) -> int {\n\
@@ -304,11 +304,11 @@ roots = ["./src"]
              }\n",
         ),
         (
-            "src/util/inc.0s",
+            "src/util/inc.hy",
             "fn inc(int x) -> int { return x + 1; }\n",
         ),
     ];
-    let (root, entry) = build_project("two_module_polyfn_fib", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("two_module_polyfn_fib", manifest, files, "src/main.hy");
 
     let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
     let original_cwd = std::env::current_dir().expect("get cwd");
@@ -384,13 +384,13 @@ roots = ["./src"]
 "#;
     let files = &[
         (
-            "src/main.0s",
+            "src/main.hy",
             "use a::*;\nuse b::*;\nfn main() { from_a(); from_b(); }\n",
         ),
-        ("src/a.0s", "fn from_a() { print \"%i\", 1; }\n"),
-        ("src/b.0s", "fn from_b() { print \"%i\", 2; }\n"),
+        ("src/a.hy", "fn from_a() { print \"%i\", 1; }\n"),
+        ("src/b.hy", "fn from_b() { print \"%i\", 2; }\n"),
     ];
-    let (root, entry) = build_project("two_glob_imports", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("two_glob_imports", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "12");
 }
@@ -404,16 +404,16 @@ roots = ["./src"]
 "#;
     let files = &[
         (
-            "src/main.0s",
+            "src/main.hy",
             "use util::*;\nfn main() { print \"%i\", public_fn(); }\n",
         ),
         (
-            "src/util.0s",
+            "src/util.hy",
             "fn helper() -> int { return 7; }\n\
              fn public_fn() -> int { return helper(); }\n",
         ),
     ];
-    let (root, entry) = build_project("sibling_bare_call", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("sibling_bare_call", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "7");
 }
@@ -425,13 +425,13 @@ fn cross_module_static_slot_init_and_mutation() {
 roots = ["./src"]
 "#;
     let files = &[
-        ("src/counter.0s", "static let n = 0;\n"),
+        ("src/counter.hy", "static let n = 0;\n"),
         (
-            "src/main.0s",
+            "src/main.hy",
             "mod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    print \"%i\", counter::n;\n}\n",
         ),
     ];
-    let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.0s");
+    let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "5");
 }

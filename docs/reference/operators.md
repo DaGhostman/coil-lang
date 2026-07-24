@@ -1,6 +1,6 @@
 # Operators reference
 
-zero-script expressions use a **Pratt parser** with prefix, infix, and postfix operators. Higher rows in the [precedence table](#precedence-table-high-to-low) bind tighter.
+coil expressions use a **Pratt parser** with prefix, infix, and postfix operators. Higher rows in the [precedence table](#precedence-table-high-to-low) bind tighter.
 
 Associativity:
 
@@ -61,7 +61,7 @@ Mixed `int` and `float` operands → **type error** at compile time.
 
 String concatenation uses `+`:
 
-```0s
+```coil
 let s = "hello" + " " + "world";
 s += "!";
 ```

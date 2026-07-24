@@ -1,4 +1,4 @@
-//! End-to-end golden tests for `.0s` example programs.
+//! End-to-end golden tests for `.hy` example programs.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -93,7 +93,7 @@ fn example_panic_loc_archive_has_source_files() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root");
-    let path = workspace_root.join("examples/panic_loc.0s");
+    let path = workspace_root.join("examples/panic_loc.hy");
     let mut pipeline = Pipeline::new();
     let (bytecode, _constants) = pipeline
         .compile_src_from_file(path.to_str().unwrap())
@@ -103,8 +103,8 @@ fn example_panic_loc_archive_has_source_files() {
         debug
             .source_files
             .iter()
-            .any(|p| p.contains("panic_loc.0s")),
-        "expected panic_loc.0s in source_files: {:?}",
+            .any(|p| p.contains("panic_loc.hy")),
+        "expected panic_loc.hy in source_files: {:?}",
         debug.source_files
     );
     assert_eq!(debug.debug_locs.len(), bytecode.len());
@@ -119,31 +119,31 @@ fn example_panic_loc_archive_has_source_files() {
 
 #[test]
 fn example_option_prints_42() {
-    let output = run_example("examples/option.0s");
+    let output = run_example("examples/option.hy");
     assert_eq!(output, "42");
 }
 
 #[test]
 fn example_generics_uses_builtin_dictionary_abi() {
-    let output = run_example("examples/generics.0s");
+    let output = run_example("examples/generics.hy");
     assert_eq!(output, "7424.0427");
 }
 
 #[test]
 fn example_result_prints_42_and_neg1() {
-    let output = run_example("examples/result.0s");
+    let output = run_example("examples/result.hy");
     assert_eq!(output, "420-1");
 }
 
 #[test]
 fn example_raise_try_prints_10_neg() {
-    let output = run_example("examples/raise_try.0s");
+    let output = run_example("examples/raise_try.hy");
     assert_eq!(output, "10,neg");
 }
 
 #[test]
 fn example_assert_prints_ok_assertion_failed_custom() {
-    let output = run_example("examples/assert.0s");
+    let output = run_example("examples/assert.hy");
     assert_eq!(output, "ok,assertion failed,custom");
 }
 
@@ -175,61 +175,61 @@ fn main() {
 
 #[test]
 fn example_coalesce_prints_bar_hi_7_9() {
-    let output = run_example("examples/coalesce.0s");
+    let output = run_example("examples/coalesce.hy");
     assert_eq!(output, "bar,hi,7,9");
 }
 
 #[test]
 fn example_optional_chain_prints_42_0() {
-    let output = run_example("examples/optional_chain.0s");
+    let output = run_example("examples/optional_chain.hy");
     assert_eq!(output, "42,0");
 }
 
 #[test]
 fn example_tree_prints_6() {
-    let output = run_example("examples/tree.0s");
+    let output = run_example("examples/tree.hy");
     assert_eq!(output, "6");
 }
 
 #[test]
 fn example_fib_still_works() {
-    let output = run_example("examples/fib.0s");
+    let output = run_example("examples/fib.hy");
     assert_eq!(output, "55");
 }
 
 #[test]
 fn example_record_prints_169_5_12() {
-    let output = run_example("examples/record.0s");
+    let output = run_example("examples/record.hy");
     assert_eq!(output, "169512");
 }
 
 #[test]
 fn example_dict_prints_42_100_42() {
-    let output = run_example("examples/dict.0s");
+    let output = run_example("examples/dict.hy");
     assert_eq!(output, "4210042");
 }
 
 #[test]
 fn example_array_grow_prints_len_first_and_last() {
-    let output = run_example("examples/array_grow.0s");
+    let output = run_example("examples/array_grow.hy");
     assert_eq!(output, "414");
 }
 
 #[test]
 fn example_static_singleton_prints_121() {
-    let output = run_example("examples/static_singleton.0s");
+    let output = run_example("examples/static_singleton.hy");
     assert_eq!(output, "121");
 }
 
 #[test]
 fn example_static_minimal_prints_11() {
-    let output = run_example("examples/static_minimal.0s");
+    let output = run_example("examples/static_minimal.hy");
     assert_eq!(output, "11");
 }
 
 #[test]
 fn example_readonly_seal_prints_322() {
-    let output = run_example("examples/readonly_seal.0s");
+    let output = run_example("examples/readonly_seal.hy");
     assert_eq!(output, "322");
 }
 
@@ -270,104 +270,104 @@ fn main() {
 
 #[test]
 fn example_classes_prints_7458() {
-    let output = run_example("examples/classes.0s");
+    let output = run_example("examples/classes.hy");
     assert_eq!(output, "7458");
 }
 
 #[test]
 fn example_generic_class_prints_42() {
-    let output = run_example("examples/generic_class.0s");
+    let output = run_example("examples/generic_class.hy");
     assert_eq!(output, "42");
 }
 
 #[test]
 fn example_aliases_prints_3_4_7() {
-    let output = run_example("examples/aliases.0s");
+    let output = run_example("examples/aliases.hy");
     assert_eq!(output, "347");
 }
 
 #[test]
 fn example_generic_alias_prints_7() {
-    let output = run_example("examples/generic_alias.0s");
+    let output = run_example("examples/generic_alias.hy");
     assert_eq!(output, "7");
 }
 
 #[test]
 fn example_generic_enum_prints_7() {
-    let output = run_example("examples/generic_enum.0s");
+    let output = run_example("examples/generic_enum.hy");
     assert_eq!(output, "7");
 }
 
 #[test]
 fn example_generics_prints_add_results_for_int_and_float() {
-    let output = run_example("examples/generics.0s");
+    let output = run_example("examples/generics.hy");
     assert_eq!(output, "7424.0427");
 }
 
 #[test]
 fn example_typeclass_dict_forwards_dictionary_and_prints_42_twice() {
-    let output = run_example("examples/typeclass_dict.0s");
+    let output = run_example("examples/typeclass_dict.hy");
     assert_eq!(output, "4242");
 }
 
 #[test]
 fn example_typeclass_default_calls_sibling_and_prints_42() {
-    let output = run_example("examples/typeclass_default.0s");
+    let output = run_example("examples/typeclass_default.hy");
     assert_eq!(output, "42");
 }
 
 #[test]
 fn example_polyfn_supports_multi_instantiation_constraints_and_rank_n() {
-    let output = run_example("examples/polyfn.0s");
+    let output = run_example("examples/polyfn.hy");
     assert_eq!(output, "424.0424242");
 }
 
 /// Phase 4: `%v` displays through Show (builtin + user instance + format).
 #[test]
 fn example_generic_print_shows_primitives_and_user_type() {
-    let output = run_example("examples/generic_print.0s");
+    let output = run_example("examples/generic_print.hy");
     assert_eq!(output, "42hi1.5true(3,4)99");
 }
 
 /// Advanced generics Phase 4: a bare unary trait name is an existential type.
 #[test]
 fn example_existential_show_prints_42() {
-    let output = run_example("examples/existential_show.0s");
+    let output = run_example("examples/existential_show.hy");
     assert_eq!(output, "42");
 }
 
 /// Phase 8: tuples and anonymous records have structural Show for `%v`.
 #[test]
 fn example_show_tuple_prints_structural_tuple_and_record() {
-    let output = run_example("examples/show_tuple.0s");
+    let output = run_example("examples/show_tuple.hy");
     assert_eq!(output, "(1, 2){ a: 3, b: 4 }");
 }
 
 /// Constructor-kind trait `Container<Option>` + `get<F: Container, A>(F<A>)`.
 #[test]
 fn example_hkt_container_prints_42() {
-    let output = run_example("examples/hkt_container.0s");
+    let output = run_example("examples/hkt_container.hy");
     assert_eq!(output, "42");
 }
 
 /// Phase 1 advanced generics: binary HKT `Bifunctor<Result>`.
 #[test]
 fn example_hkt_bifunctor_prints_42() {
-    let output = run_example("examples/hkt_bifunctor.0s");
+    let output = run_example("examples/hkt_bifunctor.hy");
     assert_eq!(output, "42");
 }
 
 /// Phase 3: multi-param trait `Convert<A, B>` + `where` clause.
 #[test]
 fn example_multiparam_prints_42() {
-    let output = run_example("examples/multiparam.0s");
+    let output = run_example("examples/multiparam.hy");
     assert_eq!(output, "42");
 }
 
 /// Prelude `Into`: `let f: Fahrenheit = c.into();` with two local classes.
 #[test]
 fn example_into_prints_32() {
-    let output = run_example("examples/into.0s");
+    let output = run_example("examples/into.hy");
     assert_eq!(output, "32");
 }
 
@@ -424,28 +424,28 @@ fn main() {
 /// Phase 5: superclass / implied bounds (`Ordered<T: Equal>` → `eq_val` under `T: Ordered`).
 #[test]
 fn example_superclass_ord_prints_truetruefalse() {
-    let output = run_example("examples/superclass_ord.0s");
+    let output = run_example("examples/superclass_ord.hy");
     assert_eq!(output, "truetruefalse");
 }
 
 /// Advanced generics Phase 5: `c: * -> Constraint, T: c` with superclass method use.
 #[test]
 fn example_constraint_kind_prints_42() {
-    let output = run_example("examples/constraint_kind.0s");
+    let output = run_example("examples/constraint_kind.hy");
     assert_eq!(output, "42");
 }
 
 /// Phase 6: associated types — `Collect::Elem` pinned from ground instance.
 #[test]
 fn example_assoc_type_prints_42() {
-    let output = run_example("examples/assoc_type.0s");
+    let output = run_example("examples/assoc_type.hy");
     assert_eq!(output, "42");
 }
 
 /// Phase 3 advanced generics: generic associated type `Pointer::Ref<A>`.
 #[test]
 fn example_gat_pointer_prints_42() {
-    let output = run_example("examples/gat_pointer.0s");
+    let output = run_example("examples/gat_pointer.hy");
     assert_eq!(output, "42");
 }
 
@@ -669,13 +669,13 @@ fn monomorphized_generic_add_prints_3() {
 
 #[test]
 fn example_const_prints_42hi() {
-    let output = run_example("examples/const.0s");
+    let output = run_example("examples/const.hy");
     assert_eq!(output, "42hi");
 }
 
 #[test]
 fn string_fmt_example_prints_concatenated_and_formatted_strings() {
-    let output = run_example("examples/string_fmt.0s");
+    let output = run_example("examples/string_fmt.hy");
     assert_eq!(output, "hello world42-x");
 }
 
@@ -693,13 +693,13 @@ fn string_plus_equal_updates_binding() {
 
 #[test]
 fn example_mixed_prints_zero_circle_square_triangle() {
-    let output = run_example("examples/mixed.0s");
+    let output = run_example("examples/mixed.hy");
     assert_eq!(output, "025122");
 }
 
 #[test]
 fn example_chained_prints_42_7() {
-    let output = run_example("examples/chained.0s");
+    let output = run_example("examples/chained.hy");
     assert_eq!(output, "427");
 }
 
@@ -711,13 +711,13 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/result.0s");
+    let full = workspace_root.join("examples/result.hy");
     let src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
 
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
-    let mut ast = parser.parse(&src).expect("result.0s should parse");
+    let mut ast = parser.parse(&src).expect("result.hy should parse");
     let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
@@ -740,13 +740,13 @@ fn fizbuz_runs_to_completion() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
-    let full = workspace_root.join("examples/fizbuz.0s");
+    let full = workspace_root.join("examples/fizbuz.hy");
     let src = std::fs::read_to_string(&full)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", full.display(), e));
 
     let mut pipeline = compiler::Pipeline::new();
     let parser = parser::Pratt::default();
-    let mut ast = parser.parse(&src).expect("fizbuz.0s should parse");
+    let mut ast = parser.parse(&src).expect("fizbuz.hy should parse");
     let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
     use std::cell::RefCell;
@@ -801,13 +801,13 @@ fn let_binding_emits_store_pop_in_bytecode() {
 
 #[test]
 fn example_let_reassignment_works() {
-    let output = run_example("examples/let_test.0s");
+    let output = run_example("examples/let_test.hy");
     assert_eq!(output, "51020");
 }
 
 #[test]
 fn example_named_args_prints_ada36_grace40() {
-    let output = run_example("examples/named_args.0s");
+    let output = run_example("examples/named_args.hy");
     assert_eq!(output, "Ada36Grace40");
 }
 
@@ -853,7 +853,7 @@ fn main() {
 
 #[test]
 fn example_let_destructure_prints_12342() {
-    let output = run_example("examples/let_destructure.0s");
+    let output = run_example("examples/let_destructure.hy");
     assert_eq!(output, "12342");
 }
 
@@ -875,7 +875,7 @@ fn main() {
 
 #[test]
 fn example_variadic_prints_60_hi() {
-    let output = run_example("examples/variadic.0s");
+    let output = run_example("examples/variadic.hy");
     assert_eq!(output, "60Hi!?");
 }
 
@@ -1015,7 +1015,7 @@ fn nested_if_in_loop_runs_correctly() {
 
 #[test]
 fn example_nested_records_prints_99() {
-    let output = run_example("examples/nested_records.0s");
+    let output = run_example("examples/nested_records.hy");
     assert_eq!(output, "99");
 }
 
@@ -1095,7 +1095,7 @@ fn example_ffi_sum_via_dlopen_prints_42() {
         .expect("compiler crate must have a parent (workspace root)");
 
     // Absolute dload path avoids cwd races in parallel tests.
-    let full = workspace_root.join("examples/ffi_sum.0s");
+    let full = workspace_root.join("examples/ffi_sum.hy");
     let lib_abs = libsum
         .canonicalize()
         .unwrap_or_else(|_| libsum.clone());
@@ -1130,8 +1130,8 @@ fn example_strlen_prints_5() {
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("compiler crate must have a parent (workspace root)");
-        let full = workspace_root.join("examples/strlen.0s");
-        let src = std::fs::read_to_string(&full).expect("read strlen.0s");
+        let full = workspace_root.join("examples/strlen.hy");
+        let src = std::fs::read_to_string(&full).expect("read strlen.hy");
         run_example_src_with_entry(&src, Some(full.as_path()))
     });
     let output = match result {
@@ -1254,8 +1254,8 @@ fn example_ffi_printf_prints_hello_42() {
             let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("compiler crate must have a parent (workspace root)");
-            let full = workspace_root.join("examples/ffi_printf.0s");
-            let src = std::fs::read_to_string(&full).expect("read ffi_printf.0s");
+            let full = workspace_root.join("examples/ffi_printf.hy");
+            let src = std::fs::read_to_string(&full).expect("read ffi_printf.hy");
             let ((), os_out) = with_captured_os_stdout(|| {
                 let _vm_out = run_example_src_with_entry(&src, Some(full.as_path()));
             });
@@ -1336,37 +1336,37 @@ fn main() {
 
 #[test]
 fn example_coro_prints_suspended_1_resumed() {
-    let output = run_example("examples/coro.0s");
+    let output = run_example("examples/coro.hy");
     assert_eq!(output, "Suspended\n1Resumed\n");
 }
 
 #[test]
 fn example_coro_gen_prints_012() {
-    let output = run_example("examples/coro_gen.0s");
+    let output = run_example("examples/coro_gen.hy");
     assert_eq!(output, "012");
 }
 
 #[test]
 fn example_coro_interleave_prints_out_of_order_counters() {
-    let output = run_example("examples/coro_interleave.0s");
+    let output = run_example("examples/coro_interleave.hy");
     assert_eq!(output, "10,100,101,11,12,102");
 }
 
 #[test]
 fn example_coro_send_prints_hello() {
-    let output = run_example("examples/coro_send.0s");
+    let output = run_example("examples/coro_send.hy");
     assert_eq!(output, "hello");
 }
 
 #[test]
 fn example_coro_yield_from_prints_012() {
-    let output = run_example("examples/coro_yield_from.0s");
+    let output = run_example("examples/coro_yield_from.hy");
     assert_eq!(output, "012");
 }
 
 #[test]
 fn example_coro_done_prints_false_false_true() {
-    let output = run_example("examples/coro_done.0s");
+    let output = run_example("examples/coro_done.hy");
     assert_eq!(output, "falsefalsetrue");
 }
 
@@ -1374,31 +1374,31 @@ fn example_coro_done_prints_false_false_true() {
 fn example_for_in_coro_prints_012_and_breaks() {
     // counter yields 0,1,2 then returns 99 — completion must NOT print.
     // early yields 10,20,30 — break on 20 prints only 10.
-    let output = run_example("examples/for_in_coro.0s");
+    let output = run_example("examples/for_in_coro.hy");
     assert_eq!(output, "01210");
 }
 
 #[test]
 fn example_for_in_array_prints_123() {
-    let output = run_example("examples/for_in_array.0s");
+    let output = run_example("examples/for_in_array.hy");
     assert_eq!(output, "123");
 }
 
 #[test]
 fn example_for_in_tuple_prints_123() {
-    let output = run_example("examples/for_in_tuple.0s");
+    let output = run_example("examples/for_in_tuple.hy");
     assert_eq!(output, "123");
 }
 
 #[test]
 fn example_for_in_dict_prints_12() {
-    let output = run_example("examples/for_in_dict.0s");
+    let output = run_example("examples/for_in_dict.hy");
     assert_eq!(output, "12");
 }
 
 #[test]
 fn example_for_in_custom_prints_012() {
-    let output = run_example("examples/for_in_custom.0s");
+    let output = run_example("examples/for_in_custom.hy");
     assert_eq!(output, "012");
 }
 
@@ -1406,7 +1406,7 @@ fn example_for_in_custom_prints_012() {
 fn example_range_prints_01234012356() {
     // 0..5 → 01234; 0..=3 → 0123; 10..0 empty; byte 5..=6 → 56;
     // float 1.0..4.0 → 1.02.03.0
-    let output = run_example("examples/range.0s");
+    let output = run_example("examples/range.hy");
     assert_eq!(output, "012340123561.02.03.0");
 }
 
@@ -1623,7 +1623,7 @@ fn example_ffi_array_sum_prints_15() {
         ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
-    let output = run_ffi_example_with_lib("examples/ffi_array.0s", &libsum);
+    let output = run_ffi_example_with_lib("examples/ffi_array.hy", &libsum);
     assert_eq!(output, "15");
 }
 
@@ -1634,7 +1634,7 @@ fn example_ffi_callback_prints_42() {
         ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
-    let output = run_ffi_example_with_lib("examples/ffi_callback.0s", &libsum);
+    let output = run_ffi_example_with_lib("examples/ffi_callback.hy", &libsum);
     assert_eq!(output, "42");
 }
 
@@ -1645,7 +1645,7 @@ fn example_ffi_struct_return_prints_34() {
         ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
-    let output = run_ffi_example_with_lib("examples/ffi_struct_ret.0s", &libsum);
+    let output = run_ffi_example_with_lib("examples/ffi_struct_ret.hy", &libsum);
     assert_eq!(output, "34");
 }
 
@@ -1656,13 +1656,13 @@ fn example_ffi_callback_return_prints_1() {
         ffi_soft_skip(&format!("{} not built", libsum.display()));
         return;
     }
-    let output = run_ffi_example_with_lib("examples/ffi_callback_ret.0s", &libsum);
+    let output = run_ffi_example_with_lib("examples/ffi_callback_ret.hy", &libsum);
     assert_eq!(output, "1");
 }
 
 #[test]
 fn example_operators_prints_expected() {
-    let output = run_example("examples/operators.0s");
+    let output = run_example("examples/operators.hy");
     assert_eq!(output, "801125428falsetrue3");
 }
 
@@ -1686,13 +1686,13 @@ fn example_while_loop_accumulates_correctly() {
 
 #[test]
 fn example_for_break_prints_18() {
-    let output = run_example("examples/for_break.0s");
+    let output = run_example("examples/for_break.hy");
     assert_eq!(output, "18");
 }
 
 #[test]
 fn example_derive_show_eq_prints_expected() {
-    let output = run_example("examples/derive_show_eq.0s");
+    let output = run_example("examples/derive_show_eq.hy");
     assert_eq!(
         output,
         "Color::Red,true,false,true,Point::Point { x: 5, y: 12 },true,false,Cell { value: 42 },true,false"
@@ -1756,25 +1756,25 @@ fn main() {
 
 #[test]
 fn example_attr_ffi_strlen_prints_5() {
-    let output = run_example("examples/attr_ffi.0s");
+    let output = run_example("examples/attr_ffi.hy");
     assert_eq!(output, "5");
 }
 
 #[test]
 fn example_spread_prints_3_and_60() {
-    let output = run_example("examples/spread.0s");
+    let output = run_example("examples/spread.hy");
     assert_eq!(output, "360");
 }
 
 #[test]
 fn example_attr_decorator_forwards_args_and_stacks_attrs() {
-    let output = run_example("examples/attr_decorator.0s");
+    let output = run_example("examples/attr_decorator.hy");
     assert_eq!(output, "enterdo_thinghi42");
 }
 
 #[test]
 fn example_attr_class_decorates_constructor() {
-    let output = run_example("examples/attr_class.0s");
+    let output = run_example("examples/attr_class.hy");
     assert_eq!(output, "Point ctor512");
 }
 
@@ -1814,10 +1814,10 @@ fn attr_test_fn_discovered_by_harness() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("tests/positive/attr_test.0s"),
+            .join("tests/positive/attr_test.hy"),
     )
-    .expect("read attr_test.0s");
-    let (bytecode, constants) = pipeline.compile_src(&src).expect("compile attr_test.0s");
+    .expect("read attr_test.hy");
+    let (bytecode, constants) = pipeline.compile_src(&src).expect("compile attr_test.hy");
     let cases = pipeline.test_cases().to_vec();
     assert_eq!(
         cases.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
@@ -1838,61 +1838,61 @@ fn attr_test_fn_discovered_by_harness() {
 
 #[test]
 fn example_perf_numeric_prints_expected_sum() {
-    let output = run_example("examples/perf/numeric.0s");
+    let output = run_example("examples/perf/numeric.hy");
     assert_eq!(output, "1999000");
 }
 
 #[test]
 fn example_perf_array_mut_prints_expected() {
-    let output = run_example("examples/perf/array_mut.0s");
+    let output = run_example("examples/perf/array_mut.hy");
     assert_eq!(output, "2000");
 }
 
 #[test]
 fn example_perf_dict_hot_prints_expected() {
-    let output = run_example("examples/perf/dict_hot.0s");
+    let output = run_example("examples/perf/dict_hot.hy");
     assert_eq!(output, "6000");
 }
 
 #[test]
 fn example_perf_operators_loop_prints_expected() {
-    let output = run_example("examples/perf/operators_loop.0s");
+    let output = run_example("examples/perf/operators_loop.hy");
     assert_eq!(output, "149912");
 }
 
 #[test]
 fn example_perf_coro_ping_prints_expected() {
-    let output = run_example("examples/perf/coro_ping.0s");
+    let output = run_example("examples/perf/coro_ping.hy");
     assert_eq!(output, "124750");
 }
 
 #[test]
 fn example_io_bytes_prints_25532() {
-    let output = run_example("examples/io_bytes.0s");
+    let output = run_example("examples/io_bytes.hy");
     assert_eq!(output, "25532");
 }
 
 #[test]
 fn example_io_file_prints_2() {
-    let output = run_example("examples/io_file.0s");
+    let output = run_example("examples/io_file.hy");
     assert_eq!(output, "2");
 }
 
 #[test]
 fn example_io_eof_prints_eof() {
-    let output = run_example("examples/io_eof.0s");
+    let output = run_example("examples/io_eof.hy");
     assert_eq!(output, "eof");
 }
 
 #[test]
 fn example_io_text_prints_hello2() {
-    let output = run_example("examples/io_text.0s");
+    let output = run_example("examples/io_text.hy");
     assert_eq!(output, "hello2");
 }
 
 #[test]
 fn example_io_udp_prints_2() {
-    let output = run_example("examples/io_udp.0s");
+    let output = run_example("examples/io_udp.hy");
     assert_eq!(output, "2");
 }
 
@@ -1900,7 +1900,7 @@ fn example_io_udp_prints_2() {
 /// the stack as the MakeTuple element, not the outer native id.
 #[test]
 fn example_io_nested_host_prints_3() {
-    let output = run_example("examples/io_nested_host.0s");
+    let output = run_example("examples/io_nested_host.hy");
     assert_eq!(output, "3");
 }
 
@@ -1908,7 +1908,7 @@ fn example_io_nested_host_prints_3() {
 /// Outer arity > 1 — MakeTuple must pack the stream, not the outer native id.
 #[test]
 fn example_io_nested_write_prints_2() {
-    let output = run_example("examples/io_nested_write.0s");
+    let output = run_example("examples/io_nested_write.hy");
     assert_eq!(output, "2");
 }
 
@@ -2290,25 +2290,25 @@ fn main() {
 
 #[test]
 fn example_overload_prints_15() {
-    let output = run_example("examples/overload.0s");
+    let output = run_example("examples/overload.hy");
     assert_eq!(output, "15");
 }
 
 #[test]
 fn example_fn_value_prints_423() {
-    let output = run_example("examples/fn_value.0s");
+    let output = run_example("examples/fn_value.hy");
     assert_eq!(output, "423");
 }
 
 #[test]
 fn example_lambda_prints_42() {
-    let output = run_example("examples/lambda.0s");
+    let output = run_example("examples/lambda.hy");
     assert_eq!(output, "42");
 }
 
 #[test]
 fn example_method_overload_prints_1116() {
-    let output = run_example("examples/method_overload.0s");
+    let output = run_example("examples/method_overload.hy");
     assert_eq!(output, "1116");
 }
 

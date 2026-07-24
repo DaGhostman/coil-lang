@@ -1,4 +1,4 @@
-//! Per-instruction debug locations shipped in `.c0s` archives.
+//! Per-instruction debug locations shipped in `.hyc` archives.
 
 use rkyv::{Archive, Deserialize, Serialize};
 

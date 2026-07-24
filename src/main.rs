@@ -9,7 +9,7 @@ use machine::Machine;
 use reporting::{ErrorCode, ReportConfig, ReportFormat};
 use rkyv::rancor::Error;
 
-const DEFAULT_OUT: &str = "out.c0s";
+const DEFAULT_OUT: &str = "out.hyc";
 const TESTS_DIR: &str = "tests";
 
 mod package_app;
@@ -18,7 +18,7 @@ use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
-    /// Legacy: compile entry → out.c0s (cached) → run.
+    /// Legacy: compile entry → out.hyc (cached) → run.
     BuildAndRun { filename: String },
     Compile { filename: String, output: String },
     Run { archive: String },
@@ -46,18 +46,18 @@ struct CliArgs {
 fn print_help() {
     eprintln!(
         "Usage:\n\
-         \x20 zero-script [--log-json | --log-lsp] <file.0s>\n\
-         \x20 zero-script [--log-json | --log-lsp] compile <file.0s> [-o|--output <path>]\n\
-         \x20 zero-script [--log-json | --log-lsp] run <file.c0s>\n\
-         \x20 zero-script [--log-json | --log-lsp] package <file.0s> [-o|--output <path>]\n\
-         \x20 zero-script [--log-json | --log-lsp] test [path] [--fail-fast]\n\
+         \x20 coil [--log-json | --log-lsp] <file.hy>\n\
+         \x20 coil [--log-json | --log-lsp] compile <file.hy> [-o|--output <path>]\n\
+         \x20 coil [--log-json | --log-lsp] run <file.hyc>\n\
+         \x20 coil [--log-json | --log-lsp] package <file.hy> [-o|--output <path>]\n\
+         \x20 coil [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \n\
          Commands:\n\
-         \x20 (default)  Compile <file.0s> to out.c0s (cached) and run it\n\
-         \x20 compile    Compile an entry file (must define main) to a .c0s archive\n\
-         \x20 run        Execute a previously compiled .c0s archive\n\
-         \x20 package    Build a single-host executable (runner + embedded .c0s)\n\
-         \x20 test       Compile and run every .0s file under [path] (default: ./tests)\n\
+         \x20 (default)  Compile <file.hy> to out.hyc (cached) and run it\n\
+         \x20 compile    Compile an entry file (must define main) to a .hyc archive\n\
+         \x20 run        Execute a previously compiled .hyc archive\n\
+         \x20 package    Build a single-host executable (runner + embedded .hyc)\n\
+         \x20 test       Compile and run every .hy file under [path] (default: ./tests)\n\
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
          \n\
          Options:\n\
@@ -167,7 +167,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             }
         }
         [cmd] if cmd == "compile" => return Err("compile requires an entry file"),
-        [cmd] if cmd == "run" => return Err("run requires a .c0s archive path"),
+        [cmd] if cmd == "run" => return Err("run requires a .hyc archive path"),
         [cmd] if cmd == "package" => return Err("package requires an entry file"),
         [cmd, filename] if cmd == "package" => {
             if filename == "package" || filename == "compile" || filename == "run" || filename == "test" {
@@ -262,7 +262,7 @@ pub(crate) fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: i
 }
 
 fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
-    // Multi-file entry: discovers `use` / `mod` via zero.toml.
+    // Multi-file entry: discovers `use` / `mod` via coil.toml.
     let (bytecode, constants) = match pipeline.compile_src_from_file(filename) {
         Ok(ok) => ok,
         Err(()) => {
@@ -467,7 +467,7 @@ fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, out)?;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("0s") {
+            } else if path.extension().and_then(|e| e.to_str()) == Some("hy") {
                 out.push(path);
             }
         }
@@ -477,7 +477,7 @@ fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     files.sort();
     if files.is_empty() {
         return Err(format!(
-            "no `.0s` test files found under `{}`",
+            "no `.hy` test files found under `{}`",
             dir.display()
         ));
     }
@@ -767,18 +767,18 @@ mod tests {
     use super::*;
 
     fn args(parts: &[&str]) -> Vec<String> {
-        std::iter::once("zero-script".to_string())
+        std::iter::once("coil".to_string())
             .chain(parts.iter().map(|s| (*s).to_string()))
             .collect()
     }
 
     #[test]
     fn parse_legacy_build_and_run() {
-        let cli = parse_args(&args(&["examples/fib.0s"])).unwrap();
+        let cli = parse_args(&args(&["examples/fib.hy"])).unwrap();
         assert_eq!(
             cli.command,
             Command::BuildAndRun {
-                filename: "examples/fib.0s".into()
+                filename: "examples/fib.hy".into()
             }
         );
         assert!(!cli.log_json);
@@ -786,11 +786,11 @@ mod tests {
 
     #[test]
     fn parse_compile_default_output() {
-        let cli = parse_args(&args(&["compile", "examples/fib.0s"])).unwrap();
+        let cli = parse_args(&args(&["compile", "examples/fib.hy"])).unwrap();
         assert_eq!(
             cli.command,
             Command::Compile {
-                filename: "examples/fib.0s".into(),
+                filename: "examples/fib.hy".into(),
                 output: DEFAULT_OUT.into(),
             }
         );
@@ -798,46 +798,46 @@ mod tests {
 
     #[test]
     fn parse_compile_with_short_output() {
-        let cli = parse_args(&args(&["compile", "examples/fib.0s", "-o", "fib.c0s"])).unwrap();
+        let cli = parse_args(&args(&["compile", "examples/fib.hy", "-o", "fib.hyc"])).unwrap();
         assert_eq!(
             cli.command,
             Command::Compile {
-                filename: "examples/fib.0s".into(),
-                output: "fib.c0s".into(),
+                filename: "examples/fib.hy".into(),
+                output: "fib.hyc".into(),
             }
         );
     }
 
     #[test]
     fn parse_compile_with_long_output_before_command() {
-        let cli = parse_args(&args(&["--output", "x.c0s", "compile", "a.0s"])).unwrap();
+        let cli = parse_args(&args(&["--output", "x.hyc", "compile", "a.hy"])).unwrap();
         assert_eq!(
             cli.command,
             Command::Compile {
-                filename: "a.0s".into(),
-                output: "x.c0s".into(),
+                filename: "a.hy".into(),
+                output: "x.hyc".into(),
             }
         );
     }
 
     #[test]
     fn parse_run() {
-        let cli = parse_args(&args(&["run", "out.c0s"])).unwrap();
+        let cli = parse_args(&args(&["run", "out.hyc"])).unwrap();
         assert_eq!(
             cli.command,
             Command::Run {
-                archive: "out.c0s".into()
+                archive: "out.hyc".into()
             }
         );
     }
 
     #[test]
     fn parse_package_default_output() {
-        let cli = parse_args(&args(&["package", "examples/fib.0s"])).unwrap();
+        let cli = parse_args(&args(&["package", "examples/fib.hy"])).unwrap();
         assert_eq!(
             cli.command,
             Command::Package {
-                filename: "examples/fib.0s".into(),
+                filename: "examples/fib.hy".into(),
                 output: "fib".into(),
                 runner: None,
                 check_native: false,
@@ -850,21 +850,21 @@ mod tests {
     fn parse_package_with_flags() {
         let cli = parse_args(&args(&[
             "package",
-            "app.0s",
+            "app.hy",
             "-o",
             "myapp",
             "--check-native",
             "--strip-debug",
             "--runner",
-            "/usr/bin/zero-script",
+            "/usr/bin/coil",
         ]))
         .unwrap();
         assert_eq!(
             cli.command,
             Command::Package {
-                filename: "app.0s".into(),
+                filename: "app.hy".into(),
                 output: "myapp".into(),
-                runner: Some(PathBuf::from("/usr/bin/zero-script")),
+                runner: Some(PathBuf::from("/usr/bin/coil")),
                 check_native: true,
                 strip_debug: true,
             }
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn parse_log_flags_with_subcommand() {
-        let cli = parse_args(&args(&["--log-json", "compile", "a.0s"])).unwrap();
+        let cli = parse_args(&args(&["--log-json", "compile", "a.hy"])).unwrap();
         assert!(cli.log_json);
         assert!(matches!(cli.command, Command::Compile { .. }));
 
@@ -922,9 +922,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_output_on_run_and_test() {
-        assert!(parse_args(&args(&["run", "a.c0s", "-o", "x"])).is_err());
+        assert!(parse_args(&args(&["run", "a.hyc", "-o", "x"])).is_err());
         assert!(parse_args(&args(&["test", "-o", "x"])).is_err());
-        assert!(parse_args(&args(&["examples/fib.0s", "-o", "x"])).is_err());
+        assert!(parse_args(&args(&["examples/fib.hy", "-o", "x"])).is_err());
         assert!(parse_args(&args(&["test", "--include-tests"])).is_err());
     }
 
@@ -937,9 +937,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_fail_fast_on_non_test_commands() {
-        assert!(parse_args(&args(&["--fail-fast", "examples/fib.0s"])).is_err());
-        assert!(parse_args(&args(&["compile", "a.0s", "--fail-fast"])).is_err());
-        assert!(parse_args(&args(&["run", "out.c0s", "--fail-fast"])).is_err());
+        assert!(parse_args(&args(&["--fail-fast", "examples/fib.hy"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.hy", "--fail-fast"])).is_err());
+        assert!(parse_args(&args(&["run", "out.hyc", "--fail-fast"])).is_err());
     }
 
     #[test]
@@ -951,19 +951,19 @@ mod tests {
 
     #[test]
     fn parse_rejects_unrecognized_flag() {
-        assert!(parse_args(&args(&["--bogus", "a.0s"])).is_err());
+        assert!(parse_args(&args(&["--bogus", "a.hy"])).is_err());
     }
 
     #[test]
     fn parse_rejects_duplicate_output_and_missing_output_path() {
-        assert!(parse_args(&args(&["compile", "a.0s", "-o"])).is_err());
-        assert!(parse_args(&args(&["compile", "a.0s", "-o", "-x"])).is_err());
-        assert!(parse_args(&args(&["compile", "a.0s", "-o", "x", "--output", "y"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.hy", "-o"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.hy", "-o", "-x"])).is_err());
+        assert!(parse_args(&args(&["compile", "a.hy", "-o", "x", "--output", "y"])).is_err());
     }
 
     #[test]
     fn parse_rejects_too_many_args_and_reserved_compile_names() {
-        assert!(parse_args(&args(&["a.0s", "b.0s"])).is_err());
+        assert!(parse_args(&args(&["a.hy", "b.hy"])).is_err());
         assert!(parse_args(&args(&["compile", "compile"])).is_err());
         assert!(parse_args(&args(&["compile", "run"])).is_err());
         assert!(parse_args(&args(&["compile", "test"])).is_err());
@@ -975,14 +975,14 @@ mod tests {
         let cli = parse_args(&args(&["--log-json", "--log-lsp", "test"])).unwrap();
         assert!(cli.log_json && cli.log_lsp);
 
-        let cli = parse_args(&args(&["--include-tests", "examples/fib.0s"])).unwrap();
+        let cli = parse_args(&args(&["--include-tests", "examples/fib.hy"])).unwrap();
         assert!(cli.include_tests);
         assert!(matches!(cli.command, Command::BuildAndRun { .. }));
     }
 
     fn unique_tmp(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "zero_script_cli_{label}_{}_{}",
+            "coil_cli_{label}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1047,8 +1047,8 @@ mod tests {
     fn source_newer_than_archive_compares_mtimes() {
         let dir = unique_tmp("mtime");
         std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("a.0s");
-        let arch = dir.join("a.c0s");
+        let src = dir.join("a.hy");
+        let arch = dir.join("a.hyc");
         // Archive first, then source after a short sleep so src mtime is newer.
         std::fs::write(&arch, b"old").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -1059,7 +1059,7 @@ mod tests {
         ));
         // Missing paths => false
         assert!(!source_newer_than_archive(
-            dir.join("nope.0s").to_str().unwrap(),
+            dir.join("nope.hy").to_str().unwrap(),
             arch.to_str().unwrap()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1077,12 +1077,12 @@ mod tests {
         let root = unique_tmp("nested_tests");
         let nested = root.join("more");
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(root.join("b.0s"), b"fn main() {}").unwrap();
-        std::fs::write(nested.join("a.0s"), b"fn main() {}").unwrap();
+        std::fs::write(root.join("b.hy"), b"fn main() {}").unwrap();
+        std::fs::write(nested.join("a.hy"), b"fn main() {}").unwrap();
         std::fs::write(root.join("ignore.txt"), b"x").unwrap();
         let files = collect_test_files(&root).expect("files");
         assert_eq!(files.len(), 2);
-        assert!(files[0].ends_with("a.0s") || files[0].ends_with("b.0s"));
+        assert!(files[0].ends_with("a.hy") || files[0].ends_with("b.hy"));
         // Sorted lexicographically by full path.
         assert!(files[0] < files[1]);
         let _ = std::fs::remove_dir_all(&root);
@@ -1091,12 +1091,12 @@ mod tests {
 
     #[test]
     fn is_compile_fail_detects_path_segment() {
-        assert!(is_compile_fail(Path::new("tests/compile_fail/bad.0s")));
-        assert!(is_compile_fail(Path::new("/tmp/compile_fail/x.0s")));
-        assert!(is_compile_fail(Path::new("suite/nested/compile_fail/deep/x.0s")));
-        assert!(!is_compile_fail(Path::new("tests/arithmetic.0s")));
-        assert!(!is_compile_fail(Path::new("tests/compile_fail_not/x.0s")));
-        assert!(!is_compile_fail(Path::new("tests/my_compile_fail/x.0s")));
+        assert!(is_compile_fail(Path::new("tests/compile_fail/bad.hy")));
+        assert!(is_compile_fail(Path::new("/tmp/compile_fail/x.hy")));
+        assert!(is_compile_fail(Path::new("suite/nested/compile_fail/deep/x.hy")));
+        assert!(!is_compile_fail(Path::new("tests/arithmetic.hy")));
+        assert!(!is_compile_fail(Path::new("tests/compile_fail_not/x.hy")));
+        assert!(!is_compile_fail(Path::new("tests/my_compile_fail/x.hy")));
     }
 
     #[test]
@@ -1122,19 +1122,19 @@ mod tests {
 
         // Type error under compile_fail/ ⇒ harness pass.
         std::fs::write(
-            cf.join("bad.0s"),
+            cf.join("bad.hy"),
             "fn main() {\n  let x: int = \"no\";\n}\n",
         )
         .unwrap();
         // Well-typed under compile_fail/ ⇒ harness failure (inverted).
         std::fs::write(
-            cf.join("unexpected_ok.0s"),
+            cf.join("unexpected_ok.hy"),
             "fn main() {\n  print \"%i\", 1;\n}\n",
         )
         .unwrap();
         // Normal positive case still runs.
         std::fs::write(
-            pos.join("ok.0s"),
+            pos.join("ok.hy"),
             "test(\"ok\") {\n  assert(true)?;\n}\n",
         )
         .unwrap();
@@ -1155,12 +1155,12 @@ mod tests {
 
         // Lexicographic order: a_ok before z_bad — fail-fast must stop after a_ok.
         std::fs::write(
-            cf.join("a_ok.0s"),
+            cf.join("a_ok.hy"),
             "fn main() {\n  print \"%i\", 1;\n}\n",
         )
         .unwrap();
         std::fs::write(
-            cf.join("z_bad.0s"),
+            cf.join("z_bad.hy"),
             "fn main() {\n  let x: int = \"no\";\n}\n",
         )
         .unwrap();

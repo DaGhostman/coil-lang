@@ -1,6 +1,6 @@
 # Syntax reference
 
-Complete grammar overview for zero-script source (`.0s`). This document describes what the parser accepts today; see [Types](types.md), [Operators](operators.md), and [Keywords](keywords.md) for semantics.
+Complete grammar overview for coil source (`.hy`). This document describes what the parser accepts today; see [Types](types.md), [Operators](operators.md), and [Keywords](keywords.md) for semantics.
 
 ---
 
@@ -8,8 +8,8 @@ Complete grammar overview for zero-script source (`.0s`). This document describe
 
 | Extension | Role |
 |-----------|------|
-| `.0s` | Source text parsed by `parser::Pratt` |
-| `.c0s` | Compiled bytecode archive (rkyv-serialized `ArchivedProgram`) |
+| `.hy` | Source text parsed by `parser::Pratt` |
+| `.hyc` | Compiled bytecode archive (rkyv-serialized `ArchivedProgram`) |
 
 Programs are sequences of **declarations** and **statements**. Most top-level items are declarations; statements appear inside function bodies and blocks.
 
@@ -32,7 +32,7 @@ literal     ::= string | int | float | 'true' | 'false'
 
 Examples:
 
-```0s
+```coil
 #[derive(Show, Eq, Ord)]
 enum Color { Red, Blue }
 
@@ -59,7 +59,7 @@ class Point { x: int, y: int }
 | Attribute | Target | Semantics |
 |-----------|--------|-----------|
 | `#[derive(Trait, …)]` | `enum` / `class` | Synthesizes builtin trait instances (`Show`, `Eq`, `Ord`) |
-| `#[test]` / `#[test("desc")]` | `fn` with body | Registers a `zero-script test` harness case (Result mode) |
+| `#[test]` / `#[test("desc")]` | `fn` with body | Registers a `coil test` harness case (Result mode) |
 | `#[ffi(lib = "…", name = "…", variadic = true)]` | signature-only `fn …;` | Desugars to compile-time `extern` lowering |
 | User `attr` names | `fn`, methods, `class` | Expands to a wrapper that receives the decoratee callable, attribute extras, and forwarded call arguments (`...args`); class attrs wrap the constructor |
 
@@ -88,7 +88,7 @@ Multiple attributes stack (e.g. `#[derive(Show)] #[derive(Eq)]`). Unknown attrib
 program ::= declaration*
 ```
 
-Every runnable program needs `fn main() { ... }` (or an entry file declared in `zero.toml`).
+Every runnable program needs `fn main() { ... }` (or an entry file declared in `coil.toml`).
 
 ---
 
@@ -136,7 +136,7 @@ attr_param  ::= type_fn_sig IDENT          // first param: `fn(...args) -> T tar
 type_fn_sig ::= 'fn' '(' '...' IDENT ')' '->' type_annotation
 ```
 
-Arity overloads (same name, different arities / rest ranges), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.0s`, `fn_value.0s`, and `lambda.0s`.
+Arity overloads (same name, different arities / rest ranges), first-class monomorphic functions (`let f = add`), positional and named partial application, and explicit-capture lambdas (`fn (T x) use (y) => …`) are supported. See `examples/overload.hy`, `fn_value.hy`, and `lambda.hy`.
 
 
 Call sites may use named arguments (`name: expr`) after any positional
@@ -158,7 +158,7 @@ call_arg    ::= expr | '...' expr
 
 Examples:
 
-```0s
+```coil
 fn triple(int a, int b, int c) -> int { return a + b + c; }
 triple(...(1, 2, 3));          // tuple spread
 triple(...[10, 20, 30]);       // array spread
@@ -168,7 +168,7 @@ attr wrap<T>(fn(...args) -> T target, ...args) -> T {
 }
 ```
 
-```0s
+```coil
 fn add(int a, int b) -> int { return a + b; }
 fn add<T: Num>(T a, T b) -> T { return a + b; }
 fn apply_cast<A, B>(A x) -> B where Convert<A, B> { return cast(x); }
@@ -204,7 +204,7 @@ The type after `for` is prepended as the first type argument (Self slot):
 
 Example:
 
-```0s
+```coil
 // Builtin arithmetic: Add / Sub / Mul / Div (Num implies all four).
 // Builtin ordering: Lt / Le / Gt / Ge (Ord implies all four).
 
@@ -272,7 +272,7 @@ enum_decl ::= attr_list? 'enum' IDENT type_param_list? '{' variant (',' variant)
 
 Example:
 
-```0s
+```coil
 enum Tree { Leaf, Node(int, Tree, Tree) }
 enum Point { Origin, Point { x: int, y: int } }
 #[derive(Show, Eq, Ord)]
@@ -311,7 +311,7 @@ rejected inside `extern` — use bare `...` instead.
 
 Example:
 
-```0s
+```coil
 extern "c" {
     fn strlen(string s) -> int;
     fn printf(string fmt, ...) -> int;
@@ -322,7 +322,7 @@ extern "c" {
 
 Equivalent attribute form for a single function:
 
-```0s
+```coil
 #[ffi(lib = "c")]
 fn strlen(string s) -> int;
 ```
@@ -344,7 +344,7 @@ See [Trait derive](types.md#trait-derive) for `#[derive(...)]`.
 
 Example:
 
-```0s
+```coil
 class Foo { pub name: string, count: int, }
 impl Foo {
     pub fn bump() -> int { return 1; }
@@ -360,7 +360,7 @@ impl Cell<T> {
 }
 ```
 
-Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.0s` and `examples/generic_class.0s`.
+Classes support positional constructor args (field order), field read/write, and method calls with implicit `self`. See `examples/classes.hy` and `examples/generic_class.hy`.
 
 Note: trait `impl` (`impl Collect<Option<int>> { … }`) uses a different
 parse path — see [Traits and impl](#traits-and-impl) above.
@@ -421,7 +421,7 @@ statement ::= while_stmt
 
 Empty index `arr[]` is valid **only** as an assignment target and appends to a dynamic array:
 
-```0s
+```coil
 arr[] = value;
 ```
 
@@ -431,7 +431,7 @@ Using `arr[]` as an rvalue is a compile error. See [Built-ins — Array append](
 
 Prefix `readonly` on array literals or `new` seals the value against external mutation:
 
-```0s
+```coil
 let xs = readonly [1, 2, 3];
 let p = readonly new Point(1, 2);
 ```
@@ -485,7 +485,7 @@ binding_yield ::= 'let' IDENT '=' yield_expr
 
 Examples:
 
-```0s
+```coil
 async fn ping() {
     let msg = yield "ready";
     print "%s", msg;
@@ -529,7 +529,7 @@ field_pattern   ::= IDENT (':' pattern)?   /* shorthand: x => x: x */
 
 Examples:
 
-```0s
+```coil
 match x {
     Option::None => 0,
     Option::Some(v) => v,
@@ -590,7 +590,7 @@ Arms are comma-separated inside `match { ... }`. The last arm may use `_` or `de
 
 ## Multi-file projects
 
-With `zero.toml`, the pipeline discovers dependencies via `use` / `mod` and compiles each file with a namespace prefix. The **entry file** uses the empty namespace. See [Modules reference](modules.md).
+With `coil.toml`, the pipeline discovers dependencies via `use` / `mod` and compiles each file with a namespace prefix. The **entry file** uses the empty namespace. See [Modules reference](modules.md).
 
 ---
 
@@ -615,14 +615,14 @@ Construction needs only `Ord`. **`for` iteration** steps with `+1` /
 `+1.0` for `int`, `byte`, and `float` (other `Ord` types may form a
 range value but are not iterable yet).
 
-```0s
+```coil
 for x in 0..5 { print "%i", x; }   // 01234
 let r = 0..=3;
 for x in r { print "%i", x; }      // 0123
 for x in 1.0..4.0 { print "%f", x; } // 1.02.03.0
 ```
 
-See `examples/range.0s`.
+See `examples/range.hy`.
 
 **Deferred:** turning a range into a concrete array (e.g. a future
 `collect(0..5)` → `[0, 1, 2, 3, 4]`), step syntax, iterating non-numeric

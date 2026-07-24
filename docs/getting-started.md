@@ -1,12 +1,12 @@
 # Getting Started
 
-This guide walks you through building zero-script, running your first program, and understanding how source becomes bytecode on the VM.
+This guide walks you through building coil, running your first program, and understanding how source becomes bytecode on the VM.
 
 ## Prerequisites
 
 ### Rust toolchain
 
-zero-script is a Rust workspace. Install a recent stable Rust toolchain ([rustup](https://rustup.rs/)) and ensure `cargo` is on your `PATH`.
+coil is a Rust workspace. Install a recent stable Rust toolchain ([rustup](https://rustup.rs/)) and ensure `cargo` is on your `PATH`.
 
 ```bash
 rustc --version
@@ -15,7 +15,7 @@ cargo --version
 
 ### libffi (optional, for FFI examples)
 
-Examples that call C code (`examples/strlen.0s`, `examples/ffi_sum.0s`) require **libffi** at link time.
+Examples that call C code (`examples/strlen.hy`, `examples/ffi_sum.hy`) require **libffi** at link time.
 
 | Platform | Package |
 |----------|---------|
@@ -30,8 +30,15 @@ You can build and run all non-FFI examples without libffi.
 Clone the repository and build the workspace from the root:
 
 ```bash
-cd zero-script
+git clone git@github.com:DaGhostman/coil-lang.git
+cd coil-lang
 cargo build --workspace
+```
+
+The GitHub repository is named **`coil-lang`**. If you previously cloned **`zero`** / **zero-script**, update the remote after the repository is renamed on GitHub, or clone fresh:
+
+```bash
+git remote set-url origin git@github.com:DaGhostman/coil-lang.git
 ```
 
 For optimized binaries:
@@ -40,15 +47,15 @@ For optimized binaries:
 cargo build --release --workspace
 ```
 
-A successful build produces the `zero-script` binary (via `src/main.rs`) plus the `parser`, `compiler`, `machine`, and `common` crates as libraries.
+A successful build produces the `coil` binary (via `src/main.rs`) plus the `parser`, `compiler`, `machine`, and `common` crates as libraries.
 
 ## Run your first program
 
 The canonical starter example computes the 10th Fibonacci number recursively
 (fast enough for debug builds; the release CPU bench uses
-`examples/fib_bench.0s` with `fib(32)`):
+`examples/fib_bench.hy` with `fib(32)`):
 
-```0s
+```coil
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -65,38 +72,38 @@ fn main() {
 Run it:
 
 ```bash
-cargo run -- examples/fib.0s
+cargo run -- examples/fib.hy
 ```
 
 **Expected output:** `55`
 
-The default CLI invocation compiles `examples/fib.0s` to bytecode, serializes it into `out.c0s` in the current directory (if needed), then loads and executes it on the VM.
+The default CLI invocation compiles `examples/fib.hy` to bytecode, serializes it into `out.hyc` in the current directory (if needed), then loads and executes it on the VM.
 
 ### CLI commands
 
 | Invocation | Meaning |
 |------------|---------|
-| `zero-script <file.0s>` | Compile to `out.c0s` (cached) and run |
-| `zero-script compile <file.0s> [-o path]` | Compile only; default output is `out.c0s` |
-| `zero-script run <file.c0s>` | Execute a previously compiled archive |
-| `zero-script package <file.0s> [-o path]` | Build a **single executable** for this OS/arch (embedded `.c0s`) |
-| `zero-script test [path] [--fail-fast]` | Compile and run every `.0s` under `[path]` (default `./tests`) |
+| `coil <file.hy>` | Compile to `out.hyc` (cached) and run |
+| `coil compile <file.hy> [-o path]` | Compile only; default output is `out.hyc` |
+| `coil run <file.hyc>` | Execute a previously compiled archive |
+| `coil package <file.hy> [-o path]` | Build a **single executable** for this OS/arch (embedded `.hyc`) |
+| `coil test [path] [--fail-fast]` | Compile and run every `.hy` under `[path]` (default `./tests`) |
 
 Examples:
 
 ```bash
 # Compile only, custom archive path
-cargo run -- compile examples/fib.0s -o /tmp/fib.c0s
+cargo run -- compile examples/fib.hy -o /tmp/fib.hyc
 
 # Run that archive
-cargo run -- run /tmp/fib.c0s
+cargo run -- run /tmp/fib.hyc
 
-# Single-file app for this machine (no separate .c0s or zero-script install needed to run)
-cargo run --release -- package examples/fib.0s -o ./fib-app
+# Single-file app for this machine (no separate .hyc or coil install needed to run)
+cargo run --release -- package examples/fib.hy -o ./fib-app
 ./fib-app
 
 # With FFI: verify required shared libraries exist on this machine before shipping
-cargo run --release -- package examples/strlen.0s -o ./strlen-app --check-native
+cargo run --release -- package examples/strlen.hy -o ./strlen-app --check-native
 
 # Project tests (default root ./tests)
 cargo run -- test
@@ -108,13 +115,13 @@ Layout under `./tests`:
 
 | Path | Meaning |
 |------|---------|
-| `tests/**/*.0s` (except below) | Must compile; each `test("…")` or `#[test]` case must return `Ok` |
-| `tests/compile_fail/**/*.0s` | Must **fail** to compile (negative syntax / type tests) |
+| `tests/**/*.hy` (except below) | Must compile; each `test("…")` or `#[test]` case must return `Ok` |
+| `tests/compile_fail/**/*.hy` | Must **fail** to compile (negative syntax / type tests) |
 | `tests/positive/`, `tests/negative_runtime/` | Organized positive and soft-failure runtime suites |
 
 A test file can declare multiple cases without `fn main`:
 
-```0s
+```coil
 test("addition works") {
     assert(1 + 1 == 2)?;
 }
@@ -127,20 +134,20 @@ fn multiply_works() {
 
 Each `test("…") { … }` or `#[test]` function body runs in Result mode. A failed `assert`/`?` or a language `panic` fails that case; by default the harness continues to the next case (each case runs in an isolated VM so a panic does not skip later cases). Failures print `> Test "<description>" failed`. Files without `test(...)` cases still use a single `fn main()` as one opaque case. Files under `compile_fail/` pass only when compilation returns a clean diagnostic rejection (`Err`); a compiler panic does not count (and aborts under release `panic = "abort"`). Diagnostics for those files are silenced so the summary stays readable.
 
-**Production builds** (`cargo run -- file.0s`, `zero-script compile`) **omit** harness declarations by default — `test("…")` blocks and `#[test]` functions are stripped before codegen so they are not shipped in `out.c0s`. Use `--include-tests` to embed them (useful when you want to run the harness against a pre-built archive on another machine):
+**Production builds** (`cargo run -- file.hy`, `coil compile`) **omit** harness declarations by default — `test("…")` blocks and `#[test]` functions are stripped before codegen so they are not shipped in `out.hyc`. Use `--include-tests` to embed them (useful when you want to run the harness against a pre-built archive on another machine):
 
 ```bash
-zero-script --include-tests compile myapp.0s -o myapp.c0s
-zero-script test ./tests          # always includes harness tests
+coil --include-tests compile myapp.hy -o myapp.hyc
+coil test ./tests          # always includes harness tests
 ```
 
 ### Recompiling after changes
 
-The default (`BuildAndRun`) path caches `out.c0s`. After editing a `.0s` file, delete the archive to pick up changes, or rely on automatic invalidation:
+The default (`BuildAndRun`) path caches `out.hyc`. After editing a `.hy` file, delete the archive to pick up changes, or rely on automatic invalidation:
 
 ```bash
-rm -f out.c0s
-cargo run -- examples/fib.0s
+rm -f out.hyc
+cargo run -- examples/fib.hy
 ```
 
 The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source. The dedicated `compile` command always recompiles; `run` never recompiles (it rejects a version-mismatched archive and asks you to rebuild from source).
@@ -150,12 +157,12 @@ The CLI recompiles automatically when the archive is missing, corrupt, version-m
 For a minimal smoke test:
 
 ```bash
-cargo run -- examples/print_literal.0s
+cargo run -- examples/print_literal.hy
 ```
 
 Source:
 
-```0s
+```coil
 fn main() {
     print "hello";
 }
@@ -166,7 +173,7 @@ fn main() {
 ## Project layout
 
 ```
-zero-script/
+coil/
 ├── common/              # Opcodes, values, diagnostics, archive envelope
 ├── parser/              # Lexer + Pratt parser → AST
 ├── compiler/
@@ -178,32 +185,32 @@ zero-script/
 │   ├── src/vm.rs          # Bytecode interpreter
 │   ├── src/memory/        # Stack, heap, GC
 │   └── src/ffi/           # libffi dynamic calls + host natives
-├── examples/              # Runnable .0s programs (catalog in examples.md)
+├── examples/              # Runnable .hy programs (catalog in examples.md)
 ├── docs/                  # User documentation (you are here)
 ├── src/main.rs            # `cargo run` entry point
-└── zero.toml.example      # Sample project manifest for modules
+└── coil.toml.example      # Sample project manifest for modules
 ```
 
 ### Crate responsibilities
 
 | Crate | Role |
 |-------|------|
-| `parser` | Turn `.0s` text into an AST (`Expression`, `Pattern`, declarations) |
-| `compiler` | Typecheck, emit bytecode, peephole-optimize, write `.c0s` archives |
+| `parser` | Turn `.hy` text into an AST (`Expression`, `Pattern`, declarations) |
+| `compiler` | Typecheck, emit bytecode, peephole-optimize, write `.hyc` archives |
 | `machine` | Execute bytecode; manage stack, heap, and automatic GC |
 | `common` | Shared `Instruction` opcodes, `Value` representation, `ArchivedProgram` |
 
 ## Compilation model
 
-zero-script uses a **single-pass stack codegen** pipeline (with a post-codegen peephole pass). There is no separate register-IR stage in the current tree.
+coil uses a **single-pass stack codegen** pipeline (with a post-codegen peephole pass). There is no separate register-IR stage in the current tree.
 
 ```
 ┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────┐
-│  .0s source │ →  │ Parser (AST) │ →  │ HM checker  │ →  │ Codegen  │
+│  .hy source │ →  │ Parser (AST) │ →  │ HM checker  │ →  │ Codegen  │
 └─────────────┘    └──────────────┘    └─────────────┘    └────┬─────┘
                                                                 │
                     ┌──────────────┐    ┌─────────────┐         ▼
-                    │ VM execute   │ ←  │  out.c0s    │ ←  Peephole
+                    │ VM execute   │ ←  │  out.hyc    │ ←  Peephole
                     └──────────────┘    │  (rkyv)     │
                                         └─────────────┘
 ```
@@ -225,10 +232,10 @@ Every program must define `fn main()`. The compiler emits a short prologue (`CAL
 
 | Extension | Meaning |
 |-----------|---------|
-| `.0s` | zero-script source |
-| `.c0s` | Compiled bytecode archive (rkyv-serialized `ArchivedProgram`) |
+| `.hy` | Coil source (`.hy` = **henry**, the SI unit of inductance) |
+| `.hyc` | Compiled bytecode archive (rkyv-serialized `ArchivedProgram`) |
 
-The default CLI writes `out.c0s` in the working directory. Treat archives as **compiler-version-specific** — stale archives are rejected when `ARCHIVE_VERSION` changes.
+The default CLI writes `out.hyc` in the working directory. Treat archives as **compiler-version-specific** — stale archives are rejected when `ARCHIVE_VERSION` changes.
 
 ## What you can write today
 
@@ -244,7 +251,7 @@ The language includes:
 - **Type aliases** `type Point = (int, int);`
 - **Modules** via `use foo::bar;` and `mod foo;` (multi-file projects; see [reference/modules.md](reference/modules.md))
 - **FFI** via `extern "lib" { ... }` or runtime `dload` / `declare` / `invoke`
-- **Classes** (partial — see `examples/classes.0s`)
+- **Classes** (partial — see `examples/classes.hy`)
 - **Coroutines** — `async fn`, `yield`, `resume`, `resume h with v`, `let x = yield e`, `yield from` (see [tutorial/08-coroutines.md](tutorial/08-coroutines.md))
 
 Not yet available: string concatenation with `+`, and a user-facing `format` keyword (use `print "%i", value` instead).
@@ -254,19 +261,19 @@ Not yet available: string concatenation with `+`, and a user-facing `format` key
 1. **Tutorial** — start with [01 — Basics](tutorial/01-basics.md) for a guided tour of syntax and types.
 2. **Examples** — browse the full catalog in [examples.md](examples.md); each entry includes the run command and expected output.
 3. **Reference** — keep [reference/syntax.md](reference/syntax.md) and [reference/types.md](reference/types.md) open while you code.
-4. **Modules** — copy `zero.toml.example` to `zero.toml` when you split code across files; see [reference/project-config.md](reference/project-config.md).
+4. **Modules** — copy `coil.toml.example` to `coil.toml` when you split code across files; see [reference/project-config.md](reference/project-config.md).
 
 ### Suggested learning path
 
 | Step | Example | Teaches |
 |------|---------|---------|
-| 1 | `print_literal.0s` | `print`, `main` |
-| 2 | `let_test.0s` | `let`, reassignment |
-| 3 | `fizbuz.0s` | `if`, modulo, multiple prints |
-| 4 | `option.0s` | enums, `match` |
-| 5 | `record.0s` | record variants, field access |
-| 6 | `dict.0s` | anonymous records |
-| 7 | `aliases.0s` | type aliases, tuples |
-| 8 | `strlen.0s` or `ffi_sum.0s` | FFI (after installing libffi) |
+| 1 | `print_literal.hy` | `print`, `main` |
+| 2 | `let_test.hy` | `let`, reassignment |
+| 3 | `fizbuz.hy` | `if`, modulo, multiple prints |
+| 4 | `option.hy` | enums, `match` |
+| 5 | `record.hy` | record variants, field access |
+| 6 | `dict.hy` | anonymous records |
+| 7 | `aliases.hy` | type aliases, tuples |
+| 8 | `strlen.hy` or `ffi_sum.hy` | FFI (after installing libffi) |
 
 Happy scripting.

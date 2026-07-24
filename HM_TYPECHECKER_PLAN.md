@@ -6,7 +6,7 @@
 
 Wire up the automatic GC in `Machine::execute` (the missing
 piece flagged by 15C's "Anything 15D needs to know" #2), add
-golden end-to-end tests for `.0s` files, document the
+golden end-to-end tests for `.hy` files, document the
 `JUMP_IF_MATCH` 16-bit target ceiling, clean up review nits, and
 land the polish that closes out the sum-types/match work.
 
@@ -44,13 +44,13 @@ has on the stack that points into the heap is a potential root.
 Immediates (ints, floats, bools) aren't roots but the trace
 function already ignores non-heap addresses.
 
-### 15D.2 — examples/result.0s
+### 15D.2 — examples/result.hy
 
 Sum-of-sum (`Option<Result<int>>`) demonstrating nested match
 with both a binding pattern (`Some(v)`) and a nested
 constructor pattern (`Result::Ok(Option::Some(v))`).
 
-### 15D.3 — examples/tree.0s
+### 15D.3 — examples/tree.hy
 
 Recursive enum (binary tree) to verify the isorecursive
 encoding (MUST-HAVE #1 from the red-team): a `Tree` enum whose
@@ -60,9 +60,9 @@ encoding (MUST-HAVE #1 from the red-team): a `Tree` enum whose
 
 A new `compiler/tests/pipeline.rs` integration test that:
 
-1. Reads an `.0s` file from disk.
+1. Reads an `.hy` file from disk.
 2. Compiles it in-memory via a new `Pipeline::compile_src`
-   helper (avoids the `out.c0s` round-trip).
+   helper (avoids the `out.hyc` round-trip).
 3. Runs the resulting bytecode through a new
    `Machine::with_output(...)` builder that captures stdout.
 4. Asserts on the exact captured output.

@@ -404,7 +404,7 @@ pub enum Expression<'expr> {
         ty: Box<Output<'expr>>,
     },
 
-    /// Top-level `test("description") { … }` case for `zero-script test`.
+    /// Top-level `test("description") { … }` case for `coil test`.
     ///
     /// The name expression should be a string literal; the body is a block
     /// typechecked in Result mode (`Result<(), string>`).

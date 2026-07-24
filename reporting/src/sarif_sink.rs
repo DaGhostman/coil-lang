@@ -125,7 +125,7 @@ impl DiagnosticSink for SarifSink {
             runs: vec![SarifRun {
                 tool: SarifTool {
                     driver: SarifDriver {
-                        name: "zero-script".to_string(),
+                        name: "coil".to_string(),
                     },
                 },
                 artifacts,
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn sarif_spanned_message_shaped_diagnostic() {
         let mut sources = SourceMap::new();
-        let file = sources.insert("test.0s", "let x = 1;\n");
+        let file = sources.insert("test.hy", "let x = 1;\n");
 
         let mut msg = Message::error(ErrorCode::TypeMismatch, "Type mismatch".into(), 4..5);
         msg.with_help("expected int".into());
@@ -303,7 +303,7 @@ mod tests {
 
         let v: Value = serde_json::from_str(&shared.into_string()).unwrap();
         assert_eq!(v["version"], "2.1.0");
-        assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "zero-script");
+        assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "coil");
         let result = &v["runs"][0]["results"][0];
         assert_eq!(result["ruleId"], "E0102");
         assert_eq!(result["level"], "error");

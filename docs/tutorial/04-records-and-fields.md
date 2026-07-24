@@ -10,7 +10,7 @@ This chapter assumes you have read [Enums and Pattern Matching](03-enums-and-mat
 
 Declare a variant with named fields inside braces:
 
-```0s
+```coil
 enum Point {
     Origin,
     Point { x: int, y: int },
@@ -25,7 +25,7 @@ Here `Origin` is a unit variant (no payload) and `Point` is a record variant wit
 
 Use `Enum::Variant { field: value, ... }`:
 
-```0s
+```coil
 Point::Point { x: 5, y: 12 }
 ```
 
@@ -33,7 +33,7 @@ Point::Point { x: 5, y: 12 }
 
 Fields can appear in any order at the call site. The compiler reorders them to match the declaration:
 
-```0s
+```coil
 Point::Point { y: 12, x: 5 }   // same as { x: 5, y: 12 }
 ```
 
@@ -41,7 +41,7 @@ Point::Point { y: 12, x: 5 }   // same as { x: 5, y: 12 }
 
 When a field's type is another record-shaped enum, nest constructors:
 
-```0s
+```coil
 enum Inner {
     Inner { v: int },
 }
@@ -61,7 +61,7 @@ let p = Outer::Outer { x: Inner::Inner { v: 42 }, y: 7 };
 
 Match a record variant and bind each field:
 
-```0s
+```coil
 match p {
     Point::Origin => 0,
     Point::Point { x: x_val, y: y_val } => x_val * x_val + y_val * y_val,
@@ -72,7 +72,7 @@ match p {
 
 When the pattern variable name matches the field name, omit the value side:
 
-```0s
+```coil
 Point::Point { x, y } => x * x + y * y
 ```
 
@@ -80,9 +80,9 @@ Point::Point { x, y } => x * x + y * y
 
 ### Nested record patterns
 
-Patterns can nest constructors inside record fields. From `examples/nested_records.0s`:
+Patterns can nest constructors inside record fields. From `examples/nested_records.hy`:
 
-```0s
+```coil
 enum Inner {
     I { v: int },
 }
@@ -115,7 +115,7 @@ Nested patterns work at arbitrary depth — a record inside a tuple inside a rec
 
 Instead of destructuring in a `match`, read a single field directly:
 
-```0s
+```coil
 fn x_coord(Point p) -> int {
     return p.x;
 }
@@ -125,9 +125,9 @@ Dot access works on values whose type is a record-shaped enum variant. The compi
 
 ### Worked example: pattern vs. field access
 
-From `examples/record.0s`:
+From `examples/record.hy`:
 
-```0s
+```coil
 enum Point {
     Origin,
     Point { x: int, y: int },
@@ -169,9 +169,9 @@ Use `match` when you need to branch on the variant tag (e.g. `Origin` vs `Point`
 
 ## Chained field access
 
-When a field's type is itself a record-shaped enum, chain dots to read through nested records. From `examples/chained.0s`:
+When a field's type is itself a record-shaped enum, chain dots to read through nested records. From `examples/chained.hy`:
 
-```0s
+```coil
 enum Inner {
     Inner { v: int },
 }
@@ -212,7 +212,7 @@ Record-shaped **enum variants** and anonymous **dict literals** look similar but
 | Tag | carries a variant tag for `match` | no tag — plain data |
 | Field access | `p.x` (enum `LoadField`) | `d.x` (string-keyed lookup) |
 
-```0s
+```coil
 // enum record variant — tagged, matchable
 let p = Point::Point { x: 5, y: 12 };
 
@@ -236,7 +236,7 @@ Supplying the same field twice in a constructor or pattern:
 Duplicate field `x` in record constructor `Point`
 ```
 
-```0s
+```coil
 Point::Point { x: 1, x: 2 }   // error
 ```
 
@@ -248,7 +248,7 @@ Omitting a required field from a constructor:
 Missing field `y` in record constructor `Point`
 ```
 
-```0s
+```coil
 Point::Point { x: 1 }   // error — `y` is required
 ```
 
@@ -260,7 +260,7 @@ Referencing a field that does not exist in the declaration:
 Unknown field `z` in record constructor `Point`
 ```
 
-```0s
+```coil
 Point::Point { x: 1, y: 2, z: 3 }   // error
 ```
 
@@ -272,7 +272,7 @@ Using the wrong payload shape for a variant:
 Constructor `Point` payload shape mismatch (declared as record, called as tuple)
 ```
 
-```0s
+```coil
 // declared as Point { x: int, y: int }
 Point::Point(5, 12)   // error — use { x: 5, y: 12 } instead
 ```
@@ -291,7 +291,7 @@ This applies to both dot access on enum record variants and anonymous dicts.
 
 ## Quick reference
 
-```0s
+```coil
 // Declaration
 enum E {
     V { x: int, y: int },

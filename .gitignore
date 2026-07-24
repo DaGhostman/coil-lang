@@ -1,7 +1,8 @@
 /target
+tmp/
 flamegraph.svg
 perf.*
 callgrind.out*
-out.c0s
+out.hyc
 *.so
 *.o

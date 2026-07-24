@@ -10,7 +10,7 @@ This chapter builds on [Types and Variables](02-types-and-variables.md). Record-
 
 An enum groups related variants under one type name. For the common “maybe” / “success or failure” shapes, prefer the **compiler-built-in** [`Option` and `Result`](09-error-handling.md) — do not redeclare those names.
 
-```0s
+```coil
 enum Tree {
     Leaf,
     Node(int, Tree, Tree),
@@ -33,7 +33,7 @@ A single enum can mix all three shapes. See [Mixed-shape enums](#mixed-shape-enu
 
 Use `Enum::Variant` to build a value:
 
-```0s
+```coil
 Tree::Leaf                // unit variant
 Option::Some(42)          // built-in Option — tuple payload
 ```
@@ -42,7 +42,7 @@ Option::Some(42)          // built-in Option — tuple payload
 
 `Variant` and `Variant()` are equivalent for unit variants:
 
-```0s
+```coil
 Tree::Leaf
 Tree::Leaf()   // same thing
 ```
@@ -51,7 +51,7 @@ Tree::Leaf()   // same thing
 
 Record variants use named fields:
 
-```0s
+```coil
 Point::Point { x: 5, y: 12 }
 ```
 
@@ -63,7 +63,7 @@ Field order at the call site does not have to match the declaration — `Point::
 
 A `match` tests a scrutinee value against a list of patterns and runs the body of the first matching arm:
 
-```0s
+```coil
 match scrutinee {
     pattern1 => body1,
     pattern2 => body2,
@@ -80,19 +80,19 @@ match scrutinee {
 
 Constructor patterns mirror constructor syntax. A unit variant matches by name:
 
-```0s
+```coil
 Option::None => 0
 ```
 
 A tuple variant binds positional payloads:
 
-```0s
+```coil
 Option::Some(v) => v
 ```
 
 A record variant binds named fields (with shorthand — see chapter 04):
 
-```0s
+```coil
 Point::Point { x, y } => x * x + y * y
 ```
 
@@ -100,7 +100,7 @@ Point::Point { x, y } => x * x + y * y
 
 Every arm must produce a value, and all arm bodies must have the **same type**. The `match` expression itself evaluates to that unified type:
 
-```0s
+```coil
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -117,9 +117,9 @@ Because `match` is an expression, it can appear anywhere a value is expected —
 
 ## Worked example: built-in `Option`
 
-From `examples/option.0s` (`Option` is a compiler builtin — no local `enum` declaration):
+From `examples/option.hy` (`Option` is a compiler builtin — no local `enum` declaration):
 
-```0s
+```coil
 fn unwrap(Option o) -> int {
     return match o {
         Option::None => 0,
@@ -150,7 +150,7 @@ Non-exhaustive match: variants not covered: `Some`
 
 Cover every variant, use a wildcard arm to catch the rest, or combine both:
 
-```0s
+```coil
 match o {
     Option::None => 0,
     Option::Some(v) => v,
@@ -179,7 +179,7 @@ This catches copy-paste mistakes and redundant patterns before they silently dea
 
 When a variant's payload is itself an enum, you can nest constructor patterns in a single arm:
 
-```0s
+```coil
 Result::Ok(Option::Some(v)) => v
 ```
 
@@ -187,9 +187,9 @@ This matches a `Result::Ok` whose inner `Option` is `Some`, binding `v` to the i
 
 ### Inner-pattern dispatch
 
-When **multiple arms share the same outer variant** but differ on the inner pattern, the runtime dispatches on the inner tag at match time. From `examples/result.0s`:
+When **multiple arms share the same outer variant** but differ on the inner pattern, the runtime dispatches on the inner tag at match time. From `examples/result.hy`:
 
-```0s
+```coil
 fn unwrap_result(Result r) -> int {
     return match r {
         Result::Err(_) => -1,
@@ -221,9 +221,9 @@ The two `Result::Ok` arms share the outer tag but differ on the inner `Option` t
 
 ## Recursive enums
 
-Variants can reference their own enum type, enabling tree-like structures. From `examples/tree.0s`:
+Variants can reference their own enum type, enabling tree-like structures. From `examples/tree.hy`:
 
-```0s
+```coil
 enum Tree {
     Leaf,
     Node(int, Tree, Tree),
@@ -251,9 +251,9 @@ The tree has value `1` at the root, `2` on the left subtree, and `3` on the righ
 
 ## Mixed-shape enums
 
-A single enum can combine unit, tuple, and record variants. From `examples/mixed.0s`:
+A single enum can combine unit, tuple, and record variants. From `examples/mixed.hy`:
 
-```0s
+```coil
 enum Shape {
     Empty,
     CircleR(int),
@@ -293,7 +293,7 @@ Each arm uses the pattern shape that matches its variant: no payload for `Empty`
 
 ## Quick reference
 
-```0s
+```coil
 // Declaration
 enum E {
     Unit,                    // no payload

@@ -1,0 +1,33 @@
+// examples/classes.hy — class ctor args, fields, mutation, methods.
+//
+// Output: 7458
+//   7  — 2*2+3
+//   4  — Point(1,3).sum()
+//   5  — p.x after set_x(5)
+//   8  — p.sum() after mutation
+
+class Point {
+    x: int,
+    y: int,
+}
+
+impl Point {
+    fn sum() -> int {
+        return self.x + self.y;
+    }
+
+    fn set_x(int n) {
+        self.x = n;
+    }
+}
+
+fn main() {
+    print "%i", (2 * 2 + 3);
+
+    let p = new Point(1, 3);
+    print "%i", p.sum();
+
+    p.set_x(5);
+    print "%i", p.x;
+    print "%i", p.sum();
+}

@@ -1,15 +1,15 @@
-//! Integration tests for `zero-script package` (requires the real CLI binary, not the test harness).
+//! Integration tests for `coil package` (requires the real CLI binary, not the test harness).
 
 use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
 fn package_fib_embedded_run_prints_55() {
-    let bin = std::env::var("CARGO_BIN_EXE_zero-script")
-        .expect("CARGO_BIN_EXE_zero-script (run via `cargo test -p zero-script`)");
+    let bin = std::env::var("CARGO_BIN_EXE_coil")
+        .expect("CARGO_BIN_EXE_coil (run via `cargo test -p coil`)");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let entry = manifest.join("examples/fib.0s");
-    let out = std::env::temp_dir().join(format!("zs_fib_pack_{}", std::process::id()));
+    let entry = manifest.join("examples/fib.hy");
+    let out = std::env::temp_dir().join(format!("coil_fib_pack_{}", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
     let status = Command::new(&bin)
@@ -20,7 +20,7 @@ fn package_fib_embedded_run_prints_55() {
             out.to_str().unwrap(),
         ])
         .status()
-        .expect("spawn zero-script package");
+        .expect("spawn coil package");
     assert!(status.success(), "package failed");
 
     let run = Command::new(&out)

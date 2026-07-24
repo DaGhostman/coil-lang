@@ -367,7 +367,7 @@ impl Pipeline {
     }
 
     /// Walk up from `start` looking for a directory that contains
-    /// `zero.toml`. Falls back to the process cwd when none is found.
+    /// `coil.toml`. Falls back to the process cwd when none is found.
     fn find_project_root(start: &Path) -> PathBuf {
         let mut dir = if start.is_file() {
             start
@@ -378,7 +378,7 @@ impl Pipeline {
             start.to_path_buf()
         };
         loop {
-            if dir.join("zero.toml").is_file() {
+            if dir.join("coil.toml").is_file() {
                 return dir;
             }
             if !dir.pop() {
@@ -398,7 +398,7 @@ impl Pipeline {
     /// capture rendered diagnostics into a buffer.
     pub fn with_reporter(config: ReportConfig, writer: Box<dyn Write + Send>) -> Self {
         let cwd = std::env::current_dir().expect("Unable to determine current working directory");
-        // Prefer a `zero.toml` found by walking up from cwd; otherwise
+        // Prefer a `coil.toml` found by walking up from cwd; otherwise
         // use cwd with the default manifest (`src/` only).
         let project_root = Self::find_project_root(&cwd);
         let sink = create_sink(&config, SourceMap::new(), writer);
@@ -473,14 +473,14 @@ impl Pipeline {
     }
 
     fn emit_manifest_load_error(&mut self, project_root: &Path, err: crate::manifest::ManifestError) {
-        let path = project_root.join("zero.toml");
+        let path = project_root.join("coil.toml");
         match err {
             crate::manifest::ManifestError::Parse { line, message } => {
                 if let Ok(contents) = std::fs::read_to_string(&path) {
                     let range = Manifest::byte_range_for_line(&contents, line);
                     let msg = Message::error(
                         ErrorCode::IoError,
-                        format!("`zero.toml` parse error at line {line}: {message}"),
+                        format!("`coil.toml` parse error at line {line}: {message}"),
                         range,
                     );
                     self.emit_message(&path, &contents, &msg);
@@ -571,7 +571,7 @@ impl Pipeline {
         match ast.1.borrow() {
             Expression::Use { path, name, .. } => {
                 // Compiler virtual modules (`prelude`, `ffi`, …) are not
-                // `.0s` files — skip disk discovery for those paths.
+                // `.hy` files — skip disk discovery for those paths.
                 {
                     use crate::typechecking::VirtualModules;
                     let vm = VirtualModules::new();
@@ -986,7 +986,7 @@ impl Pipeline {
         }
 
         // Wrap the bytecode in the versioned `ArchivedProgram` envelope
-        // so that older `.c0s` files can be rejected at load time via
+        // so that older `.hyc` files can be rejected at load time via
         // `version` mismatch (see `Pipeline::run`).
         let program = ArchivedProgram {
             version: ARCHIVE_VERSION,
@@ -1010,7 +1010,7 @@ impl Pipeline {
     /// Compile a parsed AST and return the bytecode
     /// (ignoring typecheck messages). Used by the
     /// `fizbuz_runs_to_completion` golden test, which
-    /// exercises a .0s example that the typechecker
+    /// exercises a .hy example that the typechecker
     /// rejects (`return;` is parsed as a variable name)
     /// but the codegen still produces valid bytecode for.
     pub fn compile_test(
@@ -1067,12 +1067,12 @@ impl Pipeline {
     pub fn compile_src_from_file(&mut self, file: &str) -> Result<(Vec<Byte>, Vec<u64>), ()> {
         let entry = PathBuf::from(file);
         // Re-root the manifest from the entry file so
-        // `cargo run -- examples/modules.0s` finds the workspace
-        // `zero.toml` even when cwd differs.
+        // `cargo run -- examples/modules.hy` finds the workspace
+        // `coil.toml` even when cwd differs.
         let root = Self::find_project_root(&entry);
         if root != self.project_root {
             self.project_root = root.clone();
-            self.manifest = Manifest::load(&root).expect("Failed to load zero.toml for entry file");
+            self.manifest = Manifest::load(&root).expect("Failed to load coil.toml for entry file");
         }
         self.entry_file = Some(entry.clone());
         self.enqueue_file(entry);

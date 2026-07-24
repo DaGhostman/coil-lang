@@ -1,10 +1,10 @@
 # Chapter 1 — Basics
 
-This chapter introduces the core syntax of zero-script: literals, variables, functions, control flow, output, and the expression/statement model. By the end you will be able to write small programs like Fibonacci, arithmetic helpers, and FizzBuzz-style output.
+This chapter introduces the core syntax of coil: literals, variables, functions, control flow, output, and the expression/statement model. By the end you will be able to write small programs like Fibonacci, arithmetic helpers, and FizzBuzz-style output.
 
-Every zero-script program is a `.0s` file. The runtime looks for a top-level `main` function as the entry point:
+Every coil program is a `.hy` file. The runtime looks for a top-level `main` function as the entry point:
 
-```0s
+```coil
 fn main() {
     print "hello";
 }
@@ -13,7 +13,7 @@ fn main() {
 Run a file from the project root:
 
 ```bash
-cargo run -- examples/fib.0s
+cargo run -- examples/fib.hy
 ```
 
 ---
@@ -22,7 +22,7 @@ cargo run -- examples/fib.0s
 
 Line comments start with `//` and run to the end of the line:
 
-```0s
+```coil
 // This is a comment.
 let x = 5; // inline comment
 ```
@@ -33,7 +33,7 @@ Comments are ignored by the compiler. Use them to explain *why* something is wri
 
 ## Literals
 
-zero-script has four primitive literal forms.
+coil has four primitive literal forms.
 
 | Kind   | Examples              | Notes                                      |
 |--------|-----------------------|--------------------------------------------|
@@ -42,7 +42,7 @@ zero-script has four primitive literal forms.
 | `string` | `"hello"`, `"FIZ"`  | Double-quoted; escape sequences follow C-style conventions where supported |
 | `bool` | `true`, `false`       | Boolean literals                           |
 
-```0s
+```coil
 fn main() {
     print "%i", 42;
     print "%f", 3.14;
@@ -57,16 +57,16 @@ fn main() {
 
 Bind a name to a value with `let`:
 
-```0s
+```coil
 let x = 5;
 let y = 10;
 ```
 
 You may attach an explicit type after the name:
 
-```0s
+```coil
 let x: int = 5;
-let name: string = "zero-script";
+let name: string = "coil";
 ```
 
 When the type is omitted, the compiler infers it from the right-hand side (see [Chapter 2 — Types and Variables](02-types-and-variables.md)).
@@ -79,14 +79,14 @@ Each `let` creates a new binding in the current scope. Bindings are introduced a
 
 After a variable is bound, update it with assignment (no `let` keyword):
 
-```0s
+```coil
 let x = 5;
 x = 20;
 ```
 
-From `examples/let_test.0s`:
+From `examples/let_test.hy`:
 
-```0s
+```coil
 fn main() {
     let x = 5;
     print "%i", x;   // 5
@@ -103,7 +103,7 @@ Assignment requires an existing binding. Assigning to an undeclared name is a co
 
 Compound assignment (`+=`, `-=`, `*=`, and the other arithmetic/bitwise forms) updates a binding in place and evaluates to the new value:
 
-```0s
+```coil
 let x = 5;
 x += 3;
 print "%i", x;   // 8
@@ -111,7 +111,7 @@ print "%i", x;   // 8
 
 Increment and decrement follow C-like rules: prefix forms (`++x`, `--x`) evaluate to the new value; postfix forms (`x++`, `x--`) evaluate to the old value. They work on variables, dict fields, and array elements.
 
-```0s
+```coil
 let y = 0;
 print "%i", y++;   // 0
 print "%i", y;     // 1
@@ -119,7 +119,7 @@ let z = 0;
 print "%i", ++z;   // 1
 ```
 
-See `examples/operators.0s` for a broader operator demo.
+See `examples/operators.hy` for a broader operator demo.
 
 ---
 
@@ -127,7 +127,7 @@ See `examples/operators.0s` for a broader operator demo.
 
 Define functions with `fn`. Parameter types and an optional return type are written in the signature; the body is a block:
 
-```0s
+```coil
 fn add(int a, int b) -> int {
     return a + b;
 }
@@ -135,17 +135,17 @@ fn add(int a, int b) -> int {
 
 - Parameters are comma-separated: `Type name`.
 - Return type follows `->`. Omit it when the function returns nothing useful (implicit unit).
-- Functions must be declared at the top level in a file (not nested inside other functions in current zero-script).
+- Functions must be declared at the top level in a file (not nested inside other functions in current coil).
 
 Call a function by name with parenthesised arguments:
 
-```0s
+```coil
 add(3, 4);
 ```
 
-From `examples/call_test.0s`:
+From `examples/call_test.hy`:
 
-```0s
+```coil
 fn add(int a, int b) -> int {
     return a + b;
 }
@@ -164,7 +164,7 @@ The call `add(3, 4)` is an **expression statement** — its return value is comp
 
 Use `return expr;` to leave a function early with a value:
 
-```0s
+```coil
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -183,7 +183,7 @@ If execution reaches the end of a function body without hitting `return`, the fu
 
 Conditions must be boolean expressions:
 
-```0s
+```coil
 if n <= 2 {
     return 1;
 }
@@ -205,7 +205,7 @@ Parentheses around conditions are optional but often improve readability when mi
 
 A `while` loop repeats its body while the condition is `true`:
 
-```0s
+```coil
 let i = 0;
 while (i < 3) {
     i = i + 1;
@@ -220,7 +220,7 @@ Use `break;` to leave the nearest loop and `continue;` to jump to the next itera
 
 C-style `for` loops combine an optional initializer, a required boolean condition, an optional step expression, and a block body:
 
-```0s
+```coil
 let sum = 0;
 for (let i = 0; i < 10; i = i + 1) {
     if i == 3 { continue; }
@@ -237,7 +237,7 @@ For this example, `sum` becomes `18` (`0 + 1 + 2 + 4 + 5 + 6`).
 
 A block `{ ... }` groups zero or more statements. Blocks create scope for `let` bindings declared inside them:
 
-```0s
+```coil
 fn main() {
     let x = 1;
     {
@@ -256,7 +256,7 @@ Function bodies, `if` branches, `while` bodies, and `defer` bodies are all block
 
 Schedule cleanup (or other exit work) with `defer`:
 
-```0s
+```coil
 fn example() {
     defer {
         print "cleanup";
@@ -277,7 +277,7 @@ Use `defer` for resource teardown, logging, or paired setup/teardown logic witho
 
 Print a string with no formatting:
 
-```0s
+```coil
 print "hello";
 print "FIZ";
 ```
@@ -286,7 +286,7 @@ print "FIZ";
 
 When the format string contains conversion specifiers, pass matching arguments after a comma:
 
-```0s
+```coil
 print "%i", 42;
 print "%i", x + y;
 ```
@@ -305,9 +305,9 @@ The compiler **type-checks** every specifier against its argument. A mismatch is
 | `%z`      | `bool`        | Boolean (`true` / `false`)           |
 | `%%`      | (none)        | Literal percent sign                 |
 
-Example mixing integers from `examples/const.0s`:
+Example mixing integers from `examples/const.hy`:
 
-```0s
+```coil
 fn sum(int a, int b) -> int {
     return a + b;
 }
@@ -320,7 +320,7 @@ fn main() {
 
 Common type errors:
 
-```0s
+```coil
 print "%i", "hello";  // error: %i requires int
 print "%s", 42;       // error: %s requires string
 print "%f", 1;        // error: %f requires float (use 1.0)
@@ -344,7 +344,7 @@ Understanding the distinction keeps programs predictable.
 
 Function calls, arithmetic, and comparisons are expressions and can nest:
 
-```0s
+```coil
 return fib(n - 1) + fib(n - 2);
 print "%u", 2 + 2 + sum(2 + 2);
 ```
@@ -353,7 +353,7 @@ print "%u", 2 + 2 + sum(2 + 2);
 
 ## Operator precedence (overview)
 
-zero-script uses a Pratt parser with familiar C-like precedence. From highest to lowest (approximate):
+coil uses a Pratt parser with familiar C-like precedence. From highest to lowest (approximate):
 
 1. Postfix: field access (`.field`), function call `()`
 2. Prefix: `-`, `+`, `~`
@@ -367,7 +367,7 @@ zero-script uses a Pratt parser with familiar C-like precedence. From highest to
 
 When in doubt, parenthesise:
 
-```0s
+```coil
 ((2 + 2) * 2) + -3
 (2 + 2) * (2 + 2)
 ```
@@ -380,11 +380,11 @@ For the full precedence table and associativity rules, see [Operator reference](
 
 The following examples build on each other. Read them in order, then run them locally.
 
-### Step 1 — Fibonacci (`examples/fib.0s`)
+### Step 1 — Fibonacci (`examples/fib.hy`)
 
 Recursive functions, `if`, and formatted integer output:
 
-```0s
+```coil
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -404,11 +404,11 @@ Running this prints `55` (the 10th Fibonacci number). Notice:
 - Recursive calls in an expression (`fib(n - 1) + fib(n - 2)`).
 - `%i` matches the `int` return type.
 
-### Step 2 — Variables and reassignment (`examples/let_test.0s`)
+### Step 2 — Variables and reassignment (`examples/let_test.hy`)
 
 Multiple bindings and reassignment:
 
-```0s
+```coil
 fn main() {
     let x = 5;
     print "%i", x;
@@ -421,11 +421,11 @@ fn main() {
 
 Output: `51020`.
 
-### Step 3 — Calls and arithmetic (`examples/call_test.0s`, `examples/const.0s`)
+### Step 3 — Calls and arithmetic (`examples/call_test.hy`, `examples/const.hy`)
 
 Combine function calls with expression statements and `%u` formatting:
 
-```0s
+```coil
 fn add(int a, int b) -> int {
     return a + b;
 }
@@ -438,7 +438,7 @@ fn main() {
 
 And nested arithmetic with a helper:
 
-```0s
+```coil
 fn sum(int a, int b) -> int {
     return a + b;
 }
@@ -449,11 +449,11 @@ fn main() {
 }
 ```
 
-### Step 4 — FizzBuzz-style output (`examples/fizbuz.0s`)
+### Step 4 — FizzBuzz-style output (`examples/fizbuz.hy`)
 
 Independent `if` checks (not `else if`) so multiples of both 3 and 5 print both fragments:
 
-```0s
+```coil
 fn fizbuz(int n) {
     if (n % 3) == 0 {
         print "FIZ";
@@ -521,7 +521,7 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 4. Use `defer` in a function that prints `"enter"`, does work, and relies on defer to print `"leave"`. Confirm LIFO order with two defers.
 
 5. Fix the type errors in this snippet (there are three):
-   ```0s
+   ```coil
    fn main() {
        print "%f", 3;
        print "%s", 100;
@@ -538,4 +538,4 @@ For `n = 15`, both conditions hold, so output includes `FIZBUZ`. For `n = 3`, on
 - [Chapter 2 — Types and Variables](02-types-and-variables.md) — annotations, inference, and type errors
 - [Operator reference](../reference/operators.md) — full precedence and associativity
 - [Aggregates](../tutorial/05-aggregates.md) — tuples, arrays, records (coming in the tutorial track)
-- `examples/fib.0s`, `examples/let_test.0s`, `examples/fizbuz.0s` — source for the worked examples above
+- `examples/fib.hy`, `examples/let_test.hy`, `examples/fizbuz.hy` — source for the worked examples above

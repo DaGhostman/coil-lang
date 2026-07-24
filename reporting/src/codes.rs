@@ -1,4 +1,4 @@
-//! Stable diagnostic error codes for zero-script.
+//! Stable diagnostic error codes for coil.
 
 /// Stable machine-readable diagnostic code.
 ///

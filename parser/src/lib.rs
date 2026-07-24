@@ -1,4 +1,4 @@
-//! Pratt parser for zero-script source.
+//! Pratt parser for coil source.
 //!
 //! Builds a span-annotated `Expression` AST for the compiler pipeline.
 
@@ -4532,7 +4532,7 @@ mod tests {
     fn parse_static_singleton_example_file() {
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../examples/static_singleton.0s"
+            "/../examples/static_singleton.hy"
         ))
         .expect("read example");
         let result = Pratt::default().parse(&src);
@@ -4736,7 +4736,7 @@ mod tests_classes {
 
     #[test]
     fn parse_classes_example() {
-        let src = include_str!("../../examples/classes.0s");
+        let src = include_str!("../../examples/classes.hy");
         let p = Pratt::default();
         p.parse(src).unwrap_or_else(|e| panic!("PARSE FAIL: {e:?}"));
     }

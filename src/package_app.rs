@@ -1,4 +1,4 @@
-//! `zero-script package` and embedded-archive startup.
+//! `coil package` and embedded-archive startup.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use rkyv::rancor::Error;
 
 use crate::{execute_archive, fail_and_exit, LoadErr};
 
-/// Deserialize an `ArchivedProgram` blob (from `.c0s` or an embedded slice).
+/// Deserialize an `ArchivedProgram` blob (from `.hyc` or an embedded slice).
 pub fn load_archive_bytes(
     buffer: &[u8],
 ) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebug), LoadErr> {
@@ -99,7 +99,7 @@ pub fn try_run_embedded() -> Option<bool> {
 
     if trailer.archive_version != ARCHIVE_VERSION {
         eprintln!(
-            "embedded bytecode version {} does not match this runner ({}); rebuild with `zero-script package`",
+            "embedded bytecode version {} does not match this runner ({}); rebuild with `coil package`",
             trailer.archive_version, ARCHIVE_VERSION
         );
         exit(1);
@@ -202,7 +202,7 @@ pub fn cmd_package(
             pipeline,
             ErrorCode::IoError,
             format!(
-                "runner `{}` is already a packaged executable; use an unpackaged `zero-script` binary as the template",
+                "runner `{}` is already a packaged executable; use an unpackaged `coil` binary as the template",
                 runner_path.display()
             ),
         );
