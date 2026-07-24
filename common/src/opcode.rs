@@ -234,6 +234,9 @@ pub enum Instruction {
     LoadStatic,
     /// StoreStatic: pop value, write statics[operands[31:0]].
     StoreStatic,
+
+    /// TailCall: same packing as CALL — reuse frame (self tail recursion).
+    TailCall,
 }
 
 impl From<u8> for Instruction {

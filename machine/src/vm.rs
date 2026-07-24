@@ -1082,7 +1082,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::StoreStatic as u8);
+            promise!(*bc as u8 <= Instruction::TailCall as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1345,6 +1345,17 @@ impl<const S: usize> Machine<S> {
                     if target != 0 {
                         ip = target;
                     }
+                }
+                Instruction::TailCall => {
+                    let (arity, target) = opcode.call_parts();
+                    let callee_sp = self.frames.get().get();
+                    for i in (0..arity).rev() {
+                        let val = self.stack.pop();
+                        self.stack[callee_sp + i] = val;
+                    }
+                    self.stack.seek(callee_sp + arity);
+                    sp = callee_sp + arity;
+                    ip = target;
                 }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
