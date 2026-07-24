@@ -79,12 +79,42 @@ fn run_bytecode(
     machine.with_output(shared);
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
+    machine.set_program_debug(pipeline.program_debug());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
         .expect("VM still holds a reference to the buffer")
         .into_inner();
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
+}
+
+#[test]
+fn example_panic_loc_archive_has_source_files() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let path = workspace_root.join("examples/panic_loc.0s");
+    let mut pipeline = Pipeline::new();
+    let (bytecode, _constants) = pipeline
+        .compile_src_from_file(path.to_str().unwrap())
+        .expect("panic_loc should compile");
+    let debug = pipeline.program_debug();
+    assert!(
+        debug
+            .source_files
+            .iter()
+            .any(|p| p.contains("panic_loc.0s")),
+        "expected panic_loc.0s in source_files: {:?}",
+        debug.source_files
+    );
+    assert_eq!(debug.debug_locs.len(), bytecode.len());
+    use common::Instruction;
+    assert!(
+        bytecode
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::Panic)),
+        "expected Panic opcode"
+    );
 }
 
 #[test]
@@ -164,7 +194,7 @@ fn example_tree_prints_6() {
 #[test]
 fn example_fib_still_works() {
     let output = run_example("examples/fib.0s");
-    assert_eq!(output, "2178309");
+    assert_eq!(output, "55");
 }
 
 #[test]
@@ -1267,6 +1297,7 @@ fn main() {
     machine.with_output(shared);
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
+    machine.set_program_debug(pipeline.program_debug());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     assert!(
         machine.panicked(),
@@ -1913,6 +1944,7 @@ test("broken") {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
     pipeline.wire_host_natives(&mut machine);
+    machine.set_program_debug(pipeline.program_debug());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
     assert!(

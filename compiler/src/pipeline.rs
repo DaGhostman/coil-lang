@@ -7,7 +7,8 @@ use std::{
 };
 
 use common::{
-    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, Value,
+    ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, Instruction, ProgramDebug,
+    Value,
 };
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
@@ -886,6 +887,12 @@ impl Pipeline {
         // worklist is fully populated. We just
         // compile now.
 
+        let rel = file
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&file)
+            .to_path_buf();
+        self.compiler.set_source_file(rel);
+
         // Compile the file. The compiler's `namespace`
         // field is set to the file's derived namespace.
         // We use `compile_module` (not `compile`) so the
@@ -986,6 +993,8 @@ impl Pipeline {
             static_slot_count: self.compiler.static_slot_count(),
             constants: self.compiler.constants.clone(),
             bytecode: self.bytecode,
+            source_files: self.compiler.source_files_list(),
+            debug_locs: self.compiler.debug_locs().to_vec(),
         };
 
         let mut out = File::create(output).expect("Unable to open output file");
@@ -1032,6 +1041,7 @@ impl Pipeline {
             }
         };
 
+        self.compiler.set_source_file(path);
         let mut bytecode = self.compiler.compile("", &mut ast);
 
         // Register source and drain typecheck / codegen diagnostics via the sink.
@@ -1137,7 +1147,14 @@ impl Pipeline {
         self.compiler.static_slot_count()
     }
 
-    pub fn run(self, filename: String) -> Result<(Vec<Byte>, Vec<u64>, u32), ()> {
+    pub fn program_debug(&self) -> ProgramDebug {
+        ProgramDebug {
+            source_files: self.compiler.source_files_list(),
+            debug_locs: self.compiler.debug_locs().to_vec(),
+        }
+    }
+
+    pub fn run(self, filename: String) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebug), ()> {
         let mut f = File::open(filename).expect("Unable to find file");
         let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");
@@ -1169,8 +1186,20 @@ impl Pipeline {
         let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
             .expect("Unable to deserialize constant pool");
         let static_slot_count = u32::from(archived.static_slot_count);
+        let source_files = rkyv::deserialize::<Vec<String>, Error>(&archived.source_files)
+            .expect("Unable to deserialize source_files");
+        let debug_locs = rkyv::deserialize::<Vec<common::DebugLoc>, Error>(&archived.debug_locs)
+            .expect("Unable to deserialize debug_locs");
 
-        Ok((bytecode, constants, static_slot_count))
+        Ok((
+            bytecode,
+            constants,
+            static_slot_count,
+            ProgramDebug {
+                source_files,
+                debug_locs,
+            },
+        ))
     }
 }
 

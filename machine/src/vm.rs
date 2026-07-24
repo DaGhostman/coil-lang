@@ -11,8 +11,8 @@ use std::{
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{
-    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte, Value,
-    promise, unlikely,
+    ArchivedByte as Byte, ArchivedInstruction as Instruction, ArrayVec, Byte as RawByte,
+    ProgramDebug, Value, byte_to_position, promise, unlikely,
 };
 
 use crate::{
@@ -159,6 +159,8 @@ pub struct Machine<const S: usize> {
     panicked: bool,
     /// Global static slots (`LoadStatic` / `StoreStatic`).
     statics: Vec<Value>,
+    /// Debug line table (parallel to archived bytecode indices).
+    program_debug: ProgramDebug,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -187,6 +189,7 @@ impl<const S: usize> Default for Machine<S> {
             pending_ffi: None,
             panicked: false,
             statics: Vec::new(),
+            program_debug: ProgramDebug::default(),
         }
     }
 }
@@ -195,6 +198,47 @@ impl<const S: usize> Machine<S> {
     pub fn set_ffi_paths(&mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) {
         self.base_dir = base_dir;
         self.ffi_search_paths = search_paths;
+    }
+
+    pub fn set_program_debug(&mut self, debug: ProgramDebug) {
+        self.program_debug = debug;
+    }
+
+    fn resolve_source_path(&self, path: &str) -> PathBuf {
+        let p = PathBuf::from(path);
+        if p.is_absolute() {
+            return p;
+        }
+        if std::fs::metadata(&p).is_ok() {
+            return p;
+        }
+        if let Some(base) = &self.base_dir {
+            let root = base.parent().unwrap_or(base.as_path());
+            let from_root = root.join(path);
+            if std::fs::metadata(&from_root).is_ok() {
+                return from_root;
+            }
+            let from_base = base.join(path);
+            if std::fs::metadata(&from_base).is_ok() {
+                return from_base;
+            }
+        }
+        p
+    }
+
+    fn format_panic_location(&self, panic_insn_ip: usize) -> Option<String> {
+        let loc = self.program_debug.debug_locs.get(panic_insn_ip)?;
+        if !loc.is_known() {
+            return None;
+        }
+        let path = self.program_debug.source_files.get(loc.file as usize)?;
+        let read_path = self.resolve_source_path(path);
+        let text = std::fs::read_to_string(&read_path).ok()?;
+        let pos = byte_to_position(&text, loc.start_byte as usize);
+        Some(format!(
+            "{}:{}:{}",
+            path, pos.line, pos.column
+        ))
     }
 
     pub fn with_ffi_paths(mut self, base_dir: Option<PathBuf>, search_paths: Vec<PathBuf>) -> Self {
@@ -1678,13 +1722,18 @@ impl<const S: usize> Machine<S> {
                     return false;
                 }
                 Instruction::Panic => {
+                    let panic_ip = ip.saturating_sub(1);
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
                     let s = unsafe { &*ptr };
+                    let loc_suffix = self
+                        .format_panic_location(panic_ip)
+                        .map(|loc| format!(" at {loc}"))
+                        .unwrap_or_default();
                     if let Some(out) = self.output.as_mut() {
-                        let _ = write!(out, "panic: {}", s);
+                        let _ = write!(out, "panic: {}{}", s, loc_suffix);
                         let _ = out.flush();
                     } else {
-                        eprint!("panic: {}", s);
+                        eprint!("panic: {}{}", s, loc_suffix);
                         let _ = io::stderr().flush();
                     }
                     self.panicked = true;

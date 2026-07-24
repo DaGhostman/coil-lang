@@ -13,7 +13,8 @@ use std::{
 };
 
 use common::{
-    Byte, Instruction, Interner, Value, ValueTag, encode_tag_operand, likely, tag, unlikely,
+    Byte, DebugLoc, Instruction, Interner, Value, ValueTag, DEBUG_FILE_UNKNOWN,
+    encode_tag_operand, likely, tag, unlikely,
 };
 use reporting::Label as DiagLabel;
 
@@ -663,6 +664,15 @@ pub struct Compiler {
     mono_offsets: HashMap<MonoKey, usize>,
     /// Temporary variable-type overrides while emitting a specialized clone.
     mono_codegen_var_types: Vec<HashMap<String, Ty>>,
+
+    /// Project-relative path of the module currently being codegen'd.
+    current_source_file: Option<std::path::PathBuf>,
+    /// Stable `DebugLoc::file` indices (path string → id).
+    source_file_indices: std::collections::BTreeMap<String, u32>,
+    /// `source_files` order for the archive (index → path).
+    source_file_list: Vec<String>,
+    /// One [`DebugLoc`] per bytecode slot (grows with [`Self::bytecode`]).
+    debug_locs: Vec<DebugLoc>,
 }
 
 impl Default for Compiler {
@@ -677,10 +687,12 @@ impl Default for Compiler {
         // the prologue) is offset `bytecode.len()`, which
         // is exactly 3 (CALL + JMP + HALT).
         let program_start_offset = bytecode.len() as u32;
+        let debug_locs = vec![DebugLoc::unknown(); bytecode.len()];
 
         Self {
             namespace: String::default(),
             bytecode,
+            debug_locs,
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
             module_items: std::collections::HashMap::default(),
@@ -714,6 +726,9 @@ impl Default for Compiler {
             mono_offsets: HashMap::new(),
             mono_codegen_var_types: Vec::new(),
             static_init_bytecode: Vec::new(),
+            current_source_file: None,
+            source_file_indices: std::collections::BTreeMap::new(),
+            source_file_list: Vec::new(),
         }
     }
 }
@@ -721,6 +736,78 @@ impl Default for Compiler {
 impl Compiler {
     pub fn constants(&self) -> &[u64] {
         &self.constants
+    }
+
+    pub fn set_source_file(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.current_source_file = Some(path.into());
+    }
+
+    pub fn source_files_list(&self) -> Vec<String> {
+        self.source_file_list.clone()
+    }
+
+    pub fn debug_locs(&self) -> &[DebugLoc] {
+        &self.debug_locs
+    }
+
+    fn pad_debug_locs(&mut self) {
+        while self.debug_locs.len() < self.bytecode.len() {
+            self.debug_locs.push(DebugLoc::unknown());
+        }
+        if self.debug_locs.len() > self.bytecode.len() {
+            self.debug_locs.truncate(self.bytecode.len());
+        }
+    }
+
+    fn loc_for_span(&mut self, span: SimpleSpan) -> DebugLoc {
+        let file = self.intern_source_file();
+        if file == DEBUG_FILE_UNKNOWN {
+            return DebugLoc::unknown();
+        }
+        let start = span.start as u32;
+        let end = span.end.max(span.start + 1) as u32;
+        DebugLoc {
+            file,
+            start_byte: start,
+            end_byte: end,
+        }
+    }
+
+    fn intern_source_file(&mut self) -> u32 {
+        let Some(ref path) = self.current_source_file else {
+            return DEBUG_FILE_UNKNOWN;
+        };
+        let key = path.to_string_lossy().into_owned();
+        if let Some(&id) = self.source_file_indices.get(&key) {
+            return id;
+        }
+        let id = self.source_file_list.len() as u32;
+        self.source_file_list.push(key.clone());
+        self.source_file_indices.insert(key, id);
+        id
+    }
+
+    fn emit_byte(&mut self, span: SimpleSpan, b: Byte) {
+        self.pad_debug_locs();
+        let loc = self.loc_for_span(span);
+        self.bytecode.push(b);
+        self.debug_locs.push(loc);
+    }
+
+    fn emit_bytes(&mut self, span: SimpleSpan, bytes: &[Byte]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.pad_debug_locs();
+        let loc = self.loc_for_span(span);
+        for &b in bytes {
+            self.bytecode.push(b);
+            self.debug_locs.push(loc);
+        }
+    }
+
+    fn emit_extend(&mut self, span: SimpleSpan, bytes: Vec<Byte>) {
+        self.emit_bytes(span, &bytes);
     }
 
     /// Number of global static slots for the VM table.
@@ -4721,7 +4808,7 @@ impl Compiler {
                 // `%v` args are lowered through `Show` to strings and the
                 // format literal is rewritten to `%s` before FORMAT.
                 self.emit_format_expression(format, params.as_ref());
-                self.bytecode.push(Byte::new(Instruction::PRINT));
+                self.emit_byte(*span, Byte::new(Instruction::PRINT));
             }
             Expression::Format(format, params) => {
                 self.emit_format_expression(format, params.as_ref());
@@ -7710,17 +7797,16 @@ impl Compiler {
             // --- Error-handling operators (desugar to MakeEnum / JumpIfMatch) ---
             Expression::Raise(expr) => {
                 // `raise e` → push e, wrap Err(e), RETURN.
-                // Emit to self.bytecode so nested absolute jumps stay valid.
                 let expr_bc = self.do_compile(expr);
-                self.bytecode.extend(expr_bc);
+                self.emit_bytes(*span, &expr_bc);
                 Self::emit_result_err(&mut self.bytecode);
-                self.bytecode.push(Byte::new(Instruction::RETURN));
+                self.pad_debug_locs();
+                self.emit_byte(*span, Byte::new(Instruction::RETURN));
             }
             Expression::Panic(expr) => {
-                // `panic msg` → push msg, Panic (abort VM).
                 let expr_bc = self.do_compile(expr);
-                self.bytecode.extend(expr_bc);
-                self.bytecode.push(Byte::new(Instruction::Panic));
+                self.emit_bytes(*span, &expr_bc);
+                self.emit_byte(*span, Byte::new(Instruction::Panic));
             }
             Expression::Try(inner) => {
                 // `e?` → if Ok/Some, leave payload; else RETURN the failure.
@@ -7938,6 +8024,7 @@ impl Compiler {
         self.messages.extend(self.checker.take_messages());
 
         self.bytecode.append(&mut program);
+        self.pad_debug_locs();
     }
 
     /// Peephole-fuse `self.bytecode` and relocate absolute code offsets
@@ -7946,12 +8033,16 @@ impl Compiler {
     /// Called once after multi-file linking by the pipeline, or at the end
     /// of single-file [`compile`] so unit tests observe fused output.
     pub fn finalize_bytecode(&mut self) {
+        self.pad_debug_locs();
         let static_init_region = if !self.static_init_bytecode.is_empty() {
             let pos = self.program_start_offset as usize;
             self.setup_entry_offset = pos as u32;
             let inits = std::mem::take(&mut self.static_init_bytecode);
             let init_len = inits.len();
             self.bytecode.splice(pos..pos, inits);
+            let pad = vec![DebugLoc::unknown(); init_len];
+            self.pad_debug_locs();
+            self.debug_locs.splice(pos..pos, pad);
             self.program_start_offset += init_len as u32;
             for offset in self.functions.values_mut() {
                 if *offset >= pos {
@@ -7980,6 +8071,9 @@ impl Compiler {
         };
 
         let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
+        peephole::shrink_debug_locs(&mut self.debug_locs, &fusion_sites);
+        self.pad_debug_locs();
+        debug_assert_eq!(self.debug_locs.len(), self.bytecode.len());
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
         }
@@ -8007,6 +8101,9 @@ impl Compiler {
                 jmp_pos,
                 Byte::new(Instruction::JMP).with_operand_u32(jmp_target as u32),
             );
+            self.pad_debug_locs();
+            self.debug_locs
+                .insert(jmp_pos, DebugLoc::unknown());
             peephole::bump_targets_at_or_after_skip_byte(
                 &mut self.bytecode,
                 &mut self.constants,
@@ -8033,6 +8130,13 @@ impl Compiler {
                 self.program_start_offset += 1;
             }
         }
+
+        self.pad_debug_locs();
+        debug_assert_eq!(
+            self.debug_locs.len(),
+            self.bytecode.len(),
+            "debug_locs / bytecode length mismatch after finalize"
+        );
     }
 
     pub fn compile<'compiler>(
@@ -8116,6 +8220,7 @@ mod tests {
 
         let mut machine = machine::Machine::<256>::default();
         pipeline.wire_host_natives(&mut machine);
+        machine.set_program_debug(pipeline.program_debug());
         machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     }
 
@@ -8139,6 +8244,8 @@ mod tests {
             static_slot_count: pipeline.static_slot_count(),
             constants: constants.clone(),
             bytecode: bytecode.clone(),
+            source_files: pipeline.program_debug().source_files,
+            debug_locs: pipeline.program_debug().debug_locs,
         };
         let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
         let archived =

@@ -3,20 +3,24 @@
 mod archive;
 mod array_vec;
 mod builtins;
+mod debug;
 mod ffi;
 mod interner;
 mod opcode;
 mod seekable_iter;
+mod source_pos;
 mod value;
 
 pub use archive::*;
 pub use builtins::*;
+pub use debug::*;
 pub use ffi::*;
 pub use ffi::tag;
 pub use array_vec::*;
 pub use interner::*;
 pub use opcode::*;
 pub use seekable_iter::*;
+pub use source_pos::*;
 pub use value::*;
 
 #[macro_export]

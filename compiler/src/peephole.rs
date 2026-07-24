@@ -19,7 +19,7 @@
 //! result is a non-negative `i32`. Fusion bails when operands won't fit packed
 //! fields (slot > 255, imm outside `i16`, target > `u16::MAX`, pool-backed const).
 
-use common::{Byte, Instruction};
+use common::{Byte, DebugLoc, Instruction};
 
 /// A window that was collapsed into one fused opcode.
 #[derive(Clone, Copy)]
@@ -41,6 +41,30 @@ pub fn fuse_bytecode(bytecode: &mut Vec<Byte>, pool: &mut Vec<u64>) -> Vec<Fusio
         patch_targets(byte, &sites, pool);
     }
     sites
+}
+
+/// Shrink a parallel debug line table using the same fusion windows as [`fuse_bytecode`].
+pub fn shrink_debug_locs(locs: &mut Vec<DebugLoc>, fusion_sites: &[FusionSite]) {
+    if locs.is_empty() || fusion_sites.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(
+        locs.len().saturating_sub(fusion_sites.iter().map(|s| s.removed).sum::<usize>()),
+    );
+    let mut i = 0;
+    let mut site_idx = 0;
+    while i < locs.len() {
+        if site_idx < fusion_sites.len() && fusion_sites[site_idx].orig == i {
+            let site = fusion_sites[site_idx];
+            out.push(locs[i]);
+            i += site.removed + 1;
+            site_idx += 1;
+        } else {
+            out.push(locs[i]);
+            i += 1;
+        }
+    }
+    *locs = out;
 }
 
 fn fuse_bytecode_pass(bytecode: &mut Vec<Byte>, pool: &mut Vec<u64>) -> Vec<FusionSite> {
@@ -526,6 +550,27 @@ mod tests {
     fn fuse(bc: &mut Vec<Byte>) -> Vec<FusionSite> {
         let mut pool = Vec::new();
         fuse_bytecode(bc, &mut pool)
+    }
+
+    #[test]
+    fn shrink_debug_locs_tracks_fusion_windows() {
+        let mut bc = vec![
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::CONST).with_const_inline(1),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut locs = vec![
+            DebugLoc {
+                file: 0,
+                start_byte: 0,
+                end_byte: 1,
+            };
+            4
+        ];
+        let sites = fuse(&mut bc);
+        shrink_debug_locs(&mut locs, &sites);
+        assert_eq!(locs.len(), bc.len());
     }
 
     #[test]

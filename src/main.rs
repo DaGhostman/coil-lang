@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::SystemTime;
 
-use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte};
+use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, ProgramDebug};
 use compiler::Pipeline;
 use machine::Machine;
 use reporting::{ErrorCode, ReportConfig, ReportFormat};
@@ -199,11 +199,15 @@ fn compile_to_archive(pipeline: &mut Pipeline, filename: &str, output: &str) {
         }
     };
 
+    let debug = pipeline.program_debug();
+
     let program = ArchivedProgram {
         version: ARCHIVE_VERSION,
         static_slot_count: pipeline.static_slot_count(),
         constants,
         bytecode,
+        source_files: debug.source_files,
+        debug_locs: debug.debug_locs,
     };
 
     let bytes = match rkyv::to_bytes::<Error>(&program) {
@@ -235,7 +239,7 @@ fn source_newer_than_archive(filename: &str, archive: &str) -> bool {
     }
 }
 
-fn try_load_archive(path: &str) -> Result<(Vec<Byte>, Vec<u64>, u32), LoadErr> {
+fn try_load_archive(path: &str) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebug), LoadErr> {
     let mut f = std::fs::File::open(path).map_err(|_| LoadErr::Missing)?;
     let mut buffer = Vec::with_capacity(1024);
     f.read_to_end(&mut buffer).map_err(|_| LoadErr::Corrupt)?;
@@ -250,7 +254,19 @@ fn try_load_archive(path: &str) -> Result<(Vec<Byte>, Vec<u64>, u32), LoadErr> {
     let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
         .map_err(|_| LoadErr::Corrupt)?;
     let static_slot_count = u32::from(archived.static_slot_count);
-    Ok((bytecode, constants, static_slot_count))
+    let source_files = rkyv::deserialize::<Vec<String>, Error>(&archived.source_files)
+        .map_err(|_| LoadErr::Corrupt)?;
+    let debug_locs = rkyv::deserialize::<Vec<common::DebugLoc>, Error>(&archived.debug_locs)
+        .map_err(|_| LoadErr::Corrupt)?;
+    Ok((
+        bytecode,
+        constants,
+        static_slot_count,
+        ProgramDebug {
+            source_files,
+            debug_locs,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -266,11 +282,13 @@ fn execute_archive(
     bytecode: &[Byte],
     constants: &[u64],
     static_slots: u32,
+    debug: ProgramDebug,
     entry: Option<&Path>,
 ) -> bool {
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
+    machine.set_program_debug(debug);
     machine.run_raw(bytecode, constants, static_slots);
     machine.panicked()
 }
@@ -297,7 +315,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         compile_to_archive(pipeline, filename, DEFAULT_OUT);
     }
 
-    let (bytecode, constants, static_slots) = if recompile {
+    let (bytecode, constants, static_slots, debug) = if recompile {
         match try_load_archive(DEFAULT_OUT) {
             Ok(ok) => ok,
             Err(_) => fail_and_exit(
@@ -323,6 +341,7 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         &bytecode,
         &constants,
         static_slots,
+        debug,
         Some(Path::new(filename)),
     ) {
         exit(1);
@@ -341,7 +360,7 @@ fn cmd_compile(pipeline: &mut Pipeline, filename: &str, output: &str) {
 }
 
 fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
-    let (bytecode, constants, static_slots) = match try_load_archive(archive) {
+    let (bytecode, constants, static_slots, debug) = match try_load_archive(archive) {
         Ok(ok) => ok,
         Err(LoadErr::Missing) => fail_and_exit(
             pipeline,
@@ -373,7 +392,14 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
 
     // Weak base_dir: archive parent, for relative FFI dload paths.
     let entry = Path::new(archive);
-    if execute_archive(pipeline, &bytecode, &constants, static_slots, Some(entry)) {
+    if execute_archive(
+        pipeline,
+        &bytecode,
+        &constants,
+        static_slots,
+        debug,
+        Some(entry),
+    ) {
         exit(1);
     }
 }
@@ -435,6 +461,7 @@ fn run_test_case(
         let mut machine = Machine::<256>::default();
         pipeline.wire_vm_ffi(&mut machine, entry);
         pipeline.wire_host_natives(&mut machine);
+        machine.set_program_debug(pipeline.program_debug());
         machine.load_program(bytecode, constants);
         let ret = machine.call_function(offset, &[]);
         !machine.panicked() && machine.result_is_ok(ret)
@@ -533,12 +560,14 @@ fn run_test_suite(config: ReportConfig, root: &Path, fail_fast: bool) -> Result<
                     let entry = path.as_path();
                     if cases.is_empty() {
                         // Legacy: whole-file `main` is one opaque case.
+                        let debug = pipeline.program_debug();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             execute_archive(
                                 &pipeline,
                                 &bytecode,
                                 &constants,
                                 static_slots,
+                                debug,
                                 Some(entry),
                             )
                         }));
@@ -878,6 +907,8 @@ mod tests {
             static_slot_count: 0,
             constants: vec![],
             bytecode: vec![Byte::new(common::Instruction::HALT)],
+            source_files: vec![],
+            debug_locs: vec![common::DebugLoc::unknown()],
         })
         .unwrap();
         std::fs::write(&stale, bytes.as_slice()).unwrap();
@@ -894,10 +925,12 @@ mod tests {
             static_slot_count: 0,
             constants: vec![42],
             bytecode: vec![Byte::new(common::Instruction::HALT)],
+            source_files: vec![],
+            debug_locs: vec![common::DebugLoc::unknown()],
         };
         let ok_bytes = rkyv::to_bytes::<Error>(&ok_prog).unwrap();
         std::fs::write(&ok_path, ok_bytes.as_slice()).unwrap();
-        let (bc, constants, _) = try_load_archive(ok_path.to_str().unwrap()).expect("ok archive");
+        let (bc, constants, _, _) = try_load_archive(ok_path.to_str().unwrap()).expect("ok archive");
         assert_eq!(constants, vec![42]);
         assert_eq!(bc.len(), 1);
         let _ = std::fs::remove_file(&ok_path);
