@@ -79,6 +79,7 @@ The default CLI invocation compiles `examples/fib.0s` to bytecode, serializes it
 | `zero-script <file.0s>` | Compile to `out.c0s` (cached) and run |
 | `zero-script compile <file.0s> [-o path]` | Compile only; default output is `out.c0s` |
 | `zero-script run <file.c0s>` | Execute a previously compiled archive |
+| `zero-script package <file.0s> [-o path]` | Build a **single executable** for this OS/arch (embedded `.c0s`) |
 | `zero-script test [path] [--fail-fast]` | Compile and run every `.0s` under `[path]` (default `./tests`) |
 
 Examples:
@@ -89,6 +90,13 @@ cargo run -- compile examples/fib.0s -o /tmp/fib.c0s
 
 # Run that archive
 cargo run -- run /tmp/fib.c0s
+
+# Single-file app for this machine (no separate .c0s or zero-script install needed to run)
+cargo run --release -- package examples/fib.0s -o ./fib-app
+./fib-app
+
+# With FFI: verify required shared libraries exist on this machine before shipping
+cargo run --release -- package examples/strlen.0s -o ./strlen-app --check-native
 
 # Project tests (default root ./tests)
 cargo run -- test

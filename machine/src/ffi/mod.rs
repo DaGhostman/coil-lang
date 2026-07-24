@@ -5,6 +5,7 @@ mod closure;
 mod error;
 mod registry;
 mod resolve;
+mod runtime;
 mod signature;
 
 pub use call::{
@@ -18,6 +19,7 @@ pub use error::{
 pub use libloading::Library;
 pub use registry::{HostClosureFn, NativeFn, Natives};
 pub use resolve::{library_candidates, platform_shared_lib_filename, resolve_library};
+pub use runtime::{check_native_libraries, packaged_app_ffi_startup_check, probe_system_libffi};
 pub use signature::{FfiError, FfiSignature, FfiSignatureBuilder};
 
 use std::path::{Path, PathBuf};

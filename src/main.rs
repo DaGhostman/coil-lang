@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::SystemTime;
 
-use common::{ARCHIVE_VERSION, ArchivedArchivedProgram, ArchivedProgram, Byte, ProgramDebug};
+use common::{ARCHIVE_VERSION, ArchivedProgram, Byte, ProgramDebug};
 use compiler::Pipeline;
 use machine::Machine;
 use reporting::{ErrorCode, ReportConfig, ReportFormat};
@@ -11,6 +11,10 @@ use rkyv::rancor::Error;
 
 const DEFAULT_OUT: &str = "out.c0s";
 const TESTS_DIR: &str = "tests";
+
+mod package_app;
+
+use package_app::{cmd_package, load_archive_bytes, try_run_embedded};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -21,6 +25,13 @@ enum Command {
     Test {
         path: Option<String>,
         fail_fast: bool,
+    },
+    Package {
+        filename: String,
+        output: String,
+        runner: Option<PathBuf>,
+        check_native: bool,
+        strip_debug: bool,
     },
 }
 
@@ -38,17 +49,22 @@ fn print_help() {
          \x20 zero-script [--log-json | --log-lsp] <file.0s>\n\
          \x20 zero-script [--log-json | --log-lsp] compile <file.0s> [-o|--output <path>]\n\
          \x20 zero-script [--log-json | --log-lsp] run <file.c0s>\n\
+         \x20 zero-script [--log-json | --log-lsp] package <file.0s> [-o|--output <path>]\n\
          \x20 zero-script [--log-json | --log-lsp] test [path] [--fail-fast]\n\
          \n\
          Commands:\n\
          \x20 (default)  Compile <file.0s> to out.c0s (cached) and run it\n\
          \x20 compile    Compile an entry file (must define main) to a .c0s archive\n\
          \x20 run        Execute a previously compiled .c0s archive\n\
+         \x20 package    Build a single-host executable (runner + embedded .c0s)\n\
          \x20 test       Compile and run every .0s file under [path] (default: ./tests)\n\
          \x20             Files under a `compile_fail/` directory must be rejected with diagnostics\n\
          \n\
          Options:\n\
-         \x20 -o, --output <path>  Output archive for `compile` (default: out.c0s)\n\
+         \x20 -o, --output <path>  Output archive for `compile` or packaged binary for `package`\n\
+         \x20 --runner <path>       Runner template for `package` (default: current executable)\n\
+         \x20 --check-native        With `package`, fail if required shared libraries are missing\n\
+         \x20 --strip-debug         With `package`, omit debug line table from embedded archive\n\
          \x20 --include-tests      Compile harness tests into the archive (default: omit)\n\
          \x20 --fail-fast          With `test`, stop after the first failed case\n\
          \x20 --log-json           Emit SARIF 2.1 diagnostics on stdout\n\
@@ -64,6 +80,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
     let mut log_lsp = false;
     let mut fail_fast = false;
     let mut include_tests = false;
+    let mut check_native = false;
+    let mut strip_debug = false;
+    let mut runner: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut output: Option<String> = None;
 
@@ -75,6 +94,18 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
             "--log-lsp" => log_lsp = true,
             "--fail-fast" => fail_fast = true,
             "--include-tests" => include_tests = true,
+            "--check-native" => check_native = true,
+            "--strip-debug" => strip_debug = true,
+            "--runner" => {
+                i += 1;
+                let Some(path) = args.get(i) else {
+                    return Err("missing path after --runner");
+                };
+                if path.starts_with('-') {
+                    return Err("missing path after --runner");
+                }
+                runner = Some(PathBuf::from(path));
+            }
             "-h" | "--help" => {
                 print_help();
                 exit(0);
@@ -93,7 +124,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
                 output = Some(path.clone());
             }
             s if s.starts_with('-') => {
-                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, -o/--output, or a command/file)");
+                return Err("unrecognized flag (expected --log-json, --log-lsp, --fail-fast, --include-tests, --check-native, --strip-debug, --runner, -o/--output, or a command/file)");
             }
             _ => positionals.push(arg.clone()),
         }
@@ -104,10 +135,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         [] => return Err("missing input file or command"),
         [cmd] if cmd == "test" => {
             if output.is_some() {
-                return Err("-o/--output is only valid with `compile`");
+                return Err("-o/--output is only valid with `compile` or `package`");
             }
             if include_tests {
                 return Err("--include-tests is only valid with `compile` or the default run mode");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
             Command::Test {
                 path: None,
@@ -116,12 +150,15 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         }
         [cmd, path] if cmd == "test" => {
             if output.is_some() {
-                return Err("-o/--output is only valid with `compile`");
+                return Err("-o/--output is only valid with `compile` or `package`");
             }
             if include_tests {
                 return Err("--include-tests is only valid with `compile` or the default run mode");
             }
-            if path == "compile" || path == "run" || path == "test" {
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
+            }
+            if path == "compile" || path == "run" || path == "test" || path == "package" {
                 return Err("test path must be a directory");
             }
             Command::Test {
@@ -131,12 +168,41 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         }
         [cmd] if cmd == "compile" => return Err("compile requires an entry file"),
         [cmd] if cmd == "run" => return Err("run requires a .c0s archive path"),
+        [cmd] if cmd == "package" => return Err("package requires an entry file"),
+        [cmd, filename] if cmd == "package" => {
+            if filename == "package" || filename == "compile" || filename == "run" || filename == "test" {
+                return Err("package requires an entry file");
+            }
+            if fail_fast {
+                return Err("--fail-fast is only valid with `test`");
+            }
+            if include_tests {
+                return Err("--include-tests is not valid with `package`");
+            }
+            let out = output.unwrap_or_else(|| {
+                Path::new(filename)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("a.out")
+                    .to_string()
+            });
+            Command::Package {
+                filename: filename.clone(),
+                output: out,
+                runner,
+                check_native,
+                strip_debug,
+            }
+        }
         [cmd, filename] if cmd == "compile" => {
-            if filename == "compile" || filename == "run" || filename == "test" {
+            if filename == "compile" || filename == "run" || filename == "test" || filename == "package" {
                 return Err("compile requires an entry file");
             }
             if fail_fast {
                 return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
             Command::Compile {
                 filename: filename.clone(),
@@ -145,10 +211,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         }
         [cmd, archive] if cmd == "run" => {
             if output.is_some() {
-                return Err("-o/--output is only valid with `compile`");
+                return Err("-o/--output is only valid with `compile` or `package`");
             }
             if fail_fast {
                 return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
             Command::Run {
                 archive: archive.clone(),
@@ -156,10 +225,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, &'static str> {
         }
         [filename] => {
             if output.is_some() {
-                return Err("-o/--output is only valid with `compile`");
+                return Err("-o/--output is only valid with `compile` or `package`");
             }
             if fail_fast {
                 return Err("--fail-fast is only valid with `test`");
+            }
+            if check_native || strip_debug || runner.is_some() {
+                return Err("--check-native, --strip-debug, and --runner are only valid with `package`");
             }
             Command::BuildAndRun {
                 filename: filename.clone(),
@@ -183,7 +255,7 @@ fn writer_for(format: ReportFormat) -> Box<dyn Write + Send> {
     }
 }
 
-fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: impl Into<String>) -> ! {
+pub(crate) fn fail_and_exit(pipeline: &mut Pipeline, code: ErrorCode, message: impl Into<String>) -> ! {
     pipeline.emit_spanless_error(code, message);
     let _ = pipeline.finish_reporting();
     exit(1);
@@ -243,41 +315,18 @@ fn try_load_archive(path: &str) -> Result<(Vec<Byte>, Vec<u64>, u32, ProgramDebu
     let mut f = std::fs::File::open(path).map_err(|_| LoadErr::Missing)?;
     let mut buffer = Vec::with_capacity(1024);
     f.read_to_end(&mut buffer).map_err(|_| LoadErr::Corrupt)?;
-    let archived =
-        rkyv::access::<ArchivedArchivedProgram, Error>(&buffer).map_err(|_| LoadErr::Corrupt)?;
-    let version = u32::from(archived.version);
-    if version != ARCHIVE_VERSION {
-        return Err(LoadErr::Version(version));
-    }
-    let bytecode = rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode)
-        .map_err(|_| LoadErr::Corrupt)?;
-    let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
-        .map_err(|_| LoadErr::Corrupt)?;
-    let static_slot_count = u32::from(archived.static_slot_count);
-    let source_files = rkyv::deserialize::<Vec<String>, Error>(&archived.source_files)
-        .map_err(|_| LoadErr::Corrupt)?;
-    let debug_locs = rkyv::deserialize::<Vec<common::DebugLoc>, Error>(&archived.debug_locs)
-        .map_err(|_| LoadErr::Corrupt)?;
-    Ok((
-        bytecode,
-        constants,
-        static_slot_count,
-        ProgramDebug {
-            source_files,
-            debug_locs,
-        },
-    ))
+    load_archive_bytes(&buffer)
 }
 
 #[derive(Debug)]
-enum LoadErr {
+pub(crate) enum LoadErr {
     Missing,
     Corrupt,
     Version(u32),
 }
 
 /// Run archived bytecode. Returns `true` when a language-level `panic` aborted.
-fn execute_archive(
+pub(crate) fn execute_archive(
     pipeline: &Pipeline,
     bytecode: &[Byte],
     constants: &[u64],
@@ -648,6 +697,10 @@ fn cmd_test(config: ReportConfig, path: Option<String>, fail_fast: bool) {
 }
 
 fn main() {
+    if let Some(panicked) = try_run_embedded() {
+        exit(if panicked { 1 } else { 0 });
+    }
+
     let raw_args: Vec<String> = std::env::args().collect();
     let cli = match parse_args(&raw_args) {
         Ok(c) => c,
@@ -689,6 +742,20 @@ fn main() {
                     cmd_compile(&mut pipeline, &filename, &output)
                 }
                 Command::Run { archive } => cmd_run(&mut pipeline, &archive),
+                Command::Package {
+                    filename,
+                    output,
+                    runner,
+                    check_native,
+                    strip_debug,
+                } => cmd_package(
+                    &mut pipeline,
+                    &filename,
+                    &output,
+                    runner.as_deref(),
+                    check_native,
+                    strip_debug,
+                ),
                 Command::Test { .. } => unreachable!(),
             }
         }
@@ -760,6 +827,46 @@ mod tests {
             cli.command,
             Command::Run {
                 archive: "out.c0s".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_package_default_output() {
+        let cli = parse_args(&args(&["package", "examples/fib.0s"])).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Package {
+                filename: "examples/fib.0s".into(),
+                output: "fib".into(),
+                runner: None,
+                check_native: false,
+                strip_debug: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_package_with_flags() {
+        let cli = parse_args(&args(&[
+            "package",
+            "app.0s",
+            "-o",
+            "myapp",
+            "--check-native",
+            "--strip-debug",
+            "--runner",
+            "/usr/bin/zero-script",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Package {
+                filename: "app.0s".into(),
+                output: "myapp".into(),
+                runner: Some(PathBuf::from("/usr/bin/zero-script")),
+                check_native: true,
+                strip_debug: true,
             }
         );
     }

@@ -1,6 +1,7 @@
 //! Shared types for the zero-script compiler and VM.
 
 mod archive;
+mod package;
 mod array_vec;
 mod builtins;
 mod debug;
@@ -12,6 +13,7 @@ mod source_pos;
 mod value;
 
 pub use archive::*;
+pub use package::*;
 pub use builtins::*;
 pub use debug::*;
 pub use ffi::*;

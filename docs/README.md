@@ -148,6 +148,7 @@ cargo run --release -- examples/fib.0s
 | *(no subcommand)* `<file.0s>` | Compile → `out.c0s` (cached) → run |
 | `compile <file.0s> [-o path]` | Compile entry file to a `.c0s` archive |
 | `run <file.c0s>` | Execute a compiled archive |
+| `package <file.0s> [-o path] [--check-native]` | Single executable for this OS/arch (embedded `.c0s`) |
 | `test [path] [--fail-fast]` | Compile+run all `[path]/**/*.0s` (default `./tests`); continue after failures unless `--fail-fast` |
 
 For FFI examples you also need **libffi** (e.g. `libffi-dev` on Debian/Ubuntu, `libffi` on Arch). See [Getting Started](getting-started.md).
