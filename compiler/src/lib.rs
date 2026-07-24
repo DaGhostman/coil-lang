@@ -1106,6 +1106,12 @@ impl Compiler {
                     | Instruction::JumpIfMatch
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
+                    | Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+                    | Instruction::BinReturn
+                    | Instruction::CmpJmpf
+                    | Instruction::LoadReturnSlot
+                    | Instruction::ConstReturnImm
             )
         })
     }
@@ -10738,6 +10744,19 @@ fn main() {
             "expected folded CONST 10 for `const x = 5; x + 5`"
         );
         let _ = const_count;
+    }
+
+    /// `if 5 < 5` must not fold as true (parser `<` → `Le`, strict less-than).
+    #[test]
+    fn const_if_strict_lt_does_not_take_then_branch() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "both branches constant-folded; expected only else body"
+        );
     }
 
     /// Constant `if` condition emits only the taken branch (no JMPF cascade).

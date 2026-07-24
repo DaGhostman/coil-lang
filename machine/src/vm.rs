@@ -3029,6 +3029,35 @@ mod tests {
         Byte::new(Instruction::CONST).with_const_inline(value as i32)
     }
 
+    /// Tail-recursive countdown reuses one frame (no stack overflow for deep n).
+    #[test]
+    fn tail_call_countdown_reuses_frame() {
+        const ENTRY: u32 = 3;
+        let mut code = vec![
+            const_int(10),
+            Byte::new(Instruction::CALL).with_call_packed(1, ENTRY),
+            Byte::new(Instruction::HALT),
+            // ENTRY: if n == 0 { return n }
+            load(0),
+            const_int(0),
+            Byte::new(Instruction::EQ),
+            Byte::new(Instruction::JMPF).with_operand_u32(0), // patched below
+            load(0),
+            Byte::new(Instruction::RETURN),
+        ];
+        let continue_at = code.len() as u32;
+        code.extend([
+            load(0),
+            const_int(1),
+            Byte::new(Instruction::SUB),
+            Byte::new(Instruction::TailCall).with_call_packed(1, ENTRY),
+        ]);
+        code[6] = Byte::new(Instruction::JMPF).with_operand_u32(continue_at);
+        let mut vm = Machine::<64>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 0);
+    }
+
     #[test]
     fn array_push_grows_in_place_and_len_reports_new_size() {
         let mut vm = Machine::<8>::default();

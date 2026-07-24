@@ -313,13 +313,22 @@ fn body_has_loop_control_walk<'a>(node: &Output<'a>) -> bool {
     match node.1.as_ref() {
         Expression::Break | Expression::Continue => true,
         Expression::Block(children) => children.iter().any(body_has_loop_control_walk),
+        Expression::Fragment(children) => children.iter().any(body_has_loop_control_walk),
+        Expression::ExprStatement(inner)
+        | Expression::Statement(inner)
+        | Expression::Expr(inner)
+        | Expression::Group(inner) => body_has_loop_control_walk(inner),
         Expression::If(branches) => branches.iter().any(|b| {
-            if let Expression::Branch(_, body) = b.1.as_ref() {
-                body_has_loop_control_walk(body)
+            if let Expression::Branch(cond, body) = b.1.as_ref() {
+                cond.as_ref().is_some_and(body_has_loop_control_walk) || body_has_loop_control_walk(body)
             } else {
                 false
             }
         }),
+        Expression::Match { scrutinee, arms } => {
+            body_has_loop_control_walk(scrutinee)
+                || arms.iter().any(|arm| body_has_loop_control_walk(&arm.body))
+        }
         Expression::Loop { body, .. } => body_has_loop_control_walk(body),
         Expression::For { body, .. } => body_has_loop_control_walk(body),
         _ => false,
@@ -376,6 +385,16 @@ mod tests {
             Some(ConstValue::Bool(true)),
             "`5 <= 5` must fold to true"
         );
+    }
+
+    #[test]
+    fn fold_strict_lt_boundary() {
+        let env = HashMap::new();
+        let cmp = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Le(int_expr(5), int_expr(5))),
+        );
+        assert_eq!(eval_expr(&cmp, &env), Some(ConstValue::Bool(false)));
     }
 
     #[test]
