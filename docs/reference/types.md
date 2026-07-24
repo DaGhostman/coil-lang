@@ -17,7 +17,7 @@ zero-script uses **Hindley–Milner (Algorithm W)** type inference with optional
 
 Primitive names in annotations are matched **case-insensitively** (`Int` ≡ `int`).
 
-Integer literals coerce to `byte` when the expected type is `byte` (or `[byte]` array elements) and the value is in `0..=255`. `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
+Integer literals coerce to `byte` when the expected type is `byte` (returns, annotated `let`s, call args) or `[byte]` array elements, and the value is in `0..=255`. Under an expected `byte`, arithmetic of such literals (e.g. `return 1 + 1;` in a `-> byte` function) also types as `byte`. Unannotated `int` variables still do not coerce (`let x = 42; return x;` needs `let x: byte`). `byte` implements `Show` and `Eq`; it is not in `Num` / `Add` yet.
 
 Strings support `+` / `+=` with other strings. The `format` expression returns `string` and uses the same specifier checks as `print` (`%i` accepts `byte`).
 

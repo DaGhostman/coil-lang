@@ -217,6 +217,35 @@ mod tests {
     }
 
     #[test]
+    fn pretty_sink_renders_snippet_for_message_without_labels() {
+        use crate::message::Message;
+
+        let source = "let x: int = \"hi\";\n";
+        let mut sources = SourceMap::new();
+        let file = sources.insert("sample.0s", source);
+        let shared = SharedBuf::new();
+        let mut sink = AriadneSink::new(sources, Box::new(shared.clone()));
+
+        // Typechecker-style message: range set, labels empty — convert must
+        // synthesize a primary label so ariadne shows the source line.
+        let msg = Message::error(
+            ErrorCode::TypeMismatch,
+            "Type mismatch: expected `int`, found `string`".into(),
+            13..17,
+        );
+        sink.emit(Diagnostic::from_message(&msg, file));
+        sink.finish().unwrap();
+
+        let out = shared.into_string();
+        assert!(
+            out.contains("let x: int") || out.contains("\"hi\""),
+            "expected source snippet in pretty output, got:\n{out}"
+        );
+        assert!(out.contains("E0102") || out.contains("Type mismatch"), "{out}");
+        assert!(sink.had_errors());
+    }
+
+    #[test]
     fn register_source_updates_map() {
         let shared = SharedBuf::new();
         let mut sink = AriadneSink::new(SourceMap::new(), Box::new(shared));

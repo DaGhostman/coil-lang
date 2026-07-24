@@ -1653,7 +1653,26 @@ impl Checker {
 
         match child {
             // ---- Literals ----
-            Expression::Integer(_) => int(),
+            Expression::Integer(n) => {
+                // Under an expected `byte`, in-range integer literals type as
+                // `byte` so arithmetic like `return 1 + 1;` (expected byte)
+                // unifies without falling back to `int` + post-hoc coerce.
+                if let Some(exp) = self.current_expected.clone() {
+                    let exp = apply_ty_prune(&self.subst, &exp);
+                    if Self::is_byte_ty(&exp) {
+                        if (0..=255).contains(n) {
+                            return crate::typechecking::ty::byte();
+                        }
+                        return self.error_with_help(
+                            ErrorCode::TypeMismatch,
+                            format!("byte literal out of range: `{n}` is not in 0..=255"),
+                            range,
+                            Some("a `byte` must be an integer between 0 and 255".to_string()),
+                        );
+                    }
+                }
+                int()
+            }
             Expression::Float(_) => float(),
             Expression::String(_) => string(),
             Expression::Bool(_) => boolean(),
@@ -16666,6 +16685,52 @@ trait Pointer<P: * -> *> {
         assert!(
             msgs.iter()
                 .any(|m| m.message().contains("byte literal out of range")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn byte_return_accepts_in_range_literal_arithmetic() {
+        let (mut c, _) = check(
+            r#"
+fn f() -> byte { return 1 + 1; }
+fn main() { print "%i", f(); }
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(msgs.is_empty(), "{:?}", msgs);
+    }
+
+    #[test]
+    fn byte_return_rejects_out_of_range_literal() {
+        let msgs = assert_messages("fn f() -> byte { return 300; }");
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("byte literal out of range")
+                    || m.message().contains("Type mismatch")),
+            "got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn byte_return_rejects_unannotated_int_variable() {
+        // Unannotated `let x = 42` is `int`; returning it as `byte` is not
+        // literal coercion (needs `let x: byte = 42`).
+        let msgs = assert_messages(
+            r#"
+fn f() -> byte {
+    let x = 42;
+    return x;
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("Type mismatch")
+                    && m.message().contains("byte")
+                    && m.message().contains("int")),
             "got: {:?}",
             msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );

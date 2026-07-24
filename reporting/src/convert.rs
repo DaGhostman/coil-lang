@@ -36,6 +36,19 @@ impl Diagnostic {
             ));
         }
 
+        // Producers often set only a primary `range` (no labels). Ariadne
+        // draws source underlines from labels only — synthesize one so
+        // EXXXX pretty reports include the code snippet.
+        if diag.labels.is_empty() {
+            let range = msg.range();
+            if range.start < range.end {
+                diag = diag.with_label(RelatedLabel::new(
+                    Location::new(file, range.clone()),
+                    "",
+                ));
+            }
+        }
+
         diag
     }
 }
@@ -68,5 +81,32 @@ mod tests {
         assert_eq!(diag.labels.len(), 1);
         assert_eq!(diag.labels[0].message, "here");
         assert_eq!(diag.labels[0].location.range, 8..9);
+    }
+
+    #[test]
+    fn from_message_synthesizes_primary_label_when_labels_empty() {
+        let mut map = SourceMap::new();
+        let file = map.insert("test.0s", "let x: int = \"hi\";\n");
+
+        let msg = Message::error(
+            ErrorCode::TypeMismatch,
+            "Type mismatch: expected `int`, found `string`".into(),
+            13..17,
+        );
+
+        let diag = Diagnostic::from_message(&msg, file);
+        assert_eq!(diag.labels.len(), 1);
+        assert_eq!(diag.labels[0].location.range, 13..17);
+        assert_eq!(diag.labels[0].message, "");
+    }
+
+    #[test]
+    fn from_message_skips_synthetic_label_for_empty_range() {
+        let mut map = SourceMap::new();
+        let file = map.insert("test.0s", "x\n");
+
+        let msg = Message::error(ErrorCode::IoError, "no source".into(), 0..0);
+        let diag = Diagnostic::from_message(&msg, file);
+        assert!(diag.labels.is_empty());
     }
 }
