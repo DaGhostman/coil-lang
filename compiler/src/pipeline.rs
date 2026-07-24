@@ -12,7 +12,7 @@ use common::{
 use machine::{FfiError, FfiSignature, FfiType, Heap, HostClosureFn, NativeFn};
 use parser::{Pratt, SimpleSpan, ast::Expression};
 use reporting::{
-    Diagnostic, DiagnosticSink, ErrorCode, Label, Message, ReportConfig, SourceId, SourceMap,
+    Diagnostic, DiagnosticSink, ErrorCode, Message, ReportConfig, SourceId, SourceMap,
     create_sink,
 };
 use rkyv::rancor::Error;
@@ -400,7 +400,7 @@ impl Pipeline {
         // Prefer a `zero.toml` found by walking up from cwd; otherwise
         // use cwd with the default manifest (`src/` only).
         let project_root = Self::find_project_root(&cwd);
-        let manifest = Manifest::load(&project_root).expect("Failed to load zero.toml manifest");
+        let sink = create_sink(&config, SourceMap::new(), writer);
 
         // The prologue is `[CALL, JMP, HALT]`. The pipeline
         // patches the JMP at offset 1 to point at `main`
@@ -414,8 +414,8 @@ impl Pipeline {
 
         let mut pipeline = Self {
             failed: false,
-            project_root,
-            manifest,
+            project_root: project_root.clone(),
+            manifest: Manifest::default(),
             bytecode,
             processed: Vec::new(),
             worklist: VecDeque::new(),
@@ -426,9 +426,13 @@ impl Pipeline {
             source_cache: Vec::new(),
             include_tests: false,
             compiler: Compiler::default(),
-            sink: create_sink(&config, SourceMap::new(), writer),
+            sink,
             messages_emitted: 0,
         };
+        match Manifest::load(&project_root) {
+            Ok(m) => pipeline.manifest = m,
+            Err(e) => pipeline.emit_manifest_load_error(&project_root, e),
+        }
         pipeline.register_io_natives();
         pipeline
     }
@@ -461,6 +465,79 @@ impl Pipeline {
         self.failed = true;
     }
 
+    /// Emit a warning with no source span (e.g. sink flush failure).
+    pub fn emit_spanless_warning(&mut self, code: ErrorCode, message: impl Into<String>) {
+        self.sink
+            .emit(Diagnostic::warning(message.into()).with_code(code));
+    }
+
+    fn emit_manifest_load_error(&mut self, project_root: &Path, err: crate::manifest::ManifestError) {
+        let path = project_root.join("zero.toml");
+        match err {
+            crate::manifest::ManifestError::Parse { line, message } => {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    let range = Manifest::byte_range_for_line(&contents, line);
+                    let msg = Message::error(
+                        ErrorCode::IoError,
+                        format!("`zero.toml` parse error at line {line}: {message}"),
+                        range,
+                    );
+                    self.emit_message(&path, &contents, &msg);
+                } else {
+                    self.emit_spanless_error(
+                        ErrorCode::IoError,
+                        format!("`{}`: parse error at line {line}: {message}", path.display()),
+                    );
+                }
+            }
+            crate::manifest::ManifestError::Io(msg) => {
+                self.emit_spanless_error(ErrorCode::IoError, msg);
+            }
+            crate::manifest::ManifestError::MissingSection(section) => {
+                self.emit_spanless_error(
+                    ErrorCode::IoError,
+                    format!(
+                        "`{}`: missing manifest section `[{section}]`",
+                        path.display()
+                    ),
+                );
+            }
+            crate::manifest::ManifestError::MissingKey { section, key } => {
+                self.emit_spanless_error(
+                    ErrorCode::IoError,
+                    format!(
+                        "`{}`: missing manifest key `[{section}].{key}`",
+                        path.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    fn emit_module_not_found(
+        &mut self,
+        parent_file: &Path,
+        parent_src: &str,
+        range: std::ops::Range<usize>,
+        detail: impl Into<String>,
+    ) {
+        let msg = Message::error(
+            ErrorCode::IoError,
+            format!("Module not found: {}", detail.into()),
+            range,
+        );
+        self.emit_message(parent_file, parent_src, &msg);
+        self.failed = true;
+    }
+
+    fn format_use_path(path: &[String], name: &str) -> String {
+        if path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", path.join("::"), name)
+        }
+    }
+
     /// Flush the diagnostic sink (required for SARIF / LSP buffered formats).
     pub fn finish_reporting(&mut self) -> std::io::Result<()> {
         self.sink.finish()
@@ -483,7 +560,13 @@ impl Pipeline {
     /// same as `use foo::bar;` for discovery purposes
     /// — we just need to load `foo::bar` so the
     /// compiler can resolve the items.
-    fn enqueue_uses(&mut self, ast: &(SimpleSpan, Box<Expression<'_>>)) {
+    fn enqueue_uses(
+        &mut self,
+        parent_file: &Path,
+        parent_src: &str,
+        ast: &(SimpleSpan, Box<Expression<'_>>),
+    ) {
+        let use_range = ast.0.into_range();
         match ast.1.borrow() {
             Expression::Use { path, name, .. } => {
                 // Compiler virtual modules (`prelude`, `ffi`, …) are not
@@ -495,35 +578,9 @@ impl Pipeline {
                         return;
                     }
                 }
-                // `use foo::sadge;` means: import `sadge`
-                // from module `foo`. The file containing
-                // the module `foo` is `foo.0s` (the file
-                // is named after the path, NOT after the
-                // item). The function imported is `sadge`
-                // (the LAST segment of the dotted path).
-                //
-                // For globs (`name == "*"`), the file
-                // is `<root>/<path joined>/<name>.0s` —
-                // i.e. the file is named after the WHOLE
-                // dotted path including the glob marker
-                // segment... actually no, the file is
-                // `<root>/<path joined>.0s` (no
-                // trailing segment). The glob marker is
-                // just a way to say "bring every item";
-                // it doesn't name a file. So we use
-                // the path with a synthetic last
-                // segment for resolution.
                 if name == "*" {
-                    // Glob: file is `<root>/<path joined>.0s`.
-                    // Equivalent to `use <last-segment-of-path>;`
-                    // but with a star marker.
                     let segments = path.clone();
                     if let Some(last) = segments.last().cloned() {
-                        // Strip the last segment since
-                        // for a glob there's no item
-                        // name. The file is at the
-                        // directory path of the
-                        // original dotted path.
                         let mut segments = segments;
                         segments.pop();
                         if let Some(file) =
@@ -531,29 +588,54 @@ impl Pipeline {
                                 .resolve_use(&self.project_root, &segments, &last)
                         {
                             self.enqueue_file(file);
+                        } else {
+                            self.emit_module_not_found(
+                                parent_file,
+                                parent_src,
+                                use_range,
+                                format!("`use {}::*`", Self::format_use_path(path, "*")),
+                            );
                         }
                     } else if let Some(file) = self.manifest.resolve_mod(&self.project_root, "*") {
-                        // `use *;` — top-level glob.
                         self.enqueue_file(file);
+                    } else {
+                        self.emit_module_not_found(
+                            parent_file,
+                            parent_src,
+                            use_range,
+                            "`use *`",
+                        );
                     }
-                } else if let Some(file) = self.manifest.resolve_use(&self.project_root, path, name)
+                } else if let Some(file) =
+                    self.manifest.resolve_use(&self.project_root, path, name)
                 {
                     self.enqueue_file(file);
+                } else {
+                    self.emit_module_not_found(
+                        parent_file,
+                        parent_src,
+                        use_range,
+                        format!("`use {}`", Self::format_use_path(path, name)),
+                    );
                 }
             }
             Expression::Module(name, _body) => {
-                // `mod foo;` — look for `foo.0s` in any
-                // root. This is the simplest resolution:
-                // the file's stem IS the module name.
                 if let Some(file) = self.manifest.resolve_mod(&self.project_root, name) {
                     self.enqueue_file(file);
+                } else {
+                    self.emit_module_not_found(
+                        parent_file,
+                        parent_src,
+                        use_range,
+                        format!("`mod {name}`"),
+                    );
                 }
             }
             Expression::Program(children)
             | Expression::Block(children)
             | Expression::Fragment(children) => {
                 for child in children.iter() {
-                    self.enqueue_uses(child);
+                    self.enqueue_uses(parent_file, parent_src, child);
                 }
             }
             _ => (),
@@ -709,13 +791,10 @@ impl Pipeline {
             let src = match self.read_source(&file) {
                 Some(s) => s,
                 None => {
-                    let mut msg = Message::error(
+                    self.emit_spanless_error(
                         ErrorCode::IoError,
                         format!("Failed to read file `{}`", file.display()),
-                        0..0,
                     );
-                    msg.push(Label::new(format!("file path: {}", file.display()), 0..0));
-                    self.emit_message(&file, "", &msg);
                     self.failed = true;
                     continue;
                 }
@@ -729,7 +808,7 @@ impl Pipeline {
                     continue;
                 }
             };
-            self.enqueue_uses(&ast);
+            self.enqueue_uses(&file, src.as_str(), &ast);
             // Only stop when every worklist entry has been
             // scanned. Length-stable checks alone are wrong:
             // scanning the first of two deps (`use a::*; use
@@ -783,13 +862,10 @@ impl Pipeline {
         let src = match self.read_source(&file) {
             Some(s) => s,
             None => {
-                let mut msg = Message::error(
+                self.emit_spanless_error(
                     ErrorCode::IoError,
                     format!("Failed to read file `{}`", file.display()),
-                    0..0,
                 );
-                msg.push(Label::new(format!("file path: {}", file.display()), 0..0));
-                self.emit_message(&file, "", &msg);
                 self.failed = true;
                 return;
             }

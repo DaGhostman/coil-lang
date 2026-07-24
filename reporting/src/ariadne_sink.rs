@@ -115,12 +115,25 @@ impl AriadneSink {
     }
 }
 
+fn diagnostic_has_source_span(diag: &Diagnostic) -> bool {
+    if diag
+        .labels
+        .iter()
+        .any(|l| l.location.range.start < l.location.range.end)
+    {
+        return diag.location.is_some();
+    }
+    diag.location
+        .as_ref()
+        .is_some_and(|l| l.range.start < l.range.end)
+}
+
 impl DiagnosticSink for AriadneSink {
     fn emit(&mut self, diag: Diagnostic) {
         if diag.is_error() {
             self.error_count += 1;
         }
-        let result = if diag.location.is_some() {
+        let result = if diagnostic_has_source_span(&diag) {
             self.write_spanned(&diag)
         } else {
             self.write_spanless(&diag)

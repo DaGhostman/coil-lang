@@ -281,10 +281,11 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
         Err(LoadErr::Missing) => true,
         Err(LoadErr::Corrupt) => true,
         Err(LoadErr::Version(v)) => {
-            // Stale archive: recompile rather than hard-fail (main #8 behavior).
-            eprintln!(
-                "Bytecode archive version {} does not match compiler version {}. Recompiling.",
-                v, ARCHIVE_VERSION
+            pipeline.emit_spanless_error(
+                ErrorCode::ArchiveVersionMismatch,
+                format!(
+                    "Bytecode archive version {v} does not match compiler version {ARCHIVE_VERSION}. Recompiling."
+                ),
             );
             true
         }
@@ -310,7 +311,11 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
     };
 
     if let Err(e) = pipeline.finish_reporting() {
-        eprintln!("warning: failed to flush diagnostics: {e}");
+        pipeline.emit_spanless_warning(
+            ErrorCode::IoError,
+            format!("failed to flush diagnostics: {e}"),
+        );
+        let _ = pipeline.finish_reporting();
     }
 
     if execute_archive(
@@ -327,7 +332,11 @@ fn cmd_build_and_run(pipeline: &mut Pipeline, filename: &str) {
 fn cmd_compile(pipeline: &mut Pipeline, filename: &str, output: &str) {
     compile_to_archive(pipeline, filename, output);
     if let Err(e) = pipeline.finish_reporting() {
-        eprintln!("warning: failed to flush diagnostics: {e}");
+        pipeline.emit_spanless_warning(
+            ErrorCode::IoError,
+            format!("failed to flush diagnostics: {e}"),
+        );
+        let _ = pipeline.finish_reporting();
     }
 }
 
@@ -355,7 +364,11 @@ fn cmd_run(pipeline: &mut Pipeline, archive: &str) {
     };
 
     if let Err(e) = pipeline.finish_reporting() {
-        eprintln!("warning: failed to flush diagnostics: {e}");
+        pipeline.emit_spanless_warning(
+            ErrorCode::IoError,
+            format!("failed to flush diagnostics: {e}"),
+        );
+        let _ = pipeline.finish_reporting();
     }
 
     // Weak base_dir: archive parent, for relative FFI dload paths.

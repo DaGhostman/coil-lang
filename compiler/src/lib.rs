@@ -2417,15 +2417,25 @@ impl Compiler {
     fn emit_io_host_invoke(&mut self, kind: crate::typechecking::IoBuiltin, args: &[Output]) {
         let name = kind.native_name();
         let Some(native_id) = self.native_id(name) else {
+            let range = args
+                .first()
+                .map(|a| a.0.into_range())
+                .unwrap_or(0..0);
             let mut message = Message::error(
                 ErrorCode::UnknownFunction,
                 format!("IO native `{name}` is not registered with the pipeline"),
-                0..0,
+                range.clone(),
             );
-            message.push(DiagLabel::new(
-                "host natives are wired in Pipeline::register_io_natives".to_string(),
-                0..0,
-            ));
+            if range.start >= range.end {
+                message.with_help(
+                    "host natives are wired in Pipeline::register_io_natives".to_string(),
+                );
+            } else {
+                message.push(DiagLabel::new(
+                    "host natives are wired in Pipeline::register_io_natives".to_string(),
+                    range,
+                ));
+            }
             self.messages.push(message);
             return;
         };

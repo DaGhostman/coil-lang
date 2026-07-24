@@ -121,8 +121,30 @@ impl Manifest {
         let manifest_path = project_root.join("zero.toml");
         match std::fs::read_to_string(&manifest_path) {
             Ok(contents) => Self::parse(&contents),
-            Err(_) => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(ManifestError::Io(format!(
+                "failed to read `{}`: {e}",
+                manifest_path.display()
+            ))),
         }
+    }
+
+    /// Byte range covering the content of `line_num` (1-based), for diagnostics.
+    pub fn byte_range_for_line(source: &str, line_num: usize) -> std::ops::Range<usize> {
+        if line_num == 0 {
+            return 0..0;
+        }
+        let mut offset = 0usize;
+        for (idx, line) in source.lines().enumerate() {
+            if idx + 1 == line_num {
+                return offset..offset + line.len();
+            }
+            offset += line.len();
+            if offset < source.len() && source.as_bytes()[offset] == b'\n' {
+                offset += 1;
+            }
+        }
+        0..0
     }
 
     /// Parse a manifest from its source text. Exposed for

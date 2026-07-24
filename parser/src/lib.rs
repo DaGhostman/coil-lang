@@ -2872,10 +2872,14 @@ impl<'pratt> Pratt<'pratt> {
             .into_result()
         {
             Err(errs) => {
+                let primary = errs
+                    .first()
+                    .map(|err| err.span().into_range())
+                    .unwrap_or_default();
                 let mut message = Message::error(
                     ErrorCode::ParseError,
                     "Parse error".to_string(),
-                    std::ops::Range::default(),
+                    primary,
                 );
 
                 errs.iter().for_each(|err| {

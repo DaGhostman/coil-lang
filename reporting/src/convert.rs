@@ -18,8 +18,23 @@ impl Diagnostic {
     /// Convert a producer-facing [`Message`] into a sink-facing diagnostic,
     /// anchoring all spans to `file`.
     pub fn from_message(msg: &Message, file: SourceId) -> Self {
-        let mut diag = Diagnostic::new(Severity::from(*msg.kind()), msg.message())
-            .at(file, msg.range().clone());
+        let primary = msg.range();
+        let promoted = msg
+            .labels()
+            .iter()
+            .find(|l| l.range().start < l.range().end)
+            .map(|l| l.range().clone());
+
+        let anchor = if primary.start < primary.end {
+            Some(primary.clone())
+        } else {
+            promoted
+        };
+
+        let mut diag = Diagnostic::new(Severity::from(*msg.kind()), msg.message());
+        if let Some(range) = anchor {
+            diag = diag.at(file, range);
+        }
 
         if let Some(code) = msg.code() {
             diag = diag.with_code(code);
@@ -40,10 +55,14 @@ impl Diagnostic {
         // draws source underlines from labels only — synthesize one so
         // EXXXX pretty reports include the code snippet.
         if diag.labels.is_empty() {
-            let range = msg.range();
-            if range.start < range.end {
+            if let Some(range) = diag
+                .location
+                .as_ref()
+                .filter(|loc| loc.range.start < loc.range.end)
+                .map(|loc| loc.range.clone())
+            {
                 diag = diag.with_label(RelatedLabel::new(
-                    Location::new(file, range.clone()),
+                    Location::new(file, range),
                     "",
                 ));
             }
@@ -108,5 +127,22 @@ mod tests {
         let msg = Message::error(ErrorCode::IoError, "no source".into(), 0..0);
         let diag = Diagnostic::from_message(&msg, file);
         assert!(diag.labels.is_empty());
+        assert!(diag.location.is_none());
+    }
+
+    #[test]
+    fn from_message_promotes_first_label_when_primary_range_empty() {
+        let mut map = SourceMap::new();
+        let file = map.insert("test.0s", "let x: int = \"hi\";\n");
+
+        let mut msg = Message::error(ErrorCode::ParseError, "Parse error".into(), 0..0);
+        msg.push(Label::new("expected `;`".into(), 13..17));
+
+        let diag = Diagnostic::from_message(&msg, file);
+        assert_eq!(
+            diag.location.as_ref().map(|l| l.range.clone()),
+            Some(13..17)
+        );
+        assert_eq!(diag.labels.len(), 1);
     }
 }
