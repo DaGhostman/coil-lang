@@ -201,8 +201,9 @@ a = b ?? c        // a = (b ?? c)
 | Form | Example | Precedence |
 |------|---------|------------|
 | Postfix index | `arr[i]`, `t[0]` | Primary |
+| Empty index append | `arr[] = v` (LHS only) | Primary |
 
-Index expression is full `expr` — `arr[i + 1]` is valid.
+`arr[]` with no index expression is only valid as the target of `=` / `+=` — it appends to a dynamic array.
 
 ---
 

@@ -79,7 +79,7 @@ fn run_bytecode(
     machine.with_output(shared);
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
         .expect("VM still holds a reference to the buffer")
@@ -133,7 +133,7 @@ fn main() {
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     assert!(machine.panicked(), "expected language-level panic");
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
@@ -164,7 +164,7 @@ fn example_tree_prints_6() {
 #[test]
 fn example_fib_still_works() {
     let output = run_example("examples/fib.0s");
-    assert_eq!(output, "55");
+    assert_eq!(output, "2178309");
 }
 
 #[test]
@@ -183,6 +183,59 @@ fn example_dict_prints_42_100_42() {
 fn example_array_grow_prints_len_first_and_last() {
     let output = run_example("examples/array_grow.0s");
     assert_eq!(output, "414");
+}
+
+#[test]
+fn example_static_singleton_prints_121() {
+    let output = run_example("examples/static_singleton.0s");
+    assert_eq!(output, "121");
+}
+
+#[test]
+fn example_static_minimal_prints_11() {
+    let output = run_example("examples/static_minimal.0s");
+    assert_eq!(output, "11");
+}
+
+#[test]
+fn example_readonly_seal_prints_322() {
+    let output = run_example("examples/readonly_seal.0s");
+    assert_eq!(output, "322");
+}
+
+/// `static const` is readable via LoadStatic; only reassignment is rejected.
+#[test]
+fn static_const_reads_via_load_static() {
+    let output = run_example_src(
+        r#"
+static const VERSION = 42;
+
+fn main() {
+    print "%i", VERSION;
+}
+"#,
+    );
+    assert_eq!(output, "42");
+}
+
+/// Class `const` fields are readable after construction (mutation is blocked separately).
+#[test]
+fn const_class_field_reads_after_construction() {
+    let output = run_example_src(
+        r#"
+class Point {
+    const x: int,
+    y: int,
+}
+
+fn main() {
+    let p = new Point(7, 9);
+    print "%i", p.x;
+    print "%i", p.y;
+}
+"#,
+    );
+    assert_eq!(output, "79");
 }
 
 #[test]
@@ -641,7 +694,7 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
 
     let _ = machine.restore_output();
     let bytes = Rc::try_unwrap(buf)
@@ -673,7 +726,7 @@ fn fizbuz_runs_to_completion() {
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
 
     let _ = buf;
 }
@@ -875,7 +928,7 @@ fn example_let_chained_bindings_works() {
     let shared = SharedBuf(std::rc::Rc::clone(&buf));
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
 
     let _ = machine.restore_output();
     let bytes = std::rc::Rc::try_unwrap(buf)
@@ -1214,7 +1267,7 @@ fn main() {
     machine.with_output(shared);
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     assert!(
         machine.panicked(),
         "missing library should panic, not segfault"
@@ -1860,7 +1913,7 @@ test("broken") {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
     pipeline.wire_host_natives(&mut machine);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
     assert!(
         machine.panicked(),
@@ -2047,22 +2100,22 @@ fn main() {
     assert_eq!(output, "16");
 }
 
-/// P1: empty array + push + index round-trip (and under GC pressure).
+/// P1: empty array + append + index round-trip (and under GC pressure).
 #[test]
-fn empty_array_push_and_index_round_trip() {
+fn empty_array_append_and_index_round_trip() {
     let output = run_example_src(
         r#"
 fn main() {
     let arr: [int] = [];
-    push(arr, 4);
-    push(arr, 1);
-    push(arr, 4);
+    arr[] = 4;
+    arr[] = 1;
+    arr[] = 4;
     print "%i", len(arr);
     print "%i", arr[0];
     print "%i", arr[2];
     let i = 0;
     while i < 80 {
-        push(arr, i);
+        arr[] = i;
         i = i + 1;
     }
     print "%i", arr[0];

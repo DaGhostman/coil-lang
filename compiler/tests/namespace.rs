@@ -90,7 +90,7 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
 
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
 
     let bytes = Rc::try_unwrap(buf)
@@ -363,7 +363,7 @@ roots = ["./src"]
     let shared = SharedBuf(Rc::clone(&buf));
     let mut machine = Machine::<128>::default();
     machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants);
+    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
     let output = String::from_utf8(
         Rc::try_unwrap(buf)
@@ -416,6 +416,24 @@ roots = ["./src"]
     let (root, entry) = build_project("sibling_bare_call", manifest, files, "src/main.0s");
     let output = run_project(&root, &entry);
     assert_eq!(output, "7");
+}
+
+#[test]
+fn cross_module_static_slot_init_and_mutation() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = &[
+        ("src/counter.0s", "static let n = 0;\n"),
+        (
+            "src/main.0s",
+            "mod counter;\nfn main() {\n    counter::n = counter::n + 5;\n    print \"%i\", counter::n;\n}\n",
+        ),
+    ];
+    let (root, entry) = build_project("cross_module_static", manifest, files, "src/main.0s");
+    let output = run_project(&root, &entry);
+    assert_eq!(output, "5");
 }
 
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

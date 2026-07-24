@@ -238,6 +238,7 @@ fn collect_and_desugar_attr_decls(
                     attrs: vec![],
                     name,
                     is_coro: false,
+                    is_static: false,
                     type_params: type_params.clone(),
                     args: args.clone(),
                     returns: returns.clone(),
@@ -563,7 +564,9 @@ fn collect_free_idents<'a>(
         Expression::Access(receiver, _) => collect_free_idents(receiver, bound, free),
         Expression::Index(receiver, index) => {
             collect_free_idents(receiver, bound, free);
-            collect_free_idents(index, bound, free);
+            if let Some(index) = index {
+                collect_free_idents(index, bound, free);
+            }
         }
         Expression::Assignment(lhs, rhs)
         | Expression::Coalesce(lhs, rhs)
@@ -684,9 +687,24 @@ fn collect_free_idents<'a>(
         }
         Expression::Forall { ty, .. } => collect_free_idents(ty, bound, free),
         Expression::Module(_, child) => collect_free_idents(child, bound, free),
-        Expression::Field(_, ty, name) => {
+        Expression::Field {
+            ty,
+            name,
+            init,
+            ..
+        } => {
             collect_free_idents(ty, bound, free);
             collect_free_idents(name, bound, free);
+            if let Some(init) = init {
+                collect_free_idents(init, bound, free);
+            }
+        }
+        Expression::Readonly(inner) => collect_free_idents(inner, bound, free),
+        Expression::StaticDecl { ty, init, .. } => {
+            if let Some(ty) = ty {
+                collect_free_idents(ty, bound, free);
+            }
+            collect_free_idents(init, bound, free);
         }
         Expression::Method(_, method) => collect_free_idents(method, bound, free),
         Expression::Class { fields, .. } => {
@@ -749,6 +767,7 @@ fn collect_free_idents<'a>(
         | Expression::Break
         | Expression::Continue
         | Expression::Use { .. }
+        | Expression::QualifiedAccess { .. }
         | Expression::AssocTypeDecl { .. } => {}
     }
 }
@@ -1029,9 +1048,13 @@ fn rewrite_expr_inline<'a>(
         }
         Expression::Assignment(lhs, rhs) => at(span, Expression::Assignment(rw(lhs), rw(rhs))),
         Expression::Access(receiver, field) => at(span, Expression::Access(rw(receiver), *field)),
-        Expression::Index(receiver, index) => {
-            at(span, Expression::Index(rw(receiver), rw(index)))
-        }
+        Expression::Index(receiver, index) => at(
+            span,
+            Expression::Index(
+                rw(receiver),
+                index.as_ref().map(|idx| rw(idx)),
+            ),
+        ),
         Expression::NamedArg(name, value) => at(span, Expression::NamedArg(*name, rw(value))),
         Expression::Branch(cond, body) => at(
             span,
@@ -1215,6 +1238,7 @@ fn rewrite_expr_inline<'a>(
             attrs,
             name,
             is_coro,
+            is_static,
             type_params,
             args,
             returns,
@@ -1226,6 +1250,7 @@ fn rewrite_expr_inline<'a>(
                 attrs: attrs.clone(),
                 name: *name,
                 is_coro: *is_coro,
+                is_static: *is_static,
                 type_params: type_params.clone(),
                 args: rw(args),
                 returns: returns.as_ref().map(|r| rw(r)),
@@ -1262,9 +1287,44 @@ fn rewrite_expr_inline<'a>(
             },
         ),
         Expression::Module(path, child) => at(span, Expression::Module(path.clone(), rw(child))),
-        Expression::Field(vis, ty, name) => {
-            at(span, Expression::Field(*vis, rw(ty), rw(name)))
-        }
+        Expression::Field {
+            visibility,
+            modifier,
+            name,
+            ty,
+            init,
+        } => at(
+            span,
+            Expression::Field {
+                visibility: *visibility,
+                modifier: *modifier,
+                name: rw(name),
+                ty: rw(ty),
+                init: init.as_ref().map(|e| rw(e)),
+            },
+        ),
+        Expression::Readonly(inner) => at(span, Expression::Readonly(rw(inner))),
+        Expression::QualifiedAccess { owner, member } => at(
+            span,
+            Expression::QualifiedAccess {
+                owner: *owner,
+                member: *member,
+            },
+        ),
+        Expression::StaticDecl {
+            is_const,
+            name,
+            ty,
+            init,
+        } => at(
+            span,
+            Expression::StaticDecl {
+                is_const: *is_const,
+                name: *name,
+                ty: ty.as_ref().map(|t| rw(t)),
+                init: rw(init),
+            },
+        ),
         Expression::Method(vis, method) => at(span, Expression::Method(*vis, rw(method))),
         Expression::Class {
             attrs,
@@ -1542,7 +1602,12 @@ fn synthesize_class_ctor<'a>(
     let mut args = Vec::new();
     let mut call_args = Vec::new();
     for field in fields {
-        if let Expression::Field(_, name_expr, ty_expr) = field.1.as_ref() {
+        if let Expression::Field {
+            name: name_expr,
+            ty: ty_expr,
+            ..
+        } = field.1.as_ref()
+        {
             if let Expression::Identifier(name) = name_expr.1.as_ref() {
                 args.push(at(
                     span,
@@ -1566,6 +1631,7 @@ fn synthesize_class_ctor<'a>(
             attrs: vec![],
             name: ctor_name,
             is_coro: false,
+            is_static: false,
             type_params: vec![],
             args: at(span, Expression::Fragment(args)),
             returns: Some(ty_name(span, class_name)),
@@ -1987,7 +2053,7 @@ fn class_field_names<'a>(fields: &[Output<'a>]) -> Vec<&'a str> {
     fields
         .iter()
         .filter_map(|f| match f.1.as_ref() {
-            Expression::Field(_, name_expr, _) => match name_expr.1.as_ref() {
+            Expression::Field { name: name_expr, .. } => match name_expr.1.as_ref() {
                 Expression::Identifier(n) => Some(*n),
                 _ => None,
             },
@@ -2091,6 +2157,7 @@ fn method_fn<'a>(
             attrs: vec![],
             name,
             is_coro: false,
+            is_static: false,
             type_params: vec![],
             args: at(span, Expression::Fragment(args)),
             returns: Some(ty_name(span, ret)),

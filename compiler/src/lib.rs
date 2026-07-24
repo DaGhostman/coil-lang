@@ -602,6 +602,9 @@ pub struct Compiler {
     emit_idx: usize,
     /// Offset where user code starts (after prologue). Extern blocks precede main.
     program_start_offset: u32,
+    /// Entry for prologue `JMP` when static initializers are spliced (unchanged
+    /// by the post-splice `program_start_offset` bump).
+    setup_entry_offset: u32,
     /// Wide immediates referenced from compact 8-byte `Byte`
     /// operands (floats, `JumpIfMatch` targets, etc.).
     constants: Vec<u64>,
@@ -623,6 +626,9 @@ pub struct Compiler {
 
     /// Name of the function currently being codegen'd (for ctor/Instantiate routing).
     active_fn_name: Option<String>,
+
+    /// Bytecode for global static initializers (spliced at `program_start_offset`).
+    static_init_bytecode: Vec<Byte>,
 
     /// True while compiling an `impl` method — Function resets locals
     /// and reserves slot 0 for `self`.
@@ -689,6 +695,7 @@ impl Default for Compiler {
             checker: crate::typechecking::Checker::new(),
             emit_idx: 0,
             program_start_offset,
+            setup_entry_offset: program_start_offset,
             constants: Vec::default(),
             coroutine_fns: std::collections::HashSet::new(),
             temp_counter: 0,
@@ -706,6 +713,7 @@ impl Default for Compiler {
             mono_plan: MonoPlan::default(),
             mono_offsets: HashMap::new(),
             mono_codegen_var_types: Vec::new(),
+            static_init_bytecode: Vec::new(),
         }
     }
 }
@@ -713,6 +721,26 @@ impl Default for Compiler {
 impl Compiler {
     pub fn constants(&self) -> &[u64] {
         &self.constants
+    }
+
+    /// Number of global static slots for the VM table.
+    pub fn static_slot_count(&self) -> u32 {
+        self.checker.static_slot_count()
+    }
+
+    /// Prologue `JMP` target: static initializers and/or `extern` setup
+    /// run at `program_start_offset`; otherwise jump straight to `main`.
+    pub fn prologue_jmp_target(&self) -> u32 {
+        if self.static_slot_count() > 0 {
+            self.setup_entry_offset
+        } else if self.has_extern_block() {
+            self.program_start_offset
+        } else {
+            self.functions
+                .get("main")
+                .copied()
+                .unwrap_or(self.program_start_offset as usize) as u32
+        }
     }
 
     /// Harness test cases emitted this compile: `(description, fn offset)`.
@@ -1104,7 +1132,7 @@ impl Compiler {
                             span,
                             Box::new(Expression::Index(
                                 inner.clone(),
-                                (span, Box::new(Expression::Integer(i as i64))),
+                                Some((span, Box::new(Expression::Integer(i as i64)))),
                             )),
                         ));
                     }
@@ -1117,7 +1145,7 @@ impl Compiler {
                             span,
                             Box::new(Expression::Index(
                                 inner.clone(),
-                                (span, Box::new(Expression::Integer(i as i64))),
+                                Some((span, Box::new(Expression::Integer(i as i64)))),
                             )),
                         ));
                     }
@@ -1143,7 +1171,7 @@ impl Compiler {
                                 span,
                                 Box::new(Expression::Index(
                                     inner.clone(),
-                                    (span, Box::new(Expression::Integer(i as i64))),
+                                    Some((span, Box::new(Expression::Integer(i as i64)))),
                                 )),
                             ));
                         }
@@ -1158,7 +1186,7 @@ impl Compiler {
                                 span,
                                 Box::new(Expression::Index(
                                     inner.clone(),
-                                    (span, Box::new(Expression::Integer(i as i64))),
+                                    Some((span, Box::new(Expression::Integer(i as i64)))),
                                 )),
                             ));
                         }
@@ -1346,10 +1374,15 @@ impl Compiler {
             bytecode.pop();
         } else if matches!(
             bytecode.last().map(|b| b.bytecode()),
-            Some(Instruction::StorePop | Instruction::SetField | Instruction::StoreIndex)
+            Some(
+                Instruction::StorePop
+                    | Instruction::SetField
+                    | Instruction::StoreIndex
+                    | Instruction::StoreStatic
+            )
         ) {
             // `x = expr;` / compound updates already consumed the
-            // RHS via StorePop/SetField/StoreIndex — no trailing POP.
+            // RHS via StorePop/SetField/StoreIndex/StoreStatic — no trailing POP.
         } else if !matches!(
             bytecode.last().map(|b| b.bytecode()),
             Some(Instruction::YieldCoro | Instruction::YieldFromCoro)
@@ -3851,7 +3884,7 @@ impl Compiler {
                         if n == crate::typechecking::ty::FLOAT
                 )
             }
-            Expression::Index(arr, idx) => {
+            Expression::Index(arr, Some(idx)) => {
                 let tmp_arr = self.alloc_temp_slot();
                 let tmp_idx = self.alloc_temp_slot();
                 bytecode.append(&mut self.do_compile(arr));
@@ -3863,6 +3896,7 @@ impl Compiler {
                 bytecode.push(Byte::new(Instruction::Index));
                 false
             }
+            Expression::Index(_, None) => false,
             _ => false,
         }
     }
@@ -3890,7 +3924,7 @@ impl Compiler {
                 self.emit_field_name(bytecode, field);
                 bytecode.push(Byte::new(Instruction::SetField));
             }
-            Expression::Index(arr, idx) => {
+            Expression::Index(arr, Some(idx)) => {
                 // Always stash the RHS — `StoreIndex` pops value/index/array.
                 // Dropping with POP when `leave_value_on_stack == false` left
                 // StoreIndex without a value (stack underflow / wrong write).
@@ -3912,6 +3946,7 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::POP));
                 }
             }
+            Expression::Index(_, None) => {}
             _ => {
                 bytecode.push(Byte::new(Instruction::POP));
             }
@@ -3937,7 +3972,7 @@ impl Compiler {
             return;
         }
 
-        if let Expression::Index(arr, idx) = target.1.as_ref() {
+        if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -3988,7 +4023,7 @@ impl Compiler {
             parser::ast::AdjustOp::Dec => -1,
         };
 
-        if let Expression::Index(arr, idx) = target.1.as_ref() {
+        if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
             let tmp_arr = self.alloc_temp_slot();
             let tmp_idx = self.alloc_temp_slot();
             bytecode.append(&mut self.do_compile(arr));
@@ -4054,6 +4089,25 @@ impl Compiler {
         } else {
             bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp_old));
         }
+    }
+
+    fn qualify_static_fqn(&self, name: &str) -> String {
+        if self.namespace.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.namespace, name)
+        }
+    }
+
+    fn emit_static_initializer(&mut self, fqn: &str, init: &Output) {
+        let Some(slot) = self.checker.static_slot_index(fqn) else {
+            return;
+        };
+        let mut init_bc = self.do_compile(init);
+        self.static_init_bytecode.append(&mut init_bc);
+        self.static_init_bytecode.push(
+            Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
+        );
     }
 
     /// Resolve enum name for field access via the codegen side-table.
@@ -4440,6 +4494,7 @@ impl Compiler {
                 attrs,
                 name,
                 is_coro,
+                is_static: _,
                 type_params,
                 args,
                 returns: _returns,
@@ -4743,12 +4798,27 @@ impl Compiler {
             // push the element at `target[index]`. The Index
             // opcode carries no operand (the index is at the top
             // of the operand stack at dispatch time).
-            Expression::Index(target, index) => {
+            Expression::Index(target, Some(index)) => {
                 let mut target_bc = self.do_compile(target);
                 bytecode.append(&mut target_bc);
                 let mut index_bc = self.do_compile(index);
                 bytecode.append(&mut index_bc);
                 bytecode.push(Byte::new(Instruction::Index));
+            }
+            Expression::Index(_, None) => {}
+            Expression::Readonly(inner) => {
+                let inner_bc = self.do_compile(inner);
+                bytecode.extend(inner_bc);
+            }
+            Expression::QualifiedAccess { owner, member } => {
+                let fqn = format!("{}::{}", owner, member);
+                if let Some(slot) = self.checker.static_slot_index(&fqn) {
+                    bytecode.push(Byte::new(Instruction::LoadStatic).with_operand_u32(slot));
+                }
+            }
+            Expression::StaticDecl { name, init, .. } => {
+                let fqn = self.qualify_static_fqn(name);
+                self.emit_static_initializer(&fqn, init);
             }
             // --- FFI declare/invoke (legacy AST; prefer Call + use ffi::*) ---
             Expression::Declare(args) => self.emit_ffi_declare(*span, args),
@@ -4816,19 +4886,34 @@ impl Compiler {
                 fields: state,
                 ..
             } => {
-                self.context.classes.insert(
-                    name.to_string(),
-                    state
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, v)| match v.1.borrow() {
-                            Expression::Field(_, n, _) => (self.resolve_variable(n), idx),
-                            _ => unreachable!(
-                                "The should be only fields inside of a class definition"
-                            ),
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                use parser::ast::FieldModifier;
+                let mut instance_fields: Vec<(String, usize)> = Vec::new();
+                let mut idx = 0usize;
+                for v in state {
+                    match v.1.borrow() {
+                        Expression::Field {
+                            modifier,
+                            name: n,
+                            init,
+                            ..
+                        } => {
+                            let fname = self.resolve_variable(n);
+                            if matches!(modifier, FieldModifier::Static) {
+                                if let Some(init_expr) = init {
+                                    let fqn = format!("{}::{}", name, fname);
+                                    self.emit_static_initializer(&fqn, init_expr);
+                                }
+                            } else {
+                                instance_fields.push((fname, idx));
+                                idx += 1;
+                            }
+                        }
+                        _ => unreachable!(
+                            "There should be only fields inside of a class definition"
+                        ),
+                    }
+                }
+                self.context.classes.insert(name.to_string(), instance_fields);
                 self.context.symbols.intern(name.to_string());
             }
             Expression::Implementation { owner, methods, .. } => {
@@ -5380,28 +5465,6 @@ impl Compiler {
                         return bytecode;
                     }
                     if let Expression::Identifier(raw) = name.1.as_ref() {
-                        if *raw == "push" {
-                            let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
-                            if let Some(items) = args
-                                && items.len() == 2
-                            {
-                                bytecode.append(&mut self.do_compile(&items[0]));
-                                bytecode.append(&mut self.do_compile(&items[1]));
-                                bytecode.push(Byte::new(Instruction::ArrayPush));
-                            } else {
-                                let mut message = Message::error(
-                                    ErrorCode::TooManyArguments,
-                                    "Invalid push call".to_string(),
-                                    span.into_range(),
-                                );
-                                message.push(DiagLabel::new(
-                                    format!("push expects 2 arguments, got {}", provided),
-                                    span.into_range(),
-                                ));
-                                self.messages.push(message);
-                            }
-                            return bytecode;
-                        }
                         if *raw == "len" {
                             let provided = args.as_ref().map(|items| items.len()).unwrap_or(0);
                             if let Some(items) = args
@@ -5901,7 +5964,20 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(ty));
             }
             Expression::Identifier(n) => {
-                if let Some(slot) = self.lookup_slot(n) {
+                let resolved = self
+                    .aliases
+                    .get(*n)
+                    .cloned()
+                    .unwrap_or_else(|| n.to_string());
+                if let Some(static_slot) = self
+                    .checker
+                    .static_slot_index(&resolved)
+                    .or_else(|| self.checker.static_slot_for_module_name(n))
+                {
+                    bytecode.push(
+                        Byte::new(Instruction::LoadStatic).with_operand_u32(static_slot),
+                    );
+                } else if let Some(slot) = self.lookup_slot(n) {
                     bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(slot));
                 } else {
                     // Not a local variable — check if it's a generic function
@@ -6526,13 +6602,40 @@ impl Compiler {
                 self.context.constants.insert(symbol, false);
             }
             Expression::Assignment(lhs, value) => match lhs.1.as_ref() {
+                Expression::QualifiedAccess { owner, member } => {
+                    let fqn = format!("{}::{}", owner, member);
+                    if let Some(slot) = self.checker.static_slot_index(&fqn) {
+                        self.append_with_existential_pack(&mut bytecode, value);
+                        bytecode.push(
+                            Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
+                        );
+                    }
+                }
+                Expression::Construct {
+                    enum_name,
+                    variant_name,
+                    fields,
+                } if matches!(fields, parser::ast::EnumConstructPayload::Unit) => {
+                    let fqn = format!("{}::{}", enum_name, variant_name);
+                    if let Some(slot) = self.checker.static_slot_index(&fqn) {
+                        self.append_with_existential_pack(&mut bytecode, value);
+                        bytecode.push(
+                            Byte::new(Instruction::StoreStatic).with_operand_u32(slot),
+                        );
+                    }
+                }
                 Expression::Access(target_expr, field) => {
                     self.append_with_existential_pack(&mut bytecode, value);
                     bytecode.append(&mut self.do_compile(target_expr));
                     self.emit_field_name(&mut bytecode, field);
                     bytecode.push(Byte::new(Instruction::SetField));
                 }
-                Expression::Index(arr, idx) => {
+                Expression::Index(arr, None) => {
+                    bytecode.append(&mut self.do_compile(arr));
+                    self.append_with_existential_pack(&mut bytecode, value);
+                    bytecode.push(Byte::new(Instruction::ArrayPush));
+                }
+                Expression::Index(arr, Some(idx)) => {
                     let tmp_arr = self.alloc_temp_slot();
                     let tmp_idx = self.alloc_temp_slot();
                     let tmp_val = self.alloc_temp_slot();
@@ -6548,6 +6651,21 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::StoreIndex));
                 }
                 Expression::Identifier(name) => {
+                    let resolved = self
+                        .aliases
+                        .get(*name)
+                        .cloned()
+                        .unwrap_or_else(|| name.to_string());
+                    if let Some(static_slot) = self
+                        .checker
+                        .static_slot_index(&resolved)
+                        .or_else(|| self.checker.static_slot_for_module_name(name))
+                    {
+                        self.append_with_existential_pack(&mut bytecode, value);
+                        bytecode.push(
+                            Byte::new(Instruction::StoreStatic).with_operand_u32(static_slot),
+                        );
+                    } else {
                     self.context.assignments.insert(name.to_string(), true);
                     let symbol_opt = if let Some(map) = &self.context.match_bindings {
                         if let Some(&slot) = map.get(*name) {
@@ -6599,6 +6717,7 @@ impl Compiler {
                             span.into_range(),
                         ));
                         self.messages.push(message);
+                    }
                     }
                 }
                 _ => {
@@ -6847,6 +6966,40 @@ impl Compiler {
                 // NodeId alignment, but do not emit MakeEnum (and do
                 // not panic: release builds use panic=abort).
                 let Some(tag) = self.checker.tag_for(enum_name, variant_name) else {
+                    let fqn = format!("{}::{}", enum_name, variant_name);
+                    if let Some(offset) = self.functions.get(&fqn).copied() {
+                        match fields {
+                            EnumConstructPayload::Unit => {}
+                            EnumConstructPayload::Tuple(args) => {
+                                for arg in args {
+                                    bytecode.append(&mut self.do_compile(arg));
+                                }
+                            }
+                            EnumConstructPayload::Record(parts) => {
+                                for part in parts {
+                                    bytecode.append(&mut self.do_compile(&part.value));
+                                }
+                            }
+                        }
+                        let arity = match fields {
+                            EnumConstructPayload::Unit => 0,
+                            EnumConstructPayload::Tuple(args) => args.len(),
+                            EnumConstructPayload::Record(parts) => parts.len(),
+                        };
+                        bytecode.push(
+                            Byte::new(Instruction::CALL)
+                                .with_call_packed(arity as u32, offset as u32),
+                        );
+                        return bytecode;
+                    }
+                    if matches!(fields, EnumConstructPayload::Unit)
+                        && let Some(slot) = self.checker.static_slot_index(&fqn)
+                    {
+                        bytecode.push(
+                            Byte::new(Instruction::LoadStatic).with_operand_u32(slot),
+                        );
+                        return bytecode;
+                    }
                     match fields {
                         EnumConstructPayload::Unit => {}
                         EnumConstructPayload::Tuple(args) => {
@@ -7540,7 +7693,7 @@ impl Compiler {
                 }
             }
 
-            Expression::Field(_, _, _) => {
+            Expression::Field { .. } => {
                 // Class field decls are metadata only — consumed for ID alignment.
             }
 
@@ -7766,6 +7919,7 @@ impl Compiler {
         // pointing at the first user byte so `extern` prologue JMPs
         // don't fall into a Num/Ord/Eq/Show thunk body.
         self.program_start_offset = self.bytecode.len() as u32;
+        self.setup_entry_offset = self.program_start_offset;
         self.mono_plan = monomorphize::plan_monomorphization(module, ast, &self.checker);
 
         let mut program = self.do_compile(ast);
@@ -7782,6 +7936,39 @@ impl Compiler {
     /// Called once after multi-file linking by the pipeline, or at the end
     /// of single-file [`compile`] so unit tests observe fused output.
     pub fn finalize_bytecode(&mut self) {
+        let static_init_region = if !self.static_init_bytecode.is_empty() {
+            let pos = self.program_start_offset as usize;
+            self.setup_entry_offset = pos as u32;
+            let inits = std::mem::take(&mut self.static_init_bytecode);
+            let init_len = inits.len();
+            self.bytecode.splice(pos..pos, inits);
+            self.program_start_offset += init_len as u32;
+            for offset in self.functions.values_mut() {
+                if *offset >= pos {
+                    *offset += init_len;
+                }
+            }
+            for (_, offset) in self.test_cases.iter_mut() {
+                if (*offset as usize) >= pos {
+                    *offset += init_len as u32;
+                }
+            }
+            for offset in self.mono_offsets.values_mut() {
+                if *offset >= pos {
+                    *offset += init_len;
+                }
+            }
+            peephole::bump_targets_at_or_after(
+                &mut self.bytecode,
+                &mut self.constants,
+                pos,
+                init_len,
+            );
+            Some((pos, init_len))
+        } else {
+            None
+        };
+
         let fusion_sites = peephole::fuse_bytecode(&mut self.bytecode, &mut self.constants);
         for offset in self.functions.values_mut() {
             *offset = peephole::adjust_target(*offset, &fusion_sites);
@@ -7794,6 +7981,48 @@ impl Compiler {
         }
         self.program_start_offset =
             peephole::adjust_target(self.program_start_offset as usize, &fusion_sites) as u32;
+        self.setup_entry_offset =
+            peephole::adjust_target(self.setup_entry_offset as usize, &fusion_sites) as u32;
+
+        if let (Some((pos, init_len)), Some(&main_off)) =
+            (static_init_region, self.functions.get("main"))
+        {
+            let jmp_pos = peephole::adjust_target(pos + init_len, &fusion_sites);
+            let jmp_target = if main_off >= jmp_pos {
+                main_off + 1
+            } else {
+                main_off
+            };
+            self.bytecode.insert(
+                jmp_pos,
+                Byte::new(Instruction::JMP).with_operand_u32(jmp_target as u32),
+            );
+            peephole::bump_targets_at_or_after_skip_byte(
+                &mut self.bytecode,
+                &mut self.constants,
+                jmp_pos,
+                jmp_pos,
+                1,
+            );
+            for offset in self.functions.values_mut() {
+                if *offset >= jmp_pos {
+                    *offset += 1;
+                }
+            }
+            for (_, offset) in self.test_cases.iter_mut() {
+                if (*offset as usize) >= jmp_pos {
+                    *offset += 1;
+                }
+            }
+            for offset in self.mono_offsets.values_mut() {
+                if *offset >= jmp_pos {
+                    *offset += 1;
+                }
+            }
+            if (self.program_start_offset as usize) > jmp_pos {
+                self.program_start_offset += 1;
+            }
+        }
     }
 
     pub fn compile<'compiler>(
@@ -7853,6 +8082,67 @@ mod tests {
         let mut compiler = Compiler::default();
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
+    }
+
+    #[test]
+    fn method_call_target_relocated_after_static_init_splice() {
+        use common::Instruction;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples/static_singleton.0s");
+        let mut pipeline = crate::Pipeline::new();
+        let (bytecode, constants) = pipeline
+            .compile_src_from_file(path.to_str().unwrap())
+            .expect("compile");
+        let bump_off = pipeline.compiler_mut().get_function("Counter::bump");
+        assert!(
+            bytecode.iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CALL) && b.call_parts().1 == bump_off
+            }),
+            "CALL to Counter::bump must target {bump_off} after static-init splice"
+        );
+
+        let mut machine = machine::Machine::<256>::default();
+        pipeline.wire_host_natives(&mut machine);
+        machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
+    }
+
+    #[test]
+    fn two_module_and_class_static_assignments_run() {
+        use common::{ArchivedProgram, ARCHIVE_VERSION};
+        use rkyv::rancor::Error;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("examples/static_minimal.0s");
+        let mut pipeline = crate::Pipeline::new();
+        let (bytecode, constants) = pipeline
+            .compile_src_from_file(path.to_str().unwrap())
+            .expect("compile");
+        assert_eq!(pipeline.static_slot_count(), 2);
+
+        let program = ArchivedProgram {
+            version: ARCHIVE_VERSION,
+            static_slot_count: pipeline.static_slot_count(),
+            constants: constants.clone(),
+            bytecode: bytecode.clone(),
+        };
+        let bytes = rkyv::to_bytes::<Error>(&program).expect("serialize");
+        let archived =
+            rkyv::access::<rkyv::Archived<ArchivedProgram>, Error>(bytes.as_slice()).expect("access");
+        let loaded_bc: Vec<Byte> =
+            rkyv::deserialize::<Vec<Byte>, Error>(&archived.bytecode).expect("bc");
+        let loaded_constants: Vec<u64> =
+            rkyv::deserialize::<Vec<u64>, Error>(&archived.constants).expect("consts");
+        let static_slots = u32::from(archived.static_slot_count);
+
+        let mut machine = machine::Machine::<256>::default();
+        pipeline.wire_vm_ffi(&mut machine, Some(path.as_path()));
+        pipeline.wire_host_natives(&mut machine);
+        machine.run_raw(&loaded_bc, &loaded_constants, static_slots);
     }
 
     /// `test("…")` cases become `__zs_test_N` functions; standalone runs get a virtual `main`.
@@ -9861,12 +10151,12 @@ fn main() {
     // ============================================================
 
     #[test]
-    fn array_push_and_len_builtins_emit_array_opcodes() {
+    fn array_append_and_len_emit_array_opcodes() {
         use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn main() { \
 let a = [1, 2]; \
-push(a, 3); \
+a[] = 3; \
 print \"%i\", len(a); \
 }",
         );
@@ -9874,7 +10164,7 @@ print \"%i\", len(a); \
         assert!(
             bc.iter()
                 .any(|b| matches!(b.bytecode(), Instruction::ArrayPush)),
-            "expected `push(a, 3)` to emit ArrayPush"
+            "expected `a[] = 3` to emit ArrayPush"
         );
         assert!(
             bc.iter()

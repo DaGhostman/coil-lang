@@ -422,6 +422,7 @@ fn contains_var(ty: &Ty) -> bool {
         Ty::Array { element, .. } => contains_var(element),
         Ty::Record { fields } => fields.iter().any(|(_, ty)| contains_var(ty)),
         Ty::Forall { body, .. } => contains_var(body),
+        Ty::Readonly(inner) => contains_var(inner),
         Ty::Con(_) | Ty::Existential { .. } => false,
     }
 }
@@ -544,10 +545,15 @@ where
         | Expression::Gt(l, r)
         | Expression::Leq(l, r)
         | Expression::Geq(l, r)
-        | Expression::Coalesce(l, r)
-        | Expression::Index(l, r) => {
+        | Expression::Coalesce(l, r) => {
             f(l);
             f(r);
+        }
+        Expression::Index(l, r) => {
+            f(l);
+            if let Some(r) = r {
+                f(r);
+            }
         }
         Expression::Range { start, end, .. } => {
             f(start);
@@ -721,11 +727,19 @@ where
         | Expression::Variable(_, _)
         | Expression::Constant(_, _)
         | Expression::Argument(_, _, _)
-        | Expression::Field(_, _, _)
+        | Expression::Field { .. }
+        | Expression::QualifiedAccess { .. }
         | Expression::ExternBlock { .. }
         | Expression::ExternStruct(_)
         | Expression::Forall { .. } => {}
         Expression::LetDestructure { rhs, .. } => f(rhs),
+        Expression::Readonly(inner) => f(inner),
+        Expression::StaticDecl { ty, init, .. } => {
+            if let Some(ty) = ty {
+                f(ty);
+            }
+            f(init);
+        }
         Expression::NamedArg(_, value) => f(value),
         Expression::Spread(inner) => f(inner),
         Expression::TypeFnSig { params, ret } => {

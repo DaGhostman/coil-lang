@@ -51,7 +51,7 @@ fn encode_frame([byte] body) -> [byte] {
     let i = 0;
     while i < n {
         if i < 5 {
-            push(frame, body[i]);
+            frame[] = body[i];
         }
         i = i + 1;
     }

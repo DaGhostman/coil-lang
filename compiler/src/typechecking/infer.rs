@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use parser::ast::{Expression, MatchArm, Output, Pattern, Visibility};
+use parser::ast::{Expression, FieldModifier, MatchArm, Output, Pattern, Visibility};
 use reporting::{ErrorCode, Label, Message};
 
 use super::env::{Env, TyVarCounter, instantiate_with_kinds};
@@ -90,7 +90,7 @@ use super::ty::{
     EnumVariantPayloadTy, STRING, Ty, TyVarId, boolean, float, int, is_option_ty, is_result_ty,
     list, option_app_ty, option_inner, option_ty, range_inclusive_ty, range_ty, result_app_ty,
     result_ok_err, result_ty, schemaize_payload, schemaize_ty, string, subst_payload_params,
-    subst_ty_params, unit as unit_ty,
+    subst_ty_params, unit as unit_ty, readonly_ty, strip_readonly,
 };
 use super::unify::{UnifyError, unify_with};
 use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};
@@ -291,6 +291,18 @@ pub struct Checker {
     /// Names declared with `const`, tracked per lexical scope so assignment
     /// diagnostics can distinguish immutable bindings from mutable `let`s.
     const_scopes: Vec<HashSet<String>>,
+
+    /// Global static slots (`static let` / `static const` / class `static` fields).
+    /// Key = FQN (`module::name` or `Class::field`). Persists across modules.
+    static_slots: HashMap<String, (u32, bool)>,
+    static_slot_types: HashMap<String, Ty>,
+    next_static_slot: u32,
+
+    /// `const` class fields: class name → field names (immutable for everyone).
+    const_class_fields: HashMap<String, HashSet<String>>,
+
+    /// Owner class while typechecking an `impl` block (`self` exception for readonly).
+    impl_owner: Option<String>,
 
     // Enum registry: Vec preserves source-declaration order for tags;
     // BTreeMap indexes variant name → tag.
@@ -555,6 +567,11 @@ impl Checker {
             type_aliases: vec![HashMap::new()],
             generic_aliases: HashMap::new(),
             const_scopes: vec![HashSet::new()],
+            static_slots: HashMap::new(),
+            static_slot_types: HashMap::new(),
+            next_static_slot: 0,
+            const_class_fields: HashMap::new(),
+            impl_owner: None,
             enums: BTreeMap::new(),
             enum_tags: BTreeMap::new(),
             enum_payloads: BTreeMap::new(),
@@ -1197,6 +1214,7 @@ impl Checker {
             Ty::Tuple(elems) => elems.iter().any(Self::ty_contains_open_var),
             Ty::Record { fields } => fields.iter().any(|(_, t)| Self::ty_contains_open_var(t)),
             Ty::Constructor { owner, .. } => Self::ty_contains_open_var(owner),
+            Ty::Readonly(inner) => Self::ty_contains_open_var(inner),
             Ty::Con(_) | Ty::Sum { .. } | Ty::Existential { .. } => false,
         }
     }
@@ -1343,7 +1361,8 @@ impl Checker {
             | Ty::Array { .. }
             | Ty::Record { .. }
             | Ty::Existential { .. }
-            | Ty::Forall { .. } => Kind::Type,
+            | Ty::Forall { .. }
+            | Ty::Readonly(_) => Kind::Type,
         }
     }
 
@@ -1995,6 +2014,9 @@ impl Checker {
             }
 
             Expression::Assignment(name, value) => {
+                if let Expression::Index(arr, None) = name.1.as_ref() {
+                    return self.infer_array_append_assign(arr, value, range);
+                }
                 // `x = resume x` overwrites the coroutine handle with the yield value.
                 if let (Expression::Identifier(var_name), Expression::Resume(target, None)) =
                     (name.1.as_ref(), value.1.as_ref())
@@ -2129,14 +2151,7 @@ impl Checker {
 
                     // Named args on methods: only inherent class methods.
                     if method_has_named {
-                        let class_owner = match &resolved {
-                            Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
-                            Ty::App(head, _) => match head.as_ref() {
-                                Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
+                        let class_owner = self.class_owner_from_ty(&resolved);
                         if let Some(owner) = class_owner.as_ref()
                             && self.methods.get(owner).and_then(|m| m.get(*method)).is_some()
                         {
@@ -2288,14 +2303,7 @@ impl Checker {
                     // (Rust-style): `impl Point { fn show() ... }` must not be
                     // shadowed by prelude `Show::show` when no Show instance
                     // exists for Point.
-                    let class_owner = match &resolved {
-                        Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
-                        Ty::App(head, _) => match head.as_ref() {
-                            Ty::Con(n) if self.classes.contains_key(n) => Some(n.clone()),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
+                    let class_owner = self.class_owner_from_ty(&resolved);
                     if let Some(owner) = class_owner.as_ref()
                         && self.methods.get(owner).and_then(|m| m.get(*method)).is_some()
                     {
@@ -2434,7 +2442,9 @@ impl Checker {
                 // First-class callee (`lambda(...)`, nested fn value, etc.).
                 if !matches!(
                     name.1.as_ref(),
-                    Expression::Identifier(_) | Expression::Access(_, _)
+                    Expression::Identifier(_)
+                        | Expression::Access(_, _)
+                        | Expression::QualifiedAccess { .. }
                 ) {
                     let callee_ty = self.infer(name);
                     let flat_args = self.flatten_spread_call_args(args.as_deref().unwrap_or(&[]));
@@ -2454,6 +2464,21 @@ impl Checker {
 
                 let ident = match name.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
+                    Expression::QualifiedAccess { owner, member } => {
+                        let fqn = format!("{}::{}", owner, member);
+                        if self.static_slot_types.contains_key(&fqn) {
+                            return self.error_with_help(
+                                ErrorCode::GenericTypeError,
+                                format!("`{}` is a static field, not a function", fqn),
+                                range,
+                                Some(
+                                    "read it as a value or assign with `Class::field = expr`"
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                        fqn
+                    }
                     _ => {
                         return self.error(
                             ErrorCode::UnknownFunction,
@@ -2468,17 +2493,6 @@ impl Checker {
                     .iter()
                     .any(|a| matches!(a.1.as_ref(), Expression::NamedArg(..)));
 
-                if ident == "push" {
-                    if has_named {
-                        return self.error_with_help(
-                            ErrorCode::GenericTypeError,
-                            "Named arguments are not supported on `push`".to_string(),
-                            range,
-                            Some("use positional arguments: `push(arr, value)`".to_string()),
-                        );
-                    }
-                    return self.infer_array_push(args.as_deref(), range);
-                }
                 if ident == "len" {
                     if has_named {
                         return self.error_with_help(
@@ -3151,6 +3165,14 @@ impl Checker {
             Expression::Index(target, index_expr) => {
                 let target_ty = self.infer(target);
                 let target_ty = apply_ty_prune(&self.subst, &target_ty);
+                let Some(index_expr) = index_expr else {
+                    return self.error_with_help(
+                        ErrorCode::CannotIndex,
+                        "empty index `arr[]` is only valid as an assignment target".to_string(),
+                        range,
+                        Some("use `arr[] = value` to append to a dynamic array".to_string()),
+                    );
+                };
                 let index_ty = self.infer(index_expr);
                 let index_ty_pruned = apply_ty_prune(&self.subst, &index_ty);
                 // Constrain the index to be an `int` (the VM only
@@ -3330,12 +3352,21 @@ impl Checker {
                 attrs,
                 name,
                 is_coro,
+                is_static,
                 type_params,
                 args,
                 returns,
                 where_constraints,
                 body,
             } => {
+                if *is_static {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "`static fn` is only allowed inside an `impl` block".to_string(),
+                        range,
+                        Some("declare static methods as `impl Class { static fn ... }`".to_string()),
+                    );
+                }
                 if *name == "main" {
                     self.main_decl_span = Some(range.clone());
                 }
@@ -3484,7 +3515,7 @@ impl Checker {
             Expression::Access(receiver, field) => {
                 let receiver_ty = self.infer(receiver);
                 let resolved = apply_ty_prune(&self.subst, &receiver_ty);
-                match &resolved {
+                match strip_readonly(&resolved) {
                     Ty::Sum { name, variants } => {
                         self.access_field_in_sum(name, variants, None, field, range)
                     }
@@ -3639,7 +3670,7 @@ impl Checker {
                 }
                 Ty::Con(class_name)
             }
-            Expression::Field(_, _, _) => unit_ty(),
+            Expression::Field { .. } => unit_ty(),
 
             // ---- Enums / constructors / type aliases ----
             Expression::EnumDecl {
@@ -4408,6 +4439,54 @@ impl Checker {
                 unit_ty()
             }
 
+            Expression::Readonly(inner) => {
+                let inner_ty = self.infer(inner);
+                readonly_ty(apply_ty_prune(&self.subst, &inner_ty))
+            }
+            Expression::QualifiedAccess { owner, member } => {
+                let fqn = format!("{}::{}", owner, member);
+                if let Some(ty) = self.static_slot_types.get(&fqn).cloned() {
+                    return apply_ty_prune(&self.subst, &ty);
+                }
+                self.error_with_help(
+                    ErrorCode::UnknownValue,
+                    format!("Cannot find static member `{}`", fqn),
+                    range,
+                    Some("declare it with `static` at module or class scope".to_string()),
+                )
+            }
+            Expression::StaticDecl {
+                is_const,
+                name,
+                ty,
+                init,
+            } => {
+                let fqn = self.qualify_module_name(name);
+                let declared = ty.as_ref().map(|t| self.parse_type_name(t));
+                let init_ty = self.infer(init);
+                let slot_ty = if let Some(d) = declared {
+                    self.coerce_or_unify(
+                        &d,
+                        &init_ty,
+                        Some(init),
+                        &range,
+                        "static initializer",
+                    );
+                    apply_ty_prune(&self.subst, &d)
+                } else {
+                    apply_ty_prune(&self.subst, &init_ty)
+                };
+                self.register_static_slot(fqn, *is_const, slot_ty.clone(), range.clone());
+                self.env
+                    .insert_top(name.to_string(), Scheme::mono(slot_ty.clone()));
+                self.record_codegen_var_type(name.to_string(), slot_ty.clone());
+                if *is_const {
+                    self.insert_const_binding(name.to_string());
+                    self.warn_shallow_const_binding(name, &slot_ty, range);
+                }
+                unit_ty()
+            }
+
             Expression::Forall { params, ty } => {
                 self.forall_type(params, |checker| checker.infer(ty))
             }
@@ -4696,6 +4775,7 @@ impl Checker {
                                 );
                                 let pruned = apply_ty_prune(&self.subst, &var_ty);
                                 self.record_codegen_var_type(n.to_string(), pruned.clone());
+                                self.warn_shallow_const_binding(n, &pruned, child.0.into_range());
                                 self.maybe_record_polyfn_binding(
                                     (child.0.start, child.0.end),
                                     &pruned,
@@ -4999,6 +5079,25 @@ impl Checker {
         match target.1.as_ref() {
             Expression::Identifier(n) => {
                 let ident = n.to_string();
+                let module_fqn = self.qualify_module_name(&ident);
+                if self.static_slots.contains_key(&module_fqn) {
+                    if self.is_static_const_fqn(&module_fqn) {
+                        let mut msg = Message::error(
+                            ErrorCode::InvalidAssignment,
+                            format!("Cannot assign to constant `{}`", ident),
+                            range,
+                        );
+                        msg.with_help(
+                            "`static const` bindings are immutable after initialization".to_string(),
+                        );
+                        self.messages.push(msg);
+                    }
+                    return self
+                        .static_slot_types
+                        .get(&module_fqn)
+                        .cloned()
+                        .unwrap_or_else(|| Ty::Var(self.counter.fresh()));
+                }
                 match self.env.lookup(&ident).cloned() {
                     Some(s) => {
                         let ty = self.instantiate_ty(&s);
@@ -5024,8 +5123,26 @@ impl Checker {
                 }
             }
             Expression::Access(receiver, field) => {
+                let is_self_field = matches!(
+                    receiver.1.as_ref(),
+                    Expression::Identifier(n) if *n == "self" && self.impl_owner.is_some()
+                );
                 let receiver_ty = self.infer(receiver);
+                if !is_self_field {
+                    self.check_readonly_external_mutation(&receiver_ty, range.clone());
+                }
                 let resolved = apply_ty_prune(&self.subst, &receiver_ty);
+                let class_name = self.class_owner_from_ty(&resolved);
+                if let Some(class) = class_name.as_ref()
+                    && self.is_const_class_field(class, field)
+                {
+                    let _ = self.error_with_help(
+                        ErrorCode::InvalidAssignment,
+                        format!("Cannot assign to const field `{}` of `{}`", field, class),
+                        range.clone(),
+                        Some("const fields are immutable after construction".to_string()),
+                    );
+                }
                 match &resolved {
                     Ty::Record { fields } => match fields.iter().find(|(n, _)| n == field) {
                         Some((_, fty)) => fty.clone(),
@@ -5061,9 +5178,62 @@ impl Checker {
                     ),
                 }
             }
+            Expression::QualifiedAccess { owner, member } => {
+                let fqn = format!("{}::{}", owner, member);
+                if let Some(ty) = self.static_slot_types.get(&fqn).cloned() {
+                    if self.is_static_const_fqn(&fqn) {
+                        let _ = self.error_with_help(
+                            ErrorCode::InvalidAssignment,
+                            format!("Cannot assign to constant `{}`", fqn),
+                            range,
+                            Some("`static const` bindings are immutable after initialization".to_string()),
+                        );
+                    }
+                    return ty;
+                }
+                self.error_with_help(
+                    ErrorCode::UndeclaredAssignment,
+                    format!("Cannot assign to undeclared static `{}`", fqn),
+                    range,
+                    None,
+                )
+            }
+            Expression::Construct {
+                enum_name,
+                variant_name,
+                fields,
+            } if matches!(fields, parser::ast::EnumConstructPayload::Unit) => {
+                let fqn = format!("{}::{}", enum_name, variant_name);
+                if let Some(ty) = self.static_slot_types.get(&fqn).cloned() {
+                    if self.is_static_const_fqn(&fqn) {
+                        let _ = self.error_with_help(
+                            ErrorCode::InvalidAssignment,
+                            format!("Cannot assign to constant `{}`", fqn),
+                            range,
+                            Some("`static const` bindings are immutable after initialization".to_string()),
+                        );
+                    }
+                    return ty;
+                }
+                self.error_with_help(
+                    ErrorCode::UndeclaredAssignment,
+                    format!("Cannot assign to undeclared static `{}`", fqn),
+                    range,
+                    None,
+                )
+            }
             Expression::Index(arr, idx) => {
                 let target_ty = self.infer(arr);
                 let target_ty = apply_ty_prune(&self.subst, &target_ty);
+                let Some(idx) = idx else {
+                    return self.error_with_help(
+                        ErrorCode::InvalidAssignment,
+                        "empty index `arr[]` is only valid as an assignment target".to_string(),
+                        range,
+                        Some("use `arr[] = value` to append to a dynamic array".to_string()),
+                    );
+                };
+                self.check_readonly_external_mutation(&target_ty, range.clone());
                 let index_ty = self.infer(idx);
                 let _ = unify_with(&self.subst, &apply_ty_prune(&self.subst, &index_ty), &int());
                 match &target_ty {
@@ -5143,63 +5313,6 @@ impl Checker {
         list(first_ty)
     }
 
-    fn infer_array_push(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
-        let args = args.unwrap_or(&[]);
-        if args.len() != 2 {
-            for arg in args {
-                let _ = self.infer(arg);
-            }
-            return self.error_with_help(
-                ErrorCode::ConstructorArity,
-                format!("push expects 2 arguments, got {}", args.len()),
-                range,
-                Some("use `push(array, value)`".to_string()),
-            );
-        }
-
-        let array_ty = self.infer(&args[0]);
-        let value_ty = self.infer(&args[1]);
-        let resolved = apply_ty_prune(&self.subst, &array_ty);
-        match resolved {
-            Ty::Array { element, .. } => {
-                self.coerce_or_unify(
-                    element.as_ref(),
-                    &value_ty,
-                    Some(&args[1]),
-                    &args[1].0.into_range(),
-                    "push element",
-                );
-                let elem = apply_ty_prune(&self.subst, element.as_ref());
-                let dynamic = array(elem);
-                if let Expression::Identifier(name) = args[0].1.as_ref() {
-                    self.env
-                        .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
-                    self.record_codegen_var_type((*name).to_string(), dynamic.clone());
-                }
-                dynamic
-            }
-            Ty::Var(v) => {
-                let elem = Ty::Var(self.counter.fresh());
-                let dynamic = array(elem.clone());
-                self.unify(&Ty::Var(v), &dynamic, &args[0].0.into_range(), "push array");
-                self.unify(&elem, &value_ty, &args[1].0.into_range(), "push element");
-                let dynamic = apply_ty_prune(&self.subst, &dynamic);
-                if let Expression::Identifier(name) = args[0].1.as_ref() {
-                    self.env
-                        .insert_top((*name).to_string(), Scheme::mono(dynamic.clone()));
-                    self.record_codegen_var_type((*name).to_string(), dynamic.clone());
-                }
-                dynamic
-            }
-            other => self.error_with_help(
-                ErrorCode::ConstructorArity,
-                "push expects an array as its first argument".to_string(),
-                args[0].0.into_range(),
-                Some(format!("found `{}`; use `push(array, value)`", other)),
-            ),
-        }
-    }
-
     fn infer_array_len(&mut self, args: Option<&[Output]>, range: Range<usize>) -> Ty {
         let args = args.unwrap_or(&[]);
         if args.len() != 1 {
@@ -5216,12 +5329,12 @@ impl Checker {
 
         let target_ty = self.infer(&args[0]);
         let resolved = apply_ty_prune(&self.subst, &target_ty);
-        match resolved {
+        match strip_readonly(&resolved) {
             Ty::Array { .. } => int(),
             Ty::Var(v) => {
                 let elem = Ty::Var(self.counter.fresh());
                 self.unify(
-                    &Ty::Var(v),
+                    &Ty::Var(*v),
                     &array(elem),
                     &args[0].0.into_range(),
                     "len array",
@@ -6886,7 +6999,8 @@ impl Checker {
             | Ty::Record { .. }
             | Ty::Existential { .. }
             | Ty::Fun(_, _)
-            | Ty::Forall { .. } => None,
+            | Ty::Forall { .. }
+            | Ty::Readonly(_) => None,
         }
     }
 
@@ -7761,7 +7875,14 @@ impl Checker {
     fn register_class(&mut self, name: &str, fields: &[Output], range: &Range<usize>) {
         let mut field_info = Vec::new();
         for field in fields {
-            if let Expression::Field(vis, fname, fty) = field.1.as_ref() {
+            if let Expression::Field {
+                visibility: vis,
+                modifier,
+                name: fname,
+                ty: fty,
+                init,
+            } = field.1.as_ref()
+            {
                 let fname_str = match fname.1.as_ref() {
                     Expression::Identifier(n) => n.to_string(),
                     _ => {
@@ -7774,6 +7895,40 @@ impl Checker {
                     }
                 };
                 let ty = self.parse_type_name(fty);
+                if matches!(modifier, FieldModifier::Static) {
+                    if init.is_none() {
+                        self.messages.push(Message::error(
+                            ErrorCode::GenericTypeError,
+                            format!("Static field `{}` in class `{}` requires an initializer", fname_str, name),
+                            field.0.into_range(),
+                        ));
+                        continue;
+                    }
+                    let fqn = format!("{}::{}", name, fname_str);
+                    self.register_static_slot(
+                        fqn,
+                        false,
+                        ty.clone(),
+                        field.0.into_range(),
+                    );
+                    if let Some(init_expr) = init {
+                        let init_ty = self.infer(init_expr);
+                        self.coerce_or_unify(
+                            &ty,
+                            &init_ty,
+                            Some(init_expr),
+                            &field.0.into_range(),
+                            "static field initializer",
+                        );
+                    }
+                    continue;
+                }
+                if matches!(modifier, FieldModifier::Const) {
+                    self.const_class_fields
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(fname_str.clone());
+                }
                 field_info.push((*vis, fname_str, ty));
             } else {
                 self.messages.push(Message::error(
@@ -7853,6 +8008,7 @@ impl Checker {
                 .insert_top(owner.to_string(), Scheme::mono(Ty::Con(owner.to_string())));
         }
 
+        let prev_impl_owner = self.impl_owner.replace(owner.to_string());
         self.push_scope();
         self.env
             .insert_top("self".to_string(), Scheme::mono(owner_ty.clone()));
@@ -7862,6 +8018,7 @@ impl Checker {
                 if let Expression::Function {
                     name,
                     is_coro,
+                    is_static,
                     args,
                     returns,
                     where_constraints,
@@ -7869,6 +8026,7 @@ impl Checker {
                     ..
                 } = body.1.as_ref()
                 {
+                    let self_ty = if *is_static { None } else { Some(&owner_ty) };
                     // Type params stay in the outer impl frame so `self`
                     // and method annotations share the same variables.
                     let fun_ty = self.infer_function(
@@ -7879,7 +8037,7 @@ impl Checker {
                         where_constraints,
                         func_body.as_ref(),
                         &method.0.into_range(),
-                        Some(&owner_ty),
+                        self_ty,
                         *is_coro,
                     );
                     // Method calls resolve as `Owner::method`; mirror that
@@ -7937,6 +8095,7 @@ impl Checker {
         }
 
         self.pop_scope();
+        self.impl_owner = prev_impl_owner;
         self.pop_type_params_for_type_parsing(pushed);
         let _ = range;
     }
@@ -8693,7 +8852,7 @@ impl Checker {
             span,
             Box::new(Expression::Index(
                 base.clone(),
-                (span, Box::new(Expression::Integer(idx))),
+                Some((span, Box::new(Expression::Integer(idx)))),
             )),
         )
     }
@@ -8733,7 +8892,7 @@ impl Checker {
 
     /// Infer a call argument, skipping ID consumption for spread-expanded indices.
     fn infer_call_arg(&mut self, arg: &Output) -> Ty {
-        if let Expression::Index(target, index_expr) = arg.1.as_ref() {
+        if let Expression::Index(target, Some(index_expr)) = arg.1.as_ref() {
             if self
                 .spread_expanded_bases
                 .contains(&(target.0.start, target.0.end))
@@ -9338,7 +9497,8 @@ impl Checker {
             | Expression::Variable(_, _)
             | Expression::Constant(_, _)
             | Expression::Argument(_, _, _)
-            | Expression::Field(_, _, _)
+            | Expression::Field { .. }
+            | Expression::QualifiedAccess { .. }
             | Expression::ExternBlock { .. }
             | Expression::ExternStruct(_) => {}
 
@@ -9454,7 +9614,16 @@ impl Checker {
             }
             Expression::Index(target, index) => {
                 self.pre_register_enums_walk(target, errors);
-                self.pre_register_enums_walk(index, errors);
+                if let Some(index) = index {
+                    self.pre_register_enums_walk(index, errors);
+                }
+            }
+            Expression::Readonly(inner) => self.pre_register_enums_walk(inner, errors),
+            Expression::StaticDecl { ty, init, .. } => {
+                if let Some(ty) = ty {
+                    self.pre_register_enums_walk(ty, errors);
+                }
+                self.pre_register_enums_walk(init, errors);
             }
             Expression::Dict(fields) => {
                 for f in fields {
@@ -9769,6 +9938,12 @@ impl Checker {
         let tags = match self.enum_tags.get(&enum_str) {
             Some(t) => t.clone(),
             None => {
+                let static_fqn = format!("{}::{}", enum_name, variant_name);
+                if matches!(fields, EnumConstructPayload::Unit) {
+                    if let Some(ty) = self.static_slot_types.get(&static_fqn).cloned() {
+                        return apply_ty_prune(&self.subst, &ty);
+                    }
+                }
                 return self.error(
                     ErrorCode::UnknownEnum,
                     format!("Cannot find enum `{}` in this scope", enum_name),
@@ -11459,6 +11634,148 @@ impl Checker {
         self.codegen_var_types.get(name)
     }
 
+    /// Number of global static slots allocated during typechecking.
+    pub fn static_slot_count(&self) -> u32 {
+        self.next_static_slot
+    }
+
+    /// Static slot index for a fully-qualified name (`Class::field`, `mod::x`).
+    pub fn static_slot_index(&self, fqn: &str) -> Option<u32> {
+        self.static_slots.get(fqn).map(|(id, _)| *id)
+    }
+
+    /// Whether a static slot is declared `static const` / class static const.
+    pub fn is_static_const_fqn(&self, fqn: &str) -> bool {
+        self.static_slots.get(fqn).map(|(_, c)| *c).unwrap_or(false)
+    }
+
+    /// Static slot for a name in the current module namespace.
+    pub fn static_slot_for_module_name(&self, name: &str) -> Option<u32> {
+        self.static_slot_index(&self.qualify_module_name(name))
+    }
+
+    /// Whether `class.field` is declared `const`.
+    pub fn is_const_class_field(&self, class: &str, field: &str) -> bool {
+        self.const_class_fields
+            .get(class)
+            .is_some_and(|fields| fields.contains(field))
+    }
+
+    fn qualify_module_name(&self, name: &str) -> String {
+        if self.current_module.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.current_module, name)
+        }
+    }
+
+    fn register_static_slot(
+        &mut self,
+        fqn: String,
+        is_const: bool,
+        ty: Ty,
+        range: Range<usize>,
+    ) -> u32 {
+        if self.static_slots.contains_key(&fqn) {
+            let id = self.static_slots.get(&fqn).map(|(id, _)| *id).unwrap_or(0);
+            let _ = self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("Duplicate static slot `{}`", fqn),
+                range,
+                Some(
+                    "each `static let` / `static const` / class `static` field must have a unique name"
+                        .to_string(),
+                ),
+            );
+            return id;
+        }
+        let id = self.next_static_slot;
+        self.next_static_slot += 1;
+        self.static_slots.insert(fqn.clone(), (id, is_const));
+        self.static_slot_types.insert(fqn, ty);
+        id
+    }
+
+    fn warn_shallow_const_binding(&mut self, name: &str, ty: &Ty, range: Range<usize>) {
+        let pruned = apply_ty_prune(&self.subst, ty);
+        if super::ty::is_shallow_const_mutable(&pruned) {
+            let mut msg = Message::warn(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "binding `{}` is constant, but the underlying value of type `{}` is still mutable",
+                    name, pruned
+                ),
+                range,
+            );
+            msg.with_help(
+                "mutations through fields, indices, or `arr[] =` will still succeed".to_string(),
+            );
+            self.messages.push(msg);
+        }
+    }
+
+    fn check_readonly_external_mutation(&mut self, receiver_ty: &Ty, range: Range<usize>) {
+        let pruned = apply_ty_prune(&self.subst, receiver_ty);
+        if matches!(pruned, Ty::Readonly(_)) {
+            let _ = self.error_with_help(
+                ErrorCode::InvalidAssignment,
+                "Cannot mutate a `readonly` value from outside its defining methods".to_string(),
+                range,
+                Some("rebind the variable with a new `readonly` value, or mutate via `self` inside an inherent method".to_string()),
+            );
+        }
+    }
+
+    fn infer_array_append_assign(
+        &mut self,
+        arr: &Output,
+        value: &Output,
+        range: Range<usize>,
+    ) -> Ty {
+        let array_ty = self.infer(arr);
+        let value_ty = self.infer(value);
+        let resolved = apply_ty_prune(&self.subst, &array_ty);
+        self.check_readonly_external_mutation(&resolved, range.clone());
+        match resolved {
+            Ty::Array { element, .. } => {
+                self.coerce_or_unify(
+                    element.as_ref(),
+                    &value_ty,
+                    Some(value),
+                    &value.0.into_range(),
+                    "array append",
+                );
+                let elem = apply_ty_prune(&self.subst, element.as_ref());
+                let dynamic = array(elem);
+                if let Expression::Identifier(name) = arr.1.as_ref() {
+                    self.env
+                        .insert_top(name.to_string(), Scheme::mono(dynamic.clone()));
+                    self.record_codegen_var_type(name.to_string(), dynamic.clone());
+                }
+                dynamic
+            }
+            Ty::Var(v) => {
+                let elem = Ty::Var(self.counter.fresh());
+                let dynamic = array(elem.clone());
+                self.unify(&Ty::Var(v), &dynamic, &arr.0.into_range(), "append array");
+                self.unify(&elem, &value_ty, &value.0.into_range(), "append element");
+                let dynamic = apply_ty_prune(&self.subst, &dynamic);
+                if let Expression::Identifier(name) = arr.1.as_ref() {
+                    self.env
+                        .insert_top(name.to_string(), Scheme::mono(dynamic.clone()));
+                    self.record_codegen_var_type(name.to_string(), dynamic.clone());
+                }
+                dynamic
+            }
+            other => self.error_with_help(
+                ErrorCode::InvalidAssignment,
+                "append assignment requires an array".to_string(),
+                range,
+                Some(format!("found `{}`; use `arr[] = value` on a `[T]` binding", other)),
+            ),
+        }
+    }
+
     /// For-in lowering info recorded during typecheck (by Loop node id).
     pub fn for_in_info_at(&self, id: NodeId) -> Option<&ForInInfo> {
         self.for_in_infos.get(&id)
@@ -11736,7 +12053,7 @@ impl Checker {
 
     /// Class name from `Con(C)` or `App(Con(C), _)` (Phase 7).
     pub fn class_name_of_ty(ty: &Ty) -> Option<&str> {
-        match ty {
+        match strip_readonly(ty) {
             Ty::Con(n) => Some(n.as_str()),
             Ty::App(head, _) => match head.as_ref() {
                 Ty::Con(n) => Some(n.as_str()),
@@ -11744,6 +12061,12 @@ impl Checker {
             },
             _ => None,
         }
+    }
+
+    fn class_owner_from_ty(&self, ty: &Ty) -> Option<String> {
+        Self::class_name_of_ty(ty)
+            .filter(|n| self.classes.contains_key(*n))
+            .map(|n| n.to_string())
     }
 
     /// True if `ty` is a registered class instance (`Con` or `App`).
@@ -13997,20 +14320,20 @@ mod tests {
     }
 
     #[test]
-    fn push_promotes_static_array_to_dynamic_for_later_indexing() {
-        let src = "fn main() { let arr = [0, 1]; push(arr, 2); let _ = arr[2]; }";
+    fn array_append_promotes_static_array_to_dynamic_for_later_indexing() {
+        let src = "fn main() { let arr = [0, 1]; arr[] = 2; let _ = arr[2]; }";
         let (_c, msgs) = check_warn(src);
         assert!(msgs.is_empty(), "unexpected: {:?}", msgs);
     }
 
     #[test]
-    fn push_rejects_element_type_mismatch() {
-        let src = "fn main() { let arr = [0, 1]; push(arr, \"x\"); }";
+    fn array_append_rejects_element_type_mismatch() {
+        let src = "fn main() { let arr = [0, 1]; arr[] = \"x\"; }";
         let (_c, msgs) = check_warn(src);
         let found = msgs.iter().any(|m| m.message().contains("Type mismatch"));
         assert!(
             found,
-            "expected push element type mismatch, got: {:?}",
+            "expected append element type mismatch, got: {:?}",
             msgs
         );
     }

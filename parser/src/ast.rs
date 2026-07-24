@@ -107,6 +107,15 @@ pub enum Visibility {
     Public,
 }
 
+/// Class field modifier: instance (default), `const`, or `static`.
+#[derive(Clone, PartialEq, Eq, Debug, Copy, Default)]
+pub enum FieldModifier {
+    #[default]
+    Instance,
+    Const,
+    Static,
+}
+
 /// One `#[name]` / `#[name(args)]` attribute on a declaration.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Attribute<'expr> {
@@ -261,8 +270,25 @@ pub enum Expression<'expr> {
     /// Anonymous record literal `{ name: expr, ... }`.
     Dict(Vec<RecordFieldValue<'expr>>),
 
-    /// Element access `target[index]`.
-    Index(Output<'expr>, Output<'expr>),
+    /// Element access `target[index]`; `index = None` means append LHS (`arr[] = v`).
+    Index(Output<'expr>, Option<Output<'expr>>),
+
+    /// `readonly expr` — sealed against external mutation.
+    Readonly(Output<'expr>),
+
+    /// `ClassName::member` — static field or method reference.
+    QualifiedAccess {
+        owner: &'expr str,
+        member: &'expr str,
+    },
+
+    /// Top-level `static let` / `static const` singleton binding.
+    StaticDecl {
+        is_const: bool,
+        name: &'expr str,
+        ty: Option<Output<'expr>>,
+        init: Output<'expr>,
+    },
 
     /// Dynamic library load: `dload(path)`.
     Dload(Output<'expr>),
@@ -292,6 +318,8 @@ pub enum Expression<'expr> {
         attrs: Vec<Attribute<'expr>>,
         name: &'expr str,
         is_coro: bool,
+        /// `static fn` inside an `impl` block.
+        is_static: bool,
         type_params: Vec<TypeParam<'expr>>,
         args: Output<'expr>,
         returns: Option<Output<'expr>>,
@@ -355,7 +383,14 @@ pub enum Expression<'expr> {
         type_params: Vec<TypeParam<'expr>>,
         methods: Vec<Output<'expr>>,
     },
-    Field(Visibility, Output<'expr>, Output<'expr>),
+    Field {
+        visibility: Visibility,
+        modifier: FieldModifier,
+        name: Output<'expr>,
+        ty: Output<'expr>,
+        /// Required initializer for `static` fields.
+        init: Option<Output<'expr>>,
+    },
     Method(Visibility, Output<'expr>),
     Member(Output<'expr>),
     Access(Output<'expr>, &'expr str),
@@ -871,7 +906,25 @@ impl<'a> Display for Expression<'a> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Self::Index(target, index) => write!(f, "{}[{}]", target.1, index.1),
+            Self::Index(target, index) => match index {
+                Some(idx) => write!(f, "{}[{}]", target.1, idx.1),
+                None => write!(f, "{}[]", target.1),
+            },
+            Self::Readonly(inner) => write!(f, "readonly {}", inner.1),
+            Self::QualifiedAccess { owner, member } => write!(f, "{}::{}", owner, member),
+            Self::StaticDecl {
+                is_const,
+                name,
+                ty,
+                init,
+            } => {
+                let ty_str = ty
+                    .as_ref()
+                    .map(|t| format!(": {}", t.1))
+                    .unwrap_or_default();
+                let kw = if *is_const { "static const" } else { "static let" };
+                write!(f, "{}{} {} = {};", kw, ty_str, name, init.1)
+            }
             Self::Declare(args) | Self::Invoke(args) => {
                 let kw = if matches!(self, Self::Declare(_)) {
                     "declare"
@@ -892,6 +945,7 @@ impl<'a> Display for Expression<'a> {
                 attrs,
                 name,
                 is_coro,
+                is_static,
                 type_params,
                 args,
                 returns,
@@ -899,6 +953,7 @@ impl<'a> Display for Expression<'a> {
                 body,
             } => {
                 let async_kw = if *is_coro { "async " } else { "" };
+                let static_kw = if *is_static { "static " } else { "" };
                 let tp = if type_params.is_empty() {
                     String::new()
                 } else {
@@ -924,13 +979,13 @@ impl<'a> Display for Expression<'a> {
                 match body {
                     Some(b) => write!(
                         f,
-                        "{}{}fn {}{}({}){}{} {{\n{}}}",
-                        attr_prefix, async_kw, name, tp, args.1, ret_str, where_str, b.1
+                        "{}{}{}fn {}{}({}){}{} {{\n{}}}",
+                        attr_prefix, async_kw, static_kw, name, tp, args.1, ret_str, where_str, b.1
                     ),
                     None => write!(
                         f,
-                        "{}{}fn {}{}({}){}{};",
-                        attr_prefix, async_kw, name, tp, args.1, ret_str, where_str
+                        "{}{}{}fn {}{}({}){}{};",
+                        attr_prefix, async_kw, static_kw, name, tp, args.1, ret_str, where_str
                     ),
                 }
             }

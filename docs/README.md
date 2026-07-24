@@ -48,7 +48,7 @@ Re-run the same binary without deleting `out.c0s` to reuse the cached compile. D
 | `break` / `continue` | Supported |
 | Enums, `match`, record variants | Supported |
 | Built-in `Option` / `Result`, `raise`, `?`, `??`, `?.` | Supported (desugar to match/return) |
-| Tuples, arrays (`push` / `len`), dicts (anonymous records) | Supported |
+| Tuples, arrays (`arr[] =` / `len`), dicts (anonymous records) | Supported |
 | Type aliases (`type Name = T;`, lexically scoped) | Supported |
 | Generics and traits | Supported: generic functions/enums/aliases/classes, higher-kinded type parameters, associated types/GATs, existentials, coherence checks |
 | Modules / namespaces (`use`, `mod`) | Supported (multi-file CLI via `zero.toml`) |

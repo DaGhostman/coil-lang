@@ -1607,6 +1607,137 @@ fn record_pattern_shape_mismatch_errors() {
 }
 
 #[test]
+fn shallow_const_on_array_emits_warning() {
+    let msgs = check_messages(r#"fn main() { const a = [1, 2, 3]; }"#);
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("binding `a` is constant")
+                && m.message().contains("still mutable")
+        }),
+        "expected shallow-const warning, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn shallow_const_on_record_emits_warning() {
+    let msgs = check_messages(r#"fn main() { const d = { foo: 1 }; }"#);
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("binding `d` is constant")
+                && m.message().contains("still mutable")
+        }),
+        "expected shallow-const warning for record, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn readonly_external_field_assign_errors() {
+    let msgs = check_messages(
+        r#"
+class Point {
+    x: int,
+    y: int,
+}
+
+fn main() {
+    let p = new readonly Point(1, 2);
+    p.x = 10;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("Cannot mutate a `readonly` value")
+                && m.code() == Some(ErrorCode::InvalidAssignment)
+        }),
+        "expected readonly external mutation diagnostic, got: {:?}",
+        msgs.iter().map(|m| (m.code(), m.message())).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn readonly_array_append_errors() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    let xs = readonly [1, 2, 3];
+    xs[] = 4;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.message().contains("Cannot mutate a `readonly` value")),
+        "expected readonly append rejection, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn static_const_reassign_errors() {
+    let msgs = check_messages(
+        r#"
+static const VERSION = 1;
+
+fn main() {
+    VERSION = 2;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("Cannot assign to constant `VERSION`")
+                || m.message().contains("Cannot assign to constant")
+        }),
+        "expected static const reassignment diagnostic, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn const_class_field_assign_errors() {
+    let msgs = check_messages(
+        r#"
+class Point {
+    const x: int,
+    y: int,
+}
+
+fn main() {
+    let p = new Point(1, 2);
+    p.x = 10;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.message().contains("Cannot assign to const field `x`")
+                && m.message().contains("Point")
+        }),
+        "expected const class field diagnostic, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn array_append_on_non_array_errors() {
+    let msgs = check_messages(
+        r#"
+fn main() {
+    let x = 1;
+    x[] = 2;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.message().contains("append assignment requires an array")),
+        "expected non-array append diagnostic, got: {:?}",
+        msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn const_reassignment_errors() {
     let (_ty, msgs) = check(
         r#"

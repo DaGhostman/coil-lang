@@ -19,7 +19,7 @@ fn empty_board() -> [Task] {
 fn add_task([Task] board, string title) {
     let id = len(board);
     let t = new Task(id, title, 0);
-    push(board, t);
+    board[] = t;
     return board;
 }
 

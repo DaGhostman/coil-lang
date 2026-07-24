@@ -229,6 +229,11 @@ pub enum Instruction {
     /// `filled_mask` is an int on the stack (bit i ⇒ fixed param i is bound).
     /// `entry` is a code offset (CodePtr / int).
     MakeFn,
+
+    /// LoadStatic: operands[31:0] = static slot index → push statics[slot].
+    LoadStatic,
+    /// StoreStatic: pop value, write statics[operands[31:0]].
+    StoreStatic,
 }
 
 impl From<u8> for Instruction {

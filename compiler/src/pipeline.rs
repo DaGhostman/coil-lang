@@ -894,21 +894,12 @@ impl Pipeline {
 
         // Patch the JMP at offset 1 to point to the
         // user-program's `main`. If the source had at
-        // least one `extern` block, jump to
-        // `program_start_offset` (right after the
-        // prologue) so the extern's dload + declare
-        // bytecode runs before main. Otherwise jump
-        // straight to `main`.
-        if self.compiler.has_extern_block() {
-            if let Some(byte) = self.bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(self.compiler.program_start_offset());
-            }
-        } else {
-            if let Some(byte) = self.bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(self.compiler.get_function("main") as u32);
-            }
+        // least one `extern` block or module statics,
+        // jump to `program_start_offset` so setup runs
+        // before `main`. Otherwise jump straight to `main`.
+        if let Some(byte) = self.bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         // Wrap the bytecode in the versioned `ArchivedProgram` envelope
@@ -916,6 +907,7 @@ impl Pipeline {
         // `version` mismatch (see `Pipeline::run`).
         let program = ArchivedProgram {
             version: ARCHIVE_VERSION,
+            static_slot_count: self.compiler.static_slot_count(),
             constants: self.compiler.constants.clone(),
             bytecode: self.bytecode,
         };
@@ -944,18 +936,10 @@ impl Pipeline {
         let mut bytecode = self.compiler.compile(module, ast);
 
         // Patch the JMP at offset 1 (the second prologue
-        // instruction). If `extern` blocks were emitted,
-        // jump to `program_start_offset` so they run first;
-        // otherwise jump straight to `main`.
-        if self.compiler.has_extern_block() {
-            if let Some(byte) = bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(self.compiler.program_start_offset());
-            }
-        } else if let Some(&main_offset) = self.compiler.functions.get("main")
-            && let Some(byte) = bytecode.get_mut(1)
-        {
-            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
+        // instruction).
+        if let Some(byte) = bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         (bytecode, self.compiler.constants.clone())
@@ -981,18 +965,9 @@ impl Pipeline {
             return Err(());
         }
 
-        // Patch the JMP at offset 1. If `extern` blocks
-        // were emitted, jump to `program_start_offset` so
-        // they run first; otherwise jump to `main`.
-        if self.compiler.has_extern_block() {
-            if let Some(byte) = bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(self.compiler.program_start_offset());
-            }
-        } else if let Some(&main_offset) = self.compiler.functions.get("main")
-            && let Some(byte) = bytecode.get_mut(1)
-        {
-            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
+        if let Some(byte) = bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         Ok((bytecode, self.compiler.constants.clone()))
@@ -1041,15 +1016,9 @@ impl Pipeline {
         self.bytecode = self.compiler.bytecode.clone();
 
         // Patch the JMP at offset 1.
-        if self.compiler.has_extern_block() {
-            if let Some(byte) = self.bytecode.get_mut(1) {
-                *byte = Byte::new(Instruction::JMP)
-                    .with_operand_u32(self.compiler.program_start_offset());
-            }
-        } else if let Some(&main_offset) = self.compiler.functions.get("main")
-            && let Some(byte) = self.bytecode.get_mut(1)
-        {
-            *byte = Byte::new(Instruction::JMP).with_operand_u32(main_offset as u32);
+        if let Some(byte) = self.bytecode.get_mut(1) {
+            *byte = Byte::new(Instruction::JMP)
+                .with_operand_u32(self.compiler.prologue_jmp_target());
         }
 
         // In-memory API: any diagnostic (error or warning) is a failure.
@@ -1084,7 +1053,15 @@ impl Pipeline {
         &self.natives
     }
 
-    pub fn run(self, filename: String) -> Result<(Vec<Byte>, Vec<u64>), ()> {
+    pub fn constants(&self) -> &[u64] {
+        self.compiler.constants()
+    }
+
+    pub fn static_slot_count(&self) -> u32 {
+        self.compiler.static_slot_count()
+    }
+
+    pub fn run(self, filename: String) -> Result<(Vec<Byte>, Vec<u64>, u32), ()> {
         let mut f = File::open(filename).expect("Unable to find file");
         let mut buffer = Vec::with_capacity(1024);
         f.read_to_end(&mut buffer).expect("Unable to read file");
@@ -1115,8 +1092,9 @@ impl Pipeline {
             .expect("Unable to deserialize bytecode");
         let constants = rkyv::deserialize::<Vec<u64>, Error>(&archived.constants)
             .expect("Unable to deserialize constant pool");
+        let static_slot_count = u32::from(archived.static_slot_count);
 
-        Ok((bytecode, constants))
+        Ok((bytecode, constants, static_slot_count))
     }
 }
 
