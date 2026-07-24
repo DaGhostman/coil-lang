@@ -2632,3 +2632,119 @@ fn main() {
     );
     assert_eq!(output, "102030x40");
 }
+
+/// End-to-end TailCall: self-recursive accumulator must print the correct sum.
+#[test]
+fn tail_recursive_sum_to_prints_15() {
+    let output = run_example_src(
+        r#"
+fn sum_to(int n, int acc) -> int {
+    if n <= 0 { return acc; }
+    return sum_to(n - 1, acc + n);
+}
+fn main() {
+    print "%i", sum_to(5, 0);
+}
+"#,
+    );
+    assert_eq!(output, "15");
+}
+
+/// Const-fold `if` with strict `<` equality boundary takes else (Le vs Leq).
+#[test]
+fn const_if_strict_lt_equality_prints_else() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    if 5 < 5 {
+        print "%i", 1;
+    } else {
+        print "%i", 0;
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0");
+}
+
+/// `while false` must skip the body entirely.
+#[test]
+fn const_while_false_skips_body() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    while false {
+        print "%i", 1;
+    }
+    print "%i", 2;
+}
+"#,
+    );
+    assert_eq!(output, "2");
+}
+
+/// Constant-trip `for` unroll must still accumulate the right sum.
+#[test]
+fn const_for_unroll_prints_sum() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let s = 0;
+    for (let i = 0; i < 4; i = i + 1) {
+        s = s + i;
+    }
+    print "%i", s;
+}
+"#,
+    );
+    assert_eq!(output, "6");
+}
+
+/// Range for-in unroll (`0..3`) binds successive values correctly.
+#[test]
+fn const_range_for_in_unroll_prints() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let s = 0;
+    for x in 0..3 {
+        s = s + x;
+    }
+    print "%i", s;
+}
+"#,
+    );
+    assert_eq!(output, "3");
+}
+
+/// `break` disables unroll — first iteration still runs, rest skipped.
+#[test]
+fn for_with_break_still_stops_early() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let s = 0;
+    for (let i = 0; i < 5; i = i + 1) {
+        s = s + i;
+        break;
+    }
+    print "%i", s;
+}
+"#,
+    );
+    assert_eq!(output, "0");
+}
+
+/// Tiny direct-call inlining must preserve call semantics end-to-end.
+#[test]
+fn tiny_add_inlined_prints_7() {
+    let output = run_example_src(
+        r#"
+fn add(int a, int b) -> int { return a + b; }
+fn main() {
+    print "%i", add(3, 4);
+}
+"#,
+    );
+    assert_eq!(output, "7");
+}

@@ -683,6 +683,55 @@ mod tests {
     }
 
     #[test]
+    fn const_fold_div_and_mod() {
+        let mut div = vec![
+            Byte::new(Instruction::CONST).with_const_inline(20),
+            Byte::new(Instruction::CONST).with_const_inline(4),
+            Byte::new(Instruction::DIV),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut div);
+        assert_eq!(div.len(), 2);
+        assert_eq!(*div[0].bytecode(), Instruction::CONST);
+        assert_eq!(div[0].operand_u32() as i32, 5);
+
+        let mut modulo = vec![
+            Byte::new(Instruction::CONST).with_const_inline(17),
+            Byte::new(Instruction::CONST).with_const_inline(5),
+            Byte::new(Instruction::MOD),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut modulo);
+        assert_eq!(modulo.len(), 2);
+        assert_eq!(*modulo[0].bytecode(), Instruction::CONST);
+        assert_eq!(modulo[0].operand_u32() as i32, 2);
+    }
+
+    #[test]
+    fn const_fold_div_by_zero_left_unfused() {
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(10),
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::DIV),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 3);
+        assert_eq!(*bc[2].bytecode(), Instruction::DIV);
+    }
+
+    #[test]
+    fn bump_targets_at_or_after_shifts_tail_call_operand() {
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::TailCall).with_call_packed(2, 5),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut pool = Vec::<u64>::new();
+        bump_targets_at_or_after(&mut bc, &mut pool, 3, 2);
+        assert_eq!(bc[1].call_parts().1, 7);
+    }
+
+    #[test]
     fn fuse_cmp_jmpf_sequence() {
         let mut bc = vec![
             Byte::new(Instruction::GT),

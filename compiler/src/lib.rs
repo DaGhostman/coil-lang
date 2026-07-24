@@ -10811,6 +10811,80 @@ print \"%i\", s; \
         );
     }
 
+    /// `if 5 < 5` (strict) must take the else branch — guards Le/`<=` fold mix-up.
+    #[test]
+    fn const_if_strict_lt_equality_takes_else() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "folded `if 5 < 5` should not emit JMPF"
+        );
+        // Taken else prints 0 — must see CONST 0 (or ConstReturnImm), not only CONST 1.
+        let has_zero = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 0
+        });
+        assert!(
+            has_zero,
+            "else branch for `5 < 5` should emit CONST 0; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `while false` eliminates the loop body (no JMPF / back-edge).
+    #[test]
+    fn const_while_false_eliminates_loop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { while false { print \"%i\", 1; } print \"%i\", 2; }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "folded `while false` should not emit JMPF; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `break` inside a countable `for` must keep a real loop (no unroll).
+    #[test]
+    fn for_with_break_is_not_unrolled() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let s = 0; \
+for (let i = 0; i < 3; i = i + 1) { \
+  s = s + i; \
+  break; \
+} \
+print \"%i\", s; \
+}",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "for-with-break must keep JMPF loop structure (unroll skips break bodies)"
+        );
+    }
+
+    /// `async fn` self-resume path must not emit TailCall.
+    #[test]
+    fn async_fn_does_not_emit_tail_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "async fn tick(int n) { \
+if n <= 0 { return 0; } \
+yield n; \
+return tick(n - 1); \
+} \
+fn main() { let h = tick(2); print \"%i\", resume h; }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            "coroutines must not use TailCall"
+        );
+    }
+
     // ============================================================
     // growing array builtin codegen tests
     // ============================================================

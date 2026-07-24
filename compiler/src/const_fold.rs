@@ -89,7 +89,7 @@ pub fn eval_expr<'a>(
                 _ => None,
             }
         }
-        Expression::Le(lhs, rhs) => eval_cmp(lhs, rhs, env, |a, b| a <= b),
+        Expression::Le(lhs, rhs) => eval_cmp(lhs, rhs, env, |a, b| a < b),
         Expression::Gt(lhs, rhs) => eval_cmp(lhs, rhs, env, |a, b| a > b),
         Expression::Leq(lhs, rhs) => eval_cmp(lhs, rhs, env, |a, b| a <= b),
         Expression::Geq(lhs, rhs) => eval_cmp(lhs, rhs, env, |a, b| a >= b),
@@ -335,6 +335,10 @@ mod tests {
         (SimpleSpan::from(0..1), Box::new(Expression::Integer(n)))
     }
 
+    fn id_expr(name: &'static str) -> Output<'static> {
+        (SimpleSpan::from(0..1), Box::new(Expression::Identifier(name)))
+    }
+
     #[test]
     fn fold_add_and_cmp() {
         let env = HashMap::new();
@@ -350,6 +354,30 @@ mod tests {
         assert_eq!(eval_expr(&cmp, &env), Some(ConstValue::Bool(true)));
     }
 
+    /// `Expression::Le` is `<` (not `<=`). Equality must stay false.
+    #[test]
+    fn le_is_strict_less_than_not_leq() {
+        let env = HashMap::new();
+        let eq_boundary = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Le(int_expr(5), int_expr(5))),
+        );
+        assert_eq!(
+            eval_expr(&eq_boundary, &env),
+            Some(ConstValue::Bool(false)),
+            "`5 < 5` must fold to false (Le is strict <)"
+        );
+        let leq = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Leq(int_expr(5), int_expr(5))),
+        );
+        assert_eq!(
+            eval_expr(&leq, &env),
+            Some(ConstValue::Bool(true)),
+            "`5 <= 5` must fold to true"
+        );
+    }
+
     #[test]
     fn const_ident_in_env() {
         let mut env = HashMap::new();
@@ -360,5 +388,138 @@ mod tests {
             Box::new(Expression::Add(id, int_expr(5))),
         );
         assert_eq!(eval_expr(&add, &env), Some(ConstValue::Int(10)));
+    }
+
+    #[test]
+    fn div_and_mod_by_zero_do_not_fold() {
+        let env = HashMap::new();
+        let div0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Div(int_expr(10), int_expr(0))),
+        );
+        let mod0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mod(int_expr(10), int_expr(0))),
+        );
+        assert_eq!(eval_expr(&div0, &env), None);
+        assert_eq!(eval_expr(&mod0, &env), None);
+    }
+
+    #[test]
+    fn strength_mul_int_only_powers_of_two() {
+        assert_eq!(strength_mul_int(8), Some(3));
+        assert_eq!(strength_mul_int(1), Some(0));
+        assert_eq!(strength_mul_int(6), None);
+        assert_eq!(strength_mul_int(0), None);
+        assert_eq!(strength_mul_int(-4), None);
+    }
+
+    #[test]
+    fn strength_reduced_inner_add_zero_and_mul_one() {
+        let add0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Add(id_expr("x"), int_expr(0))),
+        );
+        let mul1 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(int_expr(1), id_expr("x"))),
+        );
+        assert!(matches!(
+            strength_reduced_inner(&add0).map(|e| e.1.as_ref()),
+            Some(Expression::Identifier("x"))
+        ));
+        assert!(matches!(
+            strength_reduced_inner(&mul1).map(|e| e.1.as_ref()),
+            Some(Expression::Identifier("x"))
+        ));
+    }
+
+    #[test]
+    fn for_loop_trip_count_le_and_leq() {
+        let init = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Fragment(vec![id_expr("i"), int_expr(0)])),
+        );
+        let step = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Assignment(
+                id_expr("i"),
+                (
+                    SimpleSpan::from(0..3),
+                    Box::new(Expression::Add(id_expr("i"), int_expr(1))),
+                ),
+            )),
+        );
+        let le_cond = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Le(id_expr("i"), int_expr(3))),
+        );
+        let leq_cond = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Leq(id_expr("i"), int_expr(2))),
+        );
+        assert_eq!(
+            for_loop_trip_count(Some(&init), &le_cond, Some(&step)),
+            Some(3)
+        );
+        assert_eq!(
+            for_loop_trip_count(Some(&init), &leq_cond, Some(&step)),
+            Some(3)
+        );
+        let too_many = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Le(id_expr("i"), int_expr(9))),
+        );
+        assert_eq!(
+            for_loop_trip_count(Some(&init), &too_many, Some(&step)),
+            None
+        );
+    }
+
+    #[test]
+    fn range_trip_count_exclusive_and_inclusive() {
+        assert_eq!(
+            range_trip_count(&int_expr(0), &int_expr(3), false),
+            Some(3)
+        );
+        assert_eq!(
+            range_trip_count(&int_expr(0), &int_expr(2), true),
+            Some(3)
+        );
+        assert_eq!(range_trip_count(&int_expr(0), &int_expr(9), false), None);
+    }
+
+    #[test]
+    fn body_has_loop_control_detects_break() {
+        let plain = (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::Block(vec![int_expr(1)])),
+        );
+        let with_break = (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::Block(vec![(
+                SimpleSpan::from(0..1),
+                Box::new(Expression::Break),
+            )])),
+        );
+        assert!(!body_has_loop_control(&plain));
+        assert!(body_has_loop_control(&with_break));
+    }
+
+    #[test]
+    fn string_add_folds_concatenation() {
+        let env = HashMap::new();
+        let lhs = (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::String("he")),
+        );
+        let rhs = (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::String("llo")),
+        );
+        assert_eq!(
+            eval_string_add(&lhs, &rhs, &env),
+            Some(ConstValue::Str("hello".into()))
+        );
     }
 }
