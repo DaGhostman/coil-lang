@@ -1354,7 +1354,10 @@ impl<const S: usize> Machine<S> {
                         self.stack[callee_sp + i] = val;
                     }
                     self.stack.seek(callee_sp + arity);
-                    sp = callee_sp + arity;
+                    // Match CALL: `sp` is the frame base (locals start at slot 0),
+                    // not past the args. Using `callee_sp + arity` would make
+                    // subsequent LOAD/BinSlotImm read the wrong slots.
+                    sp = callee_sp;
                     ip = target;
                 }
                 Instruction::INIT => {

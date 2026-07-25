@@ -331,6 +331,11 @@ fn body_has_loop_control_walk<'a>(node: &Output<'a>) -> bool {
         }
         Expression::Loop { body, .. } => body_has_loop_control_walk(body),
         Expression::For { body, .. } => body_has_loop_control_walk(body),
+        // `break;` / `continue;` often sit under statement wrappers.
+        Expression::ExprStatement(inner)
+        | Expression::Statement(inner)
+        | Expression::Group(inner)
+        | Expression::Expr(inner) => body_has_loop_control_walk(inner),
         _ => false,
     }
 }
@@ -521,8 +526,19 @@ mod tests {
                 Box::new(Expression::Break),
             )])),
         );
+        let with_wrapped_break = (
+            SimpleSpan::from(0..1),
+            Box::new(Expression::Block(vec![(
+                SimpleSpan::from(0..1),
+                Box::new(Expression::ExprStatement((
+                    SimpleSpan::from(0..1),
+                    Box::new(Expression::Break),
+                ))),
+            )])),
+        );
         assert!(!body_has_loop_control(&plain));
         assert!(body_has_loop_control(&with_break));
+        assert!(body_has_loop_control(&with_wrapped_break));
     }
 
     #[test]

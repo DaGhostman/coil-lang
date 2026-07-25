@@ -953,7 +953,13 @@ impl Compiler {
     }
 
     fn discard_compile(&mut self, ast: &(SimpleSpan, Box<Expression<'_>>)) {
+        // Walk for NodeId alignment / side tables, but drop any bytes that
+        // direct-to-`self.bytecode` emitters (Print/Format/control flow) wrote.
+        let bc_len = self.bytecode.len();
+        let dbg_len = self.debug_locs.len();
         let _ = self.do_compile(ast);
+        self.bytecode.truncate(bc_len);
+        self.debug_locs.truncate(dbg_len);
     }
 
     fn discard_if_branch(&mut self, branch: &Output<'_>) {
@@ -10880,9 +10886,20 @@ for (let i = 0; i < 3; i = i + 1) { \
 print \"%i\", s; \
 }",
         );
+        // Peephole may fuse JMPF into CmpJmpf / BinSlotImmJmpf / LogNotJmpf.
+        let has_cond_jump = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::JMPF
+                    | Instruction::CmpJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::LogNotJmpf
+            )
+        });
         assert!(
-            bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
-            "for-with-break must keep JMPF loop structure (unroll skips break bodies)"
+            has_cond_jump,
+            "for-with-break must keep a conditional loop exit; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
