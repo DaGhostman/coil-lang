@@ -148,11 +148,12 @@ supports `⊕` — **not** in v1 (complicates codegen and traits).
 
 ### 2.5 Explicit non-goals (v1)
 
-- Dot product via `*`, matrix multiply, BLAS-style APIs
+- Dot product via `*`, matrix multiply / matrix `**`, BLAS-style APIs
 - Mixing `int` and `float` inside one vector (no promotion)
 - User `impl Add for (int, int)` coherence vs compiler lifting
   (compiler owns aggregate arithmetic; user instances for
   builtin aggregate heads stay rejected per coherence rules)
+- Runtime length checks for aggregate–aggregate zip
 - New surface syntax (`@[1,2]`, `vec2`, etc.)
 - Changing tuple literal parsing / comma rules
 
