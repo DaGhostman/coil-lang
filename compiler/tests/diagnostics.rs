@@ -1830,6 +1830,22 @@ fn main() {
 }
 
 #[test]
+fn bitwise_on_aggregates_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = (1, 2) & (3, 4);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("not supported on aggregates")),
+        "expected bitwise-on-aggregate rejection, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
 fn static_array_length_mismatch_zip_errors() {
     let (_ty, msgs) = check(
         r#"

@@ -1909,8 +1909,8 @@ impl Compiler {
                 (AggregateOp::Mod, true) => Instruction::MODF,
                 (AggregateOp::Pow, false) => Instruction::Pow,
                 (AggregateOp::Pow, true) => Instruction::PowF,
-                (AggregateOp::Neg, false) => Instruction::NEG,
-                (AggregateOp::Neg, true) => Instruction::NEG, // float: same as scalar Negate today
+                // Neg is handled by `emit_neg_tos` (float uses MULF −1; no NEGF).
+                (AggregateOp::Neg, _) => Instruction::NEG,
             }
         };
 
@@ -1925,11 +1925,11 @@ impl Compiler {
                 self.emit_zip_loop(
                     bytecode,
                     arity,
-                    |_c, bc, i| {
+                    |c, bc, i| {
                         bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
                         bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
                         bc.push(Byte::new(Instruction::Index));
-                        bc.push(Byte::new(scalar_instr(AggregateOp::Neg, elem_is_float)));
+                        c.emit_neg_tos(bc, elem_is_float);
                     },
                     true,
                 );
@@ -1947,17 +1947,16 @@ impl Compiler {
                         self.emit_zip_loop(
                             bytecode,
                             n,
-                            |_c, bc, i| {
+                            |c, bc, i| {
                                 bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
                                 bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
                                 bc.push(Byte::new(Instruction::Index));
-                                bc.push(Byte::new(scalar_instr(AggregateOp::Neg, elem_is_float)));
+                                c.emit_neg_tos(bc, elem_is_float);
                             },
                             false,
                         );
                     }
                     None => {
-                        // Dynamic: materialise via ArrayLen + counted loop.
                         self.emit_dynamic_unary_array(bytecode, t0, elem_is_float);
                     }
                 }
@@ -2144,8 +2143,19 @@ impl Compiler {
         }
     }
 
-    /// Always unrolls for arity ≤ 4 (NT plan). Larger static arities also
-    /// unroll at compile time in v1 (no new loop opcodes required).
+    /// Negate TOS: int via `NEG`; float via `MULF` by −1 (no `NEGF` opcode).
+    fn emit_neg_tos(&mut self, bytecode: &mut Vec<Byte>, is_float: bool) {
+        if is_float {
+            let bits = Value::from(-1.0f64).raw() as u64;
+            let idx = self.intern_constant(bits);
+            bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            bytecode.push(Byte::new(Instruction::MULF));
+        } else {
+            bytecode.push(Byte::new(Instruction::NEG));
+        }
+    }
+
+    /// Always unrolls static arities at compile time in v1 (including N > 4).
     fn emit_zip_loop<F>(
         &mut self,
         bytecode: &mut Vec<Byte>,
@@ -2169,9 +2179,14 @@ impl Compiler {
         &mut self,
         bytecode: &mut Vec<Byte>,
         src: u32,
-        _elem_is_float: bool,
+        elem_is_float: bool,
     ) {
         // Build result by iterating 0..len(src).
+        // Jump targets are absolute VM IPs. This helper often writes into a
+        // temporary `Vec` that is later appended to `self.bytecode`, so every
+        // target must be `self.bytecode.len() + local_offset`.
+        let base = self.bytecode.len();
+        let abs_ip = |local_len: usize| (base + local_len) as u32;
         let len_slot = self.alloc_temp_slot();
         let idx = self.alloc_temp_slot();
         let out = self.alloc_temp_slot();
@@ -2182,7 +2197,7 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
         bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
-        let loop_top = bytecode.len() as u32;
+        let loop_top = abs_ip(bytecode.len());
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
         bytecode.push(Byte::new(Instruction::LE));
@@ -2192,7 +2207,7 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
         bytecode.push(Byte::new(Instruction::Index));
-        bytecode.push(Byte::new(Instruction::NEG));
+        self.emit_neg_tos(bytecode, elem_is_float);
         bytecode.push(Byte::new(Instruction::ArrayPush));
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
@@ -2200,7 +2215,7 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::ADD));
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
         bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(loop_top));
-        let end = bytecode.len() as u32;
+        let end = abs_ip(bytecode.len());
         bytecode[jmpf_pos] = Byte::new(Instruction::JMPF).with_operand_u32(end);
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
     }
@@ -2230,6 +2245,10 @@ impl Compiler {
             (AggregateOp::Pow, true) => Instruction::PowF,
             (AggregateOp::Neg, _) => Instruction::NEG, // unused
         };
+        // See `emit_dynamic_unary_array`: absolute IPs for a buffer that may
+        // still be appended onto `self.bytecode`.
+        let base = self.bytecode.len();
+        let abs_ip = |local_len: usize| (base + local_len) as u32;
         let len_slot = self.alloc_temp_slot();
         let idx = self.alloc_temp_slot();
         let out = self.alloc_temp_slot();
@@ -2240,7 +2259,7 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
         bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
-        let loop_top = bytecode.len() as u32;
+        let loop_top = abs_ip(bytecode.len());
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
         bytecode.push(Byte::new(Instruction::LE));
@@ -2269,19 +2288,23 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::ADD));
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
         bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(loop_top));
-        let end = bytecode.len() as u32;
+        let end = abs_ip(bytecode.len());
         bytecode[jmpf_pos] = Byte::new(Instruction::JMPF).with_operand_u32(end);
         bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
     }
 
     /// Recover aggregate arith info from mono/codegen var types when the
     /// side-table miss (specialized clones).
+    ///
+    /// Requires the same homogeneous-element rule as the typechecker: mixed
+    /// element types (e.g. `(int, float)`) must not recover as zip candidates.
     fn recover_aggregate_arith(
         &self,
         lhs: &Output,
         rhs: Option<&Output>,
         op: crate::typechecking::AggregateOp,
     ) -> Option<crate::typechecking::AggregateArithInfo> {
+        use crate::typechecking::aggregate_arith::{elem_is_float, homogeneous_aggregate_elem};
         use crate::typechecking::subst::apply_ty_prune;
         use crate::typechecking::ty::{ArrayLength, Ty};
         use crate::typechecking::{
@@ -2291,35 +2314,44 @@ impl Compiler {
         let lty = self.expr_codegen_ty(lhs)?;
         let lty = apply_ty_prune(self.checker.subst(), &lty);
         match (op, rhs) {
-            (AggregateOp::Neg, None) => match lty {
-                Ty::Tuple(elems) if !elems.is_empty() => Some(AggregateArithInfo {
-                    kind: AggregateArithKind::NegTuple {
-                        arity: elems.len(),
-                        elem_is_float: matches!(&elems[0], Ty::Con(n) if n == "float"),
-                    },
-                    op,
-                }),
-                Ty::Array { element, length } => Some(AggregateArithInfo {
-                    kind: AggregateArithKind::NegArray {
-                        length: match length {
-                            ArrayLength::Static(n) => Some(n),
-                            ArrayLength::Dynamic => None,
+            (AggregateOp::Neg, None) => {
+                let elem = homogeneous_aggregate_elem(&lty)?;
+                let float = elem_is_float(&elem);
+                match lty {
+                    Ty::Tuple(elems) => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::NegTuple {
+                            arity: elems.len(),
+                            elem_is_float: float,
                         },
-                        elem_is_float: matches!(element.as_ref(), Ty::Con(n) if n == "float"),
-                    },
-                    op,
-                }),
-                _ => None,
-            },
+                        op,
+                    }),
+                    Ty::Array { length, .. } => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::NegArray {
+                            length: match length {
+                                ArrayLength::Static(n) => Some(n),
+                                ArrayLength::Dynamic => None,
+                            },
+                            elem_is_float: float,
+                        },
+                        op,
+                    }),
+                    _ => None,
+                }
+            }
             (_, Some(rhs)) => {
                 let rty = self.expr_codegen_ty(rhs)?;
                 let rty = apply_ty_prune(self.checker.subst(), &rty);
-                match (lty, rty) {
+                match (&lty, &rty) {
                     (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() && !a.is_empty() => {
+                        let le = homogeneous_aggregate_elem(&lty)?;
+                        let re = homogeneous_aggregate_elem(&rty)?;
+                        if le != re {
+                            return None;
+                        }
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::ZipTuple {
                                 arity: a.len(),
-                                elem_is_float: matches!(&a[0], Ty::Con(n) if n == "float"),
+                                elem_is_float: elem_is_float(&le),
                             },
                             op,
                         })
@@ -2335,57 +2367,55 @@ impl Compiler {
                         },
                     ) if n == m => Some(AggregateArithInfo {
                         kind: AggregateArithKind::ZipArray {
-                            length: n,
-                            elem_is_float: matches!(element.as_ref(), Ty::Con(n) if n == "float"),
+                            length: *n,
+                            elem_is_float: elem_is_float(element),
                         },
                         op,
                     }),
                     (Ty::Tuple(a), r) if !a.is_empty() && matches!(r, Ty::Con(_)) => {
+                        let elem = homogeneous_aggregate_elem(&lty)?;
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastTuple {
                                 arity: a.len(),
                                 scalar_on: ScalarSide::Right,
-                                elem_is_float: matches!(&a[0], Ty::Con(n) if n == "float"),
+                                elem_is_float: elem_is_float(&elem),
                             },
                             op,
                         })
                     }
                     (l, Ty::Tuple(b)) if !b.is_empty() && matches!(l, Ty::Con(_)) => {
+                        let elem = homogeneous_aggregate_elem(&rty)?;
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastTuple {
                                 arity: b.len(),
                                 scalar_on: ScalarSide::Left,
-                                elem_is_float: matches!(&b[0], Ty::Con(n) if n == "float"),
+                                elem_is_float: elem_is_float(&elem),
                             },
                             op,
                         })
                     }
-                    (
-                        Ty::Array { element, length },
-                        r,
-                    ) if matches!(r, Ty::Con(_)) => Some(AggregateArithInfo {
-                        kind: AggregateArithKind::BroadcastArray {
-                            length: match length {
-                                ArrayLength::Static(n) => Some(n),
-                                ArrayLength::Dynamic => None,
+                    (Ty::Array { element, length }, r) if matches!(r, Ty::Con(_)) => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastArray {
+                                length: match length {
+                                    ArrayLength::Static(n) => Some(*n),
+                                    ArrayLength::Dynamic => None,
+                                },
+                                scalar_on: ScalarSide::Right,
+                                elem_is_float: elem_is_float(element),
                             },
-                            scalar_on: ScalarSide::Right,
-                            elem_is_float: matches!(element.as_ref(), Ty::Con(n) if n == "float"),
-                        },
-                        op,
-                    }),
+                            op,
+                        })
+                    }
                     (l, Ty::Array { element, length }) if matches!(l, Ty::Con(_)) => {
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastArray {
                                 length: match length {
-                                    ArrayLength::Static(n) => Some(n),
+                                    ArrayLength::Static(n) => Some(*n),
                                     ArrayLength::Dynamic => None,
                                 },
                                 scalar_on: ScalarSide::Left,
-                                elem_is_float: matches!(
-                                    element.as_ref(),
-                                    Ty::Con(n) if n == "float"
-                                ),
+                                elem_is_float: elem_is_float(element),
                             },
                             op,
                         })

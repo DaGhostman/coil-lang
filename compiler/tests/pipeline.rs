@@ -2795,6 +2795,38 @@ fn example_vec_tuple_prints_zip_broadcast_negate() {
 }
 
 #[test]
+fn aggregate_float_negate_uses_mulf_not_int_neg() {
+    // Regression: float aggregate unary `-` must not emit int `NEG`
+    // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
+    let output = run_example_src(
+        r#"
+fn main() {
+    let d = -(1.5, 2.0);
+    print "%f,%f", d[0], d[1];
+}
+"#,
+    );
+    assert_eq!(output, "-1.5,-2.0");
+}
+
+#[test]
+fn aggregate_dynamic_array_broadcast_adds_scalar() {
+    let output = run_example_src(
+        r#"
+fn add1([int] xs) -> [int] {
+    return xs + 1;
+}
+
+fn main() {
+    let a = add1([1, 2, 3]);
+    print "%i%i%i", a[0], a[1], a[2];
+}
+"#,
+    );
+    assert_eq!(output, "234");
+}
+
+#[test]
 fn example_vec_array_prints_zip_broadcast_pow() {
     let output = run_example("examples/vec_array.hy");
     assert_eq!(output, "46,45,18");

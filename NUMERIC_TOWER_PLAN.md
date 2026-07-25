@@ -12,8 +12,9 @@ generic/`T: Num` call sites where that is sound.
    time**; mismatch or unknown dynamic length is a **hard type error**
    (no runtime length check).
 2. Element-wise `**` is **in** v1 (same zip/broadcast rules as `*`).
-3. Fixed arities **≤ 4** are **always unrolled** in codegen (loop only
-   for larger static arities).
+3. Static arities are **always unrolled** in codegen in v1 (including
+   N > 4); no new VM loop opcodes. Dynamic `[T]` broadcast/unary still
+   uses a counted runtime loop via `ArrayLen`.
 4. Tier C / NT-5 (constraint lifting) lands **after** NT-1…3 bake.
 
 ---
@@ -60,7 +61,8 @@ rules, trait/`Num` integration, codegen, docs, and tests.
 7. **String `+` stays special-cased** and is never part of the tower.
 8. **Prefer lowering to existing opcodes** for correctness first;
    fused VM ops are an optional later optimization.
-9. **Codegen unrolls arity ≤ 4**; larger static arities use a loop.
+9. **Codegen always unrolls static arities in v1** (including N > 4);
+    dynamic `[T]` broadcast/unary uses a counted `ArrayLen` loop.
 10. **Trait story is lifting, not combinatorial instances.** Do not
     pre-register `impl Add<(int,int)>`, `impl Add<(int,int,int)>`, …
     for every arity.
@@ -154,6 +156,8 @@ supports `⊕` — **not** in v1 (complicates codegen and traits).
   (compiler owns aggregate arithmetic; user instances for
   builtin aggregate heads stay rejected per coherence rules)
 - Runtime length checks for aggregate–aggregate zip
+- Bitwise / shift operators on aggregates (`&`, `|`, `^`, `<<`, `>>`) —
+  v1 only zips `+ - * / % **` and unary `-` (same set as §2.2)
 - New surface syntax (`@[1,2]`, `vec2`, etc.)
 - Changing tuple literal parsing / comma rules
 
@@ -210,7 +214,7 @@ Mirror existing patterns (`bound_operator_call_at`, `ForInKind`):
 
 ```text
 enum AggregateArithKind {
-  ZipTuple { arity },           // arity known; unroll if ≤ 4
+  ZipTuple { arity },           // always unroll static arity in v1
   ZipArray { length: Static(N) }, // never Dynamic for zip
   BroadcastTuple { arity, scalar_on: Left|Right },
   BroadcastArray { length: Static(N) | Dynamic, scalar_on: Left|Right },
@@ -230,6 +234,7 @@ scalar pow bound) per element.
 | Binary arith (`+ - * / % **`) | `infer_arith` / pow arm | shape resolve + element constraint |
 | Unary `-` | unary infer arm | element-wise for aggregates |
 | `+=` / `**=` etc. | compound-assign infer | same shapes; LHS drives result |
+| Bitwise / shifts | same hooks | **reject** on aggregates (v1 non-goal; see §2.5) |
 | Exhaustiveness / pretty | `pretty.rs` | no change required |
 | Unify | `unify.rs` | unchanged (result still normal `Tuple`/`Array`) |
 
@@ -309,16 +314,18 @@ Docs already note `byte` is not in `Num`/`Add`. Sequence:
 
 ### 5.1 Phase 1 lowering (no new opcodes)
 
-**Arity ≤ 4:** always emit an **unrolled** straight-line zip (locked).
+**Static arity (any N):** always emit an **unrolled** straight-line zip
+in v1 (locked as D5). No new VM loop opcodes for static shapes.
 
-**Arity > 4 (static only):** emit a counted loop over indices.
+**Dynamic `[T]`:** broadcast / unary `-` use a counted runtime loop
+via `ArrayLen` (length comes from the single vector operand).
 
 For zip of two tuples arity `n` (temps = slots), unrolled form:
 
 ```text
 evaluate lhs → StorePop t0
 evaluate rhs → StorePop t1
-for i in 0..n:          // compile-time unroll when n ≤ 4
+for i in 0..n:          // compile-time unroll (any static n)
   LOAD t0; CONST i; Index
   LOAD t1; CONST i; Index
   <scalar op: ADD/ADDF/Pow/… or bound-op call>
@@ -330,7 +337,7 @@ Broadcast scalar on right:
 ```text
 evaluate vec → t0
 evaluate scalar → t1
-for i in 0..n:          // same unroll rule
+for i in 0..n:          // same compile-time unroll
   LOAD t0; CONST i; Index
   LOAD t1
   <scalar op>
@@ -354,6 +361,7 @@ Update the existing priority in `compiler/src/lib.rs`:
 1. Constant fold (unchanged)
 2. String `+` (unchanged)
 3. **NEW:** aggregate arith hint → zip/broadcast emitter
+   (`Expression::Pow` uses the same aggregate path as `*` — element-wise)
 4. Bound operator / dict call (generic scalar / lifted)
 5. Float vs int hardwired opcode
 
@@ -363,9 +371,9 @@ Append something like `ZipBin` / `BroadcastBin` only if benchmarks
 show the `Index` loop is hot (e.g. large `[T]` in a tight loop).
 Requires `ARCHIVE_VERSION` bump. **Not required for correctness.**
 
-Peephole: fixed small-arity (≤ 4) zip is already unrolled by codegen
-(§5.1); further peephole fusion of the unrolled `Index` convoys is
-optional polish, not required for NT-1.
+Peephole: static-arity zip is already unrolled by codegen (§5.1);
+further peephole fusion of the unrolled `Index` convoys is optional
+polish, not required for NT-1.
 
 ### 5.4 Compound assign
 
@@ -388,8 +396,8 @@ identifiers / locals, same as scalar `+=` today).
 ### Phase NT-1 — Homogeneous tuple zip (ground int/float)
 
 - `classify` + zip for equal-arity homogeneous numeric tuples
-- Codegen lowering (§5.1): **unroll arity ≤ 4**
-- Ops: `+ - * / % **`, unary `-`
+- Codegen lowering (§5.1): **always unroll** static arity
+- Ops: `+ - * / % **`, unary `-` (bitwise rejected — §2.5)
 - Example: `examples/vec_tuple.hy` → `(2,2)` printed via `%v` or indices
 - Pipeline + codegen tests
 
@@ -444,17 +452,12 @@ identifiers / locals, same as scalar `+=` today).
 | # | Decision |
 |---|----------|
 | D1 | Dynamic `[T] ⊕ [T]` (and any aggregate–aggregate zip whose lengths are not equal static facts) → **compile-time hard error**. No runtime length check. |
+| D2 | `%` on floats in zip — **allow** (mirror scalars / `MODF`). |
 | D3 | Element-wise `**` is **in** v1. |
-| D5 | Codegen **always unrolls arity ≤ 4**; larger static arities use a loop. |
+| D4 | Empty tuple `()` — **error** (not numeric); empty `[T; 0]` zip optional later. |
+| D5 | Codegen **always unrolls** static arities in v1 (including N > 4). |
 | D6 | Tier C / NT-5 lands **after** NT-1…3 bake. |
-
-### Still open / minor
-
-| # | Question | Recommendation |
-|---|----------|----------------|
-| D2 | `%` on floats in zip | **allow** — mirror scalars (`MODF`) |
-| D4 | Empty tuple `()` | **error** — not numeric; empty `[T; 0]` ⊕ `[T; 0]` → `[]` OK if we allow arity 0 arrays |
-| D7 | Dicts / records field-wise `+` | **out of scope** |
+| D7 | Dicts / records field-wise `+` — **out of scope**. |
 
 ---
 
@@ -492,9 +495,9 @@ No parser changes expected for v1.
 
 ### Codegen
 
-- zip emits unrolled `Index` × 2n + scalar ops + `MakeTuple` for n ≤ 4
-  (not a single `ADD` on pointers)
-- arity 5+ uses a loop form
+- zip emits unrolled `Index` × 2n + scalar ops + `MakeTuple` for any
+  static `n` (not a single `ADD` on pointers)
+- dynamic `[T]` broadcast/unary uses an `ArrayLen` counted loop
 - broadcast emits one scalar load reused
 - regression: `integer_arithmetic_emits_int_opcode` still scalar
 
@@ -539,7 +542,7 @@ No parser changes expected for v1.
   typecheck with clear messages (NT-0 even before full zip).
 - Static arrays and scalar broadcast (including `[T] ⊕ scalar`) work
   per §2.
-- Codegen unrolls zip for arity ≤ 4.
+- Codegen always unrolls static-arity zip (any N) in v1.
 - `fn add<T: Num>(T a, T b) -> T` works for `int`, `float`,
   homogeneous numeric tuples, and `[T; N]` numeric arrays (NT-5).
 - Docs and examples catalog updated; `cargo test --workspace` green.
@@ -548,13 +551,13 @@ No parser changes expected for v1.
 
 ## 12. Suggested implementation order (checklist)
 
-- [ ] NT-0 reject aggregate `+`/`**`/… without zip (incl. dynamic `[T]⊕[T]`)
-- [ ] NT-1 tuple zip ground (`+ - * / % **`, unroll ≤ 4)
-- [ ] NT-2 static array zip + hard errors for dynamic zip
-- [ ] NT-3 broadcast + compound assign (bake before NT-5)
-- [ ] NT-4 element-generic
-- [ ] NT-5 constraint lifting + monomorphize (after NT-1…3 bake)
-- [ ] NT-6 docs / byte / optional perf polish
+- [x] NT-0 reject aggregate `+`/`**`/… without zip (incl. dynamic `[T]⊕[T]`)
+- [x] NT-1 tuple zip ground (`+ - * / % **`, always unroll static arity)
+- [x] NT-2 static array zip + hard errors for dynamic zip
+- [x] NT-3 broadcast + compound assign (bake before NT-5)
+- [x] NT-4 element-generic
+- [x] NT-5 constraint lifting + monomorphize (after NT-1…3 bake)
+- [x] NT-6 docs / byte / optional perf polish
 
 Each phase: tests + minimal example before moving on; stage only
 related files per commit.

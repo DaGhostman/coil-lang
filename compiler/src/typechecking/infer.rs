@@ -5305,6 +5305,9 @@ impl Checker {
         }
 
         // Open element → bind op trait (Tier B).
+        // `%` / `**` intentionally skip trait binding — same as scalar
+        // `infer_arith` (no Mod/Pow trait dictionaries yet). Concrete
+        // `int`/`float` elements still typecheck via `is_numeric_elem`.
         if let Ty::Var(v) = &elem {
             let (class, method) = match op {
                 "+" => ("Add", "add"),
