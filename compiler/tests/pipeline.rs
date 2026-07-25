@@ -2748,3 +2748,24 @@ fn main() {
     );
     assert_eq!(output, "7");
 }
+
+/// Early-return callees must not be tiny-inlined (inliner truncates at first
+/// RETURN). Both arms must run correctly via a real CALL.
+#[test]
+fn early_return_callee_both_arms_via_call() {
+    let output = run_example_src(
+        r#"
+fn early(int n, int is_neg) -> int {
+    if is_neg == 1 {
+        return 0 - 1;
+    }
+    return n * 2;
+}
+fn main() {
+    print "%i,", early(4, 1);
+    print "%i", early(4, 0);
+}
+"#,
+    );
+    assert_eq!(output, "-1,8");
+}

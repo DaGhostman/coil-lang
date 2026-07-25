@@ -1096,6 +1096,19 @@ impl Compiler {
         if slice.is_empty() || slice.len() > 48 {
             return false;
         }
+        // Inliner copies opcodes until the first `RETURN` and leaves that
+        // value on the stack. Early-return / branched bodies therefore
+        // truncate (else-arm dropped). Only allow a single terminal RETURN
+        // and no control-flow jumps.
+        let return_idxs: Vec<usize> = slice
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::RETURN))
+            .map(|(i, _)| i)
+            .collect();
+        if return_idxs.len() != 1 || return_idxs[0] != slice.len() - 1 {
+            return false;
+        }
         !slice.iter().any(|b| {
             matches!(
                 b.bytecode(),
@@ -1112,10 +1125,15 @@ impl Compiler {
                     | Instruction::JumpIfMatch
                     | Instruction::HostInvoke
                     | Instruction::FfiInvoke
+                    | Instruction::JMP
+                    | Instruction::JMPF
+                    | Instruction::JMPT
                     | Instruction::BinSlotImm
                     | Instruction::BinSlotSlot
                     | Instruction::BinReturn
                     | Instruction::CmpJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::LogNotJmpf
                     | Instruction::LoadReturnSlot
                     | Instruction::ConstReturnImm
             )
@@ -10812,6 +10830,25 @@ fn main() { print \"%i\", add(3, 4); }",
                 )
             }),
             "expected inlined add to emit a binary op in bytecode"
+        );
+    }
+
+    /// Early-return bodies must NOT be tiny-inlined: the inliner stops at the
+    /// first `RETURN`, which would drop the else arm (`return n * 2`).
+    #[test]
+    fn early_return_callee_is_not_tiny_inlined() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn early(int n, int is_neg) -> int { \
+               if is_neg == 1 { return 99; } \
+               return n * 2; \
+             } \
+             fn main() { print \"%i\", early(4, 0); }",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "early-return callee must remain a CALL (not truncated inline); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
