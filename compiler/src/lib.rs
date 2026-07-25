@@ -5279,7 +5279,44 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([1, 1])); // Err tag=1 arity=1
     }
 
-    /// Emit `dot` / `matmul` / `cross` from the linear-algebra side table.
+    /// Emit `Matrix` ops (`*`, `+`, `-`, unary `-`) when the typechecker
+    /// recorded [`LinearAlgebraInfo`] on this node.
+    fn try_emit_matrix_op(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
+        lhs: &Output,
+        rhs: Option<&Output>,
+    ) -> bool {
+        let Some(info) = self_id
+            .and_then(|id| self.checker.linear_algebra_at(id))
+            .or_else(|| self.checker.linear_algebra_for_span(span_start, span_end))
+            .cloned()
+        else {
+            return false;
+        };
+        match &info.kind {
+            crate::typechecking::LinearAlgebraKind::MatMul { .. }
+            | crate::typechecking::LinearAlgebraKind::MatrixZip { .. } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let args = [lhs.clone(), rhs.clone()];
+                self.emit_linear_algebra(bytecode, self_id, span_start, span_end, &args);
+                true
+            }
+            crate::typechecking::LinearAlgebraKind::MatrixNeg { .. } => {
+                let args = [lhs.clone()];
+                self.emit_linear_algebra(bytecode, self_id, span_start, span_end, &args);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit `dot` / `matmul` / `cross` / Matrix ops from the linear-algebra side table.
     fn emit_linear_algebra(
         &mut self,
         bytecode: &mut Vec<Byte>,
@@ -5288,11 +5325,8 @@ impl Compiler {
         span_end: usize,
         args: &[Output],
     ) {
-        use crate::typechecking::LinearAlgebraKind;
+        use crate::typechecking::{AggregateOp, LinearAlgebraKind};
 
-        if args.len() != 2 {
-            return;
-        }
         let Some(info) = self_id
             .and_then(|id| self.checker.linear_algebra_at(id))
             .or_else(|| self.checker.linear_algebra_for_span(span_start, span_end))
@@ -5301,12 +5335,25 @@ impl Compiler {
             return;
         };
 
+        let needs_two = !matches!(info.kind, LinearAlgebraKind::MatrixNeg { .. });
+        if needs_two && args.len() != 2 {
+            return;
+        }
+        if !needs_two && args.is_empty() {
+            return;
+        }
+
         let t0 = self.alloc_temp_slot();
-        let t1 = self.alloc_temp_slot();
         bytecode.append(&mut self.do_compile(&args[0]));
         bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
-        bytecode.append(&mut self.do_compile(&args[1]));
-        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+        let t1 = if needs_two {
+            let slot = self.alloc_temp_slot();
+            bytecode.append(&mut self.do_compile(&args[1]));
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            Some(slot)
+        } else {
+            None
+        };
 
         match info.kind {
             LinearAlgebraKind::Dot {
@@ -5314,6 +5361,7 @@ impl Compiler {
                 elem_is_float,
                 ..
             } => {
+                let t1 = t1.expect("dot needs two args");
                 let mul = if elem_is_float {
                     Instruction::MULF
                 } else {
@@ -5341,6 +5389,7 @@ impl Compiler {
                 left_is_tuple,
                 elem_is_float,
             } => {
+                let t1 = t1.expect("cross needs two args");
                 let mul = if elem_is_float {
                     Instruction::MULF
                 } else {
@@ -5409,6 +5458,7 @@ impl Compiler {
                 row_is_tuple,
                 elem_is_float,
             } => {
+                let t1 = t1.expect("matmul needs two args");
                 let mul = if elem_is_float {
                     Instruction::MULF
                 } else {
@@ -5439,6 +5489,76 @@ impl Compiler {
                                 bytecode.push(Byte::new(add));
                             }
                         }
+                    }
+                    if row_is_tuple {
+                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                    } else {
+                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                    }
+                }
+                if outer_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                }
+            }
+            LinearAlgebraKind::MatrixZip {
+                m,
+                n,
+                op,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                let t1 = t1.expect("matrix zip needs two args");
+                let cell_op = match (op, elem_is_float) {
+                    (AggregateOp::Add, false) => Instruction::ADD,
+                    (AggregateOp::Add, true) => Instruction::ADDF,
+                    (AggregateOp::Sub, false) => Instruction::SUB,
+                    (AggregateOp::Sub, true) => Instruction::SUBF,
+                    _ => Instruction::ADD,
+                };
+                for i in 0..m {
+                    for j in 0..n {
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(cell_op));
+                    }
+                    if row_is_tuple {
+                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                    } else {
+                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                    }
+                }
+                if outer_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                }
+            }
+            LinearAlgebraKind::MatrixNeg {
+                m,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                for i in 0..m {
+                    for j in 0..n {
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        self.emit_neg_tos(bytecode, elem_is_float);
                     }
                     if row_is_tuple {
                         bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
@@ -6569,6 +6689,12 @@ impl Compiler {
                     match kind {
                         crate::typechecking::PreludeFn::Assert => {
                             self.emit_assert(arg_slice);
+                        }
+                        crate::typechecking::PreludeFn::Matrix => {
+                            // Zero-cost wrap: runtime is the nested data.
+                            if let Some(arg) = arg_slice.first() {
+                                bytecode.append(&mut self.do_compile(arg));
+                            }
                         }
                         crate::typechecking::PreludeFn::Dot
                         | crate::typechecking::PreludeFn::MatMul
@@ -7725,7 +7851,15 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::LogNot));
             }
             Expression::Negate(lhs) => {
-                if self.try_emit_aggregate_arith(
+                if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    None,
+                ) {
+                } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
                     span.start,
@@ -7740,6 +7874,14 @@ impl Compiler {
             }
             Expression::Add(lhs, rhs) => {
                 if self.try_emit_folded_expr(ast, &mut bytecode) {
+                } else if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                ) {
                 } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
@@ -7779,7 +7921,15 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                if self.try_emit_aggregate_arith(
+                if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                ) {
+                } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
                     span.start,
@@ -7813,7 +7963,15 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
-                if self.try_emit_aggregate_arith(
+                if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                ) {
+                } else if self.try_emit_aggregate_arith(
                     &mut bytecode,
                     self_id,
                     span.start,

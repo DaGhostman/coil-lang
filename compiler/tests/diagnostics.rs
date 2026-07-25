@@ -1897,3 +1897,40 @@ fn main() {
     );
 }
 
+#[test]
+fn matrix_mul_inner_dimension_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a = matrix([[1, 2, 3]]);
+    let b = matrix([[1, 2], [3, 4]]);
+    let _ = a * b;
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("inner dimensions mismatch")),
+        "expected Matrix * dimension mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn matrix_div_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let _ = a / a;
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("not supported on `Matrix`")),
+        "expected Matrix / rejection, got: {:?}",
+        msgs
+    );
+}
+

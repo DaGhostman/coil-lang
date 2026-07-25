@@ -834,6 +834,17 @@ fn main() {
 
 ---
 
+### `examples/matrix_mul.hy`
+
+**Demonstrates:** Nominal `Matrix` — `*` is matmul (Mul), `+` is element-wise.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/matrix_mul.hy` |
+| **Output** | `19,22,43,502` |
+
+---
+
 ### `examples/generic_alias.hy`
 
 **Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
@@ -1592,6 +1603,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `vec_generic.hy` | Aggregates | `24,55` |
 | `vec_dot.hy` | Aggregates | `32,001` |
 | `vec_matmul.hy` | Aggregates | `19,22,43,50` |
+| `matrix_mul.hy` | Aggregates | `19,22,43,502` |
 | `generic_alias.hy` | Types | `7` |
 | `generic_enum.hy` | Enums / types | `7` |
 | `generics.hy` | Types | `7424.0427` |

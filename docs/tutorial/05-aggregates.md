@@ -68,9 +68,9 @@ scalar broadcast:
 Heterogeneous tuples and mismatched arities are compile errors.
 See [Operators — Aggregate arithmetic](../reference/operators.md).
 
-For linear algebra on vectors/matrices, use named helpers (`dot`,
-`cross`, `matmul`) from [Built-ins](../reference/built-ins.md#linear-algebra-dot--matmul--cross)
-rather than overloading `*` / `**`.
+For linear algebra on bare vectors/arrays, use named helpers (`dot`,
+`cross`, `matmul`). For matmul with `*`, wrap with `matrix(...)` to get
+a `Matrix` — see [Built-ins](../reference/built-ins.md#linear-algebra-dot--matmul--cross--matrix).
 
 ---
 

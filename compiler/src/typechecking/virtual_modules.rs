@@ -67,6 +67,8 @@ pub enum PreludeFn {
     Dot,
     MatMul,
     Cross,
+    /// Construct a nominal `Matrix` from nested static rows.
+    Matrix,
 }
 
 impl PreludeFn {
@@ -76,6 +78,7 @@ impl PreludeFn {
             Self::Dot => "dot",
             Self::MatMul => "matmul",
             Self::Cross => "cross",
+            Self::Matrix => "matrix",
         }
     }
 
@@ -85,6 +88,7 @@ impl PreludeFn {
             "dot" => Some(Self::Dot),
             "matmul" => Some(Self::MatMul),
             "cross" => Some(Self::Cross),
+            "matrix" => Some(Self::Matrix),
             _ => None,
         }
     }
@@ -384,6 +388,12 @@ impl VirtualModules {
                 },
                 BuiltinExport::Fn {
                     kind: PreludeFn::Cross,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Matrix,
+                },
+                BuiltinExport::OpaqueType {
+                    name: common::BUILTIN_MATRIX_TYPE,
                 },
             ],
         );

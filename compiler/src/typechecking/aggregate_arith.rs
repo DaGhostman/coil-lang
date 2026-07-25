@@ -203,6 +203,23 @@ pub enum LinearAlgebraKind {
         row_is_tuple: bool,
         elem_is_float: bool,
     },
+    /// Element-wise `+` / `-` on equal-shaped `Matrix` values (Hadamard).
+    MatrixZip {
+        m: usize,
+        n: usize,
+        op: AggregateOp,
+        outer_is_tuple: bool,
+        row_is_tuple: bool,
+        elem_is_float: bool,
+    },
+    /// Element-wise unary `-` on a `Matrix`.
+    MatrixNeg {
+        m: usize,
+        n: usize,
+        outer_is_tuple: bool,
+        row_is_tuple: bool,
+        elem_is_float: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +284,43 @@ pub fn classify_matrix(
     }
 }
 
+/// True when `ty` is `Matrix<Data>` (nominal wrapper).
+pub fn is_matrix_ty(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::App(head, args)
+            if args.len() == 1
+                && matches!(
+                    head.as_ref(),
+                    Ty::Con(name) if name == common::BUILTIN_MATRIX_TYPE
+                )
+    )
+}
+
+/// Peel `Matrix<Data>` → `Data`.
+pub fn unwrap_matrix_ty(ty: &Ty) -> Option<&Ty> {
+    match ty {
+        Ty::App(head, args)
+            if args.len() == 1
+                && matches!(
+                    head.as_ref(),
+                    Ty::Con(name) if name == common::BUILTIN_MATRIX_TYPE
+                ) =>
+        {
+            Some(&args[0])
+        }
+        _ => None,
+    }
+}
+
+/// Wrap nested matrix data as `Matrix<Data>`.
+pub fn wrap_matrix_ty(data: Ty) -> Ty {
+    Ty::App(
+        Box::new(Ty::Con(common::BUILTIN_MATRIX_TYPE.into())),
+        vec![data],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +349,13 @@ mod tests {
         assert!(
             homogeneous_aggregate_elem(&Ty::Tuple(vec![int(), Ty::Con("float".into())])).is_none()
         );
+    }
+
+    #[test]
+    fn matrix_wrap_unwrap_round_trip() {
+        let data = array_fixed(array_fixed(int(), 2), 2);
+        let m = wrap_matrix_ty(data.clone());
+        assert!(is_matrix_ty(&m));
+        assert_eq!(unwrap_matrix_ty(&m), Some(&data));
     }
 }

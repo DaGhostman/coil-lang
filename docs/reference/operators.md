@@ -76,20 +76,25 @@ Homogeneous numeric tuples and arrays support the same operators
 negates each element. Compound assign (`+=`, `**=`, …) follows the same
 rules with the LHS shape fixed.
 
-For **dot product**, **cross product**, and **matrix multiply**, use the
-named helpers `dot`, `cross`, and `matmul` (auto-imported from
-`prelude::math`) — see [Built-ins](built-ins.md#linear-algebra-dot--matmul--cross).
+For **dot product**, **cross product**, and bare-array **matrix multiply**,
+use the named helpers `dot`, `cross`, and `matmul`. For matmul via `*`
+(Mul), wrap rows with `matrix(...)` to get a nominal `Matrix` — see
+[Built-ins](built-ins.md#linear-algebra-dot--matmul--cross--matrix).
 
 ```coil
 (1, 1) + (1, 1);   // (2, 2)
 [1, 2] + 3;        // [4, 5]
 -(1, 2);           // (-1, -2)
 dot((1, 2), (3, 4));  // 11
+let a = matrix([[1, 2], [3, 4]]);
+let b = matrix([[5, 6], [7, 8]]);
+a * b;             // matmul (Matrix)
+a + a;             // element-wise
 ```
 
 See `examples/vec_tuple.hy`, `examples/vec_array.hy`,
-`examples/vec_generic.hy`, `examples/vec_dot.hy`, and
-`examples/vec_matmul.hy`.
+`examples/vec_generic.hy`, `examples/vec_dot.hy`,
+`examples/vec_matmul.hy`, and `examples/matrix_mul.hy`.
 
 String concatenation uses `+`:
 

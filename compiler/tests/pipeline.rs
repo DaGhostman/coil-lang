@@ -2851,6 +2851,12 @@ fn example_vec_matmul_prints_2x2_product() {
 }
 
 #[test]
+fn example_matrix_mul_prints_product_and_hadamard_add() {
+    let output = run_example("examples/matrix_mul.hy");
+    assert_eq!(output, "19,22,43,502");
+}
+
+#[test]
 fn aggregate_compound_assign_updates_tuple() {
     let output = run_example_src(
         r#"

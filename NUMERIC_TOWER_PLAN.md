@@ -1,6 +1,6 @@
 # Numeric Tower — Implementation Plan
 
-**Status:** implemented (NT-0…NT-7)  
+**Status:** implemented (NT-0…NT-7 + Matrix/Mul)  
 **Goal:** Treat homogeneous numeric tuples and arrays as vectors with a
 full element-wise / broadcast arithmetic tower, so that e.g.
 `(1, 1) + (1, 1) == (2, 2)` and `[1, 2] + 3 == [4, 5]`, including
@@ -566,6 +566,7 @@ No parser changes expected for v1.
 - [x] NT-5 constraint lifting + monomorphize (after NT-1…3 bake)
 - [x] NT-6 docs / byte / optional perf polish
 - [x] NT-7 named linear-algebra helpers (`dot` / `matmul` / `cross`) — §13
+- [x] Matrix + Mul (`matrix(...)`, `*` matmul, `+`/`-` zip) — §13.3
 
 Each phase: tests + minimal example before moving on; stage only
 related files per commit.
@@ -583,7 +584,7 @@ is a **separate surface**:
 |-------|-----|-----------|
 | Homogeneous `(T,…)` / `[T; N]` | `+ - * / % **`, unary `-` | Element-wise zip / broadcast (NT-0…6) |
 | Same aggregates | `dot`, `matmul`, `cross` | **Named prelude helpers** (NT-7) |
-| Future `Matrix` type | `*` → matmul; `+` → element-wise | Explicit type gate; **`Mul` (not `Num`)**; **never `**` for dot** |
+| `Matrix` | `matrix(rows)`; `*` matmul; `+`/`-` zip | Nominal `Matrix<Data>`; **`Mul` (not `Num`)** |
 
 **Do not:**
 
@@ -598,10 +599,10 @@ is a **separate surface**:
 
 - Ship `dot` / `matmul` / `cross` as auto-imported `prelude::math`
   builtins (same Call / `PreludeFn` pattern as `assert`).
-- Later add `Matrix` if a dedicated type + `impl Mul` is needed; existing
-  zip + named helpers stay.
+- Ship `matrix(...)` + nominal `Matrix<Data>` with `*` → matmul (Mul)
+  and `+`/`-` → element-wise; zip + named helpers stay.
 
-### 13.2 NT-7 — Named helpers (this phase)
+### 13.2 NT-7 — Named helpers
 
 Auto-imported free functions:
 
@@ -619,11 +620,21 @@ mirroring the tower style.
 
 Examples: `examples/vec_dot.hy`, `examples/vec_matmul.hy`.
 
-### 13.3 Future — `Matrix` builtin (not in NT-7)
+### 13.3 `Matrix` + `Mul` (implemented)
 
-Optional later phase:
+Nominal wrapper distinct from bare nested arrays:
 
-1. Introduce `Matrix` (or `Mat<R, C, T>`) distinct from bare nested arrays.
-2. `m * n` on `Matrix` → matmul via `Mul`.
-3. Keep `dot` as a named helper (or method); do **not** bind it to `**`.
-4. Do **not** implement `Matrix: Num` solely to get matmul.
+1. **`matrix(rows)`** — `rows` must classify as a nested static matrix;
+   result type is `Matrix<Data>` where `Data` is the nested layout
+   (dims stay in the type argument). Runtime is the nested data
+   (zero-cost wrap).
+2. **`m * n` on `Matrix`** → matmul (same unroll as `matmul`); recorded
+   as `LinearAlgebraInfo::MatMul`. This is the `Mul` surface — not
+   Hadamard zip.
+3. **`m + n` / `m - n`** → element-wise zip of the nested data, re-wrapped.
+4. **`/` / `%` / `**` on `Matrix`** → hard error (`Matrix` is not `Num`).
+5. **Indexing** `m[i][j]` peels the wrapper and indexes `Data`.
+6. Keep `dot` / `matmul` / `cross` for bare aggregates; do **not** bind
+   dot to `**`.
+
+Example: `examples/matrix_mul.hy` → `19,22,43,502`.

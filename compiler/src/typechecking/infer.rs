@@ -2133,6 +2133,9 @@ impl Checker {
             Expression::Negate(e) => {
                 let inner = self.infer(e);
                 let pruned = apply_ty_prune(&self.subst, &inner);
+                if super::aggregate_arith::is_matrix_ty(&pruned) {
+                    return self.infer_matrix_neg(pruned, id, range);
+                }
                 if matches!(&pruned, Ty::Tuple(_) | Ty::Array { .. }) {
                     self.infer_aggregate_neg(pruned, id, range)
                 } else {
@@ -2580,6 +2583,7 @@ impl Checker {
                         PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
                         PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
                         PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
+                        PreludeFn::Matrix => self.infer_matrix_ctor(arg_slice, id, range),
                     };
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
@@ -3242,6 +3246,14 @@ impl Checker {
                 // supports integer indices).
                 let _ = unify_with(&self.subst, &index_ty_pruned, &int());
                 let resolved = apply_ty_prune(&self.subst, &target_ty);
+                // Peel `Matrix<Data>` so `m[i][j]` indexes the nested rows.
+                let resolved = if let Some(data) =
+                    super::aggregate_arith::unwrap_matrix_ty(&resolved)
+                {
+                    data.clone()
+                } else {
+                    resolved
+                };
                 match &resolved {
                     Ty::Array { element, length } => {
                         // Out-of-bounds check: only fires when the
@@ -5071,6 +5083,13 @@ impl Checker {
 
         let lp = apply_ty_prune(&self.subst, &lt);
         let rp = apply_ty_prune(&self.subst, &rt);
+        // Nominal `Matrix` — `*` is matmul (Mul), `+`/`-` are element-wise.
+        // Must run before aggregate zip so nested-array data inside Matrix
+        // is not treated as Hadamard product.
+        if super::aggregate_arith::is_matrix_ty(&lp) || super::aggregate_arith::is_matrix_ty(&rp)
+        {
+            return self.infer_matrix_arith(lp, rp, id, range, op);
+        }
         if matches!(&lp, Ty::Tuple(_) | Ty::Array { .. })
             || matches!(&rp, Ty::Tuple(_) | Ty::Array { .. })
         {
@@ -6141,6 +6160,295 @@ impl Checker {
                 length: ArrayLength::Static(m),
             }
         }
+    }
+
+    /// `matrix(rows)` — wrap nested static matrix data as `Matrix<Data>`.
+    fn infer_matrix_ctor(
+        &mut self,
+        args: &[Output],
+        _id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        use super::aggregate_arith::{classify_matrix, is_numeric_elem, wrap_matrix_ty};
+
+        if args.len() != 1 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("matrix expects 1 argument, got {}", args.len()),
+                range,
+                Some("use `matrix([[…], …])` with nested fixed-length rows".to_string()),
+            );
+        }
+
+        let data_ty = self.infer(&args[0]);
+        let pruned = apply_ty_prune(&self.subst, &data_ty);
+        let Some((elem, _m, _n, _, _)) = classify_matrix(&pruned) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "`matrix` expects a nested fixed-length matrix, found `{}`",
+                    pruned
+                ),
+                args[0].0.into_range(),
+                Some("use `[[T; N]; M]` (or a tuple of equal-length row tuples/arrays)".to_string()),
+            );
+        };
+        if !is_numeric_elem(&elem) {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("element type `{}` does not support `matrix`", elem),
+                range,
+                Some("matrix elements must be numeric (`int` or `float`)".to_string()),
+            );
+        }
+        wrap_matrix_ty(pruned)
+    }
+
+    /// Arithmetic on nominal `Matrix` values.
+    ///
+    /// - `*` → matmul (Mul), recording [`LinearAlgebraInfo`]
+    /// - `+` / `-` → element-wise zip of the nested data (Add / Sub)
+    /// - unary handled via [`Self::infer_aggregate_neg`]
+    /// - `/`, `%`, `**` rejected (Matrix is not `Num`)
+    fn infer_matrix_arith(
+        &mut self,
+        lp: Ty,
+        rp: Ty,
+        id: Option<NodeId>,
+        range: Range<usize>,
+        op: &str,
+    ) -> Ty {
+        use super::aggregate_arith::{
+            classify_matrix, elem_is_float, is_numeric_elem, unwrap_matrix_ty, wrap_matrix_ty,
+            LinearAlgebraInfo, LinearAlgebraKind,
+        };
+
+        let Some(ld) = unwrap_matrix_ty(&lp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("cannot apply `{}` between `{}` and `{}`", op, lp, rp),
+                range,
+                Some("both operands of matrix arithmetic must be `Matrix` values".to_string()),
+            );
+        };
+        let Some(rd) = unwrap_matrix_ty(&rp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("cannot apply `{}` between `{}` and `{}`", op, lp, rp),
+                range,
+                Some("both operands of matrix arithmetic must be `Matrix` values".to_string()),
+            );
+        };
+
+        match op {
+            "*" => {
+                let Some((le, m, k1, outer_is_tuple, row_is_tuple)) = classify_matrix(ld) else {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("invalid matrix layout `{}`", ld),
+                        range.clone(),
+                        None,
+                    );
+                };
+                let Some((re, k2, n, right_outer, right_row)) = classify_matrix(rd) else {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("invalid matrix layout `{}`", rd),
+                        range.clone(),
+                        None,
+                    );
+                };
+                if outer_is_tuple != right_outer || row_is_tuple != right_row {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        "matrix operands must use the same container shape".to_string(),
+                        range,
+                        Some(
+                            "both matrices must be array-of-arrays or both tuple-of-rows"
+                                .to_string(),
+                        ),
+                    );
+                }
+                if k1 != k2 {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "matrix multiply inner dimensions mismatch: {}×{} and {}×{}",
+                            m, k1, k2, n
+                        ),
+                        range,
+                        Some("left columns must equal right rows".to_string()),
+                    );
+                }
+                let _ = self.unify(&le, &re, &range, "element types of matrix `*`");
+                let elem = apply_ty_prune(&self.subst, &le);
+                if !is_numeric_elem(&elem) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("element type `{}` does not support matrix `*`", elem),
+                        range,
+                        None,
+                    );
+                }
+                self.record_linear_algebra(
+                    id,
+                    &range,
+                    LinearAlgebraInfo {
+                        kind: LinearAlgebraKind::MatMul {
+                            m,
+                            k: k1,
+                            n,
+                            outer_is_tuple,
+                            row_is_tuple,
+                            elem_is_float: elem_is_float(&elem),
+                        },
+                    },
+                );
+                let row_ty = if row_is_tuple {
+                    Ty::Tuple(vec![elem.clone(); n])
+                } else {
+                    Ty::Array {
+                        element: Box::new(elem.clone()),
+                        length: ArrayLength::Static(n),
+                    }
+                };
+                let data = if outer_is_tuple {
+                    Ty::Tuple(vec![row_ty; m])
+                } else {
+                    Ty::Array {
+                        element: Box::new(row_ty),
+                        length: ArrayLength::Static(m),
+                    }
+                };
+                wrap_matrix_ty(data)
+            }
+            "+" | "-" => {
+                use super::aggregate_arith::AggregateOp;
+                let Some((le, m, n, outer_is_tuple, row_is_tuple)) = classify_matrix(ld) else {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("invalid matrix layout `{}`", ld),
+                        range.clone(),
+                        None,
+                    );
+                };
+                let Some((re, m2, n2, right_outer, right_row)) = classify_matrix(rd) else {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("invalid matrix layout `{}`", rd),
+                        range.clone(),
+                        None,
+                    );
+                };
+                if m != m2
+                    || n != n2
+                    || outer_is_tuple != right_outer
+                    || row_is_tuple != right_row
+                {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "cannot apply `{}` to matrices of different shapes",
+                            op
+                        ),
+                        range,
+                        Some("element-wise matrix ops require equal dimensions".to_string()),
+                    );
+                }
+                let _ = self.unify(&le, &re, &range, &format!("element types of matrix `{}`", op));
+                let elem = apply_ty_prune(&self.subst, &le);
+                if !is_numeric_elem(&elem) {
+                    return self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!("element type `{}` does not support matrix `{}`", elem, op),
+                        range,
+                        None,
+                    );
+                }
+                let agg_op = if op == "+" {
+                    AggregateOp::Add
+                } else {
+                    AggregateOp::Sub
+                };
+                self.record_linear_algebra(
+                    id,
+                    &range,
+                    LinearAlgebraInfo {
+                        kind: LinearAlgebraKind::MatrixZip {
+                            m,
+                            n,
+                            op: agg_op,
+                            outer_is_tuple,
+                            row_is_tuple,
+                            elem_is_float: elem_is_float(&elem),
+                        },
+                    },
+                );
+                wrap_matrix_ty(ld.clone())
+            }
+            _ => self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "operator `{}` is not supported on `Matrix` (use `*` for matmul, `+`/`-` for element-wise)",
+                    op
+                ),
+                range,
+                Some(
+                    "`Matrix` implements Mul/Add/Sub only — not Num (no `/`, `%`, or `**`)"
+                        .to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// Unary `-` on a `Matrix` — element-wise negate of every cell.
+    fn infer_matrix_neg(
+        &mut self,
+        matrix_ty: Ty,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        use super::aggregate_arith::{
+            classify_matrix, elem_is_float, is_numeric_elem, unwrap_matrix_ty, wrap_matrix_ty,
+            LinearAlgebraInfo, LinearAlgebraKind,
+        };
+
+        let Some(data) = unwrap_matrix_ty(&matrix_ty) else {
+            return matrix_ty;
+        };
+        let Some((elem, m, n, outer_is_tuple, row_is_tuple)) = classify_matrix(data) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("invalid matrix layout `{}`", data),
+                range,
+                None,
+            );
+        };
+        if !is_numeric_elem(&elem) {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("element type `{}` does not support unary `-`", elem),
+                range,
+                None,
+            );
+        }
+        self.record_linear_algebra(
+            id,
+            &range,
+            LinearAlgebraInfo {
+                kind: LinearAlgebraKind::MatrixNeg {
+                    m,
+                    n,
+                    outer_is_tuple,
+                    row_is_tuple,
+                    elem_is_float: elem_is_float(&elem),
+                },
+            },
+        );
+        wrap_matrix_ty(data.clone())
     }
 
     /// Thread a curried function type through a list of argument types,

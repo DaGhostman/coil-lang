@@ -9,7 +9,7 @@ use super::kind::Kind;
 use super::subst::Subst;
 use super::ty::{Ty, TyVarId};
 use super::unify::unify_with;
-use super::virtual_modules::{PRELUDE_MODULE, PRELUDE_OPS_MODULE};
+use super::virtual_modules::{PRELUDE_MATH_MODULE, PRELUDE_MODULE, PRELUDE_OPS_MODULE};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -253,6 +253,13 @@ impl Generics {
             .insert("RangeInclusive".into(), vec!["T".into()]);
         self.register_nominal_type("RangeInclusive", PRELUDE_MODULE);
         self.register_nominal_type("ArrayIter", PRELUDE_MODULE);
+        // Nominal matrix wrapper: `Matrix<Data>` where `Data` is nested
+        // static rows (`[[T; N]; M]`). `*` is matmul (Mul), not zip.
+        self.generic_type_ctors.insert(
+            common::BUILTIN_MATRIX_TYPE.into(),
+            vec!["T".into()],
+        );
+        self.register_nominal_type(common::BUILTIN_MATRIX_TYPE, PRELUDE_MATH_MODULE);
     }
 
     pub fn register_nominal_type(&mut self, name: &str, module: &str) {
