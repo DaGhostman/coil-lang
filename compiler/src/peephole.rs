@@ -111,7 +111,7 @@ fn patch_targets(byte: &mut Byte, fusion_sites: &[FusionSite], pool: &mut [u64])
                 *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
             }
         }
-        Instruction::CALL | Instruction::MakeCoro => {
+        Instruction::CALL | Instruction::MakeCoro | Instruction::TailCall => {
             let (arity, target) = byte.call_parts();
             let t = adjust_target(target, fusion_sites);
             *byte = Byte::new(*byte.bytecode()).with_call_packed(arity as u32, t as u32);
@@ -213,7 +213,7 @@ fn bump_target_in_byte(byte: &mut Byte, pool: &mut [u64], threshold: usize, delt
                 *byte = Byte::new(*byte.bytecode()).with_operand_u32(t as u32);
             }
         }
-        Instruction::CALL | Instruction::MakeCoro => {
+        Instruction::CALL | Instruction::MakeCoro | Instruction::TailCall => {
             let (arity, target) = byte.call_parts();
             let t = bump(target);
             *byte = Byte::new(*byte.bytecode()).with_call_packed(arity as u32, t as u32);
@@ -323,7 +323,7 @@ fn try_fuse(window: &[Byte], pool: &mut Vec<u64>) -> Option<(Byte, usize)> {
         return Some((b, 4));
     }
     // 3-instruction convoys (their prefix overlaps the shorter rules).
-    if let Some(b) = try_fold_const_bin(window) {
+    if let Some(b) = try_fold_const_bin(window, pool) {
         return Some((b, 3));
     }
     if let Some(b) = try_fuse_bin_slot_imm(window) {
@@ -405,10 +405,8 @@ fn try_fuse_bin_slot_slot(window: &[Byte]) -> Option<Byte> {
     Some(Byte::new(Instruction::BinSlotSlot).with_bin_slot_slot(op as u8, a, b))
 }
 
-/// `CONST a; CONST b; <ADD|SUB|MUL>` → `CONST (a op b)`, when both are
-/// inline and the result is a non-negative `i32` (inline `CONST`
-/// reserves the high bit for the pool flag, so negatives can't fold).
-fn try_fold_const_bin(window: &[Byte]) -> Option<Byte> {
+/// `CONST a; CONST b; <ADD|SUB|MUL|DIV|MOD>` → single `CONST` when foldable.
+fn try_fold_const_bin(window: &[Byte], pool: &mut Vec<u64>) -> Option<Byte> {
     if window.len() < 3 {
         return None;
     }
@@ -418,12 +416,17 @@ fn try_fold_const_bin(window: &[Byte]) -> Option<Byte> {
         Instruction::ADD => a + b,
         Instruction::SUB => a - b,
         Instruction::MUL => a * b,
+        Instruction::DIV if b != 0 => a / b,
+        Instruction::MOD if b != 0 => a % b,
         _ => return None,
     };
-    if result < 0 || result > i32::MAX as i64 {
-        return None;
+    if (0..=i32::MAX as i64).contains(&result) {
+        return Some(Byte::new(Instruction::CONST).with_operand_u32(result as u32));
     }
-    Some(Byte::new(Instruction::CONST).with_operand_u32(result as u32))
+    let bits = common::Value::from(result).raw() as u64;
+    let idx = pool.len();
+    pool.push(bits);
+    Some(Byte::new(Instruction::CONST).with_const_pool(idx as u32))
 }
 
 /// `LOAD s; CONST k; <cmp>; JMPF t` → `BinSlotImmJmpf` (pool packs imm + target).
@@ -667,17 +670,65 @@ mod tests {
     }
 
     #[test]
-    fn const_fold_skips_negative_result() {
-        // 3 - 5 = -2 can't be an inline CONST (high bit = pool flag),
-        // so the convoy is left untouched.
+    fn const_fold_negative_uses_pool() {
         let mut bc = vec![
             Byte::new(Instruction::CONST).with_const_inline(3),
             Byte::new(Instruction::CONST).with_const_inline(5),
             Byte::new(Instruction::SUB),
         ];
         fuse(&mut bc);
-        assert_eq!(bc.len(), 3);
+        assert_eq!(bc.len(), 1);
         assert_eq!(*bc[0].bytecode(), Instruction::CONST);
+        assert_ne!(bc[0].operand_u32() & Byte::POOL_FLAG, 0);
+    }
+
+    #[test]
+    fn const_fold_div_and_mod() {
+        let mut div = vec![
+            Byte::new(Instruction::CONST).with_const_inline(20),
+            Byte::new(Instruction::CONST).with_const_inline(4),
+            Byte::new(Instruction::DIV),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut div);
+        assert_eq!(div.len(), 2);
+        assert_eq!(*div[0].bytecode(), Instruction::CONST);
+        assert_eq!(div[0].operand_u32() as i32, 5);
+
+        let mut modulo = vec![
+            Byte::new(Instruction::CONST).with_const_inline(17),
+            Byte::new(Instruction::CONST).with_const_inline(5),
+            Byte::new(Instruction::MOD),
+            Byte::new(Instruction::HALT),
+        ];
+        fuse(&mut modulo);
+        assert_eq!(modulo.len(), 2);
+        assert_eq!(*modulo[0].bytecode(), Instruction::CONST);
+        assert_eq!(modulo[0].operand_u32() as i32, 2);
+    }
+
+    #[test]
+    fn const_fold_div_by_zero_left_unfused() {
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(10),
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::DIV),
+        ];
+        fuse(&mut bc);
+        assert_eq!(bc.len(), 3);
+        assert_eq!(*bc[2].bytecode(), Instruction::DIV);
+    }
+
+    #[test]
+    fn bump_targets_at_or_after_shifts_tail_call_operand() {
+        let mut bc = vec![
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::TailCall).with_call_packed(2, 5),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut pool = Vec::<u64>::new();
+        bump_targets_at_or_after(&mut bc, &mut pool, 3, 2);
+        assert_eq!(bc[1].call_parts().1, 7);
     }
 
     #[test]

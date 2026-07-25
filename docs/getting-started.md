@@ -52,8 +52,8 @@ A successful build produces the `coil` binary (via `src/main.rs`) plus the `pars
 ## Run your first program
 
 The canonical starter example computes the 10th Fibonacci number recursively
-(fast enough for debug builds; the release CPU bench uses
-`examples/fib_bench.hy` with `fib(32)`):
+(fast enough for debug builds; the release CPU / dispatch entry is the same
+workload in `examples/fib_bench.hy`):
 
 ```coil
 fn fib(int n) -> int {
@@ -219,9 +219,9 @@ coil uses a **single-pass stack codegen** pipeline (with a post-codegen peephole
 
 1. **Parse** — `parser::Pratt` builds an AST. Syntax errors are reported with spans.
 2. **Typecheck** — `compiler::typechecking::Checker` runs Algorithm W, producing a type for every expression and collecting diagnostics (unknown identifiers, unify errors, non-exhaustive `match`, and so on).
-3. **Codegen** — `Compiler::compile` walks the AST and appends stack instructions (`LOAD`, `CONST`, `JMP`, `MakeEnum`, `StorePop`, …) to a bytecode vector.
-4. **Peephole** — `peephole::optimize` fuses frequent instruction sequences (`LOAD; CONST; ADD` → `BinSlotImm`, and similar) and relocates jump targets.
-5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **24**) must match at load time.
+3. **Codegen** — `Compiler::compile` walks the AST and appends stack instructions (`LOAD`, `CONST`, `JMP`, `MakeEnum`, `StorePop`, …) to a bytecode vector. A compile-time **`ConstEnv`** folds scalar `const` values, constant `if`/`while` conditions, and small constant-bound loops (unroll ≤ 8 trips). Direct tail-recursive `return f(...)` emits **`TailCall`** (reuse frame, no extra `CALL`+`RETURN`); tiny callees may be inlined at `CALL` sites.
+4. **Peephole** — `peephole::optimize` fuses frequent instruction sequences (`LOAD; CONST; ADD` → `BinSlotImm`, and similar), folds constant `CONST` pairs (including pool-backed negatives), and relocates jump targets.
+5. **Archive** — bytecode and a constant pool are wrapped in `ArchivedProgram { version, bytecode, constants }` and serialized with rkyv. `ARCHIVE_VERSION` (currently **27**) must match at load time.
 6. **Run** — `Machine::run_raw` deserializes and dispatches opcodes. Heap allocations trigger periodic mark-and-sweep GC.
 
 ### Entry point convention

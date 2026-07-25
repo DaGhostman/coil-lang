@@ -1082,7 +1082,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::StoreStatic as u8);
+            promise!(*bc as u8 <= Instruction::TailCall as u8);
 
             match bc {
                 Instruction::POP => {
@@ -1345,6 +1345,20 @@ impl<const S: usize> Machine<S> {
                     if target != 0 {
                         ip = target;
                     }
+                }
+                Instruction::TailCall => {
+                    let (arity, target) = opcode.call_parts();
+                    let callee_sp = self.frames.get().get();
+                    for i in (0..arity).rev() {
+                        let val = self.stack.pop();
+                        self.stack[callee_sp + i] = val;
+                    }
+                    self.stack.seek(callee_sp + arity);
+                    // Match CALL: `sp` is the frame base (locals start at slot 0),
+                    // not past the args. Using `callee_sp + arity` would make
+                    // subsequent LOAD/BinSlotImm read the wrong slots.
+                    sp = callee_sp;
+                    ip = target;
                 }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
@@ -3016,6 +3030,35 @@ mod tests {
     /// `MAKE_ENUM` and `JUMP_IF_MATCH`.
     fn const_int(value: i64) -> Byte {
         Byte::new(Instruction::CONST).with_const_inline(value as i32)
+    }
+
+    /// Tail-recursive countdown reuses one frame (no stack overflow for deep n).
+    #[test]
+    fn tail_call_countdown_reuses_frame() {
+        const ENTRY: u32 = 3;
+        let mut code = vec![
+            const_int(10),
+            Byte::new(Instruction::CALL).with_call_packed(1, ENTRY),
+            Byte::new(Instruction::HALT),
+            // ENTRY: if n == 0 { return n }
+            load(0),
+            const_int(0),
+            Byte::new(Instruction::EQ),
+            Byte::new(Instruction::JMPF).with_operand_u32(0), // patched below
+            load(0),
+            Byte::new(Instruction::RETURN),
+        ];
+        let continue_at = code.len() as u32;
+        code.extend([
+            load(0),
+            const_int(1),
+            Byte::new(Instruction::SUB),
+            Byte::new(Instruction::TailCall).with_call_packed(1, ENTRY),
+        ]);
+        code[6] = Byte::new(Instruction::JMPF).with_operand_u32(continue_at);
+        let mut vm = Machine::<64>::default();
+        vm.run(&code);
+        assert_eq!(vm.pop().as_int(), 0);
     }
 
     #[test]
@@ -4870,6 +4913,63 @@ mod tests {
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 1);
         assert_eq!(vm.pop().as_int(), 42);
+    }
+
+    /// TailCall reuses the current frame (no nest) and overwrites args in place.
+    /// Manual sum_to(n, acc): if n <= 0 return acc; else TailCall(n-1, acc+n).
+    #[test]
+    fn tail_call_reuses_frame_and_computes_sum() {
+        let leq = Instruction::LEQ as u8;
+        let sub = Instruction::SUB as u8;
+        let code = [
+            Byte::new(Instruction::CONST).with_const_inline(5),
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::CALL).with_call_packed(2, 4),
+            Byte::new(Instruction::HALT),
+            // 4: if !(n <= 0) jump to recurse at 7
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(leq, 0, 0),
+            Byte::new(Instruction::JMPF).with_operand_u32(7),
+            // 6: return acc
+            Byte::new(Instruction::LoadReturnSlot).with_operand_u32(1),
+            // 7: n - 1 onto stack
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(sub, 0, 1),
+            // 8–10: acc + n → new_acc; stack = [n-1, new_acc]
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::TailCall).with_call_packed(2, 4),
+        ];
+        let mut vm = Machine::<128>::default();
+        vm.run(&code);
+        // sum_to(5,0) = 5+4+3+2+1 = 15
+        assert_eq!(vm.pop().as_int(), 15);
+    }
+
+    /// TailCall must not push frames: deep recursion stays within Machine::<64> frames.
+    #[test]
+    fn tail_call_does_not_grow_frame_stack() {
+        // sum_to(200, 0) via TailCall — if TailCall pushed frames like CALL,
+        // Machine::<64> would overflow the frame stack.
+        let leq = Instruction::LEQ as u8;
+        let sub = Instruction::SUB as u8;
+        let code = [
+            Byte::new(Instruction::CONST).with_const_inline(200),
+            Byte::new(Instruction::CONST).with_const_inline(0),
+            Byte::new(Instruction::CALL).with_call_packed(2, 4),
+            Byte::new(Instruction::HALT),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(leq, 0, 0),
+            Byte::new(Instruction::JMPF).with_operand_u32(7),
+            Byte::new(Instruction::LoadReturnSlot).with_operand_u32(1),
+            Byte::new(Instruction::BinSlotImm).with_bin_slot_imm(sub, 0, 1),
+            Byte::new(Instruction::LOAD).with_operand_u32(1),
+            Byte::new(Instruction::LOAD).with_operand_u32(0),
+            Byte::new(Instruction::ADD),
+            Byte::new(Instruction::TailCall).with_call_packed(2, 4),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run(&code);
+        // 200+199+...+1 = 20100
+        assert_eq!(vm.pop().as_int(), 20100);
     }
 
     /// Out-of-range StoreStatic is a defensive no-op in release (debug_assert in dev).

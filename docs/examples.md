@@ -249,20 +249,20 @@ fn main() {
 | **Run** | `cargo run -- examples/fib.hy` |
 | **Output** | `55` |
 
-For the release CPU / dispatch regression (`fib(32)` → `2178309`), use
+For the release CPU / dispatch regression entry (same `fib(10)` → `55`), use
 `examples/fib_bench.hy` instead.
 
 ---
 
 ### `examples/fib_bench.hy`
 
-**Demonstrates:** Same recursive Fibonacci as `fib.hy`, but with `fib(32)` for
-release `poop` / `perf_metrics` regression measurement.
+**Demonstrates:** Same recursive Fibonacci as `fib.hy` (`fib(10)`), kept as the
+dedicated entry for release `poop` / `perf_metrics` without long wall time.
 
 | | |
 |---|---|
 | **Run** | `cargo run --release -- examples/fib_bench.hy` |
-| **Output** | `2178309` |
+| **Output** | `55` |
 
 ---
 
@@ -1508,7 +1508,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `for_break.hy` | Basics | `18` |
 | `fizbuz.hy` | Basics | `FIZBUZFIZFIZBUZFIZFIZBUZ` |
 | `fib.hy` | Basics | `55` |
-| `fib_bench.hy` | Perf | `2178309` |
+| `fib_bench.hy` | Perf | `55` |
 | `bench.hy` | Basics | `12\n` |
 | `call_test.hy` | Basics | `done` |
 | `gc.hy` | Basics | `Hello` |

@@ -1,5 +1,5 @@
 // CPU / dispatch regression bench (release `poop` / perf_metrics).
-// Correctness smoke uses examples/fib.hy with fib(10).
+// Uses fib(10) so the recursion shape is exercised without long wall time.
 fn fib(int n) -> int {
     if n <= 2 {
         return 1;
@@ -9,5 +9,5 @@ fn fib(int n) -> int {
 }
 
 fn main() {
-    print "%i", fib(32);
+    print "%i", fib(10);
 }

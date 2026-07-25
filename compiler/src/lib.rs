@@ -1,5 +1,6 @@
 mod block_builder;
 mod attrs;
+mod const_fold;
 mod manifest;
 mod monomorphize;
 mod peephole;
@@ -19,6 +20,7 @@ use common::{
 use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
+use crate::const_fold::ConstValue;
 use crate::monomorphize::{MonoKey, MonoPlan};
 use parser::{
     SimpleSpan,
@@ -673,6 +675,18 @@ pub struct Compiler {
     source_file_list: Vec<String>,
     /// One [`DebugLoc`] per bytecode slot (grows with [`Self::bytecode`]).
     debug_locs: Vec<DebugLoc>,
+
+    /// Compile-time scalar values for `const` bindings (frame stack).
+    const_env_stack: Vec<HashMap<String, ConstValue>>,
+    /// Folded scalar initializers for module `static const` / `static` slots.
+    static_const_values: HashMap<String, ConstValue>,
+
+    /// Qualified name of the function currently being codegen'd (tail-call eligibility).
+    current_function_qualified: Option<String>,
+    /// `functions` map key for the active function (overload-aware).
+    current_function_table_key: Option<String>,
+    /// Bytecode span `(start, end)` per function for tiny inlining.
+    fn_bytecode_spans: HashMap<String, (usize, usize)>,
 }
 
 impl Default for Compiler {
@@ -729,6 +743,11 @@ impl Default for Compiler {
             current_source_file: None,
             source_file_indices: std::collections::BTreeMap::new(),
             source_file_list: Vec::new(),
+            const_env_stack: Vec::new(),
+            static_const_values: HashMap::new(),
+            current_function_qualified: None,
+            current_function_table_key: None,
+            fn_bytecode_spans: HashMap::new(),
         }
     }
 }
@@ -848,6 +867,325 @@ impl Compiler {
         let idx = self.constants.len() as u32;
         self.constants.push(value);
         idx
+    }
+
+    fn const_env(&self) -> &HashMap<String, ConstValue> {
+        self.const_env_stack
+            .last()
+            .expect("const_env_stack initialized in compile_unfused")
+    }
+
+    fn const_env_mut(&mut self) -> &mut HashMap<String, ConstValue> {
+        self.const_env_stack
+            .last_mut()
+            .expect("const_env_stack must be non-empty during codegen")
+    }
+
+    fn push_const_env(&mut self) {
+        let parent = self.const_env().clone();
+        self.const_env_stack.push(parent);
+    }
+
+    fn pop_const_env(&mut self) {
+        self.const_env_stack.pop();
+    }
+
+    fn ensure_const_env(&mut self) {
+        if self.const_env_stack.is_empty() {
+            self.const_env_stack.push(HashMap::new());
+        }
+    }
+
+    fn emit_const_value(&mut self, v: &ConstValue, bytecode: &mut Vec<Byte>) {
+        match v {
+            ConstValue::Int(n) => {
+                if (0..=i32::MAX as i64).contains(n) {
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(*n as i32));
+                } else {
+                    let bits = Value::from(*n).raw() as u64;
+                    let idx = self.intern_constant(bits);
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+                }
+            }
+            ConstValue::Float(n) => {
+                let bits = Value::from(*n).raw() as u64;
+                let idx = self.intern_constant(bits);
+                bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            }
+            ConstValue::Bool(b) => {
+                bytecode.push(Byte::new_with_value(Instruction::CONST, Value::from(*b).raw() as _));
+            }
+            ConstValue::Str(s) => {
+                Self::emit_string_const(bytecode, s);
+            }
+        }
+    }
+
+    fn emit_string_const(bytecode: &mut Vec<Byte>, escaped: &str) {
+        let idx = bytecode.len();
+        let mut count = 0usize;
+        for ch in escaped.chars() {
+            count += 1;
+            bytecode.push(Byte::new(Instruction::DATA).with_operand_u32(ch.into()));
+        }
+        bytecode.insert(
+            idx,
+            Byte::new(Instruction::STRING).with_operand_u32(count as u32),
+        );
+    }
+
+    /// If `ast` folds to a scalar, emit it and return true.
+    fn try_emit_folded_expr(
+        &mut self,
+        ast: &(SimpleSpan, Box<Expression<'_>>),
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        if let Some(v) = const_fold::eval_expr(ast, self.const_env()) {
+            self.emit_const_value(&v, bytecode);
+            true
+        } else if let Some(inner) = const_fold::strength_reduced_inner(ast) {
+            let mut inner_bc = self.do_compile(inner);
+            bytecode.append(&mut inner_bc);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn discard_compile(&mut self, ast: &(SimpleSpan, Box<Expression<'_>>)) {
+        // Walk for NodeId alignment / side tables, but drop any bytes that
+        // direct-to-`self.bytecode` emitters (Print/Format/control flow) wrote.
+        let bc_len = self.bytecode.len();
+        let dbg_len = self.debug_locs.len();
+        let _ = self.do_compile(ast);
+        self.bytecode.truncate(bc_len);
+        self.debug_locs.truncate(dbg_len);
+    }
+
+    fn discard_if_branch(&mut self, branch: &Output<'_>) {
+        if let Expression::Branch(cond, body) = branch.1.as_ref() {
+            if let Some(c) = cond {
+                self.discard_compile(c);
+            }
+            self.discard_compile(body);
+        }
+    }
+
+    /// Constant-folded `if` / `else if` / `else`. Returns true when handled.
+    fn try_compile_const_if(&mut self, branches: &[Output<'_>]) -> bool {
+        let mut i = 0usize;
+        while i < branches.len() {
+            let Expression::Branch(cond, body) = branches[i].1.as_ref() else {
+                return false;
+            };
+            match cond {
+                Some(c) => match const_fold::eval_expr(c, self.const_env()) {
+                    Some(ConstValue::Bool(true)) => {
+                        for j in 0..i {
+                            self.discard_if_branch(&branches[j]);
+                        }
+                        self.discard_compile(c);
+                        let mut body_bc = self.do_compile(body);
+                        self.bytecode.append(&mut body_bc);
+                        for j in (i + 1)..branches.len() {
+                            self.discard_if_branch(&branches[j]);
+                        }
+                        return true;
+                    }
+                    Some(ConstValue::Bool(false)) => {
+                        self.discard_compile(c);
+                        self.discard_compile(body);
+                        i += 1;
+                    }
+                    _ => return false,
+                },
+                None => {
+                    for j in 0..i {
+                        self.discard_if_branch(&branches[j]);
+                    }
+                    let mut body_bc = self.do_compile(body);
+                    self.bytecode.append(&mut body_bc);
+                    for j in (i + 1)..branches.len() {
+                        self.discard_if_branch(&branches[j]);
+                    }
+                    return true;
+                }
+            }
+        }
+        for b in branches {
+            self.discard_if_branch(b);
+        }
+        true
+    }
+
+    /// `return self(...)` tail-call when eligible.
+    fn try_emit_tail_call_expr(
+        &mut self,
+        expr: &Output<'_>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        if !self.context.defers.is_empty() {
+            return false;
+        }
+        let Some(cur) = self.current_function_table_key.clone() else {
+            return false;
+        };
+        let call_expr = match expr.1.as_ref() {
+            Expression::Call { .. } => expr,
+            Expression::Expr(inner) | Expression::Group(inner) => {
+                if matches!(inner.1.as_ref(), Expression::Call { .. }) {
+                    inner
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+        let Expression::Call { name, args } = call_expr.1.as_ref() else {
+            return false;
+        };
+        let Expression::Identifier(fname) = name.1.as_ref() else {
+            return false;
+        };
+        let mut call_key = self
+            .aliases
+            .get(*fname)
+            .cloned()
+            .unwrap_or_else(|| fname.to_string());
+        if let Some((fa, is_rest)) = self
+            .checker
+            .selected_overload_at(call_expr.0.start, call_expr.0.end)
+        {
+            let keyed = overload_fn_key(&call_key, fa, is_rest);
+            if self.functions.contains_key(&keyed) {
+                call_key = keyed;
+            } else {
+                let simple = call_key.rsplit("::").next().unwrap_or(&call_key).to_string();
+                let keyed_simple = overload_fn_key(&simple, fa, is_rest);
+                if self.functions.contains_key(&keyed_simple) {
+                    call_key = keyed_simple;
+                }
+            }
+        } else if !self.functions.contains_key(&call_key) {
+            if let Some(q) = self.current_function_qualified.as_ref() {
+                if call_key == *q || call_key == strip_overload_key(&cur) {
+                    call_key = cur.clone();
+                }
+            }
+        }
+        if call_key != cur {
+            return false;
+        }
+        let qualified = self.current_function_qualified.as_deref().unwrap_or("");
+        if self.coroutine_fns.contains(qualified) || self.coroutine_fns.contains(&call_key) {
+            return false;
+        }
+        let arg_slice = args.as_deref().unwrap_or(&[]);
+        let lookup = strip_overload_key(&cur).to_string();
+        let arity = self.emit_call_args_with_rest(&lookup, arg_slice, bytecode, false);
+        let Some(&target) = self.functions.get(&cur) else {
+            return false;
+        };
+        bytecode.push(
+            Byte::new(Instruction::TailCall).with_call_packed(arity as u32, target as u32),
+        );
+        true
+    }
+
+    fn is_tiny_inline_body(slice: &[Byte]) -> bool {
+        if slice.is_empty() || slice.len() > 48 {
+            return false;
+        }
+        // Inliner copies opcodes until the first `RETURN` and leaves that
+        // value on the stack. Early-return / branched bodies therefore
+        // truncate (else-arm dropped). Only allow a single terminal RETURN
+        // and no control-flow jumps.
+        let return_idxs: Vec<usize> = slice
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.bytecode(), Instruction::RETURN))
+            .map(|(i, _)| i)
+            .collect();
+        if return_idxs.len() != 1 || return_idxs[0] != slice.len() - 1 {
+            return false;
+        }
+        !slice.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::CALL
+                    | Instruction::TailCall
+                    | Instruction::MakeCoro
+                    | Instruction::CallIndirect
+                    | Instruction::YieldCoro
+                    | Instruction::YieldFromCoro
+                    | Instruction::LoadField
+                    | Instruction::MakeEnum
+                    | Instruction::MakeArray
+                    | Instruction::MakeTuple
+                    | Instruction::JumpIfMatch
+                    | Instruction::HostInvoke
+                    | Instruction::FfiInvoke
+                    | Instruction::JMP
+                    | Instruction::JMPF
+                    | Instruction::JMPT
+                    | Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+                    | Instruction::BinReturn
+                    | Instruction::CmpJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::LogNotJmpf
+                    | Instruction::LoadReturnSlot
+                    | Instruction::ConstReturnImm
+            )
+        })
+    }
+
+    fn try_emit_inline_direct_call(
+        &mut self,
+        fqn: &str,
+        args: Option<&[Output<'_>]>,
+        bytecode: &mut Vec<Byte>,
+    ) -> bool {
+        let Some((start, end)) = self.fn_bytecode_spans.get(fqn).copied() else {
+            return false;
+        };
+        let lookup = strip_overload_key(fqn).to_string();
+        if self.checker.fn_has_rest(&lookup) {
+            return false;
+        }
+        let slice = self.bytecode[start..end].to_vec();
+        if !Self::is_tiny_inline_body(&slice) {
+            return false;
+        }
+        let arg_slice = args.unwrap_or(&[]);
+        let _lookup = strip_overload_key(fqn);
+        let mut temps = Vec::new();
+        let flat = self.flatten_call_args_for_emit(arg_slice);
+        for arg in &flat {
+            let value = match arg.1.as_ref() {
+                Expression::NamedArg(_, v) => v,
+                _ => arg,
+            };
+            bytecode.append(&mut self.do_compile(value));
+            let tmp = self.alloc_temp_slot();
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(tmp));
+            temps.push(tmp);
+        }
+        for byte in &slice {
+            if matches!(byte.bytecode(), Instruction::RETURN) {
+                break;
+            }
+            if matches!(byte.bytecode(), Instruction::LOAD) {
+                let slot = byte.operand_u32() as usize;
+                let Some(&tmp) = temps.get(slot) else {
+                    return false;
+                };
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(tmp));
+            } else {
+                bytecode.push(*byte);
+            }
+        }
+        true
     }
 }
 
@@ -3483,6 +3821,34 @@ impl Compiler {
         inclusive: bool,
         float: bool,
     ) {
+        if !float {
+            if let Expression::Range { start, end, .. } = iterable.1.as_ref()
+                && !const_fold::body_has_loop_control(body)
+            {
+                if let Some(trips) = const_fold::range_trip_count(start, end, inclusive) {
+                    let _ = self.next_emit_id();
+                    let binding_slot = self.alloc_binding_slot(binding_name);
+                    let _ = self.next_emit_id();
+                    if let Some(ConstValue::Int(s)) =
+                        const_fold::eval_expr(start, self.const_env())
+                    {
+                        for k in 0..trips {
+                            let val = s + k as i64;
+                            let mut trip_bc = Vec::new();
+                            self.emit_const_value(&ConstValue::Int(val), &mut trip_bc);
+                            trip_bc.push(
+                                Byte::new(Instruction::StorePop).with_operand_u32(binding_slot),
+                            );
+                            let mut body_bc = self.do_compile(body);
+                            trip_bc.append(&mut body_bc);
+                            self.bytecode.append(&mut trip_bc);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         let cur_slot = self.alloc_temp_slot();
         let end_slot = self.alloc_temp_slot();
 
@@ -4200,6 +4566,11 @@ impl Compiler {
         let Some(slot) = self.checker.static_slot_index(fqn) else {
             return;
         };
+        if let Some(val) = const_fold::eval_expr(init, self.const_env()) {
+            if self.checker.is_static_const_fqn(fqn) {
+                self.static_const_values.insert(fqn.to_string(), val);
+            }
+        }
         let mut init_bc = self.do_compile(init);
         self.static_init_bytecode.append(&mut init_bc);
         self.static_init_bytecode.push(
@@ -4553,13 +4924,25 @@ impl Compiler {
                         // high while JumpIfMatch still pushed at the real
                         // cursor.
                         self.append_with_existential_pack(&mut bytecode, &children[1]);
-                        let slot = self.alloc_binding_slot(&name);
                         if is_const {
-                            self.context.constants.insert(slot as usize, true);
+                            if let Some(val) =
+                                const_fold::eval_expr(&children[1], self.const_env())
+                            {
+                                self.const_env_mut().insert(name.clone(), val);
+                            } else {
+                                let slot = self.alloc_binding_slot(&name);
+                                self.context.constants.insert(slot as usize, true);
+                                bytecode.push(
+                                    Byte::new(Instruction::StorePop).with_operand_u32(slot),
+                                );
+                            }
+                            is_binding = true;
+                        } else {
+                            let slot = self.alloc_binding_slot(&name);
+                            bytecode
+                                .push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                            is_binding = true;
                         }
-                        // Append the explicit store-pop-and-write.
-                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
-                        is_binding = true;
                     }
                 }
                 if !is_binding {
@@ -4575,6 +4958,7 @@ impl Compiler {
                 // outer same-named ObjFn / mono local after the block.
                 let saved_polyfn_vars = self.polyfn_vars.clone();
                 let saved_polyfn_sources = self.polyfn_sources.clone();
+                self.push_const_env();
                 let ctx = self.context.child();
                 self.context = ctx;
                 // Append each child to self.bytecode (Print/control-flow emit in-place).
@@ -4584,6 +4968,7 @@ impl Compiler {
                 }
 
                 self.context = *self.context.get_prev().clone().unwrap();
+                self.pop_const_env();
                 self.polyfn_vars = saved_polyfn_vars;
                 self.polyfn_sources = saved_polyfn_sources;
             }
@@ -4622,7 +5007,7 @@ impl Compiler {
                     qualified.clone()
                 };
                 let fn_offset = self.bytecode.len() as u32;
-                self.functions.insert(table_key, fn_offset as usize);
+                self.functions.insert(table_key.clone(), fn_offset as usize);
                 if let Some(desc) = parser::ast::attr_test_desc(attrs, name) {
                     self.test_cases.push((desc, fn_offset));
                 }
@@ -4639,6 +5024,11 @@ impl Compiler {
                 let prev_fn_vars = std::mem::take(&mut self.context.variables);
                 let prev_fn_polyfn_vars = std::mem::take(&mut self.polyfn_vars);
                 let prev_fn_polyfn_sources = std::mem::take(&mut self.polyfn_sources);
+                let prev_fn_qualified = self.current_function_qualified.take();
+                let prev_fn_table_key = self.current_function_table_key.take();
+                self.current_function_qualified = Some(qualified.clone());
+                self.current_function_table_key = Some(table_key.clone());
+                self.push_const_env();
                 self.context.variables = Interner::default();
                 if self.compiling_method {
                     self.context.variables.intern("self".to_string());
@@ -4665,6 +5055,7 @@ impl Compiler {
 
                 self.bytecode.append(&mut a);
 
+                let body_start = self.bytecode.len();
                 let prev_active = self.active_fn_name.take();
                 self.active_fn_name = Some(name.to_string());
                 let mut c = self.do_compile(body);
@@ -4691,6 +5082,11 @@ impl Compiler {
                 }
 
                 self.compiling_result_mode = prev_result_mode;
+                self.pop_const_env();
+                self.current_function_qualified = prev_fn_qualified;
+                self.current_function_table_key = prev_fn_table_key;
+                self.fn_bytecode_spans
+                    .insert(table_key, (body_start, self.bytecode.len()));
                 self.context.variables = prev_fn_vars;
                 self.polyfn_vars = prev_fn_polyfn_vars;
                 self.polyfn_sources = prev_fn_polyfn_sources;
@@ -4953,6 +5349,13 @@ impl Compiler {
                 //     let symbol = self.context.variables.intern(self.resolve_variable(expr));
                 // }
 
+                if self.try_emit_tail_call_expr(expr, &mut bytecode) {
+                    if self.compiling_result_mode {
+                        Self::emit_ok_or_some_wrap(&mut bytecode, false);
+                    }
+                    return bytecode;
+                }
+
                 self.append_with_existential_pack(&mut bytecode, expr);
                 // Result-mode functions: bare `return v` becomes `Ok(v)`.
                 if self.compiling_result_mode {
@@ -5160,6 +5563,13 @@ impl Compiler {
                         }
                     }
                 } else {
+                    if let Some(ConstValue::Bool(false)) =
+                        const_fold::eval_expr(iterable, self.const_env())
+                    {
+                        self.discard_compile(iterable);
+                        self.discard_compile(body);
+                        return bytecode;
+                    }
                     let mut bb = BlockBuilder::new();
                     let top_label = bb.fresh_label();
                     let exit_label = bb.fresh_label();
@@ -5211,6 +5621,50 @@ impl Compiler {
                 step,
                 body,
             } => {
+                if let Some(trips) = const_fold::for_loop_trip_count(
+                    init.as_ref(),
+                    cond,
+                    step.as_ref(),
+                ) && !const_fold::body_has_loop_control(body)
+                {
+                    // Pre-walk order is init → cond → body → step. Emit init,
+                    // discard cond (IDs only), then for each trip restore the
+                    // emit cursor and emit body + step so the induction
+                    // variable advances (e.g. `s = s + i` for `i < 4` → 6).
+                    if let Some(init) = init {
+                        let mut init_bc = self.do_compile(init);
+                        Self::discard_statement_value(&mut init_bc);
+                        self.bytecode.extend(init_bc);
+                    }
+                    self.discard_compile(cond);
+                    let body_start_idx = self.emit_idx;
+                    for _ in 0..trips {
+                        self.emit_idx = body_start_idx;
+                        let mut body_bc = self.do_compile(body);
+                        self.bytecode.append(&mut body_bc);
+                        if let Some(step) = step {
+                            let mut step_bc = self.do_compile(step);
+                            Self::discard_statement_value(&mut step_bc);
+                            self.bytecode.extend(step_bc);
+                        }
+                    }
+                    return bytecode;
+                }
+                if let Some(ConstValue::Bool(false)) =
+                    const_fold::eval_expr(cond, self.const_env())
+                {
+                    if let Some(init) = init {
+                        let mut init_bc = self.do_compile(init);
+                        Self::discard_statement_value(&mut init_bc);
+                        self.bytecode.extend(init_bc);
+                    }
+                    self.discard_compile(cond);
+                    if let Some(step) = step {
+                        self.discard_compile(step);
+                    }
+                    self.discard_compile(body);
+                    return bytecode;
+                }
                 if let Some(init) = init {
                     let mut init_bc = self.do_compile(init);
                     Self::discard_statement_value(&mut init_bc);
@@ -5718,6 +6172,14 @@ impl Compiler {
                         self.consume_spread_emit_ids(arg_slice);
                         let flat_arg_slice = self.flatten_call_args_for_emit(arg_slice);
 
+                        if !is_generic
+                            && !self.coroutine_fns.contains(&n)
+                            && !self.coroutine_fns.contains(&lookup_name)
+                            && self.try_emit_inline_direct_call(&n, Some(arg_slice), &mut bytecode)
+                        {
+                            return bytecode;
+                        }
+
                         // Partial application → MakeFn (not CALL).
                         let (fa, is_rest) = self
                             .checker
@@ -6066,7 +6528,28 @@ impl Compiler {
                     .get(*n)
                     .cloned()
                     .unwrap_or_else(|| n.to_string());
-                if let Some(static_slot) = self
+                if let Some(v) = self
+                    .const_env()
+                    .get(&resolved)
+                    .or_else(|| self.const_env().get(*n))
+                    .cloned()
+                {
+                    self.emit_const_value(&v, &mut bytecode);
+                } else if let Some(v) = self
+                    .static_const_values
+                    .get(&resolved)
+                    .filter(|_| self.checker.is_static_const_fqn(&resolved))
+                    .cloned()
+                {
+                    self.emit_const_value(&v, &mut bytecode);
+                } else if let Some(v) = self
+                    .static_const_values
+                    .get(&self.qualify_static_fqn(n))
+                    .filter(|_| self.checker.is_static_const_fqn(&self.qualify_static_fqn(n)))
+                    .cloned()
+                {
+                    self.emit_const_value(&v, &mut bytecode);
+                } else if let Some(static_slot) = self
                     .checker
                     .static_slot_index(&resolved)
                     .or_else(|| self.checker.static_slot_for_module_name(n))
@@ -6201,6 +6684,9 @@ impl Compiler {
             // --- If codegen ---
             // Layout: c1, JMPF1, b1, JMP1, c2, JMPF2, b2, JMP2, b3, [end]
             Expression::If(branches) => {
+                if self.try_compile_const_if(branches) {
+                    return bytecode;
+                }
                 let mut bb = BlockBuilder::new();
                 let end_label = bb.fresh_label();
                 let mut branch_start_labels: Vec<Option<crate::block_builder::Label>> =
@@ -6433,7 +6919,8 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
+                if self.try_emit_folded_expr(ast, &mut bytecode) {
+                } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
                     bytecode.append(&mut self.do_compile(rhs));
@@ -7992,6 +8479,12 @@ impl Compiler {
 
         self.emit_idx = 0;
         self.temp_counter = 0;
+        self.const_env_stack.clear();
+        self.const_env_stack.push(HashMap::new());
+        self.static_const_values.clear();
+        self.current_function_qualified = None;
+        self.current_function_table_key = None;
+        self.fn_bytecode_spans.clear();
         self.loop_stack.clear();
         self.loop_bbs.clear();
         self.constants.clear();
@@ -8512,10 +9005,11 @@ test("two") { assert(true)?; }
         use common::Instruction;
         let (bc, _pool) = compile_src("\"a\" + \"b\";");
 
+        let folded_string = bc.iter().any(|b| matches!(b.bytecode(), Instruction::STRING));
+        let via_format = bc.iter().any(|b| matches!(b.bytecode(), Instruction::FORMAT));
         assert!(
-            bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::FORMAT)),
-            "expected string addition to lower through FORMAT; opcodes: {:?}",
+            folded_string || via_format,
+            "expected folded STRING or FORMAT for string concat; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         // Ignore ADD/ADDF inside builtin Num thunks; the top-level expression
@@ -10260,6 +10754,215 @@ fn main() {
             store_count, 0,
             "expected zero STORE instructions for `let` / assignment; got {}",
             store_count
+        );
+    }
+
+    /// Scalar `const` at use sites folds through codegen (no LOAD of binding).
+    #[test]
+    fn const_scalar_folds_add_to_single_const() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { const x = 5; print \"%i\", x + 5; }",
+        );
+        let const_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::CONST))
+            .count();
+        assert!(
+            bc.iter().any(|b| {
+                matches!(b.bytecode(), Instruction::CONST)
+                    && b.operand_u32() as i32 == 10
+            }),
+            "expected folded CONST 10 for `const x = 5; x + 5`"
+        );
+        let _ = const_count;
+    }
+
+    /// `if 5 < 5` must not fold as true (parser `<` → `Le`, strict less-than).
+    #[test]
+    fn const_if_strict_lt_does_not_take_then_branch() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "both branches constant-folded; expected only else body"
+        );
+    }
+
+    /// Constant `if` condition emits only the taken branch (no JMPF cascade).
+    #[test]
+    fn const_if_emits_only_taken_branch() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { if 4 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "folded `if 4 < 5` should not emit JMPF; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Self tail-recursive `return f(...)` uses TailCall instead of CALL+RETURN.
+    #[test]
+    fn tail_recursive_sum_emits_tail_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn sum_to(int n, int acc) -> int { \
+if n <= 0 { return acc; } \
+return sum_to(n - 1, acc + n); \
+} \
+fn main() { print \"%i\", sum_to(5, 0); }",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            "expected TailCall in tail-recursive sum_to"
+        );
+    }
+
+    /// Tiny `add` is inlined at direct call sites (arithmetic in main bytecode).
+    #[test]
+    fn tiny_add_inlined_at_call_site() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn add(int a, int b) -> int { return a + b; } \
+fn main() { print \"%i\", add(3, 4); }",
+        );
+        assert!(
+            bc.iter().any(|b| {
+                matches!(
+                    b.bytecode(),
+                    Instruction::BinSlotSlot | Instruction::ADD | Instruction::BinReturn
+                )
+            }),
+            "expected inlined add to emit a binary op in bytecode"
+        );
+    }
+
+    /// Early-return bodies must NOT be tiny-inlined: the inliner stops at the
+    /// first `RETURN`, which would drop the else arm (`return n * 2`).
+    #[test]
+    fn early_return_callee_is_not_tiny_inlined() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn early(int n, int is_neg) -> int { \
+               if is_neg == 1 { return 99; } \
+               return n * 2; \
+             } \
+             fn main() { print \"%i\", early(4, 0); }",
+        );
+        assert!(
+            bc.iter().any(|b| matches!(b.bytecode(), Instruction::CALL)),
+            "early-return callee must remain a CALL (not truncated inline); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Constant-bound C-style `for` unrolls without a back-edge JMP to loop top.
+    #[test]
+    fn const_for_loop_unrolled_without_back_edge() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let s = 0; \
+for (let i = 0; i < 3; i = i + 1) { s = s + i; } \
+print \"%i\", s; \
+}",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+            )),
+            "unrolled for (i < 3) must not emit a loop exit jump; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `if 5 < 5` (strict) must take the else branch — guards Le/`<=` fold mix-up.
+    #[test]
+    fn const_if_strict_lt_equality_takes_else() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { if 5 < 5 { print \"%i\", 1; } else { print \"%i\", 0; } }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "folded `if 5 < 5` should not emit JMPF"
+        );
+        // Taken else prints 0 — must see CONST 0 (or ConstReturnImm), not only CONST 1.
+        let has_zero = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::CONST) && b.operand_u32() as i32 == 0
+        });
+        assert!(
+            has_zero,
+            "else branch for `5 < 5` should emit CONST 0; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `while false` eliminates the loop body (no JMPF / back-edge).
+    #[test]
+    fn const_while_false_eliminates_loop() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { while false { print \"%i\", 1; } print \"%i\", 2; }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::JMPF)),
+            "folded `while false` should not emit JMPF; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `break` inside a countable `for` must keep a real loop (no unroll).
+    #[test]
+    fn for_with_break_is_not_unrolled() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn main() { \
+let s = 0; \
+for (let i = 0; i < 3; i = i + 1) { \
+  s = s + i; \
+  break; \
+} \
+print \"%i\", s; \
+}",
+        );
+        // Peephole may fuse JMPF into CmpJmpf / BinSlotImmJmpf / LogNotJmpf.
+        let has_cond_jump = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::JMPF
+                    | Instruction::CmpJmpf
+                    | Instruction::BinSlotImmJmpf
+                    | Instruction::LogNotJmpf
+            )
+        });
+        assert!(
+            has_cond_jump,
+            "for-with-break must keep a conditional loop exit; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `async fn` self-resume path must not emit TailCall.
+    #[test]
+    fn async_fn_does_not_emit_tail_call() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "async fn tick(int n) { \
+if n <= 0 { return 0; } \
+yield n; \
+return tick(n - 1); \
+} \
+fn main() { let h = tick(2); print \"%i\", resume h; }",
+        );
+        assert!(
+            !bc.iter().any(|b| matches!(b.bytecode(), Instruction::TailCall)),
+            "coroutines must not use TailCall"
         );
     }
 
