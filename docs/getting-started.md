@@ -52,8 +52,8 @@ A successful build produces the `coil` binary (via `src/main.rs`) plus the `pars
 ## Run your first program
 
 The canonical starter example computes the 10th Fibonacci number recursively
-(fast enough for debug builds; the release CPU bench uses
-`examples/fib_bench.hy` with `fib(32)`):
+(fast enough for debug builds; the release CPU / dispatch entry is the same
+workload in `examples/fib_bench.hy`):
 
 ```coil
 fn fib(int n) -> int {

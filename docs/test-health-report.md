@@ -15,7 +15,7 @@ broken, what looked flaky, incomplete implementations, and fixes applied.
 
 | Path | Issue | Fix |
 |------|-------|-----|
-| `examples/fib.hy` used `fib(32)` | Millions of recursive calls; debug heap alloc traces made `example_fib_still_works` and shared suite wall time drag | Smoke example is now `fib(10)` → `55`; bench lives in `examples/fib_bench.hy` (`fib(32)` → `2178309`) for `poop` / `vm_bench.sh` / `perf_fib_dispatch_regression` |
+| `examples/fib.hy` used `fib(32)` | Millions of recursive calls; debug heap alloc traces made `example_fib_still_works` and shared suite wall time drag | Smoke example and `examples/fib_bench.hy` both use `fib(10)` → `55` (`poop` / `vm_bench.sh` / `perf_fib_dispatch_regression`) |
 
 ## Flaky tests
 

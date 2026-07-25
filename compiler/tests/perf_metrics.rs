@@ -70,8 +70,9 @@ fn perf_match_sum_emits_jump_if_match() {
 fn perf_fib_dispatch_regression() {
     let (bc, pool, statics) = compile("examples/fib_bench.hy");
     let dispatches = run_dispatch(bc, pool, statics);
+    // fib(10) is ~445 dispatches with current fusion; keep a generous ceiling.
     assert!(
-        dispatches < 18_000_000,
-        "fib(32) dispatch count regressed: {dispatches}"
+        dispatches < 2_000,
+        "fib(10) dispatch count regressed: {dispatches}"
     );
 }

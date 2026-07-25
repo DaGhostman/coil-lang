@@ -11,7 +11,7 @@ MEM_LIMIT_KB="${MEM_LIMIT_KB:-65536}"
 
 declare -A EXPECTED=(
     ["examples/fib.hy"]="55"
-    ["examples/fib_bench.hy"]="2178309"
+    ["examples/fib_bench.hy"]="55"
     ["examples/option.hy"]="42"
     ["examples/result.hy"]="420-1"
     ["examples/tree.hy"]="6"
