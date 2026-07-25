@@ -1863,3 +1863,37 @@ fn main() {
     );
 }
 
+#[test]
+fn dot_length_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = dot((1, 2), (1, 2, 3));
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot take `dot`")),
+        "expected dot length mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn matmul_inner_dimension_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a = [[1, 2, 3]];
+    let b = [[1, 2], [3, 4]];
+    let _ = matmul(a, b);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("inner dimensions mismatch")),
+        "expected matmul dimension mismatch, got: {:?}",
+        msgs
+    );
+}
+

@@ -1,10 +1,12 @@
 # Numeric Tower — Implementation Plan
 
-**Status:** implemented (NT-0…NT-6)  
+**Status:** implemented (NT-0…NT-7)  
 **Goal:** Treat homogeneous numeric tuples and arrays as vectors with a
 full element-wise / broadcast arithmetic tower, so that e.g.
 `(1, 1) + (1, 1) == (2, 2)` and `[1, 2] + 3 == [4, 5]`, including
-generic/`T: Num` call sites where that is sound.
+generic/`T: Num` call sites where that is sound. Named linear-algebra
+helpers (`dot` / `matmul` / `cross`) cover reductions and matrix
+products without overloading `*` / `**`.
 
 **Decisions locked (2026-07-25):**
 
@@ -52,8 +54,10 @@ rules, trait/`Num` integration, codegen, docs, and tests.
    expand the scalar; two aggregates of different length never broadcast
    to each other in v1.
 5. **`*` and `**` are element-wise**, not dot product / matrix power.
-   Dot / cross / matrix are named helpers later (stretch), not operator
-   overloads.
+   Linear-algebra ops use **named helpers** (`dot`, `matmul`, `cross`)
+   — not operator overloads on tuples/arrays. A future `Matrix` type
+   may overload `*` for matmul (see §13); do **not** reuse `**` for
+   dot or matmul.
 6. **Zip length is a compile-time property.** Only equal static lengths
    (tuple arity or `[T; N]`) may zip. Dynamic `[T] ⊕ [T]` is a hard
    error — promote to `[T; N]` (literals already carry static length)
@@ -148,9 +152,12 @@ Reuse / extend `homogeneous_types` (already used for `for-in`).
 Optional later: per-position zip if every position independently
 supports `⊕` — **not** in v1 (complicates codegen and traits).
 
-### 2.5 Explicit non-goals (v1)
+### 2.5 Explicit non-goals (v1 tower / operators)
 
-- Dot product via `*`, matrix multiply / matrix `**`, BLAS-style APIs
+- Dot product / matmul / cross via `*` or `**` on tuples/arrays
+  (those are **named helpers** — §13 — not operator overloads)
+- A `Matrix` builtin type and `Matrix: Mul` / `Matrix: Num` (deferred;
+  see §13 future work)
 - Mixing `int` and `float` inside one vector (no promotion)
 - User `impl Add for (int, int)` coherence vs compiler lifting
   (compiler owns aggregate arithmetic; user instances for
@@ -558,6 +565,65 @@ No parser changes expected for v1.
 - [x] NT-4 element-generic
 - [x] NT-5 constraint lifting + monomorphize (after NT-1…3 bake)
 - [x] NT-6 docs / byte / optional perf polish
+- [x] NT-7 named linear-algebra helpers (`dot` / `matmul` / `cross`) — §13
 
 Each phase: tests + minimal example before moving on; stage only
 related files per commit.
+
+---
+
+## 13. Named linear-algebra helpers + future `Matrix` (locked design)
+
+### 13.1 Practical recommendation (locked 2026-07-25)
+
+Keep the element-wise tower on tuples/arrays unchanged. Linear algebra
+is a **separate surface**:
+
+| Layer | Ops | Mechanism |
+|-------|-----|-----------|
+| Homogeneous `(T,…)` / `[T; N]` | `+ - * / % **`, unary `-` | Element-wise zip / broadcast (NT-0…6) |
+| Same aggregates | `dot`, `matmul`, `cross` | **Named prelude helpers** (NT-7) |
+| Future `Matrix` type | `*` → matmul; `+` → element-wise | Explicit type gate; **`Mul` (not `Num`)**; **never `**` for dot** |
+
+**Do not:**
+
+- Overload `*` / `**` on tuples/arrays for matmul / dot (ambiguity with
+  Hadamard / element-wise pow).
+- Pack matmul into `Matrix: Num` — `Num` is the scalar / zip-lifted
+  tower; matrices under matmul are a different algebra (non-commutative
+  `*`, no general `/`). Prefer `Mul` (+ optional `Add`) on `Matrix`.
+- Use `**` for dot product — `Pow` means exponentiation.
+
+**Do:**
+
+- Ship `dot` / `matmul` / `cross` as auto-imported `prelude::math`
+  builtins (same Call / `PreludeFn` pattern as `assert`).
+- Later add `Matrix` if a dedicated type + `impl Mul` is needed; existing
+  zip + named helpers stay.
+
+### 13.2 NT-7 — Named helpers (this phase)
+
+Auto-imported free functions:
+
+| Helper | Inputs | Result | Notes |
+|--------|--------|--------|-------|
+| `dot(a, b)` | Equal-length homogeneous numeric vectors (tuple↔tuple or `[T; N]`↔`[T; N]`) | scalar `T` | Compile-time length; reject dynamic zip / shape mix |
+| `cross(a, b)` | Length-3 vectors (tuple or `[T; 3]`) | same shape as left | 3D only |
+| `matmul(A, B)` | Nested static matrices: `[[T; K]; M]` × `[[T; N]; K]` → `[[T; N]; M]` (row-major, outer = rows) | nested array | Also accept equal-arity homogeneous **tuple-of-tuples** rows |
+
+Codegen: unroll with existing `Index` / `MUL`/`MULF` / `ADD`/`ADDF` /
+`MakeTuple` / `MakeArray` (no new opcodes / no `ARCHIVE_VERSION` bump).
+
+Diagnostics: length / shape / non-numeric / dynamic-length messages
+mirroring the tower style.
+
+Examples: `examples/vec_dot.hy`, `examples/vec_matmul.hy`.
+
+### 13.3 Future — `Matrix` builtin (not in NT-7)
+
+Optional later phase:
+
+1. Introduce `Matrix` (or `Mat<R, C, T>`) distinct from bare nested arrays.
+2. `m * n` on `Matrix` → matmul via `Mul`.
+3. Keep `dot` as a named helper (or method); do **not** bind it to `**`.
+4. Do **not** implement `Matrix: Num` solely to get matmul.

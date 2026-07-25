@@ -178,6 +178,95 @@ pub fn result_ty_for(shape: &ArithShape) -> Ty {
     }
 }
 
+/// Codegen recipe for named linear-algebra helpers (`dot` / `matmul` / `cross`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinearAlgebraKind {
+    /// Equal-length vectors → scalar.
+    Dot {
+        length: usize,
+        left_is_tuple: bool,
+        elem_is_float: bool,
+    },
+    /// Length-3 vectors → length-3 vector (same container kind as left).
+    Cross {
+        left_is_tuple: bool,
+        elem_is_float: bool,
+    },
+    /// Nested static matrices (row-major): `(m×k) × (k×n) → (m×n)`.
+    MatMul {
+        m: usize,
+        k: usize,
+        n: usize,
+        /// Outer container is a tuple-of-rows (vs array-of-rows).
+        outer_is_tuple: bool,
+        /// Each row is a tuple (vs array).
+        row_is_tuple: bool,
+        elem_is_float: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinearAlgebraInfo {
+    pub kind: LinearAlgebraKind,
+}
+
+/// Classify a homogeneous numeric vector for `dot` / `cross`.
+pub fn classify_vector(ty: &Ty) -> Option<(Ty /*elem*/, usize /*len*/, bool /*is_tuple*/)> {
+    match ty {
+        Ty::Tuple(elems) if !elems.is_empty() => {
+            let elem = homogeneous_aggregate_elem(ty)?;
+            Some((elem, elems.len(), true))
+        }
+        Ty::Array {
+            element,
+            length: ArrayLength::Static(n),
+        } if *n > 0 => Some((element.as_ref().clone(), *n, false)),
+        _ => None,
+    }
+}
+
+/// Classify a nested static matrix (rows × cols) for `matmul`.
+///
+/// Accepts `[[T; N]; M]` or a homogeneous tuple of equal-arity row tuples/arrays.
+pub fn classify_matrix(
+    ty: &Ty,
+) -> Option<(Ty /*elem*/, usize /*m*/, usize /*n*/, bool /*outer_tuple*/, bool /*row_tuple*/)> {
+    match ty {
+        Ty::Array {
+            element,
+            length: ArrayLength::Static(m),
+        } if *m > 0 => match element.as_ref() {
+            Ty::Array {
+                element: cell,
+                length: ArrayLength::Static(n),
+            } if *n > 0 => Some((cell.as_ref().clone(), *m, *n, false, false)),
+            Ty::Tuple(row) if !row.is_empty() => {
+                let elem = homogeneous_aggregate_elem(element)?;
+                Some((elem, *m, row.len(), false, true))
+            }
+            _ => None,
+        },
+        Ty::Tuple(rows) if !rows.is_empty() => {
+            let first = &rows[0];
+            if !rows.iter().all(|r| r == first) {
+                return None;
+            }
+            match first {
+                Ty::Array {
+                    element,
+                    length: ArrayLength::Static(n),
+                } if *n > 0 => Some((element.as_ref().clone(), rows.len(), *n, true, false)),
+                Ty::Tuple(cols) if !cols.is_empty() => {
+                    let elem = homogeneous_aggregate_elem(first)?;
+                    Some((elem, rows.len(), cols.len(), true, true))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

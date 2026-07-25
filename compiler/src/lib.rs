@@ -5279,6 +5279,182 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([1, 1])); // Err tag=1 arity=1
     }
 
+    /// Emit `dot` / `matmul` / `cross` from the linear-algebra side table.
+    fn emit_linear_algebra(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
+        args: &[Output],
+    ) {
+        use crate::typechecking::LinearAlgebraKind;
+
+        if args.len() != 2 {
+            return;
+        }
+        let Some(info) = self_id
+            .and_then(|id| self.checker.linear_algebra_at(id))
+            .or_else(|| self.checker.linear_algebra_for_span(span_start, span_end))
+            .cloned()
+        else {
+            return;
+        };
+
+        let t0 = self.alloc_temp_slot();
+        let t1 = self.alloc_temp_slot();
+        bytecode.append(&mut self.do_compile(&args[0]));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+        bytecode.append(&mut self.do_compile(&args[1]));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+
+        match info.kind {
+            LinearAlgebraKind::Dot {
+                length,
+                elem_is_float,
+                ..
+            } => {
+                let mul = if elem_is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                };
+                let add = if elem_is_float {
+                    Instruction::ADDF
+                } else {
+                    Instruction::ADD
+                };
+                for i in 0..length {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push(Byte::new(mul));
+                    if i > 0 {
+                        bytecode.push(Byte::new(add));
+                    }
+                }
+            }
+            LinearAlgebraKind::Cross {
+                left_is_tuple,
+                elem_is_float,
+            } => {
+                let mul = if elem_is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                };
+                let sub = if elem_is_float {
+                    Instruction::SUBF
+                } else {
+                    Instruction::SUB
+                };
+                // Load components into temps for clarity.
+                let ax = self.alloc_temp_slot();
+                let ay = self.alloc_temp_slot();
+                let az = self.alloc_temp_slot();
+                let bx = self.alloc_temp_slot();
+                let by = self.alloc_temp_slot();
+                let bz = self.alloc_temp_slot();
+                for (slot, src, i) in [
+                    (ax, t0, 0),
+                    (ay, t0, 1),
+                    (az, t0, 2),
+                    (bx, t1, 0),
+                    (by, t1, 1),
+                    (bz, t1, 2),
+                ] {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i));
+                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                }
+                // i = ay*bz - az*by
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ay));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bz));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(az));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(by));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(sub));
+                // j = az*bx - ax*bz
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(az));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bx));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ax));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bz));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(sub));
+                // k = ax*by - ay*bx
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ax));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(by));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ay));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bx));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(sub));
+                if left_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(3));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(3));
+                }
+            }
+            LinearAlgebraKind::MatMul {
+                m,
+                k,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                let mul = if elem_is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                };
+                let add = if elem_is_float {
+                    Instruction::ADDF
+                } else {
+                    Instruction::ADD
+                };
+                for i in 0..m {
+                    for j in 0..n {
+                        for t in 0..k {
+                            // A[i][t]
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(t as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            // B[t][j]
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(t as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push(Byte::new(mul));
+                            if t > 0 {
+                                bytecode.push(Byte::new(add));
+                            }
+                        }
+                    }
+                    if row_is_tuple {
+                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                    } else {
+                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                    }
+                }
+                if outer_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                }
+            }
+        }
+    }
+
     /// Desugar `assert(cond[, msg])` to Ok(()) / Err(msg) via MakeEnum.
     ///
     /// Emits into `self.bytecode` so nested absolute jumps stay valid.
@@ -6393,6 +6569,17 @@ impl Compiler {
                     match kind {
                         crate::typechecking::PreludeFn::Assert => {
                             self.emit_assert(arg_slice);
+                        }
+                        crate::typechecking::PreludeFn::Dot
+                        | crate::typechecking::PreludeFn::MatMul
+                        | crate::typechecking::PreludeFn::Cross => {
+                            self.emit_linear_algebra(
+                                &mut bytecode,
+                                self_id,
+                                span.start,
+                                span.end,
+                                arg_slice,
+                            );
                         }
                     }
                     return bytecode;

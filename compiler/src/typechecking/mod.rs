@@ -15,7 +15,10 @@ pub mod ty;
 pub mod unify;
 pub mod virtual_modules;
 
-pub use aggregate_arith::{AggregateArithInfo, AggregateArithKind, AggregateOp, ScalarSide};
+pub use aggregate_arith::{
+    AggregateArithInfo, AggregateArithKind, AggregateOp, LinearAlgebraKind,
+    ScalarSide,
+};
 pub use infer::{CStructDef, CallbackSigDef, Checker, ForInInfo, ForInKind};
 #[allow(unused_imports)] // public API for kind-aware callers / tests
 pub use kind::Kind;

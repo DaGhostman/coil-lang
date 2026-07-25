@@ -255,6 +255,10 @@ pub struct Checker {
     aggregate_arith: HashMap<NodeId, super::aggregate_arith::AggregateArithInfo>,
     aggregate_arith_by_span: HashMap<(usize, usize), super::aggregate_arith::AggregateArithInfo>,
 
+    /// Named linear-algebra helpers (`dot` / `matmul` / `cross`).
+    linear_algebra: HashMap<NodeId, super::aggregate_arith::LinearAlgebraInfo>,
+    linear_algebra_by_span: HashMap<(usize, usize), super::aggregate_arith::LinearAlgebraInfo>,
+
     /// `%v` arguments resolved through an active `Show` constraint.
     bound_display_calls: HashMap<NodeId, BoundDisplayCall>,
     bound_display_calls_by_span: HashMap<(usize, usize), BoundDisplayCall>,
@@ -561,6 +565,8 @@ impl Checker {
             bound_operator_calls_by_span: HashMap::new(),
             aggregate_arith: HashMap::new(),
             aggregate_arith_by_span: HashMap::new(),
+            linear_algebra: HashMap::new(),
+            linear_algebra_by_span: HashMap::new(),
             bound_display_calls: HashMap::new(),
             bound_display_calls_by_span: HashMap::new(),
             existential_packs_by_span: HashMap::new(),
@@ -998,6 +1004,8 @@ impl Checker {
         self.bound_operator_calls_by_span.clear();
         self.aggregate_arith.clear();
         self.aggregate_arith_by_span.clear();
+        self.linear_algebra.clear();
+        self.linear_algebra_by_span.clear();
         self.bound_display_calls.clear();
         self.bound_display_calls_by_span.clear();
         self.existential_packs_by_span.clear();
@@ -2569,6 +2577,9 @@ impl Checker {
                     let arg_slice = args.as_deref().unwrap_or(&[]);
                     return match kind {
                         PreludeFn::Assert => self.infer_assert(arg_slice, range),
+                        PreludeFn::Dot => self.infer_dot(arg_slice, id, range),
+                        PreludeFn::MatMul => self.infer_matmul(arg_slice, id, range),
+                        PreludeFn::Cross => self.infer_cross(arg_slice, id, range),
                     };
                 }
                 // `dload` / `declare` / `invoke` after `use ffi::*`.
@@ -5482,6 +5493,34 @@ impl Checker {
         self.aggregate_arith_by_span.get(&(start, end))
     }
 
+    pub fn linear_algebra_at(
+        &self,
+        id: NodeId,
+    ) -> Option<&super::aggregate_arith::LinearAlgebraInfo> {
+        self.linear_algebra.get(&id)
+    }
+
+    pub fn linear_algebra_for_span(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<&super::aggregate_arith::LinearAlgebraInfo> {
+        self.linear_algebra_by_span.get(&(start, end))
+    }
+
+    fn record_linear_algebra(
+        &mut self,
+        id: Option<NodeId>,
+        range: &Range<usize>,
+        info: super::aggregate_arith::LinearAlgebraInfo,
+    ) {
+        if let Some(id) = id {
+            self.linear_algebra.insert(id, info.clone());
+        }
+        self.linear_algebra_by_span
+            .insert((range.start, range.end), info);
+    }
+
     fn compound_op_name(op: parser::ast::AssignOp) -> &'static str {
         use parser::ast::AssignOp;
         match op {
@@ -5807,6 +5846,301 @@ impl Checker {
             );
         }
         result_app_ty(unit_ty(), string())
+    }
+
+    /// `dot(a, b)` — equal-length homogeneous numeric vectors → scalar.
+    fn infer_dot(
+        &mut self,
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        use super::aggregate_arith::{
+            classify_vector, elem_is_float, is_numeric_elem, LinearAlgebraInfo, LinearAlgebraKind,
+        };
+
+        if args.len() != 2 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("dot expects 2 arguments, got {}", args.len()),
+                range,
+                Some("use `dot(a, b)` with equal-length numeric vectors".to_string()),
+            );
+        }
+
+        let lt = self.infer(&args[0]);
+        let rt = self.infer(&args[1]);
+        let lp = apply_ty_prune(&self.subst, &lt);
+        let rp = apply_ty_prune(&self.subst, &rt);
+
+        let Some((le, ln, left_is_tuple)) = classify_vector(&lp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("dot expects a homogeneous numeric vector, found `{}`", lp),
+                args[0].0.into_range(),
+                Some("use a tuple `(T,…,T)` or fixed-length `[T; N]`".to_string()),
+            );
+        };
+        let Some((re, rn, right_is_tuple)) = classify_vector(&rp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("dot expects a homogeneous numeric vector, found `{}`", rp),
+                args[1].0.into_range(),
+                Some("use a tuple `(T,…,T)` or fixed-length `[T; N]`".to_string()),
+            );
+        };
+        if left_is_tuple != right_is_tuple {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "cannot mix tuple and array operands in `dot`".to_string(),
+                range,
+                Some("both arguments must be tuples or both must be fixed-length arrays".to_string()),
+            );
+        }
+        if ln != rn {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("cannot take `dot` of vectors of length {} and {}", ln, rn),
+                range,
+                Some("vector lengths must be equal and known at compile time".to_string()),
+            );
+        }
+        let _ = self.unify(&le, &re, &range, "element types of `dot`");
+        let elem = apply_ty_prune(&self.subst, &le);
+        if !is_numeric_elem(&elem) {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("element type `{}` does not support `dot`", elem),
+                range,
+                Some("dot requires numeric elements (`int` or `float`)".to_string()),
+            );
+        }
+
+        self.record_linear_algebra(
+            id,
+            &range,
+            LinearAlgebraInfo {
+                kind: LinearAlgebraKind::Dot {
+                    length: ln,
+                    left_is_tuple,
+                    elem_is_float: elem_is_float(&elem),
+                },
+            },
+        );
+        elem
+    }
+
+    /// `cross(a, b)` — length-3 vectors → length-3 vector.
+    fn infer_cross(
+        &mut self,
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        use super::aggregate_arith::{
+            classify_vector, elem_is_float, is_numeric_elem, LinearAlgebraInfo, LinearAlgebraKind,
+        };
+
+        if args.len() != 2 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("cross expects 2 arguments, got {}", args.len()),
+                range,
+                Some("use `cross(a, b)` with length-3 numeric vectors".to_string()),
+            );
+        }
+
+        let lt = self.infer(&args[0]);
+        let rt = self.infer(&args[1]);
+        let lp = apply_ty_prune(&self.subst, &lt);
+        let rp = apply_ty_prune(&self.subst, &rt);
+
+        let Some((le, ln, left_is_tuple)) = classify_vector(&lp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("cross expects a length-3 numeric vector, found `{}`", lp),
+                args[0].0.into_range(),
+                None,
+            );
+        };
+        let Some((re, rn, right_is_tuple)) = classify_vector(&rp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("cross expects a length-3 numeric vector, found `{}`", rp),
+                args[1].0.into_range(),
+                None,
+            );
+        };
+        if ln != 3 || rn != 3 {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "`cross` requires length-3 vectors, found lengths {} and {}",
+                    ln, rn
+                ),
+                range,
+                None,
+            );
+        }
+        if left_is_tuple != right_is_tuple {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "cannot mix tuple and array operands in `cross`".to_string(),
+                range,
+                None,
+            );
+        }
+        let _ = self.unify(&le, &re, &range, "element types of `cross`");
+        let elem = apply_ty_prune(&self.subst, &le);
+        if !is_numeric_elem(&elem) {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("element type `{}` does not support `cross`", elem),
+                range,
+                None,
+            );
+        }
+
+        self.record_linear_algebra(
+            id,
+            &range,
+            LinearAlgebraInfo {
+                kind: LinearAlgebraKind::Cross {
+                    left_is_tuple,
+                    elem_is_float: elem_is_float(&elem),
+                },
+            },
+        );
+        if left_is_tuple {
+            Ty::Tuple(vec![elem.clone(), elem.clone(), elem])
+        } else {
+            Ty::Array {
+                element: Box::new(elem),
+                length: ArrayLength::Static(3),
+            }
+        }
+    }
+
+    /// `matmul(A, B)` — nested static matrices `(m×k) × (k×n) → (m×n)`.
+    fn infer_matmul(
+        &mut self,
+        args: &[Output],
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        use super::aggregate_arith::{
+            classify_matrix, elem_is_float, is_numeric_elem, LinearAlgebraInfo, LinearAlgebraKind,
+        };
+
+        if args.len() != 2 {
+            for arg in args {
+                let _ = self.infer(arg);
+            }
+            return self.error_with_help(
+                ErrorCode::ConstructorArity,
+                format!("matmul expects 2 arguments, got {}", args.len()),
+                range,
+                Some(
+                    "use `matmul(A, B)` with nested fixed-length matrices (`[[T; K]; M]` × `[[T; N]; K]`)"
+                        .to_string(),
+                ),
+            );
+        }
+
+        let lt = self.infer(&args[0]);
+        let rt = self.infer(&args[1]);
+        let lp = apply_ty_prune(&self.subst, &lt);
+        let rp = apply_ty_prune(&self.subst, &rt);
+
+        let Some((le, m, k1, outer_is_tuple, row_is_tuple)) = classify_matrix(&lp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "matmul expects a nested fixed-length matrix, found `{}`",
+                    lp
+                ),
+                args[0].0.into_range(),
+                Some("use `[[T; K]; M]` (or a tuple of equal-length row tuples/arrays)".to_string()),
+            );
+        };
+        let Some((re, k2, n, right_outer_tuple, right_row_tuple)) = classify_matrix(&rp) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "matmul expects a nested fixed-length matrix, found `{}`",
+                    rp
+                ),
+                args[1].0.into_range(),
+                Some("use `[[T; N]; K]` (or a tuple of equal-length row tuples/arrays)".to_string()),
+            );
+        };
+        if outer_is_tuple != right_outer_tuple || row_is_tuple != right_row_tuple {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "matmul operands must use the same matrix container shape".to_string(),
+                range,
+                Some("both matrices must be array-of-arrays or both tuple-of-rows".to_string()),
+            );
+        }
+        if k1 != k2 {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "matmul inner dimensions mismatch: {}×{} and {}×{}",
+                    m, k1, k2, n
+                ),
+                range,
+                Some("left columns must equal right rows".to_string()),
+            );
+        }
+        let _ = self.unify(&le, &re, &range, "element types of `matmul`");
+        let elem = apply_ty_prune(&self.subst, &le);
+        if !is_numeric_elem(&elem) {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("element type `{}` does not support `matmul`", elem),
+                range,
+                None,
+            );
+        }
+
+        self.record_linear_algebra(
+            id,
+            &range,
+            LinearAlgebraInfo {
+                kind: LinearAlgebraKind::MatMul {
+                    m,
+                    k: k1,
+                    n,
+                    outer_is_tuple,
+                    row_is_tuple,
+                    elem_is_float: elem_is_float(&elem),
+                },
+            },
+        );
+
+        let row_ty = if row_is_tuple {
+            Ty::Tuple(vec![elem.clone(); n])
+        } else {
+            Ty::Array {
+                element: Box::new(elem.clone()),
+                length: ArrayLength::Static(n),
+            }
+        };
+        if outer_is_tuple {
+            Ty::Tuple(vec![row_ty; m])
+        } else {
+            Ty::Array {
+                element: Box::new(row_ty),
+                length: ArrayLength::Static(m),
+            }
+        }
     }
 
     /// Thread a curried function type through a list of argument types,

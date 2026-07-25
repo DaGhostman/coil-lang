@@ -20,10 +20,11 @@ coil does **not** yet ship a general-purpose stdlib (no `map`, `filter`, file I/
 | `prelude::{Option,Result}` | Virtual module | Auto-imported sum types |
 | `prelude::ops::{Add,Eq,Into,…}` | Virtual module | Auto-imported operator / conversion traits |
 | `prelude::test::assert` | Virtual module | Auto-imported; `assert(cond[, msg]) → Result<(), string>` |
+| `prelude::math::{dot,matmul,cross}` | Virtual module | Auto-imported linear-algebra helpers on vectors/matrices |
 | `panic` | Keyword | Abort with a string message (exit code 1) |
 | Host natives | Embedder API | Rust closures from `Pipeline::register_host_native` |
 
-Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*;`. FFI and **`io`** are **not** auto-imported — write `use ffi::*;` / `use io::*;` before using those APIs.
+Compiler builtins live in **virtual modules** (not `.hy` files). Every file gets an implicit `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`. FFI and **`io`** are **not** auto-imported — write `use ffi::*;` / `use io::*;` before using those APIs.
 
 ---
 
@@ -121,6 +122,33 @@ a[] = 3;
 print "%i", len(a); // 3
 print "%i", a[2];  // 3
 ```
+
+---
+
+## Linear algebra (`dot` / `matmul` / `cross`)
+
+Auto-imported from virtual `prelude::math` (implicit `use prelude::math::*;`).
+These are **named helpers** — they do **not** overload `*` / `**` on
+tuples or arrays (those stay element-wise; see [Operators](operators.md)).
+
+| Helper | Arguments | Result |
+|--------|-----------|--------|
+| `dot(a, b)` | Equal-length homogeneous numeric vectors (tuple↔tuple or `[T; N]`↔`[T; N]`) | scalar `T` |
+| `cross(a, b)` | Length-3 vectors (same container kind) | length-3 vector |
+| `matmul(A, B)` | Nested fixed-length matrices: `[[T; K]; M]` × `[[T; N]; K]` | `[[T; N]; M]` (row-major) |
+
+Lengths / inner dimensions must be known and compatible at compile time.
+Dynamic `[T]` vectors cannot be dotted. Mixing tuple and array operands
+is rejected. A future `Matrix` type may overload `*` for matmul; prefer
+`dot` / `matmul` / `cross` until then.
+
+```coil
+dot((1, 2, 3), (4, 5, 6));           // 32
+cross((1, 0, 0), (0, 1, 0));         // (0, 0, 1)
+matmul([[1, 2], [3, 4]], [[5, 6], [7, 8]]);  // [[19, 22], [43, 50]]
+```
+
+See `examples/vec_dot.hy` and `examples/vec_matmul.hy`.
 
 ---
 
