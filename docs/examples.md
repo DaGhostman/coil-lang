@@ -778,6 +778,40 @@ fn main() {
 
 ---
 
+### `examples/vec_tuple.hy`
+
+**Demonstrates:** Element-wise tuple zip, scalar broadcast, and unary negate.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_tuple.hy` |
+| **Output** | `22,23,24,-1-2` |
+
+---
+
+### `examples/vec_array.hy`
+
+**Demonstrates:** Static array zip, scalar broadcast, and element-wise `**`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_array.hy` |
+| **Output** | `46,45,18` |
+
+---
+
+### `examples/vec_generic.hy`
+
+**Demonstrates:** Tier B `scale<T: Num>((T,T), T)` and Tier C shape-generic
+`add<T: Num>(T, T)` monomorphized over `(int, int)`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_generic.hy` |
+| **Output** | `24,55` |
+
+---
+
 ### `examples/generic_alias.hy`
 
 **Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
@@ -1531,6 +1565,9 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
 | `aliases.hy` | Types | `347` |
+| `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |
+| `vec_array.hy` | Aggregates | `46,45,18` |
+| `vec_generic.hy` | Aggregates | `24,55` |
 | `generic_alias.hy` | Types | `7` |
 | `generic_enum.hy` | Enums / types | `7` |
 | `generics.hy` | Types | `7424.0427` |

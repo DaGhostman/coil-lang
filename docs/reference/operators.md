@@ -59,6 +59,32 @@ Forms **not** in the Pratt table but still tight-binding:
 
 Mixed `int` and `float` operands → **type error** at compile time.
 
+### Aggregate (vector) arithmetic
+
+Homogeneous numeric tuples and arrays support the same operators
+**element-wise**, plus scalar broadcast:
+
+| Left | Right | Result |
+|------|-------|--------|
+| `(T,…,T)` | `(T,…,T)` (same arity) | zip |
+| `[T; N]` | `[T; N]` | zip |
+| `[T]` | `[T]` / `[T; N]` | **hard error** (length not known at compile time) |
+| aggregate | scalar `T` (or reverse) | broadcast |
+
+`T` must be numeric (`int` / `float`, or a `Num`-bounded type parameter).
+`*` and `**` are element-wise (not dot product / matrix power). Unary `-`
+negates each element. Compound assign (`+=`, `**=`, …) follows the same
+rules with the LHS shape fixed.
+
+```coil
+(1, 1) + (1, 1);   // (2, 2)
+[1, 2] + 3;        // [4, 5]
+-(1, 2);           // (-1, -2)
+```
+
+See `examples/vec_tuple.hy`, `examples/vec_array.hy`, and
+`examples/vec_generic.hy`.
+
 String concatenation uses `+`:
 
 ```coil

@@ -53,6 +53,21 @@ print "%i", t[5];   // compile error: tuple index 5 out of bounds for tuple of l
 
 Variable indices (for example `t[i]`) are not checked at compile time.
 
+### Element-wise arithmetic on numeric tuples
+
+Homogeneous tuples of `int` or `float` (or a `Num`-bounded type
+parameter) support element-wise `+ - * / % **` and unary `-`, plus
+scalar broadcast:
+
+```coil
+(1, 1) + (1, 1);   // (2, 2)
+(1, 2) + 1;        // (2, 3)
+-(1, 2);           // (-1, -2)
+```
+
+Heterogeneous tuples and mismatched arities are compile errors.
+See [Operators — Aggregate arithmetic](../reference/operators.md).
+
 ---
 
 ## Arrays
@@ -92,6 +107,17 @@ fn head([int] arr) -> int {
 ```
 
 A literal like `[1, 2, 3]` infers the fixed type `[int; 3]`. Function parameters annotated as `[int]` are dynamic — useful when data comes from external sources (SQL rows, JSON arrays) whose length is not known statically.
+
+### Element-wise arithmetic on numeric arrays
+
+Fixed-length `[T; N]` arrays zip element-wise when lengths match.
+Dynamic `[T] ⊕ [T]` is a **hard type error** — promote to `[T; N]`
+(literals already do) or broadcast a scalar:
+
+```coil
+[1, 2] + [3, 4];   // [4, 6]  (literal → [int; 2])
+[1, 2] + 3;        // [4, 5]
+```
 
 ### Array indexing
 

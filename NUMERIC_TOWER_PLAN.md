@@ -1,6 +1,6 @@
 # Numeric Tower — Implementation Plan
 
-**Status:** planning only (no code in this change set)  
+**Status:** implemented (NT-0…NT-6)  
 **Goal:** Treat homogeneous numeric tuples and arrays as vectors with a
 full element-wise / broadcast arithmetic tower, so that e.g.
 `(1, 1) + (1, 1) == (2, 2)` and `[1, 2] + 3 == [4, 5]`, including

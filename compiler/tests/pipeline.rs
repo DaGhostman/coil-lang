@@ -2787,3 +2787,35 @@ fn main() {
     );
     assert_eq!(output, "-1,8");
 }
+
+#[test]
+fn example_vec_tuple_prints_zip_broadcast_negate() {
+    let output = run_example("examples/vec_tuple.hy");
+    assert_eq!(output, "22,23,24,-1-2");
+}
+
+#[test]
+fn example_vec_array_prints_zip_broadcast_pow() {
+    let output = run_example("examples/vec_array.hy");
+    assert_eq!(output, "46,45,18");
+}
+
+#[test]
+fn example_vec_generic_prints_scale_and_shape_generic_add() {
+    let output = run_example("examples/vec_generic.hy");
+    assert_eq!(output, "24,55");
+}
+
+#[test]
+fn aggregate_compound_assign_updates_tuple() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let v = (1, 2);
+    v += (3, 4);
+    print "%i%i", v[0], v[1];
+}
+"#,
+    );
+    assert_eq!(output, "46");
+}

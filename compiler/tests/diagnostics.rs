@@ -1780,3 +1780,70 @@ fn array_element_type_mismatch_errors() {
     );
 }
 
+#[test]
+fn dynamic_array_zip_is_hard_error() {
+    let (_ty, msgs) = check(
+        r#"
+fn zip([int] a, [int] b) -> [int] {
+    return a + b;
+}
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot zip dynamic-length arrays")),
+        "expected dynamic zip diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn tuple_arity_mismatch_zip_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = (1, 2) + (1, 2, 3);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot zip tuples of length")),
+        "expected tuple length mismatch diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn heterogeneous_tuple_arith_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = (1, "x") + (2, "y");
+}
+"#,
+    );
+    assert!(
+        !msgs.is_empty(),
+        "expected diagnostic for heterogeneous tuple arith, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn static_array_length_mismatch_zip_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a: [int; 2] = [1, 2];
+    let b: [int; 3] = [1, 2, 3];
+    let _ = a + b;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot zip arrays of length")),
+        "expected static array length mismatch, got: {:?}",
+        msgs
+    );
+}
+

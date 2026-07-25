@@ -251,6 +251,10 @@ pub struct Checker {
     bound_operator_calls: HashMap<NodeId, BoundOperatorCall>,
     bound_operator_calls_by_span: HashMap<(usize, usize), BoundOperatorCall>,
 
+    /// Aggregate (tuple/array) element-wise / broadcast arithmetic.
+    aggregate_arith: HashMap<NodeId, super::aggregate_arith::AggregateArithInfo>,
+    aggregate_arith_by_span: HashMap<(usize, usize), super::aggregate_arith::AggregateArithInfo>,
+
     /// `%v` arguments resolved through an active `Show` constraint.
     bound_display_calls: HashMap<NodeId, BoundDisplayCall>,
     bound_display_calls_by_span: HashMap<(usize, usize), BoundDisplayCall>,
@@ -555,6 +559,8 @@ impl Checker {
             bound_method_calls_by_span: HashMap::new(),
             bound_operator_calls: HashMap::new(),
             bound_operator_calls_by_span: HashMap::new(),
+            aggregate_arith: HashMap::new(),
+            aggregate_arith_by_span: HashMap::new(),
             bound_display_calls: HashMap::new(),
             bound_display_calls_by_span: HashMap::new(),
             existential_packs_by_span: HashMap::new(),
@@ -990,6 +996,8 @@ impl Checker {
         self.bound_method_calls_by_span.clear();
         self.bound_operator_calls.clear();
         self.bound_operator_calls_by_span.clear();
+        self.aggregate_arith.clear();
+        self.aggregate_arith_by_span.clear();
         self.bound_display_calls.clear();
         self.bound_display_calls_by_span.clear();
         self.existential_packs_by_span.clear();
@@ -2022,12 +2030,28 @@ impl Checker {
                     let _ = unify_with(&self.subst, &target_ty, &int());
                     let _ = unify_with(&self.subst, &val_ty, &int());
                 } else {
-                    self.unify(
-                        &target_ty,
-                        &val_ty,
-                        &range,
-                        &format!("operands of `{}=`", op_name),
-                    );
+                    let tp = apply_ty_prune(&self.subst, &target_ty);
+                    let vp = apply_ty_prune(&self.subst, &val_ty);
+                    if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
+                        || matches!(&vp, Ty::Tuple(_) | Ty::Array { .. })
+                    {
+                        // Resolve as aggregate arith; result must match LHS shape.
+                        let result =
+                            self.infer_aggregate_arith(tp.clone(), vp, id, range.clone(), op_name);
+                        let _ = self.unify(
+                            &target_ty,
+                            &result,
+                            &range,
+                            &format!("operands of `{}=`", op_name),
+                        );
+                    } else {
+                        self.unify(
+                            &target_ty,
+                            &val_ty,
+                            &range,
+                            &format!("operands of `{}=`", op_name),
+                        );
+                    }
                 }
                 apply_ty_prune(&self.subst, &target_ty)
             }
@@ -2098,7 +2122,16 @@ impl Checker {
             Expression::Geq(lhs, rhs) => self.infer_comparison(lhs, rhs, id, range, "Ge", "ge"),
 
             // ---- Prefix / postfix ----
-            Expression::Negate(e) | Expression::Positive(e) => self.infer(e),
+            Expression::Negate(e) => {
+                let inner = self.infer(e);
+                let pruned = apply_ty_prune(&self.subst, &inner);
+                if matches!(&pruned, Ty::Tuple(_) | Ty::Array { .. }) {
+                    self.infer_aggregate_neg(pruned, id, range)
+                } else {
+                    pruned
+                }
+            }
+            Expression::Positive(e) => self.infer(e),
             Expression::Not(e) => {
                 let t = self.infer(e);
                 self.unify(&t, &int(), &e.0.into_range(), "operand of `~`");
@@ -5024,6 +5057,15 @@ impl Checker {
                 return self.unify(&lt, &rt, &range, "operands of `+`");
             }
         }
+
+        let lp = apply_ty_prune(&self.subst, &lt);
+        let rp = apply_ty_prune(&self.subst, &rt);
+        if matches!(&lp, Ty::Tuple(_) | Ty::Array { .. })
+            || matches!(&rp, Ty::Tuple(_) | Ty::Array { .. })
+        {
+            return self.infer_aggregate_arith(lp, rp, id, range, op);
+        }
+
         let result = self.unify(&lt, &rt, &range, &format!("operands of `{}`", op));
         // Open type variables need the matching op trait (`Add` for `+`, …).
         // `T: Num` also covers these via superclass implication.
@@ -5075,6 +5117,366 @@ impl Checker {
             }
         }
         result
+    }
+
+    /// Element-wise / broadcast arithmetic on homogeneous tuples and arrays.
+    fn infer_aggregate_arith(
+        &mut self,
+        lp: Ty,
+        rp: Ty,
+        id: Option<NodeId>,
+        range: Range<usize>,
+        op: &str,
+    ) -> Ty {
+        use super::aggregate_arith::*;
+
+        let Some(agg_op) = AggregateOp::from_str(op) else {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!("operator `{}` is not supported on aggregates", op),
+                range,
+                None,
+            );
+        };
+
+        // Homogeneity for tuples.
+        if let Ty::Tuple(elems) = &lp
+            && elems.len() > 1
+            && self.homogeneous_types(elems, &range, "tuple").is_none()
+        {
+            return Ty::Var(self.counter.fresh());
+        }
+        if let Ty::Tuple(elems) = &rp
+            && elems.len() > 1
+            && self.homogeneous_types(elems, &range, "tuple").is_none()
+        {
+            return Ty::Var(self.counter.fresh());
+        }
+
+        let left = classify_arith(&apply_ty_prune(&self.subst, &lp));
+        let right = classify_arith(&apply_ty_prune(&self.subst, &rp));
+
+        // Resolve shapes.
+        let resolved: Result<(ArithShape, ZipMode), String> = match (&left, &right) {
+            (ArithShape::Tuple { elem: e1, arity: n1 }, ArithShape::Tuple { elem: e2, arity: n2 }) => {
+                if n1 != n2 {
+                    Err(format!(
+                        "cannot zip tuples of length {} and {} with `{}`",
+                        n1, n2, op
+                    ))
+                } else {
+                    let _ = self.unify(e1, e2, &range, &format!("element types of `{}`", op));
+                    let elem = apply_ty_prune(&self.subst, e1);
+                    Ok((
+                        ArithShape::Tuple {
+                            elem,
+                            arity: *n1,
+                        },
+                        ZipMode::Zip,
+                    ))
+                }
+            }
+            (
+                ArithShape::Array {
+                    elem: e1,
+                    length: ArrayLength::Static(n1),
+                },
+                ArithShape::Array {
+                    elem: e2,
+                    length: ArrayLength::Static(n2),
+                },
+            ) => {
+                if n1 != n2 {
+                    Err(format!(
+                        "cannot zip arrays of length {} and {} with `{}`",
+                        n1, n2, op
+                    ))
+                } else {
+                    let _ = self.unify(e1, e2, &range, &format!("element types of `{}`", op));
+                    let elem = apply_ty_prune(&self.subst, e1);
+                    Ok((
+                        ArithShape::Array {
+                            elem,
+                            length: ArrayLength::Static(*n1),
+                        },
+                        ZipMode::Zip,
+                    ))
+                }
+            }
+            (
+                ArithShape::Array {
+                    length: ArrayLength::Dynamic,
+                    ..
+                },
+                ArithShape::Array { .. },
+            )
+            | (
+                ArithShape::Array { .. },
+                ArithShape::Array {
+                    length: ArrayLength::Dynamic,
+                    ..
+                },
+            ) => Err(format!(
+                "cannot zip dynamic-length arrays with `{}`; use fixed-length `[T; N]` or broadcast a scalar",
+                op
+            )),
+            (ArithShape::Tuple { elem, arity }, ArithShape::Scalar(s)) => {
+                let _ = self.unify(elem, s, &range, &format!("operands of `{}`", op));
+                let elem = apply_ty_prune(&self.subst, elem);
+                Ok((
+                    ArithShape::Tuple {
+                        elem,
+                        arity: *arity,
+                    },
+                    ZipMode::BroadcastRight,
+                ))
+            }
+            (ArithShape::Scalar(s), ArithShape::Tuple { elem, arity }) => {
+                let _ = self.unify(s, elem, &range, &format!("operands of `{}`", op));
+                let elem = apply_ty_prune(&self.subst, elem);
+                Ok((
+                    ArithShape::Tuple {
+                        elem,
+                        arity: *arity,
+                    },
+                    ZipMode::BroadcastLeft,
+                ))
+            }
+            (ArithShape::Array { elem, length }, ArithShape::Scalar(s)) => {
+                let _ = self.unify(elem, s, &range, &format!("operands of `{}`", op));
+                let elem = apply_ty_prune(&self.subst, elem);
+                Ok((
+                    ArithShape::Array {
+                        elem,
+                        length: *length,
+                    },
+                    ZipMode::BroadcastRight,
+                ))
+            }
+            (ArithShape::Scalar(s), ArithShape::Array { elem, length }) => {
+                let _ = self.unify(s, elem, &range, &format!("operands of `{}`", op));
+                let elem = apply_ty_prune(&self.subst, elem);
+                Ok((
+                    ArithShape::Array {
+                        elem,
+                        length: *length,
+                    },
+                    ZipMode::BroadcastLeft,
+                ))
+            }
+            (ArithShape::Tuple { .. }, ArithShape::Array { .. })
+            | (ArithShape::Array { .. }, ArithShape::Tuple { .. }) => Err(format!(
+                "cannot apply `{}` between a tuple and an array",
+                op
+            )),
+            _ => Err(format!("cannot apply `{}` to these operand shapes", op)),
+        };
+
+        let (result_shape, mode) = match resolved {
+            Ok(v) => v,
+            Err(msg) => {
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    msg,
+                    range,
+                    Some(
+                        "element-wise arithmetic requires equal static lengths, or a scalar broadcast"
+                            .to_string(),
+                    ),
+                );
+            }
+        };
+
+        let elem = match &result_shape {
+            ArithShape::Tuple { elem, .. } | ArithShape::Array { elem, .. } => elem.clone(),
+            ArithShape::Scalar(e) => e.clone(),
+        };
+        let elem = apply_ty_prune(&self.subst, &elem);
+        if !is_numeric_elem(&elem) {
+            return self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "element type `{}` does not support `{}`",
+                    elem, op
+                ),
+                range,
+                Some("element-wise arithmetic requires numeric elements (`int`, `float`, or a `Num`-bounded type parameter)".to_string()),
+            );
+        }
+
+        // Open element → bind op trait (Tier B).
+        if let Ty::Var(v) = &elem {
+            let (class, method) = match op {
+                "+" => ("Add", "add"),
+                "-" => ("Sub", "sub"),
+                "*" => ("Mul", "mul"),
+                "/" => ("Div", "div"),
+                _ => ("", ""),
+            };
+            if !class.is_empty() {
+                if self.user_dict_index(*v, class).is_none() {
+                    self.bind_matching_abstract_constraints(Some(*v), class);
+                }
+                if self.user_dict_index(*v, class).is_some() {
+                    self.record_bound_operator(id, &range, *v, class, method);
+                }
+            }
+        }
+
+        let float = elem_is_float(&elem);
+        let kind = match (&result_shape, mode) {
+            (ArithShape::Tuple { arity, .. }, ZipMode::Zip) => AggregateArithKind::ZipTuple {
+                arity: *arity,
+                elem_is_float: float,
+            },
+            (ArithShape::Array { length: ArrayLength::Static(n), .. }, ZipMode::Zip) => {
+                AggregateArithKind::ZipArray {
+                    length: *n,
+                    elem_is_float: float,
+                }
+            }
+            (ArithShape::Tuple { arity, .. }, ZipMode::BroadcastRight) => {
+                AggregateArithKind::BroadcastTuple {
+                    arity: *arity,
+                    scalar_on: ScalarSide::Right,
+                    elem_is_float: float,
+                }
+            }
+            (ArithShape::Tuple { arity, .. }, ZipMode::BroadcastLeft) => {
+                AggregateArithKind::BroadcastTuple {
+                    arity: *arity,
+                    scalar_on: ScalarSide::Left,
+                    elem_is_float: float,
+                }
+            }
+            (ArithShape::Array { length, .. }, ZipMode::BroadcastRight) => {
+                AggregateArithKind::BroadcastArray {
+                    length: match length {
+                        ArrayLength::Static(n) => Some(*n),
+                        ArrayLength::Dynamic => None,
+                    },
+                    scalar_on: ScalarSide::Right,
+                    elem_is_float: float,
+                }
+            }
+            (ArithShape::Array { length, .. }, ZipMode::BroadcastLeft) => {
+                AggregateArithKind::BroadcastArray {
+                    length: match length {
+                        ArrayLength::Static(n) => Some(*n),
+                        ArrayLength::Dynamic => None,
+                    },
+                    scalar_on: ScalarSide::Left,
+                    elem_is_float: float,
+                }
+            }
+            _ => {
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!("internal error resolving aggregate `{}`", op),
+                    range,
+                    None,
+                );
+            }
+        };
+
+        let info = AggregateArithInfo { kind, op: agg_op };
+        if let Some(id) = id {
+            self.aggregate_arith.insert(id, info.clone());
+        }
+        self.aggregate_arith_by_span
+            .insert((range.start, range.end), info);
+
+        result_ty_for(&result_shape)
+    }
+
+    fn infer_aggregate_neg(
+        &mut self,
+        inner: Ty,
+        id: Option<NodeId>,
+        range: Range<usize>,
+    ) -> Ty {
+        use super::aggregate_arith::*;
+
+        let pruned = apply_ty_prune(&self.subst, &inner);
+        if let Ty::Tuple(elems) = &pruned {
+            if elems.is_empty() {
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    "cannot negate an empty tuple".to_string(),
+                    range,
+                    None,
+                );
+            }
+            if elems.len() > 1 && self.homogeneous_types(elems, &range, "tuple").is_none() {
+                return Ty::Var(self.counter.fresh());
+            }
+            let elem = apply_ty_prune(&self.subst, &elems[0]);
+            if !is_numeric_elem(&elem) {
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!("element type `{}` does not support unary `-`", elem),
+                    range,
+                    None,
+                );
+            }
+            let info = AggregateArithInfo {
+                kind: AggregateArithKind::NegTuple {
+                    arity: elems.len(),
+                    elem_is_float: elem_is_float(&elem),
+                },
+                op: AggregateOp::Neg,
+            };
+            if let Some(id) = id {
+                self.aggregate_arith.insert(id, info.clone());
+            }
+            self.aggregate_arith_by_span
+                .insert((range.start, range.end), info);
+            return Ty::Tuple(vec![elem; elems.len()]);
+        }
+        if let Ty::Array { element, length } = &pruned {
+            let elem = apply_ty_prune(&self.subst, element);
+            if !is_numeric_elem(&elem) {
+                return self.error_with_help(
+                    ErrorCode::GenericTypeError,
+                    format!("element type `{}` does not support unary `-`", elem),
+                    range,
+                    None,
+                );
+            }
+            let info = AggregateArithInfo {
+                kind: AggregateArithKind::NegArray {
+                    length: match length {
+                        ArrayLength::Static(n) => Some(*n),
+                        ArrayLength::Dynamic => None,
+                    },
+                    elem_is_float: elem_is_float(&elem),
+                },
+                op: AggregateOp::Neg,
+            };
+            if let Some(id) = id {
+                self.aggregate_arith.insert(id, info.clone());
+            }
+            self.aggregate_arith_by_span
+                .insert((range.start, range.end), info);
+            return Ty::Array {
+                element: Box::new(elem),
+                length: *length,
+            };
+        }
+        // Scalar path — leave to caller.
+        pruned
+    }
+
+    pub fn aggregate_arith_at(&self, id: NodeId) -> Option<&super::aggregate_arith::AggregateArithInfo> {
+        self.aggregate_arith.get(&id)
+    }
+
+    pub fn aggregate_arith_for_span(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<&super::aggregate_arith::AggregateArithInfo> {
+        self.aggregate_arith_by_span.get(&(start, end))
     }
 
     fn compound_op_name(op: parser::ast::AssignOp) -> &'static str {
@@ -6205,6 +6607,12 @@ impl Checker {
                         self.pin_assoc_types_for_instance(&c.class, &instance, None, range);
                     }
                     Ok(None) => {
+                        if self.try_lift_aggregate_constraint(&c.class, &resolved_args, range) {
+                            // Satisfied via element-instance lift (NT-5). Ground
+                            // calls monomorphize to zip lowering; do not record a
+                            // scalar dict for the aggregate head.
+                            continue;
+                        }
                         let pretty = Constraint {
                             class: c.class.clone(),
                             args: resolved_args,
@@ -6255,6 +6663,30 @@ impl Checker {
     }
 
     /// Find exactly one instance of `class` whose args unify with `wanted`
+    /// NT-5: discharge `Add`/`Num`/… for a homogeneous aggregate when the
+    /// element type already has that instance (constraint lifting).
+    fn try_lift_aggregate_constraint(
+        &mut self,
+        class: &str,
+        wanted: &[Ty],
+        range: &Range<usize>,
+    ) -> bool {
+        use super::aggregate_arith::{homogeneous_aggregate_elem, is_liftable_arith_trait};
+        if !is_liftable_arith_trait(class) || wanted.len() != 1 {
+            return false;
+        }
+        let Some(elem) = homogeneous_aggregate_elem(&wanted[0]) else {
+            return false;
+        };
+        // Recurse through nested aggregates: `((int,int),(int,int))` lifts if
+        // `(int,int)` lifts if `int` has the instance.
+        match self.find_unique_instance(class, std::slice::from_ref(&elem), range) {
+            Ok(Some(_)) => true,
+            Ok(None) => self.try_lift_aggregate_constraint(class, std::slice::from_ref(&elem), range),
+            Err(()) => false,
+        }
+    }
+
     /// (open vars in `wanted` may be bound by the match). Ambiguous matches
     /// are diagnosed instead of silently selecting declaration order.
     fn find_unique_instance(

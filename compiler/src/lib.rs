@@ -21,7 +21,7 @@ use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
 use crate::const_fold::ConstValue;
-use crate::monomorphize::{MonoKey, MonoPlan};
+use crate::monomorphize::{MonoKey, MonoPlan, parse_mono_ty_name};
 use parser::{
     SimpleSpan,
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
@@ -1779,6 +1779,9 @@ impl Compiler {
     }
 
     fn mono_ty_from_name(name: &str) -> Ty {
+        if let Some(ty) = parse_mono_ty_name(name) {
+            return ty;
+        }
         match name {
             crate::typechecking::ty::INT => Ty::Con(crate::typechecking::ty::INT.into()),
             crate::typechecking::ty::FLOAT => Ty::Con(crate::typechecking::ty::FLOAT.into()),
@@ -1866,6 +1869,558 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::Index));
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
         true
+    }
+
+    /// Emit element-wise / broadcast aggregate arithmetic when the typechecker
+    /// recorded an [`AggregateArithInfo`] for this node (or we can recover the
+    /// shape from mono/codegen var types).
+    fn try_emit_aggregate_arith(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
+        lhs: &Output,
+        rhs: Option<&Output>,
+        fallback_op: crate::typechecking::AggregateOp,
+    ) -> bool {
+        use crate::typechecking::{AggregateArithKind, AggregateOp, ScalarSide};
+
+        let info = self_id
+            .and_then(|id| self.checker.aggregate_arith_at(id))
+            .or_else(|| self.checker.aggregate_arith_for_span(span_start, span_end))
+            .cloned()
+            .or_else(|| self.recover_aggregate_arith(lhs, rhs, fallback_op));
+        let Some(info) = info else {
+            return false;
+        };
+
+        let scalar_instr = |op: AggregateOp, is_float: bool| -> Instruction {
+            match (op, is_float) {
+                (AggregateOp::Add, false) => Instruction::ADD,
+                (AggregateOp::Add, true) => Instruction::ADDF,
+                (AggregateOp::Sub, false) => Instruction::SUB,
+                (AggregateOp::Sub, true) => Instruction::SUBF,
+                (AggregateOp::Mul, false) => Instruction::MUL,
+                (AggregateOp::Mul, true) => Instruction::MULF,
+                (AggregateOp::Div, false) => Instruction::DIV,
+                (AggregateOp::Div, true) => Instruction::DIVF,
+                (AggregateOp::Mod, false) => Instruction::MOD,
+                (AggregateOp::Mod, true) => Instruction::MODF,
+                (AggregateOp::Pow, false) => Instruction::Pow,
+                (AggregateOp::Pow, true) => Instruction::PowF,
+                (AggregateOp::Neg, false) => Instruction::NEG,
+                (AggregateOp::Neg, true) => Instruction::NEG, // float: same as scalar Negate today
+            }
+        };
+
+        match info.kind {
+            AggregateArithKind::NegTuple {
+                arity,
+                elem_is_float,
+            } => {
+                let t0 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                self.emit_zip_loop(
+                    bytecode,
+                    arity,
+                    |_c, bc, i| {
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(scalar_instr(AggregateOp::Neg, elem_is_float)));
+                    },
+                    true,
+                );
+                true
+            }
+            AggregateArithKind::NegArray {
+                length,
+                elem_is_float,
+            } => {
+                let t0 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                match length {
+                    Some(n) => {
+                        self.emit_zip_loop(
+                            bytecode,
+                            n,
+                            |_c, bc, i| {
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push(Byte::new(Instruction::Index));
+                                bc.push(Byte::new(scalar_instr(AggregateOp::Neg, elem_is_float)));
+                            },
+                            false,
+                        );
+                    }
+                    None => {
+                        // Dynamic: materialise via ArrayLen + counted loop.
+                        self.emit_dynamic_unary_array(bytecode, t0, elem_is_float);
+                    }
+                }
+                true
+            }
+            AggregateArithKind::ZipTuple {
+                arity,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t0 = self.alloc_temp_slot();
+                let t1 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.append(&mut self.do_compile(rhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+                let op = info.op;
+                self.emit_zip_loop(
+                    bytecode,
+                    arity,
+                    |_c, bc, i| {
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                    },
+                    true,
+                );
+                true
+            }
+            AggregateArithKind::ZipArray {
+                length,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t0 = self.alloc_temp_slot();
+                let t1 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.append(&mut self.do_compile(rhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+                let op = info.op;
+                self.emit_zip_loop(
+                    bytecode,
+                    length,
+                    |_c, bc, i| {
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                    },
+                    false,
+                );
+                true
+            }
+            AggregateArithKind::BroadcastTuple {
+                arity,
+                scalar_on,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t_vec = self.alloc_temp_slot();
+                let t_sc = self.alloc_temp_slot();
+                match scalar_on {
+                    ScalarSide::Right => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                    }
+                    ScalarSide::Left => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                    }
+                }
+                let op = info.op;
+                self.emit_zip_loop(
+                    bytecode,
+                    arity,
+                    |_c, bc, i| {
+                        match scalar_on {
+                            ScalarSide::Right => {
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push(Byte::new(Instruction::Index));
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                            }
+                            ScalarSide::Left => {
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push(Byte::new(Instruction::Index));
+                            }
+                        }
+                        bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                    },
+                    true,
+                );
+                true
+            }
+            AggregateArithKind::BroadcastArray {
+                length,
+                scalar_on,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t_vec = self.alloc_temp_slot();
+                let t_sc = self.alloc_temp_slot();
+                match scalar_on {
+                    ScalarSide::Right => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                    }
+                    ScalarSide::Left => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                    }
+                }
+                let op = info.op;
+                match length {
+                    Some(n) => {
+                        self.emit_zip_loop(
+                            bytecode,
+                            n,
+                            |_c, bc, i| {
+                                match scalar_on {
+                                    ScalarSide::Right => {
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                        bc.push(
+                                            Byte::new(Instruction::CONST)
+                                                .with_const_inline(i as i32),
+                                        );
+                                        bc.push(Byte::new(Instruction::Index));
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                    }
+                                    ScalarSide::Left => {
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                        bc.push(
+                                            Byte::new(Instruction::CONST)
+                                                .with_const_inline(i as i32),
+                                        );
+                                        bc.push(Byte::new(Instruction::Index));
+                                    }
+                                }
+                                bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                            },
+                            false,
+                        );
+                    }
+                    None => {
+                        self.emit_dynamic_broadcast_array(
+                            bytecode,
+                            t_vec,
+                            t_sc,
+                            scalar_on,
+                            op,
+                            elem_is_float,
+                        );
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Always unrolls for arity ≤ 4 (NT plan). Larger static arities also
+    /// unroll at compile time in v1 (no new loop opcodes required).
+    fn emit_zip_loop<F>(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        n: usize,
+        mut emit_elem: F,
+        as_tuple: bool,
+    ) where
+        F: FnMut(&mut Self, &mut Vec<Byte>, usize),
+    {
+        for i in 0..n {
+            emit_elem(self, bytecode, i);
+        }
+        if as_tuple {
+            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+        } else {
+            bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+        }
+    }
+
+    fn emit_dynamic_unary_array(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        src: u32,
+        _elem_is_float: bool,
+    ) {
+        // Build result by iterating 0..len(src).
+        let len_slot = self.alloc_temp_slot();
+        let idx = self.alloc_temp_slot();
+        let out = self.alloc_temp_slot();
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+        bytecode.push(Byte::new(Instruction::ArrayLen));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        let loop_top = bytecode.len() as u32;
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::LE));
+        let jmpf_pos = bytecode.len();
+        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::Index));
+        bytecode.push(Byte::new(Instruction::NEG));
+        bytecode.push(Byte::new(Instruction::ArrayPush));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(1));
+        bytecode.push(Byte::new(Instruction::ADD));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(loop_top));
+        let end = bytecode.len() as u32;
+        bytecode[jmpf_pos] = Byte::new(Instruction::JMPF).with_operand_u32(end);
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+    }
+
+    fn emit_dynamic_broadcast_array(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        t_vec: u32,
+        t_sc: u32,
+        scalar_on: crate::typechecking::ScalarSide,
+        op: crate::typechecking::AggregateOp,
+        elem_is_float: bool,
+    ) {
+        use crate::typechecking::{AggregateOp, ScalarSide};
+        let scalar_instr = match (op, elem_is_float) {
+            (AggregateOp::Add, false) => Instruction::ADD,
+            (AggregateOp::Add, true) => Instruction::ADDF,
+            (AggregateOp::Sub, false) => Instruction::SUB,
+            (AggregateOp::Sub, true) => Instruction::SUBF,
+            (AggregateOp::Mul, false) => Instruction::MUL,
+            (AggregateOp::Mul, true) => Instruction::MULF,
+            (AggregateOp::Div, false) => Instruction::DIV,
+            (AggregateOp::Div, true) => Instruction::DIVF,
+            (AggregateOp::Mod, false) => Instruction::MOD,
+            (AggregateOp::Mod, true) => Instruction::MODF,
+            (AggregateOp::Pow, false) => Instruction::Pow,
+            (AggregateOp::Pow, true) => Instruction::PowF,
+            (AggregateOp::Neg, _) => Instruction::NEG, // unused
+        };
+        let len_slot = self.alloc_temp_slot();
+        let idx = self.alloc_temp_slot();
+        let out = self.alloc_temp_slot();
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+        bytecode.push(Byte::new(Instruction::ArrayLen));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        let loop_top = bytecode.len() as u32;
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::LE));
+        let jmpf_pos = bytecode.len();
+        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+        match scalar_on {
+            ScalarSide::Right => {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+                bytecode.push(Byte::new(Instruction::Index));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+            }
+            ScalarSide::Left => {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+                bytecode.push(Byte::new(Instruction::Index));
+            }
+        }
+        bytecode.push(Byte::new(scalar_instr));
+        bytecode.push(Byte::new(Instruction::ArrayPush));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(1));
+        bytecode.push(Byte::new(Instruction::ADD));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(loop_top));
+        let end = bytecode.len() as u32;
+        bytecode[jmpf_pos] = Byte::new(Instruction::JMPF).with_operand_u32(end);
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+    }
+
+    /// Recover aggregate arith info from mono/codegen var types when the
+    /// side-table miss (specialized clones).
+    fn recover_aggregate_arith(
+        &self,
+        lhs: &Output,
+        rhs: Option<&Output>,
+        op: crate::typechecking::AggregateOp,
+    ) -> Option<crate::typechecking::AggregateArithInfo> {
+        use crate::typechecking::subst::apply_ty_prune;
+        use crate::typechecking::ty::{ArrayLength, Ty};
+        use crate::typechecking::{
+            AggregateArithInfo, AggregateArithKind, AggregateOp, ScalarSide,
+        };
+
+        let lty = self.expr_codegen_ty(lhs)?;
+        let lty = apply_ty_prune(self.checker.subst(), &lty);
+        match (op, rhs) {
+            (AggregateOp::Neg, None) => match lty {
+                Ty::Tuple(elems) if !elems.is_empty() => Some(AggregateArithInfo {
+                    kind: AggregateArithKind::NegTuple {
+                        arity: elems.len(),
+                        elem_is_float: matches!(&elems[0], Ty::Con(n) if n == "float"),
+                    },
+                    op,
+                }),
+                Ty::Array { element, length } => Some(AggregateArithInfo {
+                    kind: AggregateArithKind::NegArray {
+                        length: match length {
+                            ArrayLength::Static(n) => Some(n),
+                            ArrayLength::Dynamic => None,
+                        },
+                        elem_is_float: matches!(element.as_ref(), Ty::Con(n) if n == "float"),
+                    },
+                    op,
+                }),
+                _ => None,
+            },
+            (_, Some(rhs)) => {
+                let rty = self.expr_codegen_ty(rhs)?;
+                let rty = apply_ty_prune(self.checker.subst(), &rty);
+                match (lty, rty) {
+                    (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() && !a.is_empty() => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::ZipTuple {
+                                arity: a.len(),
+                                elem_is_float: matches!(&a[0], Ty::Con(n) if n == "float"),
+                            },
+                            op,
+                        })
+                    }
+                    (
+                        Ty::Array {
+                            element,
+                            length: ArrayLength::Static(n),
+                        },
+                        Ty::Array {
+                            length: ArrayLength::Static(m),
+                            ..
+                        },
+                    ) if n == m => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::ZipArray {
+                            length: n,
+                            elem_is_float: matches!(element.as_ref(), Ty::Con(n) if n == "float"),
+                        },
+                        op,
+                    }),
+                    (Ty::Tuple(a), r) if !a.is_empty() && matches!(r, Ty::Con(_)) => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastTuple {
+                                arity: a.len(),
+                                scalar_on: ScalarSide::Right,
+                                elem_is_float: matches!(&a[0], Ty::Con(n) if n == "float"),
+                            },
+                            op,
+                        })
+                    }
+                    (l, Ty::Tuple(b)) if !b.is_empty() && matches!(l, Ty::Con(_)) => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastTuple {
+                                arity: b.len(),
+                                scalar_on: ScalarSide::Left,
+                                elem_is_float: matches!(&b[0], Ty::Con(n) if n == "float"),
+                            },
+                            op,
+                        })
+                    }
+                    (
+                        Ty::Array { element, length },
+                        r,
+                    ) if matches!(r, Ty::Con(_)) => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::BroadcastArray {
+                            length: match length {
+                                ArrayLength::Static(n) => Some(n),
+                                ArrayLength::Dynamic => None,
+                            },
+                            scalar_on: ScalarSide::Right,
+                            elem_is_float: matches!(element.as_ref(), Ty::Con(n) if n == "float"),
+                        },
+                        op,
+                    }),
+                    (l, Ty::Array { element, length }) if matches!(l, Ty::Con(_)) => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastArray {
+                                length: match length {
+                                    ArrayLength::Static(n) => Some(n),
+                                    ArrayLength::Dynamic => None,
+                                },
+                                scalar_on: ScalarSide::Left,
+                                elem_is_float: matches!(
+                                    element.as_ref(),
+                                    Ty::Con(n) if n == "float"
+                                ),
+                            },
+                            op,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_codegen_ty(&self, expr: &Output) -> Option<Ty> {
+        match expr.1.as_ref() {
+            Expression::Identifier(name) => self.codegen_var_type_for(name),
+            Expression::Integer(_) => Some(Ty::Con("int".into())),
+            Expression::Float(_) => Some(Ty::Con("float".into())),
+            Expression::Tuple(items) => {
+                let mut tys = Vec::with_capacity(items.len());
+                for it in items {
+                    tys.push(self.expr_codegen_ty(it)?);
+                }
+                Some(Ty::Tuple(tys))
+            }
+            Expression::Array(items) => {
+                if items.is_empty() {
+                    return None;
+                }
+                let elem = self.expr_codegen_ty(&items[0])?;
+                Some(crate::typechecking::ty::array_fixed(elem, items.len()))
+            }
+            Expression::Group(inner) | Expression::Expr(inner) | Expression::Statement(inner) => {
+                self.expr_codegen_ty(inner)
+            }
+            _ => None,
+        }
     }
 
     /// Emit a direct call to a concrete `Eq` / `Ord` instance method when
@@ -4419,6 +4974,9 @@ impl Compiler {
     fn emit_compound_assign(
         &mut self,
         bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
         target: &Output,
         op: parser::ast::AssignOp,
         rhs: &Output,
@@ -4433,6 +4991,32 @@ impl Compiler {
             bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
             self.emit_write_lvalue(bytecode, target, false);
             return;
+        }
+
+        let agg_op = match op {
+            parser::ast::AssignOp::Add => Some(crate::typechecking::AggregateOp::Add),
+            parser::ast::AssignOp::Sub => Some(crate::typechecking::AggregateOp::Sub),
+            parser::ast::AssignOp::Mul => Some(crate::typechecking::AggregateOp::Mul),
+            parser::ast::AssignOp::Div => Some(crate::typechecking::AggregateOp::Div),
+            parser::ast::AssignOp::Mod => Some(crate::typechecking::AggregateOp::Mod),
+            parser::ast::AssignOp::Pow => Some(crate::typechecking::AggregateOp::Pow),
+            _ => None,
+        };
+        if let Some(agg_op) = agg_op {
+            let mut tmp = Vec::new();
+            if self.try_emit_aggregate_arith(
+                &mut tmp,
+                self_id,
+                span_start,
+                span_end,
+                target,
+                Some(rhs),
+                agg_op,
+            ) {
+                bytecode.append(&mut tmp);
+                self.emit_write_lvalue(bytecode, target, false);
+                return;
+            }
         }
 
         if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
@@ -5505,7 +6089,15 @@ impl Compiler {
                 self.emit_adjust(&mut bytecode, target, *op, *prefix);
             }
             Expression::CompoundAssign(target, op, rhs) => {
-                self.emit_compound_assign(&mut bytecode, target, *op, rhs);
+                self.emit_compound_assign(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    target,
+                    *op,
+                    rhs,
+                );
             }
             // --- Loop codegen ---
             // `while`: [top] cond, JMPF→exit, body, JMP→top, [exit]
@@ -6916,10 +7508,30 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::LogNot));
             }
             Expression::Negate(lhs) => {
-                unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    None,
+                    crate::typechecking::AggregateOp::Neg,
+                ) {
+                } else {
+                    unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
+                }
             }
             Expression::Add(lhs, rhs) => {
                 if self.try_emit_folded_expr(ast, &mut bytecode) {
+                } else if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Add,
+                ) {
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
@@ -6950,7 +7562,16 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                if let Some(hint) = self_id
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Sub,
+                ) {
+                } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -6975,7 +7596,16 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
-                if let Some(hint) = self_id
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Mul,
+                ) {
+                } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -7000,7 +7630,16 @@ impl Compiler {
                 }
             }
             Expression::Mod(lhs, rhs) => {
-                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Mod,
+                ) {
+                } else if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
                     let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(Instruction::DynMod));
                 } else {
@@ -7013,7 +7652,16 @@ impl Compiler {
                 }
             }
             Expression::Div(lhs, rhs) => {
-                if let Some(hint) = self_id
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Div,
+                ) {
+                } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -7044,12 +7692,23 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(lhs));
             }
             Expression::Pow(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::PowF
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Pow,
+                ) {
                 } else {
-                    Instruction::Pow
-                }));
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::PowF
+                    } else {
+                        Instruction::Pow
+                    }));
+                }
             }
             Expression::Shl(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHL));
@@ -12362,5 +13021,33 @@ fn main() {
         );
     }
 
-
+    #[test]
+    fn tuple_zip_add_emits_index_and_make_tuple() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = (1, 1) + (1, 1);
+    print "%i", a[0];
+}
+"#,
+        );
+        let has_index = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::Index));
+        let has_make = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::MakeTuple));
+        let has_add = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::ADD | Instruction::BinSlotImm | Instruction::BinSlotSlot
+            )
+        });
+        assert!(
+            has_index && has_make && has_add,
+            "expected Index + ADD + MakeTuple zip lowering; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
 }
