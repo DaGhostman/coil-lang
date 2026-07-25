@@ -5627,19 +5627,27 @@ impl Compiler {
                     step.as_ref(),
                 ) && !const_fold::body_has_loop_control(body)
                 {
+                    // Pre-walk order is init → cond → body → step. Emit init,
+                    // discard cond (IDs only), then for each trip restore the
+                    // emit cursor and emit body + step so the induction
+                    // variable advances (e.g. `s = s + i` for `i < 4` → 6).
                     if let Some(init) = init {
                         let mut init_bc = self.do_compile(init);
                         Self::discard_statement_value(&mut init_bc);
                         self.bytecode.extend(init_bc);
                     }
+                    self.discard_compile(cond);
+                    let body_start_idx = self.emit_idx;
                     for _ in 0..trips {
+                        self.emit_idx = body_start_idx;
                         let mut body_bc = self.do_compile(body);
                         self.bytecode.append(&mut body_bc);
+                        if let Some(step) = step {
+                            let mut step_bc = self.do_compile(step);
+                            Self::discard_statement_value(&mut step_bc);
+                            self.bytecode.extend(step_bc);
+                        }
                     }
-                    if let Some(step) = step {
-                        self.discard_compile(step);
-                    }
-                    self.discard_compile(cond);
                     return bytecode;
                 }
                 if let Some(ConstValue::Bool(false)) =
@@ -10863,13 +10871,13 @@ for (let i = 0; i < 3; i = i + 1) { s = s + i; } \
 print \"%i\", s; \
 }",
         );
-        let jmp_back = bc.windows(2).any(|w| {
-            matches!(w[0].bytecode(), Instruction::JMP)
-                && w[0].operand_u32() < w[1].operand_u32()
-        });
         assert!(
-            !jmp_back || bc.iter().filter(|b| matches!(b.bytecode(), Instruction::JMP)).count() <= 2,
-            "expected unrolled for (i < 3) without loop back-edge"
+            !bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::JMPF | Instruction::CmpJmpf | Instruction::BinSlotImmJmpf
+            )),
+            "unrolled for (i < 3) must not emit a loop exit jump; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 

@@ -191,14 +191,27 @@ fn one_int<'a>(expr: &Output<'a>) -> Option<()> {
     })
 }
 
+/// Peel `Expr` / `Group` / statement wrappers the parser inserts around
+/// C-style `for` `cond` / `step` (and occasionally other subtrees).
+fn unwrap_expr<'a>(expr: &'a Output<'a>) -> &'a Output<'a> {
+    match expr.1.as_ref() {
+        Expression::Expr(inner)
+        | Expression::Group(inner)
+        | Expression::Statement(inner)
+        | Expression::ExprStatement(inner) => unwrap_expr(inner),
+        _ => expr,
+    }
+}
+
 /// C-style `for` trip count when init/cond/step match `i = 0; i < N; i = i + 1`.
 pub fn for_loop_trip_count<'a>(
-    init: Option<&Output<'a>>,
-    cond: &Output<'a>,
-    step: Option<&Output<'a>>,
+    init: Option<&'a Output<'a>>,
+    cond: &'a Output<'a>,
+    step: Option<&'a Output<'a>>,
 ) -> Option<u32> {
-    let init = init?;
-    let step = step?;
+    let init = unwrap_expr(init?);
+    let step = unwrap_expr(step?);
+    let cond = unwrap_expr(cond);
     if !for_init_sets_zero(init) {
         return None;
     }
@@ -208,7 +221,8 @@ pub fn for_loop_trip_count<'a>(
     eval_for_upper_bound(cond)
 }
 
-fn eval_for_upper_bound<'a>(cond: &Output<'a>) -> Option<u32> {
+fn eval_for_upper_bound<'a>(cond: &'a Output<'a>) -> Option<u32> {
+    let cond = unwrap_expr(cond);
     match cond.1.as_ref() {
         Expression::Le(lhs, rhs) => {
             let _i_name = ident_name(lhs)?;
@@ -236,45 +250,49 @@ fn eval_for_upper_bound<'a>(cond: &Output<'a>) -> Option<u32> {
     }
 }
 
-fn ident_name<'a>(expr: &Output<'a>) -> Option<&'a str> {
-    match expr.1.as_ref() {
+fn ident_name<'a>(expr: &'a Output<'a>) -> Option<&'a str> {
+    match unwrap_expr(expr).1.as_ref() {
         Expression::Identifier(n) => Some(*n),
         _ => None,
     }
 }
 
-fn for_init_sets_zero<'a>(init: &Output<'a>) -> bool {
-    match init.1.as_ref() {
+fn for_init_sets_zero<'a>(init: &'a Output<'a>) -> bool {
+    match unwrap_expr(init).1.as_ref() {
         Expression::Fragment(children) if children.len() == 2 => {
-            matches!(children[1].1.as_ref(), Expression::Integer(0))
+            matches!(unwrap_expr(&children[1]).1.as_ref(), Expression::Integer(0))
         }
         Expression::Assignment(lhs, rhs) => {
-            matches!(lhs.1.as_ref(), Expression::Identifier(_))
-                && matches!(rhs.1.as_ref(), Expression::Integer(0))
+            matches!(unwrap_expr(lhs).1.as_ref(), Expression::Identifier(_))
+                && matches!(unwrap_expr(rhs).1.as_ref(), Expression::Integer(0))
         }
         _ => false,
     }
 }
 
-fn for_step_increments_by_one<'a>(step: &Output<'a>) -> bool {
-    match step.1.as_ref() {
+fn for_step_increments_by_one<'a>(step: &'a Output<'a>) -> bool {
+    match unwrap_expr(step).1.as_ref() {
         Expression::Assignment(lhs, rhs) => {
-            let Expression::Identifier(name) = lhs.1.as_ref() else {
+            let Expression::Identifier(name) = unwrap_expr(lhs).1.as_ref() else {
                 return false;
             };
-            match rhs.1.as_ref() {
+            match unwrap_expr(rhs).1.as_ref() {
                 Expression::Add(i, one) => {
-                    matches!(i.1.as_ref(), Expression::Identifier(n) if *n == *name)
-                        && matches!(one.1.as_ref(), Expression::Integer(1))
+                    matches!(unwrap_expr(i).1.as_ref(), Expression::Identifier(n) if *n == *name)
+                        && matches!(unwrap_expr(one).1.as_ref(), Expression::Integer(1))
                 }
                 Expression::Adjust { .. } => false,
                 _ => false,
             }
         }
-        Expression::Adjust { op, prefix: true, target } => {
+        Expression::Adjust {
+            op,
+            prefix: true,
+            target,
+        } => {
             use parser::ast::AdjustOp;
             matches!(op, AdjustOp::Inc)
-                && matches!(target.1.as_ref(), Expression::Identifier(_))
+                && matches!(unwrap_expr(target).1.as_ref(), Expression::Identifier(_))
         }
         _ => false,
     }
@@ -320,7 +338,8 @@ fn body_has_loop_control_walk<'a>(node: &Output<'a>) -> bool {
         | Expression::Group(inner) => body_has_loop_control_walk(inner),
         Expression::If(branches) => branches.iter().any(|b| {
             if let Expression::Branch(cond, body) = b.1.as_ref() {
-                cond.as_ref().is_some_and(body_has_loop_control_walk) || body_has_loop_control_walk(body)
+                cond.as_ref().is_some_and(body_has_loop_control_walk)
+                    || body_has_loop_control_walk(body)
             } else {
                 false
             }
@@ -331,11 +350,6 @@ fn body_has_loop_control_walk<'a>(node: &Output<'a>) -> bool {
         }
         Expression::Loop { body, .. } => body_has_loop_control_walk(body),
         Expression::For { body, .. } => body_has_loop_control_walk(body),
-        // `break;` / `continue;` often sit under statement wrappers.
-        Expression::ExprStatement(inner)
-        | Expression::Statement(inner)
-        | Expression::Group(inner)
-        | Expression::Expr(inner) => body_has_loop_control_walk(inner),
         _ => false,
     }
 }
@@ -497,6 +511,42 @@ mod tests {
         assert_eq!(
             for_loop_trip_count(Some(&init), &too_many, Some(&step)),
             None
+        );
+    }
+
+    /// Parser wraps C-style `for` cond/step in `Expression::Expr` — trip
+    /// counting must peel those wrappers or real sources never unroll.
+    #[test]
+    fn for_loop_trip_count_peels_expr_wrappers() {
+        let init = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Fragment(vec![id_expr("i"), int_expr(0)])),
+        );
+        let step_inner = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Assignment(
+                id_expr("i"),
+                (
+                    SimpleSpan::from(0..3),
+                    Box::new(Expression::Add(id_expr("i"), int_expr(1))),
+                ),
+            )),
+        );
+        let step = (
+            SimpleSpan::from(0..5),
+            Box::new(Expression::Expr(step_inner)),
+        );
+        let le_inner = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Le(id_expr("i"), int_expr(4))),
+        );
+        let le_cond = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Expr(le_inner)),
+        );
+        assert_eq!(
+            for_loop_trip_count(Some(&init), &le_cond, Some(&step)),
+            Some(4)
         );
     }
 

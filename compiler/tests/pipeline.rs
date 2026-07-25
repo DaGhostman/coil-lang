@@ -2683,7 +2683,8 @@ fn main() {
     assert_eq!(output, "2");
 }
 
-/// Constant-trip `for` unroll must still accumulate the right sum.
+/// Constant-trip `for` unroll must advance `i` via `step` between bodies.
+/// If unroll engaged but skipped `step`, `s = s + i` would stay `0`.
 #[test]
 fn const_for_unroll_prints_sum() {
     let output = run_example_src(
@@ -2698,6 +2699,23 @@ fn main() {
 "#,
     );
     assert_eq!(output, "6");
+}
+
+/// Same induction check with `i <= 2` (3 trips: 0+1+2).
+#[test]
+fn const_for_unroll_leq_advances_induction() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let s = 0;
+    for (let i = 0; i <= 2; i = i + 1) {
+        s = s + i;
+    }
+    print "%i", s;
+}
+"#,
+    );
+    assert_eq!(output, "3");
 }
 
 /// Range for-in unroll (`0..3`) binds successive values correctly.
