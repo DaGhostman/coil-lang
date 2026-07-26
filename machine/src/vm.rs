@@ -1049,7 +1049,13 @@ impl<const S: usize> Machine<S> {
         self.run_with_pool(code, constants, static_slots);
     }
 
-    #[inline(always)]
+    /// Never-inline: `#[inline(always)]` forced fat LTO to paste this giant
+    /// `match` into `run_with_pool` / `call_function`. Whole-program context
+    /// (e.g. a larger compiler in the same binary) then reshapes dispatch
+    /// enough to blow branch-mispredict rates on some CPUs while keeping
+    /// dynamic instruction counts identical. A single outlined copy matches
+    /// the non-LTO `machine` codegen (already identical to `main`'s).
+    #[inline(never)]
     fn execute(&mut self, code: &[Byte], constants: &[u64], start_ip: usize) -> bool {
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
