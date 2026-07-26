@@ -5375,17 +5375,23 @@ mod tests {
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 0);
         let c = vm.pop();
-        match Machine::<64>::find_object_by_addr(&vm.heap, c.raw() as u64) {
-            Some(Object::Tuple(_)) => {}
-            other => panic!("expected outer ObjTuple, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                Machine::<64>::find_object_by_addr(&vm.heap, c.raw() as u64),
+                Some(Object::Tuple(_))
+            ),
+            "expected outer ObjTuple"
+        );
         let rows = Machine::<64>::aggregate_elements(&vm.heap, c).expect("C rows");
         assert_eq!(rows.len(), 2);
         for row in &rows {
-            match Machine::<64>::find_object_by_addr(&vm.heap, row.raw() as u64) {
-                Some(Object::Tuple(_)) => {}
-                other => panic!("expected row ObjTuple, got {other:?}"),
-            }
+            assert!(
+                matches!(
+                    Machine::<64>::find_object_by_addr(&vm.heap, row.raw() as u64),
+                    Some(Object::Tuple(_))
+                ),
+                "expected row ObjTuple"
+            );
         }
         let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
         let r1 = Machine::<64>::aggregate_elements(&vm.heap, rows[1]).unwrap();
