@@ -13565,4 +13565,79 @@ fn main() {
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
+
+    /// Approach A: `matmul` lowers to `PackedMatMul`, not a MUL cascade.
+    #[test]
+    fn matmul_emits_packed_matmul_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = [[1, 2], [3, 4]];
+    let b = [[5, 6], [7, 8]];
+    let c = matmul(a, b);
+    print "%i", c[0][0];
+}
+"#,
+        );
+        let packed = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::PackedMatMul))
+            .count();
+        assert_eq!(
+            packed, 1,
+            "expected exactly one PackedMatMul; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Scalar 2×2×2 unroll would emit 8 MUL; packed path must be far below that.
+        let mul_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF))
+            .count();
+        assert!(
+            mul_count < 8,
+            "PackedMatMul path should not unroll to 8 MULs; got {mul_count}"
+        );
+    }
+
+    /// Approach A: `dot` lowers to `PackedDot`.
+    #[test]
+    fn dot_emits_packed_dot_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    print "%i", dot([1, 2], [3, 4]);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::PackedDot)),
+            "expected PackedDot; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Approach A: `Matrix` `*` lowers to `PackedMatMul`.
+    #[test]
+    fn matrix_mul_emits_packed_matmul_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let b = matrix([[5, 6], [7, 8]]);
+    let c = a * b;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::PackedMatMul)),
+            "expected PackedMatMul for Matrix *; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
 }
