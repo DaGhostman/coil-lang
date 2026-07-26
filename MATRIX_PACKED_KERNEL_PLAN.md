@@ -81,6 +81,10 @@ Dims that do not fit the packed fields emit a **compile-time warning**
 limit (255)`) and fall back to the existing scalar unroll (non-fatal —
 unroll remains correct). Dot length uses a `u16` ceiling (`65535`).
 
+VM handlers for `Packed*` live in `#[inline(never)]` helpers
+(`exec_packed_dot` / `exec_packed_matmul` / …) so the hot `execute`
+match stays small for scalar workloads (fib / numeric loops).
+
 ---
 
 ## 4. VM kernel contract
