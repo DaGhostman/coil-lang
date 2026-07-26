@@ -2857,6 +2857,52 @@ fn example_matrix_mul_prints_product_and_hadamard_add() {
 }
 
 #[test]
+fn matrix_sub_and_neg_packed_path_values() {
+    // End-to-end: Matrix `-` (PackedMatrixZip Sub) and unary `-` (PackedMatrixNeg).
+    let output = run_example_src(
+        r#"
+fn main() {
+    let a = matrix([[5, 7], [9, 11]]);
+    let b = matrix([[1, 2], [3, 4]]);
+    let s = a - b;
+    print "%i,%i,%i,%i,", s[0][0], s[0][1], s[1][0], s[1][1];
+    let n = -b;
+    print "%i,%i,%i,%i", n[0][0], n[0][1], n[1][0], n[1][1];
+}
+"#,
+    );
+    assert_eq!(output, "4,5,6,7,-1,-2,-3,-4");
+}
+
+#[test]
+fn float_dot_packed_path_value() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    print "%f", dot([1.5, 2.5], [2.0, 4.0]);
+}
+"#,
+    );
+    assert_eq!(output, "13.0");
+}
+
+#[test]
+fn matmul_tuple_of_tuples_rebuilds_correct_product() {
+    // Exercises outer_is_tuple + row_is_tuple packing flags end-to-end.
+    let output = run_example_src(
+        r#"
+fn main() {
+    let a = ((1, 2), (3, 4));
+    let b = ((5, 6), (7, 8));
+    let c = matmul(a, b);
+    print "%i,%i,%i,%i", c[0][0], c[0][1], c[1][0], c[1][1];
+}
+"#,
+    );
+    assert_eq!(output, "19,22,43,50");
+}
+
+#[test]
 fn aggregate_compound_assign_updates_tuple() {
     let output = run_example_src(
         r#"

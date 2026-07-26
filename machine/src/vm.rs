@@ -5300,4 +5300,98 @@ mod tests {
         assert_eq!(r0[0].as_int(), -5);
         assert_eq!(r0[1].as_int(), -7);
     }
+
+    /// PackedDot float path (`operands[16]` = is_float) — 1.5*2.0 + 2.5*4.0 = 13.0.
+    #[test]
+    fn packed_dot_float_arrays() {
+        let pool = [1.5f64.to_bits(), 2.0f64.to_bits(), 2.5f64.to_bits(), 4.0f64.to_bits()];
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG), // 1.5
+            Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG), // 2.0
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::CONST).with_operand_u32(2 | Byte::POOL_FLAG), // 2.5
+            Byte::new(Instruction::CONST).with_operand_u32(3 | Byte::POOL_FLAG), // 4.0
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            // length=2, is_float
+            Byte::new(Instruction::PackedDot).with_operand_u32(2 | (1 << 16)),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &pool, 0);
+        assert_eq!(vm.pop().as_float(), 13.0);
+    }
+
+    /// PackedMatrixZip Sub (`zip_kind == 1`) — [[5,7]] - [[1,2]] → [[4,5]].
+    #[test]
+    fn packed_matrix_zip_sub_1x2() {
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(5),
+            Byte::new(Instruction::CONST).with_operand_u32(7),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(1), // A
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(1), // B
+            // m=1, n=2, zip=Sub(1)
+            Byte::new(Instruction::PackedMatrixZip).with_operand_u32(1 | (2 << 8) | (1 << 16)),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 0);
+        let c = vm.pop();
+        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).unwrap();
+        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
+        assert_eq!(r0[0].as_int(), 4);
+        assert_eq!(r0[1].as_int(), 5);
+    }
+
+    /// PackedMatMul must honor outer/row tuple flags when rebuilding the result.
+    /// Wrong flags would allocate `ObjArray` and break tuple-typed consumers.
+    #[test]
+    fn packed_matmul_rebuilds_tuple_of_tuples() {
+        use crate::memory::Object;
+        // A = ((1, 2), (3, 4)); B = ((5, 6), (7, 8)); C = ((19, 22), (43, 50))
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_operand_u32(2),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::CONST).with_operand_u32(3),
+            Byte::new(Instruction::CONST).with_operand_u32(4),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2), // A
+            Byte::new(Instruction::CONST).with_operand_u32(5),
+            Byte::new(Instruction::CONST).with_operand_u32(6),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::CONST).with_operand_u32(7),
+            Byte::new(Instruction::CONST).with_operand_u32(8),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
+            Byte::new(Instruction::MakeTuple).with_operand_u32(2), // B
+            // m=2,k=2,n=2 + outer_is_tuple + row_is_tuple
+            Byte::new(Instruction::PackedMatMul)
+                .with_operand_u32(2 | (2 << 8) | (2 << 16) | (1 << 25) | (1 << 26)),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 0);
+        let c = vm.pop();
+        match Machine::<64>::find_object_by_addr(&vm.heap, c.raw() as u64) {
+            Some(Object::Tuple(_)) => {}
+            other => panic!("expected outer ObjTuple, got {other:?}"),
+        }
+        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).expect("C rows");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            match Machine::<64>::find_object_by_addr(&vm.heap, row.raw() as u64) {
+                Some(Object::Tuple(_)) => {}
+                other => panic!("expected row ObjTuple, got {other:?}"),
+            }
+        }
+        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
+        let r1 = Machine::<64>::aggregate_elements(&vm.heap, rows[1]).unwrap();
+        assert_eq!(r0[0].as_int(), 19);
+        assert_eq!(r0[1].as_int(), 22);
+        assert_eq!(r1[0].as_int(), 43);
+        assert_eq!(r1[1].as_int(), 50);
+    }
 }

@@ -1934,3 +1934,36 @@ fn main() {
     );
 }
 
+#[test]
+fn dot_mixed_tuple_and_array_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = dot((1, 2), [3, 4]);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot mix tuple and array operands in `dot`")),
+        "expected mixed container diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn cross_wrong_length_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = cross((1, 2), (3, 4));
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("length-3") || m.contains("`cross`")),
+        "expected cross length diagnostic, got: {:?}",
+        msgs
+    );
+}
+

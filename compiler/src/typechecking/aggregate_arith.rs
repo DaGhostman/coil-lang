@@ -324,7 +324,7 @@ pub fn wrap_matrix_ty(data: Ty) -> Ty {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typechecking::ty::{array_fixed, int};
+    use crate::typechecking::ty::{array, array_fixed, float, int};
 
     #[test]
     fn classify_tuple_and_array() {
@@ -357,5 +357,51 @@ mod tests {
         let m = wrap_matrix_ty(data.clone());
         assert!(is_matrix_ty(&m));
         assert_eq!(unwrap_matrix_ty(&m), Some(&data));
+    }
+
+    #[test]
+    fn classify_vector_distinguishes_tuple_and_array() {
+        let tup = classify_vector(&Ty::Tuple(vec![int(), int(), int()])).unwrap();
+        assert_eq!(tup.1, 3);
+        assert!(tup.2, "tuple flag");
+        let arr = classify_vector(&array_fixed(float(), 2)).unwrap();
+        assert_eq!(arr.0, float());
+        assert_eq!(arr.1, 2);
+        assert!(!arr.2, "array flag");
+        assert!(classify_vector(&array(int())).is_none(), "dynamic [T] is not a vector");
+    }
+
+    #[test]
+    fn classify_matrix_array_of_arrays_and_tuple_of_tuples() {
+        let arr = classify_matrix(&array_fixed(array_fixed(int(), 3), 2)).unwrap();
+        assert_eq!((arr.1, arr.2, arr.3, arr.4), (2, 3, false, false));
+        let tup = classify_matrix(&Ty::Tuple(vec![
+            Ty::Tuple(vec![int(), int()]),
+            Ty::Tuple(vec![int(), int()]),
+        ]))
+        .unwrap();
+        assert_eq!((tup.1, tup.2, tup.3, tup.4), (2, 2, true, true));
+        // Heterogeneous outer rows must fail.
+        assert!(
+            classify_matrix(&Ty::Tuple(vec![
+                Ty::Tuple(vec![int(), int()]),
+                Ty::Tuple(vec![int(), int(), int()]),
+            ]))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn classify_matrix_mixed_row_containers() {
+        // Outer array of row-tuples.
+        let mixed = classify_matrix(&array_fixed(Ty::Tuple(vec![int(), int()]), 2)).unwrap();
+        assert_eq!((mixed.1, mixed.2, mixed.3, mixed.4), (2, 2, false, true));
+        // Outer tuple of row-arrays.
+        let mixed2 = classify_matrix(&Ty::Tuple(vec![
+            array_fixed(int(), 3),
+            array_fixed(int(), 3),
+        ]))
+        .unwrap();
+        assert_eq!((mixed2.1, mixed2.2, mixed2.3, mixed2.4), (2, 3, true, false));
     }
 }

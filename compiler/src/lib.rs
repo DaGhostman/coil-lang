@@ -13640,4 +13640,130 @@ fn main() {
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
+
+    /// Approach A: `Matrix` `+` lowers to `PackedMatrixZip` with zip_kind=Add.
+    #[test]
+    fn matrix_add_emits_packed_matrix_zip_add() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let c = a + a;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        let zip = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::PackedMatrixZip))
+            .expect("expected PackedMatrixZip for Matrix +");
+        let ops = zip.operand_u32();
+        assert_eq!(ops & 0xFF, 2, "m");
+        assert_eq!((ops >> 8) & 0xFF, 2, "n");
+        assert_eq!((ops >> 16) & 0xFF, 0, "zip_kind Add");
+    }
+
+    /// Approach A: `Matrix` `-` packs zip_kind=Sub (not Add).
+    #[test]
+    fn matrix_sub_emits_packed_matrix_zip_sub() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[5, 7], [9, 11]]);
+    let b = matrix([[1, 2], [3, 4]]);
+    let c = a - b;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        let zip = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::PackedMatrixZip))
+            .expect("expected PackedMatrixZip for Matrix -");
+        assert_eq!(
+            (zip.operand_u32() >> 16) & 0xFF,
+            1,
+            "zip_kind Sub; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Approach A: unary `-` on `Matrix` lowers to `PackedMatrixNeg`.
+    #[test]
+    fn matrix_neg_emits_packed_matrix_neg() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let c = -a;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::PackedMatrixNeg)),
+            "expected PackedMatrixNeg for Matrix unary -; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `cross` stays on the scalar unroll path (no Packed* opcodes).
+    #[test]
+    fn cross_does_not_emit_packed_opcodes() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let c = cross((1, 0, 0), (0, 1, 0));
+    print "%i", c[0];
+}
+"#,
+        );
+        let packed = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::PackedDot
+                    | Instruction::PackedMatMul
+                    | Instruction::PackedMatrixZip
+                    | Instruction::PackedMatrixNeg
+            )
+        });
+        assert!(
+            !packed,
+            "cross must stay unrolled; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF)),
+            "cross unroll should emit MUL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Float `dot` sets the PackedDot is_float flag (`operands[16]`).
+    #[test]
+    fn float_dot_emits_packed_dot_with_float_flag() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    print "%f", dot([1.0, 2.0], [3.0, 4.0]);
+}
+"#,
+        );
+        let packed = bc
+            .iter()
+            .find(|b| matches!(b.bytecode(), Instruction::PackedDot))
+            .expect("expected PackedDot for float dot");
+        assert_ne!(
+            packed.operand_u32() & (1 << 16),
+            0,
+            "float PackedDot must set is_float bit"
+        );
+    }
 }
