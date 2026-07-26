@@ -639,7 +639,7 @@ Nominal wrapper distinct from bare nested arrays:
 
 Example: `examples/matrix_mul.hy` → `19,22,43,502`.
 
-### 13.4 Approach A — packed fat opcodes (in progress)
+### 13.4 Approach A — packed fat opcodes (implemented)
 
 Scalar unroll for `dot` / `matmul` / `Matrix` ops is replaced by fat
 opcodes (`PackedDot`, `PackedMatMul`, `PackedMatrixZip`,
