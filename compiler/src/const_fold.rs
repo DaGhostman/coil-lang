@@ -504,6 +504,16 @@ mod tests {
         assert_eq!(strength_mul_to_shl(&mul6, &env), None);
         // `* 1` stays with strength_reduced_inner
         assert_eq!(strength_mul_to_shl(&mul1, &env), None);
+        let mul0 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(id_expr("x"), int_expr(0))),
+        );
+        let mul_neg = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(id_expr("x"), int_expr(-8))),
+        );
+        assert_eq!(strength_mul_to_shl(&mul0, &env), None);
+        assert_eq!(strength_mul_to_shl(&mul_neg, &env), None);
     }
 
     #[test]

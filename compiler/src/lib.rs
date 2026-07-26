@@ -925,10 +925,15 @@ impl Compiler {
     }
 
     /// If `ast` folds to a scalar, emit it and return true.
+    ///
+    /// When `allow_mul_shl` is false, skip `x * 2^n` → `SHL` so trait/`Mul`
+    /// dictionary calls (`bound_operator_call`) still dispatch through
+    /// `emit_bound_operator_call` for non-primitive `T * 2^n`.
     fn try_emit_folded_expr(
         &mut self,
         ast: &(SimpleSpan, Box<Expression<'_>>),
         bytecode: &mut Vec<Byte>,
+        allow_mul_shl: bool,
     ) -> bool {
         if let Some(v) = const_fold::eval_expr(ast, self.const_env()) {
             self.emit_const_value(&v, bytecode);
@@ -937,9 +942,10 @@ impl Compiler {
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
             true
-        } else if let Some((inner, shift)) =
-            const_fold::strength_mul_to_shl(ast, self.const_env())
+        } else if allow_mul_shl
+            && let Some((inner, shift)) = const_fold::strength_mul_to_shl(ast, self.const_env())
         {
+            // Primitive int only: SHL is not valid for float / trait Mul.
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
             bytecode.push(Byte::new(Instruction::CONST).with_const_inline(shift as i32));
@@ -6902,7 +6908,9 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
             }
             Expression::Add(lhs, rhs) => {
-                if self.try_emit_folded_expr(ast, &mut bytecode) {
+                // `allow_mul_shl` is irrelevant for Add (strength_mul_to_shl
+                // only matches Mul); pass true for the shared helper API.
+                if self.try_emit_folded_expr(ast, &mut bytecode, true) {
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
@@ -6958,7 +6966,17 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
-                if self.try_emit_folded_expr(ast, &mut bytecode) {
+                // Prefer trait/`Mul` dictionary dispatch over primitive
+                // `x * 2^n` → SHL when the checker recorded a bound operator
+                // (non-primitive `T * 2^n` must not emit int SHL).
+                let has_bound_mul = self_id
+                    .and_then(|id| self.checker.bound_operator_call_at(id))
+                    .or_else(|| {
+                        self.checker
+                            .bound_operator_call_for_span(span.start, span.end)
+                    })
+                    .is_some();
+                if self.try_emit_folded_expr(ast, &mut bytecode, !has_bound_mul) {
                 } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
@@ -8675,6 +8693,34 @@ mod tests {
         (bc, compiler.constants)
     }
 
+    /// True when bytecode contains a strength-reduced `x << shift`
+    /// (`LOAD; CONST; SHL` or fused `BinSlotImm(SHL, shift)`).
+    fn bytecode_has_shl_by(bc: &[Byte], shift: i64) -> bool {
+        use common::Instruction;
+        let has_load_const_shl = bc.windows(3).any(|w| {
+            matches!(w[0].bytecode(), Instruction::LOAD)
+                && matches!(w[1].bytecode(), Instruction::CONST)
+                && matches!(w[2].bytecode(), Instruction::SHL)
+                && (w[1].operand_u32() & Byte::POOL_FLAG) == 0
+                && w[1].operand_u32() as i32 == shift as i32
+        });
+        let has_fused_shl = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
+                && b.bin_slot_imm_parts().2 == shift
+        });
+        has_load_const_shl || has_fused_shl
+    }
+
+    fn bytecode_has_any_shl(bc: &[Byte]) -> bool {
+        use common::Instruction;
+        bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::SHL)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::SHL as u8)
+        })
+    }
+
     #[test]
     fn method_call_target_relocated_after_static_init_splice() {
         use common::Instruction;
@@ -8987,22 +9033,9 @@ test("two") { assert(true)?; }
     /// `x * 8` strength-reduces to `x << 3` (via [`const_fold::strength_mul_int`]).
     #[test]
     fn mul_by_power_of_two_emits_shl_not_mul() {
-        use common::Instruction;
         let (bc, _pool) = compile_src("fn scale(int x) -> int { return x * 8; }");
-        // Builtin Num dictionary thunks also contain MUL; look for the
-        // strength-reduced user body (`LOAD; CONST; SHL` or a fused BinSlotImm SHL).
-        let has_load_const_shl = bc.windows(3).any(|w| {
-            matches!(w[0].bytecode(), Instruction::LOAD)
-                && matches!(w[1].bytecode(), Instruction::CONST)
-                && matches!(w[2].bytecode(), Instruction::SHL)
-        });
-        let has_fused_shl = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::BinSlotImm
-                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
-                && b.bin_slot_imm_parts().2 == 3
-        });
         assert!(
-            has_load_const_shl || has_fused_shl,
+            bytecode_has_shl_by(&bc, 3),
             "expected LOAD/CONST/SHL (shift 3) or fused BinSlotImm(SHL, 3) for x*8; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
@@ -9011,20 +9044,9 @@ test("two") { assert(true)?; }
     /// Commuted form `8 * x` must use the same SHL lowering (LHS factor).
     #[test]
     fn mul_by_lhs_power_of_two_emits_shl() {
-        use common::Instruction;
         let (bc, _pool) = compile_src("fn scale(int x) -> int { return 8 * x; }");
-        let has_load_const_shl = bc.windows(3).any(|w| {
-            matches!(w[0].bytecode(), Instruction::LOAD)
-                && matches!(w[1].bytecode(), Instruction::CONST)
-                && matches!(w[2].bytecode(), Instruction::SHL)
-        });
-        let has_fused_shl = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::BinSlotImm
-                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
-                && b.bin_slot_imm_parts().2 == 3
-        });
         assert!(
-            has_load_const_shl || has_fused_shl,
+            bytecode_has_shl_by(&bc, 3),
             "expected SHL (shift 3) for 8*x; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
@@ -9033,22 +9055,11 @@ test("two") { assert(true)?; }
     /// `const K = 16; x * K` must consult `const_env` and emit `<< 4`.
     #[test]
     fn mul_by_const_power_of_two_emits_shl() {
-        use common::Instruction;
         let (bc, _pool) = compile_src(
             "fn scale(int x) -> int { const K = 16; return x * K; }",
         );
-        let has_load_const_shl = bc.windows(3).any(|w| {
-            matches!(w[0].bytecode(), Instruction::LOAD)
-                && matches!(w[1].bytecode(), Instruction::CONST)
-                && matches!(w[2].bytecode(), Instruction::SHL)
-        });
-        let has_fused_shl = bc.iter().any(|b| {
-            *b.bytecode() == Instruction::BinSlotImm
-                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
-                && b.bin_slot_imm_parts().2 == 4
-        });
         assert!(
-            has_load_const_shl || has_fused_shl,
+            bytecode_has_shl_by(&bc, 4),
             "expected SHL (shift 4) for x*const(16); opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
@@ -9058,15 +9069,9 @@ test("two") { assert(true)?; }
     /// [`const_fold::strength_reduced_inner`], not SHL lowering).
     #[test]
     fn mul_by_one_does_not_emit_shl() {
-        use common::Instruction;
         let (bc, _pool) = compile_src("fn id(int x) -> int { return x * 1; }");
-        let has_shl = bc.iter().any(|b| {
-            matches!(b.bytecode(), Instruction::SHL)
-                || (*b.bytecode() == Instruction::BinSlotImm
-                    && b.bin_slot_imm_parts().0 == Instruction::SHL as u8)
-        });
         assert!(
-            !has_shl,
+            !bytecode_has_any_shl(&bc),
             "x*1 should identity-reduce, not emit SHL; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
