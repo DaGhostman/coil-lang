@@ -9008,6 +9008,70 @@ test("two") { assert(true)?; }
         );
     }
 
+    /// Commuted form `8 * x` must use the same SHL lowering (LHS factor).
+    #[test]
+    fn mul_by_lhs_power_of_two_emits_shl() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn scale(int x) -> int { return 8 * x; }");
+        let has_load_const_shl = bc.windows(3).any(|w| {
+            matches!(w[0].bytecode(), Instruction::LOAD)
+                && matches!(w[1].bytecode(), Instruction::CONST)
+                && matches!(w[2].bytecode(), Instruction::SHL)
+        });
+        let has_fused_shl = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
+                && b.bin_slot_imm_parts().2 == 3
+        });
+        assert!(
+            has_load_const_shl || has_fused_shl,
+            "expected SHL (shift 3) for 8*x; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `const K = 16; x * K` must consult `const_env` and emit `<< 4`.
+    #[test]
+    fn mul_by_const_power_of_two_emits_shl() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src(
+            "fn scale(int x) -> int { const K = 16; return x * K; }",
+        );
+        let has_load_const_shl = bc.windows(3).any(|w| {
+            matches!(w[0].bytecode(), Instruction::LOAD)
+                && matches!(w[1].bytecode(), Instruction::CONST)
+                && matches!(w[2].bytecode(), Instruction::SHL)
+        });
+        let has_fused_shl = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
+                && b.bin_slot_imm_parts().2 == 4
+        });
+        assert!(
+            has_load_const_shl || has_fused_shl,
+            "expected SHL (shift 4) for x*const(16); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x * 1` is identity-reduced, not `<< 0` (shift 0 is reserved for
+    /// [`const_fold::strength_reduced_inner`], not SHL lowering).
+    #[test]
+    fn mul_by_one_does_not_emit_shl() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn id(int x) -> int { return x * 1; }");
+        let has_shl = bc.iter().any(|b| {
+            matches!(b.bytecode(), Instruction::SHL)
+                || (*b.bytecode() == Instruction::BinSlotImm
+                    && b.bin_slot_imm_parts().0 == Instruction::SHL as u8)
+        });
+        assert!(
+            !has_shl,
+            "x*1 should identity-reduce, not emit SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn string_addition_emits_format_not_add() {
         use common::Instruction;

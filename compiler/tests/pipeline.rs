@@ -2767,6 +2767,32 @@ fn main() {
     assert_eq!(output, "7");
 }
 
+/// `x * 2^n` / `2^n * x` / `x * const(2^n)` must lower to SHL but still
+/// compute the same values as MUL (wrong shift amount is silent otherwise).
+#[test]
+fn mul_strength_reduce_to_shl_prints_correct_values() {
+    let output = run_example_src(
+        r#"
+fn scale_rhs(int x) -> int { return x * 8; }
+fn scale_lhs(int x) -> int { return 4 * x; }
+fn scale_const(int x) -> int {
+    const K = 16;
+    return x * K;
+}
+fn scale_one(int x) -> int { return x * 1; }
+fn scale_six(int x) -> int { return x * 6; }
+fn main() {
+    print "%i,", scale_rhs(5);
+    print "%i,", scale_lhs(7);
+    print "%i,", scale_const(3);
+    print "%i,", scale_one(9);
+    print "%i", scale_six(7);
+}
+"#,
+    );
+    assert_eq!(output, "40,28,48,9,42");
+}
+
 /// Early-return callees must not be tiny-inlined (inliner truncates at first
 /// RETURN). Both arms must run correctly via a real CALL.
 #[test]
