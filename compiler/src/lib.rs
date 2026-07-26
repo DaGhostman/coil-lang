@@ -6969,21 +6969,15 @@ impl Compiler {
                 // Prefer trait/`Mul` dictionary dispatch over primitive
                 // `x * 2^n` → SHL when the checker recorded a bound operator
                 // (non-primitive `T * 2^n` must not emit int SHL).
-                let has_bound_mul = self_id
+                let bound_mul = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
                             .bound_operator_call_for_span(span.start, span.end)
                     })
-                    .is_some();
-                if self.try_emit_folded_expr(ast, &mut bytecode, !has_bound_mul) {
-                } else if let Some(hint) = self_id
-                    .and_then(|id| self.checker.bound_operator_call_at(id))
-                    .or_else(|| {
-                        self.checker
-                            .bound_operator_call_for_span(span.start, span.end)
-                    })
-                    .cloned()
+                    .cloned();
+                if self.try_emit_folded_expr(ast, &mut bytecode, bound_mul.is_none()) {
+                } else if let Some(hint) = bound_mul
                     && self.emit_bound_operator_call(
                         &mut bytecode,
                         lhs,
@@ -9073,6 +9067,29 @@ test("two") { assert(true)?; }
         assert!(
             !bytecode_has_any_shl(&bc),
             "x*1 should identity-reduce, not emit SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Generic `T: Num` bodies with two type operands dispatch through the
+    /// dictionary (`CallIndirect`), never primitive `SHL`. (A literal factor
+    /// like `x * 8` unifies `T` to `int` in the checker today, so that shape
+    /// correctly takes the primitive SHL path; the `bound_mul` guard covers
+    /// the open-var case.)
+    #[test]
+    fn generic_num_mul_uses_dictionary_not_shl() {
+        use common::Instruction;
+        let (bc, _pool) =
+            compile_src("fn mul2<T: Num>(T a, T b) -> T { return a * b; } fn main() { }");
+        assert!(
+            !bytecode_has_any_shl(&bc),
+            "generic Num mul must not lower to SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::CallIndirect)),
+            "expected CallIndirect for generic Num mul; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
