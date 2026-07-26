@@ -5544,11 +5544,70 @@ impl Checker {
         range: &Range<usize>,
         info: super::aggregate_arith::LinearAlgebraInfo,
     ) {
+        self.warn_packed_la_dim_limit(&info.kind, range);
         if let Some(id) = id {
             self.linear_algebra.insert(id, info.clone());
         }
         self.linear_algebra_by_span
             .insert((range.start, range.end), info);
+    }
+
+    /// Warn when static dims exceed Approach A packed-opcode packing
+    /// (`u8` for matrix dims, `u16` for `dot` length). Codegen still falls
+    /// back to scalar unroll — this is advisory, not a hard error.
+    fn warn_packed_la_dim_limit(
+        &mut self,
+        kind: &super::aggregate_arith::LinearAlgebraKind,
+        range: &Range<usize>,
+    ) {
+        use super::aggregate_arith::LinearAlgebraKind;
+        let (what, limit, dims): (&str, usize, String) = match kind {
+            LinearAlgebraKind::Dot { length, .. } if *length > u16::MAX as usize => (
+                "dot length",
+                u16::MAX as usize,
+                format!("{length}"),
+            ),
+            LinearAlgebraKind::MatMul { m, k, n, .. }
+                if *m > u8::MAX as usize || *k > u8::MAX as usize || *n > u8::MAX as usize =>
+            {
+                (
+                    "matrix multiply dimensions",
+                    u8::MAX as usize,
+                    format!("{m}×{k}×{n}"),
+                )
+            }
+            LinearAlgebraKind::MatrixZip { m, n, .. }
+                if *m > u8::MAX as usize || *n > u8::MAX as usize =>
+            {
+                (
+                    "matrix dimensions",
+                    u8::MAX as usize,
+                    format!("{m}×{n}"),
+                )
+            }
+            LinearAlgebraKind::MatrixNeg { m, n, .. }
+                if *m > u8::MAX as usize || *n > u8::MAX as usize =>
+            {
+                (
+                    "matrix dimensions",
+                    u8::MAX as usize,
+                    format!("{m}×{n}"),
+                )
+            }
+            _ => return,
+        };
+        let mut msg = Message::warn(
+            ErrorCode::GenericTypeError,
+            format!(
+                "{what} `{dims}` exceed the packed opcode limit ({limit})",
+            ),
+            range.clone(),
+        );
+        msg.with_help(
+            "codegen will fall back to scalar unroll; prefer smaller static shapes for the packed kernel"
+                .to_string(),
+        );
+        self.messages.push(msg);
     }
 
     fn compound_op_name(op: parser::ast::AssignOp) -> &'static str {

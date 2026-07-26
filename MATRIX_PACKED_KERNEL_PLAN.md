@@ -59,7 +59,7 @@ release `promise!(opcode <= …)` ceiling to the new last variant.
 ### 3.2 `PackedMatMul`
 
 - Stack: `[..., A, B]` (TOS = `B`)
-- Dims packed as `u8` (any dim > 255 → codegen keeps scalar unroll):
+- Dims packed as `u8` (any dim > 255 → typechecker warns, codegen unrolls):
   - `operands[7:0]` = `m`, `[15:8]` = `k`, `[23:16]` = `n`
   - `[24]` = `is_float`, `[25]` = `outer_is_tuple`, `[26]` = `row_is_tuple`
 - Push nested `m×n` result (array/tuple of rows per flags)
@@ -76,8 +76,10 @@ release `promise!(opcode <= …)` ceiling to the new last variant.
 - `operands[7:0]` = `m`, `[15:8]` = `n`
 - `[16]` = `is_float`, `[17]` = `outer_is_tuple`, `[18]` = `row_is_tuple`
 
-Dims that do not fit the packed fields fall back to the existing scalar
-unroll (defensive; no current program approaches that).
+Dims that do not fit the packed fields emit a **compile-time warning**
+(e.g. `matrix multiply dimensions \`2×256×2\` exceed the packed opcode
+limit (255)`) and fall back to the existing scalar unroll (non-fatal —
+unroll remains correct). Dot length uses a `u16` ceiling (`65535`).
 
 ---
 

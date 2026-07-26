@@ -13613,6 +13613,36 @@ fn main() {
         );
     }
 
+    /// Dims over the `u8` packed ceiling fall back to scalar unroll (and the
+    /// typechecker warns — see diagnostics `*_over_packed_u8_limit_warns`).
+    #[test]
+    fn matmul_dims_over_u8_limit_falls_back_to_unroll() {
+        use common::Instruction;
+        let ones: String = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(", ");
+        let a = format!("[[{ones}]]"); // 1×256
+        let b_rows: String = std::iter::repeat_n("[1]", 256)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!(
+            "fn main() {{\n    let a = {a};\n    let b = [{b_rows}];\n    let _ = matmul(a, b);\n}}\n"
+        );
+        let (bc, _) = compile_src(&src);
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::PackedMatMul)),
+            "dims > 255 must not emit PackedMatMul"
+        );
+        let mul_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF))
+            .count();
+        // 1×256×1 scalar unroll → 256 MULs.
+        assert!(
+            mul_count >= 256,
+            "expected scalar unroll (≥256 MUL); got {mul_count}"
+        );
+    }
+
     /// Approach A: `dot` lowers to `PackedDot`.
     #[test]
     fn dot_emits_packed_dot_opcode() {
