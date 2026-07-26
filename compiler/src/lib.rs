@@ -825,10 +825,6 @@ impl Compiler {
         }
     }
 
-    fn emit_extend(&mut self, span: SimpleSpan, bytes: Vec<Byte>) {
-        self.emit_bytes(span, &bytes);
-    }
-
     /// Number of global static slots for the VM table.
     pub fn static_slot_count(&self) -> u32 {
         self.checker.static_slot_count()
@@ -890,12 +886,6 @@ impl Compiler {
         self.const_env_stack.pop();
     }
 
-    fn ensure_const_env(&mut self) {
-        if self.const_env_stack.is_empty() {
-            self.const_env_stack.push(HashMap::new());
-        }
-    }
-
     fn emit_const_value(&mut self, v: &ConstValue, bytecode: &mut Vec<Byte>) {
         match v {
             ConstValue::Int(n) => {
@@ -946,6 +936,14 @@ impl Compiler {
         } else if let Some(inner) = const_fold::strength_reduced_inner(ast) {
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
+            true
+        } else if let Some((inner, shift)) =
+            const_fold::strength_mul_to_shl(ast, self.const_env())
+        {
+            let mut inner_bc = self.do_compile(inner);
+            bytecode.append(&mut inner_bc);
+            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(shift as i32));
+            bytecode.push(Byte::new(Instruction::SHL));
             true
         } else {
             false
@@ -1535,14 +1533,6 @@ impl Compiler {
         }
     }
 
-    /// Unwrap a [`Expression::NamedArg`] to its value expression.
-    fn call_arg_value<'a>(arg: &'a Output<'a>) -> &'a Output<'a> {
-        match arg.1.as_ref() {
-            Expression::NamedArg(_, value) => value,
-            _ => arg,
-        }
-    }
-
     /// Flatten `...expr` spread nodes for codegen using inferred types.
     fn flatten_call_args_for_emit<'a>(&self, args: &[Output<'a>]) -> Vec<Output<'a>> {
         use crate::typechecking::subst::apply_ty_prune;
@@ -1699,13 +1689,6 @@ impl Compiler {
             (fixed, rest, true)
         } else {
             (fixed, Vec::new(), false)
-        }
-    }
-
-    fn call_arg_value_owned<'a>(arg: &'a Output<'a>) -> Output<'a> {
-        match arg.1.as_ref() {
-            Expression::NamedArg(_, v) => v.clone(),
-            _ => arg.clone(),
         }
     }
 
@@ -6975,7 +6958,8 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
-                if let Some(hint) = self_id
+                if self.try_emit_folded_expr(ast, &mut bytecode) {
+                } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -8996,6 +8980,30 @@ test("two") { assert(true)?; }
         assert!(
             has_int_bin_slot && !has_float_bin_slot,
             "expected fused int BinSlotSlot(ADD) for integer arithmetic; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `x * 8` strength-reduces to `x << 3` (via [`const_fold::strength_mul_int`]).
+    #[test]
+    fn mul_by_power_of_two_emits_shl_not_mul() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn scale(int x) -> int { return x * 8; }");
+        // Builtin Num dictionary thunks also contain MUL; look for the
+        // strength-reduced user body (`LOAD; CONST; SHL` or a fused BinSlotImm SHL).
+        let has_load_const_shl = bc.windows(3).any(|w| {
+            matches!(w[0].bytecode(), Instruction::LOAD)
+                && matches!(w[1].bytecode(), Instruction::CONST)
+                && matches!(w[2].bytecode(), Instruction::SHL)
+        });
+        let has_fused_shl = bc.iter().any(|b| {
+            *b.bytecode() == Instruction::BinSlotImm
+                && b.bin_slot_imm_parts().0 == Instruction::SHL as u8
+                && b.bin_slot_imm_parts().2 == 3
+        });
+        assert!(
+            has_load_const_shl || has_fused_shl,
+            "expected LOAD/CONST/SHL (shift 3) or fused BinSlotImm(SHL, 3) for x*8; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }

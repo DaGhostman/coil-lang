@@ -16,15 +16,6 @@ pub enum ConstValue {
     Str(String),
 }
 
-impl ConstValue {
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            ConstValue::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-}
-
 /// Evaluate a pure expression using `env` for const identifiers.
 pub fn eval_expr<'a>(
     ast: &(SimpleSpan, Box<Expression<'a>>),
@@ -155,13 +146,46 @@ pub fn eval_string_add<'a>(
     }
 }
 
-/// Integer strength-reduction hint: `x * k` when k is 2 → shift left 1.
+/// Integer strength-reduction hint: `x * k` when k is a positive power of
+/// two → shift left by `trailing_zeros(k)`.
 pub fn strength_mul_int(k: i64) -> Option<u32> {
     if k > 0 && (k & (k - 1)) == 0 {
         Some(k.trailing_zeros())
     } else {
         None
     }
+}
+
+/// If `expr` is `x * 2^n` or `2^n * x` (n ≥ 1), return `(x, n)` so codegen
+/// can emit `SHL` instead of `MUL`. `n == 0` (`* 1`) is left to
+/// [`strength_reduced_inner`].
+pub fn strength_mul_to_shl<'a>(
+    expr: &'a (SimpleSpan, Box<Expression<'a>>),
+    env: &HashMap<String, ConstValue>,
+) -> Option<(&'a Output<'a>, u32)> {
+    let Expression::Mul(lhs, rhs) = expr.1.as_ref() else {
+        return None;
+    };
+    let shift_for = |side: &Output<'a>| -> Option<u32> {
+        match eval_expr(side, env)? {
+            ConstValue::Int(k) => {
+                let shift = strength_mul_int(k)?;
+                if shift == 0 {
+                    None
+                } else {
+                    Some(shift)
+                }
+            }
+            _ => None,
+        }
+    };
+    if let Some(shift) = shift_for(rhs) {
+        return Some((lhs, shift));
+    }
+    if let Some(shift) = shift_for(lhs) {
+        return Some((rhs, shift));
+    }
+    None
 }
 
 /// If `expr` is `x + 0`, `x - 0`, `x * 1`, `x / 1`, `x % 1` (when defined), return inner.
@@ -450,6 +474,52 @@ mod tests {
         assert_eq!(strength_mul_int(6), None);
         assert_eq!(strength_mul_int(0), None);
         assert_eq!(strength_mul_int(-4), None);
+    }
+
+    #[test]
+    fn strength_mul_to_shl_rewrites_power_of_two_factor() {
+        let env = HashMap::new();
+        let mul8 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(id_expr("x"), int_expr(8))),
+        );
+        let mul2_lhs = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(int_expr(2), id_expr("x"))),
+        );
+        let mul6 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(id_expr("x"), int_expr(6))),
+        );
+        let mul1 = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(id_expr("x"), int_expr(1))),
+        );
+        let (inner, shift) = strength_mul_to_shl(&mul8, &env).expect("x*8");
+        assert!(matches!(inner.1.as_ref(), Expression::Identifier("x")));
+        assert_eq!(shift, 3);
+        let (inner, shift) = strength_mul_to_shl(&mul2_lhs, &env).expect("2*x");
+        assert!(matches!(inner.1.as_ref(), Expression::Identifier("x")));
+        assert_eq!(shift, 1);
+        assert_eq!(strength_mul_to_shl(&mul6, &env), None);
+        // `* 1` stays with strength_reduced_inner
+        assert_eq!(strength_mul_to_shl(&mul1, &env), None);
+    }
+
+    #[test]
+    fn strength_mul_to_shl_uses_const_env() {
+        let mut env = HashMap::new();
+        env.insert("K".into(), ConstValue::Int(16));
+        let mul = (
+            SimpleSpan::from(0..3),
+            Box::new(Expression::Mul(
+                id_expr("x"),
+                (SimpleSpan::from(0..1), Box::new(Expression::Identifier("K"))),
+            )),
+        );
+        let (inner, shift) = strength_mul_to_shl(&mul, &env).expect("x*K");
+        assert!(matches!(inner.1.as_ref(), Expression::Identifier("x")));
+        assert_eq!(shift, 4);
     }
 
     #[test]
