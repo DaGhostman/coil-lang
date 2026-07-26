@@ -2341,6 +2341,7 @@ impl Compiler {
             (_, Some(rhs)) => {
                 let rty = self.expr_codegen_ty(rhs)?;
                 let rty = apply_ty_prune(self.checker.subst(), &rty);
+                use crate::typechecking::aggregate_arith::is_numeric_elem;
                 match (&lty, &rty) {
                     (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() && !a.is_empty() => {
                         let le = homogeneous_aggregate_elem(&lty)?;
@@ -2372,7 +2373,7 @@ impl Compiler {
                         },
                         op,
                     }),
-                    (Ty::Tuple(a), r) if !a.is_empty() && matches!(r, Ty::Con(_)) => {
+                    (Ty::Tuple(a), r) if !a.is_empty() && is_numeric_elem(r) => {
                         let elem = homogeneous_aggregate_elem(&lty)?;
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastTuple {
@@ -2383,7 +2384,7 @@ impl Compiler {
                             op,
                         })
                     }
-                    (l, Ty::Tuple(b)) if !b.is_empty() && matches!(l, Ty::Con(_)) => {
+                    (l, Ty::Tuple(b)) if !b.is_empty() && is_numeric_elem(l) => {
                         let elem = homogeneous_aggregate_elem(&rty)?;
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastTuple {
@@ -2394,7 +2395,7 @@ impl Compiler {
                             op,
                         })
                     }
-                    (Ty::Array { element, length }, r) if matches!(r, Ty::Con(_)) => {
+                    (Ty::Array { element, length }, r) if is_numeric_elem(r) => {
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastArray {
                                 length: match length {
@@ -2407,7 +2408,7 @@ impl Compiler {
                             op,
                         })
                     }
-                    (l, Ty::Array { element, length }) if matches!(l, Ty::Con(_)) => {
+                    (l, Ty::Array { element, length }) if is_numeric_elem(l) => {
                         Some(AggregateArithInfo {
                             kind: AggregateArithKind::BroadcastArray {
                                 length: match length {
@@ -5034,6 +5035,18 @@ impl Compiler {
         };
         if let Some(agg_op) = agg_op {
             let mut tmp = Vec::new();
+            if self.try_emit_matrix_op(
+                &mut tmp,
+                self_id,
+                span_start,
+                span_end,
+                target,
+                Some(rhs),
+            ) {
+                bytecode.append(&mut tmp);
+                self.emit_write_lvalue(bytecode, target, false);
+                return;
+            }
             if self.try_emit_aggregate_arith(
                 &mut tmp,
                 self_id,

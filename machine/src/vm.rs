@@ -2982,6 +2982,9 @@ impl<const S: usize> Machine<S> {
                     let is_float = (ops & (1 << 16)) != 0;
                     let b = self.stack.pop();
                     let a = self.stack.pop();
+                    // Defensive: typechecker guarantees aggregates. Missing
+                    // heap objects → empty slices → scalar 0 (same posture as
+                    // Index OOB), not a VM trap.
                     let av = Self::aggregate_elements(&self.heap, a).unwrap_or_default();
                     let bv = Self::aggregate_elements(&self.heap, b).unwrap_or_default();
                     let n = len.min(av.len()).min(bv.len());
@@ -3009,6 +3012,8 @@ impl<const S: usize> Machine<S> {
                     let row_is_tuple = (ops & (1 << 26)) != 0;
                     let b = self.stack.pop();
                     let a = self.stack.pop();
+                    // Defensive fill with defaults if extract fails (typechecker
+                    // is the source of truth for shapes).
                     let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, k)
                         .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(k)]);
                     let b_cells = Self::extract_matrix_row_major(&self.heap, b, k, n)

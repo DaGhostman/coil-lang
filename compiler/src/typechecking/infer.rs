@@ -2040,7 +2040,18 @@ impl Checker {
                 } else {
                     let tp = apply_ty_prune(&self.subst, &target_ty);
                     let vp = apply_ty_prune(&self.subst, &val_ty);
-                    if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
+                    if super::aggregate_arith::is_matrix_ty(&tp)
+                        || super::aggregate_arith::is_matrix_ty(&vp)
+                    {
+                        let result =
+                            self.infer_matrix_arith(tp.clone(), vp, id, range.clone(), op_name);
+                        let _ = self.unify(
+                            &target_ty,
+                            &result,
+                            &range,
+                            &format!("operands of `{}=`", op_name),
+                        );
+                    } else if matches!(&tp, Ty::Tuple(_) | Ty::Array { .. })
                         || matches!(&vp, Ty::Tuple(_) | Ty::Array { .. })
                     {
                         // Resolve as aggregate arith; result must match LHS shape.
@@ -5934,7 +5945,7 @@ impl Checker {
                 ErrorCode::GenericTypeError,
                 format!("element type `{}` does not support `dot`", elem),
                 range,
-                Some("dot requires numeric elements (`int` or `float`)".to_string()),
+                Some("dot requires numeric elements (`int`, `float`, or `byte`)".to_string()),
             );
         }
 
@@ -6201,7 +6212,7 @@ impl Checker {
                 ErrorCode::GenericTypeError,
                 format!("element type `{}` does not support `matrix`", elem),
                 range,
-                Some("matrix elements must be numeric (`int` or `float`)".to_string()),
+                Some("matrix elements must be numeric (`int`, `float`, or `byte`)".to_string()),
             );
         }
         wrap_matrix_ty(pruned)
@@ -13119,14 +13130,11 @@ impl Checker {
                 let _ = self.error_with_help(
                     ErrorCode::GenericTypeError,
                     format!(
-                        "heterogeneous {} is not iterable (element types `{}` and `{}`)",
+                        "heterogeneous {}: element types `{}` and `{}` do not match",
                         kind, first, other
                     ),
                     range.clone(),
-                    Some(format!(
-                        "{} for-in requires all elements to share one type",
-                        kind
-                    )),
+                    Some(format!("{} elements must all share one type", kind)),
                 );
                 return None;
             }

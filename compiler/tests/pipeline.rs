@@ -2857,6 +2857,20 @@ fn example_matrix_mul_prints_product_and_hadamard_add() {
 }
 
 #[test]
+fn matrix_compound_add_assign_updates_cells() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let m = matrix([[1, 2], [3, 4]]);
+    m += matrix([[10, 20], [30, 40]]);
+    print "%i,%i,%i,%i", m[0][0], m[0][1], m[1][0], m[1][1];
+}
+"#,
+    );
+    assert_eq!(output, "11,22,33,44");
+}
+
+#[test]
 fn matrix_sub_and_neg_packed_path_values() {
     // End-to-end: Matrix `-` (PackedMatrixZip Sub) and unary `-` (PackedMatrixNeg).
     let output = run_example_src(
