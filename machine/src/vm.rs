@@ -5301,7 +5301,7 @@ mod tests {
         assert_eq!(r0[1].as_int(), -7);
     }
 
-    /// PackedDot float path (`operands[16]` = is_float) — 1.5*2.0 + 2.5*4.0 = 13.0.
+    /// PackedDot float path (`operands[16]` = is_float) — 1.5*2.5 + 2.0*4.0 = 11.75.
     #[test]
     fn packed_dot_float_arrays() {
         let pool = [1.5f64.to_bits(), 2.0f64.to_bits(), 2.5f64.to_bits(), 4.0f64.to_bits()];
@@ -5318,7 +5318,7 @@ mod tests {
         ];
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &pool, 0);
-        assert_eq!(vm.pop().as_float(), 13.0);
+        assert_eq!(vm.pop().as_float(), 11.75);
     }
 
     /// PackedMatrixZip Sub (`zip_kind == 1`) — [[5,7]] - [[1,2]] → [[4,5]].

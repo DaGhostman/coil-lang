@@ -2879,11 +2879,11 @@ fn float_dot_packed_path_value() {
     let output = run_example_src(
         r#"
 fn main() {
-    print "%f", dot([1.5, 2.5], [2.0, 4.0]);
+    print "%f", dot([1.5, 2.0], [2.5, 4.0]);
 }
 "#,
     );
-    assert_eq!(output, "13.0");
+    assert_eq!(output, "11.75");
 }
 
 #[test]
