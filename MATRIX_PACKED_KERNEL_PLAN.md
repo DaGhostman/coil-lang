@@ -1,19 +1,32 @@
-# Approach A — Packed Fat Opcodes for Linear Algebra
+# Approach A — Packed Linear-Algebra Kernels
 
-**Status:** implemented  
+**Status:** implemented (via `HostInvoke`, not new opcodes)  
 **Depends on:** NT-7 named helpers + `Matrix`/`Mul` (already shipped)  
 **Goal:** Replace compile-time scalar unrolls for `dot` / `matmul` /
-`Matrix` `*` `+` `-` with **one fat opcode per op family**, whose VM
+`Matrix` `*` `+` `-` with **one packed kernel per op family**, whose
 handler extracts nested aggregates into contiguous Rust buffers, runs a
-tight packed kernel, then rebuilds the nested result. Same language
-surface and observable results; enables future SIMD/FMA inside the
-kernel without changing the opcode API.
+tight loop, then rebuilds the nested result. Same language surface and
+observable results; enables future SIMD/FMA inside the kernel without
+growing the `Instruction` enum.
+
+### Why not dedicated opcodes?
+
+Appending `PackedDot` / `PackedMatMul` / `PackedMatrixZip` /
+`PackedMatrixNeg` to `Instruction` grew the `execute` match and
+regressed fib branch prediction on some CPUs (~+25% wall / ~+40%
+branch misses vs `main` with nearly identical instruction counts).
+Kernels now live in `machine/src/packed_la.rs` and are registered as
+ordinary host natives (`packed_dot`, …). Codegen emits
+`CONST id` + args + `CONST meta` + `MakeTuple` + `HostInvoke`.
+`Instruction` stays identical to `main` (`TailCall` last).
+`ARCHIVE_VERSION` is **29** (invalidate archives that encoded the
+short-lived Packed\* opcodes).
 
 ---
 
 ## 1. Why Approach A
 
-Today `emit_linear_algebra` unrolls every cell into `LOAD` / `CONST` /
+Today `emit_linear_algebra` can unroll every cell into `LOAD` / `CONST` /
 `Index` / `MUL` / `ADD` / `MakeArray`. That is correct but:
 
 - Dispatch cost scales with `m·k·n` (matmul) or `length` (dot).
@@ -31,94 +44,76 @@ contiguous matrix heap objects) is deferred.
 
 ## 2. Scope
 
-| Op | Source | Fat opcode | Notes |
-|----|--------|------------|-------|
-| `dot(a,b)` | named helper | `PackedDot` | Equal-length vectors |
-| `matmul(A,B)` / `Matrix` `*` | named / Mul | `PackedMatMul` | Row-major `m×k` × `k×n` |
-| `Matrix` `+` / `-` | MatrixZip | `PackedMatrixZip` | Cell-wise add/sub |
-| `Matrix` unary `-` | MatrixNeg | `PackedMatrixNeg` | Cell-wise neg |
+| Op | Source | Host native | Notes |
+|----|--------|-------------|-------|
+| `dot(a,b)` | named helper | `packed_dot` | Equal-length vectors |
+| `matmul(A,B)` / `Matrix` `*` | named / Mul | `packed_matmul` | Row-major `m×k` × `k×n` |
+| `Matrix` `+` / `-` | MatrixZip | `packed_matrix_zip` | Cell-wise add/sub |
+| `Matrix` unary `-` | MatrixNeg | `packed_matrix_neg` | Cell-wise neg |
 | `cross(a,b)` | named helper | **keep unroll** | Fixed N=3; tiny; revisit later |
 
 No new syntax. Typechecker / `LinearAlgebraInfo` side table unchanged.
-Only codegen lowering + VM + `ARCHIVE_VERSION` bump.
+Codegen prefers HostInvoke when dims fit; otherwise falls back to unroll.
 
 ---
 
-## 3. Opcode layout (append-only)
+## 3. Meta `u32` layouts (same bits as the former opcodes)
 
-Append after `TailCall`. Bump `ARCHIVE_VERSION` **27 → 28**. Raise the
-release `promise!(opcode <= …)` ceiling to the new last variant.
+Dims that do not fit emit a **compile-time warning** and fall back to
+scalar unroll. Dot length uses a `u16` ceiling (`65535`); matrix dims
+use `u8` (255).
 
-### 3.1 `PackedDot`
+### 3.1 `packed_dot` — args `[a, b, meta]`
 
-- Stack: `[..., a, b]` (TOS = `b`)
-- `operands[15:0]` = length (`u16`)
-- `operands[16]` = `is_float`
-- Push scalar `Σ a[i]*b[i]`
+- `meta[15:0]` = length (`u16`)
+- `meta[16]` = `is_float`
+- Returns scalar `Σ a[i]*b[i]`
 
-### 3.2 `PackedMatMul`
+### 3.2 `packed_matmul` — args `[A, B, meta]`
 
-- Stack: `[..., A, B]` (TOS = `B`)
-- Dims packed as `u8` (any dim > 255 → typechecker warns, codegen unrolls):
-  - `operands[7:0]` = `m`, `[15:8]` = `k`, `[23:16]` = `n`
-  - `[24]` = `is_float`, `[25]` = `outer_is_tuple`, `[26]` = `row_is_tuple`
-- Push nested `m×n` result (array/tuple of rows per flags)
+- `meta[7:0]` = `m`, `[15:8]` = `k`, `[23:16]` = `n`
+- `[24]` = `is_float`, `[25]` = `outer_is_tuple`, `[26]` = `row_is_tuple`
+- Returns nested `m×n` result
 
-### 3.3 `PackedMatrixZip`
+### 3.3 `packed_matrix_zip` — args `[A, B, meta]`
 
-- Stack: `[..., A, B]`
-- `operands[7:0]` = `m`, `[15:8]` = `n`, `[23:16]` = zip kind (`0` Add, `1` Sub)
+- `meta[7:0]` = `m`, `[15:8]` = `n`, `[23:16]` = zip kind (`0` Add, `1` Sub)
 - `[24]` = `is_float`, `[25]` = `outer_is_tuple`, `[26]` = `row_is_tuple`
 
-### 3.4 `PackedMatrixNeg`
+### 3.4 `packed_matrix_neg` — args `[A, meta]`
 
-- Stack: `[..., A]`
-- `operands[7:0]` = `m`, `[15:8]` = `n`
+- `meta[7:0]` = `m`, `[15:8]` = `n`
 - `[16]` = `is_float`, `[17]` = `outer_is_tuple`, `[18]` = `row_is_tuple`
-
-Dims that do not fit the packed fields emit a **compile-time warning**
-(e.g. `matrix multiply dimensions \`2×256×2\` exceed the packed opcode
-limit (255)`) and fall back to the existing scalar unroll (non-fatal —
-unroll remains correct). Dot length uses a `u16` ceiling (`65535`).
-
-VM handlers for `Packed*` live in `#[inline(never)]` helpers
-(`exec_packed_dot` / `exec_packed_matmul` / …) so the hot `execute`
-match stays small for scalar workloads (fib / numeric loops).
 
 ---
 
-## 4. VM kernel contract
+## 4. VM / host contract
 
-Shared helpers on `Machine` (or free fns with `&Heap` / `&mut Heap`):
+Shared helpers in `machine/src/packed_la.rs`:
 
-1. **`aggregate_elements(heap, v) -> Option<&[Value]>`** — Array or Tuple.
-2. **`extract_matrix_row_major(heap, v, m, n) -> Option<Vec<Value>>`** —
-   walk outer × inner; fail soft → push `0` / empty defensive result
-   (typechecker is source of truth).
-3. **`packed_*_kernel`** — convert to `Vec<i64>` or `Vec<f64>`, loop
-   with contiguous indexing (`c[i*n+j] += a[i*k+t] * b[t*n+j]` for
-   matmul). **No SIMD in v1** — keep the loop obvious so SIMD can land
-   later inside the same function.
-4. **`alloc_nested_matrix(...)`** — allocate inner rows then outer
-   container; bump `alloc_counter` / GC pressure like `MakeArray`.
+1. **`aggregate_elements`** — Array or Tuple.
+2. **`extract_matrix_row_major`** — walk outer × inner.
+3. **Kernel loops** — contiguous indexing; **no SIMD in v1**.
+4. **`alloc_nested_matrix`** — allocate inner rows then outer container.
 
-Extract copies `Value`s (immediates or heap pointers for nested cells —
-cells are scalars for these ops).
+Pipeline wires natives in `Pipeline::register_packed_la_natives`
+(after IO natives). Codegen looks up ids via `Compiler::native_id`.
+
+Meta CONST bytes **must** use `with_operand_u32` (full 32 bits). Do not
+use `with_value_u32` for meta — it only keeps the low 16 bits.
 
 ---
 
 ## 5. Codegen
 
-`emit_linear_algebra` for Dot / MatMul / MatrixZip / MatrixNeg:
+`try_emit_packed_linear_algebra` for Dot / MatMul / MatrixZip / MatrixNeg:
 
-1. Compile args onto the stack (no temp `StorePop` required for the
-   packed path — leave values on TOS in order `[a, b]`).
-2. Emit the matching `Packed*` byte with packed dims/flags.
-3. If any dim > `u16::MAX`, keep the pre-Approach-A unroll path.
+1. Resolve host-native id; bail to unroll if unregistered.
+2. Emit `CONST id`, compile value args, `CONST meta`, `MakeTuple(n+1)`,
+   `HostInvoke(n+1)`.
+3. If any dim exceeds packed field width, keep the unroll path.
 
 `cross` stays on the unroll path.
-
-Peephole: treat new opcodes as opaque (no fusion required).
 
 ---
 
@@ -126,17 +121,17 @@ Peephole: treat new opcodes as opaque (no fusion required).
 
 | Suite | What |
 |-------|------|
-| `machine` unit | `PackedDot` int; `PackedMatMul` 2×2; zip add; neg |
+| `machine` unit | `packed_dot` int; `packed_matmul` 2×2; zip add; neg |
 | Pipeline goldens | Existing `vec_dot`, `vec_matmul`, `matrix_mul` unchanged outputs |
-| Optional codegen | Assert `matmul` / `matrix *` emit `PackedMatMul` (not a cascade of `MUL`) |
+| Codegen | Assert packed ops emit `HostInvoke` (not a MUL cascade); `cross` does not |
 
 ---
 
 ## 7. Non-goals / follow-ups
 
 - Contiguous `ObjMatrix` heap type (Approach B).
-- SIMD / FMA / blocked matmul inside the kernel (same opcode later).
-- `PackedCross`.
+- SIMD / FMA / blocked matmul inside the kernel.
+- Dedicated opcodes again (rejected for fib dispatch cost).
 - Changing zip Hadamard on bare tuples/arrays (NT tower unroll stays).
 
 ---
@@ -147,4 +142,5 @@ Peephole: treat new opcodes as opaque (no fusion required).
 - `examples/vec_matmul.hy` → `19,22,43,50`
 - `examples/vec_dot.hy` → `32,001`
 - `cargo test --workspace` green
-- `ARCHIVE_VERSION == 28`; release opcode ceiling includes new variants
+- `ARCHIVE_VERSION == 29`; `Instruction` last variant remains `TailCall`
+  (same as `main`)

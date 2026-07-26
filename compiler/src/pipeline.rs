@@ -311,6 +311,33 @@ impl Pipeline {
         }
     }
 
+    /// Approach A packed LA kernels via existing `HostInvoke` (no new opcodes —
+    /// keeps the `Instruction` enum identical to `main` for fib dispatch).
+    fn register_packed_la_natives(&mut self) {
+        use machine::{
+            PACKED_DOT, PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, packed_dot,
+            packed_matmul, packed_matrix_neg, packed_matrix_zip,
+        };
+
+        let specs: &[(&str, usize, fn(&mut machine::Heap, &[common::Value]) -> common::Value)] = &[
+            (PACKED_DOT, 3, packed_dot),
+            (PACKED_MATMUL, 3, packed_matmul),
+            (PACKED_MATRIX_ZIP, 3, packed_matrix_zip),
+            (PACKED_MATRIX_NEG, 2, packed_matrix_neg),
+        ];
+        for &(name, arity, kernel) in specs {
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.to_string(), args, FfiType::Int)
+                .expect("packed LA native signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(name, id);
+            self.host_natives
+                .push(std::sync::Arc::new(HostClosureFn::new(sig, move |heap, args| {
+                    Ok(Some(kernel(heap, args)))
+                })));
+        }
+    }
+
     /// Borrow the inner `Compiler` mutably. Used by the
     /// integration tests in `compiler/src/lib.rs::tests`
     /// and `compiler/tests/namespace.rs` that need to
@@ -435,6 +462,7 @@ impl Pipeline {
             Err(e) => pipeline.emit_manifest_load_error(&project_root, e),
         }
         pipeline.register_io_natives();
+        pipeline.register_packed_la_natives();
         pipeline
     }
 

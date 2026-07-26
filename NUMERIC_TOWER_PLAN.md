@@ -639,11 +639,12 @@ Nominal wrapper distinct from bare nested arrays:
 
 Example: `examples/matrix_mul.hy` → `19,22,43,502`.
 
-### 13.4 Approach A — packed fat opcodes (implemented)
+### 13.4 Approach A — packed LA kernels (implemented via HostInvoke)
 
-Scalar unroll for `dot` / `matmul` / `Matrix` ops is replaced by fat
-opcodes (`PackedDot`, `PackedMatMul`, `PackedMatrixZip`,
-`PackedMatrixNeg`) that extract nested aggregates into contiguous
-buffers, run a packed kernel, and rebuild the nested result. Enables
-future SIMD inside the same opcode surface. Details:
+Scalar unroll for `dot` / `matmul` / `Matrix` ops is replaced by packed
+kernels registered as host natives (`packed_dot`, `packed_matmul`,
+`packed_matrix_zip`, `packed_matrix_neg` in `machine/src/packed_la.rs`).
+Codegen emits `HostInvoke` with a meta `u32` (same bit layouts as the
+short-lived Packed\* opcodes). **No new `Instruction` variants** — fib
+dispatch stays identical to `main`. Details:
 [`MATRIX_PACKED_KERNEL_PLAN.md`](./MATRIX_PACKED_KERNEL_PLAN.md).

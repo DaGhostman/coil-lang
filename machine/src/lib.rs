@@ -4,9 +4,14 @@ mod ffi;
 pub mod io;
 mod memory;
 mod opcode;
+pub mod packed_la;
 mod vm;
 
 pub use ffi::*;
 pub use memory::*;
 pub use opcode::*;
+pub use packed_la::{
+    PACKED_DOT, PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, packed_dot, packed_matmul,
+    packed_matrix_neg, packed_matrix_zip,
+};
 pub use vm::*;

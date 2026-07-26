@@ -24,15 +24,6 @@ use common::ValueTag;
 /// Run mark-and-sweep after this many heap allocations (`INIT`, `STRING`, `FORMAT`, `MAKE_ENUM`).
 const GC_TRIGGER_INTERVAL: usize = 64;
 
-/// Outcome of a cold opcode — rare paths out of the hot `execute` loop.
-enum ColdDispatch {
-    Continue,
-    Stop,
-    /// Pending FFI callback: unwind `execute` with `true` (see `FfiInvoke`).
-    Yield,
-}
-
-
 // Thread-local dispatch counter (tests / `vm_profile` only).
 #[cfg(any(test, feature = "vm_profile"))]
 thread_local! {
@@ -276,214 +267,6 @@ impl<const S: usize> Machine<S> {
             current = reference.get_next();
         }
         None
-    }
-
-    /// Clone elements of an `ObjArray` / `ObjTuple` (Approach A packed kernels).
-    fn aggregate_elements(heap: &Heap, v: Value) -> Option<Vec<Value>> {
-        match Self::find_object_by_addr(heap, v.raw() as u64) {
-            Some(Object::Array(gc)) => Some(gc.as_ref().elements.clone()),
-            Some(Object::Tuple(gc)) => Some(gc.as_ref().elements.clone()),
-            _ => None,
-        }
-    }
-
-    /// Flatten a nested matrix into row-major `m * n` cells.
-    fn extract_matrix_row_major(
-        heap: &Heap,
-        v: Value,
-        m: usize,
-        n: usize,
-    ) -> Option<Vec<Value>> {
-        let rows = Self::aggregate_elements(heap, v)?;
-        if rows.len() < m {
-            return None;
-        }
-        let mut out = Vec::with_capacity(m.saturating_mul(n));
-        for i in 0..m {
-            let row = Self::aggregate_elements(heap, rows[i])?;
-            if row.len() < n {
-                return None;
-            }
-            out.extend_from_slice(&row[..n]);
-        }
-        Some(out)
-    }
-
-    fn maybe_gc_after_alloc(&mut self) {
-        if self.alloc_counter > GC_TRIGGER_INTERVAL {
-            Self::gc_collect(
-                &mut self.heap,
-                &self.stack,
-                &self.resume_stack,
-                &mut self.alloc_counter,
-            );
-        }
-    }
-
-    /// Allocate an array or tuple from already-ordered elements.
-    fn alloc_aggregate(&mut self, values: Vec<Value>, is_tuple: bool) -> Value {
-        self.alloc_counter += 1;
-        let addr = if is_tuple {
-            let (object, _) = self.heap.alloc(ObjTuple { elements: values }, Object::Tuple);
-            object.addr()
-        } else {
-            let (object, _) = self.heap.alloc(ObjArray { elements: values }, Object::Array);
-            object.addr()
-        };
-        self.maybe_gc_after_alloc();
-        Value::from(addr)
-    }
-
-    /// Rebuild nested `m×n` matrix from row-major cells.
-    fn alloc_nested_matrix(
-        &mut self,
-        cells: Vec<Value>,
-        m: usize,
-        n: usize,
-        outer_is_tuple: bool,
-        row_is_tuple: bool,
-    ) -> Value {
-        let mut rows = Vec::with_capacity(m);
-        for i in 0..m {
-            let start = i * n;
-            let row = cells[start..start + n].to_vec();
-            rows.push(self.alloc_aggregate(row, row_is_tuple));
-        }
-        self.alloc_aggregate(rows, outer_is_tuple)
-    }
-
-    /// Cold path for `PackedDot` — kept out of the hot `execute` match so
-    /// fib/scalar dispatch stays I-cache friendly (Approach A kernels are rare).
-    #[inline(never)]
-    fn exec_packed_dot(&mut self, ops: u32) {
-        let len = (ops & 0xFFFF) as usize;
-        let is_float = (ops & (1 << 16)) != 0;
-        let b = self.stack.pop();
-        let a = self.stack.pop();
-        // Defensive: typechecker guarantees aggregates. Missing heap objects
-        // → empty slices → scalar 0 (same posture as Index OOB), not a VM trap.
-        let av = Self::aggregate_elements(&self.heap, a).unwrap_or_default();
-        let bv = Self::aggregate_elements(&self.heap, b).unwrap_or_default();
-        let n = len.min(av.len()).min(bv.len());
-        if is_float {
-            let mut sum = 0.0_f64;
-            for i in 0..n {
-                sum += av[i].as_float() * bv[i].as_float();
-            }
-            self.stack.push(Value::from(sum));
-        } else {
-            let mut sum = 0_i64;
-            for i in 0..n {
-                sum = sum.wrapping_add(av[i].as_int().wrapping_mul(bv[i].as_int()));
-            }
-            self.stack.push(Value::from(sum));
-        }
-    }
-
-    /// Cold path for `PackedMatMul` (see `exec_packed_dot`).
-    #[inline(never)]
-    fn exec_packed_matmul(&mut self, ops: u32) {
-        let m = (ops & 0xFF) as usize;
-        let k = ((ops >> 8) & 0xFF) as usize;
-        let n = ((ops >> 16) & 0xFF) as usize;
-        let is_float = (ops & (1 << 24)) != 0;
-        let outer_is_tuple = (ops & (1 << 25)) != 0;
-        let row_is_tuple = (ops & (1 << 26)) != 0;
-        let b = self.stack.pop();
-        let a = self.stack.pop();
-        // Defensive fill with defaults if extract fails (typechecker is the
-        // source of truth for shapes).
-        let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, k)
-            .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(k)]);
-        let b_cells = Self::extract_matrix_row_major(&self.heap, b, k, n)
-            .unwrap_or_else(|| vec![Value::default(); k.saturating_mul(n)]);
-        let mut c = vec![Value::default(); m.saturating_mul(n)];
-        if is_float {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0.0_f64;
-                    for t in 0..k {
-                        acc += a_cells[i * k + t].as_float() * b_cells[t * n + j].as_float();
-                    }
-                    c[i * n + j] = Value::from(acc);
-                }
-            }
-        } else {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0_i64;
-                    for t in 0..k {
-                        acc = acc.wrapping_add(
-                            a_cells[i * k + t]
-                                .as_int()
-                                .wrapping_mul(b_cells[t * n + j].as_int()),
-                        );
-                    }
-                    c[i * n + j] = Value::from(acc);
-                }
-            }
-        }
-        let result = self.alloc_nested_matrix(c, m, n, outer_is_tuple, row_is_tuple);
-        self.stack.push(result);
-    }
-
-    /// Cold path for `PackedMatrixZip` (see `exec_packed_dot`).
-    #[inline(never)]
-    fn exec_packed_matrix_zip(&mut self, ops: u32) {
-        let m = (ops & 0xFF) as usize;
-        let n = ((ops >> 8) & 0xFF) as usize;
-        let zip_kind = ((ops >> 16) & 0xFF) as u8;
-        let is_float = (ops & (1 << 24)) != 0;
-        let outer_is_tuple = (ops & (1 << 25)) != 0;
-        let row_is_tuple = (ops & (1 << 26)) != 0;
-        let b = self.stack.pop();
-        let a = self.stack.pop();
-        let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, n)
-            .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
-        let b_cells = Self::extract_matrix_row_major(&self.heap, b, m, n)
-            .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
-        let mut c = Vec::with_capacity(m.saturating_mul(n));
-        for i in 0..m.saturating_mul(n) {
-            let cell = if is_float {
-                let av = a_cells[i].as_float();
-                let bv = b_cells[i].as_float();
-                Value::from(if zip_kind == 1 { av - bv } else { av + bv })
-            } else {
-                let av = a_cells[i].as_int();
-                let bv = b_cells[i].as_int();
-                Value::from(if zip_kind == 1 {
-                    av.wrapping_sub(bv)
-                } else {
-                    av.wrapping_add(bv)
-                })
-            };
-            c.push(cell);
-        }
-        let result = self.alloc_nested_matrix(c, m, n, outer_is_tuple, row_is_tuple);
-        self.stack.push(result);
-    }
-
-    /// Cold path for `PackedMatrixNeg` (see `exec_packed_dot`).
-    #[inline(never)]
-    fn exec_packed_matrix_neg(&mut self, ops: u32) {
-        let m = (ops & 0xFF) as usize;
-        let n = ((ops >> 8) & 0xFF) as usize;
-        let is_float = (ops & (1 << 16)) != 0;
-        let outer_is_tuple = (ops & (1 << 17)) != 0;
-        let row_is_tuple = (ops & (1 << 18)) != 0;
-        let a = self.stack.pop();
-        let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, n)
-            .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
-        let mut c = Vec::with_capacity(a_cells.len());
-        for cell in a_cells {
-            c.push(if is_float {
-                Value::from(-cell.as_float())
-            } else {
-                Value::from(cell.as_int().wrapping_neg())
-            });
-        }
-        let result = self.alloc_nested_matrix(c, m, n, outer_is_tuple, row_is_tuple);
-        self.stack.push(result);
     }
 
     #[allow(dead_code)]
@@ -1266,21 +1049,57 @@ impl<const S: usize> Machine<S> {
         self.run_with_pool(code, constants, static_slots);
     }
 
-    /// Cold opcode dispatch (I/O, FFI, match, coro, packed LA, …).
-    /// `#[inline(never)]` + `#[cold]` keep fib/scalar loops in a small hot
-    /// `execute` match for branch prediction / I-cache.
-    #[cold]
-    #[inline(never)]
-    fn dispatch_cold(
-        &mut self,
-        bc: Instruction,
-        opcode: &Byte,
-        code: &[Byte],
-        constants: &[u64],
-        ip: &mut usize,
-        sp: &mut usize,
-    ) -> ColdDispatch {
-        match bc {
+    #[inline(always)]
+    fn execute(&mut self, code: &[Byte], constants: &[u64], start_ip: usize) -> bool {
+        #[cfg(debug_assertions)]
+        let frame_no = self.frames.len();
+
+        let mut ip: usize = start_ip;
+        let mut sp = self.frames.get_mut().get();
+
+        while ip < code.len() {
+            #[cfg(any(test, feature = "vm_profile"))]
+            VM_DISPATCH_COUNT.with(|c| c.fetch_add(1, Ordering::Relaxed));
+
+            let opcode = &code[ip];
+            ip += 1;
+
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
+                    frame_no,
+                    ip,
+                    *opcode.bytecode() as u8,
+                    opcode.operand_u16(0),
+                    opcode.operand_u16(1),
+                    self.stack.as_slice()
+                );
+            }
+
+            let bc = opcode.bytecode();
+            // Release-only optimizer hint: must track the LAST `Instruction`
+            // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
+            // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
+            #[cfg(not(debug_assertions))]
+            promise!(*bc as u8 <= Instruction::TailCall as u8);
+
+            match bc {
+                Instruction::POP => {
+                    self.stack.pop();
+                }
+                Instruction::DUPLICATE => {
+                    self.stack.push(*self.stack.peek());
+                }
+                Instruction::CONST => {
+                    let op = opcode.operand_u32();
+                    let raw = if unlikely(op & Byte::POOL_FLAG != 0) {
+                        constants[(op & !Byte::POOL_FLAG) as usize]
+                    } else {
+                        op as i32 as i64 as u64
+                    };
+                    self.stack.push(Value::from(raw));
+                }
                 Instruction::CodePtr => {
                     // Absolute bytecode entry — same stack representation as an
                     // integer constant so `CallIndirect` / dict `Index` can
@@ -1288,6 +1107,89 @@ impl<const S: usize> Machine<S> {
                     let offset = opcode.operand_u32() as i64;
                     self.stack.push(Value::from(offset));
                 }
+                Instruction::STORE => {
+                    // No-op: stack and locals share memory; UNPACK/JUMP_IF_MATCH
+                    // already wrote match bindings into slot positions.
+                }
+                Instruction::LOAD => {
+                    self.stack
+                        .push(self.stack[sp + opcode.operand_u32() as usize]);
+                }
+                Instruction::INC => {
+                    let (slot, prefix, is_float) = opcode.inc_dec_parts();
+                    let idx = sp + slot;
+                    let old = self.stack[idx];
+                    let new_val = if is_float {
+                        Value::from(old.as_float() + 1.0)
+                    } else {
+                        Value::from(old.as_int() + 1)
+                    };
+                    self.stack[idx] = new_val;
+                    self.stack.push(if prefix { new_val } else { old });
+                }
+                Instruction::DEC => {
+                    let (slot, prefix, is_float) = opcode.inc_dec_parts();
+                    let idx = sp + slot;
+                    let old = self.stack[idx];
+                    let new_val = if is_float {
+                        Value::from(old.as_float() - 1.0)
+                    } else {
+                        Value::from(old.as_int() - 1)
+                    };
+                    self.stack[idx] = new_val;
+                    self.stack.push(if prefix { new_val } else { old });
+                }
+                Instruction::NOT => unary!(self.stack, !, as_int),
+                Instruction::LogNot => {
+                    let val = self.stack.pop();
+                    self.stack.push(Value::from(!(val.as_int() != 0)));
+                }
+                Instruction::NEG => unary!(self.stack, -, as_int),
+                Instruction::AND => binary!(self.stack, &&, as_bool),
+                Instruction::OR => binary!(self.stack, ||, as_bool),
+                Instruction::ADD => binary!(self.stack, +, as_int),
+                Instruction::SUB => binary!(self.stack, -, as_int),
+                Instruction::MUL => binary!(self.stack, *, as_int),
+                Instruction::DIV => binary!(self.stack, /, as_int),
+                Instruction::MOD => binary!(self.stack, %, as_int),
+                Instruction::LE => binary!(self.stack, <, raw),
+                Instruction::LEQ => binary!(self.stack, <=, raw),
+                Instruction::GT => binary!(self.stack, >, raw),
+                Instruction::GEQ => binary!(self.stack, >=, raw),
+                Instruction::EQ => binary!(self.stack, ==, raw),
+                Instruction::NEQ => binary!(self.stack, !=, raw),
+                Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
+                Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
+                Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
+                Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
+                Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
+                Instruction::SHL => binary!(self.stack, <<, as_int),
+                Instruction::SHR => binary!(self.stack, >>, as_int),
+                Instruction::XOR => binary!(self.stack, ^, as_int),
+                Instruction::BITAND => binary!(self.stack, &, as_int),
+                Instruction::BITOR => binary!(self.stack, |, as_int),
+                Instruction::Pow => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 2);
+                    let rhs = self.stack[sp - 1].as_int();
+                    let lhs = self.stack[sp - 2].as_int();
+                    let result = lhs.pow(rhs as u32);
+                    self.stack[sp - 2].replace(result as _);
+                    self.stack.seek(sp - 1);
+                }
+                Instruction::PowF => {
+                    let sp = self.stack.tell();
+                    promise!(sp >= 2);
+                    let rhs = self.stack[sp - 1].as_float();
+                    let lhs = self.stack[sp - 2].as_float();
+                    let result = lhs.powf(rhs);
+                    self.stack[sp - 2].replace(result.to_bits() as _);
+                    self.stack.seek(sp - 1);
+                }
+                Instruction::LEF => binary!(self.stack, <, as_float),
+                Instruction::LEQF => binary!(self.stack, <=, as_float),
+                Instruction::GTF => binary!(self.stack, >, as_float),
+                Instruction::GEQF => binary!(self.stack, >=, as_float),
                 Instruction::FORMAT => {
                     let params_count = opcode.operand_u32();
                     if params_count != 0 {
@@ -1419,6 +1321,45 @@ impl<const S: usize> Machine<S> {
                         let _ = io::stdout().flush();
                     }
                 }
+                Instruction::JMP => {
+                    ip = opcode.operand_u32() as usize;
+                }
+                Instruction::JMPF => {
+                    if !self.stack.pop().as_bool() {
+                        ip = opcode.operand_u32() as usize;
+                    }
+                }
+                Instruction::JMPT => {
+                    if self.stack.pop().as_bool() {
+                        ip = opcode.operand_u32() as usize;
+                    }
+                }
+                Instruction::CALL => {
+                    let (arity, target) = opcode.call_parts();
+                    let return_ip = ip + if target == 0 { 1 } else { 0 };
+                    let callee_sp = self.stack.tell() - arity;
+                    self.frames.get_mut().seek(return_ip);
+                    self.frames
+                        .setup_current_and_advance(|frame| frame.set(callee_sp));
+                    sp = callee_sp;
+                    if target != 0 {
+                        ip = target;
+                    }
+                }
+                Instruction::TailCall => {
+                    let (arity, target) = opcode.call_parts();
+                    let callee_sp = self.frames.get().get();
+                    for i in (0..arity).rev() {
+                        let val = self.stack.pop();
+                        self.stack[callee_sp + i] = val;
+                    }
+                    self.stack.seek(callee_sp + arity);
+                    // Match CALL: `sp` is the frame base (locals start at slot 0),
+                    // not past the args. Using `callee_sp + arity` would make
+                    // subsequent LOAD/BinSlotImm read the wrong slots.
+                    sp = callee_sp;
+                    ip = target;
+                }
                 Instruction::INIT => {
                     let (_, mut r) = self.heap.alloc(ObjInstance::default(), Object::Instance);
                     let _ = r.as_mut();
@@ -1434,6 +1375,182 @@ impl<const S: usize> Machine<S> {
                     }
 
                     self.stack.push(Value::from(r.as_ptr().addr() as u64));
+                }
+                Instruction::RETURN => {
+                    let ret_val = self.stack.pop();
+                    let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+                    if self.nested_depth > 0 && self.frames.len() == nested_target {
+                        self.nested_return = Some(ret_val);
+                        return false;
+                    }
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
+                    self.stack.push(ret_val);
+                    self.after_return(&mut ip, &mut sp);
+                }
+                // Fused `LOAD slot; CONST imm; <binop>`.
+                Instruction::BinSlotImm => {
+                    let (op, slot, imm) = opcode.bin_slot_imm_parts();
+                    let lhs = self.stack[sp + slot];
+                    self.stack.push(lhs);
+                    self.stack.push(Value::from(imm));
+                    match Instruction::from(op) {
+                        Instruction::ADD => binary!(self.stack, +, as_int),
+                        Instruction::SUB => binary!(self.stack, -, as_int),
+                        Instruction::MUL => binary!(self.stack, *, as_int),
+                        Instruction::DIV => binary!(self.stack, /, as_int),
+                        Instruction::MOD => binary!(self.stack, %, as_int),
+                        Instruction::LE => binary!(self.stack, <, raw),
+                        Instruction::LEQ => binary!(self.stack, <=, raw),
+                        Instruction::GT => binary!(self.stack, >, raw),
+                        Instruction::GEQ => binary!(self.stack, >=, raw),
+                        Instruction::EQ => binary!(self.stack, ==, raw),
+                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::Pow => {
+                            let sp = self.stack.tell();
+                            let rhs = self.stack[sp - 1].as_int().max(0) as u32;
+                            let lhs = self.stack[sp - 2].as_int();
+                            self.stack[sp - 2].replace(lhs.pow(rhs) as u64);
+                            self.stack.seek(sp - 1);
+                        }
+                        Instruction::BITAND => binary!(self.stack, &, as_int),
+                        Instruction::BITOR => binary!(self.stack, |, as_int),
+                        _ => {}
+                    }
+                }
+                // Fused `<cmp>; JMPF target`.
+                Instruction::CmpJmpf => {
+                    let (op, target) = opcode.cmp_jmpf_parts();
+                    match Instruction::from(op) {
+                        Instruction::LE => binary!(self.stack, <, raw),
+                        Instruction::LEQ => binary!(self.stack, <=, raw),
+                        Instruction::GT => binary!(self.stack, >, raw),
+                        Instruction::GEQ => binary!(self.stack, >=, raw),
+                        Instruction::EQ => binary!(self.stack, ==, raw),
+                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::LEF => binary!(self.stack, <, as_float),
+                        Instruction::LEQF => binary!(self.stack, <=, as_float),
+                        Instruction::GTF => binary!(self.stack, >, as_float),
+                        Instruction::GEQF => binary!(self.stack, >=, as_float),
+                        _ => {}
+                    }
+                    if !self.stack.pop().as_bool() {
+                        ip = target;
+                    }
+                }
+                Instruction::BinSlotImmJmpf => {
+                    let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
+                    let packed = constants.get(pool_idx).copied().unwrap_or(0);
+                    let imm = packed as u32 as i32 as i64;
+                    let target = (packed >> 32) as usize;
+                    let lhs = self.stack[sp + slot];
+                    self.stack.push(lhs);
+                    self.stack.push(Value::from(imm));
+                    match Instruction::from(op) {
+                        Instruction::LE => binary!(self.stack, <, raw),
+                        Instruction::LEQ => binary!(self.stack, <=, raw),
+                        Instruction::GT => binary!(self.stack, >, raw),
+                        Instruction::GEQ => binary!(self.stack, >=, raw),
+                        Instruction::EQ => binary!(self.stack, ==, raw),
+                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::LEF => binary!(self.stack, <, as_float),
+                        Instruction::LEQF => binary!(self.stack, <=, as_float),
+                        Instruction::GTF => binary!(self.stack, >, as_float),
+                        Instruction::GEQF => binary!(self.stack, >=, as_float),
+                        _ => {
+                            self.stack.pop();
+                            self.stack.pop();
+                        }
+                    }
+                    if !self.stack.pop().as_bool() {
+                        ip = target;
+                    }
+                }
+                Instruction::LogNotJmpf => {
+                    let target = opcode.log_not_jmpf_target();
+                    let val = self.stack.pop();
+                    if val.as_int() != 0 {
+                        ip = target;
+                    }
+                }
+                Instruction::LoadReturnSlot => {
+                    let ret_val = self.stack[sp + opcode.operand_u32() as usize];
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
+                    self.stack.push(ret_val);
+                    self.after_return(&mut ip, &mut sp);
+                }
+                Instruction::ConstReturnImm => {
+                    let ret_val = Value::from(opcode.operand_u32() as i32 as i64 as u64);
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
+                    self.stack.push(ret_val);
+                    self.after_return(&mut ip, &mut sp);
+                }
+                Instruction::BinReturn => {
+                    match Instruction::from(opcode.bin_return_op()) {
+                        Instruction::ADD => binary!(self.stack, +, as_int),
+                        Instruction::SUB => binary!(self.stack, -, as_int),
+                        Instruction::MUL => binary!(self.stack, *, as_int),
+                        Instruction::DIV => binary!(self.stack, /, as_int),
+                        Instruction::MOD => binary!(self.stack, %, as_int),
+                        Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
+                        Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
+                        Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
+                        Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
+                        Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
+                        Instruction::LE => binary!(self.stack, <, raw),
+                        Instruction::LEQ => binary!(self.stack, <=, raw),
+                        Instruction::GT => binary!(self.stack, >, raw),
+                        Instruction::GEQ => binary!(self.stack, >=, raw),
+                        Instruction::EQ => binary!(self.stack, ==, raw),
+                        Instruction::NEQ => binary!(self.stack, !=, raw),
+                        Instruction::LEF => binary!(self.stack, <, as_float),
+                        Instruction::LEQF => binary!(self.stack, <=, as_float),
+                        Instruction::GTF => binary!(self.stack, >, as_float),
+                        Instruction::GEQF => binary!(self.stack, >=, as_float),
+                        _ => {}
+                    }
+                    let ret_val = self.stack.pop();
+                    let return_sp = self.frames.pop().get();
+                    self.stack.seek(return_sp);
+                    self.stack.push(ret_val);
+                    self.after_return(&mut ip, &mut sp);
+                }
+                Instruction::BinSlotSlot => {
+                    let (op, a, b) = opcode.bin_slot_slot_parts();
+                    let va = self.stack[sp + a];
+                    let vb = self.stack[sp + b];
+                    let result = match Instruction::from(op) {
+                        Instruction::ADD => Value::from(va.as_int() + vb.as_int()),
+                        Instruction::SUB => Value::from(va.as_int() - vb.as_int()),
+                        Instruction::MUL => Value::from(va.as_int() * vb.as_int()),
+                        Instruction::DIV => Value::from(va.as_int() / vb.as_int()),
+                        Instruction::MOD => Value::from(va.as_int() % vb.as_int()),
+                        Instruction::Pow => {
+                            let exp = vb.as_int().max(0) as u32;
+                            Value::from(va.as_int().pow(exp))
+                        }
+                        Instruction::BITAND => Value::from(va.as_int() & vb.as_int()),
+                        Instruction::BITOR => Value::from(va.as_int() | vb.as_int()),
+                        Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
+                        Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
+                        Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
+                        Instruction::DIVF => Value::from(va.as_float() / vb.as_float()),
+                        Instruction::MODF => Value::from(va.as_float() % vb.as_float()),
+                        Instruction::LE => Value::from((va.raw() < vb.raw()) as i64),
+                        Instruction::LEQ => Value::from((va.raw() <= vb.raw()) as i64),
+                        Instruction::GT => Value::from((va.raw() > vb.raw()) as i64),
+                        Instruction::GEQ => Value::from((va.raw() >= vb.raw()) as i64),
+                        Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
+                        Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
+                        Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
+                        Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
+                        Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
+                        Instruction::GEQF => Value::from((va.as_float() >= vb.as_float()) as i64),
+                        _ => Value::default(),
+                    };
+                    self.stack.push(result);
                 }
                 Instruction::NATIVE => {
                     #[cfg(debug_assertions)]
@@ -1508,16 +1625,16 @@ impl<const S: usize> Machine<S> {
                         _ => Vec::new(),
                     };
 
-                    self.frames.get_mut().set(*sp);
+                    self.frames.get_mut().set(sp);
                     self.pending_ffi = Some(PendingFfiInvoke {
                         lib_addr,
                         function_id,
                         args,
                         arg_types,
-                        resume_ip: *ip,
-                        resume_sp: *sp,
+                        resume_ip: ip,
+                        resume_sp: sp,
                     });
-                    return ColdDispatch::Yield;
+                    return true;
                 }
                 Instruction::DeclareFFI => {
                     let raw = opcode.operand_u32();
@@ -1616,10 +1733,10 @@ impl<const S: usize> Machine<S> {
                     } else {
                         let _ = io::stdout().flush();
                     }
-                    return ColdDispatch::Stop;
+                    return false;
                 }
                 Instruction::Panic => {
-                    let panic_ip = (*ip).saturating_sub(1);
+                    let panic_ip = ip.saturating_sub(1);
                     let ptr = self.stack.pop().as_ptr::<ObjString>();
                     let s = unsafe { &*ptr };
                     let loc_suffix = self
@@ -1634,15 +1751,15 @@ impl<const S: usize> Machine<S> {
                         let _ = io::stderr().flush();
                     }
                     self.panicked = true;
-                    return ColdDispatch::Stop;
+                    return false;
                 }
                 Instruction::STRING => {
                     let length = opcode.operand_u32() as usize;
                     let mut value: String = String::with_capacity(length);
 
-                    while length != value.len() && *ip < code.len() {
-                        let data = &code[*ip];
-                        *ip += 1;
+                    while length != value.len() && ip < code.len() {
+                        let data = &code[ip];
+                        ip += 1;
                         value.push(char::from_u32(data.operand_u32()).unwrap_or_default());
                     }
 
@@ -1661,6 +1778,7 @@ impl<const S: usize> Machine<S> {
                     self.stack
                         .push(Value::from(gc_string.as_ptr() as *mut u8 as u64));
                 }
+                Instruction::NOOP => continue,
                 Instruction::MakeEnum => {
                     // operands: tag (high 16), arity (low 16). Args popped top-first
                     // into declaration order; classify each as immediate or heap pointer.
@@ -1958,7 +2076,7 @@ impl<const S: usize> Machine<S> {
                                     };
                                     self.stack.push(value);
                                 }
-                                *ip = target_offset;
+                                ip = target_offset;
                             }
                         }
                     }
@@ -2024,12 +2142,12 @@ impl<const S: usize> Machine<S> {
                     }
                 }
                 Instruction::UnpackAt => {
-                    // Unpack enum at `*sp + slot_offset` in place (nested record patterns).
+                    // Unpack enum at `sp + slot_offset` in place (nested record patterns).
                     let operands = opcode.operand_u32();
                     let slot_offset = (operands & 0xFFFF) as usize;
                     let _arity = (operands >> 16) as usize;
 
-                    let slot = *sp + slot_offset;
+                    let slot = sp + slot_offset;
                     if slot >= self.stack.tell() {
                     } else {
                         let scrutinee_addr = self.stack[slot].raw() as u64;
@@ -2050,6 +2168,20 @@ impl<const S: usize> Machine<S> {
                                 self.stack[slot + i] = value;
                             }
                         }
+                    }
+                }
+                Instruction::StorePop => {
+                    // Pop TOS into `sp + slot`. Extend the cursor when the slot
+                    // is newly allocated, but NEVER shrink past higher locals —
+                    // locals and the operand stack share memory (Phase 18E).
+                    // Unconditional `seek(slot + 1)` orphans later slots and
+                    // makes early-loop flags appear not to stick.
+                    let slot = sp + opcode.operand_u32() as usize;
+                    let val = self.stack.pop();
+                    self.stack[slot] = val;
+                    let tell = self.stack.tell();
+                    if tell < slot + 1 {
+                        self.stack.seek(slot + 1);
                     }
                 }
                 Instruction::MakeCoro => {
@@ -2115,9 +2247,9 @@ impl<const S: usize> Machine<S> {
                                 self.with_coroutine_mut(gc.as_ptr() as u64, |c| {
                                     c.pending_send = send_val;
                                 });
-                                self.resume_coroutine(ip, sp, sub, send_val, code, true);
+                                self.resume_coroutine(&mut ip, &mut sp, sub, send_val, code, true);
                             } else {
-                                self.resume_coroutine(ip, sp, gc, send_val, code, true);
+                                self.resume_coroutine(&mut ip, &mut sp, gc, send_val, code, true);
                             }
                         } else {
                             // Handle didn't resolve to a live coroutine
@@ -2131,7 +2263,7 @@ impl<const S: usize> Machine<S> {
                     if self.stack.tell() == 0 {
                     } else {
                         let yield_val = self.stack.pop();
-                        self.yield_coroutine(ip, sp, yield_val);
+                        self.yield_coroutine(&mut ip, &mut sp, yield_val);
                     }
                 }
                 Instruction::YieldFromCoro => {
@@ -2142,7 +2274,7 @@ impl<const S: usize> Machine<S> {
                         if let Some(Object::Coroutine(sub)) =
                             Self::find_object_by_addr(&self.heap, addr)
                         {
-                            self.start_yield_from(ip, sp, sub, code);
+                            self.start_yield_from(&mut ip, &mut sp, sub, code);
                         }
                     }
                 }
@@ -2216,7 +2348,7 @@ impl<const S: usize> Machine<S> {
                         let mut arg_i = 0usize;
                         for slot in 0..arity {
                             if filled_mask & (1u32 << slot) != 0 {
-                                return ColdDispatch::Continue;
+                                continue;
                             }
                             if arg_i >= new_args.len() {
                                 break;
@@ -2259,7 +2391,7 @@ impl<const S: usize> Machine<S> {
                                 );
                             }
                             self.stack.push(Value::from(object.addr()));
-                            return ColdDispatch::Continue;
+                            continue;
                         }
 
                         // Fixed slots complete. Rest extras → MakeArray
@@ -2306,14 +2438,14 @@ impl<const S: usize> Machine<S> {
                             self.stack.push(*a);
                         }
                         let frame_arity = captures.len() + call_args.len();
-                        let return_ip = *ip;
+                        let return_ip = ip;
                         let callee_sp = self.stack.tell() - frame_arity;
                         self.frames.get_mut().seek(return_ip);
                         self.frames
                             .setup_current_and_advance(|frame| frame.set(callee_sp));
-                        *sp = callee_sp;
-                        *ip = entry as usize;
-                        return ColdDispatch::Continue;
+                        sp = callee_sp;
+                        ip = entry as usize;
+                        continue;
                     }
 
                     let (target, captured) = {
@@ -2379,13 +2511,13 @@ impl<const S: usize> Machine<S> {
 
                     let arity = value_arity + dict_arity;
 
-                    let return_ip = *ip;
+                    let return_ip = ip;
                     let callee_sp = self.stack.tell() - arity;
                     self.frames.get_mut().seek(return_ip);
                     self.frames
                         .setup_current_and_advance(|frame| frame.set(callee_sp));
-                    *sp = callee_sp;
-                    *ip = target;
+                    sp = callee_sp;
+                    ip = target;
                 }
                 Instruction::MakeFn => {
                     // Stack (bottom → TOS):
@@ -2458,6 +2590,57 @@ impl<const S: usize> Machine<S> {
                     if let Some(s) = self.statics.get_mut(slot) {
                         *s = val;
                     }
+                }
+                Instruction::BoxValue => {
+                    let tag = (opcode.operand_u32() & 0xFFFF) as u16;
+                    let v = self.stack.pop();
+                    let addr = v.raw() as u64;
+                    let payload = if addr != 0
+                        && self.heap.contains_addr(addr as *mut u8)
+                    {
+                        if let Some(obj) =
+                            Self::find_object_by_addr(&self.heap, addr)
+                        {
+                            Member::Object(obj)
+                        } else {
+                            Member::Value(v)
+                        }
+                    } else {
+                        Member::Value(v)
+                    };
+                    let boxed = ObjBoxed { tag, payload };
+                    let (object, _) = self.heap.alloc(boxed, Object::Boxed);
+                    self.alloc_counter += 1;
+                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
+                        Self::gc_collect(
+                            &mut self.heap,
+                            &self.stack,
+                            &self.resume_stack,
+                            &mut self.alloc_counter,
+                        );
+                    }
+                    self.stack.push(Value::from(object.addr()));
+                }
+                Instruction::UnboxValue => {
+                    let expected_tag = (opcode.operand_u32() & 0xFFFF) as u16;
+                    let v = self.stack.pop();
+                    let addr = v.raw() as u64;
+                    let result = if let Some(Object::Boxed(gc)) =
+                        Self::find_object_by_addr(&self.heap, addr)
+                    {
+                        let b = gc.as_ref();
+                        if b.tag == expected_tag {
+                            match &b.payload {
+                                Member::Value(inner) => *inner,
+                                Member::Object(o) => Value::from(o.addr()),
+                            }
+                        } else {
+                            Value::default()
+                        }
+                    } else {
+                        Value::default()
+                    };
+                    self.stack.push(result);
                 }
                 Instruction::MakePolyFn => {
                     let entry = opcode.operand_u32();
@@ -2719,448 +2902,7 @@ impl<const S: usize> Machine<S> {
                         print!("{text}");
                     }
                 }
-                // Packed LA kernels: cold `#[inline(never)]` helpers — keep the
-                // hot scalar dispatch match small for fib / numeric loops.
-                Instruction::PackedDot => self.exec_packed_dot(opcode.operand_u32()),
-                Instruction::PackedMatMul => self.exec_packed_matmul(opcode.operand_u32()),
-                Instruction::PackedMatrixZip => {
-                    self.exec_packed_matrix_zip(opcode.operand_u32())
-                }
-                Instruction::PackedMatrixNeg => {
-                    self.exec_packed_matrix_neg(opcode.operand_u32())
-                }
-                _ => return ColdDispatch::Stop,
-                    }
-        ColdDispatch::Continue
-    }
-
-    #[inline(always)]
-    fn execute(&mut self, code: &[Byte], constants: &[u64], start_ip: usize) -> bool {
-        #[cfg(debug_assertions)]
-        let frame_no = self.frames.len();
-
-        let mut ip: usize = start_ip;
-        let mut sp = self.frames.get_mut().get();
-
-        while ip < code.len() {
-            #[cfg(any(test, feature = "vm_profile"))]
-            VM_DISPATCH_COUNT.with(|c| c.fetch_add(1, Ordering::Relaxed));
-
-            let opcode = &code[ip];
-            ip += 1;
-
-            #[cfg(debug_assertions)]
-            {
-                eprintln!(
-                    "#{:<2} @ {:0>4} - {:>8}[{:0>4}, {:0>4}] - {:?}",
-                    frame_no,
-                    ip,
-                    *opcode.bytecode() as u8,
-                    opcode.operand_u16(0),
-                    opcode.operand_u16(1),
-                    self.stack.as_slice()
-                );
-            }
-
-            let bc = opcode.bytecode();
-            // Release-only optimizer hint: must track the LAST `Instruction`
-            // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
-            // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
-            #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::PackedMatrixNeg as u8);
-
-            match bc {
-                Instruction::POP => {
-                    self.stack.pop();
-                }
-                Instruction::DUPLICATE => {
-                    self.stack.push(*self.stack.peek());
-                }
-                Instruction::CONST => {
-                    let op = opcode.operand_u32();
-                    let raw = if unlikely(op & Byte::POOL_FLAG != 0) {
-                        constants[(op & !Byte::POOL_FLAG) as usize]
-                    } else {
-                        op as i32 as i64 as u64
-                    };
-                    self.stack.push(Value::from(raw));
-                }
-                Instruction::STORE => {
-                    // No-op: stack and locals share memory; UNPACK/JUMP_IF_MATCH
-                    // already wrote match bindings into slot positions.
-                }
-                Instruction::LOAD => {
-                    self.stack
-                        .push(self.stack[sp + opcode.operand_u32() as usize]);
-                }
-                Instruction::INC => {
-                    let (slot, prefix, is_float) = opcode.inc_dec_parts();
-                    let idx = sp + slot;
-                    let old = self.stack[idx];
-                    let new_val = if is_float {
-                        Value::from(old.as_float() + 1.0)
-                    } else {
-                        Value::from(old.as_int() + 1)
-                    };
-                    self.stack[idx] = new_val;
-                    self.stack.push(if prefix { new_val } else { old });
-                }
-                Instruction::DEC => {
-                    let (slot, prefix, is_float) = opcode.inc_dec_parts();
-                    let idx = sp + slot;
-                    let old = self.stack[idx];
-                    let new_val = if is_float {
-                        Value::from(old.as_float() - 1.0)
-                    } else {
-                        Value::from(old.as_int() - 1)
-                    };
-                    self.stack[idx] = new_val;
-                    self.stack.push(if prefix { new_val } else { old });
-                }
-                Instruction::NOT => unary!(self.stack, !, as_int),
-                Instruction::LogNot => {
-                    let val = self.stack.pop();
-                    self.stack.push(Value::from(!(val.as_int() != 0)));
-                }
-                Instruction::NEG => unary!(self.stack, -, as_int),
-                Instruction::AND => binary!(self.stack, &&, as_bool),
-                Instruction::OR => binary!(self.stack, ||, as_bool),
-                Instruction::ADD => binary!(self.stack, +, as_int),
-                Instruction::SUB => binary!(self.stack, -, as_int),
-                Instruction::MUL => binary!(self.stack, *, as_int),
-                Instruction::DIV => binary!(self.stack, /, as_int),
-                Instruction::MOD => binary!(self.stack, %, as_int),
-                Instruction::LE => binary!(self.stack, <, raw),
-                Instruction::LEQ => binary!(self.stack, <=, raw),
-                Instruction::GT => binary!(self.stack, >, raw),
-                Instruction::GEQ => binary!(self.stack, >=, raw),
-                Instruction::EQ => binary!(self.stack, ==, raw),
-                Instruction::NEQ => binary!(self.stack, !=, raw),
-                Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
-                Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
-                Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
-                Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
-                Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
-                Instruction::SHL => binary!(self.stack, <<, as_int),
-                Instruction::SHR => binary!(self.stack, >>, as_int),
-                Instruction::XOR => binary!(self.stack, ^, as_int),
-                Instruction::BITAND => binary!(self.stack, &, as_int),
-                Instruction::BITOR => binary!(self.stack, |, as_int),
-                Instruction::Pow => {
-                    let sp = self.stack.tell();
-                    promise!(sp >= 2);
-                    let rhs = self.stack[sp - 1].as_int();
-                    let lhs = self.stack[sp - 2].as_int();
-                    let result = lhs.pow(rhs as u32);
-                    self.stack[sp - 2].replace(result as _);
-                    self.stack.seek(sp - 1);
-                }
-                Instruction::PowF => {
-                    let sp = self.stack.tell();
-                    promise!(sp >= 2);
-                    let rhs = self.stack[sp - 1].as_float();
-                    let lhs = self.stack[sp - 2].as_float();
-                    let result = lhs.powf(rhs);
-                    self.stack[sp - 2].replace(result.to_bits() as _);
-                    self.stack.seek(sp - 1);
-                }
-                Instruction::LEF => binary!(self.stack, <, as_float),
-                Instruction::LEQF => binary!(self.stack, <=, as_float),
-                Instruction::GTF => binary!(self.stack, >, as_float),
-                Instruction::GEQF => binary!(self.stack, >=, as_float),
-                Instruction::JMP => {
-                    ip = opcode.operand_u32() as usize;
-                }
-                Instruction::JMPF => {
-                    if !self.stack.pop().as_bool() {
-                        ip = opcode.operand_u32() as usize;
-                    }
-                }
-                Instruction::JMPT => {
-                    if self.stack.pop().as_bool() {
-                        ip = opcode.operand_u32() as usize;
-                    }
-                }
-                Instruction::CALL => {
-                    let (arity, target) = opcode.call_parts();
-                    let return_ip = ip + if target == 0 { 1 } else { 0 };
-                    let callee_sp = self.stack.tell() - arity;
-                    self.frames.get_mut().seek(return_ip);
-                    self.frames
-                        .setup_current_and_advance(|frame| frame.set(callee_sp));
-                    sp = callee_sp;
-                    if target != 0 {
-                        ip = target;
-                    }
-                }
-                Instruction::TailCall => {
-                    let (arity, target) = opcode.call_parts();
-                    let callee_sp = self.frames.get().get();
-                    for i in (0..arity).rev() {
-                        let val = self.stack.pop();
-                        self.stack[callee_sp + i] = val;
-                    }
-                    self.stack.seek(callee_sp + arity);
-                    // Match CALL: `sp` is the frame base (locals start at slot 0),
-                    // not past the args. Using `callee_sp + arity` would make
-                    // subsequent LOAD/BinSlotImm read the wrong slots.
-                    sp = callee_sp;
-                    ip = target;
-                }
-                Instruction::RETURN => {
-                    let ret_val = self.stack.pop();
-                    let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
-                    if self.nested_depth > 0 && self.frames.len() == nested_target {
-                        self.nested_return = Some(ret_val);
-                        return false;
-                    }
-                    let return_sp = self.frames.pop().get();
-                    self.stack.seek(return_sp);
-                    self.stack.push(ret_val);
-                    self.after_return(&mut ip, &mut sp);
-                }
-                // Fused `LOAD slot; CONST imm; <binop>`.
-                Instruction::BinSlotImm => {
-                    let (op, slot, imm) = opcode.bin_slot_imm_parts();
-                    let lhs = self.stack[sp + slot];
-                    self.stack.push(lhs);
-                    self.stack.push(Value::from(imm));
-                    match Instruction::from(op) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::Pow => {
-                            let sp = self.stack.tell();
-                            let rhs = self.stack[sp - 1].as_int().max(0) as u32;
-                            let lhs = self.stack[sp - 2].as_int();
-                            self.stack[sp - 2].replace(lhs.pow(rhs) as u64);
-                            self.stack.seek(sp - 1);
-                        }
-                        Instruction::BITAND => binary!(self.stack, &, as_int),
-                        Instruction::BITOR => binary!(self.stack, |, as_int),
-                        _ => {}
-                    }
-                }
-                // Fused `<cmp>; JMPF target`.
-                Instruction::CmpJmpf => {
-                    let (op, target) = opcode.cmp_jmpf_parts();
-                    match Instruction::from(op) {
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {}
-                    }
-                    if !self.stack.pop().as_bool() {
-                        ip = target;
-                    }
-                }
-                Instruction::BinSlotImmJmpf => {
-                    let (op, slot, pool_idx) = opcode.bin_slot_imm_jmpf_parts();
-                    let packed = constants.get(pool_idx).copied().unwrap_or(0);
-                    let imm = packed as u32 as i32 as i64;
-                    let target = (packed >> 32) as usize;
-                    let lhs = self.stack[sp + slot];
-                    self.stack.push(lhs);
-                    self.stack.push(Value::from(imm));
-                    match Instruction::from(op) {
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {
-                            self.stack.pop();
-                            self.stack.pop();
-                        }
-                    }
-                    if !self.stack.pop().as_bool() {
-                        ip = target;
-                    }
-                }
-                Instruction::LogNotJmpf => {
-                    let target = opcode.log_not_jmpf_target();
-                    let val = self.stack.pop();
-                    if val.as_int() != 0 {
-                        ip = target;
-                    }
-                }
-                Instruction::LoadReturnSlot => {
-                    let ret_val = self.stack[sp + opcode.operand_u32() as usize];
-                    let return_sp = self.frames.pop().get();
-                    self.stack.seek(return_sp);
-                    self.stack.push(ret_val);
-                    self.after_return(&mut ip, &mut sp);
-                }
-                Instruction::ConstReturnImm => {
-                    let ret_val = Value::from(opcode.operand_u32() as i32 as i64 as u64);
-                    let return_sp = self.frames.pop().get();
-                    self.stack.seek(return_sp);
-                    self.stack.push(ret_val);
-                    self.after_return(&mut ip, &mut sp);
-                }
-                Instruction::BinReturn => {
-                    match Instruction::from(opcode.bin_return_op()) {
-                        Instruction::ADD => binary!(self.stack, +, as_int),
-                        Instruction::SUB => binary!(self.stack, -, as_int),
-                        Instruction::MUL => binary!(self.stack, *, as_int),
-                        Instruction::DIV => binary!(self.stack, /, as_int),
-                        Instruction::MOD => binary!(self.stack, %, as_int),
-                        Instruction::ADDF => binary!(self.stack, +, as_float, to_bits),
-                        Instruction::SUBF => binary!(self.stack, -, as_float, to_bits),
-                        Instruction::MULF => binary!(self.stack, *, as_float, to_bits),
-                        Instruction::DIVF => binary!(self.stack, /, as_float, to_bits),
-                        Instruction::MODF => binary!(self.stack, %, as_float, to_bits),
-                        Instruction::LE => binary!(self.stack, <, raw),
-                        Instruction::LEQ => binary!(self.stack, <=, raw),
-                        Instruction::GT => binary!(self.stack, >, raw),
-                        Instruction::GEQ => binary!(self.stack, >=, raw),
-                        Instruction::EQ => binary!(self.stack, ==, raw),
-                        Instruction::NEQ => binary!(self.stack, !=, raw),
-                        Instruction::LEF => binary!(self.stack, <, as_float),
-                        Instruction::LEQF => binary!(self.stack, <=, as_float),
-                        Instruction::GTF => binary!(self.stack, >, as_float),
-                        Instruction::GEQF => binary!(self.stack, >=, as_float),
-                        _ => {}
-                    }
-                    let ret_val = self.stack.pop();
-                    let return_sp = self.frames.pop().get();
-                    self.stack.seek(return_sp);
-                    self.stack.push(ret_val);
-                    self.after_return(&mut ip, &mut sp);
-                }
-                Instruction::BinSlotSlot => {
-                    let (op, a, b) = opcode.bin_slot_slot_parts();
-                    let va = self.stack[sp + a];
-                    let vb = self.stack[sp + b];
-                    let result = match Instruction::from(op) {
-                        Instruction::ADD => Value::from(va.as_int() + vb.as_int()),
-                        Instruction::SUB => Value::from(va.as_int() - vb.as_int()),
-                        Instruction::MUL => Value::from(va.as_int() * vb.as_int()),
-                        Instruction::DIV => Value::from(va.as_int() / vb.as_int()),
-                        Instruction::MOD => Value::from(va.as_int() % vb.as_int()),
-                        Instruction::Pow => {
-                            let exp = vb.as_int().max(0) as u32;
-                            Value::from(va.as_int().pow(exp))
-                        }
-                        Instruction::BITAND => Value::from(va.as_int() & vb.as_int()),
-                        Instruction::BITOR => Value::from(va.as_int() | vb.as_int()),
-                        Instruction::ADDF => Value::from(va.as_float() + vb.as_float()),
-                        Instruction::SUBF => Value::from(va.as_float() - vb.as_float()),
-                        Instruction::MULF => Value::from(va.as_float() * vb.as_float()),
-                        Instruction::DIVF => Value::from(va.as_float() / vb.as_float()),
-                        Instruction::MODF => Value::from(va.as_float() % vb.as_float()),
-                        Instruction::LE => Value::from((va.raw() < vb.raw()) as i64),
-                        Instruction::LEQ => Value::from((va.raw() <= vb.raw()) as i64),
-                        Instruction::GT => Value::from((va.raw() > vb.raw()) as i64),
-                        Instruction::GEQ => Value::from((va.raw() >= vb.raw()) as i64),
-                        Instruction::EQ => Value::from((va.raw() == vb.raw()) as i64),
-                        Instruction::NEQ => Value::from((va.raw() != vb.raw()) as i64),
-                        Instruction::LEF => Value::from((va.as_float() < vb.as_float()) as i64),
-                        Instruction::LEQF => Value::from((va.as_float() <= vb.as_float()) as i64),
-                        Instruction::GTF => Value::from((va.as_float() > vb.as_float()) as i64),
-                        Instruction::GEQF => Value::from((va.as_float() >= vb.as_float()) as i64),
-                        _ => Value::default(),
-                    };
-                    self.stack.push(result);
-                }
-                Instruction::NOOP => continue,
-                Instruction::StorePop => {
-                    // Pop TOS into `sp + slot`. Extend the cursor when the slot
-                    // is newly allocated, but NEVER shrink past higher locals —
-                    // locals and the operand stack share memory (Phase 18E).
-                    // Unconditional `seek(slot + 1)` orphans later slots and
-                    // makes early-loop flags appear not to stick.
-                    let slot = sp + opcode.operand_u32() as usize;
-                    let val = self.stack.pop();
-                    self.stack[slot] = val;
-                    let tell = self.stack.tell();
-                    if tell < slot + 1 {
-                        self.stack.seek(slot + 1);
-                    }
-                }
-                Instruction::BoxValue => {
-                    let tag = (opcode.operand_u32() & 0xFFFF) as u16;
-                    let v = self.stack.pop();
-                    let addr = v.raw() as u64;
-                    let payload = if addr != 0
-                        && self.heap.contains_addr(addr as *mut u8)
-                    {
-                        if let Some(obj) =
-                            Self::find_object_by_addr(&self.heap, addr)
-                        {
-                            Member::Object(obj)
-                        } else {
-                            Member::Value(v)
-                        }
-                    } else {
-                        Member::Value(v)
-                    };
-                    let boxed = ObjBoxed { tag, payload };
-                    let (object, _) = self.heap.alloc(boxed, Object::Boxed);
-                    self.alloc_counter += 1;
-                    if self.alloc_counter > GC_TRIGGER_INTERVAL {
-                        Self::gc_collect(
-                            &mut self.heap,
-                            &self.stack,
-                            &self.resume_stack,
-                            &mut self.alloc_counter,
-                        );
-                    }
-                    self.stack.push(Value::from(object.addr()));
-                }
-                Instruction::UnboxValue => {
-                    let expected_tag = (opcode.operand_u32() & 0xFFFF) as u16;
-                    let v = self.stack.pop();
-                    let addr = v.raw() as u64;
-                    let result = if let Some(Object::Boxed(gc)) =
-                        Self::find_object_by_addr(&self.heap, addr)
-                    {
-                        let b = gc.as_ref();
-                        if b.tag == expected_tag {
-                            match &b.payload {
-                                Member::Value(inner) => *inner,
-                                Member::Object(o) => Value::from(o.addr()),
-                            }
-                        } else {
-                            Value::default()
-                        }
-                    } else {
-                        Value::default()
-                    };
-                    self.stack.push(result);
-                }
-                _ => match self.dispatch_cold(
-                    *bc,
-                    opcode,
-                    code,
-                    constants,
-                    &mut ip,
-                    &mut sp,
-                ) {
-                    ColdDispatch::Continue => {}
-                    ColdDispatch::Stop => return false,
-                    ColdDispatch::Yield => return true,
-                }
+                _ => return false,
             }
         }
         false
@@ -5256,207 +4998,5 @@ mod tests {
         ];
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 1);
-    }
-
-    /// Approach A: PackedDot on two length-2 int arrays → 1*3 + 2*4 = 11.
-    #[test]
-    fn packed_dot_int_arrays() {
-        let code = [
-            // a = [1, 2]
-            Byte::new(Instruction::CONST).with_operand_u32(1),
-            Byte::new(Instruction::CONST).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            // b = [3, 4]
-            Byte::new(Instruction::CONST).with_operand_u32(3),
-            Byte::new(Instruction::CONST).with_operand_u32(4),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::PackedDot).with_operand_u32(2), // length=2, int
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 0);
-        assert_eq!(vm.pop().as_int(), 11);
-    }
-
-    /// Approach A: PackedMatMul [[1,2],[3,4]] * [[5,6],[7,8]] → [[19,22],[43,50]].
-    #[test]
-    fn packed_matmul_2x2_int() {
-        // Build A rows, then A; B rows, then B; PackedMatMul m=2,k=2,n=2.
-        let code = [
-            Byte::new(Instruction::CONST).with_operand_u32(1),
-            Byte::new(Instruction::CONST).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::CONST).with_operand_u32(3),
-            Byte::new(Instruction::CONST).with_operand_u32(4),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2), // A
-            Byte::new(Instruction::CONST).with_operand_u32(5),
-            Byte::new(Instruction::CONST).with_operand_u32(6),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::CONST).with_operand_u32(7),
-            Byte::new(Instruction::CONST).with_operand_u32(8),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2), // B
-            // m=2, k=2, n=2
-            Byte::new(Instruction::PackedMatMul).with_operand_u32(2 | (2 << 8) | (2 << 16)),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 0);
-        let c = vm.pop();
-        // C[0][0]=19, C[0][1]=22, C[1][0]=43, C[1][1]=50
-        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).expect("C rows");
-        assert_eq!(rows.len(), 2);
-        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
-        let r1 = Machine::<64>::aggregate_elements(&vm.heap, rows[1]).unwrap();
-        assert_eq!(r0[0].as_int(), 19);
-        assert_eq!(r0[1].as_int(), 22);
-        assert_eq!(r1[0].as_int(), 43);
-        assert_eq!(r1[1].as_int(), 50);
-    }
-
-    /// Approach A: PackedMatrixZip add on 1×2 matrices.
-    #[test]
-    fn packed_matrix_zip_add_1x2() {
-        let code = [
-            Byte::new(Instruction::CONST).with_operand_u32(1),
-            Byte::new(Instruction::CONST).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(1), // A = [[1,2]]
-            Byte::new(Instruction::CONST).with_operand_u32(3),
-            Byte::new(Instruction::CONST).with_operand_u32(4),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(1), // B = [[3,4]]
-            // m=1, n=2, zip=Add(0)
-            Byte::new(Instruction::PackedMatrixZip).with_operand_u32(1 | (2 << 8)),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 0);
-        let c = vm.pop();
-        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).unwrap();
-        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
-        assert_eq!(r0[0].as_int(), 4);
-        assert_eq!(r0[1].as_int(), 6);
-    }
-
-    /// Approach A: PackedMatrixNeg on 1×2.
-    #[test]
-    fn packed_matrix_neg_1x2() {
-        let code = [
-            Byte::new(Instruction::CONST).with_operand_u32(5),
-            Byte::new(Instruction::CONST).with_operand_u32(7),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(1),
-            Byte::new(Instruction::PackedMatrixNeg).with_operand_u32(1 | (2 << 8)),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 0);
-        let c = vm.pop();
-        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).unwrap();
-        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
-        assert_eq!(r0[0].as_int(), -5);
-        assert_eq!(r0[1].as_int(), -7);
-    }
-
-    /// PackedDot float path (`operands[16]` = is_float) — 1.5*2.5 + 2.0*4.0 = 11.75.
-    #[test]
-    fn packed_dot_float_arrays() {
-        let pool = [1.5f64.to_bits(), 2.0f64.to_bits(), 2.5f64.to_bits(), 4.0f64.to_bits()];
-        let code = [
-            Byte::new(Instruction::CONST).with_operand_u32(Byte::POOL_FLAG), // 1.5
-            Byte::new(Instruction::CONST).with_operand_u32(1 | Byte::POOL_FLAG), // 2.0
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::CONST).with_operand_u32(2 | Byte::POOL_FLAG), // 2.5
-            Byte::new(Instruction::CONST).with_operand_u32(3 | Byte::POOL_FLAG), // 4.0
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            // length=2, is_float
-            Byte::new(Instruction::PackedDot).with_operand_u32(2 | (1 << 16)),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &pool, 0);
-        assert_eq!(vm.pop().as_float(), 11.75);
-    }
-
-    /// PackedMatrixZip Sub (`zip_kind == 1`) — [[5,7]] - [[1,2]] → [[4,5]].
-    #[test]
-    fn packed_matrix_zip_sub_1x2() {
-        let code = [
-            Byte::new(Instruction::CONST).with_operand_u32(5),
-            Byte::new(Instruction::CONST).with_operand_u32(7),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(1), // A
-            Byte::new(Instruction::CONST).with_operand_u32(1),
-            Byte::new(Instruction::CONST).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(2),
-            Byte::new(Instruction::MakeArray).with_operand_u32(1), // B
-            // m=1, n=2, zip=Sub(1)
-            Byte::new(Instruction::PackedMatrixZip).with_operand_u32(1 | (2 << 8) | (1 << 16)),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 0);
-        let c = vm.pop();
-        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).unwrap();
-        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
-        assert_eq!(r0[0].as_int(), 4);
-        assert_eq!(r0[1].as_int(), 5);
-    }
-
-    /// PackedMatMul must honor outer/row tuple flags when rebuilding the result.
-    /// Wrong flags would allocate `ObjArray` and break tuple-typed consumers.
-    #[test]
-    fn packed_matmul_rebuilds_tuple_of_tuples() {
-        use crate::memory::Object;
-        // A = ((1, 2), (3, 4)); B = ((5, 6), (7, 8)); C = ((19, 22), (43, 50))
-        let code = [
-            Byte::new(Instruction::CONST).with_operand_u32(1),
-            Byte::new(Instruction::CONST).with_operand_u32(2),
-            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
-            Byte::new(Instruction::CONST).with_operand_u32(3),
-            Byte::new(Instruction::CONST).with_operand_u32(4),
-            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
-            Byte::new(Instruction::MakeTuple).with_operand_u32(2), // A
-            Byte::new(Instruction::CONST).with_operand_u32(5),
-            Byte::new(Instruction::CONST).with_operand_u32(6),
-            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
-            Byte::new(Instruction::CONST).with_operand_u32(7),
-            Byte::new(Instruction::CONST).with_operand_u32(8),
-            Byte::new(Instruction::MakeTuple).with_operand_u32(2),
-            Byte::new(Instruction::MakeTuple).with_operand_u32(2), // B
-            // m=2,k=2,n=2 + outer_is_tuple + row_is_tuple
-            Byte::new(Instruction::PackedMatMul)
-                .with_operand_u32(2 | (2 << 8) | (2 << 16) | (1 << 25) | (1 << 26)),
-            Byte::new(Instruction::HALT),
-        ];
-        let mut vm = Machine::<64>::default();
-        vm.run_with_pool(&code, &[], 0);
-        let c = vm.pop();
-        assert!(
-            matches!(
-                Machine::<64>::find_object_by_addr(&vm.heap, c.raw() as u64),
-                Some(Object::Tuple(_))
-            ),
-            "expected outer ObjTuple"
-        );
-        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).expect("C rows");
-        assert_eq!(rows.len(), 2);
-        for row in &rows {
-            assert!(
-                matches!(
-                    Machine::<64>::find_object_by_addr(&vm.heap, row.raw() as u64),
-                    Some(Object::Tuple(_))
-                ),
-                "expected row ObjTuple"
-            );
-        }
-        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
-        let r1 = Machine::<64>::aggregate_elements(&vm.heap, rows[1]).unwrap();
-        assert_eq!(r0[0].as_int(), 19);
-        assert_eq!(r0[1].as_int(), 22);
-        assert_eq!(r1[0].as_int(), 43);
-        assert_eq!(r1[1].as_int(), 50);
     }
 }

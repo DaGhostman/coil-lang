@@ -5360,7 +5360,7 @@ impl Compiler {
             return;
         }
 
-        // Prefer packed fat opcodes (Approach A) for Dot / MatMul / Matrix*.
+        // Prefer packed HostInvoke kernels (Approach A) for Dot / MatMul / Matrix*.
         if self.try_emit_packed_linear_algebra(bytecode, &info.kind, args) {
             return;
         }
@@ -5597,7 +5597,8 @@ impl Compiler {
         }
     }
 
-    /// Emit Approach A packed opcodes when dims fit; return false to fall back.
+    /// Emit Approach A packed LA via `HostInvoke` (no new opcodes) when dims fit.
+    /// Returns false to fall back to scalar unroll.
     fn try_emit_packed_linear_algebra(
         &mut self,
         bytecode: &mut Vec<Byte>,
@@ -5606,7 +5607,7 @@ impl Compiler {
     ) -> bool {
         use crate::typechecking::{AggregateOp, LinearAlgebraKind};
 
-        match kind {
+        let (native_name, meta, value_args): (&str, u32, &[Output]) = match kind {
             LinearAlgebraKind::Dot {
                 length,
                 elem_is_float,
@@ -5615,14 +5616,11 @@ impl Compiler {
                 if *length == 0 || *length > u16::MAX as usize || args.len() != 2 {
                     return false;
                 }
-                bytecode.append(&mut self.do_compile(&args[0]));
-                bytecode.append(&mut self.do_compile(&args[1]));
                 let mut ops = (*length as u32) & 0xFFFF;
                 if *elem_is_float {
                     ops |= 1 << 16;
                 }
-                bytecode.push(Byte::new(Instruction::PackedDot).with_operand_u32(ops));
-                true
+                (machine::PACKED_DOT, ops, args)
             }
             LinearAlgebraKind::MatMul {
                 m,
@@ -5642,11 +5640,7 @@ impl Compiler {
                 {
                     return false;
                 }
-                bytecode.append(&mut self.do_compile(&args[0]));
-                bytecode.append(&mut self.do_compile(&args[1]));
-                let mut ops = (*m as u32)
-                    | ((*k as u32) << 8)
-                    | ((*n as u32) << 16);
+                let mut ops = (*m as u32) | ((*k as u32) << 8) | ((*n as u32) << 16);
                 if *elem_is_float {
                     ops |= 1 << 24;
                 }
@@ -5656,8 +5650,7 @@ impl Compiler {
                 if *row_is_tuple {
                     ops |= 1 << 26;
                 }
-                bytecode.push(Byte::new(Instruction::PackedMatMul).with_operand_u32(ops));
-                true
+                (machine::PACKED_MATMUL, ops, args)
             }
             LinearAlgebraKind::MatrixZip {
                 m,
@@ -5680,8 +5673,6 @@ impl Compiler {
                     AggregateOp::Sub => 1,
                     _ => return false,
                 };
-                bytecode.append(&mut self.do_compile(&args[0]));
-                bytecode.append(&mut self.do_compile(&args[1]));
                 let mut ops = (*m as u32) | ((*n as u32) << 8) | (zip_kind << 16);
                 if *elem_is_float {
                     ops |= 1 << 24;
@@ -5692,8 +5683,7 @@ impl Compiler {
                 if *row_is_tuple {
                     ops |= 1 << 26;
                 }
-                bytecode.push(Byte::new(Instruction::PackedMatrixZip).with_operand_u32(ops));
-                true
+                (machine::PACKED_MATRIX_ZIP, ops, args)
             }
             LinearAlgebraKind::MatrixNeg {
                 m,
@@ -5710,7 +5700,6 @@ impl Compiler {
                 {
                     return false;
                 }
-                bytecode.append(&mut self.do_compile(&args[0]));
                 let mut ops = (*m as u32) | ((*n as u32) << 8);
                 if *elem_is_float {
                     ops |= 1 << 16;
@@ -5721,11 +5710,27 @@ impl Compiler {
                 if *row_is_tuple {
                     ops |= 1 << 18;
                 }
-                bytecode.push(Byte::new(Instruction::PackedMatrixNeg).with_operand_u32(ops));
-                true
+                (machine::PACKED_MATRIX_NEG, ops, args)
             }
-            LinearAlgebraKind::Cross { .. } => false,
+            LinearAlgebraKind::Cross { .. } => return false,
+        };
+
+        let Some(native_id) = self.native_id(native_name) else {
+            return false;
+        };
+
+        // HostInvoke stack: [id, args_tuple]; tuple = [arg0, …, meta].
+        // Meta is a full u32 bitfield — must use `with_operand_u32` (not
+        // `with_value_u32`, which only keeps the low 16 bits).
+        bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(native_id as u32));
+        for arg in value_args {
+            bytecode.append(&mut self.do_compile(arg));
         }
+        bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(meta));
+        let arity = value_args.len() + 1; // + meta
+        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+        bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
+        true
     }
 
     /// Desugar `assert(cond[, msg])` to Ok(()) / Err(msg) via MakeEnum.
@@ -9874,6 +9879,12 @@ mod tests {
     fn compile_src(src: &str) -> (Vec<Byte>, Vec<u64>) {
         let mut ast = Pratt::default().parse(src).expect("parse failed");
         let mut compiler = Compiler::default();
+        // Stable placeholder ids so Approach A packed HostInvoke lowering
+        // fires in unit tests (Pipeline assigns real ids at runtime).
+        compiler.register_native_id(machine::PACKED_DOT, 9001);
+        compiler.register_native_id(machine::PACKED_MATMUL, 9002);
+        compiler.register_native_id(machine::PACKED_MATRIX_ZIP, 9003);
+        compiler.register_native_id(machine::PACKED_MATRIX_NEG, 9004);
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }
@@ -13579,7 +13590,7 @@ fn main() {
         );
     }
 
-    /// Approach A: `matmul` lowers to `PackedMatMul`, not a MUL cascade.
+    /// Approach A: `matmul` lowers to packed `HostInvoke`, not a MUL cascade.
     #[test]
     fn matmul_emits_packed_matmul_opcode() {
         use common::Instruction;
@@ -13593,13 +13604,13 @@ fn main() {
 }
 "#,
         );
-        let packed = bc
+        let hosts = bc
             .iter()
-            .filter(|b| matches!(b.bytecode(), Instruction::PackedMatMul))
+            .filter(|b| matches!(b.bytecode(), Instruction::HostInvoke))
             .count();
-        assert_eq!(
-            packed, 1,
-            "expected exactly one PackedMatMul; opcodes: {:?}",
+        assert!(
+            hosts >= 1,
+            "expected packed HostInvoke for matmul; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
         // Scalar 2×2×2 unroll would emit 8 MUL; packed path must be far below that.
@@ -13609,7 +13620,7 @@ fn main() {
             .count();
         assert!(
             mul_count < 8,
-            "PackedMatMul path should not unroll to 8 MULs; got {mul_count}"
+            "packed matmul path should not unroll to 8 MULs; got {mul_count}"
         );
     }
 
@@ -13629,8 +13640,8 @@ fn main() {
         let (bc, _) = compile_src(&src);
         assert!(
             !bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::PackedMatMul)),
-            "dims > 255 must not emit PackedMatMul"
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "dims > 255 must not emit packed HostInvoke"
         );
         let mul_count = bc
             .iter()
@@ -13656,8 +13667,8 @@ fn main() {
         );
         assert!(
             bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::PackedDot)),
-            "expected PackedDot; opcodes: {:?}",
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected packed HostInvoke (dot); opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
@@ -13678,13 +13689,31 @@ fn main() {
         );
         assert!(
             bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::PackedMatMul)),
-            "expected PackedMatMul for Matrix *; opcodes: {:?}",
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected packed HostInvoke (matmul) for Matrix *; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
-    /// Approach A: `Matrix` `+` lowers to `PackedMatrixZip` with zip_kind=Add.
+    fn packed_host_meta(bc: &[common::Byte]) -> u32 {
+        use common::Instruction;
+        let hi = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::HostInvoke))
+            .expect("expected HostInvoke");
+        // Layout: … CONST meta, MakeTuple, HostInvoke
+        assert!(
+            hi >= 2 && matches!(bc[hi - 1].bytecode(), Instruction::MakeTuple),
+            "HostInvoke must follow MakeTuple"
+        );
+        assert!(
+            matches!(bc[hi - 2].bytecode(), Instruction::CONST),
+            "meta CONST must precede MakeTuple"
+        );
+        bc[hi - 2].operand_u32()
+    }
+
+    /// Approach A: `Matrix` `+` lowers to packed_matrix_zip with zip_kind=Add.
     #[test]
     fn matrix_add_emits_packed_matrix_zip_add() {
         use common::Instruction;
@@ -13697,11 +13726,12 @@ fn main() {
 }
 "#,
         );
-        let zip = bc
-            .iter()
-            .find(|b| matches!(b.bytecode(), Instruction::PackedMatrixZip))
-            .expect("expected PackedMatrixZip for Matrix +");
-        let ops = zip.operand_u32();
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for Matrix +"
+        );
+        let ops = packed_host_meta(&bc);
         assert_eq!(ops & 0xFF, 2, "m");
         assert_eq!((ops >> 8) & 0xFF, 2, "n");
         assert_eq!((ops >> 16) & 0xFF, 0, "zip_kind Add");
@@ -13721,19 +13751,20 @@ fn main() {
 }
 "#,
         );
-        let zip = bc
-            .iter()
-            .find(|b| matches!(b.bytecode(), Instruction::PackedMatrixZip))
-            .expect("expected PackedMatrixZip for Matrix -");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for Matrix -"
+        );
         assert_eq!(
-            (zip.operand_u32() >> 16) & 0xFF,
+            (packed_host_meta(&bc) >> 16) & 0xFF,
             1,
             "zip_kind Sub; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
-    /// Approach A: unary `-` on `Matrix` lowers to `PackedMatrixNeg`.
+    /// Approach A: unary `-` on `Matrix` lowers to packed_matrix_neg via HostInvoke.
     #[test]
     fn matrix_neg_emits_packed_matrix_neg() {
         use common::Instruction;
@@ -13748,13 +13779,13 @@ fn main() {
         );
         assert!(
             bc.iter()
-                .any(|b| matches!(b.bytecode(), Instruction::PackedMatrixNeg)),
-            "expected PackedMatrixNeg for Matrix unary -; opcodes: {:?}",
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for Matrix unary -; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
 
-    /// `cross` stays on the scalar unroll path (no Packed* opcodes).
+    /// `cross` stays on the scalar unroll path (no HostInvoke / packed natives).
     #[test]
     fn cross_does_not_emit_packed_opcodes() {
         use common::Instruction;
@@ -13766,17 +13797,9 @@ fn main() {
 }
 "#,
         );
-        let packed = bc.iter().any(|b| {
-            matches!(
-                b.bytecode(),
-                Instruction::PackedDot
-                    | Instruction::PackedMatMul
-                    | Instruction::PackedMatrixZip
-                    | Instruction::PackedMatrixNeg
-            )
-        });
         assert!(
-            !packed,
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
             "cross must stay unrolled; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
@@ -13788,7 +13811,7 @@ fn main() {
         );
     }
 
-    /// Float `dot` sets the PackedDot is_float flag (`operands[16]`).
+    /// Float `dot` sets the packed_dot is_float meta flag (`operands[16]`).
     #[test]
     fn float_dot_emits_packed_dot_with_float_flag() {
         use common::Instruction;
@@ -13799,14 +13822,15 @@ fn main() {
 }
 "#,
         );
-        let packed = bc
-            .iter()
-            .find(|b| matches!(b.bytecode(), Instruction::PackedDot))
-            .expect("expected PackedDot for float dot");
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for float dot"
+        );
         assert_ne!(
-            packed.operand_u32() & (1 << 16),
+            packed_host_meta(&bc) & (1 << 16),
             0,
-            "float PackedDot must set is_float bit"
+            "float packed_dot meta must set is_float bit"
         );
     }
 }
