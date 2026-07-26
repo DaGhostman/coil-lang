@@ -7,7 +7,7 @@
 | Decision | Choice |
 |----------|--------|
 | Delivery scope | **Full:** `Thread` + `Channel` + `ThreadPool` in one cut |
-| Channel payloads | **Deep-copy** almost any coil value; reject opaque host handles that cannot be cloned across heaps |
+| Channel / join payloads | **Sendable subset** deep-copied: immediates, `string`, and nested arrays/tuples/records/enums of sendables. **Rejected:** `Stream`, `Thread`, `Coroutine`, `Fn` / `PolyFn` (and other non-listed opaques) |
 | Runtime model | **One `Machine` per OS thread** (isolate); no shared VM heap |
 | Language surface | Virtual module `thread` via **HostInvoke** (mirror `io`) — no new opcodes |
 | `ARCHIVE_VERSION` | **No bump** (HostInvoke-only; append heap `Object` variants only) |
@@ -32,7 +32,7 @@ Current VM assumptions that forbid a shared-heap design without a concurrent GC 
 2. Host native registry (`Arc<dyn NativeFn>` already `Send + Sync`).
 3. Host-owned sync objects (`Thread` join state, channel ends, pool workers) living **outside** any coil heap.
 
-Cross-thread communication deep-copies values through a portable intermediate (see § Deep-copy).
+Cross-thread communication deep-copies **sendable** values through a portable intermediate (see § Deep-copy). Callables are never copied as heap `Fn` values — `spawn` / `submit` pass a capture-free bytecode entry plus optional sendable args.
 
 ```mermaid
 flowchart LR
@@ -50,10 +50,10 @@ flowchart LR
   Host[Host Thread / Channel / Pool]
   MP -.-> Prog
   MC -.-> Prog
-  MP -->|spawn deep_copy Fn| Host
+  MP -->|spawn entry plus sendable args| Host
   Host -->|start| MC
-  MP <-->|send / recv deep_copy| Host
-  MC <-->|send / recv deep_copy| Host
+  MP <-->|send / recv sendable deep_copy| Host
+  MC <-->|send / recv sendable deep_copy| Host
 ```
 
 ---
@@ -82,7 +82,7 @@ Unit enum `ThreadError` (lazy-registered on `use thread::*`, same as `IoError`):
 | `WouldBlock` | `try_send` / `try_recv` would wait |
 | `Disconnected` | Peer dropped / channel closed |
 | `JoinFailed` | Worker panicked or join already consumed |
-| `NotSendable` | Deep-copy rejected (opaque / cycle policy / unsupported object) |
+| `NotSendable` | Value is not in the sendable subset (`Stream` / `Thread` / `Coroutine` / `Fn` / captures / cycles / …) |
 | `PoolShutdown` | `submit` after pool shutdown |
 | `Other` | Catch-all |
 
@@ -92,18 +92,23 @@ Results: `Result<T, ThreadError>` via existing prelude `Result`.
 
 ```coil
 // --- Thread ---
-// Spawn a zero-arg function on a new OS thread. The closure / Fn value
-// (and its captures) are deep-copied into the child Machine.
+// Spawn a capture-free function by bytecode entry on a new OS thread.
+// Optional args must be sendable (see § Deep-copy); they are deep-copied
+// into the child Machine and applied to `f`. Closures with captures and
+// heap Fn values are NOT copied across threads.
 fn spawn(f: () -> T) -> Result<Thread, ThreadError>
+fn spawn(f: (A) -> T, arg: A) -> Result<Thread, ThreadError>   // A sendable
 
 // Block until the thread finishes; deep-copy the return value into the
-// caller's heap. Consumes the join (second join → JoinFailed).
+// caller's heap (return type must be sendable). Consumes the join
+// (second join → JoinFailed).
 fn join(t: Thread) -> Result<T, ThreadError>
 
 // Detach: allow the thread to run without join. Further join → JoinFailed.
 fn detach(t: Thread) -> Result<(), ThreadError>
 
 // --- Channel (unbounded MPSC host queue; directional) ---
+// T must be sendable (immediates / string / nested aggregates of those).
 fn channel[T]() -> (Sender, Receiver)
 
 fn send[T](tx: Sender, value: T) -> Result<(), ThreadError>
@@ -115,16 +120,18 @@ fn close(tx: Sender) -> Result<(), ThreadError>             // optional; Drop al
 // --- ThreadPool ---
 fn pool(workers: int) -> Result<ThreadPool, ThreadError>    // workers >= 1
 fn submit[T](p: ThreadPool, f: () -> T) -> Result<Thread, ThreadError>
+fn submit[T, A](p: ThreadPool, f: (A) -> T, arg: A) -> Result<Thread, ThreadError>
 fn shutdown(p: ThreadPool) -> Result<(), ThreadError>       // refuse new submit; join workers
 ```
 
 Notes:
 
 - **No method syntax required for v1** (free functions + UFCS later if desired). Mirror `io` free fns.
-- **`spawn` / `submit` accept first-class `ObjFn` / lambdas** with arity 0 after captures (`() -> T`). Named top-level functions work via existing callable values.
-- **Generics:** schemes are polymorphic in `T` the same way IO schemes are monomorphic today — implement via HM type variables in `thread_fn_scheme` (pattern after polymorphic builtins if present; otherwise monomorphize at call site via unification with argument/return). Prefer real polymorphism: `Scheme` with quantified `T`.
+- **`spawn` / `submit` take a capture-free callable** (typically a top-level `fn`). Implementation records the bytecode `entry` (+ arity) from the `ObjFn` / function value and **discards** any heap Fn identity — empty `captures` / `captured_args` required, else `NotSendable` (or a type/diagnostic error). Optional sendable args are deep-copied into the child and applied there. Capturing lambdas are rejected.
+- **`Sender` / `Receiver` are host handles**, not channel *payloads*. They may be passed as `spawn`/`submit` arguments (re-wrap the same `Arc` on the child heap) so a worker can send/recv. They must **not** appear inside a `send`/`recv` message body (message `T` is the sendable subset only). `Thread` / `ThreadPool` are never sendable payloads or spawn args.
+- **Generics:** schemes are polymorphic in sendable `T` / `A` via HM type variables in `thread_fn_scheme`. Prefer real polymorphism: `Scheme` with quantified vars + sendability constraints.
 - **Statics are per-Machine:** child threads do **not** see parent `static` mutations. Document this.
-- **Coroutines stay single-Machine:** `async fn` / `resume` do not cross OS threads. Spawning an `async fn` is rejected (`NotSendable` or type error: spawn expects `() -> T`, not `coroutine<…>`).
+- **Coroutines stay single-Machine:** `async fn` / `resume` do not cross OS threads. Spawning an `async fn` is a type error (spawn expects an ordinary function, not `coroutine<…>`).
 
 ### Example sketches
 
@@ -148,22 +155,24 @@ fn main() {
 ```coil
 use thread::*;
 
+fn producer(Sender tx) -> int {
+    send(tx, "hello")?;
+    return 0;
+}
+
 fn main() {
     let pair = channel();
     let tx = pair[0];
     let rx = pair[1];
-    let t = spawn(|| {
-        send(tx, "hello")?;
-        return 0;
-    })?;
+    let t = spawn(producer, tx)?;
     print "%s", recv(rx)?;
     join(t)?;
 }
 ```
 
-(Exact lambda / tuple destructure syntax must match current grammar; adjust to `let pair = channel();` + index or record if needed.)
+(Exact tuple indexing / destructure syntax must match current grammar.)
 
-`examples/thread_pool.hy` → print sum of parallel jobs.
+`examples/thread_pool.hy` → print sum of parallel jobs (each job returns a sendable `int`; no Fn/captures in messages).
 
 ---
 
@@ -198,9 +207,9 @@ PoolInner {
 Worker threads for `spawn` / pool:
 
 1. Build a fresh `Machine` with `Arc` program + cloned host-native list.
-2. Deep-copy the entry `ObjFn` (and captures) into the child heap.
+2. Resolve the capture-free function by bytecode `entry` (shared program). Deep-copy any sendable spawn args into the child heap; re-wrap `Sender`/`Receiver` args as host `Arc`s. Reject non-empty Fn captures.
 3. Invoke the function (reuse nested-call / `call_function` path).
-4. Deep-copy the return `Value` into a `PortableValue`; store in `JoinState`.
+4. Deep-copy the return `Value` into a `PortableValue` (**sendable subset only**); store in `JoinState`.
 5. On panic / VM panic flag → `JoinFailed` / error string.
 
 ### Making `Machine` movable onto threads
@@ -242,11 +251,32 @@ GC: these hold **no coil `Value` roots** (only `Arc` to host). Mark/size/display
 
 ---
 
-## Deep-copy / `PortableValue`
+## Deep-copy / `PortableValue` (sendable subset)
+
+### What may cross a thread boundary
+
+**Allowed (structurally deep-copied):**
+
+- Immediates: `int`, `float`, `bool`, `byte`, `unit`, and other immediate bit-patterns
+- `string`
+- Nested aggregates whose **every** element/field is sendable: arrays, tuples, record/dict instances, enums (including payloads)
+
+**Rejected (`NotSendable` at runtime; typechecker when resolved):**
+
+- `Stream`
+- `Thread`
+- `Coroutine` / `coroutine<…>`
+- `Fn` / `PolyFn` (including capturing lambdas and partial applications)
+- `Library`, `ThreadPool`, and any other opaque not listed as allowed
+- Cycles in the object graph (v1)
+
+**Narrow spawn-arg exception (not channel message bodies):**
+
+- `Sender` / `Receiver` may be passed as `spawn` / `submit` arguments by re-wrapping the host `Arc` onto the child heap. They are **not** valid `send`/`recv`/`join` payload types.
 
 ### Portable IR
 
-Host-side enum (not a coil type), roughly:
+Host-side enum (not a coil type) — **no Fn / handle variants for messages**:
 
 ```rust
 enum PortableValue {
@@ -255,22 +285,15 @@ enum PortableValue {
     Array(Vec<PortableValue>),
     Tuple(Vec<PortableValue>),
     Enum { tag: u32, payload: Vec<PortableValue> },
-    Instance { fields: Vec<(String, PortableValue)> }, // dict / class instance
-    Fn {
-        entry: u32,
-        arity: u32,
-        is_rest: bool,
-        filled_mask: u32,
-        captured_args: Vec<PortableValue>,
-        captures: Vec<PortableValue>,
-    },
-    PolyFn {
-        entry: u32,
-        type_arity: u8,
-        captured_dicts: Vec<Option<PortableValue>>,
-    },
+    Instance { fields: Vec<(String, PortableValue)> }, // dict / class instance; fields sendable
     Boxed(PortableValue),
-    // Library? reject or share Arc<Library> by path id — see below
+}
+
+/// Spawn/submit args only — not used inside channel queues / join results.
+enum SpawnArg {
+    Value(PortableValue),
+    Sender(Arc<ChannelInner>),
+    Receiver(Arc<ChannelInner>),
 }
 ```
 
@@ -280,15 +303,16 @@ enum PortableValue {
 |-----------------|--------|
 | Immediate `Value` | Bit-copy into `Immediate` |
 | `String` | Own `String` bytes |
-| `Array` / `Tuple` / `Enum` / `Boxed` | Recurse |
-| `Instance` | Recurse field table (string keys + members) |
-| `Fn` / `PolyFn` | Copy descriptor; recurse captures / dicts; **reuse `entry` offsets** (same shared program) |
-| `Library` | Prefer re-`dlopen` / share `Arc<Library>` by registered id; if awkward, `NotSendable` in v1 |
+| `Array` / `Tuple` / `Enum` / `Boxed` | Recurse; any nested reject aborts with `NotSendable` |
+| `Instance` | Recurse field table (string keys + members); same reject rules |
+| `Fn` / `PolyFn` | **`NotSendable`** (callables cross threads only as capture-free bytecode `entry` for `spawn`/`submit`) |
+| `Library` | **`NotSendable`** |
 | `Stream` | **`NotSendable`** |
 | `Coroutine` | **`NotSendable`** |
-| `Thread` / `Sender` / `Receiver` / `ThreadPool` | **Sendable as handle:** encode as host-id in a dedicated portable variant that re-wraps the same `Arc` on the destination heap (not a structural deep-copy) |
+| `Thread` / `ThreadPool` | **`NotSendable`** |
+| `Sender` / `Receiver` | **`NotSendable`** in message/`join` graphs; allowed only as `SpawnArg` host-Arc rewrap |
 
-Cycle handling: maintain `HashMap<*const (), PortableValue>` (or addr → already-copied) while encoding; on back-edge, either fail `NotSendable` or emit a structured cycle ref. **v1: reject cycles with `NotSendable`** (simpler; document).
+Cycle handling: track visited heap addresses while encoding; on back-edge → `NotSendable`.
 
 Decode: allocate into the **destination** `Heap`, reconstructing objects. Strings go through `heap.intern`.
 
@@ -297,17 +321,19 @@ API:
 ```rust
 pub fn value_to_portable(heap: &Heap, v: Value) -> Result<PortableValue, ThreadErrorKind>;
 pub fn portable_to_value(heap: &mut Heap, p: PortableValue) -> Result<Value, ThreadErrorKind>;
+pub fn value_to_spawn_arg(heap: &Heap, v: Value) -> Result<SpawnArg, ThreadErrorKind>;
 ```
 
-Used by: `send`/`recv`, `spawn` (copy fn in), `join` (copy result out), `submit`.
+Used by: `send`/`recv`/`join` (portable subset only); `spawn`/`submit` (entry + `SpawnArg` list).
 
 ### Typechecker sendability (best-effort)
 
-Static check in `spawn` / `send` / `submit` schemes:
+Static check for `send` / `recv` type arg `T`, `join` result `T`, and `spawn`/`submit` data args:
 
-- Reject known-unsound types when fully resolved: `Stream`, `coroutine<…>`, and (if distinguishable) IO handles.
-- `Thread` / `Sender` / `Receiver` / `ThreadPool` **are** allowed (handle share).
-- Open type variables: allow; runtime deep-copy is the source of truth (`NotSendable`).
+- **Sendable:** immediates, `string`, arrays/tuples/records/enums/aliases thereof when all leaves are sendable.
+- **Not sendable:** `Stream`, `Thread`, `ThreadPool`, `coroutine<…>`, function types / `Fn`, `Library`.
+- **`Sender` / `Receiver`:** allowed only as `spawn`/`submit` argument types; rejected as `channel`/`send`/`join` payload types.
+- Open type variables: allow; runtime deep-copy remains the source of truth (`NotSendable`).
 
 Mirror FFI’s `is_ffi_marshallable_ty` as `is_thread_sendable_ty` in [`infer.rs`](compiler/src/typechecking/infer.rs).
 
@@ -329,14 +355,14 @@ Follow the `io` layering exactly.
 | [`machine/src/thread.rs`](machine/src/thread.rs) | Host impls + portable deep-copy |
 | Docs | Tutorial `11-threads.md`; update `built-ins.md`, `modules.md`, `types.md`, `README.md` feature matrix, `examples.md` |
 | Examples + goldens | `examples/thread_*.hy` + pipeline tests |
-| `AGENTS.md` | Learned fact: virtual `thread` module; isolate Machines; deep-copy channels |
+| `AGENTS.md` | Learned fact: virtual `thread` module; isolate Machines; sendable-subset deep-copy channels |
 
 ---
 
 ## ThreadPool semantics (locked)
 
 - `pool(n)` creates `n` OS threads, each with a **long-lived** `Machine` that pulls jobs from a host queue **or** spawns a fresh Machine per job. **Prefer fresh Machine per job** for isolation (no leftover locals/statics between jobs); workers are OS threads that construct a Machine, run one job, tear down. (Cheaper pooling of Machines can be a later optimization.)
-- `submit(p, f)` deep-copies `f` into a `PortableValue`, enqueues; a worker decodes onto its Machine, runs, stores result in a `JoinState`, returns `Thread` (= join handle).
+- `submit(p, f)` / `submit(p, f, arg)` records a capture-free bytecode `entry` (+ optional sendable/`Sender`/`Receiver` args), enqueues; a worker builds a Machine, applies args, runs, stores a **sendable** result in a `JoinState`, returns `Thread` (= join handle).
 - `shutdown(p)` stops accepting jobs, waits for queue drain + workers; further `submit` → `PoolShutdown`.
 - Drop of last `ThreadPool` handle triggers shutdown asynchronously or blocks — **v1: `shutdown` is explicit; Drop calls shutdown + join workers**.
 
@@ -360,11 +386,13 @@ Follow the `io` layering exactly.
 
 ### Unit (machine)
 
-- `portable_roundtrip_immediate_string_array_tuple_enum_instance_fn`
-- `portable_rejects_stream_and_coroutine`
-- `portable_shares_sender_handle_identity`
+- `portable_roundtrip_immediate_string_array_tuple_enum_instance`
+- `portable_rejects_stream_thread_coroutine_and_fn`
+- `spawn_arg_rewrapping_sender_preserves_channel_identity`
+- `spawn_rejects_fn_with_captures`
 - `spawn_join_returns_deep_copied_int`
 - `channel_send_recv_across_two_machines`
+- `channel_rejects_sending_fn_or_thread_handle`
 - `try_recv_would_block`
 - `recv_after_close_disconnected`
 - `pool_submit_n_jobs_join_all`
@@ -372,8 +400,9 @@ Follow the `io` layering exactly.
 
 ### Typechecker / diagnostics
 
-- `spawn` on non-function / wrong arity
-- `send` of `Stream` → diagnostic or runtime `NotSendable` golden
+- `spawn` on non-function / wrong arity / capturing lambda
+- `send` of `Stream` / `Thread` / function type → diagnostic
+- `join` result type not sendable → diagnostic
 - Unknown `thread::` import without `use`
 
 ### Pipeline goldens
@@ -390,9 +419,9 @@ Run with 64MB memory limit per project preference when exercising pools (watch f
 
 Work can land as stacked commits on one PR, but all ship together:
 
-1. **Plumbing:** `PortableValue` deep-copy; `SharedProgram`; `Send` output sink; heap object stubs.
-2. **Thread:** `spawn` / `join` / `detach` + virtual module + example.
-3. **Channel:** `channel` / `send` / `recv` / `try_*` + example.
+1. **Plumbing:** sendable-subset `PortableValue` + `SpawnArg`; `SharedProgram`; `Send` output sink; heap object stubs.
+2. **Thread:** capture-free `spawn` / `join` / `detach` + virtual module + example.
+3. **Channel:** `channel` / `send` / `recv` / `try_*` + example (`spawn(producer, tx)`).
 4. **ThreadPool:** `pool` / `submit` / `shutdown` + example.
 5. **Docs + AGENTS.md + diagnostics polish.**
 
@@ -401,6 +430,7 @@ Work can land as stacked commits on one PR, but all ship together:
 ## Explicit non-goals (this cut)
 
 - Shared-heap concurrent GC / true shared `Value` pointers across OS threads.
+- Deep-copying `Fn` / capturing lambdas / `Thread` / `Stream` / `Coroutine` as message or join payloads.
 - Bounded channels with back-pressure sizing API (`channel(capacity)` — easy follow-up; v1 unbounded).
 - `Select` / multi-recv.
 - Structured concurrency / cancellation tokens.
@@ -427,7 +457,8 @@ Work can land as stacked commits on one PR, but all ship together:
 
 - `use thread::*;` works like `use io::*;`.
 - `spawn` + `join`, directional channels, and `ThreadPool` all work end-to-end in examples.
-- Deep-copy sends structured values (including `Fn` captures and nested aggregates); `Stream` / `Coroutine` fail cleanly.
+- Deep-copy sends only the sendable subset (immediates, `string`, nested aggregates); `Stream` / `Thread` / `Coroutine` / `Fn` fail cleanly with `NotSendable` (or a type diagnostic).
+- `spawn` uses capture-free bytecode entries + optional sendable/`Sender`/`Receiver` args — no heap Fn cloning.
 - No `ARCHIVE_VERSION` bump; no new opcodes.
 - Coroutines and single-threaded programs unchanged.
 - `cargo test --workspace` green; docs updated.
