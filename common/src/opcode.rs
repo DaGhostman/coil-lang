@@ -237,6 +237,32 @@ pub enum Instruction {
 
     /// TailCall: same packing as CALL — reuse frame (self tail recursion).
     TailCall,
+
+    // --- Approach A: packed linear-algebra kernels (ARCHIVE_VERSION 28) ---
+
+    /// PackedDot — pop `b`, pop `a`; push `Σ a[i]*b[i]`.
+    ///
+    /// `operands[15:0]` = length (`u16`); `operands[16]` = `is_float`.
+    PackedDot,
+
+    /// PackedMatMul — pop `B`, pop `A`; push nested `m×n` product.
+    ///
+    /// Dims are `u8` (fallback to scalar unroll when any dim > 255):
+    /// `operands[7:0]` = `m`, `[15:8]` = `k`, `[23:16]` = `n`;
+    /// `[24]` = `is_float`; `[25]` = `outer_is_tuple`; `[26]` = `row_is_tuple`.
+    PackedMatMul,
+
+    /// PackedMatrixZip — pop `B`, pop `A`; cell-wise add/sub → nested `m×n`.
+    ///
+    /// `operands[7:0]` = `m`, `[15:8]` = `n`, `[23:16]` = zip kind (`0` Add, `1` Sub);
+    /// `[24]` = `is_float`; `[25]` = `outer_is_tuple`; `[26]` = `row_is_tuple`.
+    PackedMatrixZip,
+
+    /// PackedMatrixNeg — pop `A`; cell-wise negate → nested `m×n`.
+    ///
+    /// `operands[7:0]` = `m`, `[15:8]` = `n`;
+    /// `[16]` = `is_float`; `[17]` = `outer_is_tuple`; `[18]` = `row_is_tuple`.
+    PackedMatrixNeg,
 }
 
 impl From<u8> for Instruction {

@@ -638,3 +638,12 @@ Nominal wrapper distinct from bare nested arrays:
    dot to `**`.
 
 Example: `examples/matrix_mul.hy` → `19,22,43,502`.
+
+### 13.4 Approach A — packed fat opcodes (in progress)
+
+Scalar unroll for `dot` / `matmul` / `Matrix` ops is replaced by fat
+opcodes (`PackedDot`, `PackedMatMul`, `PackedMatrixZip`,
+`PackedMatrixNeg`) that extract nested aggregates into contiguous
+buffers, run a packed kernel, and rebuild the nested result. Enables
+future SIMD inside the same opcode surface. Details:
+[`MATRIX_PACKED_KERNEL_PLAN.md`](./MATRIX_PACKED_KERNEL_PLAN.md).

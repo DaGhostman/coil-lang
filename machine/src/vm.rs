@@ -269,6 +269,80 @@ impl<const S: usize> Machine<S> {
         None
     }
 
+    /// Clone elements of an `ObjArray` / `ObjTuple` (Approach A packed kernels).
+    fn aggregate_elements(heap: &Heap, v: Value) -> Option<Vec<Value>> {
+        match Self::find_object_by_addr(heap, v.raw() as u64) {
+            Some(Object::Array(gc)) => Some(gc.as_ref().elements.clone()),
+            Some(Object::Tuple(gc)) => Some(gc.as_ref().elements.clone()),
+            _ => None,
+        }
+    }
+
+    /// Flatten a nested matrix into row-major `m * n` cells.
+    fn extract_matrix_row_major(
+        heap: &Heap,
+        v: Value,
+        m: usize,
+        n: usize,
+    ) -> Option<Vec<Value>> {
+        let rows = Self::aggregate_elements(heap, v)?;
+        if rows.len() < m {
+            return None;
+        }
+        let mut out = Vec::with_capacity(m.saturating_mul(n));
+        for i in 0..m {
+            let row = Self::aggregate_elements(heap, rows[i])?;
+            if row.len() < n {
+                return None;
+            }
+            out.extend_from_slice(&row[..n]);
+        }
+        Some(out)
+    }
+
+    fn maybe_gc_after_alloc(&mut self) {
+        if self.alloc_counter > GC_TRIGGER_INTERVAL {
+            Self::gc_collect(
+                &mut self.heap,
+                &self.stack,
+                &self.resume_stack,
+                &mut self.alloc_counter,
+            );
+        }
+    }
+
+    /// Allocate an array or tuple from already-ordered elements.
+    fn alloc_aggregate(&mut self, values: Vec<Value>, is_tuple: bool) -> Value {
+        self.alloc_counter += 1;
+        let addr = if is_tuple {
+            let (object, _) = self.heap.alloc(ObjTuple { elements: values }, Object::Tuple);
+            object.addr()
+        } else {
+            let (object, _) = self.heap.alloc(ObjArray { elements: values }, Object::Array);
+            object.addr()
+        };
+        self.maybe_gc_after_alloc();
+        Value::from(addr)
+    }
+
+    /// Rebuild nested `m×n` matrix from row-major cells.
+    fn alloc_nested_matrix(
+        &mut self,
+        cells: Vec<Value>,
+        m: usize,
+        n: usize,
+        outer_is_tuple: bool,
+        row_is_tuple: bool,
+    ) -> Value {
+        let mut rows = Vec::with_capacity(m);
+        for i in 0..m {
+            let start = i * n;
+            let row = cells[start..start + n].to_vec();
+            rows.push(self.alloc_aggregate(row, row_is_tuple));
+        }
+        self.alloc_aggregate(rows, outer_is_tuple)
+    }
+
     #[allow(dead_code)]
     fn value_to_string(&self, v: &Value) -> String {
         self.heap
@@ -1082,7 +1156,7 @@ impl<const S: usize> Machine<S> {
             // variant. A stale ceiling (e.g. YieldFromCoro) makes later opcodes
             // (`StoreIndex`, `DoneCoro`, `ArrayPush`, …) UB via assert_unchecked.
             #[cfg(not(debug_assertions))]
-            promise!(*bc as u8 <= Instruction::TailCall as u8);
+            promise!(*bc as u8 <= Instruction::PackedMatrixNeg as u8);
 
             match bc {
                 Instruction::POP => {
@@ -2901,6 +2975,131 @@ impl<const S: usize> Machine<S> {
                     } else {
                         print!("{text}");
                     }
+                }
+                Instruction::PackedDot => {
+                    let ops = opcode.operand_u32();
+                    let len = (ops & 0xFFFF) as usize;
+                    let is_float = (ops & (1 << 16)) != 0;
+                    let b = self.stack.pop();
+                    let a = self.stack.pop();
+                    let av = Self::aggregate_elements(&self.heap, a).unwrap_or_default();
+                    let bv = Self::aggregate_elements(&self.heap, b).unwrap_or_default();
+                    let n = len.min(av.len()).min(bv.len());
+                    if is_float {
+                        let mut sum = 0.0_f64;
+                        for i in 0..n {
+                            sum += av[i].as_float() * bv[i].as_float();
+                        }
+                        self.stack.push(Value::from(sum));
+                    } else {
+                        let mut sum = 0_i64;
+                        for i in 0..n {
+                            sum = sum.wrapping_add(av[i].as_int().wrapping_mul(bv[i].as_int()));
+                        }
+                        self.stack.push(Value::from(sum));
+                    }
+                }
+                Instruction::PackedMatMul => {
+                    let ops = opcode.operand_u32();
+                    let m = (ops & 0xFF) as usize;
+                    let k = ((ops >> 8) & 0xFF) as usize;
+                    let n = ((ops >> 16) & 0xFF) as usize;
+                    let is_float = (ops & (1 << 24)) != 0;
+                    let outer_is_tuple = (ops & (1 << 25)) != 0;
+                    let row_is_tuple = (ops & (1 << 26)) != 0;
+                    let b = self.stack.pop();
+                    let a = self.stack.pop();
+                    let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, k)
+                        .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(k)]);
+                    let b_cells = Self::extract_matrix_row_major(&self.heap, b, k, n)
+                        .unwrap_or_else(|| vec![Value::default(); k.saturating_mul(n)]);
+                    let mut c = vec![Value::default(); m.saturating_mul(n)];
+                    if is_float {
+                        for i in 0..m {
+                            for j in 0..n {
+                                let mut acc = 0.0_f64;
+                                for t in 0..k {
+                                    acc += a_cells[i * k + t].as_float()
+                                        * b_cells[t * n + j].as_float();
+                                }
+                                c[i * n + j] = Value::from(acc);
+                            }
+                        }
+                    } else {
+                        for i in 0..m {
+                            for j in 0..n {
+                                let mut acc = 0_i64;
+                                for t in 0..k {
+                                    acc = acc.wrapping_add(
+                                        a_cells[i * k + t]
+                                            .as_int()
+                                            .wrapping_mul(b_cells[t * n + j].as_int()),
+                                    );
+                                }
+                                c[i * n + j] = Value::from(acc);
+                            }
+                        }
+                    }
+                    let result =
+                        self.alloc_nested_matrix(c, m, n, outer_is_tuple, row_is_tuple);
+                    self.stack.push(result);
+                }
+                Instruction::PackedMatrixZip => {
+                    let ops = opcode.operand_u32();
+                    let m = (ops & 0xFF) as usize;
+                    let n = ((ops >> 8) & 0xFF) as usize;
+                    let zip_kind = ((ops >> 16) & 0xFF) as u8;
+                    let is_float = (ops & (1 << 24)) != 0;
+                    let outer_is_tuple = (ops & (1 << 25)) != 0;
+                    let row_is_tuple = (ops & (1 << 26)) != 0;
+                    let b = self.stack.pop();
+                    let a = self.stack.pop();
+                    let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, n)
+                        .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
+                    let b_cells = Self::extract_matrix_row_major(&self.heap, b, m, n)
+                        .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
+                    let mut c = Vec::with_capacity(m.saturating_mul(n));
+                    for i in 0..m.saturating_mul(n) {
+                        let cell = if is_float {
+                            let av = a_cells[i].as_float();
+                            let bv = b_cells[i].as_float();
+                            Value::from(if zip_kind == 1 { av - bv } else { av + bv })
+                        } else {
+                            let av = a_cells[i].as_int();
+                            let bv = b_cells[i].as_int();
+                            Value::from(if zip_kind == 1 {
+                                av.wrapping_sub(bv)
+                            } else {
+                                av.wrapping_add(bv)
+                            })
+                        };
+                        c.push(cell);
+                    }
+                    let result =
+                        self.alloc_nested_matrix(c, m, n, outer_is_tuple, row_is_tuple);
+                    self.stack.push(result);
+                }
+                Instruction::PackedMatrixNeg => {
+                    let ops = opcode.operand_u32();
+                    let m = (ops & 0xFF) as usize;
+                    let n = ((ops >> 8) & 0xFF) as usize;
+                    let is_float = (ops & (1 << 16)) != 0;
+                    let outer_is_tuple = (ops & (1 << 17)) != 0;
+                    let row_is_tuple = (ops & (1 << 18)) != 0;
+                    let a = self.stack.pop();
+                    let a_cells = Self::extract_matrix_row_major(&self.heap, a, m, n)
+                        .unwrap_or_else(|| vec![Value::default(); m.saturating_mul(n)]);
+                    let mut c = Vec::with_capacity(a_cells.len());
+                    for cell in a_cells {
+                        c.push(if is_float {
+                            Value::from(-cell.as_float())
+                        } else {
+                            Value::from(cell.as_int().wrapping_neg())
+                        });
+                    }
+                    let result =
+                        self.alloc_nested_matrix(c, m, n, outer_is_tuple, row_is_tuple);
+                    self.stack.push(result);
                 }
                 _ => return false,
             }
@@ -4998,5 +5197,107 @@ mod tests {
         ];
         let mut vm = Machine::<64>::default();
         vm.run_with_pool(&code, &[], 1);
+    }
+
+    /// Approach A: PackedDot on two length-2 int arrays → 1*3 + 2*4 = 11.
+    #[test]
+    fn packed_dot_int_arrays() {
+        let code = [
+            // a = [1, 2]
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            // b = [3, 4]
+            Byte::new(Instruction::CONST).with_operand_u32(3),
+            Byte::new(Instruction::CONST).with_operand_u32(4),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::PackedDot).with_operand_u32(2), // length=2, int
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 0);
+        assert_eq!(vm.pop().as_int(), 11);
+    }
+
+    /// Approach A: PackedMatMul [[1,2],[3,4]] * [[5,6],[7,8]] → [[19,22],[43,50]].
+    #[test]
+    fn packed_matmul_2x2_int() {
+        // Build A rows, then A; B rows, then B; PackedMatMul m=2,k=2,n=2.
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::CONST).with_operand_u32(3),
+            Byte::new(Instruction::CONST).with_operand_u32(4),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2), // A
+            Byte::new(Instruction::CONST).with_operand_u32(5),
+            Byte::new(Instruction::CONST).with_operand_u32(6),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::CONST).with_operand_u32(7),
+            Byte::new(Instruction::CONST).with_operand_u32(8),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2), // B
+            // m=2, k=2, n=2
+            Byte::new(Instruction::PackedMatMul).with_operand_u32(2 | (2 << 8) | (2 << 16)),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 0);
+        let c = vm.pop();
+        // C[0][0]=19, C[0][1]=22, C[1][0]=43, C[1][1]=50
+        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).expect("C rows");
+        assert_eq!(rows.len(), 2);
+        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
+        let r1 = Machine::<64>::aggregate_elements(&vm.heap, rows[1]).unwrap();
+        assert_eq!(r0[0].as_int(), 19);
+        assert_eq!(r0[1].as_int(), 22);
+        assert_eq!(r1[0].as_int(), 43);
+        assert_eq!(r1[1].as_int(), 50);
+    }
+
+    /// Approach A: PackedMatrixZip add on 1×2 matrices.
+    #[test]
+    fn packed_matrix_zip_add_1x2() {
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(1),
+            Byte::new(Instruction::CONST).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(1), // A = [[1,2]]
+            Byte::new(Instruction::CONST).with_operand_u32(3),
+            Byte::new(Instruction::CONST).with_operand_u32(4),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(1), // B = [[3,4]]
+            // m=1, n=2, zip=Add(0)
+            Byte::new(Instruction::PackedMatrixZip).with_operand_u32(1 | (2 << 8)),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 0);
+        let c = vm.pop();
+        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).unwrap();
+        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
+        assert_eq!(r0[0].as_int(), 4);
+        assert_eq!(r0[1].as_int(), 6);
+    }
+
+    /// Approach A: PackedMatrixNeg on 1×2.
+    #[test]
+    fn packed_matrix_neg_1x2() {
+        let code = [
+            Byte::new(Instruction::CONST).with_operand_u32(5),
+            Byte::new(Instruction::CONST).with_operand_u32(7),
+            Byte::new(Instruction::MakeArray).with_operand_u32(2),
+            Byte::new(Instruction::MakeArray).with_operand_u32(1),
+            Byte::new(Instruction::PackedMatrixNeg).with_operand_u32(1 | (2 << 8)),
+            Byte::new(Instruction::HALT),
+        ];
+        let mut vm = Machine::<64>::default();
+        vm.run_with_pool(&code, &[], 0);
+        let c = vm.pop();
+        let rows = Machine::<64>::aggregate_elements(&vm.heap, c).unwrap();
+        let r0 = Machine::<64>::aggregate_elements(&vm.heap, rows[0]).unwrap();
+        assert_eq!(r0[0].as_int(), -5);
+        assert_eq!(r0[1].as_int(), -7);
     }
 }

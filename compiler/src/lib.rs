@@ -5317,6 +5317,10 @@ impl Compiler {
     }
 
     /// Emit `dot` / `matmul` / `cross` / Matrix ops from the linear-algebra side table.
+    ///
+    /// Approach A: Dot / MatMul / MatrixZip / MatrixNeg lower to packed fat
+    /// opcodes when dims fit the operand packing; otherwise keep the scalar
+    /// unroll. `cross` stays unrolled (fixed N=3).
     fn emit_linear_algebra(
         &mut self,
         bytecode: &mut Vec<Byte>,
@@ -5340,6 +5344,11 @@ impl Compiler {
             return;
         }
         if !needs_two && args.is_empty() {
+            return;
+        }
+
+        // Prefer packed fat opcodes (Approach A) for Dot / MatMul / Matrix*.
+        if self.try_emit_packed_linear_algebra(bytecode, &info.kind, args) {
             return;
         }
 
@@ -5572,6 +5581,137 @@ impl Compiler {
                     bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
                 }
             }
+        }
+    }
+
+    /// Emit Approach A packed opcodes when dims fit; return false to fall back.
+    fn try_emit_packed_linear_algebra(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        kind: &crate::typechecking::LinearAlgebraKind,
+        args: &[Output],
+    ) -> bool {
+        use crate::typechecking::{AggregateOp, LinearAlgebraKind};
+
+        match kind {
+            LinearAlgebraKind::Dot {
+                length,
+                elem_is_float,
+                ..
+            } => {
+                if *length == 0 || *length > u16::MAX as usize || args.len() != 2 {
+                    return false;
+                }
+                bytecode.append(&mut self.do_compile(&args[0]));
+                bytecode.append(&mut self.do_compile(&args[1]));
+                let mut ops = (*length as u32) & 0xFFFF;
+                if *elem_is_float {
+                    ops |= 1 << 16;
+                }
+                bytecode.push(Byte::new(Instruction::PackedDot).with_operand_u32(ops));
+                true
+            }
+            LinearAlgebraKind::MatMul {
+                m,
+                k,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                if args.len() != 2
+                    || *m == 0
+                    || *k == 0
+                    || *n == 0
+                    || *m > u8::MAX as usize
+                    || *k > u8::MAX as usize
+                    || *n > u8::MAX as usize
+                {
+                    return false;
+                }
+                bytecode.append(&mut self.do_compile(&args[0]));
+                bytecode.append(&mut self.do_compile(&args[1]));
+                let mut ops = (*m as u32)
+                    | ((*k as u32) << 8)
+                    | ((*n as u32) << 16);
+                if *elem_is_float {
+                    ops |= 1 << 24;
+                }
+                if *outer_is_tuple {
+                    ops |= 1 << 25;
+                }
+                if *row_is_tuple {
+                    ops |= 1 << 26;
+                }
+                bytecode.push(Byte::new(Instruction::PackedMatMul).with_operand_u32(ops));
+                true
+            }
+            LinearAlgebraKind::MatrixZip {
+                m,
+                n,
+                op,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                if args.len() != 2
+                    || *m == 0
+                    || *n == 0
+                    || *m > u8::MAX as usize
+                    || *n > u8::MAX as usize
+                {
+                    return false;
+                }
+                let zip_kind: u32 = match op {
+                    AggregateOp::Add => 0,
+                    AggregateOp::Sub => 1,
+                    _ => return false,
+                };
+                bytecode.append(&mut self.do_compile(&args[0]));
+                bytecode.append(&mut self.do_compile(&args[1]));
+                let mut ops = (*m as u32) | ((*n as u32) << 8) | (zip_kind << 16);
+                if *elem_is_float {
+                    ops |= 1 << 24;
+                }
+                if *outer_is_tuple {
+                    ops |= 1 << 25;
+                }
+                if *row_is_tuple {
+                    ops |= 1 << 26;
+                }
+                bytecode.push(Byte::new(Instruction::PackedMatrixZip).with_operand_u32(ops));
+                true
+            }
+            LinearAlgebraKind::MatrixNeg {
+                m,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                if args.is_empty()
+                    || *m == 0
+                    || *n == 0
+                    || *m > u8::MAX as usize
+                    || *n > u8::MAX as usize
+                {
+                    return false;
+                }
+                bytecode.append(&mut self.do_compile(&args[0]));
+                let mut ops = (*m as u32) | ((*n as u32) << 8);
+                if *elem_is_float {
+                    ops |= 1 << 16;
+                }
+                if *outer_is_tuple {
+                    ops |= 1 << 17;
+                }
+                if *row_is_tuple {
+                    ops |= 1 << 18;
+                }
+                bytecode.push(Byte::new(Instruction::PackedMatrixNeg).with_operand_u32(ops));
+                true
+            }
+            LinearAlgebraKind::Cross { .. } => false,
         }
     }
 
