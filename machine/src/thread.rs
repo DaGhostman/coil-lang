@@ -260,8 +260,6 @@ impl RwLockInner {
 }
 
 thread_local! {
-    static ACTIVE_MACHINE: RefCell<*mut Machine<WORKER_STACK_SLOTS>> =
-        const { RefCell::new(std::ptr::null_mut()) };
     static HELD_MUTEX: RefCell<Option<(u64, MutexGuard<'static, PortableValue>)>> =
         RefCell::new(None);
 }
@@ -324,30 +322,6 @@ fn host_spawn_context() -> Result<ThreadSpawnContext, ThreadErrorTag> {
             .and_then(|s| s.spawn_context.clone())
             .ok_or(ThreadErrorTag::Other)
     })
-}
-
-#[allow(dead_code)]
-pub(crate) struct ActiveMachineGuard;
-
-impl ActiveMachineGuard {
-    fn enter(machine: *mut Machine<WORKER_STACK_SLOTS>) -> Self {
-        ACTIVE_MACHINE.with(|c| {
-            *c.borrow_mut() = machine;
-        });
-        Self
-    }
-}
-
-impl Drop for ActiveMachineGuard {
-    fn drop(&mut self) {
-        ACTIVE_MACHINE.with(|c| {
-            *c.borrow_mut() = std::ptr::null_mut();
-        });
-    }
-}
-
-pub(crate) fn set_active_machine(machine: *mut Machine<WORKER_STACK_SLOTS>) -> ActiveMachineGuard {
-    ActiveMachineGuard::enter(machine)
 }
 
 /// Allocate `ThreadError` variant on the heap.

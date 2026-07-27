@@ -620,11 +620,6 @@ impl<const S: usize> Machine<S> {
         }));
     }
 
-    /// Legacy hook for host callbacks; `with_lock` holds the `MutexGuard` directly instead.
-    pub fn active_machine_for_host() -> Option<*mut Machine<{ crate::thread::WORKER_STACK_SLOTS }>> {
-        None
-    }
-
     /// Register a function signature on a previously-loaded
     /// userland library (host/test helper — userland code uses
     /// `DeclareFFI` at runtime).
