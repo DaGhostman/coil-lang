@@ -227,6 +227,21 @@ impl Heap {
                 // Closing the fd happens in ObjStream::drop via release.
                 s.release();
             }
+            Object::Thread(t) => {
+                t.release();
+            }
+            Object::Sender(s) => {
+                s.release();
+            }
+            Object::Receiver(r) => {
+                r.release();
+            }
+            Object::Mutex(m) => {
+                m.release();
+            }
+            Object::RwLock(l) => {
+                l.release();
+            }
         }
     }
 
@@ -363,6 +378,11 @@ pub type RefBoxed = Gc<ObjBoxed>;
 pub type RefPolyFn = Gc<ObjPolyFn>;
 pub type RefFn = Gc<ObjFn>;
 pub type RefStream = Gc<ObjStream>;
+pub type RefThread = Gc<ObjThread>;
+pub type RefSender = Gc<ObjSender>;
+pub type RefReceiver = Gc<ObjReceiver>;
+pub type RefThreadMutex = Gc<ObjThreadMutex>;
+pub type RefRwLock = Gc<ObjRwLock>;
 
 /// Kind of host-backed IO stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,6 +410,11 @@ pub enum Object {
     PolyFn(RefPolyFn),
     Fn(RefFn),
     Stream(RefStream),
+    Thread(RefThread),
+    Sender(RefSender),
+    Receiver(RefReceiver),
+    Mutex(RefThreadMutex),
+    RwLock(RefRwLock),
 }
 
 impl Object {
@@ -407,6 +432,11 @@ impl Object {
             Self::PolyFn(p) => p.mark(),
             Self::Fn(f) => f.mark(),
             Self::Stream(s) => s.mark(),
+            Self::Thread(t) => t.mark(),
+            Self::Sender(s) => s.mark(),
+            Self::Receiver(r) => r.mark(),
+            Self::Mutex(m) => m.mark(),
+            Self::RwLock(l) => l.mark(),
         };
         if marked {
             grey_objects.push(*self);
@@ -427,6 +457,11 @@ impl Object {
             Self::PolyFn(p) => p.unmark(),
             Self::Fn(f) => f.unmark(),
             Self::Stream(s) => s.unmark(),
+            Self::Thread(t) => t.unmark(),
+            Self::Sender(s) => s.unmark(),
+            Self::Receiver(r) => r.unmark(),
+            Self::Mutex(m) => m.unmark(),
+            Self::RwLock(l) => l.unmark(),
         }
     }
 
@@ -445,6 +480,11 @@ impl Object {
             Self::PolyFn(p) => p.is_marked(),
             Self::Fn(f) => f.is_marked(),
             Self::Stream(s) => s.is_marked(),
+            Self::Thread(t) => t.is_marked(),
+            Self::Sender(s) => s.is_marked(),
+            Self::Receiver(r) => r.is_marked(),
+            Self::Mutex(m) => m.is_marked(),
+            Self::RwLock(l) => l.is_marked(),
         }
     }
 
@@ -493,6 +533,11 @@ impl Object {
                 // when the ObjFn itself is reachable.
             }
             Self::Stream(_) => {}
+            Self::Thread(_) => {}
+            Self::Sender(_) => {}
+            Self::Receiver(_) => {}
+            Self::Mutex(_) => {}
+            Self::RwLock(_) => {}
         }
     }
 
@@ -511,6 +556,11 @@ impl Object {
             Self::PolyFn(p) => p.get_next(),
             Self::Fn(f) => f.get_next(),
             Self::Stream(s) => s.get_next(),
+            Self::Thread(t) => t.get_next(),
+            Self::Sender(s) => s.get_next(),
+            Self::Receiver(r) => r.get_next(),
+            Self::Mutex(m) => m.get_next(),
+            Self::RwLock(l) => l.get_next(),
         }
     }
 
@@ -528,6 +578,11 @@ impl Object {
             Self::PolyFn(p) => p.set_next(next),
             Self::Fn(f) => f.set_next(next),
             Self::Stream(s) => s.set_next(next),
+            Self::Thread(t) => t.set_next(next),
+            Self::Sender(s) => s.set_next(next),
+            Self::Receiver(r) => r.set_next(next),
+            Self::Mutex(m) => m.set_next(next),
+            Self::RwLock(l) => l.set_next(next),
         }
     }
 
@@ -545,6 +600,11 @@ impl Object {
             Self::PolyFn(p) => p.as_ptr() as u64,
             Self::Fn(f) => f.as_ptr() as u64,
             Self::Stream(s) => s.as_ptr() as u64,
+            Self::Thread(t) => t.as_ptr() as u64,
+            Self::Sender(s) => s.as_ptr() as u64,
+            Self::Receiver(r) => r.as_ptr() as u64,
+            Self::Mutex(m) => m.as_ptr() as u64,
+            Self::RwLock(l) => l.as_ptr() as u64,
         }
     }
 }
@@ -563,6 +623,11 @@ impl GcSized for Object {
             Self::PolyFn(p) => p.size(),
             Self::Fn(f) => f.size(),
             Self::Stream(s) => s.size(),
+            Self::Thread(t) => t.size(),
+            Self::Sender(s) => s.size(),
+            Self::Receiver(r) => r.size(),
+            Self::Mutex(m) => m.size(),
+            Self::RwLock(l) => l.size(),
         }
     }
 }
@@ -581,6 +646,11 @@ impl fmt::Display for Object {
             Self::PolyFn(_) => write!(f, "<polyfn 0x{:08x}>", self.addr()),
             Self::Fn(_) => write!(f, "<fn 0x{:08x}>", self.addr()),
             Self::Stream(_) => write!(f, "<stream 0x{:08x}>", self.addr()),
+            Self::Thread(_) => write!(f, "<thread 0x{:08x}>", self.addr()),
+            Self::Sender(_) => write!(f, "<sender 0x{:08x}>", self.addr()),
+            Self::Receiver(_) => write!(f, "<receiver 0x{:08x}>", self.addr()),
+            Self::Mutex(_) => write!(f, "<mutex 0x{:08x}>", self.addr()),
+            Self::RwLock(_) => write!(f, "<rwlock 0x{:08x}>", self.addr()),
         }
     }
 }
@@ -599,7 +669,12 @@ impl Object {
             | Self::Boxed(_)
             | Self::PolyFn(_)
             | Self::Fn(_)
-            | Self::Stream(_) => std::ptr::null(),
+            | Self::Stream(_)
+            | Self::Thread(_)
+            | Self::Sender(_)
+            | Self::Receiver(_)
+            | Self::Mutex(_)
+            | Self::RwLock(_) => std::ptr::null(),
         }
     }
 }
@@ -770,6 +845,87 @@ impl GcSized for ObjStream {
 impl fmt::Display for ObjStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<stream {:?}>", self.kind)
+    }
+}
+
+/// Join handle for a spawned OS thread (host `JoinState` lives outside the VM heap).
+pub struct ObjThread {
+    pub state: std::sync::Arc<crate::thread::JoinState>,
+}
+
+impl GcSized for ObjThread {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl fmt::Display for ObjThread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<thread>")
+    }
+}
+
+pub struct ObjSender {
+    pub inner: std::sync::Arc<crate::thread::ChannelInner>,
+}
+
+impl GcSized for ObjSender {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl fmt::Display for ObjSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<sender>")
+    }
+}
+
+pub struct ObjReceiver {
+    pub inner: std::sync::Arc<crate::thread::ChannelInner>,
+}
+
+impl GcSized for ObjReceiver {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl fmt::Display for ObjReceiver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<receiver>")
+    }
+}
+
+pub struct ObjThreadMutex {
+    pub inner: std::sync::Arc<crate::thread::MutexInner>,
+}
+
+impl GcSized for ObjThreadMutex {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl fmt::Display for ObjThreadMutex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<mutex>")
+    }
+}
+
+pub struct ObjRwLock {
+    pub inner: std::sync::Arc<crate::thread::RwLockInner>,
+}
+
+impl GcSized for ObjRwLock {
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl fmt::Display for ObjRwLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<rwlock>")
     }
 }
 

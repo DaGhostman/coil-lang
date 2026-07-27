@@ -337,6 +337,7 @@ pub(crate) fn execute_archive(
     let mut machine = Machine::<256>::default();
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
+    pipeline.wire_thread_program(&mut machine, bytecode, constants);
     machine.set_program_debug(debug);
     machine.run_raw(bytecode, constants, static_slots);
     machine.panicked()

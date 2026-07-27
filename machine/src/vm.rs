@@ -102,7 +102,7 @@ macro_rules! unary {
 
 // type External = fn(&[Value]) -> Value;
 
-type OutputSink = Box<dyn IoWrite>;
+type OutputSink = Box<dyn IoWrite + Send>;
 
 /// Saved resumer context while a coroutine runs on the shared stack.
 #[derive(Clone, Copy)]
@@ -161,6 +161,10 @@ pub struct Machine<const S: usize> {
     statics: Vec<Value>,
     /// Debug line table (parallel to archived bytecode indices).
     program_debug: ProgramDebug,
+    /// Shared program image for OS thread workers (`spawn`).
+    thread_program: Option<std::sync::Arc<crate::thread::ThreadProgram>>,
+    /// Optional shared stdout capture for worker threads.
+    shared_print: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -190,6 +194,8 @@ impl<const S: usize> Default for Machine<S> {
             panicked: false,
             statics: Vec::new(),
             program_debug: ProgramDebug::default(),
+            thread_program: None,
+            shared_print: None,
         }
     }
 }
@@ -530,7 +536,7 @@ impl<const S: usize> Machine<S> {
     }
 
     /// Redirect `PRINT` output (used by pipeline tests).
-    pub fn with_output<W: IoWrite + 'static>(&mut self, writer: W) -> Option<OutputSink> {
+    pub fn with_output<W: IoWrite + Send + 'static>(&mut self, writer: W) -> Option<OutputSink> {
         let prev = self.output.take();
         self.output = Some(Box::new(writer));
         prev
@@ -562,6 +568,66 @@ impl<const S: usize> Machine<S> {
     /// Back-compat alias for [`Self::register_fn`].
     pub fn register_native(&mut self, native: std::sync::Arc<dyn crate::ffi::NativeFn>) -> usize {
         self.natives.register(native)
+    }
+
+    /// Replace the host-native table with a clone of `other` (worker threads).
+    pub fn install_natives(&mut self, other: &crate::ffi::Natives) {
+        self.natives = other.clone_registry();
+    }
+
+    pub fn set_thread_program(&mut self, program: std::sync::Arc<crate::thread::ThreadProgram>) {
+        self.thread_program = Some(program);
+    }
+
+    pub fn thread_program(&self) -> Option<&crate::thread::ThreadProgram> {
+        self.thread_program.as_deref()
+    }
+
+    pub fn set_shared_print(&mut self, buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        self.shared_print = Some(buf);
+    }
+
+    pub fn shared_print(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> {
+        self.shared_print.clone()
+    }
+
+    /// Allocate global static slots without running bytecode.
+    pub fn init_static_slots(&mut self, static_slots: u32) {
+        self.statics = vec![Value::default(); static_slots as usize];
+    }
+
+    pub fn heap_mut(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    /// Snapshot needed to spawn a worker on this program.
+    pub fn thread_spawn_context(&self) -> Option<crate::thread::ThreadSpawnContext> {
+        let program = self.thread_program.clone()?;
+        Some(crate::thread::ThreadSpawnContext {
+            program,
+            natives: self.natives.clone_registry(),
+            shared_print: self.shared_print.clone(),
+        })
+    }
+
+    fn sync_thread_program_from_current(&mut self) {
+        if self.thread_program.is_some() {
+            return;
+        }
+        if self.program_code.is_empty() {
+            return;
+        }
+        self.thread_program = Some(std::sync::Arc::new(crate::thread::ThreadProgram {
+            code: std::sync::Arc::new(self.program_code.clone()),
+            constants: std::sync::Arc::new(self.program_constants.clone()),
+            static_slot_count: self.statics.len() as u32,
+            debug: self.program_debug.clone(),
+        }));
+    }
+
+    /// Thread-local active machine for host `with_lock` (legacy; prefer [`HostStateGuard`]).
+    pub fn active_machine_for_host() -> Option<*mut Machine<512>> {
+        None
     }
 
     /// Register a function signature on a previously-loaded
@@ -899,6 +965,7 @@ impl<const S: usize> Machine<S> {
             std::slice::from_raw_parts(code.as_ptr().cast::<RawByte>(), code.len()).to_vec()
         };
         self.program_constants = constants.to_vec();
+        self.sync_thread_program_from_current();
         let mut ip = 0usize;
         loop {
             let paused = self.execute(code, constants, ip);
@@ -1028,6 +1095,18 @@ impl<const S: usize> Machine<S> {
         self.nested_return.take().unwrap_or_default()
     }
 
+    /// Stash a return value when `execute` runs inside [`Self::call_function`].
+    #[inline]
+    fn capture_nested_return(&mut self, ret_val: Value) -> bool {
+        let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
+        if self.nested_depth > 0 && self.frames.len() == nested_target {
+            self.nested_return = Some(ret_val);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Type-erased entry for libffi callback trampolines (monomorphized per `S`).
     unsafe fn invoke_call(
         vm: *mut c_void,
@@ -1051,6 +1130,8 @@ impl<const S: usize> Machine<S> {
 
     #[inline(always)]
     fn execute(&mut self, code: &[Byte], constants: &[u64], start_ip: usize) -> bool {
+        let _active_guard = crate::thread::HostStateGuard::enter(self);
+
         #[cfg(debug_assertions)]
         let frame_no = self.frames.len();
 
@@ -1378,9 +1459,7 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::RETURN => {
                     let ret_val = self.stack.pop();
-                    let nested_target = self.nested_frame_depths.last().copied().unwrap_or(0);
-                    if self.nested_depth > 0 && self.frames.len() == nested_target {
-                        self.nested_return = Some(ret_val);
+                    if self.capture_nested_return(ret_val) {
                         return false;
                     }
                     let return_sp = self.frames.pop().get();
@@ -1475,6 +1554,9 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::LoadReturnSlot => {
                     let ret_val = self.stack[sp + opcode.operand_u32() as usize];
+                    if self.capture_nested_return(ret_val) {
+                        return false;
+                    }
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
@@ -1482,6 +1564,9 @@ impl<const S: usize> Machine<S> {
                 }
                 Instruction::ConstReturnImm => {
                     let ret_val = Value::from(opcode.operand_u32() as i32 as i64 as u64);
+                    if self.capture_nested_return(ret_val) {
+                        return false;
+                    }
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
@@ -1512,6 +1597,9 @@ impl<const S: usize> Machine<S> {
                         _ => {}
                     }
                     let ret_val = self.stack.pop();
+                    if self.capture_nested_return(ret_val) {
+                        return false;
+                    }
                     let return_sp = self.frames.pop().get();
                     self.stack.seek(return_sp);
                     self.stack.push(ret_val);
@@ -2917,6 +3005,27 @@ mod tests {
 
     use super::{dispatch_count, reset_dispatch_count};
     use crate::{Heap, Machine, ObjEnum};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct TestOutputBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TestOutputBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn take_test_output(buf: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+        Arc::try_unwrap(buf)
+            .expect("VM still holds a reference to the buffer")
+            .into_inner()
+            .expect("mutex poisoned")
+    }
 
     /// Build a `MAKE_ENUM` byte with the given tag and arity
     /// packed into the operand (upper 16 bits = tag, lower 16
@@ -3590,22 +3699,10 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn panic_opcode_sets_panicked_and_writes_message() {
         let mut vm = Machine::<4>::default();
-        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
-        #[derive(Clone)]
-        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
         let mut bytecode = Vec::new();
         // STRING 4 "boom"
@@ -3620,34 +3717,15 @@ mod tests {
         vm.run(&bytecode);
         assert!(vm.panicked());
         let _ = vm.restore_output();
-        let bytes = std::rc::Rc::try_unwrap(buf)
-            .expect("VM still holds a reference to the buffer")
-            .into_inner();
+        let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "panic: boom");
     }
 
     fn with_output_captures_print() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        /// Tiny `Write` impl that appends to a shared
-        /// `Vec<u8>`. Used only by this test.
-        struct SharedBuf(Rc<RefCell<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let mut vm = Machine::<16>::default();
-        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-        let shared = SharedBuf(Rc::clone(&buf));
-        vm.with_output(shared);
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
 
         // Build bytecode:
         //   STRING 5 "hello"
@@ -3667,9 +3745,7 @@ mod tests {
         // only one (then we can move the `Vec` out).
         let _ = vm.restore_output();
 
-        let bytes = Rc::try_unwrap(buf)
-            .expect("VM still holds a reference to the buffer")
-            .into_inner();
+        let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "hello");
     }
@@ -3707,24 +3783,11 @@ mod tests {
         bytecode.push(Byte::new(Instruction::PRINT));
         bytecode.push(Byte::new(Instruction::HALT));
 
-        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
-        #[derive(Clone)]
-        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
         vm.run(&bytecode);
         let _ = vm.restore_output();
-        let bytes = std::rc::Rc::try_unwrap(buf)
-            .expect("VM still holds a reference to the buffer")
-            .into_inner();
+        let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert_eq!(s, "hi", "GetField should return the stored string, not -1");
     }
@@ -3851,24 +3914,11 @@ mod tests {
         code.push(Byte::new(Instruction::PRINT));
         code.push(Byte::new(Instruction::HALT));
 
-        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
-        #[derive(Clone)]
-        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
         vm.run(&code);
         let _ = vm.restore_output();
-        let bytes = std::rc::Rc::try_unwrap(buf)
-            .expect("VM still holds buffer")
-            .into_inner();
+        let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("utf-8");
         assert_eq!(s, "hi", "array string element must survive GC pressure");
     }
@@ -3898,24 +3948,11 @@ mod tests {
         code.push(Byte::new(Instruction::PRINT));
         code.push(Byte::new(Instruction::HALT));
 
-        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
-        #[derive(Clone)]
-        struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
-        impl std::io::Write for SharedBuf {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        vm.with_output(SharedBuf(std::rc::Rc::clone(&buf)));
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        vm.with_output(TestOutputBuf(Arc::clone(&buf)));
         vm.run(&code);
         let _ = vm.restore_output();
-        let bytes = std::rc::Rc::try_unwrap(buf)
-            .expect("VM still holds buffer")
-            .into_inner();
+        let bytes = take_test_output(buf);
         let s = String::from_utf8(bytes).expect("utf-8");
         assert_eq!(s, "ok", "tuple string element must survive GC pressure");
     }

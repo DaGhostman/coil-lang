@@ -21,6 +21,7 @@ use rkyv::rancor::Error;
 use crate::Compiler;
 use crate::manifest::Manifest;
 use crate::typechecking::IoBuiltin;
+use crate::typechecking::ThreadBuiltin;
 
 /// A queued file to compile, along with the path it was
 /// discovered under. The pipeline processes queued files
@@ -311,6 +312,96 @@ impl Pipeline {
         }
     }
 
+    /// Register virtual `thread` host natives (`spawn`, `channel`, …).
+    fn register_thread_natives(&mut self) {
+        use machine::thread;
+
+        for kind in ThreadBuiltin::all() {
+            let name = kind.native_name().to_string();
+            let arity = match kind {
+                ThreadBuiltin::Channel => 0,
+                ThreadBuiltin::Spawn => 1,
+                ThreadBuiltin::Join
+                | ThreadBuiltin::Detach
+                | ThreadBuiltin::Recv
+                | ThreadBuiltin::TryRecv
+                | ThreadBuiltin::Close
+                | ThreadBuiltin::Mutex
+                | ThreadBuiltin::Rwlock
+                | ThreadBuiltin::Lock
+                | ThreadBuiltin::TryLock
+                | ThreadBuiltin::Unlock => 1,
+                ThreadBuiltin::Send
+                | ThreadBuiltin::TrySend
+                | ThreadBuiltin::WithLock
+                | ThreadBuiltin::WithRead
+                | ThreadBuiltin::WithWrite
+                | ThreadBuiltin::TryRead
+                | ThreadBuiltin::TryWrite => 2,
+            };
+            let args = vec![FfiType::Int; arity];
+            let sig = FfiSignature::from_parts(name.clone(), args, FfiType::Int)
+                .expect("thread native arity/signature");
+            let id = self.host_natives.len();
+            self.compiler.register_native_id(&name, id);
+            let kind = *kind;
+            let closure = move |heap: &mut machine::Heap, args: &[common::Value]| {
+                let v = match kind {
+                    ThreadBuiltin::Spawn => thread::thread_spawn(heap, args),
+                    ThreadBuiltin::Join => thread::thread_join(heap, args),
+                    ThreadBuiltin::Detach => thread::thread_detach(heap, args),
+                    ThreadBuiltin::Channel => thread::thread_channel(heap, args),
+                    ThreadBuiltin::Send => thread::thread_send(heap, args),
+                    ThreadBuiltin::Recv => thread::thread_recv(heap, args),
+                    ThreadBuiltin::TrySend => thread::thread_try_send(heap, args),
+                    ThreadBuiltin::TryRecv => thread::thread_try_recv(heap, args),
+                    ThreadBuiltin::Close => thread::thread_close(heap, args),
+                    ThreadBuiltin::Mutex => thread::thread_mutex(heap, args),
+                    ThreadBuiltin::WithLock => thread::thread_with_lock(heap, args),
+                    ThreadBuiltin::Lock => thread::thread_lock(heap, args),
+                    ThreadBuiltin::TryLock => thread::thread_try_lock(heap, args),
+                    ThreadBuiltin::Unlock => thread::thread_unlock(heap, args),
+                    ThreadBuiltin::Rwlock => thread::thread_rwlock(heap, args),
+                    ThreadBuiltin::WithRead => thread::thread_with_read(heap, args),
+                    ThreadBuiltin::WithWrite => thread::thread_with_write(heap, args),
+                    ThreadBuiltin::TryRead => thread::thread_try_read(heap, args),
+                    ThreadBuiltin::TryWrite => thread::thread_try_write(heap, args),
+                };
+                Ok(Some(v))
+            };
+            let native = if kind == ThreadBuiltin::Spawn {
+                std::sync::Arc::new(HostClosureFn::new_with_arity_range(
+                    sig, 1, 2, closure,
+                )) as std::sync::Arc<dyn NativeFn>
+            } else {
+                std::sync::Arc::new(HostClosureFn::new(sig, closure)) as std::sync::Arc<dyn NativeFn>
+            };
+            self.host_natives.push(native);
+        }
+    }
+
+    /// Install shared bytecode on `machine` for `thread::spawn` workers.
+    pub fn wire_thread_program<const N: usize>(
+        &self,
+        machine: &mut machine::Machine<N>,
+        bytecode: &[Byte],
+        constants: &[u64],
+    ) {
+        use machine::thread::ThreadProgram;
+        use std::sync::Arc;
+        machine.set_thread_program(Arc::new(ThreadProgram {
+            code: Arc::from(bytecode.to_vec()),
+            constants: Arc::from(constants.to_vec()),
+            static_slot_count: self.static_slot_count(),
+            debug: self.program_debug(),
+        }));
+    }
+
+    /// Bytecode entry offset for a registered function (for tests).
+    pub fn function_offset(&self, name: &str) -> Option<usize> {
+        self.compiler.function_offset(name)
+    }
+
     /// Borrow the inner `Compiler` mutably. Used by the
     /// integration tests in `compiler/src/lib.rs::tests`
     /// and `compiler/tests/namespace.rs` that need to
@@ -435,6 +526,7 @@ impl Pipeline {
             Err(e) => pipeline.emit_manifest_load_error(&project_root, e),
         }
         pipeline.register_io_natives();
+        pipeline.register_thread_natives();
         pipeline
     }
 

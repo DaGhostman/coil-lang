@@ -2,6 +2,7 @@
 
 mod ffi;
 pub mod io;
+pub mod thread;
 mod memory;
 mod opcode;
 mod vm;
@@ -9,4 +10,5 @@ mod vm;
 pub use ffi::*;
 pub use memory::*;
 pub use opcode::*;
+pub use thread::{ThreadErrorTag, ThreadProgram};
 pub use vm::*;

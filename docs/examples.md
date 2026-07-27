@@ -1379,6 +1379,43 @@ Stackful coroutines via `async fn`, `yield`, and `resume`. Phase 2 adds send/rec
 
 ---
 
+## OS threads
+
+Native threads via `use thread::*;` — each worker runs on its own VM. See [Tutorial 11 — OS threads](tutorial/11-threads.md).
+
+### `examples/thread_join.hy`
+
+**Demonstrates:** `spawn` a nullary function and `join` for its return value.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/thread_join.hy` |
+| **Output** | `42` |
+
+---
+
+### `examples/thread_channel.hy`
+
+**Demonstrates:** `channel`, `spawn` with one argument, `send` / `recv`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/thread_channel.hy` |
+| **Output** | `hello` |
+
+---
+
+### `examples/thread_mutex.hy`
+
+**Demonstrates:** Shared `mutex` and `with_lock` from two threads.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/thread_mutex.hy` |
+| **Output** | `2` |
+
+---
+
 ### `examples/for_in_coro.hy`
 
 **Demonstrates:** `for x in` over a coroutine — yields enter the body; completion/`return` does not; `break` mid-loop.
@@ -1565,6 +1602,9 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `coro_yield_from.hy` | Coroutines | `012` |
 | `coro_interleave.hy` | Coroutines | `10,100,101,11,12,102` |
 | `coro_done.hy` | Coroutines | `falsefalsetrue` |
+| `thread_join.hy` | OS threads | `42` |
+| `thread_channel.hy` | OS threads | `hello` |
+| `thread_mutex.hy` | OS threads | `2` |
 | `for_in_coro.hy` | Coroutines | `01210` |
 | `for_in_array.hy` | Collections | `123` |
 | `for_in_tuple.hy` | Collections | `123` |

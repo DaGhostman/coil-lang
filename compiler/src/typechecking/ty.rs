@@ -299,6 +299,12 @@ pub const BYTE: &str = "byte";
 pub const UNIT: &str = "unit";
 /// Name of the opaque `Stream` IO handle type.
 pub const STREAM: &str = "Stream";
+/// Opaque `thread` module handle types.
+pub const THREAD: &str = "Thread";
+pub const SENDER: &str = "Sender";
+pub const RECEIVER: &str = "Receiver";
+pub const MUTEX: &str = "Mutex";
+pub const RWLOCK: &str = "RwLock";
 /// Name of the `List` type constructor.
 #[allow(dead_code)] // reserved for future list-type support
 pub const LIST: &str = "List";
@@ -341,6 +347,31 @@ pub fn range_inclusive_ty(elem: Ty) -> Ty {
 /// Build the opaque `Stream` type.
 pub fn stream_ty() -> Ty {
     Ty::Con(STREAM.into())
+}
+
+/// Build the opaque `Thread` join-handle type.
+pub fn thread_ty() -> Ty {
+    Ty::Con(THREAD.into())
+}
+
+/// Build the opaque channel `Sender` type.
+pub fn sender_ty() -> Ty {
+    Ty::Con(SENDER.into())
+}
+
+/// Build the opaque channel `Receiver` type.
+pub fn receiver_ty() -> Ty {
+    Ty::Con(RECEIVER.into())
+}
+
+/// Build the opaque `Mutex` type.
+pub fn mutex_ty() -> Ty {
+    Ty::Con(MUTEX.into())
+}
+
+/// Build the opaque `RwLock` type.
+pub fn rwlock_ty() -> Ty {
+    Ty::Con(RWLOCK.into())
 }
 
 /// Build the `unit` type (used for side-effecting expressions, `print`, etc.).

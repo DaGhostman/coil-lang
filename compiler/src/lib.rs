@@ -1436,6 +1436,10 @@ impl Compiler {
         self.functions[name]
     }
 
+    pub fn function_offset(&self, name: &str) -> Option<usize> {
+        self.functions.get(name).copied()
+    }
+
     /// Bytecode offset WHERE the prologue (CALL+JMP+HALT)
     /// ENDS and user-program code BEGINS. Used by the runtime
     /// pipeline to patch the prologue's JMP operand so that
@@ -2840,24 +2844,34 @@ impl Compiler {
     /// invokes *above* the id and `MakeTuple` packed the wrong values (piped
     /// stdin then looked empty).
     fn emit_io_host_invoke(&mut self, kind: crate::typechecking::IoBuiltin, args: &[Output]) {
-        let name = kind.native_name();
-        let Some(native_id) = self.native_id(name) else {
+        self.emit_host_native_invoke(kind.native_name(), args);
+    }
+
+    fn emit_thread_host_invoke(&mut self, kind: crate::typechecking::ThreadBuiltin, args: &[Output]) {
+        self.emit_host_native_invoke(kind.native_name(), args);
+    }
+
+    /// Emit `HostInvoke` for a pipeline-registered host native by registry name.
+    fn emit_host_native_invoke(&mut self, native_name: &str, args: &[Output]) {
+        let Some(native_id) = self.native_id(native_name) else {
             let range = args
                 .first()
                 .map(|a| a.0.into_range())
                 .unwrap_or(0..0);
             let mut message = Message::error(
                 ErrorCode::UnknownFunction,
-                format!("IO native `{name}` is not registered with the pipeline"),
+                format!("Host native `{native_name}` is not registered with the pipeline"),
                 range.clone(),
             );
             if range.start >= range.end {
                 message.with_help(
-                    "host natives are wired in Pipeline::register_io_natives".to_string(),
+                    "host natives are wired in Pipeline::register_io_natives / register_thread_natives"
+                        .to_string(),
                 );
             } else {
                 message.push(DiagLabel::new(
-                    "host natives are wired in Pipeline::register_io_natives".to_string(),
+                    "host natives are wired in Pipeline::register_io_natives / register_thread_natives"
+                        .to_string(),
                     range,
                 ));
             }
@@ -5802,6 +5816,12 @@ impl Compiler {
                     && let Some(kind) = self.checker.io_fn_in_scope(fname)
                 {
                     self.emit_io_host_invoke(kind, args.as_deref().unwrap_or(&[]));
+                    return bytecode;
+                }
+                if let Expression::Identifier(fname) = name.1.as_ref()
+                    && let Some(kind) = self.checker.thread_fn_in_scope(fname)
+                {
+                    self.emit_thread_host_invoke(kind, args.as_deref().unwrap_or(&[]));
                     return bytecode;
                 }
 

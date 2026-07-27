@@ -16,6 +16,8 @@ pub trait NativeFn: Send + Sync {
 
 pub struct HostClosureFn {
     signature: FfiSignature,
+    /// When set, accept `min_args..=max_args` instead of exact `signature.arity()`.
+    arity_range: Option<(usize, usize)>,
     func: Arc<dyn Fn(&mut Heap, &[Value]) -> Result<Option<Value>, FfiError> + Send + Sync>,
 }
 
@@ -26,6 +28,24 @@ impl HostClosureFn {
     {
         Self {
             signature,
+            arity_range: None,
+            func: Arc::new(func),
+        }
+    }
+
+    /// Host native that accepts a variable number of arguments (inclusive range).
+    pub fn new_with_arity_range<F>(
+        signature: FfiSignature,
+        min_args: usize,
+        max_args: usize,
+        func: F,
+    ) -> Self
+    where
+        F: Fn(&mut Heap, &[Value]) -> Result<Option<Value>, FfiError> + Send + Sync + 'static,
+    {
+        Self {
+            signature,
+            arity_range: Some((min_args, max_args)),
             func: Arc::new(func),
         }
     }
@@ -51,7 +71,12 @@ impl NativeFn for HostClosureFn {
     }
 
     fn invoke(&self, heap: &mut Heap, args: &[Value]) -> Result<Option<Value>, FfiError> {
-        if args.len() != self.signature.arity() {
+        let ok = if let Some((min, max)) = self.arity_range {
+            args.len() >= min && args.len() <= max
+        } else {
+            args.len() == self.signature.arity()
+        };
+        if !ok {
             return Err(FfiError::ArityMismatch {
                 expected: self.signature.arity(),
                 got: args.len(),
@@ -94,6 +119,15 @@ impl Natives {
 
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+
+    /// Clone the registered natives list (stable ids) for worker threads.
+    pub fn clone_registry(&self) -> Self {
+        let mut reg = Natives::new();
+        for native in &self.by_id {
+            reg.register(Arc::clone(native));
+        }
+        reg
     }
 }
 

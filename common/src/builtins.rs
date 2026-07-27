@@ -29,6 +29,19 @@ pub const BUILTIN_IO_ERROR_VARIANTS: &[&str] = &[
     "Other",
 ];
 
+/// Built-in `ThreadError` enum name (virtual `thread` module).
+pub const BUILTIN_THREAD_ERROR_ENUM: &str = "ThreadError";
+
+/// `ThreadError` variants in tag order.
+pub const BUILTIN_THREAD_ERROR_VARIANTS: &[&str] = &[
+    "WouldBlock",
+    "Disconnected",
+    "JoinFailed",
+    "NotSendable",
+    "Poisoned",
+    "Other",
+];
+
 /// Built-in `ErrorKind` enum name (virtual `ffi` module).
 pub const BUILTIN_FFI_ERROR_KIND_ENUM: &str = "ErrorKind";
 
@@ -59,6 +72,7 @@ pub fn is_builtin_enum(name: &str) -> bool {
     is_builtin_option_enum(name)
         || is_builtin_result_enum(name)
         || is_builtin_io_error_enum(name)
+        || is_builtin_thread_error_enum(name)
         || is_builtin_ffi_error_enum(name)
         || is_builtin_ffi_error_kind_enum(name)
         || is_builtin_ffi_enum(name)
@@ -66,6 +80,10 @@ pub fn is_builtin_enum(name: &str) -> bool {
 
 pub fn is_builtin_io_error_enum(name: &str) -> bool {
     name == BUILTIN_IO_ERROR_ENUM
+}
+
+pub fn is_builtin_thread_error_enum(name: &str) -> bool {
+    name == BUILTIN_THREAD_ERROR_ENUM
 }
 
 pub fn is_builtin_ffi_error_enum(name: &str) -> bool {
