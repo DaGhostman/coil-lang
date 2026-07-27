@@ -1,0 +1,650 @@
+# Numeric Tower — Implementation Plan
+
+**Status:** implemented (NT-0…NT-7 + Matrix/Mul)  
+**Goal:** Treat homogeneous numeric tuples and arrays as vectors with a
+full element-wise / broadcast arithmetic tower, so that e.g.
+`(1, 1) + (1, 1) == (2, 2)` and `[1, 2] + 3 == [4, 5]`, including
+generic/`T: Num` call sites where that is sound. Named linear-algebra
+helpers (`dot` / `matmul` / `cross`) cover reductions and matrix
+products without overloading `*` / `**`.
+
+**Decisions locked (2026-07-25):**
+
+1. Aggregate–aggregate length must be known and equal at **compile
+   time**; mismatch or unknown dynamic length is a **hard type error**
+   (no runtime length check).
+2. Element-wise `**` is **in** v1 (same zip/broadcast rules as `*`).
+3. Static arities are **always unrolled** in codegen in v1 (including
+   N > 4); no new VM loop opcodes. Dynamic `[T]` broadcast/unary still
+   uses a counted runtime loop via `ArrayLen`.
+4. Tier C / NT-5 (constraint lifting) lands **after** NT-1…3 bake.
+
+---
+
+## 0. Problem statement
+
+Today:
+
+| Expression | Typecheck | Runtime |
+|------------|-----------|---------|
+| `1 + 1` | `int` | correct `ADD` |
+| `"a" + "b"` | `string` | `FORMAT` concat |
+| `(1, 1) + (1, 1)` | `(int, int)` (operands unify) | **wrong** — `ADD` on two heap pointers |
+| `[1, 2] + [3, 4]` | same hole | same hole |
+
+`infer_arith` unifies left and right and assumes a **scalar** opcode.
+Tuple/array values are heap addresses, so the typed result is a lie.
+
+Desired: a **numeric tower** over existing aggregates — not a new
+`vector` type — covering element-wise ops, scalar broadcast, length
+rules, trait/`Num` integration, codegen, docs, and tests.
+
+---
+
+## 1. Design principles (locked for this plan)
+
+1. **Reuse existing types.** Vectors are:
+   - homogeneous tuples `(T, T, …, T)` (arity ≥ 1), and
+   - arrays `[T]` / `[T; N]`.
+2. **Element type must be numeric** for arithmetic (`int` / `float`
+   initially; `byte` when it joins `Num`).
+3. **Same-shape ops are element-wise.** Result shape = left shape
+   (after broadcast resolution).
+4. **Scalar broadcast is one-sided.** `vec ⊕ scalar` and `scalar ⊕ vec`
+   expand the scalar; two aggregates of different length never broadcast
+   to each other in v1.
+5. **`*` and `**` are element-wise**, not dot product / matrix power.
+   Linear-algebra ops use **named helpers** (`dot`, `matmul`, `cross`)
+   — not operator overloads on tuples/arrays. A future `Matrix` type
+   may overload `*` for matmul (see §13); do **not** reuse `**` for
+   dot or matmul.
+6. **Zip length is a compile-time property.** Only equal static lengths
+   (tuple arity or `[T; N]`) may zip. Dynamic `[T] ⊕ [T]` is a hard
+   error — promote to `[T; N]` (literals already carry static length)
+   or broadcast a scalar.
+7. **String `+` stays special-cased** and is never part of the tower.
+8. **Prefer lowering to existing opcodes** for correctness first;
+   fused VM ops are an optional later optimization.
+9. **Codegen always unrolls static arities in v1** (including N > 4);
+    dynamic `[T]` broadcast/unary uses a counted `ArrayLen` loop.
+10. **Trait story is lifting, not combinatorial instances.** Do not
+    pre-register `impl Add<(int,int)>`, `impl Add<(int,int,int)>`, …
+    for every arity.
+
+---
+
+## 2. Semantic model
+
+### 2.1 Layers
+
+```
+          ┌─────────────────────────────────────┐
+          │  Aggregates (homogeneous)           │
+          │  (T,…,T)   [T]   [T; N]             │
+          │  ops: element-wise + broadcast      │
+          └─────────────────▲───────────────────┘
+                            │ T : Num (or Add/…)
+          ┌─────────────────┴───────────────────┐
+          │  Scalars                            │
+          │  int, float  (+ byte when in Num)   │
+          │  ops: existing ADD/ADDF/…           │
+          └─────────────────────────────────────┘
+```
+
+Comparisons (`Ord` / `Eq`) on aggregates are **out of scope for the
+arithmetic tower** except where already defined (e.g. structural `Eq`
+derive, tuple/array `Show`). Lexicographic / element-wise `<` on
+vectors can be a follow-up; do not overload them in the first landing.
+
+### 2.2 Operator rules (v1)
+
+Let `⊕ ∈ {+, -, *, /, %, **}` and unary `-`.
+
+| Left | Right | Result | Rule name |
+|------|-------|--------|-----------|
+| scalar `T` | scalar `T` | `T` | existing |
+| `(T)^n` | `(T)^n` | `(T)^n` | zip (equal arity) |
+| `[T; N]` | `[T; N]` | `[T; N]` | zip (static) |
+| `[T]` | `[T]` | — | **hard error** (length not known at compile time) |
+| `[T; N]` | `[T]` | — | **hard error** |
+| `[T]` | `[T; N]` | — | **hard error** |
+| `[T; N]` | `[T; M]` (`N ≠ M`) | — | **hard error** |
+| `(T)^n` | `T` | `(T)^n` | broadcast-right |
+| `T` | `(T)^n` | `(T)^n` | broadcast-left |
+| `[T; N]` | `T` | `[T; N]` | broadcast-right |
+| `T` | `[T; N]` | `[T; N]` | broadcast-left |
+| `[T]` | `T` | `[T]` | broadcast-right (length from LHS only) |
+| `T` | `[T]` | `[T]` | broadcast-left (length from RHS only) |
+| otherwise | | | diagnostic |
+
+`T` must support that operator as a scalar (`int`/`float` hardwired, or
+open `T: Add` / `Num` / pow trait as applicable — §4).
+
+**Unary `-vec`:** element-wise negate; shape preserved. Applies to
+tuples and both `[T; N]` and `[T]` (length from the single operand).
+
+**Compound assign** (`+=`, `**=`, …): same rules with LHS shape fixed
+(broadcast RHS into LHS shape; reject shape-changing or dynamic-zip RHS).
+
+**Literal note:** `[1, 2] + [3, 4]` is fine — array literals already
+infer `[int; 2]`, not dynamic `[int]`. Dynamic `[T]` arises from
+parameters / growing arrays / annotations; those must use scalar
+broadcast or be retyped as `[T; N]` to zip.
+
+### 2.3 Static vs dynamic array lengths (locked)
+
+| Pair | Typecheck | Runtime |
+|------|-----------|---------|
+| `[T; N] ⊕ [T; N]` | OK | zip |
+| `[T; N] ⊕ [T; M]` (`N ≠ M`) | **hard error** | — |
+| `[T] ⊕ [T]` | **hard error** | — |
+| `[T; N] ⊕ [T]` / `[T] ⊕ [T; N]` | **hard error** | — |
+| `[T] ⊕ T` / `T ⊕ [T]` | OK | broadcast (no length compare) |
+
+Rationale: zip length is always a compile-time fact. No runtime
+length check, panic, or `Result` for aggregate–aggregate ops.
+
+### 2.4 Heterogeneous tuples
+
+`(1, "x") + …` and `(1, 2.0) + …` are **errors**.
+Reuse / extend `homogeneous_types` (already used for `for-in`).
+
+Optional later: per-position zip if every position independently
+supports `⊕` — **not** in v1 (complicates codegen and traits).
+
+### 2.5 Explicit non-goals (v1 tower / operators)
+
+- Dot product / matmul / cross via `*` or `**` on tuples/arrays
+  (those are **named helpers** — §13 — not operator overloads)
+- A `Matrix` builtin type and `Matrix: Mul` / `Matrix: Num` (deferred;
+  see §13 future work)
+- Mixing `int` and `float` inside one vector (no promotion)
+- User `impl Add for (int, int)` coherence vs compiler lifting
+  (compiler owns aggregate arithmetic; user instances for
+  builtin aggregate heads stay rejected per coherence rules)
+- Runtime length checks for aggregate–aggregate zip
+- Bitwise / shift operators on aggregates (`&`, `|`, `^`, `<<`, `>>`) —
+  v1 only zips `+ - * / % **` and unary `-` (same set as §2.2)
+- New surface syntax (`@[1,2]`, `vec2`, etc.)
+- Changing tuple literal parsing / comma rules
+
+---
+
+## 3. Typechecker changes
+
+### 3.1 Core helper: classify arithmetic operands
+
+Add something like:
+
+```text
+enum ArithShape {
+  Scalar(Ty),
+  Tuple { elem: Ty, arity: usize },
+  Array { elem: Ty, length: ArrayLength },
+}
+
+fn classify_arith(ty: &Ty) -> Option<ArithShape>
+fn resolve_arith_shapes(op, left, right, range) -> Result<(ArithShape /*result*/, ZipMode), Diagnostic>
+```
+
+`ZipMode`: `Scalar` | `Zip` | `BroadcastLeft` | `BroadcastRight`.
+
+Call this from `infer_arith` **before** the current “unify and hope”
+path when either side is `Tuple` / `Array`. Scalar–scalar path stays
+unchanged (including string `+`).
+
+### 3.2 Element constraint
+
+After resolving shapes, constrain `elem`:
+
+- Ground `int` / `float` → existing opcode path.
+- Open `Ty::Var` → bind `Add`/`Sub`/… (or `Num`) as today for scalars,
+  so `fn f<T: Num>(T a, T b)` still works for scalars; for
+  `fn g<T: Num>((T, T) a, (T, T) b)` see §4.
+- Non-numeric ground (`string`, `bool`, enums, …) → diagnostic:
+  `cannot apply '+' element-wise to tuple of 'string'`.
+
+### 3.3 Diagnostics (suggested copy)
+
+| Case | Message sketch |
+|------|----------------|
+| Length mismatch (static) | `cannot zip tuples of length 2 and 3 with '+'` |
+| Heterogeneous tuple | `element-wise '+' requires a homogeneous numeric tuple` |
+| Non-numeric element | `element type 'string' does not support '+'` |
+| Dynamic `[T] ⊕ [T]` | `cannot zip dynamic-length arrays with '+'; use fixed-length '[T; N]' or broadcast a scalar` |
+| Array static⊕dynamic | `cannot mix fixed-length and dynamic arrays in '+'; convert both to '[T; N]' or broadcast a scalar` |
+| Static `[T; N] ⊕ [T; M]` | `cannot zip arrays of length N and M with '+'` |
+
+### 3.4 Side tables for codegen
+
+Mirror existing patterns (`bound_operator_call_at`, `ForInKind`):
+
+```text
+enum AggregateArithKind {
+  ZipTuple { arity },           // always unroll static arity in v1
+  ZipArray { length: Static(N) }, // never Dynamic for zip
+  BroadcastTuple { arity, scalar_on: Left|Right },
+  BroadcastArray { length: Static(N) | Dynamic, scalar_on: Left|Right },
+}
+```
+
+Record per `NodeId` / span so codegen does not re-infer under the
+ID-misalignment caveats inside function bodies.
+
+For `**`, record the same shape kind and select `Pow` / `PowF` (or the
+scalar pow bound) per element.
+
+### 3.5 Where to hook
+
+| Site | File / fn | Change |
+|------|-----------|--------|
+| Binary arith (`+ - * / % **`) | `infer_arith` / pow arm | shape resolve + element constraint |
+| Unary `-` | unary infer arm | element-wise for aggregates |
+| `+=` / `**=` etc. | compound-assign infer | same shapes; LHS drives result |
+| Bitwise / shifts | same hooks | **reject** on aggregates (v1 non-goal; see §2.5) |
+| Exhaustiveness / pretty | `pretty.rs` | no change required |
+| Unify | `unify.rs` | unchanged (result still normal `Tuple`/`Array`) |
+
+---
+
+## 4. Trait / generic integration (the “tower”)
+
+### 4.1 What “full tower” means here
+
+Three tiers of support:
+
+| Tier | Example | Mechanism |
+|------|---------|-----------|
+| **A. Ground** | `(1,2)+(3,4)` | Hardwired shapes in `infer_arith` + codegen lower |
+| **B. Element-generic** | `fn add2<T: Num>((T,T) a, (T,T) b)` | Shape rules + element constraint `T: Num`; codegen zips calling scalar `Add` (monomorphize or dict) |
+| **C. Shape-generic** | `fn add<V: Num>(V a, V b) -> V` with `V = (int,int)` | **Requires** aggregate types to satisfy `Num`/`Add` |
+
+Tier A+B deliver the user-facing vector math without lying about types.
+Tier C is what makes `(int,int)` a first-class `Num` citizen in
+`fn f<T: Num>(T,T)->T`.
+
+### 4.2 Recommended approach for Tier C: **constraint lifting**
+
+Do **not** enumerate instances per arity. At constraint discharge time:
+
+```text
+want: Add<(T, T, …, T)>     (homogeneous, arity n ≥ 1)
+have: Add<T>
+⇒ discharge Add<(T,…,T)> with a compiler-synthesized dictionary
+  whose `add` method is a zip thunk over Add<T>::add
+```
+
+Same for `Sub`/`Mul`/`Div` and thus `Num` (empty methods; superclass
+dict flattening already exists in `generics.rs`).
+
+Arrays:
+
+```text
+want: Add<[T]> or Add<[T; N]>
+have: Add<T>
+⇒ synthesize zip/broadcast-aware thunk
+```
+
+**Coherence:** these are compiler-owned lifts for builtin aggregate
+heads (already called out as non-local for user `impl`s in
+`docs/reference/types.md`). Document that users cannot write
+`impl Add for (int, int)`.
+
+### 4.3 Alternative rejected for v1
+
+Hand-written `impl Add<(int,int)>` thunks for arities 2..=4 only —
+simpler codegen demos, but does not scale to Tier B/C or `[T]`.
+
+### 4.4 Monomorphization
+
+Ground calls with builtin bounds may already monomorphize to unboxed
+opcodes (`monomorphize::candidate_for_call`). Extend candidates so
+that ground `(int,int) + (int,int)` becomes the zip lowering (or a
+specialized clone), not a pointer `ADD`.
+
+Shared generic bodies that receive `V: Num` where `V` is an aggregate
+must use the synthesized dict (CallIndirect), same ABI as today.
+
+### 4.5 `byte`
+
+Docs already note `byte` is not in `Num`/`Add`. Sequence:
+
+1. Land aggregate tower for `int`/`float`.
+2. Separately add `byte: Num` (or at least `Add`/`Sub`/…) with
+   wrapping or checked semantics — **explicit follow-up**, not blocked
+   on aggregates, but aggregates automatically pick it up via lifting
+   once scalars do.
+
+---
+
+## 5. Codegen strategy
+
+### 5.1 Phase 1 lowering (no new opcodes)
+
+**Static arity (any N):** always emit an **unrolled** straight-line zip
+in v1 (locked as D5). No new VM loop opcodes for static shapes.
+
+**Dynamic `[T]`:** broadcast / unary `-` use a counted runtime loop
+via `ArrayLen` (length comes from the single vector operand).
+
+For zip of two tuples arity `n` (temps = slots), unrolled form:
+
+```text
+evaluate lhs → StorePop t0
+evaluate rhs → StorePop t1
+for i in 0..n:          // compile-time unroll (any static n)
+  LOAD t0; CONST i; Index
+  LOAD t1; CONST i; Index
+  <scalar op: ADD/ADDF/Pow/… or bound-op call>
+MakeTuple n
+```
+
+Broadcast scalar on right:
+
+```text
+evaluate vec → t0
+evaluate scalar → t1
+for i in 0..n:          // same compile-time unroll
+  LOAD t0; CONST i; Index
+  LOAD t1
+  <scalar op>
+MakeTuple n
+```
+
+Arrays: same with `Index` / `MakeArray`, but **only** for
+`ArrayLength::Static(N)`. Never emit a runtime `ArrayLen` compare for
+zip — dynamic–dynamic zip is rejected in the typechecker.
+
+Reuse patterns from `emit_for_in_tuple` (already materializes tuple
+elements via `Index`).
+
+Pow: use `Instruction::Pow` / `PowF` (or the existing scalar pow
+codegen path) in the element op slot.
+
+### 5.2 Expression::Add (and siblings) dispatch order
+
+Update the existing priority in `compiler/src/lib.rs`:
+
+1. Constant fold (unchanged)
+2. String `+` (unchanged)
+3. **NEW:** aggregate arith hint → zip/broadcast emitter
+   (`Expression::Pow` uses the same aggregate path as `*` — element-wise)
+4. Bound operator / dict call (generic scalar / lifted)
+5. Float vs int hardwired opcode
+
+### 5.3 Optional VM fuse (later)
+
+Append something like `ZipBin` / `BroadcastBin` only if benchmarks
+show the `Index` loop is hot (e.g. large `[T]` in a tight loop).
+Requires `ARCHIVE_VERSION` bump. **Not required for correctness.**
+
+Peephole: static-arity zip is already unrolled by codegen (§5.1);
+further peephole fusion of the unrolled `Index` convoys is optional
+polish, not required for NT-1.
+
+### 5.4 Compound assign
+
+`a += b` for aggregates: load `a`, compute `a ⊕ b`, `StorePop` back
+(or `SetField`/`StoreIndex` for nested — v1 only whole-binding LHS
+identifiers / locals, same as scalar `+=` today).
+
+---
+
+## 6. Implementation phases
+
+### Phase NT-0 — Stop the lie (prerequisite)
+
+- In `infer_arith`, if either side is `Tuple`/`Array` and the zip
+  rules are not yet implemented, **reject** with a clear diagnostic
+  instead of unifying and emitting pointer `ADD`.
+- Tiny diagnostic golden test.
+- Unblocks “safe incompleteness” before full feature lands.
+
+### Phase NT-1 — Homogeneous tuple zip (ground int/float)
+
+- `classify` + zip for equal-arity homogeneous numeric tuples
+- Codegen lowering (§5.1): **always unroll** static arity
+- Ops: `+ - * / % **`, unary `-` (bitwise rejected — §2.5)
+- Example: `examples/vec_tuple.hy` → `(2,2)` printed via `%v` or indices
+- Pipeline + codegen tests
+
+### Phase NT-2 — Array zip (static length only)
+
+- Static `[T; N] ⊕ [T; N]` only
+- **Hard-error** `[T] ⊕ [T]`, static/dynamic mix, and `N ≠ M`
+- Example: `examples/vec_array.hy` using literals / `[T; N]` annotations
+- Diagnostic goldens for dynamic zip rejection
+
+### Phase NT-3 — Scalar broadcast
+
+- `vec ⊕ scalar` / `scalar ⊕ vec` for tuples, `[T; N]`, and dynamic `[T]`
+- Compound `+=` / `**=` with scalar RHS
+- Tests for associativity / precedence unchanged (`(1,2)+3*4`)
+
+### Phase NT-4 — Element-generic (Tier B)
+
+- Open element `T: Num` inside fixed tuple/`[T; N]` shapes in signatures
+- Codegen uses scalar bound-op / monomorphized ADD (etc.) per element
+- Golden: `fn scale<T: Num>((T,T) v, T s) -> (T,T)`
+
+### Phase NT-5 — Constraint lifting (Tier C)
+
+**Prerequisite:** NT-1…3 have baked (examples + goldens green).
+
+- Discharge `Add`/`Num`/… (and pow if modeled as a trait) for
+  homogeneous tuple and `[T; N]` when the element satisfies the class
+- Synthesize zip dictionaries / thunks
+- Monomorphization candidates for ground aggregate `Num` calls
+- Golden: `fn add<T: Num>(T a, T b) -> T` used at `(int,int)` and
+  `[float; 2]` call sites
+- Dynamic `[T]` does **not** lift for aggregate–aggregate zip; it may
+  still lift for scalar ops only if we expose broadcast via the
+  operator path (ground) rather than `T: Num` with `T = [int]`
+
+### Phase NT-6 — Polish
+
+- Docs: `docs/reference/operators.md`, `types.md`, tutorial 05,
+  feature matrix / examples catalog
+- `byte` in scalar `Num` (if not done elsewhere) so `[byte; N]` lifts
+- Optional: further peephole on unrolled `Index` convoys; VM fuse only
+  if needed
+- AGENTS.md learned facts
+
+---
+
+## 7. Decisions
+
+### Locked (user, 2026-07-25)
+
+| # | Decision |
+|---|----------|
+| D1 | Dynamic `[T] ⊕ [T]` (and any aggregate–aggregate zip whose lengths are not equal static facts) → **compile-time hard error**. No runtime length check. |
+| D2 | `%` on floats in zip — **allow** (mirror scalars / `MODF`). |
+| D3 | Element-wise `**` is **in** v1. |
+| D4 | Empty tuple `()` — **error** (not numeric); empty `[T; 0]` zip optional later. |
+| D5 | Codegen **always unrolls** static arities in v1 (including N > 4). |
+| D6 | Tier C / NT-5 lands **after** NT-1…3 bake. |
+| D7 | Dicts / records field-wise `+` — **out of scope**. |
+
+---
+
+## 8. Files likely touched
+
+| Area | Paths |
+|------|--------|
+| Infer / shapes | `compiler/src/typechecking/infer.rs` |
+| Generics / lifting | `compiler/src/typechecking/generics.rs`, discharge helpers in `infer.rs` |
+| Codegen | `compiler/src/lib.rs` (`Expression::Add`/…/`Pow`, new `emit_aggregate_arith`) |
+| Monomorphize | `compiler/src/monomorphize.rs` |
+| Diagnostics goldens | `compiler/tests/diagnostics.rs` |
+| Pipeline goldens | `compiler/tests/pipeline.rs` |
+| Examples | `examples/vec_tuple.hy`, `examples/vec_array.hy`, maybe `examples/vec_generic.hy` |
+| Docs | `docs/reference/operators.md`, `types.md`, `tutorial/05-aggregates.md`, `docs/examples.md` |
+| VM (only if fuse) | `common/src/opcode.rs`, `machine/src/vm.rs`, `ARCHIVE_VERSION` |
+
+No parser changes expected for v1.
+
+---
+
+## 9. Test plan
+
+### Unit / infer
+
+- zip success `(int,int)`, `(float,float)`, `[int; 2] ⊕ [int; 2]`
+- element-wise `**` on tuples/arrays
+- arity / static length mismatch → hard error
+- `[int] ⊕ [int]` (dynamic params) → hard error
+- heterogeneous / non-numeric element → hard error
+- broadcast left/right (including dynamic `[T] ⊕ T`)
+- unary `-` on tuple/array
+- Tier B: `(T,T)` with `T: Num`
+- Tier C: `T: Num` instantiated at `(int,int)` and `[int; 2]`
+
+### Codegen
+
+- zip emits unrolled `Index` × 2n + scalar ops + `MakeTuple` for any
+  static `n` (not a single `ADD` on pointers)
+- dynamic `[T]` broadcast/unary uses an `ArrayLen` counted loop
+- broadcast emits one scalar load reused
+- regression: `integer_arithmetic_emits_int_opcode` still scalar
+
+### Pipeline / examples
+
+| Program | Expected |
+|---------|----------|
+| `(1,1)+(1,1)` | `(2, 2)` or prints of components |
+| `(2,3)**2` | `(4, 9)` |
+| `(1,2)*3` | `(3, 6)` |
+| `[1,2]+[3,4]` | `[4, 6]` (literals → `[int; 2]`) |
+| dynamic `[int]` params zipped | compile error |
+| `add_generic((1,2),(3,4))` (NT-5) | `(4, 6)` |
+| existing `fib`, `aliases`, `for_in_tuple` | unchanged |
+
+### Memory
+
+- Run new examples under the usual 64MB limit; zip temps must not leak.
+
+---
+
+## 10. Risks
+
+1. **ID / type cache misalignment** inside functions (known Access issue) —
+   use an explicit arith-shape side table, not `lookup_at` alone.
+2. **Peephole / fusion** assuming scalar `LOAD;LOAD;ADD` — zip sequences
+   are different; ensure peephole does not mis-fuse across `Index`.
+3. **GC / temps** — holding two aggregates in locals during zip is fine;
+   avoid leaving stale heap roots on the operand stack.
+4. **Tier C complexity** — synthesized dicts must match flattened
+   superclass layout for `Num` (Add+Sub+Mul+Div method order).
+5. **Coherence surprises** — document compiler-owned lifts early so
+   users do not attempt `impl Add for (int, int)`.
+
+---
+
+## 11. Success criteria
+
+- `(1, 1) + (1, 1)` evaluates to `(2, 2)`; no pointer arithmetic.
+- `(2, 3) ** 2` evaluates to `(4, 9)`.
+- Mismatched / heterogeneous / **dynamic-length zip** fail at
+  typecheck with clear messages (NT-0 even before full zip).
+- Static arrays and scalar broadcast (including `[T] ⊕ scalar`) work
+  per §2.
+- Codegen always unrolls static-arity zip (any N) in v1.
+- `fn add<T: Num>(T a, T b) -> T` works for `int`, `float`,
+  homogeneous numeric tuples, and `[T; N]` numeric arrays (NT-5).
+- Docs and examples catalog updated; `cargo test --workspace` green.
+
+---
+
+## 12. Suggested implementation order (checklist)
+
+- [x] NT-0 reject aggregate `+`/`**`/… without zip (incl. dynamic `[T]⊕[T]`)
+- [x] NT-1 tuple zip ground (`+ - * / % **`, always unroll static arity)
+- [x] NT-2 static array zip + hard errors for dynamic zip
+- [x] NT-3 broadcast + compound assign (bake before NT-5)
+- [x] NT-4 element-generic
+- [x] NT-5 constraint lifting + monomorphize (after NT-1…3 bake)
+- [x] NT-6 docs / byte / optional perf polish
+- [x] NT-7 named linear-algebra helpers (`dot` / `matmul` / `cross`) — §13
+- [x] Matrix + Mul (`matrix(...)`, `*` matmul, `+`/`-` zip) — §13.3
+
+Each phase: tests + minimal example before moving on; stage only
+related files per commit.
+
+---
+
+## 13. Named linear-algebra helpers + future `Matrix` (locked design)
+
+### 13.1 Practical recommendation (locked 2026-07-25)
+
+Keep the element-wise tower on tuples/arrays unchanged. Linear algebra
+is a **separate surface**:
+
+| Layer | Ops | Mechanism |
+|-------|-----|-----------|
+| Homogeneous `(T,…)` / `[T; N]` | `+ - * / % **`, unary `-` | Element-wise zip / broadcast (NT-0…6) |
+| Same aggregates | `dot`, `matmul`, `cross` | **Named prelude helpers** (NT-7) |
+| `Matrix` | `matrix(rows)`; `*` matmul; `+`/`-` zip | Nominal `Matrix<Data>`; **`Mul` (not `Num`)** |
+
+**Do not:**
+
+- Overload `*` / `**` on tuples/arrays for matmul / dot (ambiguity with
+  Hadamard / element-wise pow).
+- Pack matmul into `Matrix: Num` — `Num` is the scalar / zip-lifted
+  tower; matrices under matmul are a different algebra (non-commutative
+  `*`, no general `/`). Prefer `Mul` (+ optional `Add`) on `Matrix`.
+- Use `**` for dot product — `Pow` means exponentiation.
+
+**Do:**
+
+- Ship `dot` / `matmul` / `cross` as auto-imported `prelude::math`
+  builtins (same Call / `PreludeFn` pattern as `assert`).
+- Ship `matrix(...)` + nominal `Matrix<Data>` with `*` → matmul (Mul)
+  and `+`/`-` → element-wise; zip + named helpers stay.
+
+### 13.2 NT-7 — Named helpers
+
+Auto-imported free functions:
+
+| Helper | Inputs | Result | Notes |
+|--------|--------|--------|-------|
+| `dot(a, b)` | Equal-length homogeneous numeric vectors (tuple↔tuple or `[T; N]`↔`[T; N]`) | scalar `T` | Compile-time length; reject dynamic zip / shape mix |
+| `cross(a, b)` | Length-3 vectors (tuple or `[T; 3]`) | same shape as left | 3D only |
+| `matmul(A, B)` | Nested static matrices: `[[T; K]; M]` × `[[T; N]; K]` → `[[T; N]; M]` (row-major, outer = rows) | nested array | Also accept equal-arity homogeneous **tuple-of-tuples** rows |
+
+Codegen: unroll with existing `Index` / `MUL`/`MULF` / `ADD`/`ADDF` /
+`MakeTuple` / `MakeArray` (no new opcodes / no `ARCHIVE_VERSION` bump).
+
+Diagnostics: length / shape / non-numeric / dynamic-length messages
+mirroring the tower style.
+
+Examples: `examples/vec_dot.hy`, `examples/vec_matmul.hy`.
+
+### 13.3 `Matrix` + `Mul` (implemented)
+
+Nominal wrapper distinct from bare nested arrays:
+
+1. **`matrix(rows)`** — `rows` must classify as a nested static matrix;
+   result type is `Matrix<Data>` where `Data` is the nested layout
+   (dims stay in the type argument). Runtime is the nested data
+   (zero-cost wrap).
+2. **`m * n` on `Matrix`** → matmul (same unroll as `matmul`); recorded
+   as `LinearAlgebraInfo::MatMul`. This is the `Mul` surface — not
+   Hadamard zip.
+3. **`m + n` / `m - n`** → element-wise zip of the nested data, re-wrapped.
+4. **`/` / `%` / `**` on `Matrix`** → hard error (`Matrix` is not `Num`).
+5. **Indexing** `m[i][j]` peels the wrapper and indexes `Data`.
+6. Keep `dot` / `matmul` / `cross` for bare aggregates; do **not** bind
+   dot to `**`.
+
+Example: `examples/matrix_mul.hy` → `19,22,43,502`.
+
+### 13.4 Approach A — packed LA kernels (implemented via HostInvoke)
+
+Scalar unroll for `dot` / `matmul` / `Matrix` ops is replaced by packed
+kernels registered as host natives (`packed_dot`, `packed_matmul`,
+`packed_matrix_zip`, `packed_matrix_neg` in `machine/src/packed_la.rs`).
+Codegen emits `HostInvoke` with a meta `u32` (same bit layouts as the
+short-lived Packed\* opcodes). **No new `Instruction` variants** — fib
+dispatch stays identical to `main`. Details:
+[`MATRIX_PACKED_KERNEL_PLAN.md`](./MATRIX_PACKED_KERNEL_PLAN.md).

@@ -21,6 +21,9 @@ pub const FFI_TYPES_MODULE: &str = "ffi::types";
 /// Canonical module path for test helpers (`assert`).
 pub const PRELUDE_TEST_MODULE: &str = "prelude::test";
 
+/// Canonical module path for linear-algebra helpers (`dot` / `matmul` / `cross`).
+pub const PRELUDE_MATH_MODULE: &str = "prelude::math";
+
 /// Canonical module path for IO streams (`open`, `read`, `Stream`, …).
 pub const IO_MODULE: &str = "io";
 
@@ -64,18 +67,31 @@ impl FfiBuiltin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreludeFn {
     Assert,
+    Dot,
+    MatMul,
+    Cross,
+    /// Construct a nominal `Matrix` from nested static rows.
+    Matrix,
 }
 
 impl PreludeFn {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Assert => "assert",
+            Self::Dot => "dot",
+            Self::MatMul => "matmul",
+            Self::Cross => "cross",
+            Self::Matrix => "matrix",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "assert" => Some(Self::Assert),
+            "dot" => Some(Self::Dot),
+            "matmul" => Some(Self::MatMul),
+            "cross" => Some(Self::Cross),
+            "matrix" => Some(Self::Matrix),
             _ => None,
         }
     }
@@ -465,6 +481,27 @@ impl VirtualModules {
             }],
         );
 
+        modules.insert(
+            PRELUDE_MATH_MODULE,
+            vec![
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Dot,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::MatMul,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Cross,
+                },
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Matrix,
+                },
+                BuiltinExport::OpaqueType {
+                    name: common::BUILTIN_MATRIX_TYPE,
+                },
+            ],
+        );
+
         let mut io_exports = vec![
             BuiltinExport::OpaqueType { name: "Stream" },
             BuiltinExport::Enum {
@@ -558,7 +595,7 @@ impl VirtualModules {
     }
 
     /// Exports injected into every file (implicit
-    /// `use prelude::*; use prelude::ops::*; use prelude::test::*;`).
+    /// `use prelude::*; use prelude::ops::*; use prelude::test::*; use prelude::math::*;`).
     pub fn prelude_exports(&self) -> Vec<BuiltinExport> {
         let mut out = Vec::new();
         if let Some(e) = self.modules.get(PRELUDE_MODULE) {
@@ -568,6 +605,9 @@ impl VirtualModules {
             out.extend(e.iter().cloned());
         }
         if let Some(e) = self.modules.get(PRELUDE_TEST_MODULE) {
+            out.extend(e.iter().cloned());
+        }
+        if let Some(e) = self.modules.get(PRELUDE_MATH_MODULE) {
             out.extend(e.iter().cloned());
         }
         out
@@ -632,6 +672,14 @@ mod tests {
                 e,
                 BuiltinExport::Fn {
                     kind: PreludeFn::Assert
+                }
+            ))
+        );
+        assert!(
+            exports.iter().any(|e| matches!(
+                e,
+                BuiltinExport::Fn {
+                    kind: PreludeFn::Dot
                 }
             ))
         );

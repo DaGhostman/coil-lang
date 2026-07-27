@@ -149,6 +149,12 @@ impl Heap {
         self.alloc_bytes
     }
 
+    /// Number of live heap objects (for GC pressure after `HostInvoke`).
+    #[inline]
+    pub fn live_object_count(&self) -> usize {
+        self.addr_index.len()
+    }
+
     /// Returns the next GC threshold in bytes. If `Self::size() > Self::next_gc()`,
     /// we should start tracing all reachable objects and call `Self::sweep`.
     pub const fn next_gc(&self) -> usize {

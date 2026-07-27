@@ -106,3 +106,14 @@ pub fn is_builtin_result_enum(name: &str) -> bool {
 pub fn is_poly_builtin_enum(name: &str) -> bool {
     is_builtin_option_enum(name) || is_builtin_result_enum(name)
 }
+
+/// Built-in nominal matrix wrapper (`Matrix<Data>`).
+///
+/// `Data` is a nested static array/tuple layout (`[[T; N]; M]`). Runtime
+/// representation is the nested data itself (zero-cost wrap); `*` is
+/// matmul via `Mul`, not element-wise zip.
+pub const BUILTIN_MATRIX_TYPE: &str = "Matrix";
+
+pub fn is_builtin_matrix_type(name: &str) -> bool {
+    name == BUILTIN_MATRIX_TYPE
+}

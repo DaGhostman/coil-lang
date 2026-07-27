@@ -2824,3 +2824,145 @@ fn example_thread_mutex_prints_2() {
     let output = run_example("examples/thread_mutex.hy");
     assert_eq!(output, "2");
 }
+
+#[test]
+fn example_vec_tuple_prints_zip_broadcast_negate() {
+    let output = run_example("examples/vec_tuple.hy");
+    assert_eq!(output, "22,23,24,-1-2");
+}
+
+#[test]
+fn aggregate_float_negate_uses_mulf_not_int_neg() {
+    // Regression: float aggregate unary `-` must not emit int `NEG`
+    // (which bit-twiddles a float as i64). Float path is `CONST -1; MULF`.
+    let output = run_example_src(
+        r#"
+fn main() {
+    let d = -(1.5, 2.0);
+    print "%f,%f", d[0], d[1];
+}
+"#,
+    );
+    assert_eq!(output, "-1.5,-2.0");
+}
+
+#[test]
+fn aggregate_dynamic_array_broadcast_adds_scalar() {
+    let output = run_example_src(
+        r#"
+fn add1([int] xs) -> [int] {
+    return xs + 1;
+}
+
+fn main() {
+    let a = add1([1, 2, 3]);
+    print "%i%i%i", a[0], a[1], a[2];
+}
+"#,
+    );
+    assert_eq!(output, "234");
+}
+
+#[test]
+fn example_vec_array_prints_zip_broadcast_pow() {
+    let output = run_example("examples/vec_array.hy");
+    assert_eq!(output, "46,45,18");
+}
+
+#[test]
+fn example_vec_generic_prints_scale_and_shape_generic_add() {
+    let output = run_example("examples/vec_generic.hy");
+    assert_eq!(output, "24,55");
+}
+
+#[test]
+fn example_vec_dot_prints_32_and_cross_product() {
+    let output = run_example("examples/vec_dot.hy");
+    assert_eq!(output, "32,001");
+}
+
+#[test]
+fn example_vec_matmul_prints_2x2_product() {
+    let output = run_example("examples/vec_matmul.hy");
+    assert_eq!(output, "19,22,43,50");
+}
+
+#[test]
+fn example_matrix_mul_prints_product_and_hadamard_add() {
+    let output = run_example("examples/matrix_mul.hy");
+    assert_eq!(output, "19,22,43,502");
+}
+
+#[test]
+fn matrix_compound_add_assign_updates_cells() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let m = matrix([[1, 2], [3, 4]]);
+    m += matrix([[10, 20], [30, 40]]);
+    print "%i,%i,%i,%i", m[0][0], m[0][1], m[1][0], m[1][1];
+}
+"#,
+    );
+    assert_eq!(output, "11,22,33,44");
+}
+
+#[test]
+fn matrix_sub_and_neg_packed_path_values() {
+    // End-to-end: Matrix `-` (PackedMatrixZip Sub) and unary `-` (PackedMatrixNeg).
+    let output = run_example_src(
+        r#"
+fn main() {
+    let a = matrix([[5, 7], [9, 11]]);
+    let b = matrix([[1, 2], [3, 4]]);
+    let s = a - b;
+    print "%i,%i,%i,%i,", s[0][0], s[0][1], s[1][0], s[1][1];
+    let n = -b;
+    print "%i,%i,%i,%i", n[0][0], n[0][1], n[1][0], n[1][1];
+}
+"#,
+    );
+    assert_eq!(output, "4,5,6,7,-1,-2,-3,-4");
+}
+
+#[test]
+fn float_dot_packed_path_value() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    print "%f", dot([1.5, 2.0], [2.5, 4.0]);
+}
+"#,
+    );
+    assert_eq!(output, "11.75");
+}
+
+#[test]
+fn matmul_tuple_of_tuples_rebuilds_correct_product() {
+    // Exercises outer_is_tuple + row_is_tuple packing flags end-to-end.
+    let output = run_example_src(
+        r#"
+fn main() {
+    let a = ((1, 2), (3, 4));
+    let b = ((5, 6), (7, 8));
+    let c = matmul(a, b);
+    print "%i,%i,%i,%i", c[0][0], c[0][1], c[1][0], c[1][1];
+}
+"#,
+    );
+    assert_eq!(output, "19,22,43,50");
+}
+
+#[test]
+fn aggregate_compound_assign_updates_tuple() {
+    let output = run_example_src(
+        r#"
+fn main() {
+    let v = (1, 2);
+    v += (3, 4);
+    print "%i%i", v[0], v[1];
+}
+"#,
+    );
+    assert_eq!(output, "46");
+}

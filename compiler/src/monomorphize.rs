@@ -387,6 +387,30 @@ pub fn ground_type_name(checker: &Checker, expr: &Output) -> Option<String> {
                 ty,
             ))
         }),
+        Expression::Tuple(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for it in items {
+                parts.push(ground_type_name(checker, it)?);
+            }
+            // Homogeneous only — matches numeric-tower mono keys.
+            if parts.is_empty() || parts.iter().any(|p| p != &parts[0]) {
+                return None;
+            }
+            Some(format!("({})", parts.join(", ")))
+        }
+        Expression::Array(items) => {
+            if items.is_empty() {
+                return None;
+            }
+            let elem = ground_type_name(checker, &items[0])?;
+            if items
+                .iter()
+                .any(|it| ground_type_name(checker, it).as_ref() != Some(&elem))
+            {
+                return None;
+            }
+            Some(format!("[{}; {}]", elem, items.len()))
+        }
         Expression::NamedArg(_, inner)
         | Expression::Group(inner)
         | Expression::Expr(inner)
@@ -400,6 +424,72 @@ fn concrete_ty_name(ty: &Ty) -> Option<String> {
         return None;
     }
     Some(ty.to_string())
+}
+
+/// Parse a monomorphization key fragment produced by [`ground_type_name`] /
+/// [`concrete_ty_name`] back into a [`Ty`].
+pub fn parse_mono_ty_name(name: &str) -> Option<Ty> {
+    let name = name.trim();
+    match name {
+        "int" => return Some(Ty::Con("int".into())),
+        "float" => return Some(Ty::Con("float".into())),
+        "string" => return Some(Ty::Con("string".into())),
+        "bool" => return Some(Ty::Con("bool".into())),
+        "unit" | "()" => return Some(Ty::Con("unit".into())),
+        _ => {}
+    }
+    if let Some(inner) = name.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        let parts: Vec<&str> = if inner.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_top_level_commas(inner)
+        };
+        if parts.is_empty() {
+            return None;
+        }
+        let mut elems = Vec::with_capacity(parts.len());
+        for p in parts {
+            elems.push(parse_mono_ty_name(p.trim())?);
+        }
+        return Some(Ty::Tuple(elems));
+    }
+    if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if let Some((elem_s, n_s)) = inner.rsplit_once(';') {
+            let elem = parse_mono_ty_name(elem_s.trim())?;
+            let n: usize = n_s.trim().parse().ok()?;
+            return Some(crate::typechecking::ty::array_fixed(elem, n));
+        }
+        let elem = parse_mono_ty_name(inner.trim())?;
+        return Some(crate::typechecking::ty::array(elem));
+    }
+    // Nominal / other constructors — leave as Con.
+    if name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return Some(Ty::Con(name.to_string()));
+    }
+    None
+}
+
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 fn contains_var(ty: &Ty) -> bool {

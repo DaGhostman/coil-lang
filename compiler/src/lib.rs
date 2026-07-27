@@ -21,7 +21,7 @@ use reporting::Label as DiagLabel;
 
 use crate::block_builder::{BlockBuilder, JumpKind as BbJumpKind, Label as BbLabel};
 use crate::const_fold::ConstValue;
-use crate::monomorphize::{MonoKey, MonoPlan};
+use crate::monomorphize::{MonoKey, MonoPlan, parse_mono_ty_name};
 use parser::{
     SimpleSpan,
     ast::{Expression, MatchArm, Output, Pattern, PatternPayload},
@@ -1787,6 +1787,9 @@ impl Compiler {
     }
 
     fn mono_ty_from_name(name: &str) -> Ty {
+        if let Some(ty) = parse_mono_ty_name(name) {
+            return ty;
+        }
         match name {
             crate::typechecking::ty::INT => Ty::Con(crate::typechecking::ty::INT.into()),
             crate::typechecking::ty::FLOAT => Ty::Con(crate::typechecking::ty::FLOAT.into()),
@@ -1874,6 +1877,589 @@ impl Compiler {
         bytecode.push(Byte::new(Instruction::Index));
         bytecode.push(Byte::new(Instruction::CallIndirect).with_operand_u32(3));
         true
+    }
+
+    /// Emit element-wise / broadcast aggregate arithmetic when the typechecker
+    /// recorded an [`AggregateArithInfo`] for this node (or we can recover the
+    /// shape from mono/codegen var types).
+    fn try_emit_aggregate_arith(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
+        lhs: &Output,
+        rhs: Option<&Output>,
+        fallback_op: crate::typechecking::AggregateOp,
+    ) -> bool {
+        use crate::typechecking::{AggregateArithKind, AggregateOp, ScalarSide};
+
+        let info = self_id
+            .and_then(|id| self.checker.aggregate_arith_at(id))
+            .or_else(|| self.checker.aggregate_arith_for_span(span_start, span_end))
+            .cloned()
+            .or_else(|| self.recover_aggregate_arith(lhs, rhs, fallback_op));
+        let Some(info) = info else {
+            return false;
+        };
+
+        let scalar_instr = |op: AggregateOp, is_float: bool| -> Instruction {
+            match (op, is_float) {
+                (AggregateOp::Add, false) => Instruction::ADD,
+                (AggregateOp::Add, true) => Instruction::ADDF,
+                (AggregateOp::Sub, false) => Instruction::SUB,
+                (AggregateOp::Sub, true) => Instruction::SUBF,
+                (AggregateOp::Mul, false) => Instruction::MUL,
+                (AggregateOp::Mul, true) => Instruction::MULF,
+                (AggregateOp::Div, false) => Instruction::DIV,
+                (AggregateOp::Div, true) => Instruction::DIVF,
+                (AggregateOp::Mod, false) => Instruction::MOD,
+                (AggregateOp::Mod, true) => Instruction::MODF,
+                (AggregateOp::Pow, false) => Instruction::Pow,
+                (AggregateOp::Pow, true) => Instruction::PowF,
+                // Neg is handled by `emit_neg_tos` (float uses MULF −1; no NEGF).
+                (AggregateOp::Neg, _) => Instruction::NEG,
+            }
+        };
+
+        match info.kind {
+            AggregateArithKind::NegTuple {
+                arity,
+                elem_is_float,
+            } => {
+                let t0 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                self.emit_zip_loop(
+                    bytecode,
+                    arity,
+                    |c, bc, i| {
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        c.emit_neg_tos(bc, elem_is_float);
+                    },
+                    true,
+                );
+                true
+            }
+            AggregateArithKind::NegArray {
+                length,
+                elem_is_float,
+            } => {
+                let t0 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                match length {
+                    Some(n) => {
+                        self.emit_zip_loop(
+                            bytecode,
+                            n,
+                            |c, bc, i| {
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push(Byte::new(Instruction::Index));
+                                c.emit_neg_tos(bc, elem_is_float);
+                            },
+                            false,
+                        );
+                    }
+                    None => {
+                        self.emit_dynamic_unary_array(bytecode, t0, elem_is_float);
+                    }
+                }
+                true
+            }
+            AggregateArithKind::ZipTuple {
+                arity,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t0 = self.alloc_temp_slot();
+                let t1 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.append(&mut self.do_compile(rhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+                let op = info.op;
+                self.emit_zip_loop(
+                    bytecode,
+                    arity,
+                    |_c, bc, i| {
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                    },
+                    true,
+                );
+                true
+            }
+            AggregateArithKind::ZipArray {
+                length,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t0 = self.alloc_temp_slot();
+                let t1 = self.alloc_temp_slot();
+                bytecode.append(&mut self.do_compile(lhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+                bytecode.append(&mut self.do_compile(rhs));
+                bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t1));
+                let op = info.op;
+                self.emit_zip_loop(
+                    bytecode,
+                    length,
+                    |_c, bc, i| {
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                        bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bc.push(Byte::new(Instruction::Index));
+                        bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                    },
+                    false,
+                );
+                true
+            }
+            AggregateArithKind::BroadcastTuple {
+                arity,
+                scalar_on,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t_vec = self.alloc_temp_slot();
+                let t_sc = self.alloc_temp_slot();
+                match scalar_on {
+                    ScalarSide::Right => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                    }
+                    ScalarSide::Left => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                    }
+                }
+                let op = info.op;
+                self.emit_zip_loop(
+                    bytecode,
+                    arity,
+                    |_c, bc, i| {
+                        match scalar_on {
+                            ScalarSide::Right => {
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push(Byte::new(Instruction::Index));
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                            }
+                            ScalarSide::Left => {
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                bc.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                                bc.push(Byte::new(Instruction::Index));
+                            }
+                        }
+                        bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                    },
+                    true,
+                );
+                true
+            }
+            AggregateArithKind::BroadcastArray {
+                length,
+                scalar_on,
+                elem_is_float,
+            } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let t_vec = self.alloc_temp_slot();
+                let t_sc = self.alloc_temp_slot();
+                match scalar_on {
+                    ScalarSide::Right => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                    }
+                    ScalarSide::Left => {
+                        bytecode.append(&mut self.do_compile(lhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_sc));
+                        bytecode.append(&mut self.do_compile(rhs));
+                        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t_vec));
+                    }
+                }
+                let op = info.op;
+                match length {
+                    Some(n) => {
+                        self.emit_zip_loop(
+                            bytecode,
+                            n,
+                            |_c, bc, i| {
+                                match scalar_on {
+                                    ScalarSide::Right => {
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                        bc.push(
+                                            Byte::new(Instruction::CONST)
+                                                .with_const_inline(i as i32),
+                                        );
+                                        bc.push(Byte::new(Instruction::Index));
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                    }
+                                    ScalarSide::Left => {
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                                        bc.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                                        bc.push(
+                                            Byte::new(Instruction::CONST)
+                                                .with_const_inline(i as i32),
+                                        );
+                                        bc.push(Byte::new(Instruction::Index));
+                                    }
+                                }
+                                bc.push(Byte::new(scalar_instr(op, elem_is_float)));
+                            },
+                            false,
+                        );
+                    }
+                    None => {
+                        self.emit_dynamic_broadcast_array(
+                            bytecode,
+                            t_vec,
+                            t_sc,
+                            scalar_on,
+                            op,
+                            elem_is_float,
+                        );
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Negate TOS: int via `NEG`; float via `MULF` by −1 (no `NEGF` opcode).
+    fn emit_neg_tos(&mut self, bytecode: &mut Vec<Byte>, is_float: bool) {
+        if is_float {
+            let bits = Value::from(-1.0f64).raw() as u64;
+            let idx = self.intern_constant(bits);
+            bytecode.push(Byte::new(Instruction::CONST).with_const_pool(idx));
+            bytecode.push(Byte::new(Instruction::MULF));
+        } else {
+            bytecode.push(Byte::new(Instruction::NEG));
+        }
+    }
+
+    /// Always unrolls static arities at compile time in v1 (including N > 4).
+    fn emit_zip_loop<F>(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        n: usize,
+        mut emit_elem: F,
+        as_tuple: bool,
+    ) where
+        F: FnMut(&mut Self, &mut Vec<Byte>, usize),
+    {
+        for i in 0..n {
+            emit_elem(self, bytecode, i);
+        }
+        if as_tuple {
+            bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+        } else {
+            bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+        }
+    }
+
+    fn emit_dynamic_unary_array(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        src: u32,
+        elem_is_float: bool,
+    ) {
+        // Build result by iterating 0..len(src).
+        // Jump targets are absolute VM IPs. This helper often writes into a
+        // temporary `Vec` that is later appended to `self.bytecode`, so every
+        // target must be `self.bytecode.len() + local_offset`.
+        let base = self.bytecode.len();
+        let abs_ip = |local_len: usize| (base + local_len) as u32;
+        let len_slot = self.alloc_temp_slot();
+        let idx = self.alloc_temp_slot();
+        let out = self.alloc_temp_slot();
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+        bytecode.push(Byte::new(Instruction::ArrayLen));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        let loop_top = abs_ip(bytecode.len());
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::LE));
+        let jmpf_pos = bytecode.len();
+        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::Index));
+        self.emit_neg_tos(bytecode, elem_is_float);
+        bytecode.push(Byte::new(Instruction::ArrayPush));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(1));
+        bytecode.push(Byte::new(Instruction::ADD));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(loop_top));
+        let end = abs_ip(bytecode.len());
+        bytecode[jmpf_pos] = Byte::new(Instruction::JMPF).with_operand_u32(end);
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+    }
+
+    fn emit_dynamic_broadcast_array(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        t_vec: u32,
+        t_sc: u32,
+        scalar_on: crate::typechecking::ScalarSide,
+        op: crate::typechecking::AggregateOp,
+        elem_is_float: bool,
+    ) {
+        use crate::typechecking::{AggregateOp, ScalarSide};
+        let scalar_instr = match (op, elem_is_float) {
+            (AggregateOp::Add, false) => Instruction::ADD,
+            (AggregateOp::Add, true) => Instruction::ADDF,
+            (AggregateOp::Sub, false) => Instruction::SUB,
+            (AggregateOp::Sub, true) => Instruction::SUBF,
+            (AggregateOp::Mul, false) => Instruction::MUL,
+            (AggregateOp::Mul, true) => Instruction::MULF,
+            (AggregateOp::Div, false) => Instruction::DIV,
+            (AggregateOp::Div, true) => Instruction::DIVF,
+            (AggregateOp::Mod, false) => Instruction::MOD,
+            (AggregateOp::Mod, true) => Instruction::MODF,
+            (AggregateOp::Pow, false) => Instruction::Pow,
+            (AggregateOp::Pow, true) => Instruction::PowF,
+            (AggregateOp::Neg, _) => Instruction::NEG, // unused
+        };
+        // See `emit_dynamic_unary_array`: absolute IPs for a buffer that may
+        // still be appended onto `self.bytecode`.
+        let base = self.bytecode.len();
+        let abs_ip = |local_len: usize| (base + local_len) as u32;
+        let len_slot = self.alloc_temp_slot();
+        let idx = self.alloc_temp_slot();
+        let out = self.alloc_temp_slot();
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+        bytecode.push(Byte::new(Instruction::ArrayLen));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(0));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        let loop_top = abs_ip(bytecode.len());
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(len_slot));
+        bytecode.push(Byte::new(Instruction::LE));
+        let jmpf_pos = bytecode.len();
+        bytecode.push(Byte::new(Instruction::JMPF).with_operand_u32(0));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+        match scalar_on {
+            ScalarSide::Right => {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+                bytecode.push(Byte::new(Instruction::Index));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+            }
+            ScalarSide::Left => {
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_sc));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t_vec));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+                bytecode.push(Byte::new(Instruction::Index));
+            }
+        }
+        bytecode.push(Byte::new(scalar_instr));
+        bytecode.push(Byte::new(Instruction::ArrayPush));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(out));
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(1));
+        bytecode.push(Byte::new(Instruction::ADD));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(idx));
+        bytecode.push(Byte::new(Instruction::JMP).with_operand_u32(loop_top));
+        let end = abs_ip(bytecode.len());
+        bytecode[jmpf_pos] = Byte::new(Instruction::JMPF).with_operand_u32(end);
+        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(out));
+    }
+
+    /// Recover aggregate arith info from mono/codegen var types when the
+    /// side-table miss (specialized clones).
+    ///
+    /// Requires the same homogeneous-element rule as the typechecker: mixed
+    /// element types (e.g. `(int, float)`) must not recover as zip candidates.
+    fn recover_aggregate_arith(
+        &self,
+        lhs: &Output,
+        rhs: Option<&Output>,
+        op: crate::typechecking::AggregateOp,
+    ) -> Option<crate::typechecking::AggregateArithInfo> {
+        use crate::typechecking::aggregate_arith::{elem_is_float, homogeneous_aggregate_elem};
+        use crate::typechecking::subst::apply_ty_prune;
+        use crate::typechecking::ty::{ArrayLength, Ty};
+        use crate::typechecking::{
+            AggregateArithInfo, AggregateArithKind, AggregateOp, ScalarSide,
+        };
+
+        let lty = self.expr_codegen_ty(lhs)?;
+        let lty = apply_ty_prune(self.checker.subst(), &lty);
+        match (op, rhs) {
+            (AggregateOp::Neg, None) => {
+                let elem = homogeneous_aggregate_elem(&lty)?;
+                let float = elem_is_float(&elem);
+                match lty {
+                    Ty::Tuple(elems) => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::NegTuple {
+                            arity: elems.len(),
+                            elem_is_float: float,
+                        },
+                        op,
+                    }),
+                    Ty::Array { length, .. } => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::NegArray {
+                            length: match length {
+                                ArrayLength::Static(n) => Some(n),
+                                ArrayLength::Dynamic => None,
+                            },
+                            elem_is_float: float,
+                        },
+                        op,
+                    }),
+                    _ => None,
+                }
+            }
+            (_, Some(rhs)) => {
+                let rty = self.expr_codegen_ty(rhs)?;
+                let rty = apply_ty_prune(self.checker.subst(), &rty);
+                use crate::typechecking::aggregate_arith::is_numeric_elem;
+                match (&lty, &rty) {
+                    (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() && !a.is_empty() => {
+                        let le = homogeneous_aggregate_elem(&lty)?;
+                        let re = homogeneous_aggregate_elem(&rty)?;
+                        if le != re {
+                            return None;
+                        }
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::ZipTuple {
+                                arity: a.len(),
+                                elem_is_float: elem_is_float(&le),
+                            },
+                            op,
+                        })
+                    }
+                    (
+                        Ty::Array {
+                            element,
+                            length: ArrayLength::Static(n),
+                        },
+                        Ty::Array {
+                            length: ArrayLength::Static(m),
+                            ..
+                        },
+                    ) if n == m => Some(AggregateArithInfo {
+                        kind: AggregateArithKind::ZipArray {
+                            length: *n,
+                            elem_is_float: elem_is_float(element),
+                        },
+                        op,
+                    }),
+                    (Ty::Tuple(a), r) if !a.is_empty() && is_numeric_elem(r) => {
+                        let elem = homogeneous_aggregate_elem(&lty)?;
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastTuple {
+                                arity: a.len(),
+                                scalar_on: ScalarSide::Right,
+                                elem_is_float: elem_is_float(&elem),
+                            },
+                            op,
+                        })
+                    }
+                    (l, Ty::Tuple(b)) if !b.is_empty() && is_numeric_elem(l) => {
+                        let elem = homogeneous_aggregate_elem(&rty)?;
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastTuple {
+                                arity: b.len(),
+                                scalar_on: ScalarSide::Left,
+                                elem_is_float: elem_is_float(&elem),
+                            },
+                            op,
+                        })
+                    }
+                    (Ty::Array { element, length }, r) if is_numeric_elem(r) => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastArray {
+                                length: match length {
+                                    ArrayLength::Static(n) => Some(*n),
+                                    ArrayLength::Dynamic => None,
+                                },
+                                scalar_on: ScalarSide::Right,
+                                elem_is_float: elem_is_float(element),
+                            },
+                            op,
+                        })
+                    }
+                    (l, Ty::Array { element, length }) if is_numeric_elem(l) => {
+                        Some(AggregateArithInfo {
+                            kind: AggregateArithKind::BroadcastArray {
+                                length: match length {
+                                    ArrayLength::Static(n) => Some(*n),
+                                    ArrayLength::Dynamic => None,
+                                },
+                                scalar_on: ScalarSide::Left,
+                                elem_is_float: elem_is_float(element),
+                            },
+                            op,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_codegen_ty(&self, expr: &Output) -> Option<Ty> {
+        match expr.1.as_ref() {
+            Expression::Identifier(name) => self.codegen_var_type_for(name),
+            Expression::Integer(_) => Some(Ty::Con("int".into())),
+            Expression::Float(_) => Some(Ty::Con("float".into())),
+            Expression::Tuple(items) => {
+                let mut tys = Vec::with_capacity(items.len());
+                for it in items {
+                    tys.push(self.expr_codegen_ty(it)?);
+                }
+                Some(Ty::Tuple(tys))
+            }
+            Expression::Array(items) => {
+                if items.is_empty() {
+                    return None;
+                }
+                let elem = self.expr_codegen_ty(&items[0])?;
+                Some(crate::typechecking::ty::array_fixed(elem, items.len()))
+            }
+            Expression::Group(inner) | Expression::Expr(inner) | Expression::Statement(inner) => {
+                self.expr_codegen_ty(inner)
+            }
+            _ => None,
+        }
     }
 
     /// Emit a direct call to a concrete `Eq` / `Ord` instance method when
@@ -4437,6 +5023,9 @@ impl Compiler {
     fn emit_compound_assign(
         &mut self,
         bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
         target: &Output,
         op: parser::ast::AssignOp,
         rhs: &Output,
@@ -4451,6 +5040,44 @@ impl Compiler {
             bytecode.push(Byte::new(Instruction::FORMAT).with_operand_u32(2));
             self.emit_write_lvalue(bytecode, target, false);
             return;
+        }
+
+        let agg_op = match op {
+            parser::ast::AssignOp::Add => Some(crate::typechecking::AggregateOp::Add),
+            parser::ast::AssignOp::Sub => Some(crate::typechecking::AggregateOp::Sub),
+            parser::ast::AssignOp::Mul => Some(crate::typechecking::AggregateOp::Mul),
+            parser::ast::AssignOp::Div => Some(crate::typechecking::AggregateOp::Div),
+            parser::ast::AssignOp::Mod => Some(crate::typechecking::AggregateOp::Mod),
+            parser::ast::AssignOp::Pow => Some(crate::typechecking::AggregateOp::Pow),
+            _ => None,
+        };
+        if let Some(agg_op) = agg_op {
+            let mut tmp = Vec::new();
+            if self.try_emit_matrix_op(
+                &mut tmp,
+                self_id,
+                span_start,
+                span_end,
+                target,
+                Some(rhs),
+            ) {
+                bytecode.append(&mut tmp);
+                self.emit_write_lvalue(bytecode, target, false);
+                return;
+            }
+            if self.try_emit_aggregate_arith(
+                &mut tmp,
+                self_id,
+                span_start,
+                span_end,
+                target,
+                Some(rhs),
+                agg_op,
+            ) {
+                bytecode.append(&mut tmp);
+                self.emit_write_lvalue(bytecode, target, false);
+                return;
+            }
         }
 
         if let Expression::Index(arr, Some(idx)) = target.1.as_ref() {
@@ -4681,6 +5308,447 @@ impl Compiler {
     /// Wrap the top-of-stack value as `Result::Err(e)`.
     fn emit_result_err(bytecode: &mut Vec<Byte>) {
         bytecode.push(Byte::new(Instruction::MakeEnum).with_operands_u16([1, 1])); // Err tag=1 arity=1
+    }
+
+    /// Emit `Matrix` ops (`*`, `+`, `-`, unary `-`) when the typechecker
+    /// recorded [`LinearAlgebraInfo`] on this node.
+    fn try_emit_matrix_op(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
+        lhs: &Output,
+        rhs: Option<&Output>,
+    ) -> bool {
+        let Some(info) = self_id
+            .and_then(|id| self.checker.linear_algebra_at(id))
+            .or_else(|| self.checker.linear_algebra_for_span(span_start, span_end))
+            .cloned()
+        else {
+            return false;
+        };
+        match &info.kind {
+            crate::typechecking::LinearAlgebraKind::MatMul { .. }
+            | crate::typechecking::LinearAlgebraKind::MatrixZip { .. } => {
+                let Some(rhs) = rhs else {
+                    return false;
+                };
+                let args = [lhs.clone(), rhs.clone()];
+                self.emit_linear_algebra(bytecode, self_id, span_start, span_end, &args);
+                true
+            }
+            crate::typechecking::LinearAlgebraKind::MatrixNeg { .. } => {
+                let args = [lhs.clone()];
+                self.emit_linear_algebra(bytecode, self_id, span_start, span_end, &args);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit `dot` / `matmul` / `cross` / Matrix ops from the linear-algebra side table.
+    ///
+    /// Approach A: Dot / MatMul / MatrixZip / MatrixNeg lower to packed fat
+    /// opcodes when dims fit the operand packing; otherwise keep the scalar
+    /// unroll. `cross` stays unrolled (fixed N=3).
+    fn emit_linear_algebra(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        self_id: Option<crate::typechecking::id::NodeId>,
+        span_start: usize,
+        span_end: usize,
+        args: &[Output],
+    ) {
+        use crate::typechecking::{AggregateOp, LinearAlgebraKind};
+
+        let Some(info) = self_id
+            .and_then(|id| self.checker.linear_algebra_at(id))
+            .or_else(|| self.checker.linear_algebra_for_span(span_start, span_end))
+            .cloned()
+        else {
+            return;
+        };
+
+        let needs_two = !matches!(info.kind, LinearAlgebraKind::MatrixNeg { .. });
+        if needs_two && args.len() != 2 {
+            return;
+        }
+        if !needs_two && args.is_empty() {
+            return;
+        }
+
+        // Prefer packed HostInvoke kernels (Approach A) for Dot / MatMul / Matrix*.
+        if self.try_emit_packed_linear_algebra(bytecode, &info.kind, args) {
+            return;
+        }
+
+        let t0 = self.alloc_temp_slot();
+        bytecode.append(&mut self.do_compile(&args[0]));
+        bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(t0));
+        let t1 = if needs_two {
+            let slot = self.alloc_temp_slot();
+            bytecode.append(&mut self.do_compile(&args[1]));
+            bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+            Some(slot)
+        } else {
+            None
+        };
+
+        match info.kind {
+            LinearAlgebraKind::Dot {
+                length,
+                elem_is_float,
+                ..
+            } => {
+                let t1 = t1.expect("dot needs two args");
+                let mul = if elem_is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                };
+                let add = if elem_is_float {
+                    Instruction::ADDF
+                } else {
+                    Instruction::ADD
+                };
+                for i in 0..length {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push(Byte::new(mul));
+                    if i > 0 {
+                        bytecode.push(Byte::new(add));
+                    }
+                }
+            }
+            LinearAlgebraKind::Cross {
+                left_is_tuple,
+                elem_is_float,
+            } => {
+                let t1 = t1.expect("cross needs two args");
+                let mul = if elem_is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                };
+                let sub = if elem_is_float {
+                    Instruction::SUBF
+                } else {
+                    Instruction::SUB
+                };
+                // Load components into temps for clarity.
+                let ax = self.alloc_temp_slot();
+                let ay = self.alloc_temp_slot();
+                let az = self.alloc_temp_slot();
+                let bx = self.alloc_temp_slot();
+                let by = self.alloc_temp_slot();
+                let bz = self.alloc_temp_slot();
+                for (slot, src, i) in [
+                    (ax, t0, 0),
+                    (ay, t0, 1),
+                    (az, t0, 2),
+                    (bx, t1, 0),
+                    (by, t1, 1),
+                    (bz, t1, 2),
+                ] {
+                    bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(src));
+                    bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i));
+                    bytecode.push(Byte::new(Instruction::Index));
+                    bytecode.push(Byte::new(Instruction::StorePop).with_operand_u32(slot));
+                }
+                // i = ay*bz - az*by
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ay));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bz));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(az));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(by));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(sub));
+                // j = az*bx - ax*bz
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(az));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bx));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ax));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bz));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(sub));
+                // k = ax*by - ay*bx
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ax));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(by));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(ay));
+                bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(bx));
+                bytecode.push(Byte::new(mul));
+                bytecode.push(Byte::new(sub));
+                if left_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(3));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(3));
+                }
+            }
+            LinearAlgebraKind::MatMul {
+                m,
+                k,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                let t1 = t1.expect("matmul needs two args");
+                let mul = if elem_is_float {
+                    Instruction::MULF
+                } else {
+                    Instruction::MUL
+                };
+                let add = if elem_is_float {
+                    Instruction::ADDF
+                } else {
+                    Instruction::ADD
+                };
+                for i in 0..m {
+                    for j in 0..n {
+                        for t in 0..k {
+                            // A[i][t]
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(t as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            // B[t][j]
+                            bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(t as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                            bytecode.push(Byte::new(Instruction::Index));
+                            bytecode.push(Byte::new(mul));
+                            if t > 0 {
+                                bytecode.push(Byte::new(add));
+                            }
+                        }
+                    }
+                    if row_is_tuple {
+                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                    } else {
+                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                    }
+                }
+                if outer_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                }
+            }
+            LinearAlgebraKind::MatrixZip {
+                m,
+                n,
+                op,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                let t1 = t1.expect("matrix zip needs two args");
+                let cell_op = match (op, elem_is_float) {
+                    (AggregateOp::Add, false) => Instruction::ADD,
+                    (AggregateOp::Add, true) => Instruction::ADDF,
+                    (AggregateOp::Sub, false) => Instruction::SUB,
+                    (AggregateOp::Sub, true) => Instruction::SUBF,
+                    _ => Instruction::ADD,
+                };
+                for i in 0..m {
+                    for j in 0..n {
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t1));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(cell_op));
+                    }
+                    if row_is_tuple {
+                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                    } else {
+                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                    }
+                }
+                if outer_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                }
+            }
+            LinearAlgebraKind::MatrixNeg {
+                m,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                for i in 0..m {
+                    for j in 0..n {
+                        bytecode.push(Byte::new(Instruction::LOAD).with_operand_u32(t0));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(i as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        bytecode.push(Byte::new(Instruction::CONST).with_const_inline(j as i32));
+                        bytecode.push(Byte::new(Instruction::Index));
+                        self.emit_neg_tos(bytecode, elem_is_float);
+                    }
+                    if row_is_tuple {
+                        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(n as u32));
+                    } else {
+                        bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(n as u32));
+                    }
+                }
+                if outer_is_tuple {
+                    bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(m as u32));
+                } else {
+                    bytecode.push(Byte::new(Instruction::MakeArray).with_operand_u32(m as u32));
+                }
+            }
+        }
+    }
+
+    /// Emit Approach A packed LA via `HostInvoke` (no new opcodes) when dims fit.
+    /// Returns false to fall back to scalar unroll.
+    fn try_emit_packed_linear_algebra(
+        &mut self,
+        bytecode: &mut Vec<Byte>,
+        kind: &crate::typechecking::LinearAlgebraKind,
+        args: &[Output],
+    ) -> bool {
+        use crate::typechecking::{AggregateOp, LinearAlgebraKind};
+
+        let (native_name, meta, value_args): (&str, u32, &[Output]) = match kind {
+            LinearAlgebraKind::Dot {
+                length,
+                elem_is_float,
+                ..
+            } => {
+                if *length == 0 || *length > u16::MAX as usize || args.len() != 2 {
+                    return false;
+                }
+                let mut ops = (*length as u32) & 0xFFFF;
+                if *elem_is_float {
+                    ops |= 1 << 16;
+                }
+                (machine::PACKED_DOT, ops, args)
+            }
+            LinearAlgebraKind::MatMul {
+                m,
+                k,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                if args.len() != 2
+                    || *m == 0
+                    || *k == 0
+                    || *n == 0
+                    || *m > u8::MAX as usize
+                    || *k > u8::MAX as usize
+                    || *n > u8::MAX as usize
+                {
+                    return false;
+                }
+                let mut ops = (*m as u32) | ((*k as u32) << 8) | ((*n as u32) << 16);
+                if *elem_is_float {
+                    ops |= 1 << 24;
+                }
+                if *outer_is_tuple {
+                    ops |= 1 << 25;
+                }
+                if *row_is_tuple {
+                    ops |= 1 << 26;
+                }
+                (machine::PACKED_MATMUL, ops, args)
+            }
+            LinearAlgebraKind::MatrixZip {
+                m,
+                n,
+                op,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                if args.len() != 2
+                    || *m == 0
+                    || *n == 0
+                    || *m > u8::MAX as usize
+                    || *n > u8::MAX as usize
+                {
+                    return false;
+                }
+                let zip_kind: u32 = match op {
+                    AggregateOp::Add => 0,
+                    AggregateOp::Sub => 1,
+                    _ => return false,
+                };
+                let mut ops = (*m as u32) | ((*n as u32) << 8) | (zip_kind << 16);
+                if *elem_is_float {
+                    ops |= 1 << 24;
+                }
+                if *outer_is_tuple {
+                    ops |= 1 << 25;
+                }
+                if *row_is_tuple {
+                    ops |= 1 << 26;
+                }
+                (machine::PACKED_MATRIX_ZIP, ops, args)
+            }
+            LinearAlgebraKind::MatrixNeg {
+                m,
+                n,
+                outer_is_tuple,
+                row_is_tuple,
+                elem_is_float,
+            } => {
+                if args.is_empty()
+                    || *m == 0
+                    || *n == 0
+                    || *m > u8::MAX as usize
+                    || *n > u8::MAX as usize
+                {
+                    return false;
+                }
+                let mut ops = (*m as u32) | ((*n as u32) << 8);
+                if *elem_is_float {
+                    ops |= 1 << 16;
+                }
+                if *outer_is_tuple {
+                    ops |= 1 << 17;
+                }
+                if *row_is_tuple {
+                    ops |= 1 << 18;
+                }
+                (machine::PACKED_MATRIX_NEG, ops, args)
+            }
+            LinearAlgebraKind::Cross { .. } => return false,
+        };
+
+        let Some(native_id) = self.native_id(native_name) else {
+            return false;
+        };
+
+        // HostInvoke stack: [id, args_tuple]; tuple = [arg0, …, meta].
+        // Meta is a full u32 bitfield — must use `with_operand_u32` (not
+        // `with_value_u32`, which only keeps the low 16 bits).
+        bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(native_id as u32));
+        for arg in value_args {
+            bytecode.append(&mut self.do_compile(arg));
+        }
+        bytecode.push(Byte::new(Instruction::CONST).with_operand_u32(meta));
+        let arity = value_args.len() + 1; // + meta
+        bytecode.push(Byte::new(Instruction::MakeTuple).with_operand_u32(arity as u32));
+        bytecode.push(Byte::new(Instruction::HostInvoke).with_operand_u32(arity as u32));
+        true
     }
 
     /// Desugar `assert(cond[, msg])` to Ok(()) / Err(msg) via MakeEnum.
@@ -5523,7 +6591,15 @@ impl Compiler {
                 self.emit_adjust(&mut bytecode, target, *op, *prefix);
             }
             Expression::CompoundAssign(target, op, rhs) => {
-                self.emit_compound_assign(&mut bytecode, target, *op, rhs);
+                self.emit_compound_assign(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    target,
+                    *op,
+                    rhs,
+                );
             }
             // --- Loop codegen ---
             // `while`: [top] cond, JMPF→exit, body, JMP→top, [exit]
@@ -5789,6 +6865,23 @@ impl Compiler {
                     match kind {
                         crate::typechecking::PreludeFn::Assert => {
                             self.emit_assert(arg_slice);
+                        }
+                        crate::typechecking::PreludeFn::Matrix => {
+                            // Zero-cost wrap: runtime is the nested data.
+                            if let Some(arg) = arg_slice.first() {
+                                bytecode.append(&mut self.do_compile(arg));
+                            }
+                        }
+                        crate::typechecking::PreludeFn::Dot
+                        | crate::typechecking::PreludeFn::MatMul
+                        | crate::typechecking::PreludeFn::Cross => {
+                            self.emit_linear_algebra(
+                                &mut bytecode,
+                                self_id,
+                                span.start,
+                                span.end,
+                                arg_slice,
+                            );
                         }
                     }
                     return bytecode;
@@ -6940,12 +8033,48 @@ impl Compiler {
                 unary!(bytecode, self, lhs, Byte::new(Instruction::LogNot));
             }
             Expression::Negate(lhs) => {
-                unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
+                if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    None,
+                ) {
+                } else if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    None,
+                    crate::typechecking::AggregateOp::Neg,
+                ) {
+                } else {
+                    unary!(bytecode, self, lhs, Byte::new(Instruction::NEG));
+                }
             }
             Expression::Add(lhs, rhs) => {
                 // `allow_mul_shl` is irrelevant for Add (strength_mul_to_shl
                 // only matches Mul); pass true for the shared helper API.
                 if self.try_emit_folded_expr(ast, &mut bytecode, true) {
+                } else if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                ) {
+                } else if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Add,
+                ) {
                 } else if self.is_string_expr(lhs) && self.is_string_expr(rhs) {
                     Self::emit_raw_string_literal(&mut bytecode, "%s%s");
                     bytecode.append(&mut self.do_compile(lhs));
@@ -6976,7 +8105,24 @@ impl Compiler {
                 }
             }
             Expression::Sub(lhs, rhs) => {
-                if let Some(hint) = self_id
+                if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                ) {
+                } else if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Sub,
+                ) {
+                } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -7001,6 +8147,26 @@ impl Compiler {
                 }
             }
             Expression::Mul(lhs, rhs) => {
+                // Matrix / aggregate Mul take precedence over scalar fold and
+                // `x * 2^n` → SHL (matmul and element-wise vector ops).
+                if self.try_emit_matrix_op(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                ) {
+                } else if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Mul,
+                ) {
+                } else {
                 // Prefer trait/`Mul` dictionary dispatch over primitive
                 // `x * 2^n` → SHL when the checker recorded a bound operator
                 // (non-primitive `T * 2^n` must not emit int SHL).
@@ -7031,9 +8197,19 @@ impl Compiler {
                         Instruction::MUL
                     }));
                 }
+                }
             }
             Expression::Mod(lhs, rhs) => {
-                if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Mod,
+                ) {
+                } else if self.operand_is_open_ty(lhs) || self.operand_is_open_ty(rhs) {
                     let _ = self.compile_binary_operands(&mut bytecode, lhs, rhs);
                     bytecode.push(Byte::new(Instruction::DynMod));
                 } else {
@@ -7046,7 +8222,16 @@ impl Compiler {
                 }
             }
             Expression::Div(lhs, rhs) => {
-                if let Some(hint) = self_id
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Div,
+                ) {
+                } else if let Some(hint) = self_id
                     .and_then(|id| self.checker.bound_operator_call_at(id))
                     .or_else(|| {
                         self.checker
@@ -7077,12 +8262,23 @@ impl Compiler {
                 bytecode.append(&mut self.do_compile(lhs));
             }
             Expression::Pow(lhs, rhs) => {
-                let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
-                bytecode.push(Byte::new(if is_float {
-                    Instruction::PowF
+                if self.try_emit_aggregate_arith(
+                    &mut bytecode,
+                    self_id,
+                    span.start,
+                    span.end,
+                    lhs,
+                    Some(rhs),
+                    crate::typechecking::AggregateOp::Pow,
+                ) {
                 } else {
-                    Instruction::Pow
-                }));
+                    let is_float = self.compile_binary_operands(&mut bytecode, lhs, rhs);
+                    bytecode.push(Byte::new(if is_float {
+                        Instruction::PowF
+                    } else {
+                        Instruction::Pow
+                    }));
+                }
             }
             Expression::Shl(lhs, rhs) => {
                 binary!(bytecode, self, lhs, rhs, Byte::new(Instruction::SHL));
@@ -8720,6 +9916,12 @@ mod tests {
     fn compile_src(src: &str) -> (Vec<Byte>, Vec<u64>) {
         let mut ast = Pratt::default().parse(src).expect("parse failed");
         let mut compiler = Compiler::default();
+        // Stable placeholder ids so Approach A packed HostInvoke lowering
+        // fires in unit tests (Pipeline assigns real ids at runtime).
+        compiler.register_native_id(machine::PACKED_DOT, 9001);
+        compiler.register_native_id(machine::PACKED_MATMUL, 9002);
+        compiler.register_native_id(machine::PACKED_MATRIX_ZIP, 9003);
+        compiler.register_native_id(machine::PACKED_MATRIX_NEG, 9004);
         let bc = compiler.compile("", &mut ast);
         (bc, compiler.constants)
     }
@@ -12547,5 +13749,277 @@ fn main() {
         );
     }
 
+    #[test]
+    fn tuple_zip_add_emits_index_and_make_tuple() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = (1, 1) + (1, 1);
+    print "%i", a[0];
+}
+"#,
+        );
+        let has_index = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::Index));
+        let has_make = bc
+            .iter()
+            .any(|b| matches!(b.bytecode(), Instruction::MakeTuple));
+        let has_add = bc.iter().any(|b| {
+            matches!(
+                b.bytecode(),
+                Instruction::ADD | Instruction::BinSlotImm | Instruction::BinSlotSlot
+            )
+        });
+        assert!(
+            has_index && has_make && has_add,
+            "expected Index + ADD + MakeTuple zip lowering; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
 
+    /// Approach A: `matmul` lowers to packed `HostInvoke`, not a MUL cascade.
+    #[test]
+    fn matmul_emits_packed_matmul_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = [[1, 2], [3, 4]];
+    let b = [[5, 6], [7, 8]];
+    let c = matmul(a, b);
+    print "%i", c[0][0];
+}
+"#,
+        );
+        let hosts = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::HostInvoke))
+            .count();
+        assert!(
+            hosts >= 1,
+            "expected packed HostInvoke for matmul; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        // Scalar 2×2×2 unroll would emit 8 MUL; packed path must be far below that.
+        let mul_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF))
+            .count();
+        assert!(
+            mul_count < 8,
+            "packed matmul path should not unroll to 8 MULs; got {mul_count}"
+        );
+    }
+
+    /// Dims over the `u8` packed ceiling fall back to scalar unroll (and the
+    /// typechecker warns — see diagnostics `*_over_packed_u8_limit_warns`).
+    #[test]
+    fn matmul_dims_over_u8_limit_falls_back_to_unroll() {
+        use common::Instruction;
+        let ones: String = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(", ");
+        let a = format!("[[{ones}]]"); // 1×256
+        let b_rows: String = std::iter::repeat_n("[1]", 256)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!(
+            "fn main() {{\n    let a = {a};\n    let b = [{b_rows}];\n    let _ = matmul(a, b);\n}}\n"
+        );
+        let (bc, _) = compile_src(&src);
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "dims > 255 must not emit packed HostInvoke"
+        );
+        let mul_count = bc
+            .iter()
+            .filter(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF))
+            .count();
+        // 1×256×1 scalar unroll → 256 MULs.
+        assert!(
+            mul_count >= 256,
+            "expected scalar unroll (≥256 MUL); got {mul_count}"
+        );
+    }
+
+    /// Approach A: `dot` lowers to packed `HostInvoke` (`packed_dot`).
+    #[test]
+    fn dot_emits_packed_dot_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    print "%i", dot([1, 2], [3, 4]);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected packed HostInvoke (dot); opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Approach A: `Matrix` `*` lowers to packed `HostInvoke` (`packed_matmul`).
+    #[test]
+    fn matrix_mul_emits_packed_matmul_opcode() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let b = matrix([[5, 6], [7, 8]]);
+    let c = a * b;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected packed HostInvoke (matmul) for Matrix *; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    fn packed_host_meta(bc: &[common::Byte]) -> u32 {
+        use common::Instruction;
+        let hi = bc
+            .iter()
+            .position(|b| matches!(b.bytecode(), Instruction::HostInvoke))
+            .expect("expected HostInvoke");
+        // Layout: … CONST meta, MakeTuple, HostInvoke
+        assert!(
+            hi >= 2 && matches!(bc[hi - 1].bytecode(), Instruction::MakeTuple),
+            "HostInvoke must follow MakeTuple"
+        );
+        assert!(
+            matches!(bc[hi - 2].bytecode(), Instruction::CONST),
+            "meta CONST must precede MakeTuple"
+        );
+        bc[hi - 2].operand_u32()
+    }
+
+    /// Approach A: `Matrix` `+` lowers to packed_matrix_zip with zip_kind=Add.
+    #[test]
+    fn matrix_add_emits_packed_matrix_zip_add() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let c = a + a;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for Matrix +"
+        );
+        let ops = packed_host_meta(&bc);
+        assert_eq!(ops & 0xFF, 2, "m");
+        assert_eq!((ops >> 8) & 0xFF, 2, "n");
+        assert_eq!((ops >> 16) & 0xFF, 0, "zip_kind Add");
+    }
+
+    /// Approach A: `Matrix` `-` packs zip_kind=Sub (not Add).
+    #[test]
+    fn matrix_sub_emits_packed_matrix_zip_sub() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[5, 7], [9, 11]]);
+    let b = matrix([[1, 2], [3, 4]]);
+    let c = a - b;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for Matrix -"
+        );
+        assert_eq!(
+            (packed_host_meta(&bc) >> 16) & 0xFF,
+            1,
+            "zip_kind Sub; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Approach A: unary `-` on `Matrix` lowers to packed_matrix_neg via HostInvoke.
+    #[test]
+    fn matrix_neg_emits_packed_matrix_neg() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let c = -a;
+    print "%i", c[0][0];
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for Matrix unary -; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `cross` stays on the scalar unroll path (no HostInvoke / packed natives).
+    #[test]
+    fn cross_does_not_emit_packed_opcodes() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    let c = cross((1, 0, 0), (0, 1, 0));
+    print "%i", c[0];
+}
+"#,
+        );
+        assert!(
+            !bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "cross must stay unrolled; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::MUL | Instruction::MULF)),
+            "cross unroll should emit MUL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Float `dot` sets the packed_dot is_float meta flag (`operands[16]`).
+    #[test]
+    fn float_dot_emits_packed_dot_with_float_flag() {
+        use common::Instruction;
+        let (bc, _) = compile_src(
+            r#"
+fn main() {
+    print "%f", dot([1.0, 2.0], [3.0, 4.0]);
+}
+"#,
+        );
+        assert!(
+            bc.iter()
+                .any(|b| matches!(b.bytecode(), Instruction::HostInvoke)),
+            "expected HostInvoke for float dot"
+        );
+        assert_ne!(
+            packed_host_meta(&bc) & (1 << 16),
+            0,
+            "float packed_dot meta must set is_float bit"
+        );
+    }
 }
