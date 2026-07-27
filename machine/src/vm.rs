@@ -2159,7 +2159,8 @@ impl<const S: usize> Machine<S> {
                     self.stack.push(Value::from(array_obj.addr()));
                 }
                 Instruction::JumpIfMatch => {
-                    // Tag in operands[31:16]; jump target in value[31:0].
+                    // Tag in operands[31:16]; pool index in operands[15:0]
+                    // (`constants[idx]` holds the absolute jump target).
                     let operands = opcode.operand_u32();
                     let expected_tag = operands >> 16;
 
@@ -2176,6 +2177,12 @@ impl<const S: usize> Machine<S> {
                         if let Some(enum_ref) = obj_enum {
                             let enum_ref = enum_ref.as_ref();
                             if enum_ref.tag == expected_tag {
+                                let pool_idx = (operands & 0xFFFF) as usize;
+                                debug_assert!(
+                                    pool_idx < constants.len(),
+                                    "JumpIfMatch pool index {pool_idx} out of range (len {})",
+                                    constants.len()
+                                );
                                 let target_offset = opcode.jump_if_match_target(constants);
                                 let _ = self.stack.pop();
                                 for member in &enum_ref.payload {

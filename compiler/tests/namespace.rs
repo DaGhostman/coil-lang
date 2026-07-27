@@ -106,6 +106,8 @@ fn run_bytecode(
     let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
     machine.with_output(shared.clone());
+    // Worker threads print via this buffer (not the parent's Write).
+    machine.set_shared_print(shared.inner.clone());
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
     pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
@@ -489,6 +491,111 @@ roots = ["./src"]
     let (root, entry) = build_project("use_module_file_item", manifest, files, "src/main.hy");
     let output = run_project(&root, &entry);
     assert_eq!(output, "42");
+}
+
+/// Multi-file programs that use `?` (JumpIfMatch → constant pool) in a
+/// dependency must keep a single shared pool across `compile_module`
+/// calls. Clearing the pool between files left worker threads panicking
+/// at `jump_if_match_target` (pool index OOB) under `spawn`.
+#[test]
+fn multi_file_try_operator_pool_survives_module_link() {
+    let manifest = r#"
+[module]
+roots = ["./src"]
+"#;
+    let files = [
+        (
+            "src/main.hy",
+            r#"
+use thread::*;
+use pool::worker::run_jobs;
+
+class Worker {
+    thread: Thread,
+    tx: Sender,
+}
+
+impl Worker {
+    fn submit(string job) {
+        send(self.tx, job)?;
+    }
+
+    fn join() {
+        join(self.thread)?;
+    }
+}
+
+fn main() {
+    let pair = channel()?;
+    let t = spawn(run_jobs, pair[1])?;
+    let w = new Worker(t, pair[0]);
+    w.submit("a")?;
+    w.submit("b")?;
+    w.submit("stop")?;
+    w.join()?;
+}
+"#,
+        ),
+        (
+            "src/pool/worker.hy",
+            r#"
+use thread::*;
+
+fn run_jobs(Receiver rx) -> Result<int, ThreadError> {
+    while true {
+        let job = recv(rx)?;
+        if job == "stop" {
+            break;
+        }
+        print "%s,", job;
+    }
+    return 0;
+}
+"#,
+        ),
+    ];
+    let (root, entry) = build_project("try_pool", manifest, &files, "src/main.hy");
+
+    let _cwd_lock = CwdLockGuard(CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let original_cwd = std::env::current_dir().expect("get cwd");
+    std::env::set_current_dir(&root).expect("chdir");
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(original_cwd);
+
+    let mut pipeline = Pipeline::new();
+    let (bytecode, constants) = match pipeline.compile_src_from_file(entry.to_str().unwrap()) {
+        Ok(pair) => pair,
+        Err(()) => {
+            for msg in pipeline.messages() {
+                eprintln!("MSG: {}", msg.message());
+            }
+            panic!("compile failed");
+        }
+    };
+
+    let mut oob = Vec::new();
+    for (i, b) in bytecode.iter().enumerate() {
+        if matches!(*b.bytecode(), common::Instruction::JumpIfMatch) {
+            let idx = (b.operand_u32() & 0xFFFF) as usize;
+            if idx >= constants.len() {
+                oob.push((i, idx));
+            }
+        }
+    }
+    assert!(
+        oob.is_empty(),
+        "JumpIfMatch pool index out of range after multi-file link: \
+         {oob:?} (constants.len() = {})",
+        constants.len()
+    );
+
+    let output = run_bytecode(bytecode, constants, &pipeline);
+    assert_eq!(output, "a,b,");
 }
 
 static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

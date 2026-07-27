@@ -579,6 +579,11 @@ pub struct Compiler {
 
     aliases: HashMap<String, String>,
     functions: HashMap<String, usize>,
+    /// Fixed arity + rest flag per function table key. Survives multi-file
+    /// `check_program` clears of `Checker::fn_param_names`, so `MakeFn` for
+    /// imported names (e.g. `spawn(run_jobs, …)` after `use pool::worker::run_jobs`)
+    /// still packs the real arity.
+    fn_arities: HashMap<String, (u32, bool)>,
     /// Top-level items per namespace (for `use foo::*` glob expansion).
     module_items: std::collections::HashMap<String, Vec<String>>,
     native: HashMap<String, usize>,
@@ -722,6 +727,7 @@ impl Default for Compiler {
             debug_locs,
             aliases: HashMap::default(),
             functions: HashMap::with_capacity(32),
+            fn_arities: HashMap::with_capacity(32),
             module_items: std::collections::HashMap::default(),
             native: HashMap::default(),
             extern_runtime_libs: HashMap::with_capacity(4),
@@ -6174,6 +6180,12 @@ impl Compiler {
                 };
                 let fn_offset = self.bytecode.len() as u32;
                 self.functions.insert(table_key.clone(), fn_offset as usize);
+                self.fn_arities
+                    .insert(table_key.clone(), (fixed_arity as u32, has_rest));
+                if table_key != qualified {
+                    self.fn_arities
+                        .insert(qualified.clone(), (fixed_arity as u32, has_rest));
+                }
                 if let Some(desc) = parser::ast::attr_test_desc(attrs, name) {
                     self.test_cases.push((desc, fn_offset));
                 }
@@ -7399,6 +7411,12 @@ impl Compiler {
                                 };
                                 Some((fixed, rest))
                             })
+                            .or_else(|| {
+                                self.fn_arities
+                                    .get(&lookup_name)
+                                    .or_else(|| self.fn_arities.get(&n))
+                                    .map(|(a, r)| (*a as usize, *r))
+                            })
                             .unwrap_or((0, false));
                         let fill_mask = self.checker.partial_fill_at(span.start, span.end).or_else(
                             || {
@@ -7856,6 +7874,17 @@ impl Compiler {
                             .get(&entry_key)
                             .or_else(|| self.functions.get(&resolved_n))
                         {
+                            // Prefer codegen-recorded arity: multi-file
+                            // `check_program` clears `fn_param_names`, so
+                            // imported names would otherwise MakeFn with
+                            // arity 0 and break `spawn(f, arg)`.
+                            let (fa, is_rest) = self
+                                .fn_arities
+                                .get(&entry_key)
+                                .or_else(|| self.fn_arities.get(&resolved_n))
+                                .copied()
+                                .map(|(a, r)| (a as usize, r))
+                                .unwrap_or((fa, is_rest));
                             bytecode.push(
                                 Byte::new(Instruction::CONST).with_const_inline(0),
                             );
@@ -9811,7 +9840,16 @@ impl Compiler {
         self.fn_bytecode_spans.clear();
         self.loop_stack.clear();
         self.loop_bbs.clear();
-        self.constants.clear();
+        // Constant pool is shared across multi-file `compile_module`
+        // calls. `JumpIfMatch` (and pool-backed `CONST`) store indices
+        // into this vec; clearing between modules orphans earlier
+        // instructions so the worker VM panics in
+        // `Byte::jump_if_match_target` (e.g. index 2, len 1) when a
+        // dependency uses `?` / match. Only reset on a fresh compile
+        // (still just the 3-byte CALL/JMP/HALT prologue).
+        if self.bytecode.len() <= 3 {
+            self.constants.clear();
+        }
         self.mono_offsets.clear();
         self.mono_codegen_var_types.clear();
         self.test_cases.clear();
