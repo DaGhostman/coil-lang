@@ -1371,6 +1371,25 @@ fn main() {
 | **Run** | `cargo run -- examples/classes.hy` |
 | **Output** | `7458` |
 
+### `examples/match_block_self.hy`
+
+**Demonstrates:** Brace-block `match` arm bodies that call `self.method()` (expression blocks, not dicts).
+
+```coil
+return match m {
+    Mode::Zero => { self.get() },
+    Mode::Other(n) => {
+        self.get();
+        n
+    },
+};
+```
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/match_block_self.hy` |
+| **Output** | `5` |
+
 ### `examples/generic_class.hy`
 
 **Demonstrates:** Generic class declaration (`class Cell<T>`), inherent
@@ -1707,6 +1726,7 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `ffi_callback_ret.hy` | FFI | `1` |
 | `sum.c` | FFI | (C source, not `.hy`) |
 | `classes.hy` | Classes | `7458` |
+| `match_block_self.hy` | Classes / Match | `5` |
 | `generic_class.hy` | Classes | `42` |
 | `coro.hy` | Coroutines | (see source) |
 | `coro_gen.hy` | Coroutines | `012` |
