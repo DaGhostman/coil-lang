@@ -945,7 +945,20 @@ impl Compiler {
         } else if allow_mul_shl
             && let Some((inner, shift)) = const_fold::strength_mul_to_shl(ast, self.const_env())
         {
-            // Primitive int only: SHL is not valid for float / trait Mul.
+            // Defense-in-depth: only emit int SHL when the non-const operand
+            // is known `int`. `float * k` is rejected at typecheck; skip SHL
+            // on recovery / unknown-type paths (fall through to MUL).
+            use crate::typechecking::subst::apply_ty_prune;
+            use crate::typechecking::ty::INT;
+            let inner_is_int = self.codegen_expr_ty(inner).is_some_and(|ty| {
+                matches!(
+                    apply_ty_prune(self.checker.subst(), &ty),
+                    Ty::Con(ref n) if n == INT
+                )
+            });
+            if !inner_is_int {
+                return false;
+            }
             let mut inner_bc = self.do_compile(inner);
             bytecode.append(&mut inner_bc);
             bytecode.push(Byte::new(Instruction::CONST).with_const_inline(shift as i32));
@@ -9067,6 +9080,32 @@ test("two") { assert(true)?; }
         assert!(
             !bytecode_has_any_shl(&bc),
             "x*1 should identity-reduce, not emit SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Float `*` must never strength-reduce to int `SHL` (defense-in-depth
+    /// type gate in `try_emit_folded_expr`). Typecheck rejects `float * int`;
+    /// when both sides are float the factor is never a power-of-two int, so
+    /// `strength_mul_to_shl` stays `None` and we emit `MULF`.
+    #[test]
+    fn float_mul_does_not_emit_shl() {
+        use common::Instruction;
+        let (bc, _pool) = compile_src("fn scale(float x) -> float { return x * 8.0; }");
+        assert!(
+            !bytecode_has_any_shl(&bc),
+            "float mul must not emit SHL; opcodes: {:?}",
+            bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
+        );
+        assert!(
+            bc.iter().any(|b| matches!(
+                b.bytecode(),
+                Instruction::MULF
+                    | Instruction::BinSlotImm
+                    | Instruction::BinSlotSlot
+                    | Instruction::BinReturn
+            )),
+            "expected a float mul opcode path; opcodes: {:?}",
             bc.iter().map(|b| b.bytecode()).collect::<Vec<_>>()
         );
     }
