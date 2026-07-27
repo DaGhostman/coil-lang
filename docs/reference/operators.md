@@ -63,6 +63,47 @@ When the factor is a **compile-time power of two** (`2`, `4`, `8`, …), `int` /
 `byte` multiplication lowers to a left shift (`SHL` / `<<`) instead of `MUL`.
 Trait/`Mul` dictionary dispatch and float `*` are never rewritten this way.
 
+### Aggregate (vector) arithmetic
+
+Homogeneous numeric tuples and arrays support the same operators
+**element-wise**, plus scalar broadcast:
+
+| Left | Right | Result |
+|------|-------|--------|
+| `(T,…,T)` | `(T,…,T)` (same arity) | zip |
+| `[T; N]` | `[T; N]` | zip |
+| `[T]` | `[T]` / `[T; N]` | **hard error** (length not known at compile time) |
+| aggregate | scalar `T` (or reverse) | broadcast |
+
+`T` must be numeric (`int` / `float` / `byte`, or a `Num`-bounded type
+parameter).
+`*` and `**` are element-wise (not dot product / matrix power). Unary `-`
+negates each element. Compound assign (`+=`, `**=`, …) follows the same
+rules with the LHS shape fixed.
+
+Static-length zip/broadcast fully unrolls at compile time (including large
+`[T; N]`); bytecode size scales with `N`.
+
+For **dot product**, **cross product**, and bare-array **matrix multiply**,
+use the named helpers `dot`, `cross`, and `matmul`. For matmul via `*`
+(Mul), wrap rows with `matrix(...)` to get a nominal `Matrix` — see
+[Built-ins](built-ins.md#linear-algebra-dot--matmul--cross--matrix).
+
+```coil
+(1, 1) + (1, 1);   // (2, 2)
+[1, 2] + 3;        // [4, 5]
+-(1, 2);           // (-1, -2)
+dot((1, 2), (3, 4));  // 11
+let a = matrix([[1, 2], [3, 4]]);
+let b = matrix([[5, 6], [7, 8]]);
+a * b;             // matmul (Matrix)
+a + a;             // element-wise
+```
+
+See `examples/vec_tuple.hy`, `examples/vec_array.hy`,
+`examples/vec_generic.hy`, `examples/vec_dot.hy`,
+`examples/vec_matmul.hy`, and `examples/matrix_mul.hy`.
+
 String concatenation uses `+`:
 
 ```coil

@@ -28,7 +28,7 @@ See [Getting Started](getting-started.md) for prerequisites, project layout, and
 1. **Parse** — the Pratt parser reads `.hy` source into an AST.
 2. **Typecheck** — Algorithm W (Hindley–Milner) infers types and reports source-anchored diagnostics.
 3. **Codegen** — the compiler emits stack bytecode, then runs a peephole fusion pass.
-4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **26**) and written to `out.hyc` on first run. See [Debug line table](reference/debug-info.md).
+4. **Archive** — bytecode is wrapped in a versioned `ArchivedProgram` envelope (`ARCHIVE_VERSION` is currently **29**) and written to `out.hyc` on first run. See [Debug line table](reference/debug-info.md).
 5. **Execute** — the VM loads the archive and runs `main`.
 
 Re-run the same binary without deleting `out.hyc` to reuse the cached compile. Delete `out.hyc` (or bump the archive version) to force a fresh compile. The CLI recompiles automatically when the archive is missing, corrupt, version-mismatched, or older than the entry source.

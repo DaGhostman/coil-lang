@@ -1780,3 +1780,246 @@ fn array_element_type_mismatch_errors() {
     );
 }
 
+#[test]
+fn dynamic_array_zip_is_hard_error() {
+    let (_ty, msgs) = check(
+        r#"
+fn zip([int] a, [int] b) -> [int] {
+    return a + b;
+}
+fn main() {}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot zip dynamic-length arrays")),
+        "expected dynamic zip diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn tuple_arity_mismatch_zip_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = (1, 2) + (1, 2, 3);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot zip tuples of length")),
+        "expected tuple length mismatch diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn heterogeneous_tuple_arith_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = (1, "x") + (2, "y");
+}
+"#,
+    );
+    assert!(
+        !msgs.is_empty(),
+        "expected diagnostic for heterogeneous tuple arith, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn bitwise_on_aggregates_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = (1, 2) & (3, 4);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("not supported on aggregates")),
+        "expected bitwise-on-aggregate rejection, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn static_array_length_mismatch_zip_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a: [int; 2] = [1, 2];
+    let b: [int; 3] = [1, 2, 3];
+    let _ = a + b;
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot zip arrays of length")),
+        "expected static array length mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn dot_length_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = dot((1, 2), (1, 2, 3));
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("cannot take `dot`")),
+        "expected dot length mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn matmul_inner_dimension_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a = [[1, 2, 3]];
+    let b = [[1, 2], [3, 4]];
+    let _ = matmul(a, b);
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("inner dimensions mismatch")),
+        "expected matmul dimension mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn matmul_dims_over_packed_u8_limit_warns() {
+    // Inner dim 256 > u8::MAX. Nested fixed-length type annotations are not
+    // parseable (`[[int; N]; M]`), so build literals with static length 256.
+    use compiler::MessageKind;
+    let ones: String = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(", ");
+    let a = format!("[[{ones}], [{ones}]]"); // 2×256
+    let b_rows: String = std::iter::repeat_n("[1, 2]", 256)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src = format!(
+        "fn main() {{\n    let a = {a};\n    let b = [{b_rows}];\n    let _ = matmul(a, b);\n}}\n"
+    );
+    let msgs = check_messages(&src);
+    assert!(
+        msgs.iter().any(|m| {
+            *m.kind() == MessageKind::WARNING
+                && m.message().contains("exceed the packed kernel meta limit")
+                && m.message().contains("256")
+        }),
+        "expected packed-dim warning for matmul, got: {:?}",
+        msgs.iter().map(|m| (m.kind(), m.message())).collect::<Vec<_>>()
+    );
+    assert!(
+        msgs.iter().any(|m| {
+            m.help()
+                .as_ref()
+                .is_some_and(|h| h.contains("scalar unroll"))
+        }),
+        "expected help mentioning scalar unroll, got: {:?}",
+        msgs.iter().map(|m| m.help()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn matrix_mul_dims_over_packed_u8_limit_warns() {
+    use compiler::MessageKind;
+    let ones: String = std::iter::repeat_n("1", 256).collect::<Vec<_>>().join(", ");
+    let a = format!("[[{ones}], [{ones}]]");
+    let b_rows: String = std::iter::repeat_n("[1, 2]", 256)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src = format!(
+        "fn main() {{\n    let a = matrix({a});\n    let b = matrix([{b_rows}]);\n    let _ = a * b;\n}}\n"
+    );
+    let msgs = check_messages(&src);
+    assert!(
+        msgs.iter().any(|m| {
+            *m.kind() == MessageKind::WARNING
+                && m.message().contains("exceed the packed kernel meta limit")
+        }),
+        "expected packed-dim warning for Matrix *, got: {:?}",
+        msgs.iter().map(|m| (m.kind(), m.message())).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn matrix_mul_inner_dimension_mismatch_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a = matrix([[1, 2, 3]]);
+    let b = matrix([[1, 2], [3, 4]]);
+    let _ = a * b;
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("inner dimensions mismatch")),
+        "expected Matrix * dimension mismatch, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn matrix_div_is_rejected() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let a = matrix([[1, 2], [3, 4]]);
+    let _ = a / a;
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("not supported on `Matrix`")),
+        "expected Matrix / rejection, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn dot_mixed_tuple_and_array_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = dot((1, 2), [3, 4]);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot mix tuple and array operands in `dot`")),
+        "expected mixed container diagnostic, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn cross_wrong_length_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn main() {
+    let _ = cross((1, 2), (3, 4));
+}
+"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("length-3") || m.contains("`cross`")),
+        "expected cross length diagnostic, got: {:?}",
+        msgs
+    );
+}
+

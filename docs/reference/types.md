@@ -131,6 +131,9 @@ Annotation: `(T1, T2, ...)`. Literal syntax requires a comma: `(1,)` is a 1-tupl
 
 Tuples have structural `Show` support for `%v` when every element is showable. The printed form is `(a, b)` (and `(a,)` for a 1-tuple).
 
+Homogeneous numeric tuples also support **element-wise arithmetic** (zip /
+broadcast / unary `-`). See [Operators](operators.md).
+
 ---
 
 ## Arrays (`Ty::Array`)

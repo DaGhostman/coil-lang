@@ -778,6 +778,73 @@ fn main() {
 
 ---
 
+### `examples/vec_tuple.hy`
+
+**Demonstrates:** Element-wise tuple zip, scalar broadcast, and unary negate.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_tuple.hy` |
+| **Output** | `22,23,24,-1-2` |
+
+---
+
+### `examples/vec_array.hy`
+
+**Demonstrates:** Static array zip, scalar broadcast, and element-wise `**`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_array.hy` |
+| **Output** | `46,45,18` |
+
+---
+
+### `examples/vec_generic.hy`
+
+**Demonstrates:** Tier B `scale<T: Num>((T,T), T)` and Tier C shape-generic
+`add<T: Num>(T, T)` monomorphized over `(int, int)`.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_generic.hy` |
+| **Output** | `24,55` |
+
+---
+
+### `examples/vec_dot.hy`
+
+**Demonstrates:** Named helpers `dot` and `cross` on length-3 tuples.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_dot.hy` |
+| **Output** | `32,001` |
+
+---
+
+### `examples/vec_matmul.hy`
+
+**Demonstrates:** Named helper `matmul` on nested `[int; 2]` matrices.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/vec_matmul.hy` |
+| **Output** | `19,22,43,50` |
+
+---
+
+### `examples/matrix_mul.hy`
+
+**Demonstrates:** Nominal `Matrix` — `*` is matmul (Mul), `+` is element-wise.
+
+| | |
+|---|---|
+| **Run** | `cargo run -- examples/matrix_mul.hy` |
+| **Output** | `19,22,43,502` |
+
+---
+
 ### `examples/generic_alias.hy`
 
 **Demonstrates:** Parametric type aliases — `type Pair<T> = (T, T);` expands `Pair<int>` to `(int, int)` at typecheck time.
@@ -1531,6 +1598,12 @@ See [`examples/projects/README.md`](../examples/projects/README.md).
 | `readonly_seal.hy` | Readonly | `322` |
 | `dict.hy` | Collections | `4210042` |
 | `aliases.hy` | Types | `347` |
+| `vec_tuple.hy` | Aggregates | `22,23,24,-1-2` |
+| `vec_array.hy` | Aggregates | `46,45,18` |
+| `vec_generic.hy` | Aggregates | `24,55` |
+| `vec_dot.hy` | Aggregates | `32,001` |
+| `vec_matmul.hy` | Aggregates | `19,22,43,50` |
+| `matrix_mul.hy` | Aggregates | `19,22,43,502` |
 | `generic_alias.hy` | Types | `7` |
 | `generic_enum.hy` | Enums / types | `7` |
 | `generics.hy` | Types | `7424.0427` |
