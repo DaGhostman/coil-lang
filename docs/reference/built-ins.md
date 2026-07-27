@@ -426,7 +426,7 @@ There is **no general standard library** yet. The following are **not** built-in
 | Math | `sin`, `sqrt`, `random` |
 | High-level file helpers | path utilities beyond `io::open` / `read_to_end` / `write_all` |
 | HTTP / TLS | Not in the VM (use userland on top of `io` TCP later) |
-| Concurrency | OS threads (stackful coroutines via `async` / `yield` / `resume` / `done` are supported) |
+| Concurrency | — (use virtual **`thread`** module for OS threads; coroutines via `async` / `yield` / `resume` / `done` — see [Tutorial 11](../tutorial/11-threads.md) and [Tutorial 08](../tutorial/08-coroutines.md)) |
 | Memory | `alloc`, `free` |
 
 Use **`io`** for streams, **FFI** for C libraries, or **host natives** when embedding the VM in Rust.

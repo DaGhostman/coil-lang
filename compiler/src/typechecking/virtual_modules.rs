@@ -33,6 +33,9 @@ pub const IO_NET_TCP_MODULE: &str = "io::net::tcp";
 /// UDP helpers under `io::net::udp` (`bind`, `send_to`, …).
 pub const IO_NET_UDP_MODULE: &str = "io::net::udp";
 
+/// Canonical module path for OS threads, channels, and locks.
+pub const THREAD_MODULE: &str = "thread";
+
 /// Which userland FFI builtin a virtual export names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiBuiltin {
@@ -259,6 +262,104 @@ impl IoBuiltin {
     }
 }
 
+/// Thread host natives exported from virtual `thread`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThreadBuiltin {
+    Spawn,
+    Join,
+    Detach,
+    Channel,
+    Send,
+    Recv,
+    TrySend,
+    TryRecv,
+    Close,
+    Mutex,
+    WithLock,
+    Lock,
+    TryLock,
+    Unlock,
+    Rwlock,
+    WithRead,
+    WithWrite,
+    TryRead,
+    TryWrite,
+}
+
+impl ThreadBuiltin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Join => "join",
+            Self::Detach => "detach",
+            Self::Channel => "channel",
+            Self::Send => "send",
+            Self::Recv => "recv",
+            Self::TrySend => "try_send",
+            Self::TryRecv => "try_recv",
+            Self::Close => "close",
+            Self::Mutex => "mutex",
+            Self::WithLock => "with_lock",
+            Self::Lock => "lock",
+            Self::TryLock => "try_lock",
+            Self::Unlock => "unlock",
+            Self::Rwlock => "rwlock",
+            Self::WithRead => "with_read",
+            Self::WithWrite => "with_write",
+            Self::TryRead => "try_read",
+            Self::TryWrite => "try_write",
+        }
+    }
+
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Self::Spawn => "thread_spawn",
+            Self::Join => "thread_join",
+            Self::Detach => "thread_detach",
+            Self::Channel => "thread_channel",
+            Self::Send => "thread_send",
+            Self::Recv => "thread_recv",
+            Self::TrySend => "thread_try_send",
+            Self::TryRecv => "thread_try_recv",
+            Self::Close => "thread_close",
+            Self::Mutex => "thread_mutex",
+            Self::WithLock => "thread_with_lock",
+            Self::Lock => "thread_lock",
+            Self::TryLock => "thread_try_lock",
+            Self::Unlock => "thread_unlock",
+            Self::Rwlock => "thread_rwlock",
+            Self::WithRead => "thread_with_read",
+            Self::WithWrite => "thread_with_write",
+            Self::TryRead => "thread_try_read",
+            Self::TryWrite => "thread_try_write",
+        }
+    }
+
+    pub fn all() -> &'static [ThreadBuiltin] {
+        &[
+            Self::Spawn,
+            Self::Join,
+            Self::Detach,
+            Self::Channel,
+            Self::Send,
+            Self::Recv,
+            Self::TrySend,
+            Self::TryRecv,
+            Self::Close,
+            Self::Mutex,
+            Self::WithLock,
+            Self::Lock,
+            Self::TryLock,
+            Self::Unlock,
+            Self::Rwlock,
+            Self::WithRead,
+            Self::WithWrite,
+            Self::TryRead,
+            Self::TryWrite,
+        ]
+    }
+}
+
 /// One item exported by a virtual module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinExport {
@@ -276,6 +377,8 @@ pub enum BuiltinExport {
     OpaqueType { name: &'static str },
     /// IO host native (`open`, `read`, …).
     IoFn { kind: IoBuiltin },
+    /// Thread host native (`spawn`, `send`, …).
+    ThreadFn { kind: ThreadBuiltin },
 }
 
 impl BuiltinExport {
@@ -288,6 +391,7 @@ impl BuiltinExport {
             Self::Fn { kind } => kind.as_str(),
             Self::OpaqueType { name } => name,
             Self::IoFn { kind } => kind.as_str(),
+            Self::ThreadFn { kind } => kind.as_str(),
         }
     }
 }
@@ -422,6 +526,21 @@ impl VirtualModules {
             .map(|kind| BuiltinExport::IoFn { kind: *kind })
             .collect();
         modules.insert(IO_NET_UDP_MODULE, udp_exports);
+
+        let mut thread_exports = vec![
+            BuiltinExport::OpaqueType { name: "Thread" },
+            BuiltinExport::OpaqueType { name: "Sender" },
+            BuiltinExport::OpaqueType { name: "Receiver" },
+            BuiltinExport::OpaqueType { name: "Mutex" },
+            BuiltinExport::OpaqueType { name: "RwLock" },
+            BuiltinExport::Enum {
+                name: common::BUILTIN_THREAD_ERROR_ENUM,
+            },
+        ];
+        for kind in ThreadBuiltin::all() {
+            thread_exports.push(BuiltinExport::ThreadFn { kind: *kind });
+        }
+        modules.insert(THREAD_MODULE, thread_exports);
 
         Self { modules }
     }

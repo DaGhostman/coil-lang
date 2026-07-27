@@ -1,19 +1,38 @@
 //! End-to-end golden tests for `.hy` example programs.
 
-use std::cell::RefCell;
 use std::io::Write;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use compiler::Pipeline;
 use machine::Machine;
 
-/// Captures VM `PRINT` output into a shared buffer.
-#[derive(Clone)]
-struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+/// Captures VM `PRINT` output into a shared buffer (`Send` for thread workers).
+#[derive(Clone, Default)]
+struct SharedBuf {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedBuf {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn into_utf8(self) -> String {
+        let bytes = self
+            .inner
+            .lock()
+            .expect("print buffer mutex poisoned")
+            .clone();
+        String::from_utf8(bytes).expect("captured output should be valid UTF-8")
+    }
+}
 
 impl Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(buf);
+        self.inner
+            .lock()
+            .map_err(|_| std::io::ErrorKind::Other)?
+            .extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -73,19 +92,17 @@ fn run_bytecode(
     pipeline: &Pipeline,
     entry: Option<&std::path::Path>,
 ) -> String {
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
-    machine.with_output(shared);
+    machine.set_shared_print(shared.inner.clone());
+    machine.with_output(shared.clone());
     pipeline.wire_vm_ffi(&mut machine, entry);
     pipeline.wire_host_natives(&mut machine);
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
     machine.set_program_debug(pipeline.program_debug());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    String::from_utf8(bytes).expect("captured output should be valid UTF-8")
+    shared.into_utf8()
 }
 
 #[test]
@@ -159,17 +176,13 @@ fn main() {
 "#,
         )
         .expect("panic example should compile");
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
-    machine.with_output(shared);
+    machine.with_output(shared.clone());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     assert!(machine.panicked(), "expected language-level panic");
     let _ = machine.restore_output();
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    let s = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
+    let s = shared.into_utf8();
     assert_eq!(s, "panic: boom");
 }
 
@@ -705,9 +718,6 @@ fn example_chained_prints_42_7() {
 
 #[test]
 fn example_match_with_two_ok_arms_dispatches_correctly() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate must have a parent (workspace root)");
@@ -720,17 +730,14 @@ fn example_match_with_two_ok_arms_dispatches_correctly() {
     let mut ast = parser.parse(&src).expect("result.hy should parse");
     let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared);
+    machine.with_output(shared.clone());
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
 
     let _ = machine.restore_output();
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    let output = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
+    let output = shared.into_utf8();
 
     assert_eq!(output, "420-1");
 }
@@ -749,16 +756,12 @@ fn fizbuz_runs_to_completion() {
     let mut ast = parser.parse(&src).expect("fizbuz.hy should parse");
     let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
     machine.with_output(shared);
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
 
-    let _ = buf;
+    let _ = shared;
 }
 
 #[test]
@@ -954,17 +957,13 @@ fn example_let_chained_bindings_works() {
         .expect("chained-bindings program should parse");
     let (bytecode, constants) = pipeline.compile_test("", &mut ast);
 
-    let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(std::rc::Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = machine::Machine::<128>::default();
-    machine.with_output(shared);
+    machine.with_output(shared.clone());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
 
     let _ = machine.restore_output();
-    let bytes = std::rc::Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    let output = String::from_utf8(bytes).expect("captured output should be valid UTF-8");
+    let output = shared.into_utf8();
 
     let _ = workspace_root;
     assert_eq!(output, "6");
@@ -1291,10 +1290,9 @@ fn main() {
     let (bytecode, constants) = pipeline
         .compile_src(src)
         .expect("should compile (load failure is runtime)");
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
-    machine.with_output(shared);
+    machine.with_output(shared.clone());
     pipeline.wire_vm_ffi(&mut machine, None);
     pipeline.wire_host_natives(&mut machine);
     machine.set_program_debug(pipeline.program_debug());
@@ -1304,10 +1302,7 @@ fn main() {
         "missing library should panic, not segfault"
     );
     let _ = machine.restore_output();
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    let output = String::from_utf8(bytes).expect("utf-8");
+    let output = shared.into_utf8();
     assert!(
         output.contains("panic:") && output.contains("not found"),
         "expected panic message about missing library, got: {output:?}"
@@ -1939,10 +1934,9 @@ test("broken") {
 "#,
         )
         .expect("compile");
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
+    let shared = SharedBuf::new();
     let mut machine = Machine::<128>::default();
-    machine.with_output(shared);
+    machine.with_output(shared.clone());
     pipeline.wire_host_natives(&mut machine);
     machine.set_program_debug(pipeline.program_debug());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
@@ -1951,10 +1945,7 @@ test("broken") {
         machine.panicked(),
         "virtual main must panic when a case fails"
     );
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
-    let output = String::from_utf8(bytes).expect("utf-8");
+    let output = shared.into_utf8();
     assert!(
         output.contains("> Test \"broken\" failed"),
         "expected failure banner, got {output:?}"
@@ -2814,6 +2805,116 @@ fn main() {
 "#,
     );
     assert_eq!(output, "-1,8");
+}
+
+#[test]
+fn example_thread_join_prints_42() {
+    let output = run_example("examples/thread_join.hy");
+    assert_eq!(output, "42");
+}
+
+#[test]
+fn example_thread_channel_prints_hello() {
+    let output = run_example("examples/thread_channel.hy");
+    assert_eq!(output, "hello");
+}
+
+#[test]
+fn example_thread_mutex_prints_2() {
+    let output = run_example("examples/thread_mutex.hy");
+    assert_eq!(output, "2");
+}
+
+#[test]
+fn thread_channel_close_try_recv_is_disconnected() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn main() {
+    let pair = channel()?;
+    let tx = pair[0];
+    let rx = pair[1];
+    close(tx)?;
+    let msg = match try_recv(rx) {
+        Result::Ok(_) => "ok",
+        Result::Err(e) => match e {
+            ThreadError::Disconnected => "disc",
+            _ => "other",
+        },
+    };
+    print "%s", msg;
+}
+"#,
+    );
+    assert_eq!(output, "disc");
+}
+
+#[test]
+fn thread_try_recv_empty_open_channel_would_block() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn main() {
+    let pair = channel()?;
+    let rx = pair[1];
+    let msg = match try_recv(rx) {
+        Result::Ok(_) => "ok",
+        Result::Err(e) => match e {
+            ThreadError::WouldBlock => "wb",
+            _ => "other",
+        },
+    };
+    print "%s", msg;
+}
+"#,
+    );
+    assert_eq!(output, "wb");
+}
+
+#[test]
+fn thread_rwlock_with_write_then_read() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn main() {
+    let rw = rwlock(10)?;
+    with_write(rw, fn (int n) => (n + 1, 0))?;
+    let v = with_read(rw, fn (int n) => n)?;
+    print "%i", v;
+}
+"#,
+    );
+    assert_eq!(output, "11");
+}
+
+#[test]
+fn thread_detach_then_join_fails() {
+    let output = run_example_src(
+        r#"
+use thread::*;
+
+fn work() -> int {
+    return 1;
+}
+
+fn main() {
+    let t = spawn(work)?;
+    detach(t)?;
+    let msg = match join(t) {
+        Result::Ok(_) => "joined",
+        Result::Err(e) => match e {
+            ThreadError::JoinFailed => "jf",
+            _ => "other",
+        },
+    };
+    print "%s", msg;
+}
+"#,
+    );
+    assert_eq!(output, "jf");
 }
 
 #[test]

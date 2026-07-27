@@ -1,21 +1,31 @@
 //! End-to-end tests for `use` / `mod` module resolution.
 
-use std::cell::RefCell;
 use std::io::Write;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use compiler::Pipeline;
 use machine::Machine;
 
 // Tests change cwd; serialize with CWD_LOCK when running in parallel.
 
-#[derive(Clone)]
-struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+#[derive(Clone, Default)]
+struct SharedBuf {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedBuf {
+    fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(buf);
+        self.inner
+            .lock()
+            .map_err(|_| std::io::ErrorKind::Other)?
+            .extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -85,17 +95,28 @@ fn run_project(project_root: &PathBuf, entry: &PathBuf) -> String {
         }
     };
 
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
-    let mut machine = Machine::<128>::default();
-    machine.with_output(shared);
+    run_bytecode(bytecode, constants, &pipeline)
+}
 
+fn run_bytecode(
+    bytecode: Vec<common::Byte>,
+    constants: Vec<u64>,
+    pipeline: &Pipeline,
+) -> String {
+    let shared = SharedBuf::new();
+    let mut machine = Machine::<128>::default();
+    machine.with_output(shared.clone());
+    pipeline.wire_vm_ffi(&mut machine, None);
+    pipeline.wire_host_natives(&mut machine);
+    pipeline.wire_thread_program(&mut machine, &bytecode, &constants);
+    machine.set_program_debug(pipeline.program_debug());
     machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
     let _ = machine.restore_output();
-
-    let bytes = Rc::try_unwrap(buf)
-        .expect("VM still holds a reference to the buffer")
-        .into_inner();
+    let bytes = shared
+        .inner
+        .lock()
+        .expect("print buffer mutex poisoned")
+        .clone();
     String::from_utf8(bytes).expect("captured output should be valid UTF-8")
 }
 
@@ -359,18 +380,7 @@ roots = ["./src"]
             .collect::<Vec<_>>()
     );
 
-    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let shared = SharedBuf(Rc::clone(&buf));
-    let mut machine = Machine::<128>::default();
-    machine.with_output(shared);
-    machine.run_raw(&bytecode, &constants, pipeline.static_slot_count());
-    let _ = machine.restore_output();
-    let output = String::from_utf8(
-        Rc::try_unwrap(buf)
-            .expect("VM still holds buffer")
-            .into_inner(),
-    )
-    .expect("utf8");
+    let output = run_bytecode(bytecode, constants, &pipeline);
     // fib(5)=5, inc(5)=6, id(6)=6
     assert_eq!(output, "6");
 }

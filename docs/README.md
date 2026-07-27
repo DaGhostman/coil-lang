@@ -82,6 +82,7 @@ Work through the tutorial in order. Each chapter builds on the previous one.
 | [08 — Coroutines](tutorial/08-coroutines.md) | `async fn`, resume, send/receive, `yield from`, `for x in` |
 | [09 — Error handling](tutorial/09-error-handling.md) | Built-in Option/Result, `raise`, `?`, `??`, `?.` |
 | [10 — IO streams](tutorial/10-io-streams.md) | `byte` / `[byte]`, `Stream`, files, sync adapters, TCP |
+| [11 — OS threads](tutorial/11-threads.md) | `use thread::*`, `spawn` / `join`, channels, mutexes |
 
 Classes (`class`, `impl`, `new`, field access, methods) are supported — see [02 — Types & Variables](tutorial/02-types-and-variables.md) and `examples/classes.hy`.
 

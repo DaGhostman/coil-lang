@@ -6,3 +6,4 @@ callgrind.out*
 out.hyc
 *.so
 *.o
+THREADS_PLAN.md

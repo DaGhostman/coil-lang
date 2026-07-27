@@ -2023,3 +2023,41 @@ fn main() {
     );
 }
 
+#[test]
+fn thread_spawn_without_import_errors() {
+    let (_ty, msgs) = check(
+        r#"
+fn work() -> int { return 1; }
+fn main() { let t = spawn(work); }
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("spawn")
+                && (m.contains("Cannot find") || m.contains("cannot find"))),
+        "expected missing spawn without `use thread`, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn spawn_non_sendable_argument_reports_diagnostic() {
+    let (_ty, msgs) = check(
+        r#"
+use thread::*;
+fn noop() -> int { return 0; }
+fn work(Thread t) -> int { return 1; }
+fn main() {
+    let t0 = spawn(noop)?;
+    let t = spawn(work, t0);
+}
+"#,
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("not sendable across threads")),
+        "expected non-sendable spawn arg diagnostic, got: {:?}",
+        msgs
+    );
+}
+

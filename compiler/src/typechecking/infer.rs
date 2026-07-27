@@ -93,7 +93,7 @@ use super::ty::{
     subst_ty_params, unit as unit_ty, readonly_ty, strip_readonly,
 };
 use super::unify::{UnifyError, unify_with};
-use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, VirtualModules};
+use super::virtual_modules::{BuiltinExport, FfiBuiltin, IoBuiltin, PreludeFn, ThreadBuiltin, VirtualModules};
 
 /// One candidate in a compile-time arity overload set.
 ///
@@ -661,6 +661,16 @@ impl Checker {
             self.register_builtin_io_error();
         }
 
+        let needs_thread_error = matches!(
+            &export,
+            BuiltinExport::Enum {
+                name: common::BUILTIN_THREAD_ERROR_ENUM
+            } | BuiltinExport::ThreadFn { .. }
+        );
+        if needs_thread_error && !self.enums.contains_key(common::BUILTIN_THREAD_ERROR_ENUM) {
+            self.register_builtin_thread_error();
+        }
+
         // Lazily register `Error` / `ErrorKind` when the virtual `ffi`
         // module is brought into scope (enum or any FFI builtin).
         let needs_ffi_error = matches!(
@@ -727,6 +737,14 @@ impl Checker {
     pub fn io_fn_in_scope(&self, name: &str) -> Option<IoBuiltin> {
         match self.scope_bindings.get(name)? {
             BuiltinExport::IoFn { kind } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Resolve an in-scope name to a thread host native (`spawn`, `send`, …).
+    pub fn thread_fn_in_scope(&self, name: &str) -> Option<ThreadBuiltin> {
+        match self.scope_bindings.get(name)? {
+            BuiltinExport::ThreadFn { kind } => Some(*kind),
             _ => None,
         }
     }
@@ -866,6 +884,29 @@ impl Checker {
         self.enum_arities.insert(name, arities);
     }
 
+    /// Pre-register `ThreadError` unit variants for the virtual `thread` module.
+    fn register_builtin_thread_error(&mut self) {
+        use common::{BUILTIN_THREAD_ERROR_ENUM, BUILTIN_THREAD_ERROR_VARIANTS};
+        let name = BUILTIN_THREAD_ERROR_ENUM.to_string();
+        let variant_names: Vec<String> = BUILTIN_THREAD_ERROR_VARIANTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let payloads = variant_names
+            .iter()
+            .map(|_| EnumVariantPayloadTy::Unit)
+            .collect();
+        let arities = vec![0; variant_names.len()];
+        let mut tag_map = BTreeMap::new();
+        for (i, vn) in variant_names.iter().enumerate() {
+            tag_map.insert(vn.clone(), i as u32);
+        }
+        self.enums.insert(name.clone(), variant_names);
+        self.enum_tags.insert(name.clone(), tag_map);
+        self.enum_payloads.insert(name.clone(), payloads);
+        self.enum_arities.insert(name, arities);
+    }
+
     /// Pre-register `ffi::ErrorKind` unit variants.
     fn register_builtin_ffi_error_kind(&mut self) {
         use common::{BUILTIN_FFI_ERROR_KIND_ENUM, BUILTIN_FFI_ERROR_KIND_VARIANTS};
@@ -956,6 +997,289 @@ impl Checker {
             IoBuiltin::UdpLocalPort => fun(&[stream], res_int),
         };
         Scheme::mono(ty)
+    }
+
+    /// Scheme for a virtual `thread` host native (inserted on `use thread::*`).
+    pub fn thread_fn_scheme(&mut self, kind: ThreadBuiltin) -> Scheme {
+        use crate::typechecking::ty::{
+            mutex_ty, receiver_ty, rwlock_ty, sender_ty, thread_ty, tuple,
+        };
+        let thread_err = Ty::Con(common::BUILTIN_THREAD_ERROR_ENUM.into());
+        let res_thread = result_app_ty(thread_ty(), thread_err.clone());
+        let res_unit = result_app_ty(unit_ty(), thread_err.clone());
+        let fun = |params: &[Ty], ret: Ty| {
+            params.iter().rev().fold(ret, |acc, p| {
+                Ty::Fun(Box::new(p.clone()), Box::new(acc))
+            })
+        };
+        let fn_ty = |param: Ty, ret: Ty| Ty::Fun(Box::new(param), Box::new(ret));
+        match kind {
+            ThreadBuiltin::Spawn => {
+                let t = self.counter.fresh();
+                let a = self.counter.fresh();
+                let fn_a_t = fn_ty(Ty::Var(a), Ty::Var(t));
+                Scheme::poly(
+                    vec![t, a],
+                    vec![],
+                    fun(&[fn_a_t, Ty::Var(a)], res_thread),
+                )
+            }
+            ThreadBuiltin::Join => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(
+                        &[thread_ty()],
+                        result_app_ty(Ty::Var(t), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::Detach => Scheme::mono(fun(&[thread_ty()], res_unit)),
+            ThreadBuiltin::Channel => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(
+                        &[],
+                        result_app_ty(tuple(vec![sender_ty(), receiver_ty()]), thread_err),
+                    ),
+                )
+            }
+            ThreadBuiltin::Send | ThreadBuiltin::TrySend => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(&[sender_ty(), Ty::Var(t)], res_unit.clone()),
+                )
+            }
+            ThreadBuiltin::Recv | ThreadBuiltin::TryRecv => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(
+                        &[receiver_ty()],
+                        result_app_ty(Ty::Var(t), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::Close => Scheme::mono(fun(&[sender_ty()], res_unit.clone())),
+            ThreadBuiltin::Mutex => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(
+                        &[Ty::Var(t)],
+                        result_app_ty(mutex_ty(), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::Rwlock => {
+                let t = self.counter.fresh();
+                Scheme::poly(
+                    vec![t],
+                    vec![],
+                    fun(
+                        &[Ty::Var(t)],
+                        result_app_ty(rwlock_ty(), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::WithLock => {
+                let t = self.counter.fresh();
+                let r = self.counter.fresh();
+                let callback = fn_ty(
+                    Ty::Var(t),
+                    tuple(vec![Ty::Var(t), Ty::Var(r)]),
+                );
+                Scheme::poly(
+                    vec![t, r],
+                    vec![],
+                    fun(
+                        &[mutex_ty(), callback],
+                        result_app_ty(Ty::Var(r), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::WithWrite | ThreadBuiltin::TryWrite => {
+                let t = self.counter.fresh();
+                let r = self.counter.fresh();
+                let callback = fn_ty(
+                    Ty::Var(t),
+                    tuple(vec![Ty::Var(t), Ty::Var(r)]),
+                );
+                Scheme::poly(
+                    vec![t, r],
+                    vec![],
+                    fun(
+                        &[rwlock_ty(), callback],
+                        result_app_ty(Ty::Var(r), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::WithRead | ThreadBuiltin::TryRead => {
+                let t = self.counter.fresh();
+                let r = self.counter.fresh();
+                let callback = fn_ty(Ty::Var(t), Ty::Var(r));
+                Scheme::poly(
+                    vec![t, r],
+                    vec![],
+                    fun(
+                        &[rwlock_ty(), callback],
+                        result_app_ty(Ty::Var(r), thread_err.clone()),
+                    ),
+                )
+            }
+            ThreadBuiltin::Lock | ThreadBuiltin::TryLock | ThreadBuiltin::Unlock => {
+                Scheme::mono(fun(&[mutex_ty()], res_unit))
+            }
+        }
+    }
+
+    /// Zero-argument functions are nullary at the call site (`f()`), but their
+    /// value is still a `unit -> R` function suitable for `spawn(f)` / `MakeFn`.
+    fn seal_nullary_fun_ty(fun_ty: Ty, arg_count: usize, has_self_receiver: bool) -> Ty {
+        if arg_count == 0 && !has_self_receiver {
+            Ty::Fun(Box::new(unit_ty()), Box::new(fun_ty))
+        } else {
+            fun_ty
+        }
+    }
+
+    fn infer_thread_spawn_call(
+        &mut self,
+        arg_tys: &[Ty],
+        arg_exprs: Option<&[Output]>,
+        range: Range<usize>,
+    ) -> Ty {
+        use crate::typechecking::ty::thread_ty;
+        let thread_err = Ty::Con(common::BUILTIN_THREAD_ERROR_ENUM.into());
+        let res_thread = result_app_ty(thread_ty(), thread_err.clone());
+        let fn_ty = |param: Ty, ret: Ty| Ty::Fun(Box::new(param), Box::new(ret));
+        match arg_tys.len() {
+            0 => self.error_with_help(
+                ErrorCode::GenericTypeError,
+                "spawn expects a function (and optional sendable argument)".to_string(),
+                range,
+                Some("call `spawn(work)` or `spawn(work, arg)`".to_string()),
+            ),
+            1 => {
+                let t = self.counter.fresh();
+                let expected = fn_ty(unit_ty(), Ty::Var(t));
+                self.coerce_or_unify(
+                    &expected,
+                    &arg_tys[0],
+                    arg_exprs.and_then(|a| a.first()),
+                    &range,
+                    "spawn function",
+                );
+                res_thread
+            }
+            2 => {
+                let t = self.counter.fresh();
+                let a = self.counter.fresh();
+                let expected_fn = fn_ty(Ty::Var(a), Ty::Var(t));
+                self.coerce_or_unify(
+                    &expected_fn,
+                    &arg_tys[0],
+                    arg_exprs.and_then(|a| a.first()),
+                    &range,
+                    "spawn function",
+                );
+                self.coerce_or_unify(
+                    &Ty::Var(a),
+                    &arg_tys[1],
+                    arg_exprs.and_then(|a| a.get(1)),
+                    &range,
+                    "spawn argument",
+                );
+                let arg_resolved = apply_ty_prune(&self.subst, &arg_tys[1]);
+                if !Self::is_thread_sendable_ty(&arg_resolved) {
+                    self.error_with_help(
+                        ErrorCode::GenericTypeError,
+                        format!(
+                            "spawn argument type `{}` is not sendable across threads",
+                            arg_resolved.to_string()
+                        ),
+                        range.clone(),
+                        Some(
+                            "only immediates, strings, and aggregates of sendable values may cross threads"
+                                .to_string(),
+                        ),
+                    );
+                }
+                res_thread
+            }
+            n => self.error_with_help(
+                ErrorCode::GenericTypeError,
+                format!(
+                    "spawn was called with too many arguments (expected 1 or 2, got {n})"
+                ),
+                range,
+                None,
+            ),
+        }
+    }
+
+    /// Whether `ty` may be deep-copied across OS thread boundaries (best-effort).
+    pub fn is_thread_sendable_ty(ty: &Ty) -> bool {
+        match ty {
+            Ty::Var(_) => true, // re-checked on concrete spawn arg after unify
+            Ty::Con(name) => {
+                let n = name.to_ascii_lowercase();
+                if matches!(
+                    n.as_str(),
+                    "stream" | "thread" | "coroutine" | "library" | "fn" | "polyfn"
+                ) {
+                    return false;
+                }
+                matches!(
+                    n.as_str(),
+                    "int"
+                        | "float"
+                        | "string"
+                        | "bool"
+                        | "byte"
+                        | "void"
+                        | "unit"
+                        | "int8"
+                        | "int16"
+                        | "int32"
+                        | "uint8"
+                        | "uint16"
+                        | "uint32"
+                        | "uint64"
+                ) || name == crate::typechecking::ty::SENDER
+                    || name == crate::typechecking::ty::RECEIVER
+                    || name == crate::typechecking::ty::MUTEX
+                    || name == crate::typechecking::ty::RWLOCK
+            }
+            Ty::App(head, args) => {
+                if matches!(head.as_ref(), Ty::Con(n) if n == "coroutine") {
+                    return false;
+                }
+                args.iter().all(Self::is_thread_sendable_ty)
+            }
+            Ty::Fun(_, _) => false,
+            Ty::Array { element, .. } => Self::is_thread_sendable_ty(element),
+            Ty::List(inner) => Self::is_thread_sendable_ty(inner),
+            Ty::Readonly(inner) => Self::is_thread_sendable_ty(inner),
+            Ty::Tuple(elems) => elems.iter().all(Self::is_thread_sendable_ty),
+            Ty::Record { fields } => fields
+                .iter()
+                .all(|(_, t)| Self::is_thread_sendable_ty(t)),
+            Ty::Sum { variants, .. } => variants.iter().all(|(_, payload)| {
+                payload
+                    .field_types()
+                    .iter()
+                    .all(|t| Self::is_thread_sendable_ty(t))
+            }),
+            Ty::Existential { .. } | Ty::Constructor { .. } | Ty::Forall { .. } => false,
+        }
     }
 
     /// Set the module path used for ownership checks while typechecking.
@@ -1849,7 +2173,12 @@ impl Checker {
                         .scope_bindings
                         .iter()
                         .filter(|(_, e)| {
-                            matches!(e, BuiltinExport::FfiFn { .. } | BuiltinExport::IoFn { .. })
+                            matches!(
+                                e,
+                                BuiltinExport::FfiFn { .. }
+                                    | BuiltinExport::IoFn { .. }
+                                    | BuiltinExport::ThreadFn { .. }
+                            )
                         })
                         .map(|(k, e)| (k.clone(), e.clone()))
                         .collect();
@@ -1860,6 +2189,10 @@ impl Checker {
                         match export {
                             BuiltinExport::IoFn { kind } => {
                                 self.env.insert_top(local, Self::io_fn_scheme(kind));
+                            }
+                            BuiltinExport::ThreadFn { kind } => {
+                                let scheme = self.thread_fn_scheme(kind);
+                                self.env.insert_top(local, scheme);
                             }
                             BuiltinExport::FfiFn { .. } => {
                                 self.env
@@ -2951,6 +3284,10 @@ impl Checker {
                     );
                 }
 
+                if self.thread_fn_in_scope(&ident) == Some(ThreadBuiltin::Spawn) {
+                    return self.infer_thread_spawn_call(&arg_tys, args.as_deref(), range);
+                }
+
                 let result = self.apply_function(
                     Some(&ident),
                     &fun_ty,
@@ -3548,7 +3885,7 @@ impl Checker {
                 for (_, arg_ty) in arg_tys.iter().rev() {
                     fun_ty = Ty::Fun(Box::new(arg_ty.clone()), Box::new(fun_ty));
                 }
-                fun_ty
+                Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), false)
             }
 
             // ---- `test("…") { … }` harness cases ----
@@ -6536,6 +6873,33 @@ impl Checker {
         range: Range<usize>,
     ) -> Ty {
         let mut current = fun_ty.clone();
+        // Nullary `f()` calls apply the implicit `unit` parameter (see
+        // `seal_nullary_fun_ty` on function declarations).
+        if arg_tys.is_empty() {
+            loop {
+                let pruned = apply_ty_prune(&self.subst, &current);
+                match pruned {
+                    Ty::Forall { .. } => {
+                        let (body, constraints) = self.instantiate_forall_ty(&pruned);
+                        if !constraints.is_empty() {
+                            self.discharge_constraints(call_id, &constraints, &range);
+                        }
+                        current = body;
+                    }
+                    Ty::Fun(param, ret) => {
+                        self.coerce_or_unify(
+                            param.as_ref(),
+                            &unit_ty(),
+                            None,
+                            &range,
+                            "function argument",
+                        );
+                        return apply_ty_prune(&self.subst, ret.as_ref());
+                    }
+                    _ => break,
+                }
+            }
+        }
         for (i, arg) in arg_tys.iter().enumerate() {
             let mut pending_constraints = Vec::new();
             loop {
@@ -8347,9 +8711,15 @@ impl Checker {
             "string" => string(),
             "void" => unit_ty(),
             "stream" => crate::typechecking::ty::stream_ty(),
+            "thread" => crate::typechecking::ty::thread_ty(),
+            "sender" => crate::typechecking::ty::sender_ty(),
+            "receiver" => crate::typechecking::ty::receiver_ty(),
+            "mutex" => crate::typechecking::ty::mutex_ty(),
+            "rwlock" => crate::typechecking::ty::rwlock_ty(),
             "option" => option_app_ty(Ty::Var(self.counter.fresh())),
             "result" => result_app_ty(Ty::Var(self.counter.fresh()), Ty::Var(self.counter.fresh())),
             "ioerror" => Ty::Con(common::BUILTIN_IO_ERROR_ENUM.into()),
+            "threaderror" => Ty::Con(common::BUILTIN_THREAD_ERROR_ENUM.into()),
             "error" => Ty::Con(common::BUILTIN_FFI_ERROR_ENUM.into()),
             "errorkind" => Ty::Con(common::BUILTIN_FFI_ERROR_KIND_ENUM.into()),
             _ => {
@@ -9618,7 +9988,14 @@ impl Checker {
         self.current_return_ty = prev_ret;
         self.fn_result_mode = prev_result_mode;
         self.fn_option_mode = prev_option_mode;
+        fun_ty = Self::seal_nullary_fun_ty(fun_ty, arg_tys.len(), self_ty.is_some());
         self.unify(&Ty::Var(alpha), &fun_ty, range, "function type");
+
+        if !is_generic {
+            let resolved = apply_ty_prune(&self.subst, &fun_ty);
+            self.env
+                .insert_top(name.to_string(), Scheme::mono(resolved));
+        }
 
         let abstract_bindings = self.abstract_constraint_bindings.pop().unwrap_or_default();
         let mut resolved_param_constraints = Vec::with_capacity(param_constraints.len());
@@ -18401,6 +18778,112 @@ fn main() { let g = add(a: 1); }
             c.partial_fills_by_span.values().any(|&mask| mask == 0b01),
             "expected fill mask 0b01 for `a:`; got {:?}",
             c.partial_fills_by_span.values().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn is_thread_sendable_ty_accepts_immediates_strings_and_host_handles() {
+        use crate::typechecking::ty::{mutex_ty, receiver_ty, rwlock_ty, sender_ty};
+        assert!(Checker::is_thread_sendable_ty(&int()));
+        assert!(Checker::is_thread_sendable_ty(&string()));
+        assert!(Checker::is_thread_sendable_ty(&boolean()));
+        assert!(Checker::is_thread_sendable_ty(&unit_ty()));
+        assert!(Checker::is_thread_sendable_ty(&sender_ty()));
+        assert!(Checker::is_thread_sendable_ty(&receiver_ty()));
+        assert!(Checker::is_thread_sendable_ty(&mutex_ty()));
+        assert!(Checker::is_thread_sendable_ty(&rwlock_ty()));
+        assert!(Checker::is_thread_sendable_ty(&array(int())));
+        assert!(Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), string()])));
+    }
+
+    #[test]
+    fn is_thread_sendable_ty_rejects_stream_coroutine_and_functions() {
+        use crate::typechecking::ty::stream_ty;
+        assert!(!Checker::is_thread_sendable_ty(&stream_ty()));
+        assert!(!Checker::is_thread_sendable_ty(&crate::typechecking::ty::thread_ty()));
+        assert!(!Checker::is_thread_sendable_ty(&Ty::Fun(
+            Box::new(unit_ty()),
+            Box::new(int())
+        )));
+        assert!(!Checker::is_thread_sendable_ty(&Ty::App(
+            Box::new(Ty::Con("coroutine".into())),
+            vec![int(), unit_ty()]
+        )));
+        assert!(!Checker::is_thread_sendable_ty(&array(stream_ty())));
+        assert!(!Checker::is_thread_sendable_ty(&tuple_ty(vec![int(), stream_ty()])));
+    }
+
+    #[test]
+    fn spawn_rejects_non_sendable_thread_argument() {
+        let msgs = assert_messages(
+            r#"
+use thread::*;
+fn noop() -> int { return 0; }
+fn work(Thread t) -> int { return 1; }
+fn main() {
+    let t0 = spawn(noop)?;
+    let t = spawn(work, t0);
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("not sendable across threads")),
+            "expected non-sendable spawn arg diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_zero_and_too_many_arguments() {
+        let msgs = assert_messages(
+            r#"
+use thread::*;
+fn main() {
+    let _ = spawn();
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("spawn expects a function")),
+            "expected zero-arg spawn diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+
+        let msgs = assert_messages(
+            r#"
+use thread::*;
+fn work(int a, int b) -> int { return a + b; }
+fn main() {
+    let _ = spawn(work, 1, 2);
+}
+"#,
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.message().contains("too many arguments")),
+            "expected arity spawn diagnostic, got: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn spawn_accepts_sendable_int_argument() {
+        let (mut c, _) = check(
+            r#"
+use thread::*;
+fn work(int n) -> int { return n + 1; }
+fn main() {
+    let t = spawn(work, 41);
+}
+"#,
+        );
+        let msgs = c.take_messages();
+        assert!(
+            msgs.is_empty(),
+            "unexpected messages: {:?}",
+            msgs.iter().map(|m| m.message()).collect::<Vec<_>>()
         );
     }
 }

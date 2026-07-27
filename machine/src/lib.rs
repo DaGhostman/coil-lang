@@ -2,6 +2,7 @@
 
 mod ffi;
 pub mod io;
+pub mod thread;
 mod memory;
 mod opcode;
 pub mod packed_la;
@@ -14,4 +15,5 @@ pub use packed_la::{
     PACKED_DOT, PACKED_MATMUL, PACKED_MATRIX_NEG, PACKED_MATRIX_ZIP, packed_dot, packed_matmul,
     packed_matrix_neg, packed_matrix_zip,
 };
+pub use thread::{ThreadErrorTag, ThreadProgram};
 pub use vm::*;
