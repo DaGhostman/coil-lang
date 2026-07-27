@@ -926,4 +926,42 @@ mod tests {
         assert!(vm.resolves_use(&["ffi".into(), "types".into()], "*"));
         assert!(!vm.resolves_use(&["foo".into()], "sadge"));
     }
+
+    #[test]
+    fn resolves_time_fs_env_crypto_exports() {
+        let vm = VirtualModules::new();
+        assert!(vm.resolves_use(&["time".into()], "*"));
+        assert!(vm.resolves_use(&["io".into(), "fs".into()], "*"));
+        assert!(vm.resolves_use(&["env".into()], "*"));
+        assert!(vm.resolves_use(&["crypto".into()], "*"));
+
+        assert!(matches!(
+            vm.resolve_item(&["time".into()], "epoch"),
+            Some(BuiltinExport::HostFn {
+                surface: "epoch",
+                registry: "time_epoch"
+            })
+        ));
+        assert!(matches!(
+            vm.resolve_item(&["io".into(), "fs".into()], "exists"),
+            Some(BuiltinExport::HostFn {
+                surface: "exists",
+                registry: "fs_exists"
+            })
+        ));
+        assert!(matches!(
+            vm.resolve_item(&["env".into()], "var"),
+            Some(BuiltinExport::HostFn {
+                surface: "var",
+                registry: "env_var"
+            })
+        ));
+        assert!(matches!(
+            vm.resolve_item(&["crypto".into()], "sha256"),
+            Some(BuiltinExport::HostFn {
+                surface: "sha256",
+                registry: "crypto_sha256"
+            })
+        ));
+    }
 }

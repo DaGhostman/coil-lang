@@ -2061,3 +2061,26 @@ fn main() {
     );
 }
 
+#[test]
+fn primitive_cast_rejects_float_to_byte() {
+    let (_ty, msgs) = check("fn main() { let x = 1.5 as byte; }");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("cannot cast `float` to `byte`")),
+        "expected float→byte cast rejection, got: {:?}",
+        msgs
+    );
+}
+
+#[test]
+fn primitive_cast_rejects_non_primitive_target() {
+    let (_ty, msgs) = check(r#"fn main() { let x = "hi" as int; }"#);
+    assert!(
+        msgs.iter().any(|m| m.contains(
+            "cast target must be a primitive type (`int`, `float`, `byte`, or `bool`)"
+        )),
+        "expected non-primitive cast rejection, got: {:?}",
+        msgs
+    );
+}
+
