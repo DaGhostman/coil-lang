@@ -2836,13 +2836,14 @@ fn main() {
     let tx = pair[0];
     let rx = pair[1];
     close(tx)?;
-    match try_recv(rx) {
-        Result::Ok(_) => print "ok",
+    let msg = match try_recv(rx) {
+        Result::Ok(_) => "ok",
         Result::Err(e) => match e {
-            ThreadError::Disconnected => print "disc",
-            _ => print "other",
+            ThreadError::Disconnected => "disc",
+            _ => "other",
         },
     };
+    print "%s", msg;
 }
 "#,
     );
@@ -2858,13 +2859,14 @@ use thread::*;
 fn main() {
     let pair = channel()?;
     let rx = pair[1];
-    match try_recv(rx) {
-        Result::Ok(_) => print "ok",
+    let msg = match try_recv(rx) {
+        Result::Ok(_) => "ok",
         Result::Err(e) => match e {
-            ThreadError::WouldBlock => print "wb",
-            _ => print "other",
+            ThreadError::WouldBlock => "wb",
+            _ => "other",
         },
     };
+    print "%s", msg;
 }
 "#,
     );
@@ -2901,13 +2903,14 @@ fn work() -> int {
 fn main() {
     let t = spawn(work)?;
     detach(t)?;
-    match join(t) {
-        Result::Ok(_) => print "joined",
+    let msg = match join(t) {
+        Result::Ok(_) => "joined",
         Result::Err(e) => match e {
-            ThreadError::JoinFailed => print "jf",
-            _ => print "other",
+            ThreadError::JoinFailed => "jf",
+            _ => "other",
         },
     };
+    print "%s", msg;
 }
 "#,
     );

@@ -18818,9 +18818,11 @@ fn main() { let g = add(a: 1); }
         let msgs = assert_messages(
             r#"
 use thread::*;
-fn work(fn () -> int f) -> int { return f(); }
+fn noop() -> int { return 0; }
+fn work(Thread t) -> int { return 1; }
 fn main() {
-    let t = spawn(work, fn () => 1);
+    let t0 = spawn(noop)?;
+    let t = spawn(work, t0);
 }
 "#,
         );
