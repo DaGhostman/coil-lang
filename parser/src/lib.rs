@@ -1423,12 +1423,14 @@ impl<'pratt> Pratt<'pratt> {
             )
             .map(|(name, alias): (&str, Option<String>)| (name.to_string(), alias));
 
+        // Empty `{ }` is a parse error (silent no-op would hide typos).
         let brace_group = just('{')
             .padded()
             .ignore_then(
                 brace_item
                     .separated_by(op!(","))
                     .allow_trailing()
+                    .at_least(1)
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just('}').padded());
@@ -1476,9 +1478,6 @@ impl<'pratt> Pratt<'pratt> {
                         let mut path = Vec::with_capacity(1 + middle.len());
                         path.push(first.to_string());
                         path.extend(middle);
-                        if items.is_empty() {
-                            return (span, Box::new(Expression::Fragment(Vec::new())));
-                        }
                         if items.len() == 1 {
                             let (name, alias) = items.into_iter().next().unwrap();
                             return (span, Box::new(Expression::Use { path, name, alias }));
@@ -4568,6 +4567,17 @@ mod tests {
             },
             Err(e) => panic!("parse failed: {:?}", e),
         }
+    }
+
+    #[test]
+    fn parse_use_brace_group_rejects_empty() {
+        let src = "use foo::{};";
+        let result = Pratt::default().declaration().parse(src).into_result();
+        assert!(
+            result.is_err(),
+            "empty brace-group import must fail to parse, got {:?}",
+            result
+        );
     }
 
     #[test]

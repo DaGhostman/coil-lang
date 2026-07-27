@@ -377,10 +377,12 @@ parse path — see [Traits and impl](#traits-and-impl) above.
 defer_stmt ::= 'defer' ['use' '(' ident (',' ident)* ','? ')'] block
 ```
 
-Runs when the enclosing function exits (LIFO order for multiple defers).
-Outer locals must be listed in the optional `use (…)` capture list (same
-explicit-capture rule as lambdas); bare `defer { … }` cannot close over
-enclosing locals.
+Runs when the enclosing function exits via `return` or fall-through (LIFO
+order for multiple defers). `panic` aborts without running registered defers.
+Functions that contain a `defer` are not eligible for self tail-call
+optimization (cleanup must run before leaving the frame). Outer locals must
+be listed in the optional `use (…)` capture list (same explicit-capture rule
+as lambdas); bare `defer { … }` cannot close over enclosing locals.
 
 ---
 

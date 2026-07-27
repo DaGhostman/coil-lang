@@ -265,7 +265,7 @@ fn example() {
 }
 ```
 
-A `defer` block runs when the **enclosing function** exits — whether by `return` or by falling off the end of the body. Multiple `defer` statements in one function run in **last-in, first-out (LIFO)** order: the defer written last runs first.
+A `defer` block runs when the **enclosing function** exits — whether by `return` or by falling off the end of the body. It does **not** run if the VM aborts via `panic`. Multiple `defer` statements in one function run in **last-in, first-out (LIFO)** order: the defer written last runs first. Functions with a `defer` are not self-tail-call optimized so cleanup always runs.
 
 Outer locals are **not** visible inside a defer unless you list them in an explicit `use (…)` capture list (same rule as lambdas):
 

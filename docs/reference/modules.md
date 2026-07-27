@@ -93,6 +93,8 @@ Given a concrete import `use a::b::c;`:
    - This is what makes `use math::add;` work when `add` lives in `math.hy`.
 4. If no root contains either form, emit a module-not-found diagnostic.
 
+**Shadowing:** when both `<root>/a/b/c.hy` (one-item-per-file) and `<root>/a/b.hy` (module file) exist, the one-item-per-file path always wins. Avoid keeping the same item name in both layouts.
+
 Given a brace-group import `use math::{add, mul};`:
 
 1. Desugar to `use math::add;` + `use math::mul;` (same path, one item each).

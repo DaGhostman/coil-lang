@@ -9,24 +9,28 @@ use std::sync::{
 };
 use std::thread;
 
-/// Spawned, non-forgotten join states. The root VM joins any still-live
-/// undetached entries when the main program finishes so workers blocked in
-/// `recv` are not killed by process exit (see `join_unddetached_threads`).
-static LIVE_THREADS: Mutex<Vec<Arc<JoinState>>> = Mutex::new(Vec::new());
+/// Per-root-VM registry of undetached spawns (shared with nested workers via
+/// [`ThreadSpawnContext`]). Process-global storage was wrong: parallel tests /
+/// multiple `Machine`s would steal each other's joins via `mem::take`.
+pub type LiveThreadRegistry = Arc<Mutex<Vec<Arc<JoinState>>>>;
 
-fn register_live_thread(state: Arc<JoinState>) {
-    if let Ok(mut g) = LIVE_THREADS.lock() {
+pub fn new_live_thread_registry() -> LiveThreadRegistry {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn register_live_thread(registry: &LiveThreadRegistry, state: Arc<JoinState>) {
+    if let Ok(mut g) = registry.lock() {
         g.push(state);
     }
 }
 
-/// Block until every undetached, not-yet-joined spawn from this process has
-/// finished. Called automatically at the end of [`Machine::run_with_pool`].
+/// Block until every undetached, not-yet-joined spawn in `registry` has finished.
 ///
-/// Explicit `join(t)` still returns the worker's value; this path only keeps
-/// the process alive. `detach(t)` opts a thread out.
-pub fn join_unddetached_threads() {
-    let threads = match LIVE_THREADS.lock() {
+/// Called automatically at the end of [`Machine::run_with_pool`] for that
+/// machine's own registry. Explicit `join(t)` still returns the worker's value;
+/// this path only keeps the process alive. `detach(t)` opts a thread out.
+pub fn join_unddetached_threads(registry: &LiveThreadRegistry) {
+    let threads = match registry.lock() {
         Ok(mut g) => std::mem::take(&mut *g),
         Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
     };
@@ -626,6 +630,7 @@ struct WorkerCtx {
     args: Vec<SpawnArg>,
     state: Arc<JoinState>,
     shared_print: Option<Arc<Mutex<Vec<u8>>>>,
+    live_threads: LiveThreadRegistry,
 }
 
 fn run_worker(ctx: WorkerCtx) {
@@ -636,12 +641,16 @@ fn run_worker(ctx: WorkerCtx) {
         args,
         state,
         shared_print,
+        live_threads,
     } = ctx;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut vm = Machine::<WORKER_STACK_SLOTS>::default();
         vm.install_natives(&natives);
         vm.set_thread_program(Arc::clone(&program));
         vm.set_program_debug(program.debug.clone());
+        // Nested `spawn` from a worker registers on the root VM's list so the
+        // root's `run_with_pool` join still waits for them.
+        vm.set_live_threads(Arc::clone(&live_threads));
         if let Some(buf) = &shared_print {
             vm.set_shared_print(Arc::clone(buf));
             vm.with_output(SharedPrintWriter(Arc::clone(buf)));
@@ -671,6 +680,7 @@ pub struct ThreadSpawnContext {
     pub program: Arc<ThreadProgram>,
     pub natives: Natives,
     pub shared_print: Option<Arc<Mutex<Vec<u8>>>>,
+    pub live_threads: LiveThreadRegistry,
 }
 
 impl Clone for ThreadSpawnContext {
@@ -679,6 +689,7 @@ impl Clone for ThreadSpawnContext {
             program: Arc::clone(&self.program),
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
+            live_threads: Arc::clone(&self.live_threads),
         }
     }
 }
@@ -702,6 +713,7 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
             .collect::<Result<_, _>>()?
     };
     let ctx = host_spawn_context()?;
+    let live_threads = Arc::clone(&ctx.live_threads);
     let state = Arc::new(JoinState::new());
     let worker = WorkerCtx {
         program: ctx.program,
@@ -710,10 +722,11 @@ fn try_host_spawn(heap: &mut Heap, args: &[Value]) -> Result<Value, ThreadErrorT
         args: spawn_args,
         state: Arc::clone(&state),
         shared_print: ctx.shared_print,
+        live_threads: Arc::clone(&live_threads),
     };
     let handle = thread::spawn(move || run_worker(worker));
     *state.join_handle.lock().unwrap() = Some(handle);
-    register_live_thread(Arc::clone(&state));
+    register_live_thread(&live_threads, Arc::clone(&state));
     let (obj, _) = heap.alloc(ObjThread { state }, Object::Thread);
     Ok(Value::from(obj.addr()))
 }
@@ -1119,6 +1132,29 @@ mod tests {
     use super::*;
     use crate::memory::ObjFn;
     use std::time::Duration;
+
+    #[test]
+    fn live_thread_registries_are_per_machine() {
+        let m1 = Machine::<WORKER_STACK_SLOTS>::default();
+        let m2 = Machine::<WORKER_STACK_SLOTS>::default();
+        assert!(
+            !std::sync::Arc::ptr_eq(m1.live_threads(), m2.live_threads()),
+            "each Machine must own a distinct live-thread registry"
+        );
+        // Joining an empty registry must not touch another Machine's list.
+        let sentinel = Arc::new(JoinState::new());
+        register_live_thread(m2.live_threads(), Arc::clone(&sentinel));
+        join_unddetached_threads(m1.live_threads());
+        assert_eq!(
+            m2.live_threads().lock().unwrap().len(),
+            1,
+            "joining m1 must not drain m2's undetached spawns"
+        );
+        // Avoid leaving a JoinState that never finishes: mark detached so a
+        // later join skips waiting.
+        sentinel.detached.store(true, Ordering::SeqCst);
+        join_unddetached_threads(m2.live_threads());
+    }
 
     fn enum_tag(heap: &Heap, v: Value) -> Option<u32> {
         match heap.find_object_by_addr(v.raw() as u64) {

@@ -165,6 +165,8 @@ pub struct Machine<const S: usize> {
     thread_program: Option<std::sync::Arc<crate::thread::ThreadProgram>>,
     /// Optional shared stdout capture for worker threads.
     shared_print: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    /// Undetached spawns owned by this VM (joined at end of `run_with_pool`).
+    live_threads: crate::thread::LiveThreadRegistry,
 }
 
 impl<const S: usize> Default for Machine<S> {
@@ -196,6 +198,7 @@ impl<const S: usize> Default for Machine<S> {
             program_debug: ProgramDebug::default(),
             thread_program: None,
             shared_print: None,
+            live_threads: crate::thread::new_live_thread_registry(),
         }
     }
 }
@@ -586,6 +589,16 @@ impl<const S: usize> Machine<S> {
         self.shared_print.clone()
     }
 
+    /// Replace the undetached-spawn registry (used by workers to share the
+    /// root VM's list so nested `spawn` still joins with the root).
+    pub fn set_live_threads(&mut self, registry: crate::thread::LiveThreadRegistry) {
+        self.live_threads = registry;
+    }
+
+    pub fn live_threads(&self) -> &crate::thread::LiveThreadRegistry {
+        &self.live_threads
+    }
+
     /// Allocate global static slots without running bytecode.
     pub fn init_static_slots(&mut self, static_slots: u32) {
         self.statics = vec![Value::default(); static_slots as usize];
@@ -602,6 +615,7 @@ impl<const S: usize> Machine<S> {
             program,
             natives: self.natives.clone_registry(),
             shared_print: self.shared_print.clone(),
+            live_threads: std::sync::Arc::clone(&self.live_threads),
         })
     }
 
@@ -972,7 +986,8 @@ impl<const S: usize> Machine<S> {
         // Keep undetached workers alive past main's return. Without this,
         // process exit kills threads still blocked in `recv` / still starting,
         // which looks like "recv never blocks" and "nothing after recv runs".
-        crate::thread::join_unddetached_threads();
+        // Only joins *this* Machine's registry (not a process-global list).
+        crate::thread::join_unddetached_threads(&self.live_threads);
     }
 
     fn finish_pending_ffi_invoke(&mut self, pending: PendingFfiInvoke) {

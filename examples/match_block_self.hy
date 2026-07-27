@@ -3,7 +3,7 @@
 // Match arm bodies may be `{ … }` blocks. Those are expression blocks
 // (not dict literals), so `self.get()` works inside them.
 //
-// Expected output: `55`
+// Expected output: `5`
 
 enum Mode {
     Zero,
